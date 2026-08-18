@@ -151,7 +151,9 @@ class TestTheHandoffCredential:
         )
         fell_back: list[bool] = []
         monkeypatch.setattr(
-            admin_routes, "_self_restart", lambda _s: _appended(fell_back)  # noqa: ARG005
+            admin_routes,
+            "_self_restart",
+            lambda _s: _appended(fell_back),  # noqa: ARG005
         )
 
         state = _state(api_key=None, pin="40021977")
@@ -201,7 +203,9 @@ class TestTheHandoffCredential:
         )
         fell_back: list[bool] = []
         monkeypatch.setattr(
-            admin_routes, "_self_restart", lambda _s: _appended(fell_back)  # noqa: ARG005
+            admin_routes,
+            "_self_restart",
+            lambda _s: _appended(fell_back),  # noqa: ARG005
         )
 
         state = _state(api_key=None, pin=None)
@@ -232,7 +236,9 @@ class TestTheHandoffCredential:
         monkeypatch.setattr(admin_routes.httpx, "AsyncClient", lambda **_: _Exploding())
         fell_back: list[bool] = []
         monkeypatch.setattr(
-            admin_routes, "_self_restart", lambda _s: _appended(fell_back)  # noqa: ARG005
+            admin_routes,
+            "_self_restart",
+            lambda _s: _appended(fell_back),  # noqa: ARG005
         )
 
         state = _state()
@@ -422,6 +428,9 @@ class TestTraySupervisedRestart:
         from fastapi import Request
 
         monkeypatch.setenv(ports_module.ENV_SUPERVISOR, "tray")
+        # The variable alone is not enough: the tray it names must be our
+        # live parent (a quit tray leaves it set on the server it launched).
+        monkeypatch.setattr(admin_routes, "supervising_tray_is_alive", lambda: True)
         state, _ = _restart_state(None)
         state.config.watchdog = type("W", (), {"enabled": True, "port": 1235})()
         spawned: list[Any] = []
@@ -449,6 +458,53 @@ class TestTraySupervisedRestart:
         assert asked_watchdog == [], "the watchdog would only kill us and defer to the tray"
         assert len(spawned) == 1
         assert state.restart_status["outcome"] == "supervisor-respawn"
+
+    async def test_a_stale_supervisor_variable_does_not_exit_into_the_void(
+        self, monkeypatch: pytest.MonkeyPatch, recorder: _Recorder
+    ) -> None:
+        """SF_SUPERVISOR=tray with no live tray parent (the tray was quit, or a
+        watchdog-spawned replacement inherited the variable): exiting 75 would
+        leave nobody to respawn us, so the watchdog path is taken instead."""
+        from fastapi import Request
+
+        monkeypatch.setenv(ports_module.ENV_SUPERVISOR, "tray")
+        monkeypatch.setattr(admin_routes, "supervising_tray_is_alive", lambda: False)
+        state, _ = _restart_state(None)
+        state.config.watchdog = type("W", (), {"enabled": True, "port": 1235})()
+        spawned: list[Any] = []
+        monkeypatch.setattr(
+            admin_routes, "_spawn_restart_task", lambda coro: (spawned.append(coro), coro.close())
+        )
+
+        async def reachable(url: str) -> tuple[bool, str]:
+            return True, "up"
+
+        monkeypatch.setattr(admin_routes, "_watchdog_is_reachable", reachable)
+
+        class _App:
+            pass
+
+        app = _App()
+        app.state = state  # type: ignore[attr-defined]
+        scope = {"type": "http", "app": app, "headers": [], "method": "POST", "path": "/"}
+        body = await admin_routes.restart_server(Request(scope), confirm=True)
+        assert body["via"] == "watchdog"
+        assert state.restart_status["outcome"] != "supervisor-respawn"
+
+    def test_children_never_inherit_the_supervisor_variable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(ports_module.ENV_SUPERVISOR, "tray")
+        env = ports_module.env_without_supervisor()
+        assert ports_module.ENV_SUPERVISOR not in env
+        assert env.get("PATH") == os.environ.get("PATH")
+        assert ports_module.ENV_SUPERVISOR in os.environ, (
+            "the caller's own environment is untouched"
+        )
+
+    def test_supervising_tray_is_alive_is_false_for_this_test_process(self) -> None:
+        # pytest's parent is a shell/IDE, never a StudioForge tray.
+        assert ports_module.supervising_tray_is_alive() is False
 
     def test_shutdown_prefers_the_graceful_hook_and_falls_back_to_a_signal(
         self, monkeypatch: pytest.MonkeyPatch
@@ -851,9 +907,7 @@ class TestRestartRoute:
         assert "did not answer" in reply["note"]
         assert respawned == ["self"]
 
-    async def test_status_is_never_before_anything_has_been_asked_for(
-        self, tmp_path: Path
-    ) -> None:
+    async def test_status_is_never_before_anything_has_been_asked_for(self, tmp_path: Path) -> None:
         state = _route_state(_config(tmp_path))
         assert (await admin_routes.restart_status(_FakeRequest(state)))["outcome"] == "never"
 
@@ -983,9 +1037,7 @@ def main_log(monkeypatch: pytest.MonkeyPatch) -> _Recorder:
 
 
 class TestConsoleWithoutATerminal:
-    def test_print_really_does_die_on_a_dead_stream(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_print_really_does_die_on_a_dead_stream(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Pins the hazard itself, so the guard below is not cargo cult.
 
         (``sys.stdout is None`` is *currently* survivable -- CPython's ``print``
@@ -1000,9 +1052,7 @@ class TestConsoleWithoutATerminal:
         monkeypatch.setattr(sys, "stdout", _DeadStream())
         _console("this must not raise")
 
-    def test_writing_without_stdout_at_all_is_a_noop(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_writing_without_stdout_at_all_is_a_noop(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(sys, "stdout", None)
         _console("this must not raise either")
 

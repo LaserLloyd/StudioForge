@@ -25,6 +25,7 @@ import contextlib
 import os
 import socket
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -74,6 +75,45 @@ EXIT_RESTART_REQUESTED = 75
 ENV_SUPERVISOR = "SF_SUPERVISOR"
 
 _FALSEY = {"0", "false", "no", "off"}
+
+
+def env_without_supervisor(base: Mapping[str, str] | None = None) -> dict[str, str]:
+    """A copy of the environment with :data:`ENV_SUPERVISOR` removed.
+
+    The tray sets it on the child it spawns, and it means "the process that
+    launched you respawns you" (D28). It is true of that child only -- not of
+    the watchdog the child spawns, nor of a replacement the watchdog spawns.
+    Both inherited it unchanged, so a watchdog-launched server believed a tray
+    would bring it back, exited 75 on its next restart, and nobody did.
+    """
+    source = dict(os.environ if base is None else base)
+    source.pop(ENV_SUPERVISOR, None)
+    return source
+
+
+def supervising_tray_is_alive() -> bool:
+    """Whether this process's *direct parent* is a live StudioForge tray.
+
+    :func:`supervised_by` reports the environment variable; this checks the
+    fact behind it. A tray that was quit leaves the variable set on the server
+    it launched, and an exit-75 restart then goes nowhere -- the D28 rule is
+    "the process that launched you respawns you", which needs that process to
+    exist.
+    """
+    try:
+        me = psutil.Process(os.getpid())
+        parent = me.parent()
+        if parent is None:
+            return False
+        with parent.oneshot():
+            if parent.status() == psutil.STATUS_ZOMBIE:
+                return False
+            if float(parent.create_time()) > float(me.create_time()) + 1.0:
+                return False  # pid reused: this is not the process that launched us
+            cmdline = [str(part).lower() for part in parent.cmdline()]
+    except Exception:  # noqa: BLE001 - psutil raises a family; "unknown" is "no"
+        return False
+    return "studioforge" in " ".join(cmdline) and any(part == "tray" for part in cmdline)
 
 
 def supervised_by() -> str | None:
@@ -200,9 +240,7 @@ def check_startup_ports(config: Config) -> list[PortConflict]:
     if config.gui.enabled:
         targets.append(("gui", config.gui.host, config.gui.port, "gui.port"))
     if config.watchdog.enabled:
-        targets.append(
-            ("watchdog", config.watchdog.host, config.watchdog.port, "watchdog.port")
-        )
+        targets.append(("watchdog", config.watchdog.host, config.watchdog.port, "watchdog.port"))
 
     conflicts: list[PortConflict] = []
     for role, host, port, setting in targets:

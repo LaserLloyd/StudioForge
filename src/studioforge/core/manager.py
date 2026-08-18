@@ -162,6 +162,12 @@ class ModelManager:
         self._ttl_task: asyncio.Task[None] | None = None
         self._autoload_task: asyncio.Task[None] | None = None
         self._draining = False
+        #: Set by the app to the boot's "done" event (D33): a JIT load that
+        #: arrives while the library is still being scanned or the engine is
+        #: still installing waits for that instead of answering "unknown
+        #: model" / "no engine" from a half-built state. None means "no boot
+        #: to wait for" (tests, the stdio MCP server).
+        self.boot_gate: asyncio.Event | None = None
         self._load_waiters: dict[str, int] = {}
         #: model_id -> (ts, counters) the next throughput delta is measured from.
         self._throughput_baseline: dict[str, tuple[float, dict[str, float]]] = {}
@@ -267,6 +273,22 @@ class ModelManager:
         base = self.registry.get(record.base_model_id)
         return base if base is not None else record
 
+    async def _await_boot(self) -> None:
+        """Wait (bounded by the load timeout) for the app's boot to finish.
+
+        A caller that arrives mid-boot -- OpenClaw reconnecting the moment the
+        port answers, an agent's first ``load_model`` -- would otherwise be told
+        the model does not exist because the scan has not run yet. Bounded so
+        a boot that hangs cannot hang every request with it: after the wait
+        the ordinary errors apply.
+        """
+        gate = self.boot_gate
+        if gate is None or gate.is_set():
+            return
+        log.info("waiting for startup to finish before loading", model="pending")
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(gate.wait(), timeout=float(self.config.gateway.load_timeout_s))
+
     async def _lock_for(self, model_id: str) -> asyncio.Lock:
         async with self._locks_guard:
             lock = self._locks.get(model_id)
@@ -302,6 +324,7 @@ class ModelManager:
         keeps its identity); the returned instance may belong to its base --
         use ``instance.model_id`` for anything that talks to the supervisor.
         """
+        await self._await_boot()
         record = self.registry.resolve(name)
         if record is None:
             raise ModelNotFoundError(name, known=self.registry.known_ids())
@@ -356,6 +379,7 @@ class ModelManager:
         then plan) turned every refused reload into an outage.
         """
         validate_load_args(ctx_size=ctx_size, parallel=parallel, kv_cache_type=kv_cache_type)
+        await self._await_boot()
         record = self.registry.resolve(name)
         if record is None:
             raise ModelNotFoundError(name, known=self.registry.known_ids())
@@ -760,6 +784,21 @@ class ModelManager:
         for instance in self.supervisor.list():
             if instance.state != "ready" or instance.active_requests > 0:
                 continue
+            if self._model_was_removed(instance.model_id):
+                # The file is gone (its directory was walked and it was not
+                # there): on Linux the child keeps serving from the unlinked
+                # inode while /v1/models 404s it and /api/status lists it, and a
+                # pinned one holds its VRAM until restart. A model that is
+                # merely *unreachable* (its drive dropped) is kept stale by the
+                # registry and is not touched here (WP17 R3).
+                log.warning(
+                    "unloading a model whose file was removed",
+                    model_id=instance.model_id,
+                    pid=instance.pid,
+                    port=instance.port,
+                )
+                await self.supervisor.stop(instance.model_id)
+                continue
             ttl = instance.ttl_s
             if not ttl:  # None or 0 -> pinned / no TTL
                 continue
@@ -773,6 +812,20 @@ class ModelManager:
                     ttl_s=ttl,
                 )
                 await self.supervisor.stop(instance.model_id)
+
+    def _model_was_removed(self, model_id: str) -> bool:
+        """True only when the registry has scanned and no longer knows ``model_id``.
+
+        Never true before the first scan has completed (a cold registry knows
+        nothing), and never true for a stale record (unreachable is not
+        removed).
+        """
+        try:
+            if getattr(self.registry, "last_scan_at", None) is None:
+                return False
+            return self.registry.get(model_id) is None
+        except Exception:  # noqa: BLE001 - a registry hiccup is not a removal
+            return False
 
     # -- measured throughput ----------------------------------------------
 

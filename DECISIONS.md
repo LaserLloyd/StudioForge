@@ -1676,3 +1676,64 @@ and SNI (the DNS-rebinding TOCTOU, WP17 open item 2).
 **What pins it.** `tests/unit/test_api_hardening.py`, `tests/unit/test_vision_fetch.py`,
 `tests/unit/test_gui.py` (websocket origin), `tests/unit/test_mcp_access.py` (unchanged: the PIN
 still does not reach `/v1` or `/api` reads when a key is set).
+
+---
+
+## D33 -- Bind first, boot after; the boot has phases and every request but liveness waits for the index
+
+**Problem.** Uvicorn binds the port only after the lifespan's startup half returns, and that half
+ran the library scan, the orphan sweep, `ensure_engine` (on a fresh box: a ~600 MB download), the
+manager start and the download resume. Until all of it finished, `/health` was connection-refused:
+the tray said "Starting..." with nothing to show, the watchdog's restart timed out at 120 s on a
+cold library, OpenClaw retried into a closed port, and a fresh clone's very first start looked
+hung for minutes with no way to ask it what it was doing (WP12 left this as the remaining piece of
+"every fresh-box case ends in the Setup tab").
+
+**Decision.**
+
+* **The lifespan yields at once.** It creates the HTTP client, a `BootStatus`, and one background
+  task (`_boot`) that runs the slow half in order -- `scanning models` -> `sweeping orphaned
+  engines` -> `checking engine <tag>` (`installing engine <tag>: <step> <n>%` while it downloads)
+  -> `starting model manager` -> download resume -> `ready`. Each step is individually non-fatal,
+  and `finish()` always runs (a failure records `failed: <why>`; a shutdown mid-boot records that
+  too), so nothing waiting on the boot can wait forever. Shutdown cancels a boot still in flight
+  before the ordinary teardown.
+* **`/health` carries `boot: {phase, ready, elapsed_s, error}`** and, until ready, `can_serve:
+  false` with `cannot_serve_reason: "still starting (<phase>) ..."`. `status` stays `ok` -- the
+  process is alive, which is what liveness pollers ask -- so the tray, the watchdog and the
+  `--open` waiter attach as soon as the port answers, and can now show *what* it is doing.
+* **Every request except liveness and the docs waits for the first library scan** (the auth
+  middleware, bounded by `SCAN_WAIT_S` = 60 s), so a client that connects the moment the port
+  answers is not told the library is empty or that its model does not exist. `ModelManager.load` /
+  `ensure_loaded` additionally wait for the *whole* boot (bounded by `gateway.load_timeout_s`):
+  a JIT load during an engine install waits for the engine rather than failing with "no engine",
+  and the streaming path's keep-alives cover the wait. After the bound the ordinary errors apply.
+* **The Setup tab shows the phase.** While the boot is installing the engine, the checklist's
+  engine row reads the live progress and offers no second Install button (which would have raced
+  the first behind the per-tag lock).
+
+**Also in the same commit.** A dead stderr can no longer take the process down through a log
+line: the root stream handler detaches on failure instead of printing a traceback to the stream
+that just failed (which is how `ValueError: I/O operation on closed file` escaped from
+`log.info`), and under `pythonw` no stream handler is installed at all; both uvicorn servers use
+`log_config=None` so their own loggers go through the same handlers. The GUI's uvicorn server has
+a `timeout_graceful_shutdown` (its signal handler ran first on Ctrl+C and waited without bound
+for every NiceGUI websocket, so one wedged browser tab held the whole process). `SF_SUPERVISOR`
+is honoured only when a live tray is this process's direct parent, and it is never inherited by
+the watchdog or by the replacements the watchdog spawns (a watchdog-spawned server used to exit 75
+into the void on its next restart). The API's watchdog-restart client outlives the watchdog's own
+120 s budget, so a slow cold start no longer produces two replacements. On Linux, `llama-server`
+children are launched through a tiny `PR_SET_PDEATHSIG` shim (a separate single-threaded
+interpreter that sets the flag and execs, not `preexec_fn`), the POSIX half of D23. The orphan
+sweep re-verifies a pid's identity right before killing it, and the crash watcher tears down a
+child that `stop()` overtook while `create_subprocess_exec` was in flight. A model root that is not
+a directory right now (a dropped drive) keeps its models in the index as `stale` instead of
+removing them, and the TTL sweeper unloads an instance only when its file is *removed* -- its root
+was walked and it was not there -- never when it is merely unreachable (WP17 R3).
+
+**What pins it.** `tests/unit/test_lifecycle_hardening.py` (health during boot, a listing waits
+for the scan, shutdown mid-boot, the manager waits for the gate, the safe handler, the pdeathsig
+prefix, the reclaim recheck), `tests/unit/test_restart_handover.py` (stale supervisor variable,
+children never inherit it), `tests/unit/test_registry_sticky.py` (unreachable vs removed; the
+sweeper), `tests/unit/test_gui_setup_tab.py` (install phase, no second button),
+`tests/unit/test_startup_resilience.py` (readiness after the boot).

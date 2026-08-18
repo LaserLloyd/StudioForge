@@ -58,10 +58,22 @@ def _app_state(request: Request) -> Any:
 # ---------------------------------------------------------------------------
 
 
+async def _wait_for_scan(state: Any) -> None:
+    """The middleware already holds requests for the boot scan (D33); this is
+    the same wait for a caller that invokes the handler in-process."""
+    from studioforge.api.app import SCAN_WAIT_S, wait_for_boot
+
+    await wait_for_boot(state, timeout_s=SCAN_WAIT_S, scan_only=True)
+
+
 @router.get("/v1/models")
 async def list_models(request: Request) -> JSONResponse:
     """Every downloaded model, loaded or not -- LM Studio parity."""
     state = _app_state(request)
+    # A client that connects the moment the port answers (OpenClaw reconnects
+    # on a timer) must not read an empty library because the boot scan is
+    # still running: wait for the index, bounded (D33).
+    await _wait_for_scan(state)
     data = state.registry.openai_list()
     # `state` and `loaded_context_length` are additive fields that strict
     # OpenAI clients ignore. Putting them here makes the most-used endpoint

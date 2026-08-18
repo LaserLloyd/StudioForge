@@ -226,12 +226,18 @@ async def _serve(config: Config, *, open_gui: bool = False) -> int:
     api = create_app(config)
     servers: list[uvicorn.Server] = []
 
+    # log_config=None on both servers: uvicorn's default dictConfig installs
+    # its own handlers on sys.stderr/sys.stdout with propagate=False, outside
+    # the hardened root handlers -- so under a dead console (see
+    # configure_logging) uvicorn's own "Started server process" line could
+    # still kill the process. Its loggers now propagate to the root instead.
     api_server = uvicorn.Server(
         uvicorn.Config(
             api,
             host=config.server.host,
             port=config.server.port,
             log_level=config.logging.level.lower(),
+            log_config=None,
             access_log=False,
             timeout_graceful_shutdown=int(config.server.drain_timeout_s),
         )
@@ -250,7 +256,15 @@ async def _serve(config: Config, *, open_gui: bool = False) -> int:
                     host=config.gui.host,
                     port=config.gui.port,
                     log_level="warning",
+                    log_config=None,
                     access_log=False,
+                    # Without this uvicorn waits for every NiceGUI websocket to
+                    # close before it exits -- an unbounded wait, and because
+                    # the GUI's signal handler is installed last it is the one
+                    # that runs first on Ctrl+C, so a single wedged browser tab
+                    # held the whole process (and the API's drain window never
+                    # even started).
+                    timeout_graceful_shutdown=int(config.server.drain_timeout_s),
                 )
             )
             servers.append(gui_server)
@@ -397,10 +411,16 @@ def _spawn_watchdog(config: Config) -> subprocess.Popen[bytes] | None:
             kwargs["creationflags"] = creationflags
         else:
             kwargs["start_new_session"] = True
+        from studioforge.core.ports import env_without_supervisor
+
         return subprocess.Popen(
             [sys.executable, "-m", "studioforge.watchdog", "--config", str(config.config_path)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            # The tray's SF_SUPERVISOR describes US, not the watchdog or the
+            # replacements it spawns (D28); a replacement that inherited it
+            # exited 75 into the void on its next restart.
+            env=env_without_supervisor(),
             **kwargs,
         )
     except Exception as exc:

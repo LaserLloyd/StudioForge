@@ -120,6 +120,32 @@ class RingBufferHandler(logging.Handler):
 RING_BUFFER = RingBufferHandler()
 
 
+class _SafeStreamHandler(logging.StreamHandler):  # type: ignore[type-arg,unused-ignore]
+    """A stderr handler that cannot take the process down.
+
+    ``logging.Handler.handleError`` catches ``OSError`` only; a closed or
+    detached stream raises ``ValueError: I/O operation on closed file`` from
+    ``stream.write``, and that propagates out of ``log.info(...)`` at the call
+    site. A server launched from a console that later went away (a
+    ``start /b`` shell closed, a redirect whose far end died) then dies on its
+    next log line -- the D21/D28 "last log line was X and the process was
+    simply gone". A dead console is not a reason to stop serving.
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if self.stream is None:
+            return
+        super().emit(record)  # a failure lands in handleError, below
+
+    def handleError(self, record: logging.LogRecord) -> None:  # noqa: N802 - stdlib name
+        # The stdlib version prints the traceback to sys.stderr -- the very
+        # stream that just failed -- and only swallows OSError, so a closed
+        # console's ValueError escaped from the log call. Detach for good
+        # instead: every later emit would fail the same way, and the ring
+        # buffer + log file still carry the record.
+        self.stream = None  # type: ignore[assignment,unused-ignore]
+
+
 def configure_logging(
     level: str = "INFO", *, json_logs: bool = False, log_dir: Path | None = None
 ) -> None:
@@ -156,9 +182,15 @@ def configure_logging(
         root.removeHandler(handler)
     root.setLevel(logging.getLevelNamesMapping().get(level.upper(), logging.INFO))
 
-    stream = logging.StreamHandler(sys.stderr)
-    stream.setFormatter(logging.Formatter("%(message)s"))
-    root.addHandler(stream)
+    # Only when there is a stderr at all: under pythonw.exe it is None, and a
+    # StreamHandler on None writes nowhere but a handler on a *dead* stream (a
+    # detached console, a closed handle) raises ValueError out of the log
+    # call itself -- Handler.handleError only swallows OSError. The ring
+    # buffer and the log file are where a windowless process's logs live.
+    if sys.stderr is not None:
+        stream = _SafeStreamHandler(sys.stderr)
+        stream.setFormatter(logging.Formatter("%(message)s"))
+        root.addHandler(stream)
     root.addHandler(RING_BUFFER)
 
     if log_dir is not None:

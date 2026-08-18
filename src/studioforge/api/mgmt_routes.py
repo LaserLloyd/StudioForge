@@ -230,6 +230,9 @@ async def vram_reclaim(
 @router.get("/models")
 async def list_models(request: Request) -> dict[str, Any]:
     state = _state(request)
+    from studioforge.api.app import wait_for_boot
+
+    await wait_for_boot(state, timeout_s=60.0, scan_only=True)  # D33: not an empty list mid-boot
     loaded = {i.model_id: i for i in state.supervisor.list()}
     models = []
     for record in state.registry.all():

@@ -3056,6 +3056,7 @@ def first_run_checks(
     api_key_set: bool = False,
     gui_host: str | None = None,
     watchdog_host: str | None = None,
+    boot_phase: str | None = None,
 ) -> list[SetupCheck]:
     """Everything a fresh checkout has to get right, in the order it matters.
 
@@ -3145,7 +3146,12 @@ def first_run_checks(
     )
 
     engine_ok = bool(engine_tag)
-    if not engine_tag:
+    booting_engine = bool(boot_phase) and "engine" in str(boot_phase)
+    if not engine_tag and booting_engine:
+        # The boot is installing it right now (D33): show that instead of a
+        # second Install button that would race the first.
+        engine_detail = f"{boot_phase} — the first run does this once; re-check in a minute"
+    elif not engine_tag:
         engine_detail = f"not installed — install {pinned_tag or 'the pinned build'}"
     elif engine_smoke_tested:
         engine_detail = f"active: {engine_tag} (smoke-tested)"
@@ -3157,7 +3163,7 @@ def first_run_checks(
             name="llama.cpp engine",
             ok=engine_ok,
             detail=engine_detail,
-            action="" if engine_ok else "install-engine",
+            action="" if (engine_ok or booting_engine) else "install-engine",
             action_label=f"Install engine {pinned_tag}" if pinned_tag else "Install engine",
             help="Engines are versioned artifacts under engines/<tag>/, not whatever is on PATH.",
         )

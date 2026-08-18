@@ -326,7 +326,16 @@ def _collect_checks(ctx: GuiContext) -> list[st.SetupCheck]:
         api_key_set=bool(config.server.api_key),
         gui_host=config.gui.host if config.gui.enabled else None,
         watchdog_host=config.watchdog.host if config.watchdog.enabled else None,
+        boot_phase=_boot_phase(ctx),
     )
+
+
+def _boot_phase(ctx: GuiContext) -> str | None:
+    """The boot's current phase while it is still running, else None (D33)."""
+    boot = getattr(ctx.api_state, "boot", None)
+    if boot is None or getattr(boot, "ready", True):
+        return None
+    return str(getattr(boot, "phase", "") or "") or None
 
 
 def _safe(fn: Any, fallback: Any) -> Any:

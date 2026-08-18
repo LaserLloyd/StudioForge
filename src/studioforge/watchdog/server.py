@@ -1152,6 +1152,10 @@ class Watchdog:
             )
         else:
             kwargs["start_new_session"] = True
+        # A server we spawn is OUR child: it must not believe a tray will
+        # respawn it (D28). Inlined rather than imported from core.ports: the
+        # watchdog imports nothing from the app machinery, by contract.
+        env = {key: value for key, value in os.environ.items() if key != "SF_SUPERVISOR"}
         try:
             proc = subprocess.Popen(  # noqa: S603 - argv built from config/env, no shell
                 argv,
@@ -1159,6 +1163,7 @@ class Watchdog:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 cwd=str(Path.cwd()),
+                env=env,
                 **kwargs,
             )
         except OSError as exc:

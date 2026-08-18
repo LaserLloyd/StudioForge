@@ -326,6 +326,15 @@ def reclaim_orphans(
             "killed": False,
         }
         if not dry_run:
+            # Between classification and this line the pid could have been
+            # recycled to an unrelated process; kill_process_tree resolves by
+            # pid alone, so re-check identity first (the same create_time
+            # guard the aliveness check below uses).
+            if not process_is_alive(entry.pid, create_time=entry.create_time):
+                action["killed"] = True
+                action["note"] = "already gone before the sweep reached it"
+                actions.append(action)
+                continue
             try:
                 kill_process_tree(entry.pid, timeout=5.0, force=True)
             except Exception as exc:  # noqa: BLE001 - one failure must not stop the sweep

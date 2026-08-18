@@ -858,6 +858,20 @@ def test_an_open_gui_or_watchdog_bind_is_exposure_even_with_a_private_gateway() 
     assert _check(all_private, "network").ok is True
 
 
+def test_an_engine_install_in_progress_shows_the_phase_not_a_second_button() -> None:
+    checks = st.first_run_checks(
+        **{**_ready_kwargs(), "engine_tag": None},
+        boot_phase="installing engine b10425: download 42%",
+    )
+    check = _check(checks, "engine")
+    assert check.ok is False
+    assert "42%" in check.detail
+    assert check.action == "", "no Install button while the boot is already installing"
+    # Once the boot is over, a missing engine offers the button again.
+    after = _check(st.first_run_checks(**{**_ready_kwargs(), "engine_tag": None}), "engine")
+    assert after.action == "install-engine"
+
+
 @pytest.mark.parametrize("host", ["localhost", "::1", "[::1]", "127.0.0.1"])
 def test_loopback_spellings(host: str) -> None:
     assert st._host_is_loopback(host) is True

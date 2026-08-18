@@ -205,6 +205,14 @@ def _cache_key(path: Path) -> str:
     return f"{path}#meta{gguf.META_FORMAT_VERSION}"
 
 
+def _is_under(path: Path, root: Path) -> bool:
+    """Whether ``path`` lies under ``root`` (lexically; the root may not exist)."""
+    try:
+        return path.resolve(strict=False).is_relative_to(root.resolve(strict=False))
+    except (OSError, ValueError):
+        return False
+
+
 def _newest_mtime(paths: Sequence[Path], *, fallback: float) -> float:
     """Newest mtime across a logical model's files.
 
@@ -276,7 +284,7 @@ class Registry:
         started = time.perf_counter()
         result = ScanResult()
 
-        files = self._walk()
+        files, missing_roots = self._walk()
         entries, mmprojs, adapters, cache_keep, failures = self._classify(
             files, result, force=force
         )
@@ -290,6 +298,7 @@ class Registry:
         with self._lock:
             previous = self._models
             self._carry_over_stale(previous, records, failures, result)
+            self._carry_over_unreachable(previous, records, missing_roots, result)
             for model_id, record in records.items():
                 old = previous.get(model_id)
                 if old is not None and not old.is_virtual:
@@ -369,26 +378,77 @@ class Registry:
                 ),
             )
 
+    def _carry_over_unreachable(
+        self,
+        previous: dict[str, ModelRecord],
+        records: dict[str, ModelRecord],
+        missing_roots: Sequence[Path],
+        result: ScanResult,
+    ) -> None:
+        """Keep every known model whose root directory is not there right now.
+
+        Caller holds the lock. This is the "unreachable, not removed"
+        distinction: a model is *removed* only when its root was walked and
+        the file was not in it. A model under a root that could not be walked
+        at all is carried over as ``stale`` with a reason naming the root, so
+        the index, ``/v1/models`` and the TTL sweeper all keep treating it as
+        the model it still is until the drive comes back.
+        """
+        if not missing_roots:
+            return
+        roots = [Path(root) for root in missing_roots]
+        for model_id, old in previous.items():
+            if model_id in records or old.is_virtual:
+                continue
+            path = Path(old.path)
+            under = next((root for root in roots if _is_under(path, root)), None)
+            if under is None:
+                continue
+            old.stale = True
+            old.stale_reason = f"model directory {under} is not available right now"
+            records[model_id] = old
+            result.stale.append(model_id)
+        if any(r.stale and "not available" in (r.stale_reason or "") for r in records.values()):
+            log.warning(
+                "registry.model_dir_unreachable",
+                roots=[str(r) for r in roots],
+                hint=(
+                    "the models under it are kept in the index as stale rather than "
+                    "removed; they return when the directory is reachable again"
+                ),
+            )
+
     def reconcile(self) -> ScanResult:
         """Startup alias for :meth:`scan`."""
         return self.scan()
 
     # --- walk ---------------------------------------------------------
 
-    def _walk(self) -> list[tuple[Path, Path]]:
-        """Yield ``(model_dir, gguf_path)`` for every GGUF under the roots.
+    def _walk(self) -> tuple[list[tuple[Path, Path]], list[Path]]:
+        """``(found, missing_roots)``: every GGUF under the roots, and the roots
+        that were not there to walk.
 
         Symlinks are followed (people keep models on a second drive and link
         them in) but every directory's real path is remembered so a loop
         terminates instead of recursing forever.
+
+        A root that is not a directory right now -- a second drive that has
+        not mounted yet, a network share that dropped -- is reported rather
+        than silently skipped, because "removed" and "unreachable" are
+        different facts: the models under it are still there, and dropping
+        them from the index (which is what an empty walk used to mean) would
+        make a serving model disappear from ``/v1/models`` and, on Linux, could
+        talk a sweeper into unloading everything on that drive.
         """
         found: list[tuple[Path, Path]] = []
+        missing: list[Path] = []
         seen_dirs: set[str] = set()
         seen_files: set[str] = set()
         for model_dir in self._config.model_dirs():
             root = Path(model_dir)
             if not root.is_dir():
                 log.warning("registry.model_dir_missing", path=str(root))
+                missing.append(root)
                 continue
             for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
                 try:
@@ -412,7 +472,7 @@ class Registry:
                         continue
                     seen_files.add(key)
                     found.append((root, path))
-        return found
+        return found, missing
 
     # --- classification -----------------------------------------------
 

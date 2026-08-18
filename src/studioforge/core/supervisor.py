@@ -37,6 +37,7 @@ import os
 import shlex
 import socket
 import subprocess
+import sys
 import time
 from collections import deque
 from collections.abc import Callable, Iterable, Sequence
@@ -445,6 +446,30 @@ class _Instance:
 
     def stderr_tail(self, n: int = ERROR_TAIL_LINES) -> list[str]:
         return list(self.stderr_ring)[-n:]
+
+
+#: A tiny self-exec'ing shim for Linux: ask the kernel to SIGKILL the child
+#: when its parent thread dies, then exec the real binary. This is the POSIX
+#: counterpart of the Windows job object (D23): ``kill -9`` of the server, an
+#: OOM-kill, a crashed interpreter -- the llama-server children go with it
+#: instead of holding VRAM until the next boot's orphan sweep. Done as a
+#: separate interpreter rather than ``preexec_fn`` because ``preexec_fn`` runs
+#: after ``fork()`` in *this* multi-threaded process (structlog locks, httpx
+#: pools, the asyncio child watcher) and is documented unsafe there; the shim
+#: is single-threaded, does two syscalls and execs. ``prctl`` is Linux-only,
+#: so on other POSIX systems the prefix is empty and behaviour is unchanged.
+_PDEATHSIG_SHIM = (
+    "import ctypes, os, signal, sys; "
+    "ctypes.CDLL(None, use_errno=True).prctl(1, int(signal.SIGKILL), 0, 0, 0); "
+    "os.execv(sys.argv[1], sys.argv[1:])"
+)
+
+
+def _pdeathsig_prefix() -> list[str]:
+    """``[python, -c, shim]`` on Linux, ``[]`` elsewhere. See ``_PDEATHSIG_SHIM``."""
+    if sys.platform != "linux" or os.environ.get("SF_NO_PDEATHSIG"):
+        return []
+    return [sys.executable, "-c", _PDEATHSIG_SHIM]
 
 
 class Supervisor:
@@ -879,7 +904,7 @@ class Supervisor:
             adapters=inst.adapters,
         )
         inst.argv = argv
-        full_argv = [*self._launch_prefix, *argv]
+        full_argv = [*self._launch_prefix, *_pdeathsig_prefix(), *argv]
         inst.open_log()
         inst.write_log(f"=== studioforge launch: {' '.join(full_argv)}")
 
@@ -1140,6 +1165,14 @@ class Supervisor:
 
             try:
                 await self._spawn(inst)
+                if inst.stopping:
+                    # stop() landed while create_subprocess_exec was in flight:
+                    # the process exists but the teardown that stop() ran saw
+                    # no proc to kill. Take it down here, on the far side of
+                    # the await, or it outlives its watcher with the port and
+                    # (on Linux, where it was not created suspended) the VRAM.
+                    await self._teardown(inst, timeout=0.0, force=True)
+                    return
                 await self._await_ready(inst)
             except ModelLoadError as exc:
                 inst.info.last_error = exc.message
@@ -1226,9 +1259,7 @@ class Supervisor:
                 detail="process still alive after teardown; escalating to a forced tree kill",
             )
             await asyncio.to_thread(kill_process_tree, pid, timeout=5.0, force=True)
-            alive = await asyncio.to_thread(
-                process_is_alive, pid, create_time=inst.create_time
-            )
+            alive = await asyncio.to_thread(process_is_alive, pid, create_time=inst.create_time)
 
         report = UnloadReport(
             model_id=inst.record.id,
@@ -1336,9 +1367,7 @@ class Supervisor:
                 report = await self._verify_unloaded(inst, pid, before)
                 if not report.pid_gone:
                     inst.info.state = "failed"
-                    inst.info.last_error = (
-                        f"kill could not be verified: pid {pid} is still running"
-                    )
+                    inst.info.last_error = f"kill could not be verified: pid {pid} is still running"
                 else:
                     inst.info.state = "stopped"
                     inst.info.pid = None
@@ -1367,9 +1396,7 @@ class Supervisor:
         either another live process's child or a leak. See
         :mod:`studioforge.core.vram_holders`.
         """
-        return {
-            inst.info.pid for inst in self._instances.values() if inst.info.pid is not None
-        }
+        return {inst.info.pid for inst in self._instances.values() if inst.info.pid is not None}
 
     # ------------------------------------------------------------------
     # Introspection

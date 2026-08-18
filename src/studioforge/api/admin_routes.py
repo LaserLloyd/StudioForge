@@ -25,11 +25,16 @@ import httpx
 from fastapi import APIRouter, Body, Request
 
 from studioforge.api.auth import PIN_WITHHELD_NOTE, may_reveal_pin
-from studioforge.core.ports import EXIT_RESTART_REQUESTED, supervised_by
+from studioforge.core.ports import EXIT_RESTART_REQUESTED, supervised_by, supervising_tray_is_alive
 from studioforge.errors import BadRequestError, ModelNotFoundError
 from studioforge.logging import get_logger
 
 log = get_logger(__name__)
+
+#: The watchdog's ``restart_server`` waits this long for the replacement to
+#: answer /health (watchdog/server.py). Kept here as a number rather than an
+#: import so the API never imports the watchdog module.
+WATCHDOG_RESTART_BUDGET_S = 120.0
 
 router = APIRouter()
 
@@ -188,6 +193,16 @@ async def restart_server(
         supervised_by=supervisor,
     )
 
+    if supervisor == "tray" and not supervising_tray_is_alive():
+        # The variable outlived the tray (it was quit, or it crashed): exiting
+        # 75 now would leave nobody to bring us back. Fall through to the
+        # watchdog / self-respawn paths, which do not need a parent.
+        log.warning(
+            "SF_SUPERVISOR says a tray launched this process but no live tray is its parent; "
+            "restarting via the watchdog instead"
+        )
+        supervisor = None
+
     if supervisor == "tray":
         # The tray launched us and respawns a child that exits (D28). Exiting
         # with EXIT_RESTART_REQUESTED is the whole restart: no watchdog round
@@ -239,9 +254,7 @@ async def restart_server(
         log.warning("watchdog unreachable, falling back to self-respawn", error=detail)
 
     reason = (
-        "the watchdog is disabled"
-        if not config.watchdog.enabled
-        else "the watchdog did not answer"
+        "the watchdog is disabled" if not config.watchdog.enabled else "the watchdog did not answer"
     )
     _record(state, "self-respawn", f"{reason}; respawning this process")
     _spawn_restart_task(_self_restart(state))
@@ -312,7 +325,12 @@ async def _ask_watchdog_to_restart(state: Any, watchdog_url: str) -> None:
     credential, kind = _watchdog_credential(state.config)
     headers = {"Authorization": f"Bearer {credential}"} if credential else {}
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        # Strictly longer than the watchdog's own restart budget (it waits up
+        # to WATCHDOG_RESTART_BUDGET_S for the replacement's /health). With an
+        # equal timeout a slow cold start -- a large library scan -- timed OUR
+        # client out first, we "fell back" to a self-respawn, and two
+        # replacements raced for the ports.
+        async with httpx.AsyncClient(timeout=WATCHDOG_RESTART_BUDGET_S + 60.0) as client:
             response = await client.post(f"{watchdog_url}/restart", headers=headers)
         if response.status_code < 400:
             log.info("watchdog accepted the restart handoff", status=response.status_code)

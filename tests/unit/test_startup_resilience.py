@@ -50,6 +50,17 @@ def boot(config: Config, state: Any = None) -> TestClient:
     return TestClient(app)
 
 
+def wait_booted(client: TestClient, timeout_s: float = 30.0) -> None:
+    """The slow half of startup runs after the port binds (D33); readiness
+    claims about the steady state have to wait for it."""
+    import time as _time
+
+    deadline = _time.monotonic() + timeout_s
+    while not client.app.state.boot.ready and _time.monotonic() < deadline:  # type: ignore[attr-defined]
+        _time.sleep(0.02)
+    assert client.app.state.boot.ready, "boot did not finish in time"  # type: ignore[attr-defined]
+
+
 def test_boots_with_a_missing_model_directory(tmp_path: Path) -> None:
     config = make_config(tmp_path, models_dir=tmp_path / "does-not-exist")
     with boot(config) as client:
@@ -106,6 +117,7 @@ def test_health_says_whether_a_model_could_be_served_and_why_not(tmp_path: Path)
     an empty box for a healthy one (WP17 R2)."""
     config = make_config(tmp_path)
     with boot(config) as client:
+        wait_booted(client)
         body = client.get("/health").json()
         assert body["status"] == "ok"
         assert body["can_serve"] is False
@@ -122,6 +134,7 @@ def test_health_names_the_gpu_as_the_gap_once_an_engine_exists(tmp_path: Path) -
     state = build_state(config)
     state.engine_status = {"ok": True, "tag": "b10425", "variant": "cuda-13.3"}
     with boot(config, state=state) as client:
+        wait_booted(client)
         body = client.get("/health").json()
         assert body["engine"]["tag"] == "b10425"
         assert body["can_serve"] is False

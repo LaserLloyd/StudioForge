@@ -42,8 +42,21 @@ from studioforge.logging import configure_logging, get_logger
 log = get_logger(__name__)
 
 
+#: Paths that answer during the boot without waiting for the first library
+#: scan: liveness for the watchdog/tray/load balancers, and the API docs.
+_NO_BOOT_WAIT_PATHS = frozenset({"/health", "/healthz", "/api/health", "/docs", "/openapi.json"})
+
+#: How long a request waits for the boot's first library scan (D33). A cold
+#: scan of a large library is tens of seconds; past this the request proceeds
+#: against whatever is indexed so far, and /health says why.
+SCAN_WAIT_S = 60.0
+
+
 class AuthMiddleware(BaseHTTPMiddleware):
-    """Applies the optional bearer key to every route in one place."""
+    """Applies the optional bearer key to every route in one place -- and holds
+    every request but liveness until the boot's first library scan is in (D33),
+    so a client that connects the moment the port answers is not told the
+    library is empty or a model does not exist."""
 
     def __init__(self, app: Any, config: Config) -> None:
         super().__init__(app)
@@ -54,6 +67,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
             check_request(request, self.config)
         except StudioForgeError as exc:
             return JSONResponse(exc.to_payload(), status_code=exc.status_code)
+        if request.url.path not in _NO_BOOT_WAIT_PATHS:
+            await wait_for_boot(request.app.state, timeout_s=SCAN_WAIT_S, scan_only=True)
         return await call_next(request)
 
 
@@ -217,6 +232,167 @@ async def _reclaim_orphaned_engines(state: Any) -> None:
         )
 
 
+class BootStatus:
+    """Where startup is, for /health and for the routes that wait on it.
+
+    ``phase`` is a short human string (``"scanning models"``, ``"installing
+    engine b10425"``, ``"ready"``); ``scanned`` fires when the registry has its
+    first index and ``done`` when the whole boot has run -- successfully or
+    not, so nothing that waits on it can wait forever.
+    """
+
+    def __init__(self) -> None:
+        self.phase = "starting"
+        self.started_at = time.time()
+        self.finished_at: float | None = None
+        self.error: str | None = None
+        self.scanned = asyncio.Event()
+        self.done = asyncio.Event()
+
+    def set_phase(self, phase: str) -> None:
+        self.phase = phase
+        log.info("boot phase", phase=phase, elapsed_s=round(time.time() - self.started_at, 1))
+
+    def set_progress(self, phase: str) -> None:
+        """Update the phase text without a log line (per-tick progress)."""
+        if self.phase != phase:
+            self.phase = phase
+
+    def finish(self, error: str | None = None) -> None:
+        self.error = error
+        self.finished_at = time.time()
+        self.phase = "ready" if error is None else f"failed: {error}"
+        self.scanned.set()
+        self.done.set()
+
+    @property
+    def ready(self) -> bool:
+        return self.done.is_set()
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "phase": self.phase,
+            "ready": self.ready,
+            "elapsed_s": round((self.finished_at or time.time()) - self.started_at, 1),
+            "error": self.error,
+        }
+
+
+async def wait_for_boot(state: Any, *, timeout_s: float, scan_only: bool = False) -> bool:
+    """Block until the boot has scanned (or finished), or ``timeout_s`` passes.
+
+    Returns True when the awaited phase is reached. Callers proceed either way:
+    a scan that is still running after the wait yields the ordinary "unknown
+    model" answer, which is honest -- and the wait is what makes it rare.
+    """
+    boot = getattr(state, "boot", None)
+    if boot is None:
+        return True
+    event = boot.scanned if scan_only else boot.done
+    if event.is_set():
+        return True
+    try:
+        await asyncio.wait_for(event.wait(), timeout=max(0.0, timeout_s))
+    except TimeoutError:
+        return False
+    return True
+
+
+async def _boot(state: Any, *, start_background: bool) -> None:
+    """The slow half of startup, after the port is bound (D33).
+
+    Every step is individually non-fatal and the phase is published as it
+    goes; ``BootStatus.finish`` always runs, so ``/health`` never sits on a
+    stale phase and no waiter is stranded.
+    """
+    boot: BootStatus = state.boot
+    try:
+        boot.set_phase("scanning models")
+        # Off the event loop (a cold scan of a large library stats and parses
+        # every GGUF header), and never fatal: a failing scan means an empty
+        # model list and a loud log line, not a server that will not boot.
+        try:
+            scan = await asyncio.to_thread(state.registry.scan)
+        except Exception as exc:  # noqa: BLE001
+            log.error(
+                "model scan failed at startup; serving with an empty model list",
+                error=str(exc),
+            )
+        else:
+            log.info(
+                "model scan complete",
+                added=len(scan.added),
+                removed=len(scan.removed),
+                unchanged=scan.unchanged,
+                errors=len(scan.errors),
+                duration_s=round(scan.duration_s, 2),
+            )
+            for path, error in scan.errors[:10]:
+                log.warning("model scan error", path=path, error=error)
+        boot.scanned.set()
+
+        # A secondary instance does nothing in the background at all -- no
+        # orphan sweep, no auto-load, no TTL sweeper, and above all no download
+        # resume. See _claim_data_dir for the incident this is guarding.
+        secondary = getattr(state, "instance_role", "primary") != "primary"
+        if start_background and secondary:
+            log.warning(
+                "background workers are disabled in this process because another "
+                "instance owns the data directory",
+                holder_pid=(getattr(state, "instance_holder", None) or {}).get("pid"),
+            )
+            # A secondary may show the queue but must never write into the
+            # shared model directory (D24): enqueue/resume from the API, the
+            # MCP tool and the GUI all refuse with the holder's pid.
+            holder_pid = (getattr(state, "instance_holder", None) or {}).get("pid")
+            state.downloader.disable_transfers(
+                f"another StudioForge instance (pid {holder_pid}) owns this data directory; "
+                "queue the download there, or stop it and restart this one"
+            )
+        if start_background and not secondary:
+            boot.set_phase("sweeping orphaned engines")
+            await _reclaim_orphaned_engines(state)
+            pinned = getattr(state.config.engine, "pinned_tag", "")
+            boot.set_phase(f"checking engine {pinned}".rstrip())
+            try:
+                # An install on a fresh box streams ~600 MB; its progress is the
+                # phase, updated in place (no log line per tick).
+                engine = await state.engine_manager.ensure_engine(
+                    progress=lambda step, fraction: boot.set_progress(
+                        f"installing engine {pinned}: {step} {fraction:.0%}"
+                    )
+                )
+                log.info("engine ready", tag=engine.tag, variant=engine.variant)
+                state.engine_status = {
+                    "ok": True,
+                    "tag": engine.tag,
+                    "variant": engine.variant,
+                    "smoke_tested": engine.smoke_tested,
+                }
+            except Exception as exc:  # noqa: BLE001
+                log.error("engine not ready", error=str(exc))
+                state.engine_status = {"ok": False, "tag": None, "error": str(exc)}
+            boot.set_phase("starting model manager")
+            await state.manager.start()
+            # Resumes anything a crash left half-downloaded. Never fatal --
+            # but never silent either: a queue that could not be read stays
+            # "running" with no task behind it, and the log is the only place
+            # that says why.
+            try:
+                await state.downloader.start()
+            except Exception as exc:  # noqa: BLE001 - see above
+                log.error("download queue did not start; downloads will not resume", error=str(exc))
+    except asyncio.CancelledError:
+        boot.finish("shut down before boot completed")
+        raise
+    except Exception as exc:  # noqa: BLE001 - the boot must always finish, and say how
+        log.exception("boot failed", error=str(exc))
+        boot.finish(str(exc))
+        return
+    boot.finish()
+    log.info("boot complete", elapsed_s=boot.snapshot()["elapsed_s"])
+
+
 def build_state(config: Config, *, version: str = __version__) -> Any:
     """Compose the object graph. Separated from the app so tests can reuse it."""
 
@@ -343,74 +519,26 @@ def create_app(
             timeout=httpx.Timeout(config.server.request_timeout_s, connect=10.0),
             limits=httpx.Limits(max_connections=200, max_keepalive_connections=50),
         )
-        # Off the event loop (a cold scan of a large library stats and parses
-        # every GGUF header), and never fatal: a failing scan means an empty
-        # model list and a loud log line, not a server that will not boot.
-        try:
-            scan = await asyncio.to_thread(app.state.registry.scan)
-        except Exception as exc:
-            log.error(
-                "model scan failed at startup; serving with an empty model list",
-                error=str(exc),
-            )
-        else:
-            log.info(
-                "model scan complete",
-                added=len(scan.added),
-                removed=len(scan.removed),
-                unchanged=scan.unchanged,
-                errors=len(scan.errors),
-                duration_s=round(scan.duration_s, 2),
-            )
-            for path, error in scan.errors[:10]:
-                log.warning("model scan error", path=path, error=error)
-
-        # A secondary instance does nothing in the background at all -- no
-        # orphan sweep, no auto-load, no TTL sweeper, and above all no download
-        # resume. See _claim_data_dir for the incident this is guarding.
-        secondary = getattr(app.state, "instance_role", "primary") != "primary"
-        if start_background and secondary:
-            log.warning(
-                "background workers are disabled in this process because another "
-                "instance owns the data directory",
-                holder_pid=(getattr(app.state, "instance_holder", None) or {}).get("pid"),
-            )
-        if start_background and not secondary:
-            await _reclaim_orphaned_engines(app.state)
-            try:
-                engine = await app.state.engine_manager.ensure_engine()
-                log.info("engine ready", tag=engine.tag, variant=engine.variant)
-                app.state.engine_status = {
-                    "ok": True,
-                    "tag": engine.tag,
-                    "variant": engine.variant,
-                    "smoke_tested": engine.smoke_tested,
-                }
-            except Exception as exc:
-                log.error("engine not ready", error=str(exc))
-                app.state.engine_status = {"ok": False, "tag": None, "error": str(exc)}
-            await app.state.manager.start()
-            # Resumes anything a crash left half-downloaded. Never fatal --
-            # but never silent either: a queue that could not be read stays
-            # "running" with no task behind it, and the log is the only place
-            # that says why.
-            try:
-                await app.state.downloader.start()
-            except Exception as exc:  # noqa: BLE001 - see above
-                log.error("download queue did not start; downloads will not resume", error=str(exc))
-        elif start_background:
-            # A secondary may show the queue but must never write into the
-            # shared model directory (D24): enqueue/resume from the API, the
-            # MCP tool and the GUI all refuse with the holder's pid.
-            holder_pid = (getattr(app.state, "instance_holder", None) or {}).get("pid")
-            app.state.downloader.disable_transfers(
-                f"another StudioForge instance (pid {holder_pid}) owns this data directory; "
-                "queue the download there, or stop it and restart this one"
-            )
-
+        # Bind first, boot after (D33). Everything slow -- the library scan,
+        # the orphan sweep, an engine install on a fresh box (~600 MB), the
+        # pinned auto-loads -- runs in a background task, and uvicorn starts
+        # answering as soon as this yields. /health reports the phase; the
+        # routes that need the registry or the engine wait for the phase they
+        # need (bounded), so an early caller sees a slow answer instead of a
+        # wrong one.
+        app.state.boot = BootStatus()
+        app.state.manager.boot_gate = app.state.boot.done
+        app.state.boot_task = asyncio.create_task(
+            _boot(app.state, start_background=start_background), name="studioforge-boot"
+        )
         try:
             yield
         finally:
+            boot_task = getattr(app.state, "boot_task", None)
+            if boot_task is not None and not boot_task.done():
+                boot_task.cancel()
+                with contextlib.suppress(BaseException):
+                    await boot_task
             with contextlib.suppress(Exception):
                 await app.state.downloader.stop()
             with contextlib.suppress(Exception):
@@ -546,6 +674,9 @@ def create_app(
         # "Up" and "able to serve a model" are different claims, and a poller
         # that only sees the first reads a healthy 200 from a box with no engine
         # and no GPU. Say which it is, and why not, in the same payload.
+        boot = getattr(app.state, "boot", None)
+        if boot is not None:
+            payload["boot"] = boot.snapshot()
         payload.update(_serving_readiness(app.state))
         if not deep:
             return payload
@@ -605,7 +736,10 @@ def _serving_readiness(state: Any) -> dict[str, Any]:
         models_indexed = 0
 
     reason: str | None = None
-    if not engine.get("ok"):
+    boot = getattr(state, "boot", None)
+    if boot is not None and not boot.ready:
+        reason = f"still starting ({boot.phase}); the port is up, the rest is on its way"
+    elif not engine.get("ok"):
         reason = (
             "no usable llama-server engine: install one from the Setup tab or run "
             "`studioforge engine --update`"
