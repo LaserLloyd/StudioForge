@@ -106,6 +106,26 @@ def api_request(ctx: GuiContext) -> Any:
     return _InProcessRequest(ctx.api_state)
 
 
+async def apply_config_updates(ctx: GuiContext, updates: dict[str, Any]) -> dict[str, Any]:
+    """The GUI's one and only "change a setting".
+
+    Calls the management route in-process rather than reimplementing it, so the
+    Setup tab, the Server tab, ``PATCH /api/config`` and the MCP ``set_config``
+    tool cannot drift on what saving a setting means. The handler validates
+    through :func:`studioforge.config.apply_overrides`, writes ``config.yaml``
+    atomically, mutates the shared config object where a change can take effect
+    live, and reports which keys still need a restart.
+
+    Returns the route's payload: ``{"updated": [...], "restart_required": [...]}``.
+    """
+    if not updates:
+        return {"updated": [], "restart_required": []}
+    from studioforge.api.mgmt_routes import set_config
+
+    payload = await set_config(api_request(ctx), updates)
+    return dict(payload)
+
+
 def error_text(exc: BaseException) -> str:
     """User-facing message for an exception, preferring our own error text."""
     if isinstance(exc, StudioForgeError):
@@ -178,6 +198,7 @@ def mono(text: str, *, classes: str = "") -> Any:
 __all__ = [
     "GuiContext",
     "api_request",
+    "apply_config_updates",
     "badge",
     "busy",
     "error_text",

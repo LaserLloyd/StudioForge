@@ -1101,10 +1101,27 @@ async def test_an_approximate_matrix_leaves_the_first_paint_badge_alone(
 
 
 def test_download_tab_without_a_downloader_says_so_instead(config: Config) -> None:
-    """No disk line where there is no queue to measure against."""
+    """No disk line where there is no queue to measure against.
+
+    The queue panel is rendered on its own page rather than through
+    ``/?tab=download``: every tab paints into the same document, and the Setup
+    tab legitimately shows a disk line for the model library, so asserting
+    against the whole page would be asserting about the wrong panel.
+    """
+    from nicegui import ui
+
+    from studioforge.gui.tabs import GuiContext
+    from studioforge.gui.tabs import download as tab
+
+    ctx = GuiContext(config=config, api_state=_FakeState(config))
+
+    @ui.page("/_queue_panel_smoke")
+    def _page() -> None:
+        tab._queue_panel(ctx)
+
     app = create_gui_app(config, api_state=_FakeState(config))
     with TestClient(app) as client:
-        response = client.get("/?tab=download")
+        response = client.get("/_queue_panel_smoke")
     assert "Downloads not available" in response.text
     assert "Disk:" not in response.text
 

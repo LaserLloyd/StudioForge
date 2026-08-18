@@ -27,7 +27,10 @@ import types
 import typing
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import PurePath
 from typing import Any, Final
+
+from pydantic import BaseModel
 
 from studioforge.api.auth import redact
 from studioforge.config import RESTART_REQUIRED_KEYS
@@ -1297,6 +1300,7 @@ def per_gpu_projection_lines(verdict: FitVerdict) -> list[str]:
 #: value comes from a URL a user (or another app) can type, not from us.
 DEEP_LINK_TABS: Final[Mapping[str, str]] = {
     "dashboard": "Dashboard",
+    "setup": "Setup",
     "models": "Models",
     "model": "Models",
     "download": "Download",
@@ -2955,3 +2959,915 @@ def supported_architectures(report: Mapping[str, Any] | None) -> list[str]:
 def supported_quant_types(report: Mapping[str, Any] | None) -> list[str]:
     engine = _mapping(_mapping(report).get("engine"))
     return [str(name) for name in _sequence(engine.get("quant_types"))]
+
+
+# ---------------------------------------------------------------------------
+# Setup tab: the first-run checklist
+#
+# Everything below is a pure function of primitives -- counts, flags, paths --
+# so the tab can be a thin renderer and the *rules* (what is required, what is
+# merely nice to have, what wording each state gets) are testable without a
+# browser, a GPU or a config file. See DECISIONS.md D26.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SetupCheck:
+    """One line of the Setup tab's first-run checklist.
+
+    ``required`` is the load-bearing field. A required check that fails means
+    this server cannot serve inference at all; an optional one means something
+    the user may well not want (a HuggingFace token, autostart) is absent. They
+    are rendered differently and only the required ones gate "ready", because a
+    checklist that shouts about an unset optional key teaches people to ignore
+    the ones that matter.
+    """
+
+    key: str
+    name: str
+    ok: bool
+    detail: str
+    required: bool = True
+    action: str = ""
+    action_label: str = ""
+    help: str = ""
+
+    @property
+    def icon(self) -> str:
+        if self.ok:
+            return "check_circle"
+        return "error" if self.required else "info"
+
+    @property
+    def colour(self) -> str:
+        if self.ok:
+            return "positive"
+        return "warning" if self.required else "grey"
+
+    @property
+    def status_text(self) -> str:
+        if self.ok:
+            return "ok"
+        return "required" if self.required else "optional"
+
+
+def first_run_checks(
+    *,
+    data_dir: Any,
+    data_dir_writable: bool,
+    models_dir: Any,
+    models_dir_exists: bool,
+    gguf_count: int,
+    indexed_count: int,
+    gpu_count: int,
+    engine_tag: str | None,
+    driver_version: str | None = None,
+    cuda_driver: tuple[int, int] | None = None,
+    excluded_devices: Sequence[int] = (),
+    engine_smoke_tested: bool = False,
+    pinned_tag: str = "",
+    api_port: int = 0,
+    api_reachable: bool = True,
+    api_port_detail: str = "",
+    mcp_pin_set: bool = False,
+    mcp_pin_required: bool = True,
+    hf_token_set: bool = False,
+    autostart_enabled: bool = False,
+    autostart_mechanism: str = "",
+) -> list[SetupCheck]:
+    """Everything a fresh checkout has to get right, in the order it matters.
+
+    The required set is exactly "can this box load a model and answer a
+    request": a writable data dir, a model library that has been indexed, GPUs,
+    an engine, and a listening port. Everything else -- a HuggingFace token,
+    autostart, and the MCP PIN when pairing is not enforced -- is optional and
+    says so, because a checklist that shouts about an unset optional key is a
+    checklist people learn to ignore.
+    """
+    checks: list[SetupCheck] = []
+
+    checks.append(
+        SetupCheck(
+            key="data_dir",
+            name="Data directory",
+            ok=bool(data_dir_writable),
+            detail=(
+                f"{data_dir} is writable"
+                if data_dir_writable
+                else f"{data_dir} is not writable — config, registry and logs all live here"
+            ),
+            action="" if data_dir_writable else "open-data-dir",
+            action_label="Open data dir",
+            help="config.yaml, registry.sqlite3, engines/ and logs/ all live in one place.",
+        )
+    )
+
+    library_ok = bool(models_dir) and models_dir_exists and gguf_count > 0
+    if not models_dir:
+        library_detail = "not set — point models.dir at your GGUF library"
+    elif not models_dir_exists:
+        library_detail = f"{models_dir} does not exist"
+    elif gguf_count <= 0:
+        library_detail = f"{models_dir} contains no .gguf files"
+    else:
+        library_detail = f"{gguf_count} GGUF file(s) under {models_dir}"
+    checks.append(
+        SetupCheck(
+            key="models_dir",
+            name="Model library",
+            ok=library_ok,
+            detail=library_detail,
+            action="" if library_ok else "detect-library",
+            action_label="Detect LM Studio library",
+            help="models.dir is scanned in place; nothing is ever copied or moved.",
+        )
+    )
+
+    checks.append(
+        SetupCheck(
+            key="models_indexed",
+            name="Models indexed",
+            ok=indexed_count > 0,
+            detail=(
+                f"{indexed_count} model(s) in the registry"
+                if indexed_count
+                else "nothing indexed yet — run a scan"
+            ),
+            action="" if indexed_count else "scan",
+            action_label="Rescan now",
+            help="The registry is what /v1/models, the catalog and the planner read.",
+        )
+    )
+
+    if gpu_count:
+        gpu_detail = f"{gpu_count} GPU(s) visible to NVML"
+        if driver_version:
+            gpu_detail += f" · driver {driver_version}"
+        if cuda_driver:
+            gpu_detail += f" · driver CUDA {cuda_driver[0]}.{cuda_driver[1]}"
+        excluded = sorted({int(index) for index in excluded_devices})
+        if excluded:
+            gpu_detail += " · excluded: CUDA" + ",".join(str(index) for index in excluded)
+    else:
+        gpu_detail = "no GPUs detected — this server is GPU-only, so nothing can load"
+    checks.append(
+        SetupCheck(
+            key="gpus",
+            name="GPUs",
+            ok=gpu_count > 0,
+            detail=gpu_detail,
+            action="" if gpu_count else "reprobe",
+            action_label="Re-probe",
+            help="Devices are numbered by CUDA ordinal, which is what every plan refers to.",
+        )
+    )
+
+    engine_ok = bool(engine_tag)
+    if not engine_tag:
+        engine_detail = f"not installed — install {pinned_tag or 'the pinned build'}"
+    elif engine_smoke_tested:
+        engine_detail = f"active: {engine_tag} (smoke-tested)"
+    else:
+        engine_detail = f"active: {engine_tag} — never smoke-tested on this box"
+    checks.append(
+        SetupCheck(
+            key="engine",
+            name="llama.cpp engine",
+            ok=engine_ok,
+            detail=engine_detail,
+            action="" if engine_ok else "install-engine",
+            action_label=f"Install engine {pinned_tag}" if pinned_tag else "Install engine",
+            help="Engines are versioned artifacts under engines/<tag>/, not whatever is on PATH.",
+        )
+    )
+
+    checks.append(
+        SetupCheck(
+            key="api_port",
+            name="Gateway port",
+            ok=bool(api_reachable),
+            detail=api_port_detail or f"port {api_port}",
+            help="LM Studio uses the same port by default; only one of them can hold it.",
+        )
+    )
+
+    checks.append(
+        SetupCheck(
+            key="mcp_pin",
+            name="MCP pairing PIN",
+            ok=bool(mcp_pin_set) or not mcp_pin_required,
+            required=bool(mcp_pin_required),
+            detail=(
+                "set — agents pair with it"
+                if mcp_pin_set
+                else (
+                    "not set, and mcp.pin_required is on: the MCP endpoint cannot be paired"
+                    if mcp_pin_required
+                    else "not required (mcp.pin_required is off); the API key is the credential"
+                )
+            ),
+            action="" if mcp_pin_set else "generate-pin",
+            action_label="Generate PIN",
+            help="A short pairing code for the MCP path only — never the inference credential.",
+        )
+    )
+
+    checks.append(
+        SetupCheck(
+            key="hf_token",
+            name="HuggingFace token",
+            ok=bool(hf_token_set),
+            required=False,
+            detail=(
+                "set — gated repositories are reachable"
+                if hf_token_set
+                else "not set — public repositories still download fine"
+            ),
+            help="Only needed for gated or private repositories.",
+        )
+    )
+
+    checks.append(
+        SetupCheck(
+            key="autostart",
+            name="Start at login",
+            ok=bool(autostart_enabled),
+            required=False,
+            detail=(f"enabled via {autostart_mechanism}" if autostart_enabled else "not enabled"),
+            action="" if autostart_enabled else "enable-autostart",
+            action_label="Enable autostart",
+            help="A per-user Startup entry on Windows, a systemd --user unit on Linux.",
+        )
+    )
+
+    return checks
+
+
+def checklist_is_ready(checks: Sequence[SetupCheck]) -> bool:
+    """Whether every **required** check passes. Optional ones never gate."""
+    return all(check.ok for check in checks if check.required)
+
+
+def checklist_headline(checks: Sequence[SetupCheck]) -> str:
+    """The one line at the top of the Setup tab."""
+    if not checks:
+        return "Nothing to check."
+    outstanding = [check for check in checks if check.required and not check.ok]
+    optional = [check for check in checks if not check.required and not check.ok]
+    if outstanding:
+        names = ", ".join(check.name for check in outstanding)
+        return f"{len(outstanding)} thing(s) to fix before this server can load a model: {names}"
+    tail = f" {len(optional)} optional item(s) left." if optional else ""
+    return f"Ready to serve — every required check passes.{tail}"
+
+
+def checklist_actions(checks: Sequence[SetupCheck]) -> list[tuple[str, str]]:
+    """``(action, label)`` for every unmet check that offers one."""
+    return [(c.action, c.action_label) for c in checks if not c.ok and c.action]
+
+
+# ---------------------------------------------------------------------------
+# Setup tab: model library detection
+# ---------------------------------------------------------------------------
+
+
+def lmstudio_candidate_lines(candidates: Sequence[Mapping[str, Any]]) -> list[str]:
+    """One line per probed LM Studio location, in the order they were probed.
+
+    Shows the ones that did *not* match too. "Detect found nothing" is an
+    unhelpful answer when the reason is that the ``downloadsFolder`` recorded
+    in ``~/.lmstudio/settings.json`` points at a drive that is no longer
+    mounted.
+    """
+    lines: list[str] = []
+    for entry in candidates:
+        path = str(entry.get("path") or "")
+        if not path:
+            continue
+        if not entry.get("exists"):
+            lines.append(f"{path} — does not exist")
+            continue
+        count = int(entry.get("gguf_count") or 0)
+        lines.append(f"{path} — {count} GGUF file(s)" if count else f"{path} — no GGUF files")
+    return lines
+
+
+def lmstudio_detection_note(detected: Any, current: Any) -> str:
+    """What the detect button found, relative to what is configured now."""
+    if not detected:
+        return (
+            "No LM Studio library found. Any directory of .gguf files works — "
+            "type or paste its path above."
+        )
+    if current and str(detected) == str(current):
+        return f"Detected {detected}, which is already the configured library."
+    return f"Detected {detected}. Save to point models.dir at it."
+
+
+def models_dir_status_line(
+    models_dir: Any,
+    *,
+    exists: bool,
+    gguf_count: int,
+    disk: Mapping[str, Any] | None = None,
+) -> str:
+    """Validation line under ``models.dir``: exists, how many GGUFs, free space."""
+    if not models_dir:
+        return "models.dir is not set — nothing can be indexed until it is."
+    if not exists:
+        return f"{models_dir} does not exist yet. It is created on the first download."
+    body = f"{models_dir} — {gguf_count} GGUF file(s)"
+    line = disk_line(disk)
+    return f"{body} · {line}" if line else body
+
+
+# ---------------------------------------------------------------------------
+# Setup tab: GPUs
+# ---------------------------------------------------------------------------
+
+
+#: Why the numbers in every plan are CUDA ordinals, and why they can move.
+DEVICE_RECOGNITION_NOTE: Final = (
+    "GPUs are enumerated by NVML and referred to everywhere by their CUDA ordinal "
+    "(CUDA0, CUDA1, …) — that is what excluded_devices, reserved_mb and every "
+    "per-model device override mean. Ordinals are assigned by the driver and are not "
+    "stable across a hardware change: adding, removing or re-slotting a card can "
+    "renumber the rest, and CUDA_VISIBLE_DEVICES in the environment renumbers them "
+    "for this process only. After any of those, re-probe and re-check the exclusions "
+    "below — they are indices, not names."
+)
+
+
+@dataclass(frozen=True)
+class GpuSetupRow:
+    """One GPU as the Setup tab's table shows it."""
+
+    index: int
+    name: str
+    total_bytes: int
+    free_bytes: int
+    compute_capability: str
+    excluded: bool = False
+    reserved_mb: int = 0
+    holders: str = ""
+
+    @property
+    def vram_text(self) -> str:
+        return f"{format_gib(self.free_bytes)} free of {format_gib(self.total_bytes)}"
+
+    def summary(self) -> str:
+        parts = [f"CUDA{self.index}", self.name, self.vram_text, f"cc {self.compute_capability}"]
+        if self.excluded:
+            parts.append("EXCLUDED")
+        if self.reserved_mb:
+            parts.append(f"{self.reserved_mb} MiB reserved")
+        if self.holders:
+            parts.append(self.holders)
+        return "  ·  ".join(parts)
+
+
+def gpu_setup_rows(
+    gpus: Sequence[GpuInfo],
+    *,
+    excluded_devices: Sequence[int] = (),
+    reserved_mb: Mapping[int, int] | None = None,
+    holders: Sequence[Mapping[str, Any]] = (),
+) -> list[GpuSetupRow]:
+    """The live GPU table, joined with the planner's per-device policy."""
+    excluded = {int(index) for index in excluded_devices}
+    reserved = {int(k): int(v) for k, v in (reserved_mb or {}).items()}
+    per_gpu: dict[int, list[Mapping[str, Any]]] = {}
+    for holder in holders:
+        for index in holder.get("gpu_indices") or []:
+            per_gpu.setdefault(int(index), []).append(holder)
+    return [
+        GpuSetupRow(
+            index=gpu.index,
+            name=gpu.name,
+            total_bytes=gpu.total_bytes,
+            free_bytes=gpu.free_bytes,
+            compute_capability=gpu.cc_str,
+            excluded=gpu.index in excluded,
+            reserved_mb=reserved.get(gpu.index, 0),
+            holders=_holder_summary(per_gpu.get(gpu.index, ())),
+        )
+        for gpu in gpus
+    ]
+
+
+def _holder_summary(holders: Sequence[Mapping[str, Any]]) -> str:
+    """ "2 process(es) holding 5.10 GiB", or nothing at all."""
+    if not holders:
+        return ""
+    total = sum(int(h.get("used_bytes") or 0) for h in holders)
+    if total <= 0:
+        return f"{len(holders)} process(es) holding VRAM (size unavailable)"
+    return f"{len(holders)} process(es) holding {format_gib(total)}"
+
+
+def parse_reserved_mb(raw: Any) -> int:
+    """A per-GPU reservation from a number widget: 0 rather than ``None``."""
+    if raw in (None, ""):
+        return 0
+    try:
+        return max(0, int(float(raw)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def reserved_mb_map(entries: Mapping[int, Any]) -> dict[int, int]:
+    """Only the non-zero reservations; zero means "none", not "0 MiB reserved"."""
+    out: dict[int, int] = {}
+    for index, raw in entries.items():
+        amount = parse_reserved_mb(raw)
+        if amount > 0:
+            out[int(index)] = amount
+    return out
+
+
+def excluded_devices_list(flags: Mapping[int, Any]) -> list[int]:
+    """Sorted, de-duplicated CUDA indices from a map of per-GPU toggles."""
+    return sorted({int(index) for index, flag in flags.items() if bool(flag)})
+
+
+def device_policy_note(excluded: Sequence[int], reserved: Mapping[int, int] | None) -> str:
+    """Plain-language summary of the two multi-tenant knobs (DECISIONS D19)."""
+    parts: list[str] = []
+    if excluded:
+        parts.append(
+            "never placed on: " + ", ".join(f"CUDA{index}" for index in sorted(set(excluded)))
+        )
+    for index, amount in sorted((reserved or {}).items()):
+        if amount:
+            parts.append(f"{amount} MiB held back on CUDA{index}")
+    if not parts:
+        return (
+            "No device policy set: the planner may use every GPU, minus the global headroom. "
+            "Exclude a card to leave it entirely to a neighbour (ComfyUI, a training job), or "
+            "reserve MiB on it to leave the neighbour room while still using the rest."
+        )
+    return "; ".join(parts) + ". A per-model device override still wins, with a warning."
+
+
+# ---------------------------------------------------------------------------
+# Setup tab: engine
+# ---------------------------------------------------------------------------
+
+
+def cuda_variant_note(driver_cuda: tuple[int, int] | None, variant: str = "auto") -> str:
+    """Why a particular CUDA build, backed by the driver's own number.
+
+    The correctness rule runs one way only: a build compiled against CUDA X.Y
+    runs on a driver advertising **>= X.Y** and never below it, so the highest
+    eligible build wins. On Blackwell that has to be a 13.x build -- the 12.4
+    archives carry no sm_120 kernels at all (DECISIONS D2/D3).
+    """
+    driver = f"{driver_cuda[0]}.{driver_cuda[1]}" if driver_cuda else UNKNOWN
+    chosen = (variant or "auto").strip() or "auto"
+    if chosen.lower() == "auto":
+        body = f"auto: the highest CUDA build this driver can run (driver CUDA {driver})."
+    else:
+        body = f"pinned to CUDA {chosen}; this driver advertises CUDA {driver}."
+    return (
+        f"{body} A build made against CUDA X.Y needs a driver advertising X.Y or newer — "
+        "CUDA compatibility runs forward, not back. Blackwell (sm_120) cards need the 13.x "
+        "builds; the 12.4 archives carry no sm_120 kernels at all."
+    )
+
+
+def engine_install_rows(installed: Sequence[Mapping[str, Any]]) -> list[str]:
+    """``★ b10425 (cuda-13.3) · smoke tested`` lines for the installed engines."""
+    rows: list[str] = []
+    for info in installed:
+        marker = "★" if info.get("active") else "·"
+        tested = "smoke tested" if info.get("smoke_tested") else "not smoke tested"
+        rows.append(f"{marker} {info.get('tag')} ({info.get('variant')}) · {tested}")
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Setup tab: network and access
+# ---------------------------------------------------------------------------
+
+
+def reachable_lines(endpoints: Sequence[Mapping[str, Any]]) -> list[str]:
+    """``Tailscale  http://…:1234`` lines from ``netinfo.reachable_urls``."""
+    return [f"{entry.get('label') or entry.get('kind')}  {entry.get('url')}" for entry in endpoints]
+
+
+def bind_note(host: str) -> str:
+    """What a bind address actually exposes, said plainly."""
+    value = (host or "").strip()
+    if value in {"0.0.0.0", "::", ""}:
+        return (
+            "0.0.0.0 listens on every interface — LAN and tailnet included. Set an API key if "
+            "this machine is on a network you do not control."
+        )
+    if value in {"127.0.0.1", "localhost", "::1"}:
+        return (
+            "127.0.0.1 is this machine only: nothing on the LAN or the tailnet can reach it, "
+            "an agent on another box included."
+        )
+    return f"Bound to {value} only; the server answers on no other address."
+
+
+def port_conflict_note(port: int, *, lmstudio_default: int = 1234) -> str:
+    """The one port collision every new install hits."""
+    if int(port) == int(lmstudio_default):
+        return (
+            f"Port {port} is LM Studio's default too. They can share a model library on disk "
+            "but not the port — quit LM Studio, or change this."
+        )
+    return (
+        f"Port {port}. LM Studio-compatible clients default to {lmstudio_default}, so anything "
+        "pointed at this box has to be told the new port."
+    )
+
+
+def secret_state_text(value: str | None, *, unset_note: str = "not set") -> str:
+    """Masked display for a secret, or why its absence is fine."""
+    if not value:
+        return unset_note
+    return masked_secret(value) or "***"
+
+
+#: What a masked secret looks like inside a rendered snippet.
+SNIPPET_MASK: Final = "••••••••"
+
+
+def mask_secrets(text: str, secrets: Sequence[str | None], *, mask: str = SNIPPET_MASK) -> str:
+    """Blank every secret out of a snippet before it is put on screen.
+
+    The OpenClaw snippets are built by the management route and legitimately
+    contain the API key and the pairing PIN -- that is what makes them
+    paste-ready. Rendering them into a page that may be on a shared screen is a
+    different thing from copying them to a clipboard, so the display is masked
+    and the copy button still copies the real text.
+
+    Longest first, so a secret that contains another one cannot be half-masked.
+    """
+    out = text
+    for secret in sorted((s for s in secrets if s), key=len, reverse=True):
+        out = out.replace(secret, mask)
+    return out
+
+
+def redacted_config(config: Any) -> dict[str, Any]:
+    """``config.to_yaml_dict()`` with every :data:`SECRET_KEYS` value masked.
+
+    The single source of the values every config form is drawn from, so no
+    surface can accidentally render a real credential into a page -- and so the
+    "did this field really change" guard always compares against the same
+    placeholder shape.
+    """
+    data: dict[str, Any] = config.to_yaml_dict()
+    for dotted in SECRET_KEYS:
+        section, _, leaf = dotted.partition(".")
+        holder = data.get(section)
+        if isinstance(holder, dict) and holder.get(leaf):
+            holder[leaf] = redact(str(holder[leaf]))
+    return data
+
+
+# ---------------------------------------------------------------------------
+# Setup tab: where things live
+# ---------------------------------------------------------------------------
+
+
+def data_dir_source(env_value: str | None, checkout_dir: Any) -> str:
+    """Which of D25's three rules produced the data directory in force."""
+    if env_value:
+        return f"SF_DATA_DIR={env_value}"
+    if checkout_dir:
+        return f"source checkout ({checkout_dir})"
+    return "platform data directory (no SF_DATA_DIR, not a source checkout)"
+
+
+def where_things_live(config: Any, *, source: str = "") -> list[tuple[str, str]]:
+    """The read-only "where is everything" table. Paths only, never secrets."""
+    rows: list[tuple[str, str]] = [
+        ("Data directory", str(config.data_dir)),
+        ("Config file", str(config.config_path)),
+        ("Engines", str(config.engines_dir)),
+        ("Logs", str(config.logs_dir)),
+        ("Registry database", str(config.db_path)),
+        ("Downloads (in progress)", str(config.downloads_dir)),
+        ("Model library", str(config.models.dir) if config.models.dir else "not set"),
+    ]
+    extra = [str(path) for path in config.models.extra_dirs]
+    if extra:
+        rows.append(("Extra model directories", ", ".join(extra)))
+    if source:
+        rows.append(("Data directory chosen by", source))
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Setup tab: field metadata generated from the pydantic model
+#
+# The "Advanced" section is generated rather than hand-listed so that "every
+# setting is reachable from the GUI" stays true when the config model grows: a
+# new scalar key appears the moment it is declared, with no second edit here.
+# Anything needing a real widget (secrets, the per-GPU maps, the quant-affinity
+# table) is excluded and has its own section above. See DECISIONS.md D26.
+# ---------------------------------------------------------------------------
+
+
+#: Every key holding a credential, wherever it is rendered. Displayed masked,
+#: only sent when :func:`masked_secret_changed` says it really changed, and
+#: never logged -- ``config._register_secrets`` puts all three in the redactor.
+SECRET_KEYS: Final = frozenset({"server.api_key", "hf.token", "mcp.pin"})
+
+#: Keys whose *type* rules out a generated widget: two CUDA-index mappings and
+#: the per-family quant-affinity table. Each has a purpose-built row control,
+#: and each is excluded from the generated Advanced section so there is exactly
+#: one control per key. ``excluded_devices`` is a plain ``list[int]`` and would
+#: render as a text box, but a row of per-GPU checkboxes next to the live VRAM
+#: figures is the only form in which it is actually checkable.
+CUSTOM_WIDGET_KEYS: Final = frozenset(
+    {
+        "planner.excluded_devices",
+        "planner.reserved_mb",
+        "planner.quant_affinity",
+    }
+)
+
+
+@dataclass(frozen=True)
+class ConfigFieldSpec:
+    """One config key, described well enough to render an input for it."""
+
+    key: str
+    section: str
+    name: str
+    kind: str
+    options: tuple[str, ...] = ()
+    default: Any = None
+    help: str = ""
+
+    @property
+    def restart_required(self) -> bool:
+        return self.key in RESTART_REQUIRED_KEYS
+
+    @property
+    def is_secret(self) -> bool:
+        return self.key in SECRET_KEYS
+
+    @property
+    def label(self) -> str:
+        return self.name.replace("_", " ")
+
+    @property
+    def summary(self) -> str:
+        """The one-line explanation shown under a field."""
+        default = "none" if self.default is None else str(self.default)
+        base = self.help or f"{self.kind}, default {default}"
+        if self.restart_required:
+            return f"{base} · takes effect after a restart"
+        return base
+
+
+def _spec_kind(annotation: Any) -> tuple[str, tuple[str, ...]]:
+    """Map a pydantic annotation onto a widget kind and its choices.
+
+    Returns ``("unsupported", ())`` for anything with no honest scalar
+    rendering (nested models, mappings). The caller drops those rather than
+    guessing: a dict rendered as a text box is a data-loss bug waiting to
+    happen, and it is exactly why ``planner.reserved_mb`` has its own row
+    widget instead.
+    """
+    origin = typing.get_origin(annotation)
+    if origin is typing.Literal:
+        return "select", tuple(str(arg) for arg in typing.get_args(annotation))
+    if origin in (types.UnionType, typing.Union):
+        args = [arg for arg in typing.get_args(annotation) if arg is not type(None)]
+        if len(args) == 1:
+            return _spec_kind(args[0])
+        # A union of a scalar and a literal (``models.default_parallel`` is
+        # ``int | Literal["auto"]``) has no single widget, and free text
+        # round-trips both halves -- the config model validates whichever was
+        # typed and rejects the rest.
+        return "text", ()
+    if origin in (list, Sequence):
+        return "list", ()
+    if origin is not None:
+        # A parametrised generic that is not a list -- ``dict[int, int]``,
+        # ``dict[str, QuantAffinity]``. Deliberately no fallback rendering.
+        return "unsupported", ()
+    if annotation is bool:
+        return "bool", ()
+    if annotation is int:
+        return "int", ()
+    if annotation is float:
+        return "float", ()
+    if annotation is str:
+        return "text", ()
+    if isinstance(annotation, type) and issubclass(annotation, PurePath):
+        return "text", ()
+    return "unsupported", ()
+
+
+def config_field_specs(
+    config_model: Any = None, *, help_text: Mapping[str, str] | None = None
+) -> list[ConfigFieldSpec]:
+    """Describe every scalar key of the config model, section by section.
+
+    Generated from the pydantic model itself so it cannot drift. ``data_dir``
+    and ``source_path`` are skipped: the first is derived from the environment
+    (D25) and editing it here would fight whatever set ``SF_DATA_DIR``, and the
+    second is bookkeeping that never belongs in a form.
+    """
+    from studioforge.config import Config as _Config
+
+    model = config_model or _Config
+    helps = dict(CONFIG_FIELD_HELP if help_text is None else help_text)
+    specs: list[ConfigFieldSpec] = []
+    for section_name, section_field in model.model_fields.items():
+        if section_name in {"source_path", "data_dir"}:
+            continue
+        annotation = section_field.annotation
+        if not (isinstance(annotation, type) and issubclass(annotation, BaseModel)):
+            continue
+        for name, field_info in annotation.model_fields.items():
+            key = f"{section_name}.{field_info.alias or name}"
+            kind, options = _spec_kind(field_info.annotation)
+            if kind == "unsupported":
+                continue
+            default: Any = field_info.get_default(call_default_factory=True)
+            if isinstance(default, PurePath):
+                default = str(default)
+            specs.append(
+                ConfigFieldSpec(
+                    key=key,
+                    section=section_name,
+                    name=field_info.alias or name,
+                    kind="secret" if key in SECRET_KEYS else kind,
+                    options=options,
+                    default=default,
+                    help=helps.get(key, ""),
+                )
+            )
+    return specs
+
+
+def config_sections(specs: Sequence[ConfigFieldSpec]) -> list[str]:
+    """Top-level section names, in the order the config model declares them."""
+    seen: list[str] = []
+    for spec in specs:
+        if spec.section not in seen:
+            seen.append(spec.section)
+    return seen
+
+
+def spec_by_key(specs: Sequence[ConfigFieldSpec]) -> dict[str, ConfigFieldSpec]:
+    return {spec.key: spec for spec in specs}
+
+
+def advanced_field_specs(
+    specs: Sequence[ConfigFieldSpec], covered: Sequence[str] = ()
+) -> list[ConfigFieldSpec]:
+    """The generated Advanced section: everything with no widget of its own.
+
+    Three exclusion rules, each a rule rather than a list, so they keep holding
+    as the config grows: keys already given a purpose-built control above (one
+    control per key, always), secrets (they need the masked widget and the
+    "did it really change" guard), and keys whose type has no honest scalar
+    rendering -- :func:`config_field_specs` has already dropped those.
+    """
+    taken = set(covered) | CUSTOM_WIDGET_KEYS
+    return [
+        spec
+        for spec in specs
+        if spec.key not in taken and not spec.is_secret and spec.kind != "unsupported"
+    ]
+
+
+def spec_display_value(payload: Mapping[str, Any], spec: ConfigFieldSpec) -> Any:
+    """The value to put in a widget, taken from the redacted config payload."""
+    value = config_value(payload, spec.key)
+    if spec.kind == "list":
+        return ", ".join(str(item) for item in (value or []))
+    if spec.kind == "bool":
+        return bool(value)
+    if spec.kind == "secret":
+        return "" if value is None else str(value)
+    if spec.kind in {"int", "float"}:
+        return value
+    return "" if value is None else str(value)
+
+
+def spec_form_value(spec: ConfigFieldSpec, raw: Any) -> Any:
+    """Coerce a widget value back to what ``apply_overrides`` expects.
+
+    An integer typed into the free-text field that ``int | Literal["auto"]``
+    needs is converted here, because YAML round-tripping ``"4"`` as a string
+    would then fail the config model's own validator.
+    """
+    if spec.kind in {"int", "float", "bool", "list"}:
+        return coerce_config_value(spec.kind, raw)
+    if spec.kind == "select":
+        return None if raw in (None, "") else str(raw)
+    text = coerce_config_value("text", raw)
+    if isinstance(text, str) and text.lstrip("-").isdigit():
+        return int(text)
+    return text
+
+
+def config_updates_from_form(
+    specs: Sequence[ConfigFieldSpec],
+    payload: Mapping[str, Any],
+    values: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Only the keys that genuinely changed, with secrets guarded.
+
+    A secret is included only when :func:`masked_secret_changed` says the field
+    holds something other than the placeholder it was rendered with -- the same
+    guard the Server tab uses, for the same reason: posting ``"abcd...yz"``
+    back would overwrite the real credential with nine literal characters and
+    lock every client out.
+    """
+    updates: dict[str, Any] = {}
+    for spec in specs:
+        if spec.key not in values:
+            continue
+        raw = values[spec.key]
+        current = config_value(payload, spec.key)
+        if spec.is_secret:
+            if masked_secret_changed(
+                None if current is None else str(current), None if raw is None else str(raw)
+            ):
+                updates[spec.key] = str(raw).strip()
+            continue
+        coerced = spec_form_value(spec, raw)
+        if spec.kind == "list":
+            current = list(current or [])
+        elif spec.kind in {"int", "float"} and current is not None and coerced is not None:
+            current = int(current) if spec.kind == "int" else float(current)
+        if coerced != current:
+            updates[spec.key] = coerced
+    return updates
+
+
+def save_result_text(payload: Mapping[str, Any] | None) -> str:
+    """What ``PATCH /api/config`` did, including the restart it still needs."""
+    if not payload:
+        return "nothing changed"
+    changed = [str(key) for key in payload.get("updated") or []]
+    if not changed:
+        return "nothing changed"
+    restart = [str(key) for key in payload.get("restart_required") or []]
+    message = "saved: " + ", ".join(sorted(changed))
+    if restart:
+        message += " — restart required for: " + ", ".join(sorted(restart))
+    return message
+
+
+#: Hand-written one-liners for the keys a first-run user has to think about.
+#: Anything without an entry falls back to "<kind>, default <x>", which is why
+#: a newly added key is never *missing* an explanation, only a good one.
+CONFIG_FIELD_HELP: Final[Mapping[str, str]] = {
+    "server.host": "Bind address. 0.0.0.0 exposes the gateway on the LAN and the tailnet.",
+    "server.port": "Gateway port. 1234 is LM Studio's, so OpenAI clients need no change.",
+    "server.api_key": "Inference + panel credential. Blank disables auth (LAN/tailnet trust).",
+    "server.cors_origins": "Comma separated; * allows every browser origin.",
+    "gui.port": "This control panel's own port.",
+    "watchdog.port": "The recovery sidecar's port. It is a separate process.",
+    "mcp.pin": "Short pairing code for the MCP path. Rotate it if it leaks.",
+    "mcp.pin_required": "Off falls back to the API key alone for MCP.",
+    "models.dir": "Primary GGUF library root. Scanned in place; nothing is copied or moved.",
+    "models.default_ctx": "Context FLOOR. The planner never drops below this to buy a slot.",
+    "models.target_ctx": (
+        "Context every load AIMS for; the planner halves down from here to what fits (D14)."
+    ),
+    "models.thinking_default_ctx": (
+        "Floor for reasoning models, which spend their budget thinking before answering."
+    ),
+    "models.default_parallel": (
+        "'auto' sizes conversation slots per model and placement (D17); an integer is honoured."
+    ),
+    "models.ctx_per_slot_default": "Per-slot context the slot-count estimator assumes.",
+    "models.default_kv_cache_type": (
+        "'auto' keeps full-quality KV where it is affordable and quantizes only where it is not."
+    ),
+    "models.default_ttl_s": "Idle unload timer, in seconds. 0 means never idle-unload.",
+    "models.auto_load_pinned": "Load pinned models at startup so the first request is warm.",
+    "models.default_model": "Served when a request omits 'model', or names local-model/default.",
+    "models.preload_default_model": "Load that default at startup rather than on first use.",
+    "models.default_flash_attn": "'on' everywhere from Ampere up; a large KV-bandwidth win.",
+    "models.default_cache_reuse": "Prompt-cache reuse: the biggest agent-workload latency win.",
+    "models.default_reasoning_format": (
+        "'none' keeps a thinking model's output in message.content instead of emptying it."
+    ),
+    "engine.pinned_tag": "The llama.cpp release this install uses unless a newer one is activated.",
+    "engine.cuda_variant": "'auto' picks the highest CUDA build this driver can run.",
+    "engine.keep_versions": "How many old engine directories to keep when pruning.",
+    "engine.allow_source_build": "Fall back to building llama.cpp when no prebuilt asset fits.",
+    "planner.headroom_fraction": "Fraction of EVERY GPU held back from the planner.",
+    "planner.on_insufficient": "evict = unload LRU unpinned models; reject = refuse the load.",
+    "planner.compute_overhead_fraction": "Calibrated allowance for compute and graph buffers.",
+    "hf.token": "Needed only for gated or private HuggingFace repositories.",
+    "hf.max_concurrent_downloads": "Parallel downloads. Raising it rarely helps a single link.",
+    "hf.chunk_bytes": "Download chunk size, in bytes.",
+    "logging.level": "DEBUG/INFO/WARNING/ERROR for the whole process.",
+    "logging.json": "Structured JSON log lines instead of the human-readable renderer.",
+}

@@ -66,7 +66,11 @@ _NICEGUI_MOUNTED = False
 #: ``create_gui_app`` call so the newest wiring wins.
 _CONTEXT: GuiContext | None = None
 
-TAB_NAMES = ("Dashboard", "Models", "Download", "Chat", "Server", "Logs")
+#: Setup sits second, right after the Dashboard, because it is read once and
+#: then rarely -- but a *fresh* install opens on it (see :func:`_default_tab`),
+#: since on a box with no engine and no library the Dashboard has nothing to
+#: show and the checklist has everything.
+TAB_NAMES = ("Dashboard", "Setup", "Models", "Download", "Chat", "Server", "Logs")
 
 
 # ---------------------------------------------------------------------------
@@ -308,6 +312,31 @@ def _status_line(ctx: GuiContext) -> str:
     return f"{len(loaded)} loaded · {gpu_text}"
 
 
+def _default_tab(ctx: GuiContext) -> str:
+    """Where the page lands with no deep link: Setup on a fresh install.
+
+    "Fresh" is measured, not remembered: no model library, or no models
+    indexed, or no engine installed. On such a box the Dashboard is four empty
+    panels and the Setup tab is the whole answer, so opening there saves the
+    new user from having to guess which tab is the one that matters. Once the
+    server can actually serve, this reverts to the Dashboard for good.
+
+    Any failure lands on the Dashboard: the landing tab is not worth a broken
+    page.
+    """
+    try:
+        config = ctx.config
+        if not config.models.dir:
+            return "Setup"
+        if ctx.registry is not None and not ctx.registry.all():
+            return "Setup"
+        if ctx.engine_manager is not None and ctx.engine_manager.active() is None:
+            return "Setup"
+    except Exception:  # noqa: BLE001 - never break the page over a landing tab
+        return "Dashboard"
+    return "Dashboard"
+
+
 def _render_index(query: Mapping[str, Any] | None = None) -> None:
     """Build the single-page shell: header, tab strip, six panels.
 
@@ -320,10 +349,11 @@ def _render_index(query: Mapping[str, Any] | None = None) -> None:
     status = _header(ctx)
     params = st.deep_link_params(query)
 
-    from studioforge.gui.tabs import chat, dashboard, download, logs, models, server
+    from studioforge.gui.tabs import chat, dashboard, download, logs, models, server, setup
 
     renderers: dict[str, Callable[[], None]] = {
         "Dashboard": lambda: dashboard.render(ctx),
+        "Setup": lambda: setup.render(ctx),
         "Models": lambda: models.render(ctx, params),
         "Download": lambda: download.render(ctx, params),
         "Chat": lambda: chat.render(ctx),
@@ -334,7 +364,9 @@ def _render_index(query: Mapping[str, Any] | None = None) -> None:
     with ui.tabs().classes("w-full") as tabs:
         for name in TAB_NAMES:
             ui.tab(name)
-    with ui.tab_panels(tabs, value=st.initial_tab(params)).classes("w-full"):
+    with ui.tab_panels(tabs, value=st.initial_tab(params, default=_default_tab(ctx))).classes(
+        "w-full"
+    ):
         for name in TAB_NAMES:
             with ui.tab_panel(name), panel_guard(f"The {name} tab"):
                 renderers[name]()

@@ -1262,3 +1262,101 @@ auto-load. That is a deliberate, visible degradation (`GET /health` reports
 `"instance": "secondary"` and names the holder's pid), not a failure -- but it means "point the new
 checkout at the old data dir" requires stopping the old server first, and the README says so where
 the hook is documented.
+
+---
+
+## D26 -- Setup is a tab, not a YAML file
+
+**Problem.** Every setting existed; none of them were reachable. `config.yaml` carried 81 keys and
+the GUI exposed **twelve** of them, scattered down the Server tab between a health panel and an
+engine panel. The other 69 were editable only by finding the data directory, opening a YAML file
+and knowing which key to change -- including the two knobs this rig actually needed
+(`planner.excluded_devices` and `planner.reserved_mb`, D19), the context target that decides every
+plan (`models.target_ctx`, D14), the slot estimator's inputs (D17), the CUDA-build override that is
+the fix when auto-detection picks wrong (D2/D3), and the MCP PIN, which is *displayed* in three
+places and could be rotated from none of them. A first-run user had to read the source to find out
+what they were being asked to decide.
+
+**Decision.** A **Setup** tab, second in the strip and the landing tab on a fresh install, holding
+every user-facing setting grouped by the decision being made -- model library, GPUs and memory,
+engine, network and access, downloads, startup -- with a computed first-run checklist on top. The
+Server tab keeps its compact four-item readiness strip and its panels; the Setup tab is the full
+surface, and both read the same helpers.
+
+### The checklist rule: required versus optional
+
+A check is **required** when the server cannot serve inference without it: a writable data
+directory, a model library with GGUFs in it, an indexed registry, at least one GPU (this system is
+GPU-only), an installed engine, and something listening on the gateway port. It is **optional**
+when it changes what you can *do* rather than whether the thing works: a HuggingFace token (public
+repositories download fine without one), autostart, and the MCP PIN whenever `mcp.pin_required` is
+off.
+
+Only required checks gate "Ready to serve". This is the entire point of the distinction: a
+checklist that shows a warning triangle next to an unset HuggingFace token on a machine that will
+never download a gated model is a checklist people learn to scroll past, and then they scroll past
+the amber line that says no engine is installed. Optional items render grey and say "optional" out
+loud.
+
+Every unmet item names exactly one action and renders the button for it -- Install engine, Detect
+LM Studio library, Rescan, Generate PIN, Enable autostart -- because "your model directory is not
+set" without a control next to it is a diagnosis, not a fix.
+
+The checklist is **computed, never remembered**: no "setup complete" flag is stored anywhere. A
+library on a drive that later fails to mount goes amber again by itself, which a stored flag could
+not do. It is also deliberately not on a timer -- each item costs a directory walk, a socket bind
+or a stat, and none of them change on their own.
+
+**Fresh installs land on Setup.** "Fresh" is measured, not remembered: no `models.dir`, or no
+models indexed, or no engine installed. On such a box the Dashboard is four empty panels, and the
+Setup tab is the whole answer. Once the server can serve, the landing tab reverts to the Dashboard
+for good.
+
+### The advanced-section rule: generated, with three exclusions
+
+The long tail (`gateway.*` alone is 16 keys, plus `update.*`, `watchdog.*` and the planner's
+calibration constants -- 49 in total against 30 with a purpose-built control, out of 81 keys in
+`config.example.yaml`) is **generated from the pydantic model** rather than hand-listed, with
+type-aware widgets
+derived from the annotation: `Literal` becomes a select carrying its own choices, `bool` a
+checkbox, `int`/`float` a number, `list[...]` a comma-separated field, `Path` and `str` text. A key
+added to `config.py` therefore appears in the GUI with no second edit, and "every setting is
+reachable" stays true instead of being true on the day it was written.
+
+Three exclusions, each stated as a rule so it keeps holding as the config grows:
+
+1. **Keys with a purpose-built control above.** One control per key, always. Two forms for one
+   value is how a user changes a setting and watches it change back.
+2. **Secrets** (`server.api_key`, `hf.token`, `mcp.pin`). They need the masked/reveal widget and
+   the "did this really change" guard, because a generated field drawn with the redacted
+   placeholder would post `"abcd...yz"` straight back over the real credential.
+3. **Types with no honest scalar rendering** -- `planner.reserved_mb` (`dict[int, int]`) and
+   `planner.quant_affinity` (`dict[str, QuantAffinity]`). A mapping rendered as a text box silently
+   destroys the entries the user did not retype. Both get row widgets instead:
+   `reserved_mb` as a MiB field per GPU, next to that GPU's live free VRAM.
+
+A test asserts that the only keys the generator drops are exactly those two mappings, and that the
+union of "has its own control" and "is in Advanced" is every remaining key. That is what makes the
+claim checkable rather than aspirational.
+
+### One implementation of "change a setting"
+
+Every field on the tab -- generated or hand-built, including the per-GPU maps -- saves through
+`gui.tabs.apply_config_updates`, which calls the management route `PATCH /api/config` in-process.
+So the Setup tab, the Server tab, the HTTP API and the MCP `set_config` tool all run the same
+`apply_overrides` validation, the same atomic write, the same live-apply of the sections that can
+change without a restart, and report the same `restart_required` list. The Server tab's private
+copy of that logic was deleted in the process; it had drifted -- it did not apply the `mcp` section
+live, which the route had already been fixed to do.
+
+**Secrets are never rendered in clear.** The form is drawn from `state.redacted_config()`, one
+function that masks all three keys, so no surface can leak one by forgetting. The OpenClaw snippets
+legitimately contain the key and the PIN -- that is what makes them paste-ready -- so they are
+masked on screen behind an explicit "reveal secrets" switch while the copy buttons copy the real
+text. Displaying a credential on a screen someone may be sharing and putting it on that person's
+clipboard are different acts, and only the second one was asked for.
+
+**What is still not in the GUI, and why:** `data_dir` and `source_path`. The first is derived from
+the environment (D25) and a form that edits it would fight whatever set `SF_DATA_DIR`; the second
+is bookkeeping. Both are shown read-only in "Where things live", together with which of D25's three
+rules produced the directory in force.

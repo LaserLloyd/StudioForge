@@ -77,7 +77,15 @@ depends on nothing above it. A change that makes `core` import from `api` is a c
 3. Regenerate `config.example.yaml` (it is produced by `load_config(create=True)` against a temp
    data dir, with `data_dir`, `models.dir` and `mcp.pin` blanked) and annotate the key in the
    header if it is one a new user has to think about.
-4. Consider whether the Server tab should expose it. Several keys are currently config-file-only.
+4. **The GUI needs no change.** The Setup tab's Advanced section is generated from the pydantic
+   model, so a new scalar key gets a type-aware widget automatically (DECISIONS.md D26). Two
+   optional follow-ups: add a one-liner to `gui/state.CONFIG_FIELD_HELP` if the generated
+   "`<kind>`, default `<x>`" is not explanation enough, and promote it out of Advanced into a named
+   section by adding a `fields.row(...)` in `gui/tabs/setup.py` **and** listing it in that module's
+   `COVERED_KEYS` — a test asserts every key has exactly one control.
+5. A key whose type is a mapping (`dict[int, int]`) is deliberately *not* generated: it needs a row
+   widget, like `planner.reserved_mb` has on the GPU card. Add it to
+   `gui/state.CUSTOM_WIDGET_KEYS` along with the widget, or the same test fails.
 
 ## Building the companion wheel
 

@@ -54,15 +54,24 @@ on a connection-refused page during a slow first start.
 
 **First run** detects your GPUs, tunes a handful of defaults to them, fetches the pinned
 `llama-server` build, smoke-tests it before trusting it, and registers your existing model library
-**in place** — nothing is copied or moved. Three things are worth checking in the control panel's
-Setup tab afterwards:
+**in place** — nothing is copied or moved. The panel opens on its **Setup** tab, which is where the
+whole first run happens: a live checklist of everything still standing between this box and serving
+a model, each unmet item with the button that fixes it, and every configuration key StudioForge has
+— grouped by the decision it makes, not by the file it lives in. You should never need to edit
+`config.yaml` by hand.
 
-1. **The engine installed.** If it did not, `studioforge engine --update` says why.
-2. **`models.dir` points at your GGUF library.** StudioForge probes for an LM Studio one first
+Three things are worth checking there afterwards:
+
+1. **The engine installed.** If it did not, the checklist offers an Install button, and
+   `studioforge engine --update` says why from a terminal.
+2. **`models.dir` points at your GGUF library.** "Detect LM Studio library" probes for one
    (including the relocated `downloadsFolder` recorded in `~/.lmstudio/settings.json`, which is
    where most non-default installs actually live), but any directory of GGUFs works.
-3. **The MCP pairing PIN**, printed in the startup banner and served at `GET /api/mcp/info`. You
-   need it to connect an agent.
+3. **The MCP pairing PIN**, shown masked on the Setup tab, printed in the startup banner and served
+   at `GET /api/mcp/info`. You need it to connect an agent.
+
+**[`docs/SETUP.md`](docs/SETUP.md) is the full walkthrough**, tab section by tab section, and it
+gives the equivalent YAML and CLI for a box with no browser.
 
 ## Ports
 
@@ -306,6 +315,9 @@ deploy/         systemd units
 
 ## Documentation
 
+- [`docs/SETUP.md`](docs/SETUP.md) — first run, tab by tab: the checklist, the model library, the
+  GPU policy knobs, the engine, ports and credentials — plus the equivalent YAML and CLI for a
+  headless box
 - [`docs/CATALOG.md`](docs/CATALOG.md) — the model catalog an agent picks from: how each column is
   computed, the speed formulas, calibration, and the `list_models` → `load_model` sequence
 - [`docs/OPENCLAW.md`](docs/OPENCLAW.md) — pointing OpenClaw at it, the tool list, the loop an agent
