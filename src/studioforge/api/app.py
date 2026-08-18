@@ -394,6 +394,13 @@ def create_app(
                 await app.state.downloader.stop()
             with contextlib.suppress(Exception):
                 await app.state.manager.stop()
+            # After the manager has stopped every model: the supervisor's own
+            # close is what releases the Windows job object (D23) -- and a
+            # child that somehow survived stop_all dies with it. It was never
+            # called before (WP17 F11), so the safety net only ever fired by
+            # accident, at interpreter exit.
+            with contextlib.suppress(Exception):
+                await app.state.supervisor.aclose()
             with contextlib.suppress(Exception):
                 await app.state.client.aclose()
             # The engine manager and updater lazily open their own httpx

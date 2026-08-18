@@ -290,3 +290,31 @@ def test_a_read_only_app_never_claims_the_directory(config: Config) -> None:
         assert lock.acquire() is True, "building an app locked the data directory"
     finally:
         lock.release()
+
+
+def test_shutdown_closes_the_supervisor(config: Config) -> None:
+    """``Supervisor.aclose()`` is what releases the Windows job object (D23);
+    the lifespan never called it before (WP17 F11), so a survivor of
+    ``stop_all`` was only ever reaped by the interpreter-exit safety net."""
+    from fastapi.testclient import TestClient
+
+    downloader = _RecordingDownloader()
+    state = _neutered_state(config, downloader)
+
+    class _Supervisor:
+        closed = 0
+
+        def list(self) -> list[Any]:
+            return []
+
+        def child_pids(self) -> set[int]:
+            return set()
+
+        async def aclose(self) -> None:
+            type(self).closed += 1
+
+    state.supervisor = _Supervisor()
+    app = create_app(config, state=state, start_background=True)
+    with TestClient(app) as http:
+        assert http.get("/health").status_code == 200
+    assert _Supervisor.closed == 1, "the supervisor must be closed exactly once at shutdown"

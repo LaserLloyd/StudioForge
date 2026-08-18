@@ -23,6 +23,10 @@ dependencies = [
     "pystray>=0.19",
     "typer>=0.15",
     "rich>=13.9",
+    # Windows-only: job objects (children die with the supervisor, D23) and PDH
+    # per-process VRAM attribution. Both degrade gracefully when absent, but a
+    # fresh install must get them without being told (WP17 F10).
+    "pywin32>=306; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]
