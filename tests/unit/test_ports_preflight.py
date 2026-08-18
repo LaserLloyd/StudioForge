@@ -185,3 +185,44 @@ def test_startup_exits_cleanly_instead_of_raising_oserror(tmp_path: Path) -> Non
 
 def test_startup_proceeds_when_ports_are_free(tmp_path: Path) -> None:
     assert _preflight_ports(make_config(tmp_path)) is None
+
+
+# ---------------------------------------------------------------------------
+# A wildcard listener must be SEEN by the watchdog adoption probe (2026-08-19)
+# ---------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def wildcard_listener() -> Iterator[int]:
+    """A listener on 0.0.0.0 -- exactly what the watchdog binds by default."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("0.0.0.0", 0))
+    sock.listen(1)
+    try:
+        yield int(sock.getsockname()[1])
+    finally:
+        sock.close()
+
+
+def test_port_has_listener_sees_a_wildcard_listener() -> None:
+    """On Windows, binding 127.0.0.1:port SUCCEEDS beside a 0.0.0.0:port
+    listener, so a bind-based 'is anything there' probe says free. The
+    connect-based probe must say occupied."""
+    with wildcard_listener() as port:
+        assert ports_module.port_has_listener(port, "127.0.0.1") is True
+    assert ports_module.port_has_listener(port, "127.0.0.1") is False
+
+
+def test_inspect_running_watchdog_does_not_call_a_wildcard_listener_free(tmp_path: Path) -> None:
+    """The first restart after the V2 switch: serve left the watchdog running
+    on 0.0.0.0:1235, the replacement 'saw nothing listening', refused to adopt
+    and died on the port conflict. The probe must get past the 'nothing is
+    listening' gate and actually ask /health (here: a plain socket that is not
+    an HTTP server, so the answer is 'did not answer', never 'nothing')."""
+    from studioforge.core.ports import inspect_running_watchdog
+
+    with wildcard_listener() as port:
+        config = make_config(tmp_path, watchdog=port)
+        presence = inspect_running_watchdog(config, timeout_s=1.0)
+    assert "nothing is listening" not in presence.reason, presence.reason
+    assert presence.adoptable is False  # a bare socket is not our watchdog

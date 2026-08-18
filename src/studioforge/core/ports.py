@@ -184,6 +184,27 @@ class PortConflict:
         return "\n".join(lines)
 
 
+def port_has_listener(port: int, host: str = "127.0.0.1", timeout_s: float = 1.0) -> bool:
+    """Whether something ACCEPTS connections on ``host:port`` right now.
+
+    The complement of :func:`port_is_bindable`, and not the same question. On
+    Windows a bind to a *specific* address (``127.0.0.1:1235``) succeeds even
+    while another socket holds the *wildcard* (``0.0.0.0:1235``) unless that
+    socket set ``SO_EXCLUSIVEADDRUSE`` -- so "can I bind 127.0.0.1:port" says
+    **free** for a port our own watchdog is serving on ``0.0.0.0``. That is
+    exactly how a restarted server concluded "nothing is listening on port
+    1235", declined to adopt the watchdog it had just been told to keep, and
+    then died on the port conflict the wildcard bind correctly reported
+    (2026-08-19, first restart after the V2 switch). To learn whether a
+    *listener* exists, connect to it.
+    """
+    try:
+        with socket.create_connection((host, port), timeout=timeout_s):
+            return True
+    except OSError:
+        return False
+
+
 def port_is_bindable(port: int, host: str = "0.0.0.0") -> bool:
     """Whether ``host:port`` can be bound right now.
 
@@ -409,7 +430,8 @@ def inspect_running_watchdog(config: Config, *, timeout_s: float = 3.0) -> Watch
     """
     port = config.watchdog.port
     url = f"http://127.0.0.1:{port}/health"
-    if port_is_bindable(port, "127.0.0.1"):
+    # Connect, do not bind: see port_has_listener for the Windows wildcard trap.
+    if not port_has_listener(port, "127.0.0.1"):
         return WatchdogPresence(reason=f"nothing is listening on port {port}")
 
     import httpx

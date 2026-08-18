@@ -39,7 +39,9 @@ from studioforge.core.ports import (
     ENV_SUPERVISOR,
     EXIT_PORT_CONFLICT,
     EXIT_RESTART_REQUESTED,
+    check_startup_ports,
     find_watchdog_pids,
+    port_is_bindable,
 )
 from studioforge.logging import get_logger
 
@@ -70,6 +72,14 @@ STOP_TIMEOUT = 20.0  # grace given to the tree before SIGKILL/TerminateProcess
 #: large model library; short enough that "LM Studio has the port" is reported
 #: within a couple of minutes rather than never.
 PORT_HOLDER_GRACE = 120.0
+#: A port-conflict exit is not always about the SERVER port: the first restart
+#: after the V2 switch died on the watchdog port (1235) while 1234 was free,
+#: and the tray then blamed "LM Studio" for a port nobody held. So while the
+#: grace runs, if the server port is bindable, the child is respawned after a
+#: short delay -- bounded, so a port that is genuinely held elsewhere still
+#: ends in a report and not a spawn loop.
+PORT_CONFLICT_RETRY_DELAY = 5.0
+MAX_PORT_CONFLICT_RESPAWNS = 3
 
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 
@@ -249,6 +259,25 @@ def watchdog_health_url(config: Config) -> str:
 
 def port_conflict_detail(port: int) -> str:
     return f"Port {port} is held by another program (LM Studio?) — quit it, then Start server"
+
+
+def actual_port_conflict_detail(config: Config) -> str | None:
+    """Name the port that is REALLY taken, from a fresh probe of all three.
+
+    ``None`` when nothing is taken any more (the conflict was transient). Prefers
+    the holder's identity when the OS will tell us: "Port 1235 (watchdog) is
+    held by python.exe (pid 25684)" is a next action; "LM Studio?" for a port
+    that turns out to be free is a wild goose chase.
+    """
+    try:
+        conflicts = check_startup_ports(config)
+    except Exception:  # noqa: BLE001 - a probe failure must not crash the tray poll
+        return None
+    if not conflicts:
+        return None
+    first = conflicts[0]
+    who = first.holder.describe() if first.holder is not None else "another program"
+    return f"Port {first.port} ({first.role}) is held by {who} — quit it, then Start server"
 
 
 def acquire_single_instance(
@@ -524,6 +553,8 @@ class TrayApp:
         #: deadline the tray waits for whoever holds the port to answer as a
         #: StudioForge server (a replacement mid-startup) and adopts it.
         self._port_holder_deadline: float | None = None
+        self._port_conflict_retry_at: float | None = None
+        self._port_conflict_respawns = 0
         self._log_handle: Any = None
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
@@ -719,6 +750,13 @@ class TrayApp:
     def _server_is_answering(self) -> bool:
         return self.client.get("/health", timeout=3.0).ok
 
+    def _server_port_is_free(self) -> bool:
+        """Whether nothing holds the API port -- a real bind probe, not a guess."""
+        try:
+            return port_is_bindable(self.config.server.port, self.config.server.host)
+        except Exception:  # noqa: BLE001 - a probe failure must not crash the tray poll
+            return False
+
     def adopt_running_server(self) -> bool:
         """Attach to a server that is already up instead of starting a rival.
 
@@ -806,6 +844,7 @@ class TrayApp:
                     if rc is None:
                         if self.state == STATE_STARTING and self._server_is_answering():
                             self.state = STATE_RUNNING
+                            self._port_conflict_respawns = 0
                             changed = True
                         if self.restarts and time.monotonic() - self._spawn_time > HEALTHY_AFTER:
                             self.restarts = 0
@@ -870,8 +909,9 @@ class TrayApp:
                 grace_s=PORT_HOLDER_GRACE,
             )
             self.state = STATE_STARTING
-            self.detail = f"Port {self.config.server.port} is in use — checking who has it..."
+            self.detail = "A port is in use — checking who has it..."
             self._port_holder_deadline = time.monotonic() + PORT_HOLDER_GRACE
+            self._port_conflict_retry_at = time.monotonic() + PORT_CONFLICT_RETRY_DELAY
             return False, None
 
         if self.restarts < MAX_RESTARTS:
@@ -917,11 +957,39 @@ class TrayApp:
                 log.info("another StudioForge server took over the port; attaching to it")
                 self._adopt_locked()
                 return True
-            if time.monotonic() >= deadline:
+            now = time.monotonic()
+            retry_at = self._port_conflict_retry_at
+            if (
+                retry_at is not None
+                and now >= retry_at
+                and self._port_conflict_respawns < MAX_PORT_CONFLICT_RESPAWNS
+                and self._server_port_is_free()
+            ):
+                # The server port itself is free, so the conflict was on
+                # another of our ports (the watchdog we deliberately left
+                # running for adoption, the GUI) or has cleared. Try again;
+                # the child's own preflight is the authority on whether it
+                # can now bind everything it needs.
+                self._port_conflict_respawns += 1
                 self._port_holder_deadline = None
+                self._port_conflict_retry_at = None
+                log.warning(
+                    "server port is free after a port-conflict exit; respawning",
+                    attempt=self._port_conflict_respawns,
+                    of=MAX_PORT_CONFLICT_RESPAWNS,
+                )
+                self.state = STATE_STARTING
+                self.detail = "Retrying after a port conflict..."
+                self._spawn()
+                return True
+            if now >= deadline:
+                self._port_holder_deadline = None
+                self._port_conflict_retry_at = None
                 self.state = STATE_CRASHED
                 self.user_stopped = True
-                self.detail = port_conflict_detail(self.config.server.port)
+                self.detail = actual_port_conflict_detail(self.config) or port_conflict_detail(
+                    self.config.server.port
+                )
                 log.error("port conflict persists", detail=self.detail)
                 return True
             return False

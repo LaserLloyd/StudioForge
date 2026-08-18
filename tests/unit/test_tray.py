@@ -840,3 +840,74 @@ def test_the_restart_exit_code_is_a_requested_restart_without_asking_anyone(
 ) -> None:
     client.urls.clear()  # no watchdog answering at all
     assert app.classify_exit(tray_app.EXIT_RESTART_REQUESTED) == (tray_app.KIND_RESTART_REQUESTED)
+
+
+# ---------------------------------------------------------------------------
+# A port-conflict exit on a port that is NOT the server port (2026-08-19)
+# ---------------------------------------------------------------------------
+
+
+def test_port_conflict_with_a_free_server_port_respawns_after_a_short_delay(
+    app: TrayApp, client: FakeClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The first restart after the V2 switch: serve died on the WATCHDOG port
+    (left running for adoption) while 1234 was free. The tray must retry the
+    spawn instead of waiting two minutes and blaming LM Studio for 1234."""
+    spawned: list[bool] = []
+    monkeypatch.setattr(app, "_spawn", lambda: spawned.append(True) or True)
+    monkeypatch.setattr(app, "_server_port_is_free", lambda: True)
+    app.user_stopped = False
+    client.default = ApiResult(False, error="down")
+
+    app._child_exited_locked(tray_app.KIND_PORT_TAKEN, 3)
+    assert app._port_conflict_retry_at is not None
+    # Before the retry delay: nothing yet.
+    assert app._poll_unowned_locked() is False
+    assert spawned == []
+    # Delay elapsed: respawn, once.
+    app._port_conflict_retry_at = 0.0
+    assert app._poll_unowned_locked() is True
+    assert spawned == [True]
+    assert app.state == STATE_STARTING
+    assert app._port_conflict_respawns == 1
+    assert app._port_holder_deadline is None
+
+
+def test_port_conflict_respawns_are_bounded_and_the_report_names_the_real_port(
+    app: TrayApp, client: FakeClient, monkeypatch: pytest.MonkeyPatch, config: Config
+) -> None:
+    from studioforge.core.ports import PortConflict, PortHolder
+
+    spawned: list[bool] = []
+    monkeypatch.setattr(app, "_spawn", lambda: spawned.append(True) or True)
+    monkeypatch.setattr(app, "_server_port_is_free", lambda: True)
+    monkeypatch.setattr(
+        tray_app,
+        "check_startup_ports",
+        lambda cfg: [
+            PortConflict(
+                role="watchdog",
+                port=1235,
+                host="0.0.0.0",
+                holder=PortHolder(pid=4242, name="python.exe"),
+            )
+        ],
+    )
+    app.user_stopped = False
+    client.default = ApiResult(False, error="down")
+
+    for _ in range(tray_app.MAX_PORT_CONFLICT_RESPAWNS):
+        app._child_exited_locked(tray_app.KIND_PORT_TAKEN, 3)
+        app._port_conflict_retry_at = 0.0
+        assert app._poll_unowned_locked() is True
+    assert len(spawned) == tray_app.MAX_PORT_CONFLICT_RESPAWNS
+
+    # One more conflict: no further spawn; at the deadline the REAL port is named.
+    app._child_exited_locked(tray_app.KIND_PORT_TAKEN, 3)
+    app._port_conflict_retry_at = 0.0
+    app._port_holder_deadline = 0.0
+    assert app._poll_unowned_locked() is True
+    assert len(spawned) == tray_app.MAX_PORT_CONFLICT_RESPAWNS
+    assert app.state == STATE_CRASHED
+    assert "1235" in app.status_line() and "watchdog" in app.status_line()
+    assert str(config.server.port) not in app.status_line() or config.server.port == 1235
