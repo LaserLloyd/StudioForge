@@ -65,16 +65,31 @@ def test_enable_writes_a_hidden_launch_shim(config: Config, fake_startup: Path) 
 
 
 @windows_only
-def test_shim_quotes_paths_containing_spaces(config: Config, fake_startup: Path) -> None:
-    """The real install path contains spaces; unquoted, the shim silently fails."""
-    autostart.enable(config)
+def test_shim_quotes_paths_containing_spaces(tmp_path: Path, fake_startup: Path) -> None:
+    """A path with a space must be quoted or the shim silently fails at logon.
+
+    The spaced path is built HERE, deliberately: an earlier version relied on
+    the checkout (or pytest's tmp dir) happening to live under a directory
+    with a space in its name -- true on the author's box, false for a stranger
+    cloning to ``~/dev/studioforge``, whose very first ``pytest`` went red
+    (WP17 F1).
+    """
+    spaced = tmp_path / "Studio Forge data"
+    cfg = Config(data_dir=spaced)
+    cfg.ensure_dirs()
+    cfg.save(cfg.data_dir / "config.yaml")
+    cfg.source_path = cfg.data_dir / "config.yaml"
+    assert " " in str(cfg.config_path)
+
+    autostart.enable(cfg)
     text = (fake_startup / "StudioForge.vbs").read_text(encoding="utf-8")
     run_line = next(line for line in text.splitlines() if line.startswith("shell.Run"))
     # Inside a VBScript string literal a quote is escaped by doubling it.
     assert '""' in run_line, run_line
-    for part in autostart.launch_command(config):
-        if " " in part:
-            assert f'""{part}""' in run_line, f"{part!r} was not quoted"
+    spaced_parts = [p for p in autostart.launch_command(cfg) if " " in p]
+    assert spaced_parts, "the config path itself contains a space"
+    for part in spaced_parts:
+        assert f'""{part}""' in run_line, f"{part!r} was not quoted"
 
 
 @windows_only
