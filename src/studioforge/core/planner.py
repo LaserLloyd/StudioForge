@@ -532,6 +532,35 @@ def max_ctx_for_budget(
     return max(0, total // max(1, parallel))
 
 
+def max_ctx_for_budget_geometry(
+    meta: Any,
+    *,
+    budget_bytes: int,
+    kv_k: str,
+    kv_v: str,
+    parallel: int = 1,
+) -> int:
+    """Largest ladder context per slot whose *real* allocation fits ``budget_bytes``.
+
+    The per-layer answer to the question :func:`max_ctx_for_budget` answers
+    uniformly. Walks :data:`_CTX_LADDER` from the top and asks
+    :func:`kv_alloc_bytes` -- the same arithmetic a load is charged -- at each
+    rung, so the number a refusal offers is one the next load will accept. For
+    an iSWA or hybrid model the uniform figure under-offers by 4-40x (D22: the
+    window layers do not grow with context), which sent users to a 4k window
+    when 65k fit. Returns 0 when nothing on the ladder fits or the geometry is
+    unknown; callers fall back to the uniform figure for the latter.
+    """
+    if budget_bytes <= 0 or not kv_layers(meta):
+        return 0
+    slots = max(1, int(parallel))
+    for ctx in _CTX_LADDER:
+        needed = kv_alloc_bytes(meta, ctx_total=ctx * slots, kv_k=kv_k, kv_v=kv_v, parallel=slots)
+        if 0 < needed <= budget_bytes:
+            return ctx
+    return 0
+
+
 def _round_ctx_down(ctx: int) -> int:
     """Snap to a friendly context size from the ladder (multiples users expect)."""
     for candidate in _CTX_LADDER:
@@ -989,6 +1018,7 @@ class Planner:
         draft: ModelRecord | None = None,
         adapters: Sequence[AdapterRecord] = (),
         allow_evict: bool | None = None,
+        reload_of: str | None = None,
     ) -> PlanResult:
         """Decide where (and whether) a model can be loaded.
 
@@ -1002,7 +1032,101 @@ class Planner:
         :attr:`THINKING_DEFAULT_CTX`) and the ordinary default is used if it
         does not fit. Preferring a bigger window must never turn a load that
         would have worked into a rejection.
+
+        ``reload_of`` names a model whose running instance is about to be
+        replaced by this plan (a forced reload, D30). The plan is made *as if
+        that child were already gone*: its planned footprint is credited back
+        to the GPUs it sits on, it is neither an eviction candidate nor a
+        pinned obstacle, and its pid still counts as ours in the VRAM-holder
+        attribution. The returned plan lists it first in
+        ``evict_model_ids`` so the caller stops it on the way to spawning --
+        which means a refusal leaves the resident child running, instead of
+        the old unload-then-plan order that left the model unloaded whenever
+        the reload was refused.
         """
+        if reload_of is None:
+            return self._plan_load(
+                record,
+                ctx_size=ctx_size,
+                kv_cache_type=kv_cache_type,
+                kv_cache_type_v=kv_cache_type_v,
+                parallel=parallel,
+                loaded=loaded,
+                draft=draft,
+                adapters=adapters,
+                allow_evict=allow_evict,
+            )
+        resident = next((i for i in loaded if i.model_id == reload_of), None)
+        others = [i for i in loaded if i.model_id != reload_of]
+        gpus_view = self._gpus_as_if_gone(resident) if resident is not None else None
+        own = [resident.pid] if resident is not None and resident.pid is not None else []
+        result = self._plan_load(
+            record,
+            ctx_size=ctx_size,
+            kv_cache_type=kv_cache_type,
+            kv_cache_type_v=kv_cache_type_v,
+            parallel=parallel,
+            loaded=others,
+            draft=draft,
+            adapters=adapters,
+            allow_evict=allow_evict,
+            gpus=gpus_view,
+            extra_own_pids=own,
+        )
+        if isinstance(result, LoadPlan) and resident is not None:
+            if reload_of not in result.evict_model_ids:
+                result.evict_model_ids.insert(0, reload_of)
+            credited = sum(self._instance_footprint(resident).values())
+            result.notes.append(
+                f"forced reload: planned as if the running instance of {reload_of} "
+                f"were already unloaded ({round(credited / MB)} MB credited back)"
+            )
+        return result
+
+    def _gpus_as_if_gone(self, resident: InstanceInfo) -> list[GpuInfo]:
+        """The live GPU list with ``resident``'s planned footprint credited as free.
+
+        The footprint is the instance's own plan (:meth:`_instance_footprint`),
+        the same figure the eviction ladder credits for a victim; the truth is
+        whatever the driver releases when the child exits, and a plan made on
+        the estimate meets the same one-retry OOM path a post-eviction plan does.
+        """
+        gpus = list(self.probe.list_gpus())
+        footprint = self._instance_footprint(resident)
+        if not footprint:
+            return gpus
+        view: list[GpuInfo] = []
+        for gpu in gpus:
+            credit = int(footprint.get(gpu.index, 0))
+            if credit <= 0:
+                view.append(gpu)
+                continue
+            view.append(
+                gpu.model_copy(
+                    update={
+                        "free_bytes": min(gpu.total_bytes, gpu.free_bytes + credit),
+                        "used_bytes": max(0, gpu.used_bytes - credit),
+                    }
+                )
+            )
+        return view
+
+    def _plan_load(
+        self,
+        record: ModelRecord,
+        *,
+        ctx_size: int | None,
+        kv_cache_type: KvCacheType | None,
+        kv_cache_type_v: KvCacheType | None,
+        parallel: int | None,
+        loaded: Sequence[InstanceInfo],
+        draft: ModelRecord | None,
+        adapters: Sequence[AdapterRecord],
+        allow_evict: bool | None,
+        gpus: Sequence[GpuInfo] | None = None,
+        extra_own_pids: Sequence[int] = (),
+    ) -> PlanResult:
+        """:meth:`plan_load` proper; ``gpus``/``extra_own_pids`` are the reload view."""
         settings = record.settings
         defaults = self.config.models
 
@@ -1048,6 +1172,8 @@ class Planner:
                     evict_allowed=False,
                     auto_parallel=auto_parallel,
                     terminal=False,
+                    gpus=gpus,
+                    extra_own_pids=extra_own_pids,
                     extra_notes=self._rung_notes(
                         ctx, aim, floor, thinking=thinking, kv_k=cand_k, kv_options=kv_options
                     ),
@@ -1071,6 +1197,8 @@ class Planner:
                 aim=aim,
                 floor=floor,
                 tried=tried,
+                gpus=gpus,
+                extra_own_pids=extra_own_pids,
             )
 
         # Pass 2 (DECISIONS.md D16): even the floor does not fit, so eviction is
@@ -1095,6 +1223,8 @@ class Planner:
                     evict_allowed=True,
                     auto_parallel=auto_parallel,
                     terminal=False,
+                    gpus=gpus,
+                    extra_own_pids=extra_own_pids,
                     extra_notes=self._rung_notes(
                         ctx, aim, floor, thinking=thinking, kv_k=cand_k, kv_options=kv_options
                     ),
@@ -1139,6 +1269,8 @@ class Planner:
             aim=aim,
             floor=floor,
             tried=tried,
+            gpus=gpus,
+            extra_own_pids=extra_own_pids,
         )
 
     # -- plan_load helpers -------------------------------------------------
@@ -1219,6 +1351,8 @@ class Planner:
         aim: int,
         floor: int,
         tried: Sequence[str],
+        gpus: Sequence[GpuInfo] | None = None,
+        extra_own_pids: Sequence[int] = (),
     ) -> PlanResult:
         """Recompute the floor rung as the *terminal* refusal, and log it.
 
@@ -1241,6 +1375,8 @@ class Planner:
             evict_allowed=evict_allowed,
             auto_parallel=auto_parallel,
             terminal=True,
+            gpus=gpus,
+            extra_own_pids=extra_own_pids,
             extra_notes=(
                 [
                     f"wanted up to {aim} tokens of context but not even the {floor} "
@@ -1393,11 +1529,19 @@ class Planner:
         extra_notes: Sequence[str] = (),
         auto_parallel: bool = False,
         terminal: bool = True,
+        gpus: Sequence[GpuInfo] | None = None,
+        extra_own_pids: Sequence[int] = (),
     ) -> PlanResult:
-        """Plan a load at one specific context size."""
+        """Plan a load at one specific context size.
+
+        ``gpus`` is the live probe unless a caller hands in a view (the forced
+        reload credits the resident child's footprint back, see
+        :meth:`plan_load`); ``extra_own_pids`` are pids that count as ours in
+        the holder attribution beyond those in ``loaded``.
+        """
         settings = record.settings
 
-        gpus = self.probe.list_gpus()
+        gpus = list(gpus) if gpus is not None else self.probe.list_gpus()
         if not gpus:
             estimate = self._safe_estimate(
                 record, ctx, slots, kv_k, kv_v, 1, draft, settings.draft_ctx_size, adapters
@@ -1463,6 +1607,7 @@ class Planner:
                 forced=True,
                 auto_parallel=auto_parallel,
                 terminal=terminal,
+                extra_own_pids=extra_own_pids,
             )
 
         order = self._candidate_order(gpus)
@@ -1600,6 +1745,7 @@ class Planner:
             notes=notes,
             affinity=affinity,
             terminal=terminal,
+            extra_own_pids=extra_own_pids,
         )
 
     def _wider_split_for_parallel(
@@ -2024,6 +2170,7 @@ class Planner:
         forced: bool,
         auto_parallel: bool = False,
         terminal: bool = True,
+        extra_own_pids: Sequence[int] = (),
     ) -> PlanResult:
         gpu_map = {gpu.index: gpu for gpu in gpus}
         unknown = [d for d in devices if d not in gpu_map]
@@ -2103,6 +2250,7 @@ class Planner:
             notes=notes,
             terminal=terminal,
             forced=forced,
+            extra_own_pids=extra_own_pids,
         )
         if forced:
             rejection.suggestions.append(
@@ -2127,6 +2275,7 @@ class Planner:
         affinity: QuantAffinity | None = None,
         terminal: bool = True,
         forced: bool = False,
+        extra_own_pids: Sequence[int] = (),
     ) -> LoadRejected:
         estimate = self._safe_estimate(
             record,
@@ -2184,22 +2333,30 @@ class Planner:
                     f"requirement)"
                 )
 
-        # 1. A smaller context that would actually fit.
+        # 1. A smaller context that would actually fit. Per-layer geometry
+        #    first (the number a load is really charged, D22); the uniform
+        #    formula only when the metadata cannot support a per-layer answer.
         max_ctx: int | None = None
         if meta is not None:
             fixed = estimate.total_bytes - estimate.kv_bytes
             budget = available - fixed
-            raw = max_ctx_for_budget(
-                budget_bytes=budget,
-                n_layer=meta.n_layer,
-                n_head_kv=meta.n_head_kv or meta.n_head,
-                head_dim_k=meta.head_dim_k,
-                head_dim_v=meta.head_dim_v,
-                kv_type_k=kv_k,
-                kv_type_v=kv_v,
-                parallel=slots,
+            raw = max_ctx_for_budget_geometry(
+                meta, budget_bytes=budget, kv_k=kv_k, kv_v=kv_v, parallel=slots
             )
-            max_ctx = _round_ctx_down(raw) or None
+            if raw <= 0 and not kv_layers(meta):
+                raw = _round_ctx_down(
+                    max_ctx_for_budget(
+                        budget_bytes=budget,
+                        n_layer=meta.n_layer,
+                        n_head_kv=meta.n_head_kv or meta.n_head,
+                        head_dim_k=meta.head_dim_k,
+                        head_dim_v=meta.head_dim_v,
+                        kv_type_k=kv_k,
+                        kv_type_v=kv_v,
+                        parallel=slots,
+                    )
+                )
+            max_ctx = raw or None
             if max_ctx and max_ctx < ctx:
                 suggestions.append(
                     f"reduce context from {ctx} to {max_ctx} tokens (KV cache is "
@@ -2263,7 +2420,7 @@ class Planner:
         # Only for the refusal that actually reaches the caller: this walks
         # every process on every GPU, and a ladder walk asks for a dozen
         # rejections it will throw away.
-        holders = self._vram_holders(loaded) if terminal else []
+        holders = self._vram_holders(loaded, extra_own_pids) if terminal else []
         foreign = [h for h in holders if not h.is_ours and h.used_bytes > 0]
         if foreign:
             top = sorted(foreign, key=lambda h: -h.used_bytes)[:4]
@@ -2323,14 +2480,18 @@ class Planner:
             log.debug("planner note", model_id=record.id, note=note)
         return rejected
 
-    def _vram_holders(self, loaded: Sequence[InstanceInfo]) -> list[VramProcess]:
+    def _vram_holders(
+        self, loaded: Sequence[InstanceInfo], extra_own_pids: Sequence[int] = ()
+    ) -> list[VramProcess]:
         """Processes holding VRAM, with our own children marked as ours.
 
         The pids of our llama-server children come from the instance table, so
         a rejection can say "2.1 GiB held by python.exe (pid 1234)" about a
         foreign process without blaming the models we loaded on purpose.
+        ``extra_own_pids`` covers a child deliberately left out of ``loaded``
+        (the resident instance of a forced reload).
         """
-        own = [i.pid for i in loaded if i.pid is not None]
+        own = [i.pid for i in loaded if i.pid is not None] + list(extra_own_pids)
         return vram_processes(self.probe, own_pids=own)
 
     # -- eviction ---------------------------------------------------------

@@ -304,6 +304,14 @@ class ModelManager:
         A preset-only virtual model loads its *base* instance -- launching a
         second copy of the same weights because the user clicked Load on the
         persona rather than the base would defeat the sharing.
+
+        A forced reload **plans before it unloads** (D30). The planner is told
+        which instance is being replaced and credits its footprint back, so a
+        reload that fits is spawned after the resident child is stopped, and a
+        reload that is refused -- the args no longer fit, VRAM moved to
+        ComfyUI, the engine is gone -- raises with the numbers while the model
+        that was serving a moment ago goes on serving. The old order (stop,
+        then plan) turned every refused reload into an outage.
         """
         record = self.registry.resolve(name)
         if record is None:
@@ -312,12 +320,17 @@ class ModelManager:
         lock = await self._lock_for(record.id)
         async with lock:
             existing = self.supervisor.get(record.id)
+            reload_of: str | None = None
             if existing is not None and existing.state == "ready":
                 if not force:
                     return existing
-                await self.supervisor.stop(record.id)
+                reload_of = record.id
             return await self._load_locked(
-                record, ctx_size=ctx_size, kv_cache_type=kv_cache_type, parallel=parallel
+                record,
+                ctx_size=ctx_size,
+                kv_cache_type=kv_cache_type,
+                parallel=parallel,
+                reload_of=reload_of,
             )
 
     async def _load_locked(
@@ -327,6 +340,7 @@ class ModelManager:
         ctx_size: int | None = None,
         kv_cache_type: Any = None,
         parallel: int | None = None,
+        reload_of: str | None = None,
     ) -> InstanceInfo:
         """Plan, evict if needed, launch. Caller must hold the per-model lock.
 
@@ -351,7 +365,11 @@ class ModelManager:
             )
         async with self._load_gate:
             return await self._load_gated(
-                record, ctx_size=ctx_size, kv_cache_type=kv_cache_type, parallel=parallel
+                record,
+                ctx_size=ctx_size,
+                kv_cache_type=kv_cache_type,
+                parallel=parallel,
+                reload_of=reload_of,
             )
 
     async def _load_gated(
@@ -361,9 +379,15 @@ class ModelManager:
         ctx_size: int | None,
         kv_cache_type: Any,
         parallel: int | None,
+        reload_of: str | None = None,
     ) -> InstanceInfo:
         existing = self.supervisor.get(record.id)
-        if existing is not None and existing.state == "loading":
+        if reload_of is not None and (existing is None or existing.state != "ready"):
+            # The resident child went away while we waited for the gate (a
+            # crash, a TTL unload): there is nothing to replace, so this is an
+            # ordinary load.
+            reload_of = None
+        if existing is not None and existing.state == "loading" and reload_of is None:
             # The supervisor is already bringing this child up -- its crash
             # watcher relaunching it after an exit. Planning again would launch
             # nothing (start() returns the in-flight instance) but could evict
@@ -387,14 +411,31 @@ class ModelManager:
             loaded=self.supervisor.list(),
             draft=draft,
             adapters=[a for a, _ in adapters],
+            reload_of=reload_of,
         )
 
         if isinstance(plan_result, LoadRejected):
+            if reload_of is not None:
+                log.warning(
+                    "forced reload refused; the running instance is kept",
+                    model_id=record.id,
+                    reason=plan_result.reason,
+                )
+                plan_result.suggestions.append(
+                    f"the running instance of {reload_of} was left loaded with its "
+                    f"previous settings; nothing was unloaded"
+                )
             raise self._vram_error(plan_result)
 
         plan: LoadPlan = plan_result
-        for victim in plan.evict_model_ids:
-            log.info("evicting to make room", victim=victim, for_model=record.id)
+        victims = list(plan.evict_model_ids)
+        if reload_of is not None and reload_of not in victims:
+            victims.insert(0, reload_of)
+        for victim in victims:
+            if victim == reload_of:
+                log.info("stopping the running instance for a forced reload", model_id=victim)
+            else:
+                log.info("evicting to make room", victim=victim, for_model=record.id)
             await self.supervisor.stop(victim)
 
         engine_tag = record.settings.engine_tag

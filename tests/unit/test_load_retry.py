@@ -421,3 +421,66 @@ async def test_a_watcher_relaunch_that_fails_falls_through_to_a_fresh_plan() -> 
     _, instance = await manager.ensure_loaded("test/model")
     assert instance.state == "ready"
     assert planner.calls == 1 and supervisor.starts == 1
+
+
+# ---------------------------------------------------------------------------
+# D30: a forced reload plans before it unloads. A refused reload must leave
+# the model that was serving a moment ago still serving.
+# ---------------------------------------------------------------------------
+
+
+async def test_a_refused_forced_reload_keeps_the_running_instance() -> None:
+    supervisor = StubSupervisor()
+    supervisor.instances["test/model"] = resident("test/model")
+    planner = StubPlanner(
+        result=LoadRejected(model_id="test/model", reason="no room", required_bytes=1)
+    )
+    manager = make_manager(supervisor, planner)
+
+    with pytest.raises(InsufficientVramError) as excinfo:
+        await manager.load("test/model", force=True)
+
+    assert supervisor.stopped == [], "the resident child must not be stopped before planning"
+    assert supervisor.get("test/model") is not None
+    assert supervisor.starts == 0
+    assert any("left loaded" in s for s in excinfo.value.details["suggestions"])
+
+
+async def test_a_forced_reload_tells_the_planner_which_instance_it_replaces() -> None:
+    supervisor = StubSupervisor()
+    supervisor.instances["test/model"] = resident("test/model")
+    planner = StubPlanner()
+    seen: dict[str, Any] = {}
+
+    def capture(record: ModelRecord, **kwargs: Any) -> Any:
+        planner.calls += 1
+        seen.update(kwargs)
+        return LoadPlan(model_id=record.id, devices=[0], ctx_size=8192)
+
+    planner.plan_load = capture  # type: ignore[method-assign]
+    manager = make_manager(supervisor, planner)
+
+    instance = await manager.load("test/model", force=True)
+
+    assert seen.get("reload_of") == "test/model"
+    # Planned first, then the resident stopped, then the replacement started.
+    assert supervisor.stopped == ["test/model"]
+    assert supervisor.starts == 1
+    assert instance.state == "ready"
+
+
+async def test_a_plain_load_never_passes_reload_of() -> None:
+    supervisor = StubSupervisor()
+    planner = StubPlanner()
+    seen: dict[str, Any] = {}
+
+    def capture(record: ModelRecord, **kwargs: Any) -> Any:
+        planner.calls += 1
+        seen.update(kwargs)
+        return LoadPlan(model_id=record.id, devices=[0], ctx_size=8192)
+
+    planner.plan_load = capture  # type: ignore[method-assign]
+    manager = make_manager(supervisor, planner)
+    await manager.load("test/model")
+    assert seen.get("reload_of") is None
+    assert supervisor.stopped == []

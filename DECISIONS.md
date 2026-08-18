@@ -1524,3 +1524,51 @@ same model.
 
 **What pins it.** `tests/unit/test_load_retry.py`: a second cold load is not planned until the
 first child is up, and neither evicts the other.
+
+---
+
+## D30 -- A forced reload plans before it unloads, and a refusal offers the real context
+
+**Problem (seen live, WP12).** `ModelManager.load(force=True)` -- the GUI's per-model
+*Restart*, `POST /api/models/{id}/restart`, `POST /restart/backend` after an engine update,
+the MCP `load_model(force=true)`, the Models tab's "save then load" -- stopped the running child
+first and planned second. Both call sites carried a comment promising the opposite ("a failure
+never leaves the model unloaded when it was working a moment ago"), and both were wrong: a
+reload whose arguments no longer fit -- VRAM had moved to ComfyUI, a bigger context was asked
+for, the engine had been swapped for one that would not start -- came back as a 507 with the
+model gone. Every refused reload was an outage that the code had specifically been written to
+avoid.
+
+The eviction ladder is why it was done in the wrong order: the resident instance was, to the
+planner, either a pinned obstacle ("unpin X" as the first suggestion for X's own reload) or an
+LRU candidate that pass 1 (no eviction) could not touch, so the only way to make room for a
+model was to remove it before asking.
+
+**Decision.** `Planner.plan_load(..., reload_of=<model_id>)` plans *as if that child were
+already gone*: its planned per-GPU footprint (`_instance_footprint`, the same figure the
+eviction ladder credits for a victim) is added back to the free VRAM of the cards it sits on,
+it is neither an eviction candidate nor a pinned obstacle, and its pid still counts as ours in
+the VRAM-holder attribution so a refusal cannot blame the model for its own reload. The
+returned plan lists it *first* in `evict_model_ids`, and the manager stops it there -- after
+the plan exists, before the spawn. A refusal raises with the numbers, appends "the running
+instance of X was left loaded with its previous settings; nothing was unloaded", and the child
+keeps serving. If the resident died while the caller waited for the load gate (D29) the hint
+is dropped and it is an ordinary load.
+
+The credit is the estimate, not a measurement; the truth is whatever the driver releases when
+the child exits, and a plan made on the estimate meets the same one-retry transient-OOM path
+(`_start_with_retry`) a post-eviction plan does.
+
+**Also: `max_ctx_that_fits` is computed on the per-layer geometry.** A refusal's "reduce
+context to N" walked the uniform per-token formula, which D22 established is wrong for half the
+library: an iSWA model was offered a 4k window when 65k fit, a hybrid a quarter of what it could
+have. `max_ctx_for_budget_geometry` walks the context ladder against `kv_alloc_bytes` -- the
+number a load is actually charged -- so the offer is one the next load accepts. The uniform
+formula remains only for metadata that cannot support a per-layer answer.
+
+**What pins it.** `tests/unit/test_planner_reload.py` (the footprint is credited back; a pinned
+resident is not its own obstacle; the resident pid is ours in a refusal; a reload still evicts
+other idle models when it must; a device-override reload credits that device; the geometry
+walk beats the uniform figure for Gemma-4 by 8x and its offer re-plans successfully),
+`tests/unit/test_load_retry.py` (a refused forced reload stops nothing; the planner is told
+`reload_of`; a plain load never passes it).
