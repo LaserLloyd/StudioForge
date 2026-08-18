@@ -880,3 +880,20 @@ def test_loopback_spellings(host: str) -> None:
 @pytest.mark.parametrize("host", ["0.0.0.0", "192.168.1.5", "::", "", None])
 def test_non_loopback_spellings(host: Any) -> None:
     assert st._host_is_loopback(host) is False
+
+
+def test_headline_does_not_call_a_safety_item_a_loading_blocker() -> None:
+    checks = st.first_run_checks(**_ready_kwargs(bind_host="0.0.0.0", api_key_set=False))
+    line = st.checklist_headline(checks)
+    assert "before this server can load a model" not in line
+    assert line.startswith("Ready to serve, but fix before exposing it: Network exposure")
+    assert st.checklist_is_ready(checks) is False
+
+
+def test_headline_lists_safety_after_real_blockers() -> None:
+    checks = st.first_run_checks(
+        **_ready_kwargs(bind_host="0.0.0.0", api_key_set=False, engine_tag=None)
+    )
+    line = st.checklist_headline(checks)
+    assert "before this server can load a model" in line
+    assert "Also fix: Network exposure" in line

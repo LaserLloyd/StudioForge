@@ -3276,6 +3276,12 @@ def first_run_checks(
     return checks
 
 
+#: Required checks that are about a SAFE install rather than a WORKING one.
+#: They still gate "ready" (a LAN-open admin surface is not a finished setup),
+#: but the headline must not claim they stop models from loading.
+SAFETY_CHECK_KEYS: frozenset[str] = frozenset({"network"})
+
+
 def checklist_is_ready(checks: Sequence[SetupCheck]) -> bool:
     """Whether every **required** check passes. Optional ones never gate."""
     return all(check.ok for check in checks if check.required)
@@ -3287,9 +3293,20 @@ def checklist_headline(checks: Sequence[SetupCheck]) -> str:
         return "Nothing to check."
     outstanding = [check for check in checks if check.required and not check.ok]
     optional = [check for check in checks if not check.required and not check.ok]
-    if outstanding:
-        names = ", ".join(check.name for check in outstanding)
-        return f"{len(outstanding)} thing(s) to fix before this server can load a model: {names}"
+    # Two kinds of "required": what stops a model from loading at all, and
+    # what must be fixed for a *safe* install (network exposure). Saying
+    # "before this server can load a model" about the second one is untrue and
+    # teaches the reader that the headline exaggerates.
+    blocking = [check for check in outstanding if check.key not in SAFETY_CHECK_KEYS]
+    safety = [check for check in outstanding if check.key in SAFETY_CHECK_KEYS]
+    if blocking:
+        names = ", ".join(check.name for check in blocking)
+        extra = f" Also fix: {', '.join(c.name for c in safety)}." if safety else ""
+        head = f"{len(blocking)} thing(s) to fix before this server can load a model"
+        return f"{head}: {names}.{extra}"
+    if safety:
+        names = ", ".join(check.name for check in safety)
+        return f"Ready to serve, but fix before exposing it: {names}."
     tail = f" {len(optional)} optional item(s) left." if optional else ""
     return f"Ready to serve — every required check passes.{tail}"
 
