@@ -2832,3 +2832,45 @@ def test_file_in_use_check_answers_conservatively_when_it_cannot_tell(tmp_path: 
 
     check = _file_in_use_check(_BrokenSupervisor(), _Registry())
     assert check(tmp_path / "anything.gguf") is True
+
+
+# ---------------------------------------------------------------------------
+# WP17 F9: a short os.write must not drop bytes of a resumable partial
+# ---------------------------------------------------------------------------
+
+
+def test_part_file_write_loops_on_short_writes(tmp_path: Path, monkeypatch: Any) -> None:
+    """``os.write`` may write fewer bytes than asked and simply return the count.
+    One unchecked call silently truncated a chunk while the hash and counter
+    moved on. The writer must loop until every byte is on disk."""
+    import os as os_module
+
+    from studioforge.core import downloader as dl
+
+    real_write = os_module.write
+    calls: list[int] = []
+
+    def short_write(fd: int, data: Any) -> int:
+        view = memoryview(data)
+        n = min(len(view), 7)  # never more than 7 bytes per call
+        calls.append(n)
+        return real_write(fd, view[:n])
+
+    monkeypatch.setattr(dl.os, "write", short_write)
+    part = tmp_path / "x.gguf.part"
+    payload = bytes(range(256)) * 3  # 768 bytes -> many short writes
+    with dl._PartFile(part) as owned:
+        owned.write(payload)
+    assert part.read_bytes() == payload
+    assert len(calls) >= 768 // 7, "the loop must issue as many writes as it takes"
+
+
+def test_part_file_write_raises_when_the_descriptor_makes_no_progress(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    from studioforge.core import downloader as dl
+
+    monkeypatch.setattr(dl.os, "write", lambda fd, data: 0)
+    part = tmp_path / "y.gguf.part"
+    with dl._PartFile(part) as owned, pytest.raises(OSError):
+        owned.write(b"abc")

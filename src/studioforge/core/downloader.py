@@ -471,7 +471,22 @@ class _PartFile:
         os.lseek(self.fd, offset, os.SEEK_SET)
 
     def write(self, chunk: bytes) -> None:
-        os.write(self.fd, chunk)
+        """Write ALL of ``chunk``, looping on short writes.
+
+        ``os.write`` may write fewer bytes than asked (a signal, a full pipe on
+        some filesystems, a network share flushing) and returns the count
+        instead of raising. A single unchecked call silently dropped the tail
+        of a chunk while the streamed hash and byte counter both moved on -- a
+        resumable partial that would then fail its on-disk verification (WP17
+        F9). Looping until every byte is on the file is the only correct
+        behaviour for a raw descriptor.
+        """
+        view = memoryview(chunk)
+        while view:
+            written = os.write(self.fd, view)
+            if written <= 0:
+                raise OSError(f"os.write wrote {written} bytes to {self.path}")
+            view = view[written:]
 
     def rehash(self, hasher: hashlib._Hash) -> int:
         """Feed the existing bytes into ``hasher``; return how many there were.
