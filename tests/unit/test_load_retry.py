@@ -369,3 +369,55 @@ async def test_a_second_cold_load_plans_only_after_the_first_has_started() -> No
         "ready:test/b",
     ]
     assert supervisor.stopped == [], "neither load evicted the other"
+
+
+async def test_a_request_during_a_watcher_relaunch_waits_instead_of_replanning() -> None:
+    """The supervisor's crash watcher is bringing the child back (state
+    "loading"). Planning again launches nothing -- start() hands back the
+    in-flight instance -- but could evict bystanders, and the caller would
+    forward to a port nobody listens on yet. Wait for it to settle."""
+    import asyncio
+
+    supervisor = StubSupervisor()
+    planner = StubPlanner()
+    manager = make_manager(supervisor, planner)
+    manager.SETTLE_POLL_S = 0.01  # type: ignore[misc]
+    relaunching = InstanceInfo(
+        model_id="test/model",
+        state="loading",
+        port=18100,
+        plan=LoadPlan(model_id="test/model", devices=[0]),
+    )
+    supervisor.instances["test/model"] = relaunching
+
+    async def come_up() -> None:
+        await asyncio.sleep(0.05)
+        relaunching.state = "ready"
+
+    asyncio.create_task(come_up())
+    record, instance = await manager.ensure_loaded("test/model")
+    assert instance.state == "ready"
+    assert planner.calls == 0, "an in-flight start is waited for, not re-planned"
+    assert supervisor.starts == 0
+    assert supervisor.stopped == []
+
+
+async def test_a_watcher_relaunch_that_fails_falls_through_to_a_fresh_plan() -> None:
+    import asyncio
+
+    supervisor = StubSupervisor()
+    planner = StubPlanner()
+    manager = make_manager(supervisor, planner)
+    manager.SETTLE_POLL_S = 0.01  # type: ignore[misc]
+    dying = InstanceInfo(model_id="test/model", state="loading", port=18100)
+    supervisor.instances["test/model"] = dying
+
+    async def give_up() -> None:
+        await asyncio.sleep(0.03)
+        dying.state = "failed"
+        supervisor.instances.pop("test/model", None)
+
+    asyncio.create_task(give_up())
+    _, instance = await manager.ensure_loaded("test/model")
+    assert instance.state == "ready"
+    assert planner.calls == 1 and supervisor.starts == 1

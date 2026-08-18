@@ -362,6 +362,20 @@ class ModelManager:
         kv_cache_type: Any,
         parallel: int | None,
     ) -> InstanceInfo:
+        existing = self.supervisor.get(record.id)
+        if existing is not None and existing.state == "loading":
+            # The supervisor is already bringing this child up -- its crash
+            # watcher relaunching it after an exit. Planning again would launch
+            # nothing (start() returns the in-flight instance) but could evict
+            # bystanders for a placement that is already decided, and the
+            # caller would then be handed a "loading" instance and forward a
+            # request to a port nobody is listening on yet. Wait for that
+            # start to settle instead; only a start that fails falls through
+            # to a fresh plan.
+            settled = await self._await_settled(record.id)
+            if settled is not None:
+                return settled
+
         draft = self._draft_for(record)
         adapters = self._adapters_for(record)
 
@@ -412,6 +426,30 @@ class ModelManager:
         # observation about *this* child rather than about the whole card.
         self._record_actual_vram(record, instance.plan or plan, instance)
         return instance
+
+    #: How often a caller waiting on an in-flight start re-checks it.
+    SETTLE_POLL_S = 0.25
+
+    async def _await_settled(self, model_id: str) -> InstanceInfo | None:
+        """Wait for an in-flight start of ``model_id`` to reach a terminal state.
+
+        Returns the instance once it is ``ready``; ``None`` when it failed,
+        vanished, or is still loading after the configured load timeout (in
+        which case the caller plans a fresh load and the supervisor's own
+        limits decide what happens to the straggler).
+        """
+        deadline = time.monotonic() + float(self.config.gateway.load_timeout_s) + 5.0
+        while time.monotonic() < deadline:
+            instance = self.supervisor.get(model_id)
+            if instance is None or instance.state != "loading":
+                return instance if instance is not None and instance.state == "ready" else None
+            await asyncio.sleep(self.SETTLE_POLL_S)
+        log.warning(
+            "an in-flight start never settled; planning a fresh load",
+            model_id=model_id,
+            waited_s=round(float(self.config.gateway.load_timeout_s) + 5.0),
+        )
+        return None
 
     def _vram_error(self, rejected: LoadRejected) -> InsufficientVramError:
         """Turn a planner refusal into the 507, keeping every number with it."""
