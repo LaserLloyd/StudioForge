@@ -379,6 +379,8 @@ async def test_list_models_limit_above_the_library_size_is_not_an_error(
     assert result["count"] == 3
     assert result["truncated"] is False
     assert result["total_matching"] == 3
+    exact = await call(server, "list_models", limit=3)
+    assert exact["count"] == 3 and exact["truncated"] is False, "a limit that fits hides nothing"
 
 
 async def test_list_models_says_when_the_limit_hid_rows(state: State) -> None:

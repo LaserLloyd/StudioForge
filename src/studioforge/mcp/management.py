@@ -549,6 +549,7 @@ def build_management_mcp(state: Any) -> MCPServer:
         catalog = await run_in_threadpool(state.manager.catalog, compact=not full, refresh=refresh)
         loaded = {i.model_id: i for i in state.supervisor.list()}
         rows: list[dict[str, Any]] = []
+        limit_reached = False
         truncated = False
         total_matching = 0
         for entry in catalog["models"]:
@@ -561,7 +562,8 @@ def build_management_mcp(state: Any) -> MCPServer:
             if loaded_only and instance is None:
                 continue
             total_matching += 1
-            if truncated:
+            if limit_reached:
+                truncated = True  # a matching row the limit hid
                 continue  # keep counting what the limit hid
             # Catalog fields first, the pre-catalog projection second, so on
             # any key they share the OLD meaning wins. `state` is the one that
@@ -579,7 +581,7 @@ def build_management_mcp(state: Any) -> MCPServer:
             # models" is the question, and truncating the catalog first would
             # answer "whichever of the five newest models happen to be chat".
             if limit is not None and limit >= 0 and len(rows) >= limit:
-                truncated = True
+                limit_reached = True
         return {
             "ok": True,
             "catalog_hint": catalog["catalog_hint"],

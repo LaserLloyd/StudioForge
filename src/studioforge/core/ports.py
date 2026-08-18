@@ -102,15 +102,31 @@ def supervising_tray_is_alive() -> bool:
     """
     try:
         me = psutil.Process(os.getpid())
-        parent = me.parent()
+        argv = list(me.cmdline())[1:]
+        created = float(me.create_time())
+        current = me
+        parent: psutil.Process | None = None
+        # Through venv launcher stubs: on Windows `.venv/Scripts/python.exe` is
+        # a redirector that runs the real interpreter as its child with the
+        # same argv, so our direct parent is usually that stub and the tray is
+        # one hop above it. Same rule as the watchdog's launch_parent().
+        for _ in range(8):
+            candidate = current.parent()
+            if candidate is None:
+                return False
+            with candidate.oneshot():
+                if candidate.status() == psutil.STATUS_ZOMBIE:
+                    return False
+                if float(candidate.create_time()) > created + 1.0:
+                    return False  # pid reused: this is not the process that launched us
+                candidate_argv = list(candidate.cmdline())
+            if candidate_argv[1:] != argv or not argv:
+                parent = candidate
+                break
+            current = candidate
         if parent is None:
             return False
-        with parent.oneshot():
-            if parent.status() == psutil.STATUS_ZOMBIE:
-                return False
-            if float(parent.create_time()) > float(me.create_time()) + 1.0:
-                return False  # pid reused: this is not the process that launched us
-            cmdline = [str(part).lower() for part in parent.cmdline()]
+        cmdline = [str(part).lower() for part in parent.cmdline()]
     except Exception:  # noqa: BLE001 - psutil raises a family; "unknown" is "no"
         return False
     return "studioforge" in " ".join(cmdline) and any(part == "tray" for part in cmdline)

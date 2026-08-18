@@ -534,31 +534,86 @@ def _is_tray_cmdline(cmdline: Sequence[str]) -> bool:
     return "studioforge" in joined and ("tray" in joined.split() or "tray_app" in joined)
 
 
+def launch_parent(proc: psutil.Process) -> psutil.Process | None:
+    """The process that *launched* ``proc``: its parent, seen through launcher stubs.
+
+    On Windows a venv's ``Scripts/python.exe`` (uv's and CPython's own) is a
+    small redirector: it starts the real interpreter as its child with the same
+    arguments and waits, and the two are tied by a job object -- kill the stub
+    and the interpreter dies. So the *direct* parent of a StudioForge process
+    is very often a stub whose argv is its own, and the process that actually
+    decided to start it -- the tray, the watchdog, a shell -- is one hop up.
+    Walks up while the ancestor's argv (past the executable) equals ``proc``'s,
+    applying the pid-reuse guard at every hop (an ancestor must predate the
+    child). Returns ``None`` when there is no such process.
+    """
+    try:
+        argv = list(proc.cmdline())[1:]
+        created = float(proc.create_time())
+        current = proc
+        for _ in range(8):  # stubs do not nest deeper than this; a bound, not a limit
+            parent = current.parent()
+            if parent is None:
+                return None
+            with parent.oneshot():
+                if parent.status() == psutil.STATUS_ZOMBIE:
+                    return None
+                if float(parent.create_time()) > created + 1.0:
+                    return None
+                parent_argv = list(parent.cmdline())
+            if parent_argv[1:] != argv or not argv:
+                return parent
+            current = parent
+    except (psutil.Error, ValueError, OSError):
+        return None
+    return None
+
+
 def supervising_tray_pid(pid: int) -> int | None:
     """The pid of a live StudioForge tray that launched ``pid``, or ``None``.
 
     The tray supervises the server as its own child and respawns it when it
     exits (``tray_app.TrayApp._supervise``). A restart performed here by
     killing that child must therefore *not* spawn a replacement: the tray
-    will, and two spawns race for the ports (D28). Only a direct parent
-    counts -- a tray somewhere higher up the tree did not launch this
-    process and will not respawn it -- and the parent must predate the child,
-    the same pid-reuse guard :func:`engine_orphan_state` applies.
+    will, and two spawns race for the ports (D28). Only the launching parent
+    counts (:func:`launch_parent` -- the direct parent, or the process above a
+    venv launcher stub) -- a tray somewhere higher up the tree did not launch
+    this process and will not respawn it -- and the parent must predate the
+    child, the same pid-reuse guard :func:`engine_orphan_state` applies.
     """
     try:
-        proc = psutil.Process(pid)
-        parent = proc.parent()
+        parent = launch_parent(psutil.Process(pid))
         if parent is None:
             return None
-        with parent.oneshot():
-            if parent.status() == psutil.STATUS_ZOMBIE:
-                return None
-            if float(parent.create_time()) > float(proc.create_time()) + 1.0:
-                return None
-            cmdline = list(parent.cmdline())
+        cmdline = list(parent.cmdline())
     except (psutil.Error, ValueError, OSError):
         return None
     return int(parent.pid) if _is_tray_cmdline(cmdline) else None
+
+
+def own_launcher_chain(root_pid: int) -> set[int]:
+    """Our own pid plus every ancestor of ours that sits *below* ``root_pid``.
+
+    The watchdog is normally a child of the server it restarts; under a venv
+    launcher it is a grandchild, with the stub in between -- and the stub's job
+    object takes the real interpreter down with it. Killing the server's tree
+    with only ``os.getpid()`` excluded killed that stub, and the watchdog died
+    in the middle of its own restart with nothing spawned (seen live on this
+    box, WP13). The set to protect is the chain from us up to, but never
+    including, the target root.
+    """
+    protected = {os.getpid()}
+    try:
+        current = psutil.Process(os.getpid())
+        for _ in range(16):
+            parent = current.parent()
+            if parent is None or parent.pid == root_pid:
+                break
+            protected.add(parent.pid)
+            current = parent
+    except (psutil.Error, ValueError, OSError):
+        pass
+    return protected
 
 
 def _config_matches(cmdline: Sequence[str], config_path: Path | None) -> bool:
@@ -1299,7 +1354,7 @@ class Watchdog:
         # our own pid is inside that tree. Without the exclusion this call
         # killed the watchdog in the middle of the restart it was performing,
         # and no fresh server was ever spawned (D21).
-        keep_alive = {os.getpid()}
+        keep_alive = own_launcher_chain(process.pid) if process is not None else {os.getpid()}
         if process is not None:
             log.warning("restarting the main server: killing pid %s", process.pid)
             killed = await asyncio.to_thread(

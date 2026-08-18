@@ -37,6 +37,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+import psutil
 import pytest
 import typer
 
@@ -999,8 +1000,60 @@ class TestKillProcessTreeExclusion:
     def test_restart_server_excludes_the_watchdogs_own_pid(self) -> None:
         source = Path(wd.__file__ or "").read_text(encoding="utf-8")
         body = source.split("async def restart_server")[1].split("# -- model kills")[0]
-        assert "keep_alive = {os.getpid()}" in body
+        assert "keep_alive = own_launcher_chain(process.pid)" in body
         assert "exclude=keep_alive" in body
+
+    def test_own_launcher_chain_protects_the_stub_between_us_and_the_target(self) -> None:
+        """Under a venv launcher the watchdog is the target's *grandchild*, with
+        the redirector stub in between -- and the stub's job object takes the
+        real interpreter down with it. Seen live: the watchdog killed the stub,
+        died, and spawned nothing."""
+        chain = wd.own_launcher_chain(root_pid=-1)  # no ancestor is the root
+        me = psutil.Process(os.getpid())
+        assert os.getpid() in chain
+        parent = me.parent()
+        if parent is not None:
+            assert parent.pid in chain, "the direct parent (a launcher stub, live) is protected"
+        # The root itself is never protected: with our parent as the root, only
+        # our own pid is in the set.
+        if parent is not None:
+            assert wd.own_launcher_chain(root_pid=parent.pid) == {os.getpid()}
+
+    def test_launch_parent_sees_through_a_stub_with_the_same_argv(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class _Proc:
+            def __init__(self, pid: int, argv: list[str], parent: Any, created: float) -> None:
+                self.pid, self._argv, self._parent, self._created = pid, argv, parent, created
+
+            def cmdline(self) -> list[str]:
+                return list(self._argv)
+
+            def create_time(self) -> float:
+                return self._created
+
+            def parent(self) -> Any:
+                return self._parent
+
+            def status(self) -> str:
+                return "running"
+
+            def oneshot(self) -> Any:
+                import contextlib
+
+                return contextlib.nullcontext()
+
+        tray = _Proc(10, ["pythonw.exe", "-m", "studioforge", "tray"], None, 1.0)
+        stub = _Proc(20, [".venv/Scripts/python.exe", "-m", "studioforge", "serve"], tray, 2.0)
+        real = _Proc(30, ["Python312/python.exe", "-m", "studioforge", "serve"], stub, 2.1)
+        assert wd.launch_parent(real) is tray  # type: ignore[arg-type]
+        # No stub: the direct parent is the launcher.
+        direct = _Proc(31, ["python.exe", "-m", "studioforge", "serve"], tray, 2.0)
+        assert wd.launch_parent(direct) is tray  # type: ignore[arg-type]
+        # A recycled pid above us (created after us) is not our launcher.
+        late = _Proc(40, ["python.exe", "-m", "studioforge", "tray"], None, 99.0)
+        orphan = _Proc(41, ["python.exe", "-m", "studioforge", "serve"], late, 2.0)
+        assert wd.launch_parent(orphan) is None  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------

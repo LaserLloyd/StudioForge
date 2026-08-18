@@ -1737,3 +1737,37 @@ prefix, the reclaim recheck), `tests/unit/test_restart_handover.py` (stale super
 children never inherit it), `tests/unit/test_registry_sticky.py` (unreachable vs removed; the
 sweeper), `tests/unit/test_gui_setup_tab.py` (install phase, no second button),
 `tests/unit/test_startup_resilience.py` (readiness after the boot).
+
+---
+
+## D34 -- Process identity is read through venv launcher stubs
+
+**Problem (seen live, WP13, 2026-08-19 04:46).** On Windows a virtual environment's
+`Scripts/python.exe` -- the one `uv venv` and `python -m venv` both install, the one every
+launcher, the tray and `sys.executable` name -- is a 270 KB *redirector*: it starts the real
+interpreter as its child with the same arguments, waits, and the two are tied by a job object, so
+killing the stub kills the interpreter. Two D21/D28 rules were written for a tree without the stub:
+
+* The watchdog kills the server's process tree with only its **own** pid excluded. Under the stub
+  the watchdog is the server's *grandchild*; the tree kill took its stub parent, the stub's job took
+  the watchdog, and `POST /restart` ended with the server dead, the watchdog dead and nothing
+  spawned -- the exact outcome D21 was written to prevent, one process further up. Reproduced live
+  on 1252/1253: the watchdog log ends at `killing pid N`.
+* "The tray launched this server" was decided by looking at the server's *direct parent*, which
+  under the stub is a redirector whose argv is the server's own. So the watchdog would not defer to
+  the tray, and the new `supervising_tray_is_alive` gate would never see the tray -- both halves of
+  D28 quietly off on the deployment they were made for.
+
+**Decision.** *A process's launcher is the nearest ancestor whose argv (past the executable)
+differs from its own.* `watchdog.server.launch_parent` and `core.ports.supervising_tray_is_alive`
+walk up through same-argv ancestors (bounded, with the pid-reuse guard at every hop) before asking
+"is this a tray". And the watchdog's tree kill protects `own_launcher_chain(root)`: its own pid
+plus every ancestor of its own between it and the target root -- never the root itself, and never
+its own descendants (the next server it spawns is one, and the next restart must be able to kill
+it). Verified live after the fix: kill pid 26116 -> `spawned the replacement server (pid 25032)`
+-> `POST /restart finished: ok=True`; one server on 1252/8098, the watchdog still on 1253, the old
+child gone.
+
+**What pins it.** `tests/unit/test_restart_handover.py::TestKillProcessTreeExclusion` (the chain
+protects the direct parent and never the root; `launch_parent` sees through a same-argv stub and
+refuses a recycled pid), and the live record above.
