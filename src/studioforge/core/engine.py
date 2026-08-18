@@ -549,8 +549,23 @@ class EngineManager:
         self._flag_cache: dict[str, set[str]] = {}
         self._removed_cache: dict[str, dict[str, str | None]] = {}
         self._help_cache: dict[str, str] = {}
+        #: One lock per tag around install/build. Two installs of one tag at
+        #: once -- the Setup tab's Install button clicked while boot is already
+        #: installing, or clicked twice -- would both stream into the same
+        #: ``downloads/<asset>.zip.part`` and both extract into the same
+        #: directory; the second finishes with a corrupt archive or a
+        #: half-overwritten engine. Serialised, the second caller finds the
+        #: engine present and passes through ``already_present``.
+        self._install_locks: dict[str, asyncio.Lock] = {}
         self.os_token = self._detect_os_token()
         self.arch_token = _norm_arch(platform.machine() or "x86_64")
+
+    def _install_lock(self, tag: str) -> asyncio.Lock:
+        lock = self._install_locks.get(tag)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._install_locks[tag] = lock
+        return lock
 
     # -- lifecycle ------------------------------------------------------
 
@@ -1055,7 +1070,21 @@ class EngineManager:
         progress: ProgressFn | None = None,
         force: bool = False,
     ) -> EngineInfo:
-        """Download, extract and verify the best prebuilt engine for ``tag``."""
+        """Download, extract and verify the best prebuilt engine for ``tag``.
+
+        Serialised per tag (see ``_install_locks``): a second concurrent call
+        waits, then finds the engine present and returns it.
+        """
+        async with self._install_lock(tag):
+            return await self._install_locked(tag, progress=progress, force=force)
+
+    async def _install_locked(
+        self,
+        tag: str,
+        *,
+        progress: ProgressFn | None,
+        force: bool,
+    ) -> EngineInfo:
         dest = self.engine_dir(tag)
         existing = find_server_binary(dest)
         if existing is not None and not force:
@@ -1367,24 +1396,67 @@ class EngineManager:
     # ------------------------------------------------------------------
 
     async def ensure_engine(self, *, progress: ProgressFn | None = None) -> EngineInfo:
-        """Guarantee a usable engine exists, installing or building if needed."""
+        """Guarantee a usable engine exists, installing or building if needed.
+
+        **An installed engine is reused, never reinstalled, from here** (D27).
+        This runs at every boot, before the API port is bound, so it has to
+        be fast and it has to be deterministic. It used to run the full smoke
+        test -- ``--version`` plus a real GPU micro-load -- and treat a failed
+        micro-load as "the install is bad": it then went to GitHub, called
+        :meth:`install` on the *same* tag, which ran the same micro-load
+        again, failed again, and re-downloaded a 600 MB archive over a working
+        engine, all with the port unbound. Every one of the ways that
+        micro-load fails at boot -- every GPU full because ComfyUI is
+        training, a corrupt or half-downloaded tiny model, a driver too old
+        for the build -- is a condition a reinstall of the same archive cannot
+        change, so the reinstall bought minutes of dead air and nothing else.
+
+        The rule now: ``--version`` must run (a half-extracted zip or missing
+        DLLs fail here, and *that* is a broken install worth replacing). The
+        micro-load runs only for a build that has never passed one; if it
+        fails, the engine is still activated with one WARNING carrying the
+        detail, and the first real load reports the real error with the
+        child's stderr tail. Reinstalling is an explicit act (Setup tab,
+        ``engine --update``, ``install(force=True)``), not a boot side effect.
+        """
         self.check_pinned_tag()
         tag = self.config.engine.pinned_tag
         for candidate in (tag, f"{tag}-local"):
             info = self.get(candidate)
             if info is None:
                 continue
-            smoke = await self._smoke(candidate, None)
-            if smoke.ok or smoke.no_model:
-                self.set_active(candidate)
-                info.active = True
-                info.smoke_tested = smoke.ok
-                info.smoke_tested_at = time.time() if smoke.ok else None
-                info.version_string = smoke.version_string or info.version_string
-                self._write_meta(info)
-                log.info("engine.ensure.reused", tag=candidate, smoke_ok=smoke.ok)
-                return info
-            log.warning("engine.ensure.smoke_failed", tag=candidate, detail=smoke.detail)
+            smoke = await self._boot_check(candidate, info)
+            if not smoke.version_ok:
+                log.warning(
+                    "engine.ensure.broken_install",
+                    tag=candidate,
+                    detail=smoke.detail,
+                    action="reinstalling: the binary does not even run --version",
+                )
+                continue
+            self.set_active(candidate)
+            info.active = True
+            if smoke.ok:
+                info.smoke_tested = True
+                info.smoke_tested_at = time.time()
+            info.version_string = smoke.version_string or info.version_string
+            self._write_meta(info)
+            self._warn_driver_too_old(info)
+            if smoke.ok or smoke.no_model or info.smoke_tested:
+                log.info("engine.ensure.reused", tag=candidate, detail=smoke.detail)
+            else:
+                log.warning(
+                    "engine.ensure.smoke_failed",
+                    tag=candidate,
+                    detail=smoke.detail,
+                    action=(
+                        "kept as the active engine: the binary runs, and a reinstall of the "
+                        "same build cannot fix a failed micro-load. The first real load will "
+                        "report the actual error; `studioforge engine --smoke-test` re-runs "
+                        "the check by hand"
+                    ),
+                )
+            return info
 
         assets: list[EngineAsset] = []
         error: str | None = None
@@ -1423,10 +1495,9 @@ class EngineManager:
         code, text = await self._capture(self.server_binary(tag), ["--version"])
         if code != 0 and not text.strip():
             return None
-        for line in text.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("version:") or _BUILD_RE.search(stripped):
-                return stripped
+        found = _version_line(text)
+        if found is not None:
+            return found
         return next((line.strip() for line in text.splitlines() if line.strip()), None)
 
     async def list_devices(self, tag: str) -> list[str]:
@@ -1459,6 +1530,75 @@ class EngineManager:
         result = await self._smoke(tag, tiny_model)
         return result.ok, result.detail
 
+    async def _boot_check(self, tag: str, info: EngineInfo) -> _SmokeResult:
+        """The startup verification of an installed engine (see :meth:`ensure_engine`).
+
+        ``--version`` always: it is cheap, touches no GPU, and is what fails
+        for a genuinely broken install (missing DLLs, a half-extracted
+        archive). The GPU micro-load only for a build that has never passed
+        one -- a build that passed on this box is trusted, because the
+        micro-load fails at boot for reasons that have nothing to do with the
+        install (every GPU full, a corrupt tiny model, a driver change) and
+        each of those is reported far more usefully by the first real load.
+        """
+        binary = info.server_binary
+        code, text = await self._capture(binary, ["--version"])
+        version = _version_line(text) if code == 0 else None
+        if version is None:
+            tail = "\n".join(text.splitlines()[-40:])
+            return _SmokeResult(
+                False,
+                f"'{binary.name} --version' exited {code} without a parsable version line. "
+                f"Output tail:\n{tail}",
+            )
+        if info.smoke_tested:
+            when = (
+                time.strftime("%Y-%m-%d %H:%M", time.localtime(info.smoke_tested_at))
+                if info.smoke_tested_at
+                else "earlier"
+            )
+            return _SmokeResult(
+                True,
+                f"engine {tag}: {version}; micro-load passed {when}, not repeated at boot",
+                version_ok=True,
+                version_string=version,
+            )
+        return await self._smoke(tag, None)
+
+    def _warn_driver_too_old(self, info: EngineInfo) -> str | None:
+        """One WARNING when the driver cannot run the installed CUDA build.
+
+        A driver downgrade after install (or an install copied from another
+        box) is otherwise diagnosed only by the first load, as an opaque
+        ``cuda error`` in a stderr tail. The comparison is the same one
+        :meth:`select_asset` uses to *choose* a build (``_cuda_eligible``): a
+        ``cuda-13.3`` binary needs a driver advertising CUDA 13.3 or newer.
+        Returns the warning text, or ``None`` when the driver is fine.
+        """
+        needed = (
+            _parse_version(info.variant[len("cuda-") :])
+            if info.variant.startswith("cuda-")
+            else None
+        )
+        driver = self._cuda_driver_version()
+        if needed is None or driver is None or _cuda_eligible(needed, driver):
+            return None
+        detail = (
+            f"engine {info.tag} is a {info.variant} build but this driver only "
+            f"advertises CUDA {_fmt_version(driver)}; loads will fail to initialise "
+            f"CUDA. Update the NVIDIA driver, or set engine.cuda_variant to a build "
+            f"this driver can run and reinstall the engine (Setup tab, or "
+            f"`studioforge engine --update`)."
+        )
+        log.warning(
+            "engine.driver_too_old",
+            tag=info.tag,
+            variant=info.variant,
+            driver_cuda=_fmt_version(driver),
+            detail=detail,
+        )
+        return detail
+
     async def _smoke(self, tag: str, tiny_model: Path | None) -> _SmokeResult:
         try:
             binary = self.server_binary(tag)
@@ -1466,11 +1606,7 @@ class EngineManager:
             return _SmokeResult(False, str(exc))
 
         code, text = await self._capture(binary, ["--version"])
-        version = None
-        for line in text.splitlines():
-            if line.strip().startswith("version:") or _BUILD_RE.search(line):
-                version = line.strip()
-                break
+        version = _version_line(text)
         if code != 0 or version is None:
             tail = "\n".join(text.splitlines()[-40:])
             return _SmokeResult(
@@ -1923,6 +2059,15 @@ def _cuda_eligible(asset_cuda: tuple[int, int] | None, driver: tuple[int, int] |
 
 def _fmt_version(version: tuple[int, int] | None) -> str:
     return "unknown" if version is None else f"{version[0]}.{version[1]}"
+
+
+def _version_line(text: str) -> str | None:
+    """The ``version: ... (build NNNN, ...)`` line out of ``--version`` output."""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("version:") or _BUILD_RE.search(stripped):
+            return stripped
+    return None
 
 
 def _reuse_completed_download(target: Path, expected_bytes: int) -> bool:

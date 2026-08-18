@@ -699,6 +699,197 @@ async def test_ensure_engine_reuses_installed_engine(monkeypatch: pytest.MonkeyP
 
 
 # ---------------------------------------------------------------------------
+# ensure_engine at boot: an installed engine is reused, never reinstalled (D27)
+#
+# The old policy ran the full smoke test (a real GPU micro-load) at every boot
+# and treated a failed micro-load as a broken install: it went to GitHub,
+# called install() on the same tag, ran the same micro-load again, and
+# re-downloaded ~600 MB over a working engine -- with the API port unbound the
+# whole time. Every reason that micro-load fails at boot (every GPU full,
+# a corrupt tiny model, a driver change) is one a reinstall cannot change.
+# ---------------------------------------------------------------------------
+
+
+def _installed_engine(
+    mgr: EngineManager, *, smoke_tested: bool, variant: str = "cuda-13.3"
+) -> Path:
+    directory = _fake_engine(mgr.engines_dir, TAG, 1_000_000)
+    (directory / "engine.json").write_text(
+        json.dumps(
+            {
+                "tag": TAG,
+                "variant": variant,
+                "smoke_tested": smoke_tested,
+                "smoke_tested_at": 1_700_000_000.0 if smoke_tested else None,
+                "installed_at": 1_000_000,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return directory
+
+
+def _no_network(mgr: EngineManager, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def boom(tag: str) -> list[EngineAsset]:  # pragma: no cover - must not run
+        raise AssertionError("ensure_engine hit the network for an installed engine")
+
+    monkeypatch.setattr(mgr, "list_assets", boom)
+
+
+@pytest.mark.asyncio
+async def test_boot_trusts_a_previously_verified_engine_without_a_micro_load(
+    manager: EngineManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _installed_engine(manager, smoke_tested=True)
+    _no_network(manager, monkeypatch)
+    micro_loads: list[str] = []
+
+    async def fake_capture(binary: Path, args: Any) -> tuple[int, str]:
+        assert list(args) == ["--version"]
+        return 0, "version: 1 (build 10425)\n"
+
+    async def fake_smoke(tag: str, tiny_model: Any) -> _SmokeResult:  # pragma: no cover
+        micro_loads.append(tag)
+        return _SmokeResult(True, "should not run")
+
+    monkeypatch.setattr(manager, "_capture", fake_capture)
+    monkeypatch.setattr(manager, "_smoke", fake_smoke)
+
+    info = await manager.ensure_engine()
+    assert info.tag == TAG and info.active is True
+    assert micro_loads == [], "a build that already passed a micro-load must not re-run it at boot"
+    assert manager.active() is not None and manager.active().tag == TAG
+
+
+@pytest.mark.asyncio
+async def test_boot_micro_loads_an_engine_that_was_never_verified(
+    manager: EngineManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _installed_engine(manager, smoke_tested=False)
+    _no_network(manager, monkeypatch)
+    micro_loads: list[str] = []
+
+    async def fake_capture(binary: Path, args: Any) -> tuple[int, str]:
+        return 0, "version: 1 (build 10425)\n"
+
+    async def fake_smoke(tag: str, tiny_model: Any) -> _SmokeResult:
+        micro_loads.append(tag)
+        return _SmokeResult(True, "ok", version_ok=True, version_string="build 10425")
+
+    monkeypatch.setattr(manager, "_capture", fake_capture)
+    monkeypatch.setattr(manager, "_smoke", fake_smoke)
+
+    info = await manager.ensure_engine()
+    assert micro_loads == [TAG]
+    assert info.smoke_tested is True
+    # ...and the verdict is persisted, so the NEXT boot skips it.
+    assert manager.get(TAG) is not None and manager.get(TAG).smoke_tested is True
+
+
+@pytest.mark.asyncio
+async def test_a_failed_boot_micro_load_keeps_the_engine_and_never_reinstalls(
+    manager: EngineManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A full GPU at boot must not turn into a GitHub call and a re-download."""
+    _installed_engine(manager, smoke_tested=False)
+    _no_network(manager, monkeypatch)
+    installs: list[str] = []
+
+    async def fake_capture(binary: Path, args: Any) -> tuple[int, str]:
+        return 0, "version: 1 (build 10425)\n"
+
+    async def fake_smoke(tag: str, tiny_model: Any) -> _SmokeResult:
+        return _SmokeResult(
+            False,
+            "micro-load failed: CUDA error: out of memory",
+            version_ok=True,
+            version_string="build 10425",
+        )
+
+    async def fake_install(tag: str, **kwargs: Any) -> Any:  # pragma: no cover
+        installs.append(tag)
+        raise AssertionError("boot must not reinstall an engine that runs")
+
+    monkeypatch.setattr(manager, "_capture", fake_capture)
+    monkeypatch.setattr(manager, "_smoke", fake_smoke)
+    monkeypatch.setattr(manager, "install", fake_install)
+
+    info = await manager.ensure_engine()
+    assert info.tag == TAG and info.active is True
+    assert info.smoke_tested is False, "a failed micro-load is not recorded as a pass"
+    assert installs == []
+
+
+@pytest.mark.asyncio
+async def test_a_binary_that_cannot_run_version_is_a_broken_install_and_is_replaced(
+    manager: EngineManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _installed_engine(manager, smoke_tested=True)
+    asked: list[str] = []
+
+    async def fake_capture(binary: Path, args: Any) -> tuple[int, str]:
+        return 3221225781, "The code execution cannot proceed because ggml-cuda.dll was not found"
+
+    async def fake_assets(tag: str) -> list[EngineAsset]:
+        asked.append(tag)
+        return []
+
+    monkeypatch.setattr(manager, "_capture", fake_capture)
+    monkeypatch.setattr(manager, "list_assets", fake_assets)
+    manager.config.engine.allow_source_build = False
+
+    with pytest.raises(EngineError):
+        await manager.ensure_engine()
+    assert asked == [TAG], "a binary that does not run --version must be reinstalled"
+
+
+def test_driver_too_old_for_the_installed_build_is_one_warning(tmp_config: Config) -> None:
+    mgr = EngineManager(tmp_config, probe=StubProbe(MIXED_GPUS, (12, 4)))
+    _installed_engine(mgr, smoke_tested=True, variant="cuda-13.3")
+    info = mgr.get(TAG)
+    assert info is not None
+    text = mgr._warn_driver_too_old(info)
+    assert text is not None
+    assert "driver only advertises CUDA 12.4" in text
+    assert "engine.cuda_variant" in text  # names the knob, not just the symptom
+
+    # A driver that CAN run the build says nothing; so does a non-CUDA variant.
+    ok = EngineManager(tmp_config, probe=StubProbe(MIXED_GPUS, (13, 3)))
+    assert ok._warn_driver_too_old(info) is None
+    info.variant = "source-local"
+    assert mgr._warn_driver_too_old(info) is None
+
+
+@pytest.mark.asyncio
+async def test_two_installs_of_one_tag_share_one_download(
+    manager: EngineManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Setup tab's Install button clicked during the boot install must wait,
+    not stream into the same ``.part`` file."""
+    downloads: list[str] = []
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_locked(tag: str, *, progress: Any, force: bool) -> Any:
+        downloads.append(tag)
+        entered.set()
+        await release.wait()
+        _fake_engine(manager.engines_dir, tag, 1_000_000)
+        return manager.get(tag)
+
+    monkeypatch.setattr(manager, "_install_locked", fake_locked)
+
+    first = asyncio.create_task(manager.install(TAG))
+    await entered.wait()
+    second = asyncio.create_task(manager.install(TAG))
+    await asyncio.sleep(0.05)
+    assert downloads == [TAG], "the second install must wait for the first"
+    release.set()
+    await asyncio.gather(first, second)
+    assert downloads == [TAG, TAG]  # ran in turn, never together
+
+
+# ---------------------------------------------------------------------------
 # Release discovery + update check
 #
 # Regression cover for 2026-08-18: llama.cpp published a PRERELEASE tagged
@@ -1239,7 +1430,7 @@ async def test_smoke_test_failure_carries_stderr_tail(
 # Cancellation must never orphan the smoke-test child
 # ---------------------------------------------------------------------------
 
-_HEALTHY_CHILD = '''
+_HEALTHY_CHILD = """
 import json, sys, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -1266,7 +1457,7 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
-'''
+"""
 
 
 @pytest.mark.asyncio

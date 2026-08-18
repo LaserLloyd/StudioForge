@@ -1360,3 +1360,60 @@ clipboard are different acts, and only the second one was asked for.
 the environment (D25) and a form that edits it would fight whatever set `SF_DATA_DIR`; the second
 is bookkeeping. Both are shown read-only in "Where things live", together with which of D25's three
 rules produced the directory in force.
+
+---
+
+## D27 -- Boot reuses an installed engine; it never reinstalls one
+
+**Problem.** `EngineManager.ensure_engine` runs at every boot, inside the lifespan, *before the
+API port is bound*. It ran the full smoke test on the installed engine -- `--version` plus a real
+GPU micro-load of the smallest GGUF in the library -- and read a failed micro-load as "this
+install is broken". It then went to GitHub for the asset list, called `install()` on the **same
+tag**, which ran the same micro-load again, logged `reinstall_after_failed_smoke`, re-downloaded
+the ~600 MB archive (or reused a cached one), extracted it over the working engine, ran the
+micro-load a third time, failed a third time, and raised. `smoke_test_timeout_s` is 180 s, so a
+micro-load that hangs rather than exits costs up to nine minutes of a server that answers
+nothing on any port -- the tray says "Starting...", the watchdog's restart reports
+`restart_unhealthy` at 120 s, and OpenClaw sees connection refused.
+
+Every way that micro-load fails at boot is a condition a reinstall of the same archive cannot
+change: every GPU full because ComfyUI is training on the same box; the tiny model it picked is
+corrupt or half-downloaded; the driver was downgraded under a CUDA 13.3 build. The reinstall
+bought minutes of dead air and a rewritten engine directory, and diagnosed nothing.
+
+**Decision.**
+
+* **`--version` must run; that is the whole boot check for a build that has already passed a
+  micro-load on this box.** It is cheap, touches no GPU, and is exactly what fails for a genuinely
+  broken install (a half-extracted archive, a missing `ggml-cuda.dll`). Only that failure sends
+  boot to the network, and it is logged as `engine.ensure.broken_install` with the reason.
+* **The micro-load runs at boot only for a build that has never passed one** (`smoke_tested`
+  false in its `engine.json`) -- the case where nothing yet proves CUDA initialises with this
+  binary. A pass is written back so the next boot skips it. A failure keeps the engine active,
+  logs one WARNING with the detail and the next action (`studioforge engine --smoke-test`), and
+  lets the first real load report the real error with the child's stderr tail -- which is where
+  "CUDA error: out of memory" or "driver version is insufficient" is actually legible.
+* **Reinstalling is an explicit act** -- the Setup tab's Install button, `engine --update`,
+  `install(force=True)` -- never a boot side effect. `install()` on an already-present tag still
+  re-runs the smoke test and reinstalls after a failure, because there someone asked.
+* **A driver too old for the installed CUDA build is one WARNING at boot**, using the same
+  `_cuda_eligible` comparison `select_asset` uses to choose a build: "engine b10425 is a cuda-13.3
+  build but this driver only advertises CUDA 12.4 ... update the driver, or set
+  `engine.cuda_variant` and reinstall". Before this it surfaced only as the first load's opaque
+  `cuda error`.
+* **Installs are serialised per tag.** The Setup tab's Install button clicked while boot was
+  already installing (or clicked twice) had both callers streaming into the same
+  `downloads/<asset>.zip.part` and extracting into the same directory; the second finished with a
+  corrupt archive or a half-overwritten engine. Behind one `asyncio.Lock` per tag, the second
+  caller waits, finds the engine present, and passes through `already_present`.
+
+**Cost.** A driver downgrade under a build that once passed is no longer caught at boot by a
+failed micro-load -- it is caught by the driver warning above and by the first load. That is
+the trade: boot is fast and deterministic, and the failure moves to the place that can explain
+it.
+
+**What pins it.** `tests/unit/test_engine.py`: a verified engine boots without a micro-load and
+without a network call; an unverified one is micro-loaded and the pass persisted; a failed boot
+micro-load keeps the engine and never calls `install()`; a binary that cannot run `--version`
+is reinstalled; the driver warning names the knob and stays silent when the driver is fine; two
+concurrent installs of one tag run in turn.
