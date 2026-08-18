@@ -1771,3 +1771,39 @@ child gone.
 **What pins it.** `tests/unit/test_restart_handover.py::TestKillProcessTreeExclusion` (the chain
 protects the direct parent and never the root; `launch_parent` sees through a same-argv stub and
 refuses a recycled pid), and the live record above.
+
+---
+
+## D35 -- "Is anything listening?" is answered by connecting, and a port conflict names its port
+
+**Problem.** The first `POST /api/restart/server` after switching the rig to V2 left the rig
+without a server for two minutes and then blamed LM Studio. Serve drained, exited 75 and (D28/D34)
+deliberately left the watchdog running on `0.0.0.0:1235` for the replacement to adopt. The
+replacement's `inspect_running_watchdog()` first asked "is anything on 1235?" by trying to **bind
+`127.0.0.1:1235`** -- and on Windows that bind *succeeds* beside a wildcard listener unless the
+listener set `SO_EXCLUSIVEADDRUSE`. Verdict: "nothing is listening on port 1235"; the watchdog was
+never asked `/health`; adoption was skipped; the wildcard-bind conflict check then correctly said
+1235 was in use, and serve exited 3. The tray, which rightly never crash-respawns a port conflict,
+assumed the conflict was on **1234**, waited its 120 s grace watching a port that was free, and
+reported "Port 1234 is held by another program (LM Studio?)".
+
+**Decision.**
+
+* `ports.port_has_listener(port, host)` **connects**; `inspect_running_watchdog` uses it for the
+  "nothing there" gate. Binding answers "can *I* take this address", connecting answers "is someone
+  *serving* here" -- different questions, and only the second one is the adoption question. Pinned by
+  a test that starts a real `0.0.0.0` listener and asserts the probe gets past the gate.
+* The tray's port-conflict path no longer assumes the server port. While the grace runs, if the
+  server port is bindable the child is respawned after `PORT_CONFLICT_RETRY_DELAY` (5 s), bounded by
+  `MAX_PORT_CONFLICT_RESPAWNS` (3; the counter resets once the server is RUNNING) so a port that is
+  genuinely held elsewhere still ends in a report, not a spawn loop. At the deadline the report is
+  built from a **fresh probe of all three ports** and names the port that is really taken and its
+  holder ("Port 1235 (watchdog) is held by python.exe (pid 25684)"); the "LM Studio?" line is only
+  the fallback when nothing can be named.
+
+**Why this was not caught earlier.** The scratch-data-dir restart tests ran serve and watchdog fresh
+in the same process tree; the failing case needs a watchdog that *survives* the previous serve --
+which is exactly what D28/D34 made happen for the first time on the rig itself.
+
+Tests: `tests/unit/test_ports_preflight.py` (wildcard listener), `tests/unit/test_tray.py`
+(retry, bound, report names the real port).
