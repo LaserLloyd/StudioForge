@@ -1,16 +1,24 @@
 [Unit]
 Description=StudioForge - GPU-only OpenAI-compatible LLM gateway
-Documentation=https://github.com/studioforge/studioforge
+Documentation=file:%h/studioforge/docs/SETUP.md
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=%i
-# Config and registry live outside the release tree so updates cannot destroy
-# them; see DECISIONS.md D7.
-Environment=SF_DATA_DIR=%h/.local/share/studioforge
-ExecStart=%h/.local/bin/studioforge serve
+# A *user* unit (installed under ~/.config/systemd/user, enabled with
+# `systemctl --user`), so it runs as the login user that owns the model
+# library and the venv. It must NOT carry User=/Group= -- those are only valid
+# in system units and made the file unloadable (WP17 F6).
+#
+# Layout this unit assumes -- adjust the three paths below if yours differs:
+#   repo checkout : %h/studioforge
+#   virtualenv    : %h/studioforge/.venv   (uv venv --python 3.12 .venv)
+#   data dir      : %h/studioforge/data    (config.yaml, registry, engines, logs)
+WorkingDirectory=%h/studioforge
+Environment=SF_DATA_DIR=%h/studioforge/data
+Environment=PYTHONUNBUFFERED=1
+ExecStart=%h/studioforge/.venv/bin/studioforge serve
 Restart=on-failure
 RestartSec=5
 # Long enough for a drain plus stopping every llama-server child.

@@ -1,16 +1,23 @@
 [Unit]
 Description=StudioForge recovery watchdog (sidecar)
-Documentation=https://github.com/studioforge/studioforge
+Documentation=file:%h/studioforge/docs/SETUP.md
 After=network-online.target
 Wants=network-online.target
+# Deliberately NOT bound to studioforge.service: the watchdog exists to be up
+# when the main app is not (it restarts it, reclaims orphaned engine
+# processes and answers /health on its own port), so it must never go down
+# with it.
 
 [Service]
 Type=simple
-User=%i
-Environment=SF_DATA_DIR=%h/.local/share/studioforge
-ExecStart=%h/.local/bin/python -m studioforge.watchdog
-# Restart=always, not on-failure: the watchdog exists to be up when the main
-# app is not. It must come back from any exit, including a clean one.
+# Same layout assumptions as studioforge.service (user unit, no User=):
+#   repo checkout : %h/studioforge   venv: %h/studioforge/.venv   data: %h/studioforge/data
+WorkingDirectory=%h/studioforge
+Environment=SF_DATA_DIR=%h/studioforge/data
+Environment=PYTHONUNBUFFERED=1
+ExecStart=%h/studioforge/.venv/bin/python -m studioforge.watchdog --config %h/studioforge/data/config.yaml
+# Restart=always, not on-failure: it must come back from any exit, including a
+# clean one.
 Restart=always
 RestartSec=3
 TimeoutStopSec=20
