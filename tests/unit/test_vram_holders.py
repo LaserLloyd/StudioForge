@@ -724,7 +724,9 @@ def test_reclaim_endpoint_passes_dry_run_through(
         return [{"pid": 101, "alias": "leaked", "killed": not dry_run}]
 
     monkeypatch.setattr(vh, "reclaim_orphans", fake_reclaim)
-    with TestClient(app) as client:
+    # A local caller: on an open install the reclaim route (it kills processes)
+    # is a D32 admin mutation, refused from the LAN without the PIN.
+    with TestClient(app, client=("127.0.0.1", 50000)) as client:
         preview = client.post("/api/vram/reclaim", json={"dry_run": True}).json()
         assert seen["dry_run"] is True
         assert preview == {

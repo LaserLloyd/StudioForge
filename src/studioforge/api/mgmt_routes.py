@@ -489,7 +489,11 @@ def _instance_holding(state: Any, model_id: str) -> str | None:
     """
     if state.supervisor.get(model_id) is not None:
         return str(model_id)
-    for instance in state.supervisor.all():
+    # ``list()`` -- the supervisor has no ``all()``; the old call raised
+    # AttributeError, so DELETE on any model that was not itself loaded came
+    # back as a 500 (and the guard never ran for the persona-on-base case it
+    # was written for).
+    for instance in state.supervisor.list():
         candidate = state.registry.resolve(instance.model_id)
         if candidate is None:
             continue

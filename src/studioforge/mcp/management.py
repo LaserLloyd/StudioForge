@@ -1037,7 +1037,9 @@ def build_management_mcp(state: Any) -> MCPServer:
         With ``delete_files=false`` only the registry entry and saved settings
         go away; the next library scan will find the files again. That is the
         safer choice and almost never what you actually want, so say which you
-        mean.
+        mean. Either way, virtual models (personas) built on this base are
+        removed with it and are NOT restored by a rescan; the result lists them
+        under ``virtual_models_removed``.
 
         Args:
             model_id: Model id or alias.
@@ -1060,17 +1062,33 @@ def build_management_mcp(state: Any) -> MCPServer:
         record = state.registry.resolve(model_id)
         if record is None:
             raise ModelNotFoundError(model_id, known=state.registry.known_ids())
-        if state.supervisor.get(record.id) is not None:
+        # Same guard as DELETE /api/models/{id}: a virtual model with launch-time
+        # overrides runs its OWN child on the BASE model's files, so "is this id
+        # loaded" is not the question -- "is anything serving these files" is.
+        from studioforge.api.mgmt_routes import _instance_holding
+
+        holder = _instance_holding(state, record.id)
+        if holder is not None:
             raise BadRequestError(
-                f"model '{record.id}' is loaded; call unload_model first",
+                f"model '{record.id}' is in use by the loaded instance '{holder}'; call "
+                "unload_model first",
                 code="model_loaded",
             )
+        virtual_children = [
+            r.id
+            for r in state.registry.all()
+            if getattr(r, "is_virtual", False) and getattr(r, "base_model_id", None) == record.id
+        ]
         removed = state.registry.delete_model(record.id, delete_files=delete_files)
         return {
             "ok": True,
             "model_id": record.id,
             "files_deleted": delete_files,
             "removed": [str(p) for p in removed],
+            # Personas built on this base go with it and a rescan will not
+            # bring them back; the docstring's "the next scan finds the files
+            # again" is true of the files, not of these.
+            "virtual_models_removed": virtual_children,
         }
 
     # -- status ----------------------------------------------------------
@@ -1263,7 +1281,20 @@ def build_management_mcp(state: Any) -> MCPServer:
         # is what makes a change take effect without a restart. Mirrors
         # mgmt_routes.set_config deliberately -- both surfaces must behave the
         # same way.
-        for section in ("models", "planner", "gateway", "hf", "logging", "update", "engine"):
+        for section in (
+            "models",
+            "planner",
+            "gateway",
+            "hf",
+            "logging",
+            "update",
+            "engine",
+            # "mcp" too: pin/pin_required are read live by check_request, and
+            # the HTTP route swaps it (its comment records the incident of a
+            # PATCH that reported "no restart needed" while the old PIN kept
+            # being enforced). This tool claims to mirror that route.
+            "mcp",
+        ):
             setattr(config, section, getattr(updated, section))
         config.server.api_key = updated.server.api_key
         config.server.cors_origins = updated.server.cors_origins

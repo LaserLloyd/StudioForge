@@ -68,6 +68,62 @@ def is_mcp_path(path: str, config: Config) -> bool:
     return path == mcp_path or path.startswith(mcp_path.rstrip("/") + "/")
 
 
+#: Management routes that change the box -- its config, its files, its
+#: processes -- rather than its models' residency. On an install with no
+#: ``server.api_key`` these need a caller on this machine or the MCP PIN
+#: (D32); everything else stays open for LM Studio parity (JIT loading from any
+#: client on the LAN is the product). Prefix-matched on the path, and only for
+#: mutating methods.
+_ADMIN_MUTATION_PREFIXES: tuple[str, ...] = (
+    "/api/config",
+    "/api/restart/",
+    "/api/engine/",
+    "/api/update/",
+    "/api/vram/reclaim",
+    "/api/downloads",
+)
+#: Deletions of things on disk / in the registry: same rule, DELETE only.
+_ADMIN_DELETE_PREFIXES: tuple[str, ...] = (
+    "/api/models/",
+    "/api/adapters/",
+    "/api/virtual-models/",
+)
+_MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+def is_admin_mutation(method: str, path: str) -> bool:
+    """Whether ``method path`` is one of the routes D32 guards on an open install."""
+    verb = (method or "").upper()
+    if verb not in _MUTATING_METHODS:
+        return False
+    if any(path == p.rstrip("/") or path.startswith(p) for p in _ADMIN_MUTATION_PREFIXES):
+        return True
+    return verb == "DELETE" and any(path.startswith(p) for p in _ADMIN_DELETE_PREFIXES)
+
+
+def is_local_request(request: Any) -> bool:
+    """A caller on this machine, or an in-process call (no peer at all).
+
+    The in-process case is the GUI invoking a route handler directly and the
+    tests' ``TestClient`` shims; both are trusted the way ``may_reveal_pin``
+    trusts them. Behind a reverse proxy the peer is the proxy -- a documented
+    limit of any peer-address check; put the proxy behind ``server.api_key``.
+    """
+    client = getattr(request, "client", None)
+    host = getattr(client, "host", None)
+    if not host:
+        return True
+    return _is_loopback(str(host))
+
+
+REMOTE_ADMIN_NOTE = (
+    "this management route changes the server itself and server.api_key is not set, so it "
+    "is only accepted from this machine or with the MCP pairing PIN (header 'X-MCP-Pin', "
+    "or as the bearer token -- sfctl sends it that way). Set server.api_key on the Setup "
+    "tab to manage the server remotely with a real credential."
+)
+
+
 def check_request(request: Request, config: Config) -> None:
     """Raise :class:`AuthError` unless the request is authorized.
 
@@ -83,7 +139,13 @@ def check_request(request: Request, config: Config) -> None:
     When ``server.api_key`` is unset the server is open (LAN/Tailscale trust),
     which matches how LM Studio behaves out of the box -- but an MCP PIN is
     still enforced when one is configured, so the control plane is never
-    accidentally the *least* protected surface.
+    accidentally the *least* protected surface. And on that open install the
+    routes that change the *box* -- edit config, delete files, restart,
+    install an engine or an update, queue downloads, kill processes -- need a
+    caller on this machine or the PIN (D32): the MCP ``set_config`` tool
+    demanded the PIN while ``PATCH /api/config`` -- same capability, same
+    process -- demanded nothing, and anyone on the LAN could set
+    ``server.api_key`` and lock the owner out.
     """
     path = request.url.path
     if request.method == "OPTIONS":
@@ -121,6 +183,13 @@ def check_request(request: Request, config: Config) -> None:
             )
 
     if not expected:
+        if is_admin_mutation(request.method, path) and not is_local_request(request):
+            candidate = extract_pin(request) or provided
+            if pin and candidate and _matches(candidate, str(pin)):
+                return
+            raise AuthError(
+                REMOTE_ADMIN_NOTE, code="remote_admin_requires_credential", status_code=403
+            )
         return
     raise AuthError(
         "Incorrect API key provided. Set the same key the server has in "

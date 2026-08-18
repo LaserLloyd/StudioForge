@@ -228,6 +228,66 @@ class ModelSettings(BaseModel):
             raise ValueError("max_parallel_cap must be >= 1")
         return v
 
+    @field_validator(
+        "parallel",
+        "batch_size",
+        "ubatch_size",
+        "threads",
+        "threads_batch",
+        "draft_ctx_size",
+        "reasoning_budget",
+        "spec_draft_n_max",
+        "spec_draft_n_min",
+    )
+    @classmethod
+    def _positive_counts(cls, v: int | None, info: Any) -> int | None:
+        # These all become llama-server flags verbatim; a 0 or a negative
+        # value dies as an opaque child exit instead of a message naming the
+        # field. (reasoning_budget -1 is llama.cpp's "unlimited"; allowed.)
+        if v is None:
+            return v
+        if info.field_name == "reasoning_budget" and v == -1:
+            return v
+        if v < 1:
+            raise ValueError(f"{info.field_name} must be >= 1")
+        return v
+
+    @field_validator("main_gpu", "cache_reuse")
+    @classmethod
+    def _non_negative(cls, v: int | None, info: Any) -> int | None:
+        if v is not None and v < 0:
+            raise ValueError(f"{info.field_name} must be >= 0")
+        return v
+
+    @field_validator("rope_freq_base", "rope_freq_scale", "spec_draft_p_min")
+    @classmethod
+    def _positive_floats(cls, v: float | None, info: Any) -> float | None:
+        if v is not None and v <= 0:
+            raise ValueError(f"{info.field_name} must be > 0")
+        return v
+
+    @field_validator("device_override", "draft_device_override")
+    @classmethod
+    def _device_indices(cls, v: list[int] | None, info: Any) -> list[int] | None:
+        if v is None:
+            return v
+        if any(index < 0 for index in v):
+            raise ValueError(f"{info.field_name} entries must be CUDA indices >= 0")
+        return v
+
+    @field_validator("engine_tag")
+    @classmethod
+    def _plain_tag(cls, v: str | None) -> str | None:
+        # Becomes a directory name under engines/; one path component only.
+        if v is None:
+            return None
+        cleaned = v.strip()
+        if not cleaned:
+            return None
+        if any(sep in cleaned for sep in ("/", "\\", "..", ":")) or cleaned in {".", ".."}:
+            raise ValueError("engine_tag must be a plain build tag such as 'b10425'")
+        return cleaned
+
 
 class AdapterAttachment(BaseModel):
     """A LoRA adapter attached to a model at a given scale."""

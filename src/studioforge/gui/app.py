@@ -138,6 +138,40 @@ def _is_authorized(headers: Headers, expected: str) -> bool:
     return _safe_eq(cookie, session_token(expected))
 
 
+def _host_only(value: str) -> str:
+    """``host[:port]`` -> ``host``, IPv6 brackets kept, lower-cased."""
+    text = (value or "").strip().lower()
+    if text.startswith("["):
+        return text.split("]", 1)[0] + "]"
+    return text.rsplit(":", 1)[0] if ":" in text else text
+
+
+def _same_origin_websocket(scope: Any) -> bool:
+    """False only for a browser upgrade whose Origin names a different host.
+
+    Non-browser clients send no Origin and pass; a browser always sends one on
+    a WebSocket handshake. Ports are deliberately not compared: the panel is
+    reached through the same host:port it was served from, so the host alone
+    settles same-site, and a proxy that only rewrites the port stays usable.
+    """
+    headers = Headers(scope=scope)
+    origin = headers.get("origin")
+    host = headers.get("host")
+    if not origin or not host:
+        return True
+    from urllib.parse import urlsplit
+
+    try:
+        origin_host = (urlsplit(origin).hostname or "").lower()
+    except ValueError:
+        return False
+    if not origin_host:
+        return False
+    if ":" in origin_host and not origin_host.startswith("["):
+        origin_host = f"[{origin_host}]"
+    return origin_host == _host_only(host)
+
+
 class GuiAuthGate:
     """Raw ASGI gate so websockets are covered, not just page loads.
 
@@ -151,6 +185,25 @@ class GuiAuthGate:
         self.config = config
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope.get("type") == "websocket" and not _same_origin_websocket(scope):
+            # A WebSocket handshake is not subject to the same-origin policy,
+            # and NiceGUI's socket.io accepts any Origin -- so a page on any
+            # website the operator visits could open the control channel to
+            # http://<lan-ip>:8080 and press its buttons. With no API key set
+            # there is no cookie to be missing, so this check is the only
+            # thing between "someone on my LAN" and "any site I browse".
+            log.warning(
+                "gui websocket refused: Origin does not match Host (cross-site upgrade)",
+                origin=Headers(scope=scope).get("origin"),
+                host=Headers(scope=scope).get("host"),
+                hint=(
+                    "a reverse proxy that rewrites the Host header must forward the "
+                    "original one (proxy_set_header Host $host)"
+                ),
+            )
+            await receive()
+            await send({"type": "websocket.close", "code": 1008})
+            return
         expected = self.config.server.api_key
         if not expected or scope.get("type") not in ("http", "websocket"):
             await self.app(scope, receive, send)

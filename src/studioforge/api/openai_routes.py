@@ -137,6 +137,13 @@ async def chat_completions(request: Request) -> Any:
     messages = payload.get("messages")
     if not isinstance(messages, list) or not messages:
         raise BadRequestError("'messages' must be a non-empty array", param="messages")
+    if any(not isinstance(message, dict) for message in messages):
+        # Otherwise the first `.get` inside prepare_messages raises
+        # AttributeError and a plainly malformed request comes back as a 500.
+        raise BadRequestError(
+            "every element of 'messages' must be an object with 'role' and 'content'",
+            param="messages",
+        )
 
     prepared, _stats = await prepare_messages(
         messages, record=record, config=state.config, client=state.client
@@ -475,19 +482,36 @@ async def _forward(state: Any, record: ModelRecord, path: str, payload: dict[str
             headers=SSE_HEADERS,
         )
 
+    # One `finally` for the whole non-streamed exchange: only httpx errors used
+    # to decrement, so a cancellation (client gone, shutdown) or any exception
+    # outside the httpx hierarchy left active_requests stuck at 1 -- which
+    # blocks TTL unload and eviction for that model until a restart. The
+    # streaming path has had this discipline for a while; this is its twin.
     state.supervisor.mark_request_start(record.id)
+    tps: float | None = None
     try:
-        response = await state.client.post(
-            url, json=payload, timeout=state.config.server.request_timeout_s
-        )
-    except httpx.HTTPError as exc:
-        state.supervisor.mark_request_end(record.id)
-        raise UpstreamError(
-            f"llama-server for '{record.id}' failed: {exc}. {_stderr_hint(state, record.id)}"
-        ) from exc
+        try:
+            response = await state.client.post(
+                url,
+                json=payload,
+                timeout=httpx.Timeout(state.config.server.request_timeout_s, connect=10.0),
+            )
+        except httpx.ReadTimeout as exc:
+            raise UpstreamError(
+                f"llama-server for '{record.id}' did not answer within "
+                f"{state.config.server.request_timeout_s:.0f} s (server.request_timeout_s). "
+                "A long generation should stream (stream: true) so no single read waits "
+                "for the whole reply.",
+                code="upstream_timeout",
+                status_code=504,
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise UpstreamError(
+                f"llama-server for '{record.id}' failed: {exc}. {_stderr_hint(state, record.id)}"
+            ) from exc
 
-    elapsed = time.perf_counter() - started
-    try:
+        elapsed = time.perf_counter() - started
+        tps = _tokens_per_second(response, elapsed)
         if response.status_code >= 400:
             raise UpstreamError(
                 _upstream_message(response, record.id, state),
@@ -495,7 +519,6 @@ async def _forward(state: Any, record: ModelRecord, path: str, payload: dict[str
             )
         data = response.json()
     finally:
-        tps = _tokens_per_second(response, elapsed)
         state.supervisor.mark_request_end(record.id, tokens_per_second=tps)
 
     if state.config.gateway.merge_reasoning_into_content:

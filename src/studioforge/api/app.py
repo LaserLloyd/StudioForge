@@ -482,16 +482,21 @@ def create_app(
 
     # Management-plane MCP over streamable HTTP, behind the same API key.
     # Failure here must not stop the server from serving inference.
-    try:
-        from studioforge.mcp.management import mount_management_mcp
+    if config.mcp.enabled:
+        try:
+            from studioforge.mcp.management import mount_management_mcp
 
-        # Follow the CONFIGURED path. Hardcoding "/mcp" while auth
-        # (`is_mcp_path`) and `/api/mcp/info` both honoured `mcp.path` meant a
-        # customised path mounted MCP where the PIN was not accepted, and
-        # advertised a URL that 404s -- defeating the PIN entirely.
-        mount_management_mcp(app, app.state, path=config.mcp.path or "/mcp")
-    except Exception as exc:
-        log.error("management MCP not mounted", error=str(exc))
+            # Follow the CONFIGURED path. Hardcoding "/mcp" while auth
+            # (`is_mcp_path`) and `/api/mcp/info` both honoured `mcp.path` meant
+            # a customised path mounted MCP where the PIN was not accepted, and
+            # advertised a URL that 404s -- defeating the PIN entirely.
+            mount_management_mcp(app, app.state, path=config.mcp.path or "/mcp")
+        except Exception as exc:
+            log.error("management MCP not mounted", error=str(exc))
+    else:
+        # `mcp.enabled: false` used to be inert: the endpoint stayed mounted
+        # and accepted the PIN while /api/mcp/info reported it disabled.
+        log.info("management MCP disabled by config (mcp.enabled: false)")
 
     _install_error_handlers(app)
 

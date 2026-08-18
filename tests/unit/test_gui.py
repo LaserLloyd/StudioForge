@@ -2677,7 +2677,7 @@ def test_engine_update_line_covers_every_state() -> None:
 
 
 def test_engine_update_line_names_the_variant_when_the_check_knows_it() -> None:
-    """"b10488 (cuda-13.3)" vs "(source)" is a download vs a local CUDA compile."""
+    """ "b10488 (cuda-13.3)" vs "(source)" is a download vs a local CUDA compile."""
     prebuilt = {
         "checked": True,
         "current": "b10425",
@@ -2853,3 +2853,68 @@ def test_log_line_text_does_not_double_prefix_a_rendered_structlog_line() -> Non
     assert text == rendered
     assert text.count("2026-08-14T") == 1
     assert "INFO " not in text  # no second stdlib-style level column
+
+
+# ---------------------------------------------------------------------------
+# Cross-site websocket upgrades are refused (the control channel), even with
+# no API key -- a page on any website could otherwise drive the panel.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("origin", "host", "same"),
+    [
+        ("http://192.168.1.50:8080", "192.168.1.50:8080", True),
+        ("http://rig.tailnet.ts.net:8080", "rig.tailnet.ts.net:8080", True),
+        ("https://rig.tailnet.ts.net", "rig.tailnet.ts.net:8080", True),  # port ignored
+        ("http://[::1]:8080", "[::1]:8080", True),
+        ("http://evil.example.com", "192.168.1.50:8080", False),
+        ("http://192.168.1.51:8080", "192.168.1.50:8080", False),
+        ("null", "192.168.1.50:8080", False),
+        (None, "192.168.1.50:8080", True),  # a non-browser client sends no Origin
+        ("http://evil.example.com", None, True),  # no Host to compare against
+    ],
+)
+def test_same_origin_websocket_rule(origin: str | None, host: str | None, same: bool) -> None:
+    from studioforge.gui.app import _same_origin_websocket
+
+    raw = []
+    if origin is not None:
+        raw.append((b"origin", origin.encode()))
+    if host is not None:
+        raw.append((b"host", host.encode()))
+    assert _same_origin_websocket({"type": "websocket", "headers": raw}) is same
+
+
+async def test_the_gate_closes_a_cross_site_websocket_even_without_a_key(config: Config) -> None:
+    from studioforge.gui.app import GuiAuthGate
+
+    config.server.api_key = None
+    reached = {"inner": False}
+
+    async def inner(scope: Any, receive: Any, send: Any) -> None:
+        reached["inner"] = True
+
+    sent: list[dict[str, Any]] = []
+
+    async def receive() -> dict[str, Any]:
+        return {"type": "websocket.connect"}
+
+    async def send(message: dict[str, Any]) -> None:
+        sent.append(message)
+
+    gate = GuiAuthGate(inner, config)
+    scope = {
+        "type": "websocket",
+        "path": "/_nicegui_ws/socket.io/",
+        "headers": [(b"origin", b"http://evil.example.com"), (b"host", b"192.168.1.50:8080")],
+    }
+    await gate(scope, receive, send)
+    assert reached["inner"] is False
+    assert sent == [{"type": "websocket.close", "code": 1008}]
+
+    same_site = dict(
+        scope, headers=[(b"origin", b"http://192.168.1.50:8080"), (b"host", b"192.168.1.50:8080")]
+    )
+    await gate(same_site, receive, send)
+    assert reached["inner"] is True

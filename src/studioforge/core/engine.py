@@ -169,6 +169,10 @@ _CUDART_RE = re.compile(
 #: ``engines/<tag>/``, ``active.json`` and the ``git clone --branch <tag>``
 #: source-build path. A tag outside the scheme is not an engine we can install.
 ENGINE_TAG_RE = re.compile(r"^b\d+$")
+#: What may name an engine directory at all: one path component, no
+#: separators, no drive letters. Looser than ENGINE_TAG_RE on purpose (a local
+#: source build may carry a descriptive tag); strict about escaping engines/.
+_SAFE_TAG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 
 #: Same scheme, plus the ``-local`` suffix :meth:`build_from_source` appends, so
 #: a source-built active tag still compares numerically against upstream.
@@ -611,6 +615,15 @@ class EngineManager:
         return self.config.engines_dir
 
     def engine_dir(self, tag: str) -> Path:
+        # A tag arrives from config, a per-model setting or the install route's
+        # body and becomes a directory name under engines/. Anything that is
+        # not one plain path component ("../..", "b1/../../x", "") is refused
+        # before it can name a directory outside the engines tree.
+        if not _SAFE_TAG_RE.fullmatch(tag or "") or tag.strip(".") == "":
+            raise EngineError(
+                f"invalid engine tag {tag!r}: expected a llama.cpp build tag such as "
+                "'b10425' (letters, digits, '.', '_' or '-' only)"
+            )
         return self.engines_dir / tag
 
     @property

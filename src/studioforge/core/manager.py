@@ -15,13 +15,14 @@ import time
 from collections.abc import Sequence
 from typing import Any
 
-from studioforge.config import Config
+from studioforge.config import Config, KvCacheType
 from studioforge.core.gpu import vram_processes
 from studioforge.core.planner import OBSERVATION_NOTE_PER_PID, Planner
 from studioforge.core.registry import Registry
 from studioforge.core.supervisor import Supervisor
 from studioforge.db import Database
 from studioforge.errors import (
+    BadRequestError,
     InsufficientVramError,
     ModelLoadError,
     ModelNotFoundError,
@@ -73,6 +74,47 @@ CONFIG_ERROR_MARKERS: tuple[str, ...] = (
     "no such file or directory",
     "does not exist",
 )
+
+
+#: Sanity ceilings for per-request load arguments. Not policy -- the planner
+#: refuses anything VRAM cannot hold with the numbers -- but a bound that keeps
+#: ``--ctx-size -100`` and ``--parallel 0`` out of a child's argv, where they
+#: die as an opaque llama-server exit instead of a 400 naming the parameter.
+MAX_REQUEST_CTX = 16_777_216
+MAX_REQUEST_PARALLEL = 256
+KV_CACHE_TYPES: tuple[str, ...] = tuple(KvCacheType.__args__)  # type: ignore[attr-defined]
+
+
+def validate_load_args(
+    *,
+    ctx_size: int | None,
+    parallel: int | None,
+    kv_cache_type: Any,
+) -> None:
+    """Raise :class:`BadRequestError` for a load argument no load could use.
+
+    Called by :meth:`ModelManager.load` (so the HTTP route, the MCP tool, the
+    GUI and the benchmark all get it) rather than by each caller. ``0``/negative
+    values used to fall through the planner's ``x or default`` idiom -- ``0``
+    silently meant "default", ``-1`` was honoured verbatim into the argv.
+    """
+    if ctx_size is not None and not (1 <= int(ctx_size) <= MAX_REQUEST_CTX):
+        raise BadRequestError(
+            f"ctx_size must be between 1 and {MAX_REQUEST_CTX} tokens (got {ctx_size}); "
+            "omit it to let the planner choose",
+            param="ctx_size",
+        )
+    if parallel is not None and not (1 <= int(parallel) <= MAX_REQUEST_PARALLEL):
+        raise BadRequestError(
+            f"parallel must be between 1 and {MAX_REQUEST_PARALLEL} slots (got {parallel}); "
+            "omit it to let the planner choose",
+            param="parallel",
+        )
+    if kv_cache_type is not None and str(kv_cache_type) not in KV_CACHE_TYPES:
+        raise BadRequestError(
+            f"kv_cache_type must be one of {', '.join(KV_CACHE_TYPES)} (got {kv_cache_type!r})",
+            param="kv_cache_type",
+        )
 
 
 def classify_load_failure(stderr_tail: Sequence[str]) -> str:
@@ -313,6 +355,7 @@ class ModelManager:
         that was serving a moment ago goes on serving. The old order (stop,
         then plan) turned every refused reload into an outage.
         """
+        validate_load_args(ctx_size=ctx_size, parallel=parallel, kv_cache_type=kv_cache_type)
         record = self.registry.resolve(name)
         if record is None:
             raise ModelNotFoundError(name, known=self.registry.known_ids())

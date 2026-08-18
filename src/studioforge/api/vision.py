@@ -203,23 +203,32 @@ def _decode_data_url(url: str) -> tuple[bytes, str]:
 #: a probe for anything else on the tailnet or LAN: the error text echoed the
 #: target's HTTP status straight back. Refuse to talk to non-public addresses,
 #: and re-check on every redirect hop rather than trusting the first one.
-def _is_public_address(host: str) -> bool:
-    """False for loopback, link-local, private, ULA and other reserved space."""
+def _resolve_public(host: str) -> str | None:
+    """A vetted public IP literal for ``host``, or ``None`` if any answer is not.
+
+    Resolves **once** and hands the address back so the connection is made to
+    exactly the address that was checked. Checking and then letting httpx
+    resolve again is the classic DNS-rebinding TOCTOU: a TTL-0 record can
+    answer with a public address for the check and ``127.0.0.1`` for the
+    connect. Every answer must be public -- one private A record among public
+    ones is the rebinding trick, not an edge case to be lenient about.
+    """
     import ipaddress
     import socket
 
     try:
         infos = socket.getaddrinfo(host, None)
     except OSError:
-        return False
+        return None
     if not infos:
-        return False
+        return None
+    chosen: str | None = None
     for info in infos:
         raw = info[4][0]
         try:
             address = ipaddress.ip_address(raw)
         except ValueError:
-            return False
+            return None
         if (
             address.is_private
             or address.is_loopback
@@ -228,21 +237,63 @@ def _is_public_address(host: str) -> bool:
             or address.is_multicast
             or address.is_unspecified
         ):
-            return False
-    return True
+            return None
+        # Prefer an IPv4 answer (broadest reachability); any vetted address
+        # would do.
+        if chosen is None or (address.version == 4 and ":" in chosen):
+            chosen = str(address)
+    return chosen
 
 
-async def _guard_target(url: str, *, allow_private: bool) -> None:
-    from urllib.parse import urlparse
+def _is_public_address(host: str) -> bool:
+    """False for loopback, link-local, private, ULA and other reserved space."""
+    return _resolve_public(host) is not None
 
+
+class _PinnedTarget:
+    """A URL rewritten to a vetted IP, plus the headers that keep it honest.
+
+    ``url`` connects to the address that passed the guard; ``headers`` carries
+    the original ``Host`` so virtual hosting still works; ``extensions`` sets
+    ``sni_hostname`` so TLS still negotiates -- and verifies the certificate --
+    against the name the caller gave, not the IP literal.
+    """
+
+    __slots__ = ("extensions", "headers", "url")
+
+    def __init__(self, url: str, headers: dict[str, str], extensions: dict[str, Any]) -> None:
+        self.url = url
+        self.headers = headers
+        self.extensions = extensions
+
+
+async def _guard_target(url: str, *, allow_private: bool) -> _PinnedTarget:
+    """Vet ``url``'s host and return the pinned request to make for it.
+
+    With ``allow_private`` the URL is used as given (the operator opted in to
+    fetching from their own network) and nothing is pinned.
+    """
     if allow_private:
-        return
-    host = urlparse(url).hostname or ""
+        return _PinnedTarget(url, {}, {})
+    try:
+        parsed = httpx.URL(url)
+    except Exception as exc:  # noqa: BLE001 - httpx raises its own InvalidURL family
+        raise BadRequestError(
+            "image URL could not be parsed", code="image_fetch_refused", param="messages"
+        ) from exc
+    host = parsed.host or ""
     if not host:
         raise BadRequestError(
             "image URL has no host", code="image_fetch_refused", param="messages"
         )
-    if not await asyncio.to_thread(_is_public_address, host):
+    if parsed.scheme not in ("http", "https"):
+        raise BadRequestError(
+            "image URLs must be http(s) or data: URLs",
+            code="image_fetch_refused",
+            param="messages",
+        )
+    address = await asyncio.to_thread(_resolve_public, host)
+    if address is None:
         # Deliberately does NOT say whether the host resolved, was refused or
         # timed out: that difference is the oracle worth denying.
         raise BadRequestError(
@@ -251,6 +302,11 @@ async def _guard_target(url: str, *, allow_private: bool) -> None:
             code="image_fetch_refused",
             param="messages",
         )
+    host_header = host if parsed.port is None else f"{host}:{parsed.port}"
+    literal = f"[{address}]" if ":" in address else address
+    pinned = parsed.copy_with(host=literal)
+    extensions: dict[str, Any] = {"sni_hostname": host} if parsed.scheme == "https" else {}
+    return _PinnedTarget(str(pinned), {"Host": host_header}, extensions)
 
 
 async def _fetch(url: str, *, config: Config, client: httpx.AsyncClient) -> tuple[bytes, str]:
@@ -261,16 +317,22 @@ async def _fetch(url: str, *, config: Config, client: httpx.AsyncClient) -> tupl
     before we notice.
     """
     gateway = config.gateway
-    await _guard_target(url, allow_private=gateway.allow_private_image_hosts)
+    target = await _guard_target(url, allow_private=gateway.allow_private_image_hosts)
     try:
         # follow_redirects=False: a public URL that 302s into 127.0.0.1 would
         # otherwise walk straight past the guard above. Hops are followed by
-        # hand so each new target is re-checked.
+        # hand so each new target is re-checked -- and each is connected to
+        # by the address the check resolved (see _resolve_public).
         hops = 0
         current = url
         while True:
             async with client.stream(
-                "GET", current, timeout=gateway.image_fetch_timeout_s, follow_redirects=False
+                "GET",
+                target.url,
+                headers=target.headers,
+                extensions=target.extensions,
+                timeout=gateway.image_fetch_timeout_s,
+                follow_redirects=False,
             ) as response:
                 if response.is_redirect and hops >= _MAX_REDIRECTS:
                     # Past the budget the old code fell through and handed the
@@ -282,7 +344,7 @@ async def _fetch(url: str, *, config: Config, client: httpx.AsyncClient) -> tupl
                     if not location:
                         break
                     current = str(httpx.URL(current).join(location))
-                    await _guard_target(
+                    target = await _guard_target(
                         current, allow_private=gateway.allow_private_image_hosts
                     )
                     hops += 1
@@ -327,7 +389,11 @@ async def _read_capped(
             param="messages",
         )
     declared = response.headers.get("content-length")
-    if declared and int(declared) > gateway.max_image_bytes:
+    try:
+        declared_bytes = int(declared) if declared else 0
+    except ValueError:
+        declared_bytes = 0  # a malformed header is not our 500; the streamed cap still holds
+    if declared_bytes > gateway.max_image_bytes:
         raise BadRequestError(
             f"remote image is {declared} bytes, over the "
             f"{gateway.max_image_bytes} byte limit.",

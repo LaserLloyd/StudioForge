@@ -1621,3 +1621,58 @@ treated the same, so the self-update check reports "not configured" without a ne
 
 **What pins it.** `tests/unit/test_config_hardening.py`; `tests/unit/test_updater.py` (the
 unconfigured check makes no request); `tests/unit/test_watchdog.py` (harness layout).
+
+---
+
+## D32 -- On an open install, routes that change the box need a local caller or the PIN
+
+**Problem.** The shipped default is `server.host: 0.0.0.0` with no `server.api_key`, and
+`check_request` returned unconditionally when no key was set. So on the default install anyone
+on the LAN or tailnet could, with no credential, `PATCH /api/config` (set `server.api_key`
+themselves and lock the owner out; set `hf.token`; disarm `mcp.pin_required`), delete GGUF files
+(`DELETE /api/models/{id}?delete_files=true&confirm=true`), install an engine or an app update,
+restart the process, queue downloads and kill processes. Meanwhile the MCP `set_config` tool --
+same capability, same process -- demanded the PIN. The `confirm=true` flags were footgun guards,
+not authorisation. WP17 F4 made the Setup checklist *say* this; it did not close it.
+
+**Decision.** *Reads, inference and residency stay open; changing the box does not.* When
+`server.api_key` is unset, a mutating request to `/api/config`, `/api/restart/*`,
+`/api/engine/*`, `/api/update/*`, `/api/vram/reclaim`, `/api/downloads*`, or a `DELETE` under
+`/api/models/`, `/api/adapters/`, `/api/virtual-models/` is accepted only from a caller on this
+machine (loopback peer, or an in-process call with no peer -- the GUI invoking a handler
+directly) or with the MCP PIN, sent as `X-MCP-Pin` or as the bearer token (which is how `sfctl`
+already sends it). Anything else is **403 `remote_admin_requires_credential`** with a message that
+names the two ways in and the setting that lifts the rule (`server.api_key`). With a key set,
+nothing changes: the key is the credential everywhere, as before.
+
+Not guarded, deliberately: `/v1/*`, every `GET`, load/unload/unload-all/pin/test/benchmark,
+per-model settings, scans, virtual-model creation. JIT loading from any client on the LAN is the
+product (LM Studio parity), and a per-model setting is bounded by `ModelSettings` validation and
+the engine's flag allow-list.
+
+**Limits, stated.** A peer-address check trusts whatever is on loopback, which behind a reverse
+proxy is the proxy: put a proxy behind `server.api_key`. The GUI's own control channel is a
+WebSocket, which the same-origin policy does not cover; the gate now refuses a browser upgrade
+whose `Origin` host differs from the `Host` header (a page on any site the operator visits could
+otherwise drive the panel on `http://<lan-ip>:8080`), with a log line naming the fix for a proxy
+that rewrites `Host`.
+
+**Also in the same commit.** Load arguments are validated once, in `ModelManager.load` (every
+caller): `ctx_size` and `parallel` must be positive and bounded, `kv_cache_type` must be one of
+the known types -- `0` used to mean "default" by accident and `-1` reached `--ctx-size -1`.
+`ModelSettings` refuses counts of 0, negative device indices and an `engine_tag` with path
+characters, and `EngineManager.engine_dir` refuses any tag that is not one plain path component
+(the install route's body named a directory under `engines/`). A `messages` element that is not
+an object is a 400, not a 500. The non-streamed completion decrements `active_requests` in one
+`finally` (a cancellation used to leave it stuck, blocking TTL unload and eviction), and a read
+timeout there is a 504 `upstream_timeout` naming `server.request_timeout_s`. `mcp.enabled: false`
+really leaves the endpoint unmounted. The MCP `set_config` tool live-swaps the `mcp` section like
+the HTTP route; the MCP `delete_model` uses the same "is anything serving these files" guard as
+the HTTP route and lists the virtual models removed with the base. `DELETE /api/models/{id}` on
+an unloaded model no longer 500s on `supervisor.all()`, a method that never existed. The
+image-URL SSRF guard resolves once and connects to the vetted address with the original `Host`
+and SNI (the DNS-rebinding TOCTOU, WP17 open item 2).
+
+**What pins it.** `tests/unit/test_api_hardening.py`, `tests/unit/test_vision_fetch.py`,
+`tests/unit/test_gui.py` (websocket origin), `tests/unit/test_mcp_access.py` (unchanged: the PIN
+still does not reach `/v1` or `/api` reads when a key is set).
