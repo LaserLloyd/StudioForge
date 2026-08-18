@@ -548,3 +548,93 @@ def test_migrate_with_recovery_recovers_a_corrupted_existing_db(tmp_path: Path) 
     assert second.schema_version() == SCHEMA_VERSION
     assert second.get_meta("k") is None, "recovery starts fresh; old data lives in the backup"
     second.close()
+
+
+# ---------------------------------------------------------------------------
+# WP17 F5: a LOCKED database is not a CORRUPT database
+# ---------------------------------------------------------------------------
+
+
+def test_locked_healthy_db_is_never_replaced(tmp_path: Path, monkeypatch: Any) -> None:
+    """Another process holding the registry mid-write raises OperationalError
+    ("database is locked") -- a subclass of DatabaseError. Before the fix that
+    renamed the LIVE registry to .corrupt-* and started a fresh one. Now: retry
+    briefly, then raise, and the file is untouched."""
+    from studioforge import db as dbmod
+
+    path = tmp_path / "registry.sqlite3"
+    first = Database(path)
+    first.migrate()
+    first.set_meta("k", "v")
+    first.close()
+
+    monkeypatch.setattr(dbmod, "LOCK_RETRY_DELAY_S", 0.0)
+    calls = {"n": 0}
+
+    def locked_migrate(self: Any) -> None:
+        calls["n"] += 1
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(Database, "migrate", locked_migrate)
+    second = Database(path)
+    with pytest.raises(sqlite3.OperationalError) as excinfo:
+        second.migrate_with_recovery()
+    assert "NOT being replaced" in str(excinfo.value)
+    assert calls["n"] == dbmod.LOCK_RETRY_ATTEMPTS + 1, "the lock is retried, then given up on"
+    assert not list(tmp_path.glob("registry.sqlite3.corrupt-*")), "never moved aside"
+    second.close()
+
+    monkeypatch.undo()
+    third = Database(path)
+    third.migrate()
+    assert third.get_meta("k") == "v", "the data survived"
+    third.close()
+
+
+def test_lock_that_clears_is_transparent(tmp_path: Path, monkeypatch: Any) -> None:
+    from studioforge import db as dbmod
+
+    path = tmp_path / "registry.sqlite3"
+    monkeypatch.setattr(dbmod, "LOCK_RETRY_DELAY_S", 0.0)
+    real_migrate = Database.migrate
+    calls = {"n": 0}
+
+    def flaky_migrate(self: Any) -> None:
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise sqlite3.OperationalError("database is locked")
+        real_migrate(self)
+
+    monkeypatch.setattr(Database, "migrate", flaky_migrate)
+    database = Database(path)
+    assert database.migrate_with_recovery() is False
+    assert database.schema_version() == SCHEMA_VERSION
+    database.close()
+
+
+def test_non_corruption_operational_errors_do_not_trigger_recovery(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """'unable to open database file' / 'disk I/O error' are environment faults;
+    replacing the file cures nothing and could destroy a good registry."""
+    path = tmp_path / "registry.sqlite3"
+    Database(path).migrate()
+
+    def io_error(self: Any) -> None:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(Database, "migrate", io_error)
+    with pytest.raises(sqlite3.OperationalError):
+        Database(path).migrate_with_recovery()
+    assert not list(tmp_path.glob("registry.sqlite3.corrupt-*"))
+
+
+def test_error_classifiers() -> None:
+    from studioforge.db import is_corruption_error, is_locked_error
+
+    assert is_locked_error(sqlite3.OperationalError("database is locked"))
+    assert not is_corruption_error(sqlite3.OperationalError("database is locked"))
+    assert is_corruption_error(sqlite3.DatabaseError("file is not a database"))
+    assert is_corruption_error(sqlite3.DatabaseError("database disk image is malformed"))
+    assert not is_corruption_error(sqlite3.OperationalError("unable to open database file"))
+    assert not is_locked_error(ValueError("locked"))

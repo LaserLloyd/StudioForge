@@ -41,6 +41,52 @@ log = get_logger(__name__)
 #: brings any older database up to this.
 SCHEMA_VERSION: int = 4
 
+#: SQLite's own words for "this file is not a usable database". Only a message
+#: carrying one of these is treated as corruption by ``migrate_with_recovery``;
+#: everything else (locked, busy, unable to open, disk I/O, read-only) is a
+#: condition of the *environment* and replacing the file would destroy a good
+#: registry to cure a symptom that was never the file's fault.
+CORRUPTION_MARKERS: tuple[str, ...] = (
+    "file is not a database",
+    "malformed",
+    "database disk image",
+    "unsupported file format",
+    "file is encrypted",
+    "not a database",
+)
+
+#: SQLite's words for "someone else has it right now". Retried briefly.
+LOCK_MARKERS: tuple[str, ...] = ("database is locked", "database is busy", "locked")
+
+#: How long ``migrate_with_recovery`` waits for a lock to clear before it gives
+#: up -- and gives up by *raising*, never by replacing the file. Migrations
+#: happen once at boot, so a couple of seconds is cheap; a lock that lasts
+#: longer means another instance is genuinely running against this data dir.
+LOCK_RETRY_ATTEMPTS: int = 6
+LOCK_RETRY_DELAY_S: float = 0.5
+
+
+def is_locked_error(exc: BaseException) -> bool:
+    """Whether ``exc`` is SQLite saying the database is held by someone else."""
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    text = str(exc).lower()
+    return any(marker in text for marker in LOCK_MARKERS)
+
+
+def is_corruption_error(exc: BaseException) -> bool:
+    """Whether ``exc`` is SQLite saying the file itself is not a valid database.
+
+    Deliberately narrow. ``sqlite3.DatabaseError`` is also the base class of
+    ``OperationalError`` (locks, missing files, I/O errors), so the *type* alone
+    cannot tell a broken file from a busy one -- the message can.
+    """
+    if not isinstance(exc, sqlite3.DatabaseError):
+        return False
+    text = str(exc).lower()
+    return any(marker in text for marker in CORRUPTION_MARKERS)
+
+
 DOWNLOAD_STATUSES: tuple[str, ...] = (
     "queued",
     "running",
@@ -270,16 +316,49 @@ class Database:
         of their virtual models and settings -- and a fresh database is
         created in its place. Returns True when recovery happened.
         """
-        try:
-            self.migrate()
-            return False
-        except sqlite3.DatabaseError as exc:
-            log.error(
-                "db.corrupt",
-                path=str(self._path),
-                error=str(exc),
-                action="moving the corrupt file aside and starting with a fresh database",
-            )
+        # ONLY real corruption reaches the recovery path. ``sqlite3.DatabaseError``
+        # is also the base class of ``OperationalError``, which is what a
+        # *locked* database raises when another process -- the running server,
+        # a second instance, a backup tool -- holds it mid-write. Catching the
+        # base class here therefore renamed a perfectly healthy live registry
+        # to ``.corrupt-<stamp>`` and started a fresh one beside it (WP17 F5).
+        # A lock is transient: wait for it briefly, then fail loudly and leave
+        # the file exactly where it is.
+        attempts = 0
+        while True:
+            try:
+                self.migrate()
+                return False
+            except sqlite3.DatabaseError as exc:
+                if is_locked_error(exc) and attempts < LOCK_RETRY_ATTEMPTS:
+                    attempts += 1
+                    log.warning(
+                        "db.locked",
+                        path=str(self._path),
+                        attempt=attempts,
+                        of=LOCK_RETRY_ATTEMPTS,
+                        error=str(exc),
+                    )
+                    time.sleep(LOCK_RETRY_DELAY_S)
+                    continue
+                if not is_corruption_error(exc):
+                    # Locked past the retry budget, unable to open, disk I/O
+                    # error, read-only filesystem, ...: none of these are cured
+                    # by replacing the file, and every one of them destroys data
+                    # if we do. Surface the real reason instead.
+                    raise sqlite3.OperationalError(
+                        f"database at {self._path} could not be opened for migration "
+                        f"({exc}); it is NOT being replaced because this is not a "
+                        "corruption error -- if another StudioForge instance is running "
+                        "against this data dir, stop it first"
+                    ) from exc
+                log.error(
+                    "db.corrupt",
+                    path=str(self._path),
+                    error=str(exc),
+                    action="moving the corrupt file aside and starting with a fresh database",
+                )
+                break
         self.close()
         stamp = time.strftime("%Y%m%d-%H%M%S")
         for suffix in ("", "-wal", "-shm"):
