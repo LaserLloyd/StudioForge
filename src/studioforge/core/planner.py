@@ -2146,6 +2146,35 @@ class Planner:
         suggestions: list[str] = []
         meta = record.meta
 
+        # 0. Fewer slots at the SAME window. An explicit `parallel` -- usually a
+        #    catalog row's load_args, computed against the VRAM free at that
+        #    instant -- that no longer fits is more often a slot problem than a
+        #    context problem, and the recommendation rule (D22) is that the
+        #    window outranks the second slot. So this is offered first, and it
+        #    is the exact walk a load runs (max_slots_by_vram), not arithmetic.
+        max_parallel: int | None = None
+        if slots > 1 and meta is not None:
+            fewer, at_fewer = self.max_slots_by_vram(
+                record,
+                ctx=ctx,
+                kv_k=kv_k,
+                kv_v=kv_v,
+                n_devices=len(gpus) or 1,
+                capacity_bytes=available,
+                cap=slots - 1,
+                draft=draft,
+                draft_ctx=record.settings.draft_ctx_size,
+                adapters=adapters,
+            )
+            if at_fewer.total_bytes <= available:
+                max_parallel = fewer
+                suggestions.append(
+                    f"reduce parallel from {slots} to {fewer}: {fewer} slot(s) at {ctx} tokens "
+                    f"fit in the {available / (1024**3):.2f} GiB usable right now (a catalog "
+                    f"row's parallel is the most that placement sustained when the row was "
+                    f"built, not a requirement)"
+                )
+
         # 1. A smaller context that would actually fit.
         max_ctx: int | None = None
         if meta is not None:
@@ -2262,6 +2291,7 @@ class Planner:
             available_bytes=available,
             per_gpu_free=per_gpu_free,
             max_ctx_that_fits=max_ctx,
+            max_parallel_that_fits=max_parallel,
             suggestions=suggestions,
             notes=list(notes),
             vram_holders=holders,

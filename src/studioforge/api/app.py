@@ -380,8 +380,15 @@ def create_app(
             try:
                 engine = await app.state.engine_manager.ensure_engine()
                 log.info("engine ready", tag=engine.tag, variant=engine.variant)
+                app.state.engine_status = {
+                    "ok": True,
+                    "tag": engine.tag,
+                    "variant": engine.variant,
+                    "smoke_tested": engine.smoke_tested,
+                }
             except Exception as exc:
                 log.error("engine not ready", error=str(exc))
+                app.state.engine_status = {"ok": False, "tag": None, "error": str(exc)}
             await app.state.manager.start()
             # Resumes anything a crash left half-downloaded.
             with contextlib.suppress(Exception):
@@ -517,6 +524,10 @@ def create_app(
         restart = getattr(app.state, "restart_status", None)
         if restart is not None and restart.get("outcome") == "failed":
             payload["restart_failed"] = restart
+        # "Up" and "able to serve a model" are different claims, and a poller
+        # that only sees the first reads a healthy 200 from a box with no engine
+        # and no GPU. Say which it is, and why not, in the same payload.
+        payload.update(_serving_readiness(app.state))
         if not deep:
             return payload
         gateway = app.state.config.gateway
@@ -534,6 +545,72 @@ def create_app(
         return payload
 
     return app
+
+
+def _serving_readiness(state: Any) -> dict[str, Any]:
+    """The part of ``/health`` that says whether a model could be served.
+
+    ``engine`` is what the lifespan's ``ensure_engine`` concluded (``ok``,
+    ``tag``, ``variant``, or ``ok: false`` with the error), ``gpu_count`` what
+    the probe sees now, ``models_indexed`` the registry size. ``can_serve`` is
+    the conjunction that matters -- engine present, at least one GPU -- and
+    ``cannot_serve_reason`` names the first thing missing and its fix, so a
+    watchdog, the tray or an agent reading ``/health`` learns the next action
+    without opening the GUI. Never raises: a probe that fails reads as zero
+    GPUs, which is the honest answer for the purpose.
+    """
+    engine = getattr(state, "engine_status", None)
+    if engine is None:
+        # A secondary instance, or a composed app that never ran ensure_engine:
+        # report what is installed rather than nothing.
+        try:
+            info = state.engine_manager.active()
+        except Exception:  # noqa: BLE001 - readiness must never fail /health
+            info = None
+        if info is not None:
+            engine = {
+                "ok": True,
+                "tag": info.tag,
+                "variant": info.variant,
+                "smoke_tested": info.smoke_tested,
+            }
+        else:
+            engine = {"ok": False, "tag": None, "error": "no llama-server engine is installed"}
+    try:
+        gpu_count = len(state.planner.probe.list_gpus())
+    except Exception:  # noqa: BLE001
+        gpu_count = 0
+    try:
+        models_indexed = len(state.registry.all())
+    except Exception:  # noqa: BLE001
+        models_indexed = 0
+
+    reason: str | None = None
+    if not engine.get("ok"):
+        reason = (
+            "no usable llama-server engine: install one from the Setup tab or run "
+            "`studioforge engine --update`"
+            + (f" ({engine.get('error')})" if engine.get("error") else "")
+        )
+    elif gpu_count == 0:
+        reason = (
+            "no NVIDIA GPU detected (this server is GPU-only): check the driver and "
+            "nvidia-smi, then re-probe from the Setup tab"
+        )
+    elif models_indexed == 0:
+        reason = (
+            "no models indexed: point models.dir at a GGUF library on the Setup tab "
+            "(or download one), then rescan"
+        )
+    payload: dict[str, Any] = {
+        "engine": engine,
+        "gpu_count": gpu_count,
+        "models_indexed": models_indexed,
+        "can_serve": reason is None,
+    }
+    if reason is not None:
+        payload["cannot_serve_reason"] = reason
+    return payload
 
 
 def _install_error_handlers(app: FastAPI) -> None:

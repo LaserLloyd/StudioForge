@@ -649,6 +649,11 @@ class LoadRejected(BaseModel):
     available_bytes: int = 0
     per_gpu_free: dict[int, int] = Field(default_factory=dict)
     max_ctx_that_fits: int | None = None
+    #: When an explicit ``parallel`` above 1 was refused: the largest slot
+    #: count that DOES fit at the requested context, or ``None`` if not even
+    #: one does. The window outranks the second slot (D22), so this is the
+    #: first lever an agent should reach for.
+    max_parallel_that_fits: int | None = None
     suggestions: list[str] = Field(default_factory=list)
     #: Planner notes that also apply to a refusal (e.g. "you asked for more
     #: context than this model was trained for"). Same field name and meaning

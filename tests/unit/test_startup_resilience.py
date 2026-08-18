@@ -99,6 +99,35 @@ def test_boots_with_no_gpus_and_status_says_so(tmp_path: Path) -> None:
         assert gpus["gpus"] == []
 
 
+def test_health_says_whether_a_model_could_be_served_and_why_not(tmp_path: Path) -> None:
+    """``/health`` 200 means "this process is up", which is not "can serve a
+    model". A box with no engine and no GPU must say so in the same payload,
+    with the next action, so a watchdog, the tray or an agent never mistakes
+    an empty box for a healthy one (WP17 R2)."""
+    config = make_config(tmp_path)
+    with boot(config) as client:
+        body = client.get("/health").json()
+        assert body["status"] == "ok"
+        assert body["can_serve"] is False
+        # No engine installed in this data dir: that is the first thing missing.
+        assert body["engine"]["ok"] is False
+        assert "Setup tab" in body["cannot_serve_reason"]
+        assert "engine --update" in body["cannot_serve_reason"]
+        assert body["gpu_count"] == 0
+        assert body["models_indexed"] == 0
+
+
+def test_health_names_the_gpu_as_the_gap_once_an_engine_exists(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    state = build_state(config)
+    state.engine_status = {"ok": True, "tag": "b10425", "variant": "cuda-13.3"}
+    with boot(config, state=state) as client:
+        body = client.get("/health").json()
+        assert body["engine"]["tag"] == "b10425"
+        assert body["can_serve"] is False
+        assert "GPU" in body["cannot_serve_reason"] and "nvidia-smi" in body["cannot_serve_reason"]
+
+
 def test_shutdown_closes_the_engine_and_updater_http_clients(tmp_path: Path) -> None:
     """The lazily created GitHub clients must not outlive the app.
 

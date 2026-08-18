@@ -35,7 +35,7 @@ from studioforge.core.planner import (
     max_parallel_for,
     parallel_options,
 )
-from studioforge.types import GgufMeta, LoadPlan, ModelSettings
+from studioforge.types import GgufMeta, LoadPlan, LoadRejected, ModelSettings
 from tests.unit.test_planner import (
     StubProbe,
     gpu,
@@ -355,6 +355,30 @@ def test_an_explicit_parallel_is_honoured_verbatim_under_auto() -> None:
     assert plan.parallel == 3
     assert plan.parallel_limited_by == "explicit"
     assert plan.max_parallel == 3
+
+
+def test_a_refused_explicit_parallel_offers_the_slot_count_that_fits() -> None:
+    """A catalog row's ``parallel`` is the most its placement sustained at one
+    instant; when VRAM has moved, the refusal must name the count that fits
+    NOW at the same window -- the window outranks the second slot (D22), so
+    "reduce parallel" comes before "reduce context"."""
+    # 8 GiB weights, 1 GiB of KV per 8192-token slot (make_meta's shape); one
+    # 16 GiB card. Eight slots at 8192 need ~16+ GiB with overheads: refused.
+    probe = StubProbe([gpu(0, 32.0, 16.0, (12, 0))])
+    planner = Planner(make_config(), probe)
+    result = planner.plan_load(
+        make_record(), ctx_size=8192, parallel=8, kv_cache_type="f16", allow_evict=False
+    )
+    assert isinstance(result, LoadRejected), result
+    fits = result.max_parallel_that_fits
+    assert fits is not None and 1 <= fits < 8
+    assert result.suggestions, result
+    first = result.suggestions[0]
+    assert first.startswith(f"reduce parallel from 8 to {fits}")
+    assert "8192 tokens" in first
+    # ...and the offer is honest: that count really loads at that window.
+    plan = planner.plan_load(make_record(), ctx_size=8192, parallel=fits, kv_cache_type="f16")
+    assert isinstance(plan, LoadPlan) and plan.parallel == fits
 
 
 def test_an_integer_default_parallel_still_pins_the_slot_count() -> None:

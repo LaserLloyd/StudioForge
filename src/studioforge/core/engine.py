@@ -946,14 +946,20 @@ class EngineManager:
             info = self.active()
             if info is None:
                 raise EngineError(
-                    "no llama-server engine is installed; run first-run setup "
+                    "no llama-server engine is installed, so nothing can be loaded. Install "
+                    f"{self.config.engine.pinned_tag} from the Setup tab (llama.cpp engine -> "
+                    "Install), or run `studioforge engine --update` "
                     f"(expected under {self.engines_dir})"
                 )
             return info.server_binary
         directory = self.engine_dir(tag)
         binary = find_server_binary(directory)
         if binary is None:
-            raise EngineError(f"engine '{tag}' is not installed (looked in {directory})")
+            raise EngineError(
+                f"engine '{tag}' is not installed (looked in {directory}). This model pins "
+                f"engine_tag={tag!r}: install that build from the Setup tab, or clear the "
+                f"model's engine_tag to use the active engine"
+            )
         return binary
 
     def prune(self, keep: int | None = None) -> list[str]:

@@ -384,6 +384,7 @@ class ModelManager:
                 "available_bytes": rejected.available_bytes,
                 "per_gpu_free": rejected.per_gpu_free,
                 "max_ctx_that_fits": rejected.max_ctx_that_fits,
+                "max_parallel_that_fits": rejected.max_parallel_that_fits,
                 "suggestions": rejected.suggestions,
                 "notes": rejected.notes,
                 # Who is holding the VRAM: on a shared GPU box this is usually
@@ -1020,6 +1021,7 @@ class ModelManager:
                 "available_bytes": result.available_bytes,
                 "per_gpu_free": result.per_gpu_free,
                 "max_ctx_that_fits": result.max_ctx_that_fits,
+                "max_parallel_that_fits": result.max_parallel_that_fits,
                 "suggestions": result.suggestions,
                 # Notes matter as much on a refusal as on a plan: "you asked
                 # for more context than this model was trained for" is often
