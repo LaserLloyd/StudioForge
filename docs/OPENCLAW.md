@@ -328,7 +328,13 @@ hiding a failure, and never a `200` for a route that does not exist.
 | Busy / transient | 503 | varies | **yes**, honour `Retry-After` |
 
 A `507` carries the numbers *and* what to do about it under `error.studioforge.suggestions` —
-a smaller context that would fit, a cheaper KV cache type, or a smaller quant.
+fewer slots at the same window (`max_parallel_that_fits`, when an explicit `parallel` was the
+problem), a smaller context that would fit, a cheaper KV cache type, or a smaller quant.
+
+**Loads are one at a time.** Two agents asking for two cold models at once do not race for the
+same VRAM: the second load plans after the first has actually allocated, and either fits beside it
+or is refused with the numbers (DECISIONS.md D29). A streaming request that is queued behind another
+load sees the same keep-alive comments as its own load would.
 
 **Thinking models never return an empty reply.** llama.cpp's default routes a reasoning model's
 output into `reasoning_content` and leaves `content` empty; measured on DeepSeek-R1, content length

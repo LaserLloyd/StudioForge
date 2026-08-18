@@ -31,6 +31,10 @@ context window, or more concurrent conversations than its `max_parallel`.
 - Match your client concurrency to `max_parallel`. Beyond it, llama.cpp queues rather than
   refusing, so extra streams show up as latency, not errors (watch `requests_deferred` in
   `/api/status`).
+- A row's `parallel` is the most its placement sustained *when the row was built*. If VRAM has
+  moved by the time you call `load_model`, the `507` names the slot count that fits now at the
+  same window (`max_parallel_that_fits`, and the first suggestion) -- the window outranks the
+  second slot, so reach for fewer slots before a smaller context.
 
 ---
 

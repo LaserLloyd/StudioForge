@@ -190,7 +190,11 @@ three data-directory rules produced the directory in force (D25):
 
 **Open data dir** and **Open logs** open a file manager **on the machine running StudioForge**, not
 on the machine you are browsing from. **Restart server** confirms first: it is the one control that
-takes the gateway down, and every client talking to it sees a connection error.
+takes the gateway down, and every client talking to it sees a connection error. Exactly one
+process brings it back (D28): the tray, when the tray launched the server (the server exits and
+the tray respawns it, without counting a crash); otherwise the watchdog. `GET /health` reports
+`can_serve` and, when false, `cannot_serve_reason` with the next action — an engine to install, a
+GPU the driver does not show, a library to point at.
 
 ---
 

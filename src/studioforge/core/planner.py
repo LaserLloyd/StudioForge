@@ -2154,25 +2154,34 @@ class Planner:
         #    is the exact walk a load runs (max_slots_by_vram), not arithmetic.
         max_parallel: int | None = None
         if slots > 1 and meta is not None:
-            fewer, at_fewer = self.max_slots_by_vram(
-                record,
-                ctx=ctx,
-                kv_k=kv_k,
-                kv_v=kv_v,
-                n_devices=len(gpus) or 1,
-                capacity_bytes=available,
-                cap=slots - 1,
-                draft=draft,
-                draft_ctx=record.settings.draft_ctx_size,
-                adapters=adapters,
-            )
-            if at_fewer.total_bytes <= available:
-                max_parallel = fewer
+            # Two placements, the way a load would try them: the best single
+            # card, then the whole usable pool (each device costs a CUDA
+            # context, so the pool is not simply "more room").
+            usable_gpus = [g for g in gpus if per_gpu_free.get(g.index, 0) > 0]
+            placements = [(1, best_single)]
+            if len(usable_gpus) > 1:
+                placements.append((len(usable_gpus), available))
+            for n_devices, capacity in placements:
+                fewer, at_fewer = self.max_slots_by_vram(
+                    record,
+                    ctx=ctx,
+                    kv_k=kv_k,
+                    kv_v=kv_v,
+                    n_devices=n_devices,
+                    capacity_bytes=capacity,
+                    cap=slots - 1,
+                    draft=draft,
+                    draft_ctx=record.settings.draft_ctx_size,
+                    adapters=adapters,
+                )
+                if at_fewer.total_bytes <= capacity and fewer > (max_parallel or 0):
+                    max_parallel = fewer
+            if max_parallel is not None:
                 suggestions.append(
-                    f"reduce parallel from {slots} to {fewer}: {fewer} slot(s) at {ctx} tokens "
-                    f"fit in the {available / (1024**3):.2f} GiB usable right now (a catalog "
-                    f"row's parallel is the most that placement sustained when the row was "
-                    f"built, not a requirement)"
+                    f"reduce parallel from {slots} to {max_parallel}: {max_parallel} slot(s) at "
+                    f"{ctx} tokens fit in the VRAM usable right now (a catalog row's parallel is "
+                    f"the most that placement sustained when the row was built, not a "
+                    f"requirement)"
                 )
 
         # 1. A smaller context that would actually fit.
