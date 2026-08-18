@@ -2232,6 +2232,7 @@ def test_restart_backend_note_names_each_failure() -> None:
 
 def test_restart_server_note_says_how_it_restarts() -> None:
     assert "watchdog" in st.restart_server_note({"via": "watchdog"})
+    assert "tray" in st.restart_server_note({"via": "tray"})  # D28
     assert "respawning itself" in st.restart_server_note({"via": "self-respawn"})
     assert st.restart_server_note(None) == "Restart requested."
 

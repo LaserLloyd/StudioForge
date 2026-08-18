@@ -940,6 +940,11 @@ def restart_backend_note(payload: Mapping[str, Any] | None) -> str:
 def restart_server_note(payload: Mapping[str, Any] | None) -> str:
     """Outcome line for ``POST /api/restart/server``, naming *how* it restarts."""
     via = str((payload or {}).get("via") or "")
+    if via == "tray":
+        return (
+            "Restarting: the server is exiting and the tray that launched it brings it back. "
+            "The API is down for a few seconds; this page will reconnect by itself."
+        )
     if via == "watchdog":
         return (
             "Restarting via the watchdog sidecar. The API is down for a few seconds; "
