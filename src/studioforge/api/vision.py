@@ -272,7 +272,12 @@ async def _fetch(url: str, *, config: Config, client: httpx.AsyncClient) -> tupl
             async with client.stream(
                 "GET", current, timeout=gateway.image_fetch_timeout_s, follow_redirects=False
             ) as response:
-                if response.is_redirect and hops < _MAX_REDIRECTS:
+                if response.is_redirect and hops >= _MAX_REDIRECTS:
+                    # Past the budget the old code fell through and handed the
+                    # 3xx *body* to the image decoder, so the user read "could
+                    # not decode image" for what was really "too many redirects".
+                    break
+                if response.is_redirect:
                     location = response.headers.get("location") or ""
                     if not location:
                         break

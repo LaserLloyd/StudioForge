@@ -142,6 +142,21 @@ class ServerConfig(BaseModel):
     request_timeout_s: float = 900.0
 
 
+    @model_validator(mode="after")
+    def _no_credentialed_wildcard_cors(self) -> ServerConfig:
+        """``["*"]`` + ``allow_credentials`` is the one CORS pair browsers treat
+        as "any website may make credentialed requests here". The shipped default
+        (wildcard, credentials off) is safe; flipping credentials on without
+        narrowing the origins would silently open the API to every page the
+        operator visits. Refuse the pair at load time (WP17 review, open item 1).
+        """
+        if self.cors_allow_credentials and any(o.strip() == "*" for o in self.cors_origins):
+            raise ValueError(
+                "server.cors_allow_credentials=true requires explicit server.cors_origins "
+                "(no '*'): a credentialed wildcard lets any website call this API as you"
+            )
+        return self
+
 class GuiConfig(BaseModel):
     enabled: bool = True
     host: str = "0.0.0.0"
