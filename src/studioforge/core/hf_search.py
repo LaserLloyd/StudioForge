@@ -215,7 +215,16 @@ def safe_filename(name: str) -> str:
             f"refusing repository file name {name!r}: absolute path",
             param="filename",
         )
-    if name.partition(".")[0].lower() in _WINDOWS_RESERVED:
+    if name != name.rstrip(". ") or ":" in name:
+        # Win32 silently strips trailing dots and spaces, so "model.gguf " would
+        # land on the user's real model.gguf (and be quarantined as wrong-size);
+        # a colon names an NTFS alternate data stream on the file before it.
+        raise BadRequestError(
+            f"refusing repository file name {name!r}: trailing dot/space or ':' would "
+            "resolve to a different file on Windows",
+            param="filename",
+        )
+    if name.partition(".")[0].strip().lower() in _WINDOWS_RESERVED:
         raise BadRequestError(
             f"refusing repository file name {name!r}: reserved device name",
             param="filename",

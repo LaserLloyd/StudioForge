@@ -390,9 +390,23 @@ def create_app(
                 log.error("engine not ready", error=str(exc))
                 app.state.engine_status = {"ok": False, "tag": None, "error": str(exc)}
             await app.state.manager.start()
-            # Resumes anything a crash left half-downloaded.
-            with contextlib.suppress(Exception):
+            # Resumes anything a crash left half-downloaded. Never fatal --
+            # but never silent either: a queue that could not be read stays
+            # "running" with no task behind it, and the log is the only place
+            # that says why.
+            try:
                 await app.state.downloader.start()
+            except Exception as exc:  # noqa: BLE001 - see above
+                log.error("download queue did not start; downloads will not resume", error=str(exc))
+        elif start_background:
+            # A secondary may show the queue but must never write into the
+            # shared model directory (D24): enqueue/resume from the API, the
+            # MCP tool and the GUI all refuse with the holder's pid.
+            holder_pid = (getattr(app.state, "instance_holder", None) or {}).get("pid")
+            app.state.downloader.disable_transfers(
+                f"another StudioForge instance (pid {holder_pid}) owns this data directory; "
+                "queue the download there, or stop it and restart this one"
+            )
 
         try:
             yield

@@ -186,12 +186,16 @@ class _RecordingDownloader:
     def __init__(self) -> None:
         self.started = 0
         self.stopped = 0
+        self.disabled_reason: str | None = None
 
     async def start(self) -> None:
         self.started += 1
 
     async def stop(self) -> None:
         self.stopped += 1
+
+    def disable_transfers(self, reason: str) -> None:
+        self.disabled_reason = reason
 
 
 def _neutered_state(config: Config, downloader: Any) -> Any:
@@ -253,6 +257,10 @@ def test_a_secondary_instance_does_not_start_the_downloader(config: Config) -> N
             "a secondary instance resumed the download queue: two writers, one .part"
         )
         assert app.state.manager.started == 0, "a secondary instance started the TTL sweeper"
+        # And it may not *start* one from the API/MCP/GUI either: enqueue is
+        # refused with the holder's pid, not merely un-resumed.
+        assert downloader.disabled_reason is not None
+        assert str(os.getpid()) in downloader.disabled_reason
     finally:
         owner.release()
 

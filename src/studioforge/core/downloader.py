@@ -69,6 +69,7 @@ from typing import Any, Final, Literal, cast
 import httpx
 
 from studioforge.config import Config
+from studioforge.core.gguf import looks_like_mmproj as _looks_like_mmproj
 from studioforge.core.hf_search import (
     DEFAULT_HF_ENDPOINT,
     UNKNOWN_QUANT,
@@ -380,6 +381,27 @@ class PartFileLockedError(StudioForgeError):
     code = "part_file_locked"
 
 
+class PublishFailedError(StudioForgeError):
+    """A complete, verified partial could not be renamed onto its destination.
+
+    Not retryable through the transfer loop (the handle is already closed) and
+    not a reason to discard anything: the ``.part`` is kept and the next
+    attempt publishes it without a request.
+    """
+
+    status_code = 409
+    error_type = "invalid_request_error"
+    code = "publish_failed"
+
+
+class TransfersDisabledError(StudioForgeError):
+    """This process may not write into the model directory (D24 secondary)."""
+
+    status_code = 409
+    error_type = "invalid_request_error"
+    code = "instance_secondary"
+
+
 class _PartFile:
     """Exclusive owner of one ``.part`` for the whole life of a transfer.
 
@@ -566,7 +588,7 @@ def _is_transient(exc: BaseException) -> bool:
     agent) are retried; a definite answer from the server, a size or checksum
     mismatch, and a full or read-only disk are not.
     """
-    if isinstance(exc, PartFileLockedError | ChecksumMismatchError):
+    if isinstance(exc, PartFileLockedError | ChecksumMismatchError | PublishFailedError):
         return False
     if isinstance(exc, httpx.TransportError):
         return True
@@ -646,6 +668,15 @@ class Downloader:
             self._subscribers.append(on_progress)
         self._semaphore = asyncio.Semaphore(max(1, config.hf.max_concurrent_downloads))
         self._started = False
+        #: Set by the app when this process is a *secondary* on the data dir
+        #: (D24): it may read the queue but never write into the model
+        #: directory. Checked by enqueue/resume, which is every way a transfer
+        #: starts, so the API, the MCP tool and the GUI are all covered.
+        self._transfers_disabled_reason: str | None = None
+        #: dest -> file id currently writing that destination, so two groups
+        #: that share a file (one mmproj attached to every quant of a repo)
+        #: take turns instead of one failing on the other's lock.
+        self._writing: dict[Path, tuple[str, asyncio.Event]] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -654,6 +685,24 @@ class Downloader:
     def set_in_use_check(self, check: Callable[[Path], bool] | None) -> None:
         """Register the "file is open by a loaded model" predicate."""
         self._is_in_use = check
+
+    def disable_transfers(self, reason: str) -> None:
+        """Refuse to start any transfer from this process, saying why.
+
+        A secondary instance (another process owns the data directory, D24)
+        still composes a Downloader so it can *show* the queue, but it must not
+        write into the shared model directory: on 2026-08-18 a second writer
+        interleaved into the primary's ``.part`` and published a corrupt 22 GB
+        file. Only ``start()`` was skipped for secondaries; ``enqueue`` from
+        the API/MCP/GUI still launched a real transfer.
+        """
+        self._transfers_disabled_reason = reason
+
+    def _check_transfers_allowed(self) -> None:
+        if self._transfers_disabled_reason:
+            raise TransfersDisabledError(
+                f"downloads cannot start from this process: {self._transfers_disabled_reason}"
+            )
 
     async def start(self) -> None:
         """Load persisted rows and resume anything interrupted.
@@ -668,14 +717,21 @@ class Downloader:
             # Reloading would clobber the runtime state of live transfers.
             log.debug("downloader.already_started")
             return
-        self._started = True
         # Before loading state, so pruned history is never hydrated at all.
         # Failure is non-fatal: pruning is hygiene, not a startup dependency.
         try:
             self.db.prune_downloads(older_than_s=TERMINAL_ROW_RETENTION_S)
         except Exception as exc:
             log.warning("downloader.prune_failed", error=str(exc))
-        self._load_state()
+        try:
+            self._load_state()
+        except Exception as exc:
+            # Latching _started before this meant a failed load was swallowed
+            # by the caller and never retried: rows stayed "running" with no
+            # task and the queue looked busy forever. Say what happened.
+            log.error("downloader.load_state_failed", error=_describe(exc))
+            raise
+        self._started = True
         groups = [
             gid
             for gid, ids in self._groups.items()
@@ -851,6 +907,7 @@ class Downloader:
         model the user already has is a multi-GiB mistake, and overwriting it
         while llama-server has it mmapped is worse.
         """
+        self._check_transfers_allowed()
         files: list[GgufFileInfo] = list(item.files)
         if include_mmproj and item.mmproj is not None:
             files.append(item.mmproj)
@@ -910,6 +967,7 @@ class Downloader:
             self._emit(state)
 
         self._groups[group_id] = ids
+        self._refuse_if_disk_cannot_hold(ids)
         if any(self._files[i].status in _RESUMABLE for i in ids):
             self._launch(group_id)
         log.info(
@@ -920,6 +978,57 @@ class Downloader:
             total_bytes=item.total_bytes,
         )
         return group_id
+
+    def _refuse_if_disk_cannot_hold(self, ids: Sequence[str]) -> None:
+        """Refuse a queue that provably overruns the disk it lands on.
+
+        Display-only until now (the Download tab's badge said "the download
+        will still run"), while the API, the MCP tool and the CLI had no
+        check at all: a 40 GiB model queued onto a drive with 12 GiB free ran
+        for an hour and failed with ``ENOSPC`` at 30%. The remainder of *this*
+        group is added to everything already queued; a report that cannot be
+        produced (an unmounted path, an exotic filesystem) never refuses.
+        """
+        from studioforge.core.diskspace import disk_report
+
+        remaining = sum(
+            max(0, self._files[i].total_bytes - self._files[i].downloaded_bytes)
+            for i in ids
+            if self._files[i].status in _PENDING
+        )
+        if remaining <= 0:
+            return
+        try:
+            report = disk_report(self.models_dir(), self.queued_remaining_bytes())
+        except Exception as exc:  # noqa: BLE001 - a failed report must never refuse
+            log.debug("downloader.disk_preflight_unavailable", error=str(exc))
+            return
+        if report.get("error") is not None:
+            return
+        after = int(report.get("free_after_queue_bytes") or 0)
+        if after >= 0:
+            return
+        short = -after
+        for file_id in ids:
+            state = self._files[file_id]
+            if state.status in _PENDING:
+                state.status = "failed"
+                state.error = (
+                    f"not enough disk space on {report.get('drive')}: "
+                    f"{report.get('free_bytes', 0) / GB:.1f} GiB free, "
+                    f"{int(report.get('queued_bytes') or 0) / GB:.1f} GiB queued "
+                    f"(this download included) -- {short / GB:.1f} GiB short"
+                )
+                self._persist_status(state)
+                self._emit(state)
+        raise BadRequestError(
+            f"not enough disk space on {report.get('drive')} for this download: "
+            f"{report.get('free_bytes', 0) / GB:.1f} GiB free, "
+            f"{int(report.get('queued_bytes') or 0) / GB:.1f} GiB queued including it "
+            f"({short / GB:.1f} GiB short). Free space or point models.dir at a bigger "
+            "drive, then Resume.",
+            code="insufficient_disk",
+        )
 
     async def _adopt_complete(self, state: _FileState, *, quarantine: bool = True) -> bool:
         """Mark an already-present file as completed -- if it really is complete.
@@ -1051,6 +1160,7 @@ class Downloader:
 
     async def resume(self, group_id: str) -> None:
         """Re-queue a paused/failed group and restart its transfer."""
+        self._check_transfers_allowed()
         ids = self._groups.get(group_id)
         if not ids:
             raise ConfigError(f"unknown download group: {group_id}")
@@ -1102,7 +1212,11 @@ class Downloader:
             if state.status == "completed":
                 continue
             if intent == "cancel":
-                _part_path(state.dest).unlink(missing_ok=True)
+                # Best effort: on Windows the .part may still be open by a
+                # sibling group sharing this destination, and a failed unlink
+                # must not abort the finalize loop for the rest of the group.
+                with contextlib.suppress(OSError):
+                    _part_path(state.dest).unlink(missing_ok=True)
                 state.downloaded_bytes = 0
             self._set_status(state, target)
 
@@ -1128,13 +1242,48 @@ class Downloader:
                     if state.status == "failed":
                         # Don't burn bandwidth on the rest of a group that can
                         # no longer produce a loadable model.
+                        self._note_group_failure(group_id, state)
                         break
         except asyncio.CancelledError:
             intent = self._intent.pop(group_id, "cancel")
             self._finalize_interrupted(group_id, intent)
             raise
+        except Exception as exc:  # noqa: BLE001 - the task must not die silently
+            # _download_file catches everything a transfer can raise; what
+            # reaches here is a bookkeeping failure (a persistence write, a
+            # subscriber). Left alone, every remaining file in the group sat
+            # in queued/running forever with no task behind it, and
+            # /api/update/install refused with downloads_active until a
+            # restart. Fail what is left, loudly.
+            log.error("downloader.group_task_failed", group_id=group_id, error=_describe(exc))
+            for file_id in self._groups.get(group_id, []):
+                stranded = self._files.get(file_id)
+                if stranded is not None and stranded.status in ("queued", "running"):
+                    with contextlib.suppress(Exception):
+                        self._fail(stranded, f"download task failed: {_describe(exc)}")
         finally:
             self._tasks.pop(group_id, None)
+
+    def _note_group_failure(self, group_id: str, failed: _FileState) -> None:
+        """Say what a group's failure means for the model on disk.
+
+        The projector is fetched last, so "the mmproj failed" usually means the
+        base weights are already published: the next scan registers a vision
+        model as text-only with nothing in the queue explaining why. Name it.
+        """
+        others = [
+            self._files[i]
+            for i in self._groups.get(group_id, [])
+            if i != failed.id and self._files[i].status == "completed"
+        ]
+        if others and _looks_like_mmproj(Path(failed.filename)):
+            failed.error = (
+                f"{failed.error or 'failed'} -- the model's weights are downloaded, but "
+                "without its projector it will register as text-only; Resume this download "
+                "to fetch the projector"
+            )
+            self._persist_status(failed)
+            self._emit(failed)
 
     async def _download_file(self, state: _FileState) -> None:
         """Own the ``.part``, then transfer it -- with retries -- under that lock.
@@ -1146,20 +1295,54 @@ class Downloader:
         """
         dest = state.dest
         part = _part_path(dest)
+        owns_dest = False
         try:
             dest.parent.mkdir(parents=True, exist_ok=True)
+            await self._wait_for_sibling_writer(state)
             if await self._adopt_complete(state):
                 self._persist_status(state)
                 self._emit(state)
                 return
+            self._writing[dest] = (state.id, asyncio.Event())
+            owns_dest = True
             with _PartFile(part) as part_file:
                 await self._transfer_with_retries(state, part_file)
         except asyncio.CancelledError:
             raise
         except StudioForgeError as exc:
             self._fail(state, exc.message)
+        except OSError as exc:
+            self._fail(state, self._describe_os_error(state, exc))
         except Exception as exc:
             self._fail(state, _describe(exc))
+        finally:
+            if owns_dest:
+                entry = self._writing.get(dest)
+                if entry is not None and entry[0] == state.id:
+                    self._writing.pop(dest, None)
+                    entry[1].set()
+
+    async def _wait_for_sibling_writer(self, state: _FileState) -> None:
+        """Wait while another group in this process writes ``state.dest``.
+
+        One projector is attached to every quant of a repo, so queueing two
+        quants queues the same mmproj twice under two group ids. Both ran at
+        once; the loser hit its sibling's exclusive ``.part`` lock, and that
+        error is deliberately non-retryable and blamed "another StudioForge
+        instance" -- false, and it failed the whole second group. Waiting for
+        the sibling and then adopting what it published costs nothing.
+        """
+        while True:
+            entry = self._writing.get(state.dest)
+            if entry is None or entry[0] == state.id:
+                return
+            log.info(
+                "downloader.waiting_for_sibling",
+                download_id=state.id,
+                writer=entry[0],
+                filename=state.filename,
+            )
+            await entry[1].wait()
 
     async def _transfer_with_retries(self, state: _FileState, part_file: _PartFile) -> None:
         """Retry transient failures with jittered backoff, resuming each time.
@@ -1225,8 +1408,6 @@ class Downloader:
     async def _transfer(
         self, state: _FileState, part_file: _PartFile, *, allow_resume: bool
     ) -> None:
-        dest = state.dest
-
         have = 0
         hasher = hashlib.sha256()
         if allow_resume and part_file.size > 0:
@@ -1236,6 +1417,33 @@ class Downloader:
             # every stream, every /health poll, long enough for the watchdog to
             # declare a healthy server dead and "recover" it.
             have = await asyncio.to_thread(part_file.rehash, hasher)
+            if have > 0 and state.total_bytes > 0 and have == state.total_bytes:
+                # Every declared byte is already here: a crash landed between
+                # the last write and the rename. Before this the code asked
+                # the server for ``bytes=<total>-``, was answered 416, and
+                # truncated a complete, verifiable 19 GB partial to zero one
+                # line before it would have proved it. Prove it now, from
+                # the hash just computed, and publish without a request.
+                if not state.sha256 or hasher.hexdigest() == state.sha256.lower():
+                    log.info(
+                        "downloader.publishing_complete_partial",
+                        download_id=state.id,
+                        bytes=have,
+                        verified="sha256" if state.sha256 else "length-only",
+                    )
+                    self._set_status(state, "running")
+                    self._finish(state, part_file, have, hasher)
+                    return
+                # Same length, different bytes: a stale partial from a
+                # re-uploaded revision. Start clean, keeping the name.
+                log.warning(
+                    "downloader.complete_partial_hash_mismatch",
+                    download_id=state.id,
+                    bytes=have,
+                )
+                part_file.truncate_to_zero()
+                have = 0
+                hasher = hashlib.sha256()
 
         url = file_url(state.repo_id, state.filename, endpoint=self._endpoint)
         headers = self._headers()
@@ -1251,17 +1459,7 @@ class Downloader:
                 raise _RangeUnsatisfiable
             if response.status_code >= 400:
                 await response.aread()
-                raise UpstreamError(
-                    f"HTTP {response.status_code} downloading {state.filename} "
-                    f"from {state.repo_id}",
-                    details={
-                        "status": response.status_code,
-                        "repo_id": state.repo_id,
-                        # Carried so the backoff can honour a rate limit instead
-                        # of guessing a delay the server already named.
-                        "retry_after_s": _parse_retry_after(response),
-                    },
-                )
+                raise self._http_error(state, response)
 
             resumed = have > 0 and _range_honoured(response, have)
             if have > 0 and not resumed:
@@ -1323,19 +1521,61 @@ class Downloader:
                     self._emit(state)
                     last_emit = now
                 if now - last_db >= _DB_INTERVAL_S:
-                    self.db.update_download_progress(
-                        state.id, written, total_bytes=state.total_bytes or None
-                    )
+                    # A momentarily locked registry must not fail a transfer
+                    # that is 90% done: the row is a progress hint, and the
+                    # next tick (or the completion write) refreshes it.
+                    try:
+                        self.db.update_download_progress(
+                            state.id, written, total_bytes=state.total_bytes or None
+                        )
+                    except Exception as exc:  # noqa: BLE001 - see above
+                        log.debug("downloader.progress_write_failed", error=str(exc))
                     last_db = now
 
         await asyncio.to_thread(part_file.sync)
+        self._finish(state, part_file, written, hasher)
+
+    def _finish(
+        self, state: _FileState, part_file: _PartFile, written: int, hasher: hashlib._Hash
+    ) -> None:
+        """Verify on disk, publish, and mark complete -- the tail every path shares.
+
+        A ``publish`` that fails is **not** a transfer failure to retry: the
+        bytes are complete and verified, the ``.part`` stays on disk (closed,
+        not discarded), and the next attempt -- a Resume, or the next boot --
+        publishes it without a request through the complete-partial path in
+        :meth:`_transfer`. Retrying it through the transfer loop was worse than
+        useless: the handle was already closed, so the retry died on
+        ``the .part file is not open`` and the user read a programming error.
+        On Windows the usual cause is a model that still has the destination
+        mmapped, and the message says so.
+        """
+        dest = state.dest
         self._verify(state, part_file, written, hasher)
-        part_file.publish(dest)
+        try:
+            part_file.publish(dest)
+        except OSError as exc:
+            raise PublishFailedError(
+                f"{state.filename}: downloaded and verified, but it could not be moved "
+                f"into place ({type(exc).__name__}: {exc}). "
+                + (
+                    "A loaded model has the destination open; unload it, then Resume "
+                    "-- the verified partial is kept and will be published without "
+                    "re-downloading."
+                    if self._is_in_use is not None and self._is_in_use(dest)
+                    else "Check the destination is writable, then Resume -- the verified "
+                    "partial is kept and will be published without re-downloading."
+                ),
+                details={"path": str(dest), "errno": exc.errno},
+            ) from exc
         state.downloaded_bytes = written
         state.part_bytes = 0
         if state.total_bytes <= 0:
             state.total_bytes = written
-        self.db.update_download_progress(state.id, written, total_bytes=state.total_bytes)
+        try:
+            self.db.update_download_progress(state.id, written, total_bytes=state.total_bytes)
+        except Exception as exc:  # noqa: BLE001 - the status write below is the one that counts
+            log.debug("downloader.progress_write_failed", error=str(exc))
         state.observe(time.monotonic())
         self._set_status(state, "completed")
         log.info(
@@ -1346,6 +1586,46 @@ class Downloader:
             bytes=written,
             on_disk_bytes=_stat_size(dest),
             verified="sha256" if state.sha256 else "length-only",
+        )
+
+    def _http_error(self, state: _FileState, response: httpx.Response) -> UpstreamError:
+        """The error for a >= 400 answer, actionable for the ones a user can fix.
+
+        A gated or private repo answers 401/403 at ``resolve/`` even when its
+        listing was public, and the generic "HTTP 403 downloading X" sent
+        people to the network tab. The message names the repo page, and says
+        whether the problem is a missing token or a token that has not
+        accepted the licence -- the two states that need different actions.
+        """
+        status = response.status_code
+        details = {
+            "status": status,
+            "repo_id": state.repo_id,
+            # Carried so the backoff can honour a rate limit instead of
+            # guessing a delay the server already named.
+            "retry_after_s": _parse_retry_after(response),
+        }
+        if status in (401, 403):
+            page = f"https://huggingface.co/{state.repo_id}"
+            if self.config.hf.token:
+                action = (
+                    "your hf.token is set but was refused: open the model page, accept "
+                    "its licence with the account that owns the token, and Resume"
+                )
+            else:
+                action = (
+                    "no hf.token is configured: open the model page, accept its licence, "
+                    "create a read token at https://huggingface.co/settings/tokens, set "
+                    "config key 'hf.token' (Setup tab), and Resume"
+                )
+            return UpstreamError(
+                f"HTTP {status} downloading {state.filename} from {state.repo_id}: the "
+                f"repository is gated or private ({page}); {action}",
+                details={**details, "code": "gated_repo"},
+            )
+        return UpstreamError(
+            f"HTTP {status} downloading {state.filename} from {state.repo_id}",
+            details=details,
         )
 
     def _verify(
@@ -1431,10 +1711,48 @@ class Downloader:
         self._emit(state)
 
     def _persist_status(self, state: _FileState) -> None:
-        if self.db.get_download(state.id) is None:
-            self.db.upsert_download(state.row())
-        else:
-            self.db.set_download_status(state.id, state.status, error=state.error)
+        """Write the row; never let a persistence hiccup lose a state transition.
+
+        The in-memory state is the truth for the running process; the row is
+        what the next boot reads. A locked or briefly unwritable registry must
+        not turn a completed transfer into a raised exception inside
+        ``_fail`` -- which is exactly where it would escape the group task and
+        strand every other file in the group.
+        """
+        try:
+            if self.db.get_download(state.id) is None:
+                self.db.upsert_download(state.row())
+            else:
+                self.db.set_download_status(state.id, state.status, error=state.error)
+        except Exception as exc:  # noqa: BLE001 - see docstring
+            log.warning(
+                "downloader.persist_failed",
+                download_id=state.id,
+                status=state.status,
+                error=_describe(exc),
+            )
+
+    def _describe_os_error(self, state: _FileState, exc: OSError) -> str:
+        """``ENOSPC`` names the drive and how far short it is; the rest is generic."""
+        if exc.errno not in (errno.ENOSPC, getattr(errno, "EDQUOT", -1)):
+            return _describe(exc)
+        try:
+            from studioforge.core.diskspace import clear_cache, disk_report
+
+            clear_cache()
+            report = disk_report(state.dest.parent, 0)
+            free = int(report.get("free_bytes") or 0)
+            need = max(0, state.total_bytes - state.downloaded_bytes)
+            return (
+                f"the disk is full: {report.get('drive')} has {free / GB:.1f} GiB free and "
+                f"{state.filename} still needs {need / GB:.1f} GiB. The partial is kept; free "
+                f"space (or move models.dir), then Resume."
+            )
+        except Exception:  # noqa: BLE001 - the report is a courtesy
+            return (
+                f"the disk is full ({_describe(exc)}); the partial is kept -- free space, "
+                "then Resume"
+            )
 
     def _fail(self, state: _FileState, message: str) -> None:
         """Give up on a file, recording what a Resume would actually resume from.
