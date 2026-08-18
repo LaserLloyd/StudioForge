@@ -590,6 +590,15 @@ def test_resolve_by_repo_name_without_gguf_suffix(scanned: Registry) -> None:
     assert scanned.resolve("GEMMA-4-31B-IT-QAT") is scanned.get(GEMMA_31B)
 
 
+def test_resolve_by_the_repo_name_as_pasted_from_huggingface(scanned: Registry) -> None:
+    """The string an agent copies off the model page -- suffix and all, with or
+    without the publisher -- used to 404 while its abbreviation resolved."""
+    record = scanned.get(QWEN_TINY)
+    assert scanned.resolve("Qwen2.5-0.5B-Instruct-GGUF") is record
+    assert scanned.resolve("lmstudio-community/Qwen2.5-0.5B-Instruct-GGUF") is record
+    assert scanned.resolve("lmstudio-community/Qwen2.5-0.5B-Instruct") is record
+
+
 def test_resolve_is_whitespace_tolerant_and_misses_cleanly(scanned: Registry) -> None:
     assert scanned.resolve(f"  {QWEN_TINY}  ") is scanned.get(QWEN_TINY)
     assert scanned.resolve("no-such-model") is None

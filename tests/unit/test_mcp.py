@@ -377,6 +377,24 @@ async def test_list_models_limit_above_the_library_size_is_not_an_error(
     server = build_management_mcp(state)
     result = await call(server, "list_models", limit=99)
     assert result["count"] == 3
+    assert result["truncated"] is False
+    assert result["total_matching"] == 3
+
+
+async def test_list_models_says_when_the_limit_hid_rows(state: State) -> None:
+    """The default limit keeps a big library from becoming a 100 KB answer;
+    an agent must be able to see that it did not get everything."""
+    server = build_management_mcp(state)
+    result = await call(server, "list_models", limit=1)
+    assert result["count"] == 1
+    assert result["truncated"] is True
+    assert result["total_matching"] == 3
+    # The default is a limit, not "everything".
+    import inspect
+
+    from studioforge.mcp import management as mgmt
+
+    assert "limit: int | None = 25" in inspect.getsource(mgmt)
 
 
 async def test_list_models_carries_the_catalog_columns(state: State) -> None:
@@ -422,8 +440,9 @@ async def test_list_models_never_leaks_a_chat_template_or_meta_dump(state: State
     assert "tensor_bytes" not in raw
     assert "tokenizer_model" not in raw
     assert "{% for m in messages %}" not in raw
-    # Compact by default, so three models with load recipes stay affordable.
-    assert len(raw) < 7000, f"list_models output is {len(raw)} chars"
+    # Compact by default, so three models with load recipes stay affordable
+    # (the budget includes the two truncation keys, ~50 bytes).
+    assert len(raw) < 7100, f"list_models output is {len(raw)} chars"
 
 
 async def test_model_options_returns_the_whole_table_for_one_model(state: State) -> None:

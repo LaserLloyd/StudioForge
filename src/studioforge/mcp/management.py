@@ -477,7 +477,7 @@ def build_management_mcp(state: Any) -> MCPServer:
         kind: str | None = None,
         full: bool = False,
         refresh: bool = False,
-        limit: int | None = None,
+        limit: int | None = 25,
     ) -> dict[str, Any]:
         """**Start here.** Every model, newest download first, with how to load it.
 
@@ -538,9 +538,12 @@ def build_management_mcp(state: Any) -> MCPServer:
 
         Returns:
             ``{"ok": true, "catalog_hint": "...", "models": [...],
-            "count": N}``. Every ``id`` is usable verbatim as the ``model``
-            field in OpenAI API requests. ``count`` is the number of rows
-            returned, so it reflects ``limit``. ``state`` is the child
+            "count": N, "truncated": bool, "total_matching": M}``. Every
+            ``id`` is usable verbatim as the ``model`` field in OpenAI API
+            requests. ``count`` is the number of rows returned, so it reflects
+            ``limit`` (default 25, newest first); ``truncated`` says the limit
+            hid some, and ``total_matching`` how many matched the filters in
+            all -- raise ``limit`` or filter by ``kind`` to see the rest. ``state`` is the child
             process's lifecycle word, kept from before the catalog existed:
             ``"stopped"`` there means simply *not loaded*, not that anything
             failed.
@@ -550,6 +553,8 @@ def build_management_mcp(state: Any) -> MCPServer:
         )
         loaded = {i.model_id: i for i in state.supervisor.list()}
         rows: list[dict[str, Any]] = []
+        truncated = False
+        total_matching = 0
         for entry in catalog["models"]:
             record = state.registry.get(entry["id"])
             if record is None:
@@ -559,6 +564,9 @@ def build_management_mcp(state: Any) -> MCPServer:
             instance = loaded.get(record.id)
             if loaded_only and instance is None:
                 continue
+            total_matching += 1
+            if truncated:
+                continue  # keep counting what the limit hid
             # Catalog fields first, the pre-catalog projection second, so on
             # any key they share the OLD meaning wins. `state` is the one that
             # matters: it was the instance's lifecycle word ("stopped",
@@ -575,7 +583,7 @@ def build_management_mcp(state: Any) -> MCPServer:
             # models" is the question, and truncating the catalog first would
             # answer "whichever of the five newest models happen to be chat".
             if limit is not None and limit >= 0 and len(rows) >= limit:
-                break
+                truncated = True
         return {
             "ok": True,
             "catalog_hint": catalog["catalog_hint"],
@@ -583,6 +591,11 @@ def build_management_mcp(state: Any) -> MCPServer:
             "gpus": catalog["gpus"],
             "models": rows,
             "count": len(rows),
+            # Say when the limit cut the list (the default is 25 rows so a
+            # large library cannot become a 100 KB answer by accident); pass
+            # a bigger limit, or filter, to see the rest.
+            "truncated": truncated,
+            "total_matching": total_matching,
         }
 
     @_guard

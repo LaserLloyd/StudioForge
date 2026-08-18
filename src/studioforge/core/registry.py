@@ -797,9 +797,19 @@ class Registry:
             aliases.append(f"{record.publisher}/{stem}")
         if record.repo:
             aliases.append(f"{record.repo}/{stem}")
+            # The HuggingFace repo name as people paste it -- suffix and all
+            # ("Qwen2.5-0.5B-Instruct-GGUF"), with and without the publisher --
+            # and the trimmed form ("Qwen2.5-0.5B-Instruct"). Only the trimmed
+            # one was registered, so the string an agent copies straight off
+            # the model page 404'd while its abbreviation resolved.
+            aliases.append(record.repo)
+            if record.publisher:
+                aliases.append(f"{record.publisher}/{record.repo}")
             trimmed = _REPO_SUFFIX_RE.sub("", record.repo)
             if trimmed and trimmed != record.repo:
                 aliases.append(trimmed)
+                if record.publisher:
+                    aliases.append(f"{record.publisher}/{trimmed}")
         return [a.lower() for a in aliases if a]
 
     def _rebuild_aliases(self) -> None:

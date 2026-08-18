@@ -82,7 +82,16 @@ async def list_models(request: Request) -> JSONResponse:
     for entry in data:
         instance = state.supervisor.get(_serving_id(state, entry["id"]))
         loaded = instance is not None and instance.state == "ready"
-        entry["state"] = "loaded" if loaded else "not-loaded"
+        # "loading" is neither: a client that reads not-loaded and issues a
+        # second load, or MCP list_models saying loading while this said
+        # not-loaded, was the confusion. LM Studio's own vocabulary is
+        # loaded/not-loaded; the third value is additive.
+        if loaded:
+            entry["state"] = "loaded"
+        elif instance is not None and instance.state == "loading":
+            entry["state"] = "loading"
+        else:
+            entry["state"] = "not-loaded"
         if loaded and instance is not None and instance.plan is not None:
             plan = instance.plan
             entry["loaded_context_length"] = plan.ctx_size
