@@ -372,7 +372,10 @@ class Harness:
         config.models.dir = tmp_path / "models"
         config.models.dir.mkdir(parents=True, exist_ok=True)
         config.ensure_dirs()
-        self.config_path = tmp_path / "config.yaml"
+        # The production layout: config.yaml lives IN the data directory, and a
+        # process handed `--config <path>` takes the data dir from where the
+        # file is (D31) -- the file itself never carries a data_dir key.
+        self.config_path = config.data_dir / "config.yaml"
         config.save(self.config_path)
         self.config = config
 

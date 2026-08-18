@@ -1572,3 +1572,52 @@ other idle models when it must; a device-override reload credits that device; th
 walk beats the uniform figure for Gemma-4 by 8x and its offer re-plans successfully),
 `tests/unit/test_load_retry.py` (a refused forced reload stops nothing; the planner is told
 `reload_of`; a plain load never passes it).
+
+---
+
+## D31 -- `data_dir` is never inside config.yaml; a named config file lives in its data dir
+
+**Problem.** D25 says the data directory has one story -- `SF_DATA_DIR`, else `<repo>/data` --
+but `Config.save()` wrote every field, `data_dir` included, and pydantic-settings ranks
+constructor arguments above the environment. So the moment Setup saved anything, the file
+carried `data_dir: <wherever this process was>` and that value outranked `SF_DATA_DIR` on the
+next load. Two consequences, both silent: `local-env.bat` (the documented way to point a
+checkout at an existing data directory) stopped working after the first save; and copying an
+old install's `config.yaml` into a new checkout re-pointed the whole install -- registry, engines,
+logs, downloads -- back at the old data directory. Verified on this box with the real 0.1.0 file:
+`SF_DATA_DIR=E:/should_win` lost to the file.
+
+**Decision.**
+
+* **`data_dir` is not persisted.** `Config.UNPERSISTED_KEYS = {source_path, data_dir}` is what
+  `to_yaml_dict()` excludes, so no dump, save or `apply_overrides` round-trip carries it, and
+  `apply_overrides({"data_dir": ...})` refuses with a pointer to `SF_DATA_DIR`.
+* **On load, a `data_dir` key in the file is ignored** -- with one WARNING naming the value in the
+  file and the directory actually used, when they differ. It got there from an older build's
+  save; the warning is the whole migration.
+* **The data directory of a load is `resolve_data_dir()`:** `SF_DATA_DIR` if set; else, when the
+  config file was *named* (`--config`, `SF_CONFIG`), the directory the file lives in; else the
+  checkout / platform default. The second rule is what keeps every spawn coherent: the tray, the
+  watchdog and autostart all pass `--config <data_dir>/config.yaml`, so a child without the
+  environment lands in the same data directory as its parent -- which is what the file's own
+  `data_dir` key used to do, without the trap. The watchdog's own loader applies the same rule.
+* **`config.yaml` therefore lives in the data directory, by construction.** A config file kept
+  elsewhere and pointed at with `--config` makes *that* directory the data directory (unless
+  `SF_DATA_DIR` says otherwise). The test harnesses that used to save the file beside the data
+  dir now save it inside, which is the production layout.
+
+**Also in the same commit, because a stranger's file hits them first:** every port is bounded
+(`server.port: 70000` used to reach `socket.bind` as an `OverflowError` traceback from the very
+preflight whose job is "a sentence instead of a traceback"), every count/timeout has its sign
+checked, `logging.level` is a `Literal` (case-insensitive, `warn` accepted) instead of a string
+that silently downgraded a typo to INFO, `mcp.path` is normalised to a rooted route (a bare
+`mcp` made the Starlette mount assert, which the app swallowed as "MCP not mounted" -- so MCP was
+absent, the PIN was never enforced and the banner advertised a 404), `models.dir` naming a file
+is refused, unknown keys are ignored *loudly* (one WARNING listing them), an empty
+`config.yaml` is treated as missing (WARNING + regenerated) instead of "every setting silently
+default forever", and `save()` fsyncs the temp file before the rename and keeps the previous
+file as `config.yaml.bak`. `update.repo` defaults to `null` and the shipped placeholder is
+treated the same, so the self-update check reports "not configured" without a network call.
+
+**What pins it.** `tests/unit/test_config_hardening.py`; `tests/unit/test_updater.py` (the
+unconfigured check makes no request); `tests/unit/test_watchdog.py` (harness layout).

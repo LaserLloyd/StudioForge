@@ -324,6 +324,8 @@ def _collect_checks(ctx: GuiContext) -> list[st.SetupCheck]:
         autostart_mechanism=autostart_mechanism,
         bind_host=config.server.host,
         api_key_set=bool(config.server.api_key),
+        gui_host=config.gui.host if config.gui.enabled else None,
+        watchdog_host=config.watchdog.host if config.watchdog.enabled else None,
     )
 
 

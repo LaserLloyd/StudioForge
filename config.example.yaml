@@ -142,7 +142,11 @@ logging:
   level: INFO
   json: false
 update:
-  repo: studioforge/studioforge
+  # GitHub `owner/name` that publishes StudioForge releases, or null when there
+  # is none yet: the self-update check then reports "not configured" without
+  # asking GitHub. (The old placeholder `studioforge/studioforge` is treated
+  # the same as null.)
+  repo: null
   channel: stable
   auto_check: true
   check_interval_h: 24.0

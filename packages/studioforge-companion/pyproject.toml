@@ -34,8 +34,9 @@ dev = [
 [project.scripts]
 sfctl = "studioforge_companion.cli:main"
 
-[project.urls]
-Homepage = "https://github.com/studioforge/studioforge"
+# [project.urls] is deliberately absent: the project has no public home yet,
+# and a placeholder URL is baked into every published wheel's metadata. Add
+# `Homepage = "https://github.com/<owner>/<repo>"` when there is one.
 
 [build-system]
 requires = ["hatchling"]

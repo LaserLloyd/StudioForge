@@ -19,6 +19,7 @@ what is actually on disk rather than what we believe we wrote.
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -207,7 +208,10 @@ def _enable_windows(config: Config, *, open_gui: bool, tray: bool = False) -> Au
     )
     path = target / WINDOWS_SHIM
     try:
-        path.write_text(script, encoding="utf-8")
+        # BOM on purpose: wscript.exe reads a .vbs as ANSI unless it is
+        # BOM-prefixed, so a non-ASCII data dir (a user name with an accent)
+        # became mojibake at login and autostart silently did nothing.
+        path.write_text(script, encoding="utf-8-sig")
     except OSError as exc:
         raise AutostartError(f"could not write {path}: {exc}") from exc
     log.info("autostart enabled", path=str(path), tray=tray)
@@ -243,7 +247,11 @@ def _enable_linux(config: Config, *, open_gui: bool) -> AutostartStatus:
     unit_dir = _user_unit_dir()
     unit_dir.mkdir(parents=True, exist_ok=True)
     argv = launch_command(config, open_gui=open_gui)
-    exec_start = " ".join(argv)
+    # systemd splits ExecStart= on whitespace and honours shell-style quoting,
+    # so a checkout path with a space ("26-08 StudioForgeV2") needs shlex, and
+    # an Environment= value with a space needs the whole assignment quoted.
+    exec_start = shlex.join(argv)
+    data_dir_value = str(config.data_dir).replace("\\", "\\\\").replace('"', '\\"')
     unit = unit_dir / LINUX_UNIT
     unit.write_text(
         "[Unit]\n"
@@ -253,7 +261,7 @@ def _enable_linux(config: Config, *, open_gui: bool) -> AutostartStatus:
         "\n"
         "[Service]\n"
         "Type=simple\n"
-        f"Environment=SF_DATA_DIR={config.data_dir}\n"
+        f'Environment="SF_DATA_DIR={data_dir_value}"\n'
         f"ExecStart={exec_start}\n"
         "Restart=on-failure\n"
         "RestartSec=5\n"

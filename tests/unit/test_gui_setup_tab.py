@@ -838,6 +838,26 @@ def test_lan_bind_with_key_is_green() -> None:
     assert "protected by server.api_key" in check.detail
 
 
+def test_an_open_gui_or_watchdog_bind_is_exposure_even_with_a_private_gateway() -> None:
+    """server.host 127.0.0.1 + gui.host 0.0.0.0 used to read green while the
+    control panel -- restart, delete files, edit config -- was on the LAN."""
+    checks = st.first_run_checks(
+        **_ready_kwargs(bind_host="127.0.0.1", api_key_set=False), gui_host="0.0.0.0"
+    )
+    check = _check(checks, "network")
+    assert check.ok is False and check.required is True
+    assert "gui.host 0.0.0.0" in check.detail
+    assert "control panel" in check.detail
+    only_watchdog = st.first_run_checks(
+        **_ready_kwargs(bind_host="127.0.0.1"), watchdog_host="0.0.0.0", gui_host="127.0.0.1"
+    )
+    assert _check(only_watchdog, "network").ok is False
+    all_private = st.first_run_checks(
+        **_ready_kwargs(bind_host="127.0.0.1"), watchdog_host="::1", gui_host="localhost"
+    )
+    assert _check(all_private, "network").ok is True
+
+
 @pytest.mark.parametrize("host", ["localhost", "::1", "[::1]", "127.0.0.1"])
 def test_loopback_spellings(host: str) -> None:
     assert st._host_is_loopback(host) is True

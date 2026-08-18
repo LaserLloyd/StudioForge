@@ -1,6 +1,6 @@
 # studioforge-companion (`sfctl`)
 
-Remote control for a [StudioForge](https://github.com/studioforge/studioforge) server:
+Remote control for a StudioForge server:
 a GPU-only, OpenAI-compatible LLM gateway over `llama.cpp`'s `llama-server`.
 
 This package is a **thin client**. Every piece of state — the model registry, the VRAM

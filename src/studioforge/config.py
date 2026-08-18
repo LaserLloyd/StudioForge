@@ -1,9 +1,17 @@
-"""Configuration: a single config.yaml plus SF_-prefixed env overrides.
+"""Configuration: a single config.yaml plus a few SF_-prefixed env variables.
 
-Layering (lowest priority first): field defaults -> config.yaml -> environment.
+Layering (lowest priority first): field defaults -> ``SF_*`` environment ->
+config.yaml. The file wins over the environment for every key it names because
+``save()`` writes every key: an env override that outranked the file would be
+silently undone by the first Setup-tab edit and reappear on the next restart,
+which is worse than either order alone. The environment therefore only decides
+things the file does not carry -- ``SF_DATA_DIR`` (D25) and ``SF_CONFIG`` --
+plus a first-run default for anything not yet written.
+
 The resolved config is written back on ``save()`` so the GUI/MCP ``set_config``
 surfaces and hand edits round-trip through the same file. The file lives
-*outside* the release directories so self-update never clobbers it.
+*outside* the release directories so self-update never clobbers it, and
+``data_dir`` itself is never written into it (see :meth:`Config.to_yaml_dict`).
 """
 
 from __future__ import annotations
@@ -14,7 +22,7 @@ import os
 import time
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, ClassVar, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -129,18 +137,26 @@ def detect_model_dir() -> Path | None:
     return None
 
 
+#: A TCP port. ``0`` is excluded on purpose: "pick any free port" is meaningless
+#: for a server whose clients are configured with the number.
+Port = Annotated[int, Field(ge=1, le=65535)]
+PositiveInt = Annotated[int, Field(gt=0)]
+NonNegativeInt = Annotated[int, Field(ge=0)]
+PositiveFloat = Annotated[float, Field(gt=0)]
+NonNegativeFloat = Annotated[float, Field(ge=0)]
+
+
 class ServerConfig(BaseModel):
     host: str = "0.0.0.0"
-    port: int = 1234  # LM Studio's default port: OpenClaw only changes the host
+    port: Port = 1234  # LM Studio's default port: OpenClaw only changes the host
     # >= 6 chars so the log-redaction processor will register it: shorter
     # values are ignored there, and an unredactable key can surface inside a
     # logged command line or an httpx error repr.
     api_key: str | None = Field(default=None, min_length=6)
     cors_origins: list[str] = Field(default_factory=lambda: ["*"])
     cors_allow_credentials: bool = False
-    drain_timeout_s: float = 30.0
-    request_timeout_s: float = 900.0
-
+    drain_timeout_s: NonNegativeFloat = 30.0
+    request_timeout_s: PositiveFloat = 900.0
 
     @model_validator(mode="after")
     def _no_credentialed_wildcard_cors(self) -> ServerConfig:
@@ -160,17 +176,17 @@ class ServerConfig(BaseModel):
 class GuiConfig(BaseModel):
     enabled: bool = True
     host: str = "0.0.0.0"
-    port: int = 8080
-    refresh_interval_s: float = 2.0
+    port: Port = 8080
+    refresh_interval_s: PositiveFloat = 2.0
 
 
 class WatchdogConfig(BaseModel):
     enabled: bool = True
     host: str = "0.0.0.0"
-    port: int = 1235
-    poll_interval_s: float = 10.0
-    health_timeout_s: float = 5.0
-    wedged_after_failures: int = 3
+    port: Port = 1235
+    poll_interval_s: PositiveFloat = 10.0
+    health_timeout_s: PositiveFloat = 5.0
+    wedged_after_failures: PositiveInt = 3
 
 
 #: config.yaml is rewritten while the watchdog may have it open for reading.
@@ -181,8 +197,8 @@ _SAVE_RETRY_DELAY_S = 0.05
 class ModelsConfig(BaseModel):
     dir: Path | None = None
     extra_dirs: list[Path] = Field(default_factory=list)
-    default_ctx: int = 8192
-    default_ttl_s: int = 1800  # 30 min; 0 = pinned/never unload
+    default_ctx: PositiveInt = 8192
+    default_ttl_s: NonNegativeInt = 1800  # 30 min; 0 = pinned/never unload
     # "auto": the planner picks per model rather than forcing one type on the
     # whole library. At long context the KV cache dwarfs the weights, so the
     # right trade differs per model -- a 27B reaches native 262144 on f16 and
@@ -198,14 +214,14 @@ class ModelsConfig(BaseModel):
     #: Per-slot context the parallel estimator assumes when nothing else says.
     #: Only used to *size* the slot count and to build the catalog's
     #: loading-options table; it never overrides a planned or explicit ctx_size.
-    ctx_per_slot_default: int = 32768
+    ctx_per_slot_default: PositiveInt = 32768
     # "on" rather than "auto": flash attention is a large KV-bandwidth and
     # memory win and is supported on every GPU from Ampere (sm_80) up, which
     # is all of this rig. "auto" defers the same decision to the engine and
     # has been observed to decline it. tune_for_hardware drops this back to
     # "auto" if a pre-Ampere card is ever detected.
     default_flash_attn: FlashAttn = "on"
-    default_cache_reuse: int = 256  # prompt-cache reuse: the big OpenClaw latency win
+    default_cache_reuse: NonNegativeInt = 256  # prompt-cache reuse: the OpenClaw latency win
     # "none" keeps a reasoning model's thoughts inline in message.content.
     # llama.cpp's default ("auto") splits them into reasoning_content and leaves
     # content empty, which reads as an empty reply to every OpenAI client.
@@ -214,13 +230,13 @@ class ModelsConfig(BaseModel):
     # ordinary default truncates the chain of thought AND the visible answer.
     # Applied only when a thinking model has no explicit ctx_size, clamped to
     # the model's trained window and to what actually fits.
-    thinking_default_ctx: int = 32768
+    thinking_default_ctx: PositiveInt = 32768
     # What every model AIMS for when nobody asks for a specific size. The
     # planner walks down from here -- halving -- to the largest window that
     # actually fits in VRAM, never below ``default_ctx``. Agent workloads
     # (OpenClaw) carry long tool transcripts and run out of room at 8k, so the
     # aim is high and the step-down is what keeps big models loadable.
-    target_ctx: int = 1048576
+    target_ctx: PositiveInt = 1048576
     auto_load_pinned: bool = True
     # Served when a request omits "model", or names one of DEFAULT_MODEL_ALIASES
     # ("local-model", "default", "auto"). LM Studio clients send "local-model"
@@ -247,21 +263,24 @@ class ModelsConfig(BaseModel):
             raise ValueError("models.default_parallel must be >= 1")
         return v
 
-    @field_validator("ctx_per_slot_default")
+    @field_validator("dir")
     @classmethod
-    def _positive_ctx_per_slot(cls, v: int) -> int:
-        if v <= 0:
-            raise ValueError("models.ctx_per_slot_default must be positive")
+    def _dir_is_not_a_file(cls, v: Path | None) -> Path | None:
+        # A missing directory is fine (it may be created, or be on a drive not
+        # mounted yet); a path that exists and is a *file* can never be a
+        # library, and scanning it silently found nothing.
+        if v is not None and Path(v).is_file():
+            raise ValueError(f"models.dir points at a file, not a directory: {v}")
         return v
 
 
 class EngineConfig(BaseModel):
     pinned_tag: str = "b10425"
     cuda_variant: str = "auto"  # e.g. "12.4" / "13.3" / "auto"
-    keep_versions: int = 3
+    keep_versions: PositiveInt = 3
     allow_source_build: bool = True
     repo: str = "ggml-org/llama.cpp"
-    smoke_test_timeout_s: float = 180.0
+    smoke_test_timeout_s: PositiveFloat = 180.0
 
 
 class QuantAffinity(BaseModel):
@@ -310,11 +329,11 @@ class PlannerConfig(BaseModel):
     on_insufficient: Literal["evict", "reject"] = "evict"
     # Compute/graph buffers scale with batch and model width; calibrated against
     # observed loads and refined by predicted-vs-actual logging. See DECISIONS.md.
-    compute_overhead_fraction: float = 0.06
-    compute_overhead_floor_mb: int = 400
-    cuda_context_mb: int = 300  # per-GPU CUDA context + cuBLAS workspace
-    image_tokens_default: int = 1024
-    mmproj_compute_mb: int = 512
+    compute_overhead_fraction: NonNegativeFloat = 0.06
+    compute_overhead_floor_mb: NonNegativeInt = 400
+    cuda_context_mb: NonNegativeInt = 300  # per-GPU CUDA context + cuBLAS workspace
+    image_tokens_default: PositiveInt = 1024
+    mmproj_compute_mb: NonNegativeInt = 512
     prefer_single_gpu: bool = True
     # Quant family -> hardware affinity. Keys are matched case-insensitively
     # against the model's quant label. See default_quant_affinity().
@@ -385,6 +404,20 @@ class McpConfig(BaseModel):
     #: Print the reachable MCP URLs (and the PIN) in the startup banner.
     advertise: bool = True
 
+    @field_validator("path")
+    @classmethod
+    def _rooted_path(cls, v: str) -> str:
+        # Starlette asserts a route path starts with "/"; a bare "mcp" made
+        # the mount fail, which the app swallowed as "management MCP not
+        # mounted" -- so MCP was silently absent, the PIN was never enforced,
+        # and the banner advertised a URL that 404s. Normalise instead.
+        cleaned = (v or "").strip()
+        if not cleaned or cleaned == "/":
+            raise ValueError("mcp.path must be a non-root path such as '/mcp'")
+        if not cleaned.startswith("/"):
+            cleaned = "/" + cleaned
+        return cleaned.rstrip("/") or "/mcp"
+
     @field_validator("pin")
     @classmethod
     def _sane_pin(cls, v: str | None) -> str | None:
@@ -454,40 +487,43 @@ def generate_pin(length: int = 8) -> str:
 
 
 class GatewayConfig(BaseModel):
-    child_port_start: int = 18100
-    child_port_end: int = 18200
-    load_timeout_s: float = 600.0
-    health_poll_interval_s: float = 0.5
-    max_restarts: int = 3
-    restart_backoff_s: float = 2.0
-    max_images_per_request: int = 8
-    max_image_bytes: int = 20 * 1024 * 1024
+    child_port_start: Port = 18100
+    child_port_end: Port = 18200
+    load_timeout_s: PositiveFloat = 600.0
+    health_poll_interval_s: PositiveFloat = 0.5
+    max_restarts: NonNegativeInt = 3
+    restart_backoff_s: NonNegativeFloat = 2.0
+    max_images_per_request: NonNegativeInt = 8
+    max_image_bytes: PositiveInt = 20 * 1024 * 1024
     # Vision image_url fetches are the one outbound request a CALLER chooses,
     # so by default the server refuses loopback/private/link-local targets: on
     # an open install that made it an unauthenticated probe for anything else
     # on the LAN or tailnet. Turn on only if you genuinely serve images from
     # another box on your own network.
     allow_private_image_hosts: bool = False
-    image_fetch_timeout_s: float = 20.0
-    max_image_dim: int = 2048
-    ttl_sweep_interval_s: float = 15.0
+    image_fetch_timeout_s: PositiveFloat = 20.0
+    max_image_dim: PositiveInt = 2048
+    ttl_sweep_interval_s: PositiveFloat = 15.0
     # While a streaming request waits on a JIT load, emit an SSE comment this
     # often so the client's read timeout cannot fire on a load that is
     # progressing. Large models take minutes to page in from disk.
-    stream_keepalive_interval_s: float = 5.0
+    stream_keepalive_interval_s: PositiveFloat = 5.0
     # Merge a reasoning-only reply into `content` rather than returning "".
     merge_reasoning_into_content: bool = True
     # Deep health probe: a real streamed completion per loaded model. Small and
     # bounded, because a check that can hang is worse than no check.
-    deep_probe_timeout_s: float = 20.0
-    deep_probe_max_tokens: int = 8
+    deep_probe_timeout_s: PositiveFloat = 20.0
+    deep_probe_max_tokens: PositiveInt = 8
 
 
 class HfConfig(BaseModel):
     token: str | None = None
     cache_dir: Path | None = None
-    max_concurrent_downloads: int = 2
-    chunk_bytes: int = 8 * 1024 * 1024
+    max_concurrent_downloads: PositiveInt = 2
+    chunk_bytes: PositiveInt = 8 * 1024 * 1024
+
+
+LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 
 
 class LoggingConfig(BaseModel):
@@ -495,16 +531,44 @@ class LoggingConfig(BaseModel):
     # name avoids shadowing BaseModel.json.
     model_config = ConfigDict(populate_by_name=True)
 
-    level: str = "INFO"
+    level: LogLevel = "INFO"
     json_logs: bool = Field(default=False, alias="json")
+
+    @field_validator("level", mode="before")
+    @classmethod
+    def _upper_level(cls, v: Any) -> Any:
+        # "info" and "warn" are what people type; a typo used to be accepted
+        # and silently downgraded to INFO by the logging setup.
+        if isinstance(v, str):
+            upper = v.strip().upper()
+            return "WARNING" if upper == "WARN" else upper
+        return v
+
+
+#: The placeholder the app shipped with before it had a public home. A config
+#: that still carries it (every ``config.yaml`` written by 0.1.0/0.2.0 does) is
+#: treated exactly like ``repo: null``: not configured, no network call.
+UPDATE_REPO_PLACEHOLDER = "studioforge/studioforge"
 
 
 class UpdateConfig(BaseModel):
-    repo: str = "studioforge/studioforge"
+    #: ``owner/name`` of the GitHub repository that publishes StudioForge
+    #: releases, or null when there is none yet. Unset means the self-update
+    #: check reports "not configured" instead of asking GitHub for a repo that
+    #: does not exist (a 404 every 24 h against the anonymous rate limit).
+    repo: str | None = None
     channel: Literal["stable", "prerelease"] = "stable"
     auto_check: bool = True
-    check_interval_h: float = 24.0
-    health_check_timeout_s: float = 60.0
+    check_interval_h: PositiveFloat = 24.0
+    health_check_timeout_s: PositiveFloat = 60.0
+
+    @property
+    def configured_repo(self) -> str | None:
+        """The repo to ask for releases, or ``None`` when self-update is off."""
+        value = (self.repo or "").strip()
+        if not value or value == UPDATE_REPO_PLACEHOLDER or "/" not in value:
+            return None
+        return value
 
 
 class Config(BaseSettings):
@@ -605,9 +669,17 @@ class Config(BaseSettings):
 
     # --- persistence ---------------------------------------------------
 
+    #: Keys that never go into config.yaml. ``data_dir`` is *derived* --
+    #: ``SF_DATA_DIR``, else ``<repo>/data``, else the platform dir (D25) --
+    #: and a value written into the file outranked all three on the next load:
+    #: copying an old install's ``config.yaml`` into a fresh checkout silently
+    #: pointed the whole install back at the old data directory, and
+    #: ``local-env.bat`` stopped working the moment Setup saved anything.
+    UNPERSISTED_KEYS: ClassVar[frozenset[str]] = frozenset({"source_path", "data_dir"})
+
     def to_yaml_dict(self) -> dict[str, Any]:
         # by_alias so LoggingConfig.json_logs round-trips as the `json` key.
-        return self.model_dump(mode="json", exclude={"source_path"}, by_alias=True)
+        return self.model_dump(mode="json", exclude=set(self.UNPERSISTED_KEYS), by_alias=True)
 
     def save(self, path: Path | None = None) -> Path:
         """Write the config atomically, tolerating a concurrent reader.
@@ -624,7 +696,18 @@ class Config(BaseSettings):
         target.parent.mkdir(parents=True, exist_ok=True)
         payload = yaml.safe_dump(self.to_yaml_dict(), sort_keys=False, default_flow_style=False)
         tmp = target.with_suffix(target.suffix + ".tmp")
-        tmp.write_text(payload, encoding="utf-8")
+        # fsync before the rename: without it a power loss in the rename window
+        # can leave a zero-length config.yaml, which loads as "{}" and silently
+        # reverts every setting to its default (WP17 R5). The previous file is
+        # kept as .bak so a truncated one is recoverable by hand.
+        with tmp.open("w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if target.is_file():
+            with contextlib.suppress(OSError):
+                backup = target.with_suffix(target.suffix + ".bak")
+                backup.write_bytes(target.read_bytes())
         last: OSError | None = None
         for attempt in range(_SAVE_RETRIES):
             try:
@@ -702,6 +785,25 @@ def find_config_path(explicit: Path | str | None = None) -> Path:
     return default_data_dir() / "config.yaml"
 
 
+def resolve_data_dir(config_path: Path, *, explicit: bool) -> Path:
+    """The data directory for a load of ``config_path`` (D25, in one place).
+
+    ``SF_DATA_DIR`` wins. Otherwise a config file that was *named* -- by
+    ``--config`` or ``SF_CONFIG`` -- lives in its data directory (the file is
+    always ``<data_dir>/config.yaml``, that is how every process that spawns
+    another passes the location: the tray, the watchdog, autostart), so its
+    parent is the data dir. Only an unnamed load falls through to the checkout
+    / platform default. What is never consulted is a ``data_dir`` key inside
+    the file (see :meth:`Config.to_yaml_dict`).
+    """
+    env = os.environ.get("SF_DATA_DIR")
+    if env:
+        return Path(env).expanduser().resolve()
+    if explicit:
+        return config_path.expanduser().resolve().parent
+    return default_data_dir()
+
+
 def load_config(path: Path | str | None = None, *, create: bool = False) -> Config:
     """Load config.yaml, applying env overrides on top.
 
@@ -709,24 +811,57 @@ def load_config(path: Path | str | None = None, *, create: bool = False) -> Conf
     (first-run bootstrap), including the auto-detected LM Studio model dir.
     """
     config_path = find_config_path(path)
+    explicit = path is not None or bool(os.environ.get("SF_CONFIG"))
+    data_dir = resolve_data_dir(config_path, explicit=explicit)
     raw: dict[str, Any] = {}
-    if config_path.is_file():
+    file_present = config_path.is_file()
+    if file_present:
         try:
-            loaded = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+            text = config_path.read_text(encoding="utf-8")
+            loaded = yaml.safe_load(text)
         except yaml.YAMLError as exc:
             raise ConfigError(f"config file {config_path} is not valid YAML: {exc}") from exc
         if loaded is None:
+            # An empty (0-byte or comment-only) file. This is what a crash in
+            # the old non-fsync save window left behind, and it used to load
+            # as "{}" -- every setting silently back at its default, forever,
+            # while the file's presence stopped first-run bootstrap from ever
+            # rewriting it. Treat it as missing: say so, and let ``create``
+            # regenerate it (a .bak from the last good save sits beside it).
+            _log().warning(
+                "config.yaml is empty; treating it as missing and using defaults",
+                path=str(config_path),
+                hint="a config.yaml.bak from the last successful save may be next to it",
+            )
             loaded = {}
+            file_present = False
         if not isinstance(loaded, dict):
             raise ConfigError(f"config file {config_path} must contain a YAML mapping")
         raw = loaded
 
+    # ``data_dir`` in the file is ignored (D25: SF_DATA_DIR, else the directory
+    # the named config file lives in, else <repo>/data / the platform dir). It
+    # got there from an older build's save(); a value that differs from the
+    # resolved one is worth one line, not a silent relocation of the install.
+    stray = raw.pop("data_dir", None)
+    if stray is not None:
+        with contextlib.suppress(Exception):
+            if Path(str(stray)).expanduser().resolve() != data_dir:
+                _log().warning(
+                    "config.yaml names a data_dir; ignored -- the data directory is set by "
+                    "SF_DATA_DIR or by where config.yaml lives, never by a key inside it",
+                    in_file=str(stray),
+                    using=str(data_dir),
+                )
+
+    _warn_unknown_keys(raw, config_path)
+
     try:
-        config = Config(**raw)
+        config = Config(data_dir=data_dir, **raw)
     except Exception as exc:
         raise ConfigError(f"invalid configuration in {config_path}: {exc}") from exc
 
-    config.source_path = config_path if config_path.is_file() else None
+    config.source_path = config_path if file_present else None
 
     if config.models.dir is None:
         detected = detect_model_dir()
@@ -738,7 +873,7 @@ def load_config(path: Path | str | None = None, *, create: bool = False) -> Conf
         config.mcp.pin = generate_pin()
         minted_pin = True
 
-    if create and not config_path.is_file():
+    if create and not file_present:
         config.source_path = config_path
         config.ensure_dirs()
         # First run: adapt to the detected hardware so the box works well without
@@ -776,6 +911,43 @@ def load_config(path: Path | str | None = None, *, create: bool = False) -> Conf
     return config
 
 
+def _log() -> Any:
+    from studioforge.logging import get_logger
+
+    return get_logger(__name__)
+
+
+def _warn_unknown_keys(raw: dict[str, Any], config_path: Path) -> None:
+    """One WARNING per key in the file that no config model declares.
+
+    Unknown keys are ignored rather than fatal -- a file from a newer build, or
+    a removed key like ``models.max_loaded``, must not stop the server -- but
+    silently ignoring them is how a typo (``server.api_kye``) becomes "the key
+    does not work and nothing says why".
+    """
+    unknown: list[str] = []
+    top_fields = set(Config.model_fields)
+    for key, value in raw.items():
+        if key not in top_fields:
+            unknown.append(key)
+            continue
+        section_type = Config.model_fields[key].annotation
+        fields = getattr(section_type, "model_fields", None)
+        if not isinstance(value, dict) or not isinstance(fields, dict):
+            continue
+        accepted = set(fields)
+        for info in fields.values():
+            if info.alias:
+                accepted.add(info.alias)
+        unknown.extend(f"{key}.{sub}" for sub in value if sub not in accepted)
+    if unknown:
+        _log().warning(
+            "config.yaml has keys this build does not know; they are ignored",
+            path=str(config_path),
+            keys=sorted(unknown),
+        )
+
+
 def _register_secrets(config: Config) -> None:
     from studioforge.logging import register_secret
 
@@ -796,6 +968,13 @@ def apply_overrides(config: Config, updates: dict[str, Any]) -> Config:
     """
     data = config.to_yaml_dict()
     for dotted, value in updates.items():
+        if dotted.split(".")[0] in Config.UNPERSISTED_KEYS:
+            raise ConfigError(
+                f"{dotted} is not stored in config.yaml: the data directory is set by "
+                "SF_DATA_DIR (local-env.bat next to the launchers, or the shell/systemd "
+                "environment), see README 'Data directory'",
+                param=dotted,
+            )
         parts = dotted.split(".")
         cursor: Any = data
         for part in parts[:-1]:
@@ -807,7 +986,9 @@ def apply_overrides(config: Config, updates: dict[str, Any]) -> Config:
             raise ConfigError(f"unknown config key: {dotted}")
         cursor[leaf] = value
     try:
-        updated = Config(**data)
+        # data_dir is not in the dump (never persisted); carry it over or the
+        # new object -- and its save() -- lands in the default data directory.
+        updated = Config(data_dir=config.data_dir, **data)
     except Exception as exc:
         raise ConfigError(f"invalid config update: {exc}") from exc
     updated.source_path = config.source_path
@@ -832,6 +1013,7 @@ RESTART_REQUIRED_KEYS = frozenset(
         # CORS origins are captured when the middleware is constructed, and the
         # MCP path decides where the app mounts -- neither can change in place.
         "server.cors_origins",
+        "server.cors_allow_credentials",
         "mcp.path",
         "mcp.enabled",
     }

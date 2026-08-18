@@ -92,6 +92,10 @@ class UpdateStatus:
     releases_installed: list[str] = field(default_factory=list)
     previous_release: str | None = None
     error: str | None = None
+    #: False when ``update.repo`` is unset (or still the shipped placeholder):
+    #: the check made no network call and ``update_available`` means nothing.
+    configured: bool = True
+    note: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -104,6 +108,8 @@ class UpdateStatus:
             "releases_installed": self.releases_installed,
             "previous_release": self.previous_release,
             "error": self.error,
+            "configured": self.configured,
+            "note": self.note,
         }
 
 
@@ -209,14 +215,33 @@ class Updater:
 
     # -- release discovery -------------------------------------------------
 
+    #: What ``check()`` says when there is no repo to ask. Not an error: a
+    #: build without a public home is the normal state of this project today.
+    NOT_CONFIGURED_NOTE = (
+        "app self-update is not configured: set update.repo to the GitHub "
+        "'owner/name' that publishes StudioForge releases (Setup tab or config.yaml)"
+    )
+
+    def repo(self) -> str | None:
+        """The release repository, or ``None`` when self-update is unconfigured."""
+        return self.config.update.configured_repo
+
     async def check(self) -> UpdateStatus:
-        """Compare the running version against the configured GitHub repo."""
+        """Compare the running version against the configured GitHub repo.
+
+        With no repo configured this is a local answer -- no network call, no
+        error, ``configured: false`` and a note saying how to turn it on.
+        """
         status = UpdateStatus(
             current_release=self.current_release(),
             releases_installed=self.installed_releases(),
             previous_release=self.previous_release(),
             checked_at=time.time(),
         )
+        if self.repo() is None:
+            status.configured = False
+            status.note = self.NOT_CONFIGURED_NOTE
+            return status
         try:
             release = await self.latest_release()
         except UpdateError as exc:
@@ -231,17 +256,17 @@ class Updater:
         return status
 
     async def list_releases(self, limit: int = 20) -> list[ReleaseInfo]:
+        repo = self.repo()
+        if repo is None:
+            raise UpdateError(self.NOT_CONFIGURED_NOTE)
         client = await self._http()
-        url = f"https://api.github.com/repos/{self.config.update.repo}/releases"
+        url = f"https://api.github.com/repos/{repo}/releases"
         try:
             response = await client.get(url, params={"per_page": limit}, headers=_gh_headers())
         except httpx.HTTPError as exc:
             raise UpdateError(f"could not reach GitHub: {exc}") from exc
         if response.status_code == 404:
-            raise UpdateError(
-                f"update repo '{self.config.update.repo}' not found "
-                f"(set update.repo in config.yaml)"
-            )
+            raise UpdateError(f"update repo '{repo}' not found (set update.repo in config.yaml)")
         if response.status_code >= 400:
             raise UpdateError(f"GitHub returned HTTP {response.status_code} for {url}")
         payload = response.json()
@@ -365,7 +390,7 @@ class Updater:
         for release in await self.list_releases(limit=50):
             if release.tag == tag or release.version == tag.lstrip("vV"):
                 return release
-        raise UpdateError(f"release '{tag}' not found in {self.config.update.repo}")
+        raise UpdateError(f"release '{tag}' not found in {self.repo()}")
 
     async def _download_asset(self, release: ReleaseInfo) -> Path:
         assert release.asset_url is not None

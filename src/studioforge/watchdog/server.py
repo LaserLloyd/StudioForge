@@ -82,6 +82,7 @@ from studioforge.config import (
     Config,
     apply_overrides,
     find_config_path,
+    resolve_data_dir,
 )
 
 log = logging.getLogger("studioforge.watchdog")
@@ -842,14 +843,19 @@ class Watchdog:
         and repair the real problem.
         """
         raw, error = self.read_raw_config()
+        # The watchdog is always started with --config, so the data directory
+        # is where that file lives (or SF_DATA_DIR), never a key inside it --
+        # the same rule load_config applies (D31).
+        data_dir = resolve_data_dir(self.config_path, explicit=True)
         if error is not None:
-            config = Config()
+            config = Config(data_dir=data_dir)
             config.source_path = self.config_path
             return config, error
+        raw = {k: v for k, v in raw.items() if k != "data_dir"}
         try:
-            config = Config(**raw)
+            config = Config(data_dir=data_dir, **raw)
         except Exception as exc:  # noqa: BLE001 - any pydantic failure degrades
-            fallback = Config()
+            fallback = Config(data_dir=data_dir)
             fallback.source_path = self.config_path
             return fallback, f"invalid configuration in {self.config_path}: {exc}"
         config.source_path = self.config_path
@@ -1903,8 +1909,11 @@ def build_watchdog_mcp(watchdog: Watchdog) -> MCPServer:
                 # instead -- checking each key against the schema's shape -- so
                 # the operator's other settings survive being fixed.
                 raw, _ = watchdog.read_raw_config()
+                raw = {k: v for k, v in raw.items() if k != "data_dir"}
                 merged = _set_dotted(raw, updates, reference=Config().to_yaml_dict())
-                updated = Config(**merged)
+                updated = Config(
+                    data_dir=resolve_data_dir(watchdog.config_path, explicit=True), **merged
+                )
         except Exception as exc:  # noqa: BLE001 - rejection is a result
             return _error(
                 f"Rejected: {exc} Nothing was written to {watchdog.config_path}.",

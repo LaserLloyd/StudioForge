@@ -27,6 +27,9 @@ from studioforge.core.updater import (
 
 
 def make_config(tmp_path: Path, **kwargs: Any) -> Config:
+    # A configured release repo, so the checks below exercise the network
+    # path; an unconfigured one short-circuits (see the "not configured" tests).
+    kwargs.setdefault("update", {"repo": "example-org/studioforge"})
     config = Config(data_dir=tmp_path / "data", **kwargs)
     config.ensure_dirs()
     return config
@@ -669,3 +672,46 @@ def test_prune_keeps_current_and_recent(tmp_path: Path) -> None:
 
 async def _immediate(value: Any) -> Any:
     return value
+
+
+# ---------------------------------------------------------------------------
+# no update repo configured
+# ---------------------------------------------------------------------------
+
+
+async def test_check_without_a_repo_is_a_local_answer(tmp_path: Path) -> None:
+    """The shipped default has no public repo: no network call, no error."""
+    config = Config(data_dir=tmp_path / "data")
+    assert config.update.repo is None
+    updater = Updater(config)
+
+    async def never() -> Any:
+        raise AssertionError("must not ask GitHub when no repo is configured")
+
+    updater.latest_release = never  # type: ignore[assignment]
+    status = await updater.check()
+    assert status.configured is False
+    assert status.update_available is False
+    assert status.error is None
+    assert "update.repo" in (status.note or "")
+    assert status.to_dict()["configured"] is False
+
+
+@pytest.mark.parametrize("value", [None, "", "   ", "studioforge/studioforge", "no-slash"])
+def test_placeholder_or_junk_repo_counts_as_unconfigured(tmp_path: Path, value: str | None) -> None:
+    config = Config(data_dir=tmp_path / "data", update={"repo": value})
+    assert config.update.configured_repo is None
+
+
+def test_a_real_repo_is_configured(tmp_path: Path) -> None:
+    config = Config(data_dir=tmp_path / "data", update={"repo": " someone/studioforge "})
+    assert config.update.configured_repo == "someone/studioforge"
+
+
+async def test_list_releases_without_a_repo_raises_a_readable_error(tmp_path: Path) -> None:
+    from studioforge.core.updater import UpdateError
+
+    updater = Updater(Config(data_dir=tmp_path / "data"))
+    with pytest.raises(UpdateError) as excinfo:
+        await updater.list_releases()
+    assert "update.repo" in excinfo.value.message

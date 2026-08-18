@@ -323,11 +323,14 @@ async def _serve(config: Config, *, open_gui: bool = False) -> int:
 def _log_mcp_banner(config: Config) -> None:
     """Print where the MCP endpoint is and the PIN needed to pair with it.
 
-    The PIN is printed **deliberately**, which is why it is not registered as a
-    redacted secret: it is a LAN/tailnet pairing code whose entire purpose is to
-    be read off this banner and typed into a client, in the way a Chromecast
-    shows a code on the TV. ``server.api_key`` remains the strong credential and
-    is never printed.
+    The PIN is printed **deliberately** -- it is a LAN/tailnet pairing code
+    whose entire purpose is to be read off this banner and typed into a client,
+    in the way a Chromecast shows a code on the TV. It goes through
+    ``_console`` (the human's stdout), not the logger: it *is* registered as a
+    redacted secret, so the structured log line below shows it as
+    ``***REDACTED***`` and a PIN embedded in any later logged string (a
+    ``?pin=`` URL, an error) is scrubbed too. ``server.api_key`` remains the
+    strong credential and is never printed anywhere.
 
     Tailscale is listed first because it is the address that keeps working: a
     tailnet IP survives a network change, where a LAN address silently stops

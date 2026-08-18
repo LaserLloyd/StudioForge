@@ -3054,6 +3054,8 @@ def first_run_checks(
     autostart_mechanism: str = "",
     bind_host: str = "0.0.0.0",
     api_key_set: bool = False,
+    gui_host: str | None = None,
+    watchdog_host: str | None = None,
 ) -> list[SetupCheck]:
     """Everything a fresh checkout has to get right, in the order it matters.
 
@@ -3171,7 +3173,17 @@ def first_run_checks(
         )
     )
 
-    exposed = not _host_is_loopback(bind_host)
+    # All three listeners, not just the gateway: the control panel and the
+    # watchdog's recovery surface share the credential and are just as much
+    # "the server" to anyone on the LAN. server.host 127.0.0.1 with gui.host
+    # 0.0.0.0 used to read green while the panel was wide open.
+    binds = {"server.host": bind_host}
+    if gui_host is not None:
+        binds["gui.host"] = gui_host
+    if watchdog_host is not None:
+        binds["watchdog.host"] = watchdog_host
+    open_binds = [f"{name} {host}" for name, host in binds.items() if not _host_is_loopback(host)]
+    exposed = bool(open_binds)
     network_ok = (not exposed) or bool(api_key_set)
     checks.append(
         SetupCheck(
@@ -3185,12 +3197,14 @@ def first_run_checks(
                 f"bound to {bind_host} (this machine only)"
                 if not exposed
                 else (
-                    f"reachable from the network on {bind_host}, protected by server.api_key"
+                    f"reachable from the network ({', '.join(open_binds)}), protected by "
+                    "server.api_key"
                     if api_key_set
                     else (
-                        f"reachable from the whole network on {bind_host} with NO API key: "
-                        "anyone on the LAN can load, unload and delete models. The MCP PIN "
-                        "guards only /mcp."
+                        f"reachable from the whole network ({', '.join(open_binds)}) with NO "
+                        "API key: anyone on the LAN can load, unload and delete models, "
+                        "change settings and restart the server (the control panel and the "
+                        "watchdog included). The MCP PIN guards only /mcp."
                     )
                 )
             ),
