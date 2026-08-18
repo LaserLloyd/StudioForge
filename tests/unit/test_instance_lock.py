@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -273,6 +274,17 @@ def test_the_primary_instance_starts_the_downloader_and_frees_the_lock(config: C
     assert app.state.instance_role == "primary"
     with TestClient(app) as http:
         assert http.get("/health").json()["instance"] == "primary"
+        # D33: the port answers before the boot task has run; the downloader
+        # is started BY that task. Wait for it rather than racing it (this
+        # test flaked exactly that way once the file grew).
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            body = http.get("/health").json()
+            if (body.get("boot") or {}).get("ready"):
+                break
+            time.sleep(0.05)
+        else:  # pragma: no cover - only on a wedged boot
+            raise AssertionError("boot never became ready")
     assert downloader.started == 1
 
     # Shutdown released it, so the next process can take over cleanly.
