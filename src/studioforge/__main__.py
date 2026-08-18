@@ -26,6 +26,7 @@ import typer
 
 from studioforge import __version__
 from studioforge.config import Config, find_config_path, load_config
+from studioforge.errors import ConfigError
 from studioforge.logging import configure_logging, get_logger
 
 if TYPE_CHECKING:
@@ -42,7 +43,22 @@ app = typer.Typer(
 
 
 def _load(config_path: Path | None) -> Config:
-    config = load_config(config_path, create=True)
+    """Load config for a CLI command, turning a bad file into one readable line.
+
+    ``load_config`` already raises :class:`ConfigError` with the YAML error and
+    its location, but nothing caught it here, so a stray tab in ``config.yaml``
+    greeted the user with a forty-line traceback ending in ``ConfigError``
+    (WP17 F8). Exit code 2 = "usage/config problem"; the traceback is still
+    available with ``SF_DEBUG=1`` for the case where the message is not enough.
+    """
+    try:
+        config = load_config(config_path, create=True)
+    except ConfigError as exc:
+        if os.environ.get("SF_DEBUG"):
+            raise
+        typer.echo(f"error: {exc.message}", err=True)
+        typer.echo("  (set SF_DEBUG=1 for the full traceback)", err=True)
+        raise typer.Exit(2) from exc
     configure_logging(
         config.logging.level, json_logs=config.logging.json_logs, log_dir=config.logs_dir
     )
@@ -669,6 +685,17 @@ def tray_cmd(
     config_path: Path | None = typer.Option(None, "--config", "-c"),
 ) -> None:
     """Run the system-tray app, which supervises the server for you."""
+    if os.name != "nt":
+        # The tray is a Windows feature: pystray's Linux backends need a
+        # display and a GTK/X stack that a server box does not have, and the
+        # import itself crashed on a headless Linux host (WP17 F7). The Linux
+        # mechanism is the systemd user unit; say so instead of tracebacking.
+        typer.echo(
+            "error: the system tray is Windows-only. On Linux use the systemd units in "
+            "deploy/ (see deploy/README.md) or run `studioforge serve` directly.",
+            err=True,
+        )
+        raise typer.Exit(2)
     config = _load(config_path)
     config.ensure_dirs()
     try:
