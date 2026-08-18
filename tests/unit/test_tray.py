@@ -62,10 +62,16 @@ class FakeClient:
     replies: dict[str, ApiResult] = field(default_factory=dict)
     calls: list[FakeCall] = field(default_factory=list)
     default: ApiResult = field(default_factory=lambda: ApiResult(True, {}))
+    #: Absolute-URL replies (the watchdog's /health lives on another port).
+    urls: dict[str, ApiResult] = field(default_factory=dict)
 
     def get(self, path: str, *, timeout: float = 10.0) -> ApiResult:
         self.calls.append(FakeCall("GET", path))
         return self.replies.get(path, self.default)
+
+    def get_url(self, url: str, *, timeout: float = 10.0) -> ApiResult:
+        self.calls.append(FakeCall("GET", url))
+        return self.urls.get(url, ApiResult(False, error="not answering"))
 
     def post(
         self, path: str, payload: dict[str, Any] | None = None, *, timeout: float = 60.0
@@ -622,3 +628,217 @@ def test_stop_works_during_the_crash_restart_window(
     _join_tray_threads()
 
     assert stopped == [True], "Stop was refused while the tray was supervising a restart"
+
+
+# ---------------------------------------------------------------------------
+# D28: exactly one respawner, and a deliberate restart is not a crash
+#
+# Before: a GUI "Restart server" went to the watchdog, which killed the tray's
+# child AND spawned a replacement; the tray counted a crash attempt and spawned
+# too; the loser exited 3 on the port conflict, which the tray counted again,
+# and again, until "Crashed -- see the logs folder" sat next to a healthy
+# server. Now the watchdog leaves the respawn to the tray and says so on its
+# /health, the tray reads that, and a port-conflict exit is never respawned.
+# ---------------------------------------------------------------------------
+
+
+def _watchdog_says(client: FakeClient, config: Config, payload: dict[str, Any]) -> None:
+    client.urls[tray_app.watchdog_health_url(config)] = ApiResult(True, payload)
+
+
+def test_a_port_conflict_exit_is_never_a_crash(app: TrayApp) -> None:
+    assert app.classify_exit(tray_app.EXIT_PORT_CONFLICT) == tray_app.KIND_PORT_TAKEN
+
+
+def test_an_exit_during_a_watchdog_restart_is_a_requested_restart(
+    app: TrayApp, client: FakeClient, config: Config
+) -> None:
+    _watchdog_says(client, config, {"status": "down", "restart_in_progress": {"since": 1.0}})
+    assert app.classify_exit(1) == tray_app.KIND_RESTART_REQUESTED
+
+
+def test_an_exit_with_no_restart_in_progress_is_a_crash(
+    app: TrayApp, client: FakeClient, config: Config
+) -> None:
+    _watchdog_says(client, config, {"status": "down", "restart_in_progress": None})
+    assert app.classify_exit(1) == tray_app.KIND_CRASH
+    # No watchdog at all: nobody else is restarting anything.
+    client.urls.clear()
+    assert app.classify_exit(1) == tray_app.KIND_CRASH
+
+
+def test_a_requested_restart_respawns_without_spending_a_crash_attempt(app: TrayApp) -> None:
+    app.user_stopped = False
+    app.restarts = 0
+    respawn, notice = app._child_exited_locked(tray_app.KIND_RESTART_REQUESTED, 1)
+    assert respawn is True
+    assert app.restarts == 0, "a restart somebody asked for is not a crash attempt"
+    assert app.state == STATE_STARTING
+    assert notice is not None and "unexpectedly" not in notice
+
+
+def test_a_crash_spends_an_attempt_and_says_so(app: TrayApp) -> None:
+    app.user_stopped = False
+    app.restarts = 0
+    respawn, notice = app._child_exited_locked(tray_app.KIND_CRASH, 1)
+    assert respawn is True and app.restarts == 1
+    assert notice is not None and "unexpectedly" in notice
+    # ...until the budget is gone.
+    app.restarts = tray_app.MAX_RESTARTS
+    respawn, notice = app._child_exited_locked(tray_app.KIND_CRASH, 1)
+    assert respawn is False and app.state == STATE_CRASHED and app.user_stopped is True
+
+
+def test_a_port_conflict_exit_waits_for_the_holder_and_adopts_a_studioforge(
+    app: TrayApp, client: FakeClient
+) -> None:
+    app.user_stopped = False
+    respawn, notice = app._child_exited_locked(tray_app.KIND_PORT_TAKEN, 3)
+    assert respawn is False, "respawning cannot free a port someone else holds"
+    assert app.state == STATE_STARTING
+    assert app._port_holder_deadline is not None
+    assert "in use" in app.status_line()
+
+    # Nothing answers yet: keep waiting, no state change.
+    client.default = ApiResult(False, error="down")
+    assert app._poll_unowned_locked() is False
+    assert app.state == STATE_STARTING
+
+    # A StudioForge server comes up on the port (the watchdog's replacement,
+    # or another install): attach to it, do not fight it.
+    client.default = ApiResult(True, {"status": "ok"})
+    assert app._poll_unowned_locked() is True
+    assert app.state == STATE_RUNNING
+    assert app.adopted is True and app.owns_child is False
+    assert app._port_holder_deadline is None
+
+
+def test_a_port_conflict_that_persists_names_the_fix(
+    app: TrayApp, client: FakeClient, config: Config
+) -> None:
+    app.user_stopped = False
+    app._child_exited_locked(tray_app.KIND_PORT_TAKEN, 3)
+    client.default = ApiResult(False, error="down")
+    app._port_holder_deadline = 0.0  # the grace period has passed
+    assert app._poll_unowned_locked() is True
+    assert app.state == STATE_CRASHED
+    assert app.user_stopped is True, "no more respawn attempts against a taken port"
+    line = app.status_line()
+    assert str(config.server.port) in line and "Start server" in line
+    assert "logs folder" not in line, "the generic crash advice is the wrong next action here"
+
+
+def test_respawn_attaches_when_a_server_already_answers(
+    app: TrayApp, client: FakeClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawned: list[bool] = []
+    monkeypatch.setattr(app, "_spawn", lambda: spawned.append(True) or True)
+    app.user_stopped = False
+    app.proc = None
+
+    client.default = ApiResult(True, {"status": "ok"})
+    app._respawn_or_adopt()
+    assert spawned == [] and app.state == STATE_RUNNING and app.adopted is True
+
+    app.state = STATE_STARTING
+    app.adopted = False
+    client.default = ApiResult(False, error="down")
+    app._respawn_or_adopt()
+    assert spawned == [True]
+
+
+def test_stop_refuses_an_adopted_server_instead_of_lying(
+    app: TrayApp, client: FakeClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Attached to someone else's server, Stop must not say 'stopped; VRAM
+    released' about a process that is still running."""
+    stopped: list[bool] = []
+    notices: list[str] = []
+    monkeypatch.setattr(app, "stop_server", lambda: stopped.append(True))
+    monkeypatch.setattr(
+        app, "_notify", lambda message, title=tray_app.APP_NAME: notices.append(message)
+    )
+    client.replies["/health"] = ApiResult(True, {"status": "ok"})
+    assert app.adopt_running_server() is True
+
+    app._on_stop()
+    _join_tray_threads()
+
+    assert stopped == []
+    assert notices and "not started by the tray" in notices[0]
+
+
+def test_stop_takes_down_a_watchdog_left_over_from_a_restart(
+    app: TrayApp, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After a watchdog-driven restart the watchdog is nobody's descendant, so
+    a tree kill of the server misses it; Stop from the tray means everything."""
+    killed: list[int] = []
+    monkeypatch.setattr(tray_app, "find_watchdog_pids", lambda config: [3131])
+    monkeypatch.setattr(tray_app, "kill_process_tree", lambda pid, **kw: killed.append(pid))
+
+    class LiveProc:
+        pid = 1
+
+        def poll(self) -> int | None:
+            return None
+
+        def wait(self, timeout: float = 0) -> int:
+            return 0
+
+    app.proc = LiveProc()  # type: ignore[assignment]
+    app.owns_child = True
+    app.state = STATE_RUNNING
+    app.stop_server(timeout=0.1)
+    assert killed == [1, 3131]
+    assert app.state == STATE_STOPPED
+
+
+def test_status_line_prefers_a_known_detail_for_a_down_state() -> None:
+    snap = ServerSnapshot()
+    assert status_text(STATE_CRASHED, snap, "Port 1234 is held by another program") == (
+        "Port 1234 is held by another program"
+    )
+    assert status_text(STATE_STARTING, snap, "Restarting...") == "Restarting..."
+    # A running server always shows the live numbers, whatever detail was set.
+    live = ServerSnapshot(reachable=True, loaded_models=1, free_vram_bytes=2**30)
+    assert status_text(STATE_RUNNING, live, "stale detail").startswith("Running")
+
+
+def test_exit_code_constant_matches_serve() -> None:
+    """The tray reads back the code __main__._preflight_ports exits with."""
+    from studioforge.core.ports import EXIT_PORT_CONFLICT
+
+    assert tray_app.EXIT_PORT_CONFLICT == EXIT_PORT_CONFLICT == 3
+
+
+def test_the_server_is_told_the_tray_launched_it(
+    app: TrayApp, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SF_SUPERVISOR=tray is what makes `POST /api/restart/server` exit for us
+    to respawn instead of racing us with a respawn of its own (D28)."""
+    captured: dict[str, Any] = {}
+
+    class _Proc:
+        pid = 99
+
+        def poll(self) -> None:
+            return None
+
+    def fake_popen(argv: list[str], **kwargs: Any) -> Any:
+        captured["env"] = kwargs.get("env") or {}
+        return _Proc()
+
+    monkeypatch.setattr(tray_app.subprocess, "Popen", fake_popen)
+    with app._lock:
+        assert app._spawn() is True
+    assert captured["env"].get(tray_app.ENV_SUPERVISOR) == "tray"
+
+
+def test_the_restart_exit_code_is_a_requested_restart_without_asking_anyone(
+    app: TrayApp, client: FakeClient
+) -> None:
+    client.urls.clear()  # no watchdog answering at all
+    assert app.classify_exit(tray_app.EXIT_RESTART_REQUESTED) == (
+        tray_app.KIND_RESTART_REQUESTED
+    )

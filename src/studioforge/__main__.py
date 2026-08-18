@@ -90,7 +90,11 @@ def serve(
         config.watchdog.enabled = False
 
     _preflight_ports(config)
-    asyncio.run(_serve(config, open_gui=open_gui))
+    exit_code = asyncio.run(_serve(config, open_gui=open_gui))
+    if exit_code:
+        # A restart the server left to whoever launched it (D28): the tray
+        # reads EXIT_RESTART_REQUESTED and respawns without counting a crash.
+        raise typer.Exit(exit_code)
 
 
 def _console(message: str, *, err: bool = False) -> None:
@@ -164,6 +168,7 @@ def _preflight_ports(config: Config) -> None:
     """
     from studioforge.core.ports import (
         ENV_RESPAWN_PARENT_PID,
+        EXIT_PORT_CONFLICT,
         check_startup_ports,
         describe_conflicts,
         respawn_parent_pid,
@@ -202,10 +207,18 @@ def _preflight_ports(config: Config) -> None:
     message = describe_conflicts(conflicts)
     log.error("startup port conflict", ports=[c.port for c in conflicts])
     _console(message, err=True)
-    raise typer.Exit(3)
+    # The tray reads this code back: a port conflict is not a crash, and a
+    # respawn cannot fix it (D28).
+    raise typer.Exit(EXIT_PORT_CONFLICT)
 
 
-async def _serve(config: Config, *, open_gui: bool = False) -> None:
+async def _serve(config: Config, *, open_gui: bool = False) -> int:
+    """Run the API (and GUI) servers until they stop; returns the exit code.
+
+    ``0`` for an ordinary shutdown. Non-zero only when a request handler set
+    ``state.exit_code`` before asking for shutdown -- today that is
+    ``EXIT_RESTART_REQUESTED``, the tray-supervised restart (D28).
+    """
     import uvicorn
 
     from studioforge.api.app import create_app
@@ -251,6 +264,22 @@ async def _serve(config: Config, *, open_gui: bool = False) -> None:
     # replacement must leave the watchdog running (D21).
     api.state.watchdog_proc = watchdog_proc
     api.state.handing_over = False
+    api.state.exit_code = 0
+
+    def request_shutdown() -> None:
+        """Stop both servers the way Ctrl+C does: graceful, then the lifespan.
+
+        The restart routes used ``os.kill(os.getpid(), SIGINT)`` for this, which
+        on Windows is not a signal at all -- ``os.kill`` with anything but the
+        two CTRL events is ``TerminateProcess``, so the process died with exit
+        code 2, no drain, no lifespan shutdown, and an exit code the tray read
+        as a crash. Setting ``should_exit`` is what uvicorn's own signal
+        handler does, on every platform.
+        """
+        for server in servers:
+            server.should_exit = True
+
+    api.state.request_shutdown = request_shutdown
 
     log.info(
         "studioforge starting",
@@ -288,6 +317,7 @@ async def _serve(config: Config, *, open_gui: bool = False) -> None:
                 with contextlib.suppress(Exception):
                     watchdog_proc.terminate()
                     watchdog_proc.wait(timeout=10)
+    return int(getattr(api.state, "exit_code", 0) or 0)
 
 
 def _log_mcp_banner(config: Config) -> None:

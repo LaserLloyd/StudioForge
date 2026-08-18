@@ -391,6 +391,82 @@ class TestSelfRestartFallback:
         assert state.restart_status["outcome"] == "exiting"
 
 
+class TestTraySupervisedRestart:
+    """D28: the process that launched the server respawns it.
+
+    Under the tray, ``POST /restart/server`` neither asks the watchdog nor
+    respawns itself -- it drains and exits with ``EXIT_RESTART_REQUESTED``,
+    and the tray brings it back. Two respawners racing for the ports was the
+    bug: the loser exited on a port conflict and the tray counted it as a
+    crash.
+    """
+
+    async def test_exit_for_supervisor_drains_sets_the_code_and_shuts_down_gracefully(
+        self, recorder: _Recorder
+    ) -> None:
+        state, manager = _restart_state(None)
+        shutdowns: list[bool] = []
+        state.request_shutdown = lambda: shutdowns.append(True)
+
+        await admin_routes._exit_for_supervisor(state)
+
+        assert manager.draining is True, "in-flight requests are drained first"
+        assert state.exit_code == ports_module.EXIT_RESTART_REQUESTED
+        assert state.handing_over is True, "the watchdog is left for the replacement (D21)"
+        assert shutdowns == [True], "shutdown goes through uvicorn, not a signal"
+        assert state.restart_status["outcome"] == "exiting"
+
+    async def test_the_route_exits_for_the_tray_instead_of_asking_the_watchdog(
+        self, monkeypatch: pytest.MonkeyPatch, recorder: _Recorder
+    ) -> None:
+        from fastapi import Request
+
+        monkeypatch.setenv(ports_module.ENV_SUPERVISOR, "tray")
+        state, _ = _restart_state(None)
+        state.config.watchdog = type("W", (), {"enabled": True, "port": 1235})()
+        spawned: list[Any] = []
+        monkeypatch.setattr(
+            admin_routes, "_spawn_restart_task", lambda coro: (spawned.append(coro), coro.close())
+        )
+        asked_watchdog: list[bool] = []
+
+        async def reachable(url: str) -> tuple[bool, str]:  # pragma: no cover - must not run
+            asked_watchdog.append(True)
+            return True, "up"
+
+        monkeypatch.setattr(admin_routes, "_watchdog_is_reachable", reachable)
+
+        class _App:
+            pass
+
+        app = _App()
+        app.state = state  # type: ignore[attr-defined]
+        scope = {"type": "http", "app": app, "headers": [], "method": "POST", "path": "/"}
+        request = Request(scope)
+        body = await admin_routes.restart_server(request, confirm=True)
+
+        assert body["via"] == "tray"
+        assert asked_watchdog == [], "the watchdog would only kill us and defer to the tray"
+        assert len(spawned) == 1
+        assert state.restart_status["outcome"] == "supervisor-respawn"
+
+    def test_shutdown_prefers_the_graceful_hook_and_falls_back_to_a_signal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        state, _ = _restart_state(None)
+        hooked: list[bool] = []
+        state.request_shutdown = lambda: hooked.append(True)
+        signalled: list[int] = []
+        monkeypatch.setattr(os, "kill", lambda pid, sig: signalled.append(sig))
+
+        admin_routes._shutdown_this_process(state)
+        assert hooked == [True] and signalled == []
+
+        del state.request_shutdown
+        admin_routes._shutdown_this_process(state)
+        assert signalled, "an embedder without _serve still gets the old behaviour"
+
+
 class TestManagerResume:
     """``draining`` has to be able to come back down."""
 

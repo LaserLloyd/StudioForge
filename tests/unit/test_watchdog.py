@@ -839,6 +839,116 @@ async def test_restart_without_confirm_explains_the_consequences(harness: Harnes
     assert result["error"]["param"] == "confirm"
 
 
+# ---------------------------------------------------------------------------
+# D28: exactly one respawner. When the server is the tray's child, the
+# watchdog kills it and leaves the respawn to the tray, publishing
+# restart_in_progress on /health so the tray can tell the exit from a crash.
+# ---------------------------------------------------------------------------
+
+
+def _fake_main(pid: int = 4242) -> wd_module.ChildProcess:
+    return wd_module.ChildProcess(
+        pid=pid, name="python.exe", alias=None, port=1234, create_time=1.0, cmdline=["serve"]
+    )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the tray, and this branch, are Windows-only")
+async def test_restart_leaves_the_respawn_to_a_tray_that_owns_the_server(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    watchdog = harness.watchdog()
+    killed: list[int] = []
+    seen_in_progress: list[dict[str, Any] | None] = []
+
+    monkeypatch.setattr(wd_module, "find_main_process", lambda config, **kw: _fake_main())
+    monkeypatch.setattr(wd_module, "supervising_tray_pid", lambda pid: 777)
+    monkeypatch.setattr(wd_module, "find_llama_children", lambda config: [])
+    monkeypatch.setattr(
+        wd_module, "kill_process_tree", lambda pid, **kw: (killed.append(pid), [pid])[1]
+    )
+
+    async def port_free(port: int, timeout: float = 10.0) -> bool:  # noqa: ASYNC109
+        return True
+
+    async def wait_health(config: Any, timeout: float) -> tuple[bool, float]:  # noqa: ASYNC109
+        # Captured mid-restart: this is what the tray reads on /health.
+        seen_in_progress.append(dict(watchdog._restart_in_progress or {}))
+        return True, 1.5
+
+    def must_not_spawn(config: Any) -> Any:  # pragma: no cover - the assertion
+        raise AssertionError("the watchdog spawned a server the tray was going to respawn")
+
+    monkeypatch.setattr(watchdog, "_wait_port_free", port_free)
+    monkeypatch.setattr(watchdog, "_wait_for_health", wait_health)
+    monkeypatch.setattr(watchdog, "_spawn_main", must_not_spawn)
+
+    result = await watchdog.restart_server(confirm=True, timeout_s=30.0)
+
+    assert killed == [4242], "the tray's child is still killed -- that IS the restart"
+    assert result["ok"] is True and result["healthy"] is True
+    assert result["respawned_by"] == "tray"
+    assert result["tray_pid"] == 777
+    assert "tray" in result["method"]
+    assert seen_in_progress and seen_in_progress[0]["respawned_by"] == "tray"
+    assert seen_in_progress[0]["previous_pid"] == 4242
+    # ...and cleared once the restart is over, so a later crash is a crash.
+    assert watchdog._restart_in_progress is None
+    health = await watchdog.health()
+    assert health["restart_in_progress"] is None
+
+
+async def test_restart_spawns_itself_when_no_tray_owns_the_server(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    watchdog = harness.watchdog()
+    spawned: list[bool] = []
+
+    monkeypatch.setattr(wd_module, "find_main_process", lambda config, **kw: _fake_main())
+    monkeypatch.setattr(wd_module, "supervising_tray_pid", lambda pid: None)
+    monkeypatch.setattr(wd_module, "find_llama_children", lambda config: [])
+    monkeypatch.setattr(wd_module, "kill_process_tree", lambda pid, **kw: [pid])
+
+    async def port_free(port: int, timeout: float = 10.0) -> bool:  # noqa: ASYNC109
+        return True
+
+    async def wait_health(config: Any, timeout: float) -> tuple[bool, float]:  # noqa: ASYNC109
+        return True, 1.0
+
+    def spawn(config: Any) -> tuple[int | None, list[str], str | None]:
+        spawned.append(True)
+        return 5150, ["fake"], None
+
+    monkeypatch.setattr(watchdog, "_wait_port_free", port_free)
+    monkeypatch.setattr(watchdog, "_wait_for_health", wait_health)
+    monkeypatch.setattr(watchdog, "_spawn_main", spawn)
+    if os.name != "nt":
+        # On POSIX the systemctl branch runs first; make it fall through.
+        async def no_systemctl(unit: str) -> tuple[bool, str]:
+            return False, "no systemd here"
+
+        monkeypatch.setattr(watchdog, "_systemctl_restart", no_systemctl)
+
+    result = await watchdog.restart_server(confirm=True, timeout_s=30.0)
+    assert spawned == [True]
+    assert result["respawned_by"] == "watchdog"
+    assert result["new_pid"] == 5150
+
+
+def test_tray_cmdline_recognition() -> None:
+    assert wd_module._is_tray_cmdline(["pythonw.exe", "-m", "studioforge", "tray", "--config", "x"])
+    assert wd_module._is_tray_cmdline([r"C:\v\Scripts\studioforge.exe", "tray"])
+    assert wd_module._is_tray_cmdline(["python", "-m", "studioforge.tray.tray_app"])
+    assert not wd_module._is_tray_cmdline(["python", "-m", "studioforge", "serve", "--config", "x"])
+    assert not wd_module._is_tray_cmdline(["python", "-m", "studioforge.watchdog"])
+    assert not wd_module._is_tray_cmdline(["explorer.exe"])
+
+
+def test_supervising_tray_pid_is_none_for_a_process_pytest_launched() -> None:
+    """Our own parent is pytest (or a shell), never a tray."""
+    assert wd_module.supervising_tray_pid(os.getpid()) is None
+    assert wd_module.supervising_tray_pid(2**22 + 12345) is None  # no such pid
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows respawn mechanism")
 def test_windows_restart_uses_a_detached_process_group(harness: Harness) -> None:
     """The respawn must not inherit our console or Ctrl+C group.

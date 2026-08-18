@@ -25,6 +25,7 @@ import httpx
 from fastapi import APIRouter, Body, Request
 
 from studioforge.api.auth import PIN_WITHHELD_NOTE, may_reveal_pin
+from studioforge.core.ports import EXIT_RESTART_REQUESTED, supervised_by
 from studioforge.errors import BadRequestError, ModelNotFoundError
 from studioforge.logging import get_logger
 
@@ -180,7 +181,30 @@ async def restart_server(
 
     config = state.config
     watchdog_url = f"http://127.0.0.1:{config.watchdog.port}"
-    log.info("restart requested", watchdog_enabled=bool(config.watchdog.enabled))
+    supervisor = supervised_by()
+    log.info(
+        "restart requested",
+        watchdog_enabled=bool(config.watchdog.enabled),
+        supervised_by=supervisor,
+    )
+
+    if supervisor == "tray":
+        # The tray launched us and respawns a child that exits (D28). Exiting
+        # with EXIT_RESTART_REQUESTED is the whole restart: no watchdog round
+        # trip, a graceful drain, and exactly one process bringing us back.
+        # Asking the watchdog instead would have it kill us and then defer to
+        # the tray anyway; respawning ourselves would race the tray's respawn.
+        _record(state, "supervisor-respawn", "exiting so the tray that launched us respawns us")
+        _spawn_restart_task(_exit_for_supervisor(state))
+        return {
+            "restarting": True,
+            "via": "tray",
+            "note": "the API will be unavailable for a few seconds",
+            "verify": (
+                "GET /health for the new uptime_s; if this process is still here, "
+                "GET /api/restart/status says why"
+            ),
+        }
 
     if config.watchdog.enabled:
         reachable, detail = await _watchdog_is_reachable(watchdog_url)
@@ -341,9 +365,6 @@ async def _self_restart(state: Any) -> None:
     moment the replacement checks them, so it exited rc 3 every time and we
     stayed up -- after the API had already answered ``{"restarting": true}``.
     """
-    import os
-    import signal
-
     from studioforge.core.updater import Updater
 
     await asyncio.sleep(0.5)
@@ -390,8 +411,46 @@ async def _self_restart(state: Any) -> None:
     # Leave the watchdog for the replacement to adopt: killing it here would
     # take the supervisor down with us and free its port a moment too late (D21).
     state.handing_over = True
-    # SIGTERM rather than sys.exit: we are inside a task on the event loop, and
-    # the signal path runs uvicorn's own graceful shutdown.
+    _shutdown_this_process(state)
+
+
+async def _exit_for_supervisor(state: Any) -> None:
+    """Drain, then exit with ``EXIT_RESTART_REQUESTED`` for the tray to respawn us.
+
+    The tray launched this process and respawns a child that exits (D28); the
+    exit code tells it this exit was asked for. The watchdog is left running
+    for the replacement to adopt (D21), exactly as in a self-respawn.
+    """
+    await asyncio.sleep(0.5)
+    try:
+        await state.manager.stop()
+    except Exception as exc:  # pragma: no cover - best effort
+        log.warning("drain before restart failed", error=str(exc))
+    state.handing_over = True
+    state.exit_code = EXIT_RESTART_REQUESTED
+    _record(state, "exiting", "drained; exiting for the tray to respawn this process")
+    _shutdown_this_process(state)
+
+
+def _shutdown_this_process(state: Any) -> None:
+    """Stop the servers gracefully, the way Ctrl+C would.
+
+    ``state.request_shutdown`` is installed by ``__main__._serve`` and flips
+    uvicorn's ``should_exit`` on both servers, which runs the drain and the
+    lifespan shutdown on every platform. The signal it replaces was only a
+    signal on POSIX: on Windows ``os.kill(pid, SIGINT)`` is ``TerminateProcess``
+    -- verified on this box: a handler installed for SIGINT never runs and
+    the process exits 2 -- so the restart paths skipped every ``finally`` and
+    exited with a code the tray counted as a crash. The signal stays as the
+    fallback for an embedder that composed the app without ``_serve``.
+    """
+    import os
+    import signal
+
+    request_shutdown = getattr(state, "request_shutdown", None)
+    if callable(request_shutdown):
+        request_shutdown()
+        return
     os.kill(os.getpid(), signal.SIGTERM if os.name != "nt" else signal.SIGINT)
 
 

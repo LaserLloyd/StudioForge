@@ -35,6 +35,12 @@ from PIL import Image, ImageDraw, ImageFont
 from studioforge.config import Config
 from studioforge.core import autostart
 from studioforge.core.engine import kill_process_tree
+from studioforge.core.ports import (
+    ENV_SUPERVISOR,
+    EXIT_PORT_CONFLICT,
+    EXIT_RESTART_REQUESTED,
+    find_watchdog_pids,
+)
 from studioforge.logging import get_logger
 
 log = get_logger(__name__)
@@ -58,6 +64,12 @@ MAX_RESTARTS = 3  # unexpected-exit restarts before giving up
 RESTART_BACKOFF = 5.0  # seconds to wait before each restart
 HEALTHY_AFTER = 60.0  # child alive this long => reset the restart counter
 STOP_TIMEOUT = 20.0  # grace given to the tree before SIGKILL/TerminateProcess
+#: After a child exits on a port conflict, how long to wait for whoever holds
+#: the port to start answering as a StudioForge server before calling it a
+#: real conflict. Long enough for a replacement server to finish scanning a
+#: large model library; short enough that "LM Studio has the port" is reported
+#: within a couple of minutes rather than never.
+PORT_HOLDER_GRACE = 120.0
 
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 
@@ -65,6 +77,11 @@ STATE_STOPPED = "stopped"
 STATE_STARTING = "starting"
 STATE_RUNNING = "running"
 STATE_CRASHED = "crashed"
+
+#: How :meth:`TrayApp.classify_exit` reads a supervised child's exit.
+KIND_RESTART_REQUESTED = "restart_requested"  # the watchdog is restarting it: respawn, no crash
+KIND_PORT_TAKEN = "port_taken"  # someone else holds a port: adopt them or report, never respawn
+KIND_CRASH = "crash"  # anything else
 
 #: States in which the server can be asked to start.
 DOWN_STATES = (STATE_STOPPED, STATE_CRASHED)
@@ -200,12 +217,15 @@ def snapshot_from_status(data: Mapping[str, Any]) -> ServerSnapshot:
     return ServerSnapshot(reachable=True, loaded_models=count, free_vram_bytes=free)
 
 
-def status_text(state: str, snapshot: ServerSnapshot) -> str:
+def status_text(state: str, snapshot: ServerSnapshot, detail: str | None = None) -> str:
     """Text of the disabled header item, and of the icon tooltip.
 
     Free VRAM and the loaded-model count are the two numbers that decide
     whether the next load will fit, so they are what the one always-visible
-    line spends its space on.
+    line spends its space on. ``detail`` replaces the generic crash line when
+    the tray knows exactly what went wrong -- a port held by another program
+    is the common case, and "see the logs folder" is the wrong next action for
+    it.
     """
     if state == STATE_RUNNING:
         if not snapshot.reachable:
@@ -216,10 +236,21 @@ def status_text(state: str, snapshot: ServerSnapshot) -> str:
             f"{format_gib(snapshot.free_vram_bytes)} free"
         )
     if state == STATE_STARTING:
-        return "Starting..."
+        return detail or "Starting..."
     if state == STATE_CRASHED:
-        return "Crashed — see the logs folder"
+        return detail or "Crashed — see the logs folder"
     return "Stopped"
+
+
+def watchdog_health_url(config: Config) -> str:
+    """The recovery watchdog's open ``/health``; it needs no credential."""
+    return f"http://127.0.0.1:{config.watchdog.port}/health"
+
+
+def port_conflict_detail(port: int) -> str:
+    return (
+        f"Port {port} is held by another program (LM Studio?) — quit it, then Start server"
+    )
 
 
 def acquire_single_instance(
@@ -367,6 +398,10 @@ class ApiClient(Protocol):
         self, path: str, payload: dict[str, Any] | None = None, *, timeout: float = 60.0
     ) -> ApiResult: ...
 
+    def get_url(self, url: str, *, timeout: float = 10.0) -> ApiResult:
+        """GET an absolute URL -- the watchdog lives on its own port."""
+        ...
+
 
 def _http_error_detail(exc: urlerror.HTTPError) -> str:
     """A sentence from a StudioForge error body, or the bare status code."""
@@ -411,7 +446,11 @@ class HttpApiClient:
     def _call(
         self, method: str, path: str, payload: dict[str, Any] | None, timeout: float
     ) -> ApiResult:
-        url = self.base_url.rstrip("/") + path
+        return self._call_url(method, self.base_url.rstrip("/") + path, payload, timeout)
+
+    def _call_url(
+        self, method: str, url: str, payload: dict[str, Any] | None, timeout: float
+    ) -> ApiResult:
         body = None if payload is None else json.dumps(payload).encode("utf-8")
         request = urlrequest.Request(url, data=body, method=method, headers=self._headers())
         try:
@@ -431,6 +470,9 @@ class HttpApiClient:
 
     def get(self, path: str, *, timeout: float = 10.0) -> ApiResult:
         return self._call("GET", path, None, timeout)
+
+    def get_url(self, url: str, *, timeout: float = 10.0) -> ApiResult:
+        return self._call_url("GET", url, None, timeout)
 
     def post(
         self, path: str, payload: dict[str, Any] | None = None, *, timeout: float = 60.0
@@ -464,12 +506,26 @@ class TrayApp:
         #: False when we merely attached to a server someone else started; the
         #: tray must not kill a process it did not launch.
         self.owns_child = False
+        #: True while the tray is attached to a server it did not launch (one
+        #: found already running at startup, or one that took over the port
+        #: after our child exited). Distinct from ``owns_child`` being False:
+        #: that is also true for a moment during a crash-restart, when the
+        #: tray IS still the supervisor and Stop must still work.
+        self.adopted = False
         self.user_stopped = True
         self.restarts = 0
+        #: One line explaining a non-running state when the tray knows exactly
+        #: why (a port held by another program); shown instead of the generic
+        #: "Crashed -- see the logs folder".
+        self.detail: str | None = None
 
         self._guard = guard
         self._spawn_time = 0.0
         self._last_status_poll = 0.0
+        #: Set after our child exited on a port conflict: until this monotonic
+        #: deadline the tray waits for whoever holds the port to answer as a
+        #: StudioForge server (a replacement mid-startup) and adopts it.
+        self._port_holder_deadline: float | None = None
         self._log_handle: Any = None
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
@@ -511,6 +567,9 @@ class TrayApp:
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
                 creationflags=CREATE_NO_WINDOW,
+                # Tells the server it is our child: asked to restart, it exits
+                # with EXIT_RESTART_REQUESTED and we bring it back (D28).
+                env={**os.environ, ENV_SUPERVISOR: "tray"},
             )
         except OSError as exc:
             log.error("failed to start the server child process", error=str(exc))
@@ -521,6 +580,9 @@ class TrayApp:
         self._log_handle = handle
         self._spawn_time = time.monotonic()
         self.owns_child = True
+        self.adopted = False
+        self.detail = None
+        self._port_holder_deadline = None
         self.state = STATE_STARTING
         log.info("tray started the server", pid=self.proc.pid)
         return True
@@ -547,11 +609,16 @@ class TrayApp:
             proc = self.proc
             owned = self.owns_child
             self.proc = None
+            self._port_holder_deadline = None
+            self.detail = None
 
         if proc is None or proc.poll() is not None:
             with self._lock:
                 self._close_log()
-                if owned or self.state != STATE_RUNNING:
+                # A server we merely attached to keeps running; everything
+                # else (our own dead child, a pending crash-restart) is now
+                # simply stopped.
+                if owned or not (self.adopted and self.state == STATE_RUNNING):
                     self.state = STATE_STOPPED
             self._refresh()
             return
@@ -562,6 +629,13 @@ class TrayApp:
             proc.wait(timeout=timeout)
         except (subprocess.TimeoutExpired, OSError):
             log.warning("server process did not report an exit", pid=proc.pid)
+        # The watchdog is normally a grandchild and dies with the tree above.
+        # After a watchdog-driven restart it is not: it outlived the server it
+        # restarted (D21) and our respawned child merely adopted it, so it is
+        # nobody's descendant. "Stop" from the tray means the whole deployment,
+        # so take that one down too -- only ours (same --config), never a
+        # stranger's recovery sidecar.
+        self._stop_lingering_watchdog(timeout)
 
         with self._lock:
             self._close_log()
@@ -569,6 +643,17 @@ class TrayApp:
             self.state = STATE_STOPPED
             self.snapshot = ServerSnapshot()
         self._refresh()
+
+    def _stop_lingering_watchdog(self, timeout: float) -> None:
+        try:
+            pids = find_watchdog_pids(self.config)
+        except Exception as exc:  # noqa: BLE001 - a scan failure must not block Stop
+            log.warning("could not look for a lingering watchdog", error=str(exc))
+            return
+        for pid in pids:
+            log.info("tray stopping the watchdog left over from a restart", pid=pid)
+            with contextlib.suppress(Exception):
+                kill_process_tree(pid, timeout=timeout)
 
     def restart_server(self) -> None:
         """Restart the whole server process.
@@ -646,12 +731,62 @@ class TrayApp:
         if not self._server_is_answering():
             return False
         with self._lock:
-            self.state = STATE_RUNNING
-            self.owns_child = False
-            self.user_stopped = False
+            self._adopt_locked()
         self._poll_status()
         self._refresh()
         return True
+
+    def _adopt_locked(self) -> None:
+        """Attach to the server answering on our port. Lock held."""
+        self.state = STATE_RUNNING
+        self.owns_child = False
+        self.adopted = True
+        self.user_stopped = False
+        self.detail = None
+        self._port_holder_deadline = None
+
+    def _watchdog_is_restarting(self) -> bool:
+        """Whether the recovery watchdog is in the middle of ``restart_server``.
+
+        The watchdog kills the main process and, when that process was our
+        child, leaves the respawn to us (D28). Its ``/health`` carries
+        ``restart_in_progress`` for the whole operation, so a child exit while
+        that is set is a restart somebody asked for -- the GUI's Restart
+        button, ``sfctl recover --restart``, an agent's ``restart_server`` --
+        and not a crash. Any failure to ask reads as "no": a missing watchdog
+        means nobody else is restarting anything.
+        """
+        get_url = getattr(self.client, "get_url", None)
+        if get_url is None:
+            return False
+        try:
+            # The watchdog probes the (dead) main server before answering, so
+            # this legitimately takes a few seconds during a restart.
+            result = get_url(watchdog_health_url(self.config), timeout=12.0)
+        except Exception as exc:  # noqa: BLE001 - a probe must never break supervision
+            log.debug("watchdog health probe failed", error=str(exc))
+            return False
+        return bool(result.data.get("restart_in_progress")) if result.data else False
+
+    def classify_exit(self, returncode: int | None) -> str:
+        """Why our child exited: :data:`KIND_RESTART_REQUESTED`, :data:`KIND_PORT_TAKEN`
+        or :data:`KIND_CRASH`.
+
+        The order matters. The two exit codes ``serve`` uses on purpose are
+        read first, because they are proof: :data:`EXIT_RESTART_REQUESTED`
+        is the server saying "you launched me, bring me back", and a port
+        conflict's handling is the strictest (never respawn). Then the
+        watchdog is asked -- it kills a wedged server without the server's
+        cooperation, so no exit code can carry that; only an exit nobody can
+        account for is a crash.
+        """
+        if returncode == EXIT_RESTART_REQUESTED:
+            return KIND_RESTART_REQUESTED
+        if returncode == EXIT_PORT_CONFLICT:
+            return KIND_PORT_TAKEN
+        if self._watchdog_is_restarting():
+            return KIND_RESTART_REQUESTED
+        return KIND_CRASH
 
     def _supervise(self) -> None:
         """Watch the child, reflect crashes, and keep the status line fresh."""
@@ -661,7 +796,9 @@ class TrayApp:
                 break
 
             restart_needed = False
+            notice: str | None = None
             changed = False
+            exited: int | None = None
             with self._lock:
                 proc = self.proc
                 if proc is None:
@@ -675,27 +812,18 @@ class TrayApp:
                         if self.restarts and time.monotonic() - self._spawn_time > HEALTHY_AFTER:
                             self.restarts = 0
                     else:
+                        exited = rc
                         self.proc = None
                         self.owns_child = False
                         self._close_log()
                         self.snapshot = ServerSnapshot()
                         changed = True
-                        if self.user_stopped:
-                            self.state = STATE_STOPPED
-                        elif self.restarts < MAX_RESTARTS:
-                            self.restarts += 1
-                            log.error(
-                                "server exited unexpectedly; restarting",
-                                returncode=rc,
-                                attempt=self.restarts,
-                                of=MAX_RESTARTS,
-                            )
-                            self.state = STATE_STARTING
-                            restart_needed = True
-                        else:
-                            log.error("server keeps dying; giving up", returncode=rc)
-                            self.state = STATE_CRASHED
-                            self.user_stopped = True
+            if exited is not None:
+                # Classified OUTSIDE the lock: it may ask the watchdog over HTTP,
+                # and a menu action (Stop, Start) must not sit behind that.
+                kind = KIND_CRASH if self.user_stopped else self.classify_exit(exited)
+                with self._lock:
+                    restart_needed, notice = self._child_exited_locked(kind, exited)
 
             if self.state == STATE_RUNNING and (
                 time.monotonic() - self._last_status_poll > STATUS_INTERVAL
@@ -705,18 +833,100 @@ class TrayApp:
                 changed = True
             if changed:
                 self._refresh()
+            if notice:
+                self._notify(notice)
             if restart_needed:
-                self._notify("The server exited unexpectedly; restarting it.")
                 self._stop_event.wait(RESTART_BACKOFF)
                 if self._stop_event.is_set():
                     break
-                with self._lock:
-                    if not self.user_stopped and self.proc is None:
-                        self._spawn()
+                self._respawn_or_adopt()
                 self._refresh()
+
+    def _child_exited_locked(self, kind: str, rc: int | None) -> tuple[bool, str | None]:
+        """Apply what a supervised child's exit means. Lock held.
+
+        ``kind`` comes from :meth:`classify_exit`. Returns ``(respawn,
+        notification)``. Exactly one process may respawn the server (D28): the
+        tray when it launched it, the watchdog otherwise. So a restart the
+        watchdog is performing on our child is respawned by us and never
+        counted as a crash; an exit on a port conflict is never respawned at
+        all -- whoever holds the port is either a replacement server we should
+        attach to, or another program we should name; and only an unexplained
+        exit spends one of the crash-restart attempts.
+        """
+        if self.user_stopped:
+            self.state = STATE_STOPPED
+            return False, None
+
+        if kind == KIND_RESTART_REQUESTED:
+            log.info("server exited for a requested restart; respawning", returncode=rc)
+            self.state = STATE_STARTING
+            self.detail = "Restarting..."
+            return True, "Restarting the server."
+
+        if kind == KIND_PORT_TAKEN:
+            log.warning(
+                "server exited on a port conflict; waiting to see who holds the port",
+                returncode=rc,
+                port=self.config.server.port,
+                grace_s=PORT_HOLDER_GRACE,
+            )
+            self.state = STATE_STARTING
+            self.detail = f"Port {self.config.server.port} is in use — checking who has it..."
+            self._port_holder_deadline = time.monotonic() + PORT_HOLDER_GRACE
+            return False, None
+
+        if self.restarts < MAX_RESTARTS:
+            self.restarts += 1
+            log.error(
+                "server exited unexpectedly; restarting",
+                returncode=rc,
+                attempt=self.restarts,
+                of=MAX_RESTARTS,
+            )
+            self.state = STATE_STARTING
+            return True, "The server exited unexpectedly; restarting it."
+
+        log.error("server keeps dying; giving up", returncode=rc)
+        self.state = STATE_CRASHED
+        self.user_stopped = True
+        return False, None
+
+    def _respawn_or_adopt(self) -> None:
+        """Bring a server back after a backoff: ours, unless one is already up.
+
+        A server already answering on our port means somebody else brought one
+        up in the meantime (the watchdog's own respawn on a box where the tray
+        did not launch the server, or an operator). Starting a second one would
+        only fail its port preflight, so attach to that one instead.
+        """
+        with self._lock:
+            if self.user_stopped or self.proc is not None:
+                return
+            if self._server_is_answering():
+                log.info("a server is already answering; attaching instead of respawning")
+                self._adopt_locked()
+                return
+            self._spawn()
 
     def _poll_unowned_locked(self) -> bool:
         """Track a server we attached to rather than launched. Lock held."""
+        deadline = self._port_holder_deadline
+        if deadline is not None:
+            # After a port-conflict exit: attach to a StudioForge server that
+            # takes over the port, or name the conflict once the grace is up.
+            if self._server_is_answering():
+                log.info("another StudioForge server took over the port; attaching to it")
+                self._adopt_locked()
+                return True
+            if time.monotonic() >= deadline:
+                self._port_holder_deadline = None
+                self.state = STATE_CRASHED
+                self.user_stopped = True
+                self.detail = port_conflict_detail(self.config.server.port)
+                log.error("port conflict persists", detail=self.detail)
+                return True
+            return False
         if self.state not in LIVE_STATES:
             return False
         if self.owns_child:
@@ -724,6 +934,7 @@ class TrayApp:
         if self._server_is_answering():
             return False
         self.state = STATE_STOPPED
+        self.adopted = False
         self.snapshot = ServerSnapshot()
         return True
 
@@ -735,7 +946,7 @@ class TrayApp:
             return
         try:
             icon.icon = make_icon_image(self.state == STATE_RUNNING)
-            icon.title = f"{APP_NAME} - {status_text(self.state, self.snapshot)}"
+            icon.title = f"{APP_NAME} - {self.status_line()}"
             icon.update_menu()
         except Exception as exc:  # pragma: no cover - backend specific
             log.warning("could not refresh the tray icon", error=str(exc))
@@ -758,12 +969,15 @@ class TrayApp:
             log.warning("could not read the autostart status", error=str(exc))
             return False
 
+    def status_line(self) -> str:
+        return status_text(self.state, self.snapshot, self.detail)
+
     def _build_menu(self) -> Any:
         item = pystray.MenuItem
         sep = pystray.Menu.SEPARATOR
         return pystray.Menu(
             # The one always-visible line: state, resident models, free VRAM.
-            item(lambda _i: status_text(self.state, self.snapshot), None, enabled=False),
+            item(lambda _i: self.status_line(), None, enabled=False),
             sep,
             # default=True is what a LEFT click on the icon invokes.
             item("Open control panel", self._on_open_control_panel, default=True),
@@ -856,7 +1070,10 @@ class TrayApp:
             # from the menu. Anything the tray is actively supervising is
             # stoppable; `stop_server` sets `user_stopped`, which is what
             # actually suppresses the respawn, and it handles a dead process.
-            supervising = self.owns_child or self.state in LIVE_STATES
+            # A server we merely ATTACHED to is the one thing that is not ours
+            # to stop -- and saying "stopped; VRAM released" about a process
+            # that is still running would be worse than refusing.
+            supervising = self.owns_child or (self.state in LIVE_STATES and not self.adopted)
             if not supervising:
                 self._notify(
                     "This server was not started by the tray, so the tray will not "

@@ -54,7 +54,32 @@ DEFAULT_RESPAWN_WAIT_S = 45.0
 #: port instead -- the escape hatch for "the watchdog's own code changed".
 ENV_ADOPT_WATCHDOG = "SF_ADOPT_WATCHDOG"
 
+#: Exit code ``studioforge serve`` uses when a port it needs is held by someone
+#: else (:func:`studioforge.__main__._preflight_ports`). One name for it,
+#: because the tray reads it back: a child that exits with this code did not
+#: crash, and respawning it cannot help -- the port is still taken (D28).
+EXIT_PORT_CONFLICT = 3
+
+#: Exit code ``studioforge serve`` uses when it was asked to restart and is
+#: leaving the respawn to the process that launched it (the tray). EX_TEMPFAIL
+#: in sysexits terms: "try again". The tray respawns immediately and does not
+#: count it as a crash (D28).
+EXIT_RESTART_REQUESTED = 75
+
+#: Set by a supervisor on the ``serve`` child it launches, naming itself
+#: (``"tray"``). A server that sees it restarts by *exiting* with
+#: :data:`EXIT_RESTART_REQUESTED` rather than by respawning itself or asking
+#: the watchdog to, so exactly one process -- the one that owns it -- brings
+#: it back.
+ENV_SUPERVISOR = "SF_SUPERVISOR"
+
 _FALSEY = {"0", "false", "no", "off"}
+
+
+def supervised_by() -> str | None:
+    """Who launched this process as a supervised child, per :data:`ENV_SUPERVISOR`."""
+    value = os.environ.get(ENV_SUPERVISOR, "").strip().lower()
+    return value or None
 
 
 @dataclass(slots=True)
@@ -262,6 +287,48 @@ def _same_file(left: str | Path, right: str | Path) -> bool:
         return Path(left).resolve() == Path(right).resolve()
     except OSError:  # pragma: no cover - unresolvable path
         return str(left).casefold() == str(right).casefold()
+
+
+def _config_flag(cmdline: list[str]) -> str | None:
+    """The value of ``--config``/``-c`` in an argv, or ``None``."""
+    found: str | None = None
+    for index, token in enumerate(cmdline):
+        if token in ("--config", "-c") and index + 1 < len(cmdline):
+            found = cmdline[index + 1]
+        elif token.startswith("--config="):
+            found = token.split("=", 1)[1]
+    return found
+
+
+def find_watchdog_pids(config: Config) -> list[int]:
+    """Pids of every StudioForge watchdog process guarding *this* config file.
+
+    Found by command line rather than by port, because the caller is the tray
+    taking the whole deployment down: a watchdog that has already lost its
+    port (or never bound it) still needs stopping. Identity is the module in
+    the argv plus a ``--config`` naming our file; a watchdog with a different
+    ``--config`` belongs to another install and is left alone, and one with no
+    ``--config`` at all cannot be told apart and is left alone too -- killing
+    a stranger's recovery sidecar is worse than leaving one of ours behind.
+    Never raises; a process that vanishes mid-scan is skipped.
+    """
+    ours = str(config.config_path)
+    found: list[int] = []
+    for proc in psutil.process_iter(["pid", "cmdline"]):
+        try:
+            cmdline = list(proc.info.get("cmdline") or [])
+        except (psutil.Error, ValueError):  # pragma: no cover - race with exit
+            continue
+        if not cmdline or proc.info["pid"] == os.getpid():
+            continue
+        joined = " ".join(cmdline).lower()
+        if "studioforge.watchdog" not in joined and "studioforge-watchdog" not in joined:
+            continue
+        theirs = _config_flag(cmdline)
+        if theirs is None or not _same_file(theirs, ours):
+            continue
+        found.append(int(proc.info["pid"]))
+    return found
 
 
 @dataclass(slots=True)

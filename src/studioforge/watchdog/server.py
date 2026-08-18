@@ -527,6 +527,39 @@ def _is_watchdog_cmdline(cmdline: Sequence[str]) -> bool:
     return "studioforge.watchdog" in joined or "studioforge-watchdog" in joined
 
 
+def _is_tray_cmdline(cmdline: Sequence[str]) -> bool:
+    """Whether an argv is the StudioForge system tray (``studioforge tray``)."""
+    joined = " ".join(cmdline).lower()
+    return "studioforge" in joined and ("tray" in joined.split() or "tray_app" in joined)
+
+
+def supervising_tray_pid(pid: int) -> int | None:
+    """The pid of a live StudioForge tray that launched ``pid``, or ``None``.
+
+    The tray supervises the server as its own child and respawns it when it
+    exits (``tray_app.TrayApp._supervise``). A restart performed here by
+    killing that child must therefore *not* spawn a replacement: the tray
+    will, and two spawns race for the ports (D28). Only a direct parent
+    counts -- a tray somewhere higher up the tree did not launch this
+    process and will not respawn it -- and the parent must predate the child,
+    the same pid-reuse guard :func:`engine_orphan_state` applies.
+    """
+    try:
+        proc = psutil.Process(pid)
+        parent = proc.parent()
+        if parent is None:
+            return None
+        with parent.oneshot():
+            if parent.status() == psutil.STATUS_ZOMBIE:
+                return None
+            if float(parent.create_time()) > float(proc.create_time()) + 1.0:
+                return None
+            cmdline = list(parent.cmdline())
+    except (psutil.Error, ValueError, OSError):
+        return None
+    return int(parent.pid) if _is_tray_cmdline(cmdline) else None
+
+
 def _config_matches(cmdline: Sequence[str], config_path: Path | None) -> bool:
     """Whether an argv's ``--config`` names the same file this watchdog guards.
 
@@ -764,6 +797,14 @@ class Watchdog:
         self.consecutive_failures = 0
         self.last_status: HealthStatus | None = None
         self.started_at = time.time()
+        #: Set for the duration of :meth:`restart_server` and published on
+        #: ``/health`` as ``restart_in_progress``. The tray reads it to tell a
+        #: restart it did not initiate from a crash of the child it owns (D28):
+        #: without it, a GUI "Restart server" killed the tray's child, the tray
+        #: counted a crash attempt and respawned, the watchdog respawned too,
+        #: and the loser of that race exited on a port conflict -- which the
+        #: tray counted as a second crash, then a third, then "Crashed".
+        self._restart_in_progress: dict[str, Any] | None = None
 
     # -- config ----------------------------------------------------------
 
@@ -1028,6 +1069,8 @@ class Watchdog:
             "watchdog_uptime_s": round(time.time() - self.started_at, 1),
             "wedged_after_failures": config.watchdog.wedged_after_failures,
             "health_timeout_s": config.watchdog.health_timeout_s,
+            # Non-null while restart_server is running. See __init__.
+            "restart_in_progress": self._restart_in_progress,
         }
         if config_error is not None:
             payload["config_error"] = config_error
@@ -1177,6 +1220,30 @@ class Watchdog:
             )
         config, config_error = self.load_config()
         process = find_main_process(config)
+        # A tray that launched the server respawns it itself; see _spawn below.
+        tray_pid = supervising_tray_pid(process.pid) if process is not None else None
+        self._restart_in_progress = {
+            "since": time.time(),
+            "previous_pid": process.pid if process else None,
+            "respawned_by": "tray" if tray_pid else "watchdog",
+            "tray_pid": tray_pid,
+        }
+        try:
+            return await self._restart_server(
+                config, config_error, process, tray_pid=tray_pid, timeout_s=timeout_s
+            )
+        finally:
+            self._restart_in_progress = None
+
+    async def _restart_server(
+        self,
+        config: Config,
+        config_error: str | None,
+        process: ChildProcess | None,
+        *,
+        tray_pid: int | None,
+        timeout_s: float,
+    ) -> dict[str, Any]:
         result: dict[str, Any] = {
             "ok": False,
             "method": None,
@@ -1185,6 +1252,7 @@ class Watchdog:
             "new_pid": None,
             "healthy": False,
             "waited_s": 0.0,
+            "respawned_by": "tray" if tray_pid else "watchdog",
         }
         if config_error is not None:
             result["config_error"] = config_error
@@ -1250,11 +1318,43 @@ class Watchdog:
         if not all(freed.values()):
             log.warning("some ports were still held after the kill: %s", freed)
 
+        result["watchdog_pid"] = os.getpid()
+        if tray_pid is not None:
+            # The server was the tray's child, and the tray respawns a child
+            # that exits -- it reads our /health (`restart_in_progress`) to
+            # know this exit was asked for. Spawning here as well would give
+            # the deployment two servers racing for the ports, and the loser's
+            # exit code 3 would be counted by the tray as a crash (D28).
+            result["method"] = "process-tree kill; the tray that owns the server respawns it"
+            result["tray_pid"] = tray_pid
+            log.warning(
+                "the server was launched by the tray (pid %s); leaving the respawn to it "
+                "and waiting for /health",
+                tray_pid,
+            )
+            healthy, waited = await self._wait_for_health(config, timeout_s)
+            result.update(ok=healthy, healthy=healthy, waited_s=waited)
+            if healthy:
+                replacement = find_main_process(config)
+                result["new_pid"] = replacement.pid if replacement else None
+            else:
+                result["error"] = {
+                    "message": (
+                        f"The server was killed and the tray (pid {tray_pid}) that launched "
+                        f"it was left to respawn it, but /health did not answer within "
+                        f"{timeout_s:g}s. Check the tray's status line and "
+                        f"logs/tray-server.log; if the tray is gone, restart_server again "
+                        f"and the watchdog will spawn the server itself."
+                    ),
+                    "code": "restart_unhealthy",
+                    "type": "watchdog_error",
+                }
+            return result
+
         pid, argv, error = self._spawn_main(config)
         result["method"] = "process-tree kill + respawn"
         result["command"] = argv
         result["new_pid"] = pid
-        result["watchdog_pid"] = os.getpid()
         if error is not None:
             log.error("could not spawn the replacement server: %s", error)
             result["error"] = {"message": error, "code": "spawn_failed", "type": "watchdog_error"}

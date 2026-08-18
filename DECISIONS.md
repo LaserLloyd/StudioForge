@@ -1417,3 +1417,74 @@ without a network call; an unverified one is micro-loaded and the pass persisted
 micro-load keeps the engine and never calls `install()`; a binary that cannot run `--version`
 is reinstalled; the driver warning names the knob and stays silent when the driver is fine; two
 concurrent installs of one tag run in turn.
+
+---
+
+## D28 -- Exactly one process respawns the server, and a deliberate restart is not a crash
+
+**Problem (recorded live, WP4, 2026-08-18 23:24).** With the tray supervising the server -- the
+normal Windows deployment: login -> tray -> `serve` -> watchdog -- a GUI **Restart server** went
+`POST /api/restart/server` -> watchdog `POST /restart` -> the watchdog killed the process tree
+and spawned a replacement. The tray saw its child exit, counted crash attempt 1 of 3, notified
+"The server exited unexpectedly; restarting it", waited five seconds and spawned a second
+replacement. Two servers then raced for 1234/8080; the loser's port preflight exited **3**, which
+the tray counted as crash 2, waited, spawned again, exited 3, crash 3, "server keeps dying; giving
+up" -- and the tray sat on **Crashed -- see the logs folder** beside a perfectly healthy server it
+no longer supervised and could not stop ("Stop server" then said "stopped; VRAM released" about a
+process that kept running). Every intentional restart from the GUI, from `sfctl recover
+--restart` or from an agent's `restart_server` produced that.
+
+Three things were wrong at once: two supervisors both believed they owned the respawn; the tray
+had no way to tell a restart it did not initiate from a crash; and an exit on a port conflict --
+which no respawn can fix -- was retried three times and then misdescribed.
+
+**Decision.** *The process that launched the server respawns it, and nothing else does.*
+
+* **A tray-launched server restarts by exiting.** The tray sets `SF_SUPERVISOR=tray` on the
+  child it spawns. `POST /api/restart/server` in such a process neither asks the watchdog nor
+  respawns itself: it drains, sets `exit_code`, and shuts both uvicorn servers down gracefully;
+  `serve` then exits **75** (`EXIT_RESTART_REQUESTED`, sysexits' `EX_TEMPFAIL`: "try again"). The
+  tray reads that code, respawns without spending a crash attempt, and says "Restarting the
+  server". One hop, a real drain, one respawner. Measured on this box: 1.0 s from the request to
+  the exit, the watchdog left running for the replacement to adopt (D21).
+* **The watchdog defers to a tray it can see.** Its own `restart_server` -- the wedged-server path,
+  where the app cannot cooperate -- still kills the tree, but when the killed process was the
+  direct child of a live tray (`supervising_tray_pid`: parent argv is `studioforge tray`, parent
+  predates the child) it does **not** spawn; it waits for `/health` and reports
+  `respawned_by: "tray"`. For the whole operation its `/health` carries `restart_in_progress`, and
+  the tray asks that endpoint (open, no credential) before it counts an exit as a crash.
+* **The tray never respawns onto a taken port.** A child that exits `EXIT_PORT_CONFLICT` (3)
+  spends no crash attempt: for up to `PORT_HOLDER_GRACE` (120 s) the tray waits for whoever holds
+  the port to answer `/health` as a StudioForge server -- a replacement still scanning its library
+  -- and attaches to it; otherwise the status line reads **"Port 1234 is held by another program
+  (LM Studio?) -- quit it, then Start server"** instead of "see the logs folder". Before any
+  crash-respawn it also checks whether a server already answers, and attaches rather than fights.
+* **Attached is a state, not a lie.** `TrayApp.adopted` is set when the tray attaches to a server
+  it did not launch (found at startup, or one that took over the port). "Stop server" on an adopted
+  server refuses with "not started by the tray" rather than declaring VRAM released; on a server it
+  launched, Stop also takes down a watchdog left over from an earlier restart (`find_watchdog_pids`,
+  same `--config` only), because "stop" from the outermost owner means the whole deployment.
+* **Shutdown is `should_exit`, not `os.kill`.** The restart paths ended with
+  `os.kill(os.getpid(), SIGINT)`, which on Windows is not a signal: `os.kill` with anything but
+  the two CTRL events is `TerminateProcess`, exit code 2, no handler, no drain, no lifespan
+  shutdown -- verified on this box with a handler installed. `__main__._serve` now installs
+  `state.request_shutdown`, which flips uvicorn's `should_exit` on both servers exactly as its
+  own signal handler does; the signal remains only as the fallback for an embedder without
+  `_serve`.
+
+**Exit codes are now vocabulary**, in `core/ports.py`: `2` config error, `3` port conflict,
+`75` restart requested. The tray reads them; nothing else may reuse them.
+
+**Cost.** A tray-supervised deployment now depends on the tray to bring the server back after a
+restart, which is what supervising means. If the tray has been quit, `SF_SUPERVISOR` is not set
+on the next launch and the watchdog path applies unchanged.
+
+**What pins it.** `tests/unit/test_tray.py` (exit-code and watchdog-driven classification, no
+crash attempt spent on a requested restart, a port-conflict exit waits then adopts or names the
+fix, a crash-respawn attaches to a server already up, Stop refuses an adopted server and takes a
+leftover watchdog down, `SF_SUPERVISOR=tray` on the child); `tests/unit/test_watchdog.py` (a
+tray-owned server is killed but not respawned and `restart_in_progress` is published and
+cleared; the watchdog still spawns when no tray owns the server; tray-argv recognition);
+`tests/unit/test_restart_handover.py` (the route exits for the tray instead of asking the
+watchdog, `_exit_for_supervisor` drains/sets 75/hands the watchdog over, the graceful hook is
+preferred and the signal remains the fallback).
