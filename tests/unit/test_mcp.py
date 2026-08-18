@@ -365,7 +365,7 @@ async def test_list_models_limit_returns_the_newest_downloads(state: State) -> N
 
 
 async def test_list_models_limit_applies_after_the_filters(state: State) -> None:
-    """"The newest embedding model", not "the newest model, if it is an embedding"."""
+    """ "The newest embedding model", not "the newest model, if it is an embedding"."""
     server = build_management_mcp(state)
     result = await call(server, "list_models", kind="embedding", limit=1)
     assert [row["id"] for row in result["models"]] == [EMBEDDING]
@@ -619,7 +619,7 @@ async def test_server_status_names_who_is_holding_vram(state: State) -> None:
 async def test_server_status_answers_null_rather_than_zero_when_it_cannot_look(
     state: State, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """"I could not read the process table" must not render as "nothing is leaking"."""
+    """ "I could not read the process table" must not render as "nothing is leaking"."""
     from studioforge.core import vram_holders
 
     def boom(*_args: Any, **_kwargs: Any) -> Any:
@@ -1240,9 +1240,7 @@ async def test_repo_details_can_skip_the_header_read(
     seen = _patch_repo_payload(monkeypatch)
 
     server = build_management_mcp(state)
-    payload = await call(
-        server, "repo_details", repo_id="test/TestModel-GGUF", with_context=False
-    )
+    payload = await call(server, "repo_details", repo_id="test/TestModel-GGUF", with_context=False)
 
     assert seen["with_context"] is False
     assert "context_fit" not in payload["quants"][0]

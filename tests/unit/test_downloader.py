@@ -2628,7 +2628,7 @@ async def test_the_retry_state_is_visible_to_the_gui(
     hf_server: ServerState,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """"It says running and nothing is moving" must be answerable from the payload."""
+    """ "It says running and nothing is moving" must be answerable from the payload."""
     from studioforge.core import downloader as dl
 
     monkeypatch.setattr(dl, "_RETRY_BASE_S", 0.05)
@@ -2819,7 +2819,7 @@ def test_file_in_use_check_calls_the_api_the_supervisor_actually_has(tmp_path: P
 
 
 def test_file_in_use_check_answers_conservatively_when_it_cannot_tell(tmp_path: Path) -> None:
-    """"I do not know" must not read as "go ahead and delete it"."""
+    """ "I do not know" must not read as "go ahead and delete it"."""
     from studioforge.api.app import _file_in_use_check
 
     class _BrokenSupervisor:

@@ -164,9 +164,7 @@ async def _probe_stream(
     tokens = 0
     saw_done = False
 
-    async with client.stream(
-        "POST", f"{base_url}/v1/chat/completions", json=payload
-    ) as response:
+    async with client.stream("POST", f"{base_url}/v1/chat/completions", json=payload) as response:
         if response.status_code != 200:
             body = await response.aread()
             return ProbeResult(
@@ -223,14 +221,10 @@ async def _probe_stream(
     )
 
 
-async def _probe_embedding(
-    model_id: str, base_url: str, client: httpx.AsyncClient
-) -> ProbeResult:
+async def _probe_embedding(model_id: str, base_url: str, client: httpx.AsyncClient) -> ProbeResult:
     """Embedding models do not stream; a vector with dimensions is the proof."""
     started = time.perf_counter()
-    response = await client.post(
-        f"{base_url}/v1/embeddings", json={"input": PROBE_EMBEDDING_INPUT}
-    )
+    response = await client.post(f"{base_url}/v1/embeddings", json={"input": PROBE_EMBEDDING_INPUT})
     elapsed = round((time.perf_counter() - started) * 1000, 1)
     if response.status_code != 200:
         return ProbeResult(

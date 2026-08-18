@@ -192,8 +192,9 @@ def library() -> list[ModelRecord]:
     return [
         # Deliberately NOT in date order, so the sort is doing the work.
         record("pub/dense-8b", dense_meta(), mtime=NOW - DAY, size_bytes=8 * GB, tools=True),
-        record("pub/moe-122b", moe_meta(), mtime=NOW, size_bytes=60 * GB, tools=True,
-               thinking=True),
+        record(
+            "pub/moe-122b", moe_meta(), mtime=NOW, size_bytes=60 * GB, tools=True, thinking=True
+        ),
         record(
             "pub/vlm-7b",
             vlm_meta(),
@@ -304,7 +305,7 @@ def test_tiers_are_the_documented_ladder() -> None:
 
 
 def test_exactly_one_row_per_model_is_recommended() -> None:
-    """"Pick the recommended row" must always have exactly one answer."""
+    """ "Pick the recommended row" must always have exactly one answer."""
     for entry in catalog_for()["models"]:
         marked = [r for r in entry["options"] if r["recommended"]]
         assert len(marked) == 1, entry["id"]
@@ -400,34 +401,60 @@ def test_a_thinking_model_gets_the_higher_floor() -> None:
 
 
 def test_the_idle_fallback_applies_the_same_preference_order() -> None:
-    """"Unload something" still deserves the best row, not merely the biggest."""
+    """ "Unload something" still deserves the best row, not merely the biggest."""
     rows = [
-        {"ctx_per_slot": 16384, "fits": False,
-         "if_gpus_idle": {"fits": True, "max_parallel": 4}, "recommended": False},
-        {"ctx_per_slot": 32768, "fits": False,
-         "if_gpus_idle": {"fits": True, "max_parallel": 4}, "recommended": False},
-        {"ctx_per_slot": 65536, "fits": False,
-         "if_gpus_idle": {"fits": True, "max_parallel": 1}, "recommended": False},
+        {
+            "ctx_per_slot": 16384,
+            "fits": False,
+            "if_gpus_idle": {"fits": True, "max_parallel": 4},
+            "recommended": False,
+        },
+        {
+            "ctx_per_slot": 32768,
+            "fits": False,
+            "if_gpus_idle": {"fits": True, "max_parallel": 4},
+            "recommended": False,
+        },
+        {
+            "ctx_per_slot": 65536,
+            "fits": False,
+            "if_gpus_idle": {"fits": True, "max_parallel": 1},
+            "recommended": False,
+        },
     ]
     assert mark_recommended(rows, chat_class=True, floor=16384) == "if_gpus_idle"
     assert rows[1]["recommended"] is True
 
 
 def test_when_nothing_fits_the_recommendation_points_at_freeing_vram() -> None:
-    """"Unload something" is actionable; "impossible" is not."""
+    """ "Unload something" is actionable; "impossible" is not."""
     rows = [
-        {"ctx_per_slot": 16384, "fits": False, "if_gpus_idle": {"fits": True},
-         "recommended": False},
-        {"ctx_per_slot": 32768, "fits": False, "if_gpus_idle": {"fits": False},
-         "recommended": False},
+        {
+            "ctx_per_slot": 16384,
+            "fits": False,
+            "if_gpus_idle": {"fits": True},
+            "recommended": False,
+        },
+        {
+            "ctx_per_slot": 32768,
+            "fits": False,
+            "if_gpus_idle": {"fits": False},
+            "recommended": False,
+        },
     ]
     assert mark_recommended(rows, chat_class=True) == "if_gpus_idle"
     assert rows[0]["recommended"] is True
 
 
 def test_a_model_that_fits_nowhere_recommends_nothing() -> None:
-    rows = [{"ctx_per_slot": 16384, "fits": False, "if_gpus_idle": {"fits": False},
-             "recommended": False}]
+    rows = [
+        {
+            "ctx_per_slot": 16384,
+            "fits": False,
+            "if_gpus_idle": {"fits": False},
+            "recommended": False,
+        }
+    ]
     assert mark_recommended(rows, chat_class=True) is None
 
 
@@ -447,12 +474,7 @@ def test_load_args_keys_match_the_load_model_tool_signature() -> None:
     tool = next(t for t in server._tool_manager.list_tools() if t.name == "load_model")
     accepted = set(tool.parameters["properties"])
 
-    row = next(
-        r
-        for m in catalog_for()["models"]
-        for r in m["options"]
-        if r["recommended"]
-    )
+    row = next(r for m in catalog_for()["models"] for r in m["options"] if r["recommended"])
     assert set(row["load_args"]) <= accepted
     assert set(row["load_args"]) == {"model_id", "ctx_size", "parallel", "kv_cache_type"}
 
@@ -472,7 +494,7 @@ def test_load_args_repeat_the_row_they_belong_to() -> None:
 
 
 def test_load_args_carry_a_concrete_kv_cache_type_never_auto() -> None:
-    """"auto" is a planner input, not an answer; the row states what it picked."""
+    """ "auto" is a planner input, not an answer; the row states what it picked."""
     for entry in catalog_for()["models"]:
         for row in entry["options"]:
             if row["fits"]:
@@ -608,9 +630,7 @@ def test_observations_calibrate_the_rows_that_were_not_measured() -> None:
     assert dense["calibration"]["gen_factor"] == pytest.approx(0.5)
     assert dense["calibration"]["basis"] == "model+devices"
     other = next(
-        r
-        for r in dense["options"]
-        if r["fits"] and r["ctx_per_slot"] != target["ctx_per_slot"]
+        r for r in dense["options"] if r["fits"] and r["ctx_per_slot"] != target["ctx_per_slot"]
     )
     baseline_other = next(
         r for r in dense_baseline["options"] if r["ctx_per_slot"] == other["ctx_per_slot"]
@@ -637,9 +657,7 @@ def test_every_fitting_row_quotes_both_ends_of_the_window() -> None:
 
 def test_a_window_at_or_below_the_reference_fill_quotes_one_number_twice() -> None:
     """8k of context in an 8k window *is* the full-context case."""
-    short = record(
-        "pub/short", dense_meta(n_ctx_train=8192), mtime=NOW, size_bytes=2 * GB
-    )
+    short = record("pub/short", dense_meta(n_ctx_train=8192), mtime=NOW, size_bytes=2 * GB)
     entry = catalog_for([short])["models"][0]
     row = next(r for r in entry["options"] if r["fits"])
     assert row["ctx_per_slot"] <= throughput.REFERENCE_FILL_TOKENS
@@ -739,14 +757,14 @@ def test_the_summary_tags_the_two_kinds_that_change_what_context_costs() -> None
 
 
 def test_the_summary_carries_the_tag_through_the_real_catalog() -> None:
-    entry = catalog_for(
-        [record("pub/gemma4-31b", iswa_meta(), mtime=NOW, size_bytes=30 * GB)]
-    )["models"][0]
+    entry = catalog_for([record("pub/gemma4-31b", iswa_meta(), mtime=NOW, size_bytes=30 * GB)])[
+        "models"
+    ][0]
     assert "iSWA" in entry["summary"]
 
 
 def test_a_model_with_no_usable_geometry_says_unknown_not_full() -> None:
-    """"Cannot estimate" must never be reported as the cheap case."""
+    """ "Cannot estimate" must never be reported as the cheap case."""
     blind = record(
         "pub/blind",
         GgufMeta(architecture="mystery", n_ctx_train=32768, tensor_bytes=4 * GB),

@@ -616,11 +616,15 @@ def _incident_status_payload() -> dict[str, Any]:
     """The payload exactly as /api/status produced it during the incident."""
     return {
         "vram_processes": [
-            {"gpu_index": 0, "pid": 101, "name": "llama-server.exe", "used_bytes": 0,
-             "is_ours": False},
+            {
+                "gpu_index": 0,
+                "pid": 101,
+                "name": "llama-server.exe",
+                "used_bytes": 0,
+                "is_ours": False,
+            },
             {"gpu_index": 0, "pid": 301, "name": "dwm.exe", "used_bytes": 0, "is_ours": False},
-            {"gpu_index": 0, "pid": 302, "name": "explorer.exe", "used_bytes": 0,
-             "is_ours": False},
+            {"gpu_index": 0, "pid": 302, "name": "explorer.exe", "used_bytes": 0, "is_ours": False},
         ]
     }
 
@@ -712,9 +716,7 @@ def test_holders_endpoint_answers_who_has_my_vram(
     assert captured["engines_dir"].endswith("engines")
 
 
-def test_reclaim_endpoint_passes_dry_run_through(
-    app: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_reclaim_endpoint_passes_dry_run_through(app: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     from fastapi.testclient import TestClient
 
     seen: dict[str, Any] = {}
@@ -741,9 +743,7 @@ def test_reclaim_endpoint_passes_dry_run_through(
     assert done["killed"] == 1
 
 
-def test_status_payload_carries_the_attribution(
-    app: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_status_payload_carries_the_attribution(app: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     """The endpoint an LLM reads must answer the question, not list noise."""
     from fastapi.testclient import TestClient
 
@@ -837,9 +837,7 @@ def test_the_note_says_something_in_every_state() -> None:
     )
     assert "2 orphaned" in leaking
 
-    blind = st.vram_holders_note(
-        {"holders": [{"pid": 1}], "per_process_bytes": "unavailable"}
-    )
+    blind = st.vram_holders_note({"holders": [{"pid": 1}], "per_process_bytes": "unavailable"})
     assert "Per-process VRAM is unavailable" in blind
     assert st.vram_holders_note(None) == "VRAM holders unavailable."
 

@@ -41,9 +41,7 @@ def _delete_virtual(raw: httpx.Client, virtual_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_two_presets_over_one_base_share_one_instance(
-    raw: httpx.Client, chat_model: str
-) -> None:
+def test_two_presets_over_one_base_share_one_instance(raw: httpx.Client, chat_model: str) -> None:
     """The whole point: N personas over one base cost one llama-server."""
     writer, coder = "sf-test/preset-writer", "sf-test/preset-coder"
     for virtual_id, prompt in ((writer, "You write prose."), (coder, "You write code.")):
@@ -103,9 +101,7 @@ def test_preset_max_tokens_applies_only_when_the_request_omits_it(
     try:
         ask = {"role": "user", "content": "Tell me a very long story about the sea."}
 
-        omitted = raw.post(
-            "/v1/chat/completions", json={"model": virtual_id, "messages": [ask]}
-        )
+        omitted = raw.post("/v1/chat/completions", json={"model": virtual_id, "messages": [ask]})
         assert omitted.status_code == 200, omitted.text
         assert omitted.json()["usage"]["completion_tokens"] == 2, (
             "the preset's max_tokens=2 must bind when the request omits the field"
@@ -235,9 +231,7 @@ def test_twenty_concurrent_mixed_requests_all_succeed_and_settle_to_zero(
     assert all(v == 0 for v in counts.values()), f"active_requests stuck: {counts}"
 
 
-def test_hammer_does_not_deadlock_subsequent_requests(
-    raw: httpx.Client, chat_model: str
-) -> None:
+def test_hammer_does_not_deadlock_subsequent_requests(raw: httpx.Client, chat_model: str) -> None:
     """A plain request straight after the burst must answer promptly."""
     started = time.time()
     response = raw.post(

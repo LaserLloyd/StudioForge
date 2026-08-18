@@ -86,9 +86,7 @@ def test_benchmark_modes_match_the_real_hardware(raw: httpx.Client) -> None:
 
 
 def test_model_modes_carry_planner_verdicts(raw: httpx.Client, chat_model: str) -> None:
-    response = raw.get(
-        f"/api/models/{chat_model}/benchmark/modes", params={"ctx_size": CTX_SIZE}
-    )
+    response = raw.get(f"/api/models/{chat_model}/benchmark/modes", params={"ctx_size": CTX_SIZE})
     assert response.status_code == 200, response.text
     payload = response.json()
     assert payload["model_id"] == chat_model
@@ -145,9 +143,7 @@ def test_oversized_model_reports_reasons_rather_than_erroring(
 
 
 @pytest.mark.timeout(1200)
-def test_single_gpu_benchmark_runs_and_restores_state(
-    raw: httpx.Client, chat_model: str
-) -> None:
+def test_single_gpu_benchmark_runs_and_restores_state(raw: httpx.Client, chat_model: str) -> None:
     modes = raw.get(f"/api/models/{chat_model}/benchmark/modes").json()["modes"]
     first = next(mode for mode in modes if mode["applicable"] and len(mode["devices"]) == 1)
     before = device_override(raw, chat_model)
@@ -232,16 +228,12 @@ def test_cancel_stops_the_job_and_restores_state(raw: httpx.Client, chat_model: 
     assert again.json()["canceled"] is False
 
 
-def test_unknown_job_and_unknown_mode_are_clean_errors(
-    raw: httpx.Client, chat_model: str
-) -> None:
+def test_unknown_job_and_unknown_mode_are_clean_errors(raw: httpx.Client, chat_model: str) -> None:
     missing = raw.get("/api/benchmark/jobs/does-not-exist")
     assert missing.status_code == 404
     assert missing.json()["error"]["code"] == "job_not_found"
 
-    bad_mode = raw.post(
-        f"/api/models/{chat_model}/benchmark", json={"modes": ["rtx-9999-x9"]}
-    )
+    bad_mode = raw.post(f"/api/models/{chat_model}/benchmark", json={"modes": ["rtx-9999-x9"]})
     assert bad_mode.status_code == 400
     assert "unknown benchmark mode" in bad_mode.json()["error"]["message"]
 

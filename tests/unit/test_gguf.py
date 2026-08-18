@@ -951,6 +951,7 @@ def test_known_quant_labels_cover_ftype_table() -> None:
 # Real library
 # ===========================================================================
 
+
 def _library_root() -> Path | None:
     """The GGUF library to parse for real, or ``None`` to skip.
 

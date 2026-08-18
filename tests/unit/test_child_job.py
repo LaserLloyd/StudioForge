@@ -237,9 +237,7 @@ async def test_a_refused_assignment_does_not_fail_the_load(
         await asyncio.wait_for(supervisor.aclose(), timeout=30)
 
 
-async def test_children_are_tracked_for_the_orphan_sweep(
-    config: Config, tmp_path: Path
-) -> None:
+async def test_children_are_tracked_for_the_orphan_sweep(config: Config, tmp_path: Path) -> None:
     """``child_pids`` is what stops the sweep killing our own live children."""
     binary = tmp_path / "engine" / "fake_llama_server.py"
     binary.parent.mkdir(parents=True, exist_ok=True)

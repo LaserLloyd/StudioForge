@@ -242,9 +242,7 @@ def test_iswa_allocation_is_byte_for_byte_what_it_always_was(
     )
     assert legacy is not None
     assert (
-        kv_alloc_bytes(
-            meta, ctx_total=ctx_total, kv_k=kv_type, kv_v=kv_type, parallel=parallel
-        )
+        kv_alloc_bytes(meta, ctx_total=ctx_total, kv_k=kv_type, kv_v=kv_type, parallel=parallel)
         == legacy
     )
 

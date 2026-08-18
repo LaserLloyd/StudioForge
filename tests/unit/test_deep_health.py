@@ -38,9 +38,7 @@ BASE = "http://127.0.0.1:18100"
 
 def sse(*chunks: str) -> list[str]:
     """SSE lines for content deltas, without a terminator."""
-    return [
-        "data: " + json.dumps({"choices": [{"delta": {"content": chunk}}]}) for chunk in chunks
-    ]
+    return ["data: " + json.dumps({"choices": [{"delta": {"content": chunk}}]}) for chunk in chunks]
 
 
 DONE = "data: [DONE]"

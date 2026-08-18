@@ -36,7 +36,7 @@ OOM_STDERR = [
 ]
 
 CONFIG_STDERR = [
-    "error while handling argument \"--bogus-flag\": unknown argument",
+    'error while handling argument "--bogus-flag": unknown argument',
 ]
 
 
@@ -162,7 +162,7 @@ def resident(model_id: str, *, ttl_s: int | None = 1800, last_used: float = 1.0)
         "CUDA error: out of memory",
         "ggml_backend_cuda_buffer_type_alloc_buffer: failed to allocate 4096 MiB",
         "cudaMalloc failed: out of memory",
-        "GGML_ASSERT: ggml-cuda.cu:1234: !\"CUDA error\"",
+        'GGML_ASSERT: ggml-cuda.cu:1234: !"CUDA error"',
     ],
 )
 def test_allocation_failures_are_transient(line: str) -> None:
@@ -172,7 +172,7 @@ def test_allocation_failures_are_transient(line: str) -> None:
 @pytest.mark.parametrize(
     "line",
     [
-        "error while handling argument \"--bogus\": unknown argument",
+        'error while handling argument "--bogus": unknown argument',
         "llama_model_load: unknown model architecture: 'nonsense'",
         "failed to open GGUF file: no such file or directory",
     ],
@@ -196,7 +196,7 @@ def test_an_unrecognised_failure_is_not_retried_blindly() -> None:
 
 
 async def test_a_transient_oom_evicts_and_retries_once() -> None:
-    """"a transient OOM during a model swap -- retrying later worked"."""
+    """ "a transient OOM during a model swap -- retrying later worked"."""
     supervisor = StubSupervisor(fail_times=1, stderr=OOM_STDERR)
     supervisor.instances["victim/model"] = resident("victim/model")
     planner = StubPlanner()
@@ -281,9 +281,7 @@ async def test_the_retry_keeps_the_callers_explicit_overrides() -> None:
     planner.plan_load = recording  # type: ignore[method-assign]
     manager = make_manager(supervisor, planner)
 
-    instance = await manager.load(
-        "test/model", ctx_size=16384, kv_cache_type="q8_0", parallel=2
-    )
+    instance = await manager.load("test/model", ctx_size=16384, kv_cache_type="q8_0", parallel=2)
 
     assert instance.state == "ready"
     assert len(seen) == 2, "the transient failure must trigger exactly one re-plan"

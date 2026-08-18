@@ -191,9 +191,7 @@ async def vram_holders(request: Request) -> dict[str, Any]:
 
 
 @router.post("/vram/reclaim")
-async def vram_reclaim(
-    request: Request, dry_run: bool = Body(False, embed=True)
-) -> dict[str, Any]:
+async def vram_reclaim(request: Request, dry_run: bool = Body(False, embed=True)) -> dict[str, Any]:
     """Kill orphaned llama-server processes and free their VRAM.
 
     Only ``orphan`` holders are touched: our own engine binary, under our own

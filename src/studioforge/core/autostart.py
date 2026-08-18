@@ -83,9 +83,7 @@ def _tray_interpreter() -> str:
     return str(candidate) if candidate.is_file() else sys.executable
 
 
-def launch_command(
-    config: Config, *, open_gui: bool = False, tray: bool = False
-) -> list[str]:
+def launch_command(config: Config, *, open_gui: bool = False, tray: bool = False) -> list[str]:
     """Argv that starts StudioForge the same way a manual launch would.
 
     Prefers the installed console script; falls back to ``<python> -m
@@ -115,9 +113,7 @@ def _quote_for_vbs(argv: list[str]) -> str:
     return " ".join(parts)
 
 
-def enable(
-    config: Config, *, open_gui: bool = False, tray: bool = False
-) -> AutostartStatus:
+def enable(config: Config, *, open_gui: bool = False, tray: bool = False) -> AutostartStatus:
     if os.name == "nt":
         return _enable_windows(config, open_gui=open_gui, tray=tray)
     if tray:
@@ -141,9 +137,7 @@ def status(config: Config) -> AutostartStatus:
     if os.name == "nt":
         path = startup_dir() / WINDOWS_SHIM
         if not path.is_file():
-            return AutostartStatus(
-                enabled=False, mechanism="Windows Startup folder", path=None
-            )
+            return AutostartStatus(enabled=False, mechanism="Windows Startup folder", path=None)
         # Report which entry point the shim actually launches. "Enabled" alone
         # is not enough to answer "why is there no tray icon?", which is the
         # question this status is usually being asked to settle.

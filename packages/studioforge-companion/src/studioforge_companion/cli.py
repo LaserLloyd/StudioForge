@@ -503,7 +503,7 @@ def _print_plan(plan: dict[str, Any]) -> None:
         if split:
             table.add_row("tensor_split", ", ".join(f"{s:.3f}" for s in split))
         per_gpu = plan.get("per_gpu_bytes") or {}
-        for gpu, amount in (per_gpu.items() if isinstance(per_gpu, dict) else []):
+        for gpu, amount in per_gpu.items() if isinstance(per_gpu, dict) else []:
             table.add_row(f"gpu {gpu} projected", fmt_bytes(amount))
         evict = plan.get("evict_model_ids") or []
         if evict:
@@ -521,10 +521,10 @@ def _print_plan(plan: dict[str, Any]) -> None:
     if plan.get("max_ctx_that_fits") is not None:
         table.add_row("max ctx that fits", str(plan["max_ctx_that_fits"]))
     per_gpu_free = plan.get("per_gpu_free") or {}
-    for gpu, amount in (per_gpu_free.items() if isinstance(per_gpu_free, dict) else []):
+    for gpu, amount in per_gpu_free.items() if isinstance(per_gpu_free, dict) else []:
         table.add_row(f"gpu {gpu} free", fmt_bytes(amount))
     estimate = plan.get("estimate_mb") or {}
-    for key, amount in (estimate.items() if isinstance(estimate, dict) else []):
+    for key, amount in estimate.items() if isinstance(estimate, dict) else []:
         table.add_row(f"estimate {key}", f"{amount} MiB")
     console.print(table)
     for suggestion in plan.get("suggestions") or []:
@@ -637,9 +637,7 @@ def models_pin(
     if want_json(json_out):
         emit(result)
         return
-    STATE.console.print(
-        f"{result.get('model_id')}: pinned={fmt_bool(result.get('pinned'))}"
-    )
+    STATE.console.print(f"{result.get('model_id')}: pinned={fmt_bool(result.get('pinned'))}")
 
 
 @models_app.command("test")

@@ -306,9 +306,7 @@ def _engine_holders(state: Any) -> dict[str, Any]:
         from studioforge.api.mgmt_routes import _own_child_pids
         from studioforge.core.vram_holders import find_engine_processes
 
-        processes = find_engine_processes(
-            state.config.engines_dir, own_pids=_own_child_pids(state)
-        )
+        processes = find_engine_processes(state.config.engines_dir, own_pids=_own_child_pids(state))
     except Exception as exc:  # noqa: BLE001 - attribution is never load-bearing
         log.debug("engine holder scan failed", error=str(exc))
         return {"vram_orphan_count": None, "engine_processes": None}
@@ -548,9 +546,7 @@ def build_management_mcp(state: Any) -> MCPServer:
             ``"stopped"`` there means simply *not loaded*, not that anything
             failed.
         """
-        catalog = await run_in_threadpool(
-            state.manager.catalog, compact=not full, refresh=refresh
-        )
+        catalog = await run_in_threadpool(state.manager.catalog, compact=not full, refresh=refresh)
         loaded = {i.model_id: i for i in state.supervisor.list()}
         rows: list[dict[str, Any]] = []
         truncated = False

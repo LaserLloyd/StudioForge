@@ -834,9 +834,7 @@ class Database:
         log.info("db.benchmark_saved", model_id=model_id, benchmark_id=row_id)
         return row_id
 
-    def list_benchmarks(
-        self, model_id: str | None = None, limit: int = 20
-    ) -> list[dict[str, Any]]:
+    def list_benchmarks(self, model_id: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
         """Benchmarks newest-first; ``report_json`` comes back parsed as ``report``."""
         if model_id is None:
             rows = (
@@ -848,8 +846,7 @@ class Database:
             rows = (
                 self.connect()
                 .execute(
-                    "SELECT * FROM benchmarks WHERE model_id = ? ORDER BY ts DESC, id DESC "
-                    "LIMIT ?",
+                    "SELECT * FROM benchmarks WHERE model_id = ? ORDER BY ts DESC, id DESC LIMIT ?",
                     (model_id, limit),
                 )
                 .fetchall()

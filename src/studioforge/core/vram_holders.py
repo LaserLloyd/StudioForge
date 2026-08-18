@@ -114,9 +114,7 @@ class EngineProcess:
             "exe": self.exe,
             "alias": self.alias,
             "port": self.port,
-            "uptime_s": (
-                round(time.time() - self.create_time, 1) if self.create_time else None
-            ),
+            "uptime_s": (round(time.time() - self.create_time, 1) if self.create_time else None),
             "parent_pid": self.parent_pid,
             "parent_alive": self.parent_alive,
             "parent_name": self.parent_name,

@@ -839,6 +839,4 @@ def test_the_restart_exit_code_is_a_requested_restart_without_asking_anyone(
     app: TrayApp, client: FakeClient
 ) -> None:
     client.urls.clear()  # no watchdog answering at all
-    assert app.classify_exit(tray_app.EXIT_RESTART_REQUESTED) == (
-        tray_app.KIND_RESTART_REQUESTED
-    )
+    assert app.classify_exit(tray_app.EXIT_RESTART_REQUESTED) == (tray_app.KIND_RESTART_REQUESTED)

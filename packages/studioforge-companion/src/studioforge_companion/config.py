@@ -213,8 +213,7 @@ class CompanionConfig(BaseModel):
             if self.default in self.servers:
                 return self.servers[self.default]
             raise CompanionConfigError(
-                f"default server {self.default!r} is not defined. "
-                f"Known servers: {', '.join(known)}"
+                f"default server {self.default!r} is not defined. Known servers: {', '.join(known)}"
             )
         if len(self.servers) == 1:
             return next(iter(self.servers.values()))

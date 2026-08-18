@@ -219,7 +219,7 @@ def test_lmstudio_takeover_backs_up_and_restores(tmp_path: Path) -> None:
     config = make_config(tmp_path)
     # Plant a known third-party handler so the test does not depend on what
     # this machine happens to have registered (which may already be ours).
-    _write_windows_scheme(LMSTUDIO_SCHEME, "C:\Program Files\Some Other App\other.exe" "%1")
+    _write_windows_scheme(LMSTUDIO_SCHEME, "C:\Program Files\Some Other App\other.exe%1")
     before_lmstudio = status(config)["lmstudio"]
     try:
         result = register(config, takeover_lmstudio=True)
@@ -246,7 +246,7 @@ def test_lmstudio_takeover_backs_up_and_restores(tmp_path: Path) -> None:
 def test_repeated_takeover_does_not_clobber_the_backup(tmp_path: Path) -> None:
     """A second register must not record OUR command as the thing to restore."""
     config = make_config(tmp_path)
-    _write_windows_scheme(LMSTUDIO_SCHEME, "C:\Program Files\Some Other App\other.exe" "%1")
+    _write_windows_scheme(LMSTUDIO_SCHEME, "C:\Program Files\Some Other App\other.exe%1")
     before = status(config)["lmstudio"]
     try:
         register(config, takeover_lmstudio=True)

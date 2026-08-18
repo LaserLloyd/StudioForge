@@ -26,9 +26,7 @@ def loaded_model(raw: httpx.Client, chat_model: str) -> str:
     return chat_model
 
 
-def test_shallow_health_says_nothing_about_generation(
-    raw: httpx.Client, loaded_model: str
-) -> None:
+def test_shallow_health_says_nothing_about_generation(raw: httpx.Client, loaded_model: str) -> None:
     """The endpoint that lied: it is still fast, still shallow, still 200."""
     body = raw.get("/health").json()
 

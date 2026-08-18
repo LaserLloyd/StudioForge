@@ -866,9 +866,7 @@ class ModelManager:
             try:
                 await self._sample_one(instance, now)
             except Exception as exc:  # noqa: BLE001 - telemetry, never a failure
-                log.debug(
-                    "throughput sample failed", model_id=instance.model_id, error=str(exc)
-                )
+                log.debug("throughput sample failed", model_id=instance.model_id, error=str(exc))
 
     async def _sample_one(self, instance: InstanceInfo, now: float) -> None:
         """One model's window: measure, predict at the same reference, record both.

@@ -643,7 +643,7 @@ def test_prompt_throughput_of_a_moe_beats_a_dense_model_of_the_same_size() -> No
 
 
 def test_no_placement_returns_nulls_not_zeros() -> None:
-    """"Cannot estimate" and "estimated to be zero" are different answers."""
+    """ "Cannot estimate" and "estimated to be zero" are different answers."""
     result = est8b({})
     assert result["gen_tps"] is None
     assert result["prompt_tps"] is None
@@ -1046,7 +1046,5 @@ def test_measured_is_null_for_a_placement_never_observed() -> None:
 
 def test_confidence_says_measured_only_for_an_exact_observation() -> None:
     assert confidence_for({"exact": True, "gen_tps": 40.0}, {"basis": "none"}) == "measured"
-    assert (
-        confidence_for({"exact": False, "gen_tps": 40.0}, {"basis": "gpu_class"}) == "calibrated"
-    )
+    assert confidence_for({"exact": False, "gen_tps": 40.0}, {"basis": "gpu_class"}) == "calibrated"
     assert confidence_for({"exact": None, "gen_tps": None}, {"basis": "none"}) == "estimated"

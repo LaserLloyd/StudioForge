@@ -366,9 +366,7 @@ class StudioForgeClient:
         return await self.post(f"models/{model}/pin", {"pinned": pinned})
 
     async def delete_model(self, model: str, *, delete_files: bool, confirm: bool) -> Any:
-        return await self.delete(
-            f"models/{model}", delete_files=delete_files, confirm=confirm
-        )
+        return await self.delete(f"models/{model}", delete_files=delete_files, confirm=confirm)
 
     async def settings(self, model: str) -> Any:
         return await self.get(f"models/{model}/settings")

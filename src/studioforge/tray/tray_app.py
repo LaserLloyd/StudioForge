@@ -248,9 +248,7 @@ def watchdog_health_url(config: Config) -> str:
 
 
 def port_conflict_detail(port: int) -> str:
-    return (
-        f"Port {port} is held by another program (LM Studio?) — quit it, then Start server"
-    )
+    return f"Port {port} is held by another program (LM Studio?) — quit it, then Start server"
 
 
 def acquire_single_instance(

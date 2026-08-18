@@ -190,9 +190,7 @@ _ARCH_ALIASES = {
 #: RELATIVE to each configured model directory (LM Studio's ``publisher/repo/``
 #: layout). An absolute path here would only ever be correct on one machine.
 _PREFERRED_TINY_MODELS = (
-    Path("lmstudio-community")
-    / "Qwen2.5-0.5B-Instruct-GGUF"
-    / "Qwen2.5-0.5B-Instruct-Q8_0.gguf",
+    Path("lmstudio-community") / "Qwen2.5-0.5B-Instruct-GGUF" / "Qwen2.5-0.5B-Instruct-Q8_0.gguf",
 )
 _TINY_MODEL_MAX_BYTES = 2 * 1024 * 1024 * 1024
 

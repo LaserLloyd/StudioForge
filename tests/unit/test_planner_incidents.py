@@ -131,7 +131,7 @@ def notes_text(result: LoadPlan | LoadRejected) -> str:
 
 
 def test_thinking_model_gets_the_larger_default_context() -> None:
-    """"the 8192 default truncated chain-of-thought on reasoning models"."""
+    """ "the 8192 default truncated chain-of-thought on reasoning models"."""
     planner = make_planner(StubProbe([gpu(0, 32, 31)]))
 
     plan = planner.plan_load(make_record(thinking=True))
@@ -197,7 +197,7 @@ def test_a_small_trained_window_clamps_below_the_global_default() -> None:
 
 
 def test_the_boost_never_turns_a_working_load_into_a_rejection() -> None:
-    """"Do NOT exceed what the planner says fits" -- back off, do not fail.
+    """ "Do NOT exceed what the planner says fits" -- back off, do not fail.
 
     24 GiB of weights on a 32 GiB card leaves room for an 8k KV cache but not
     a 32k one, so the model must still load, at the smaller context.
@@ -237,7 +237,7 @@ def test_the_boost_never_causes_an_eviction() -> None:
 
 
 def test_context_beyond_the_trained_window_is_flagged() -> None:
-    """"we set 256K on a 128K model and silently got 128K"."""
+    """ "we set 256K on a 128K model and silently got 128K"."""
     planner = make_planner(StubProbe([gpu(0, 80, 79)]))
     record = make_record(n_ctx_train=131072, tensor_bytes=2 * GB)
 
@@ -285,7 +285,7 @@ def test_the_warning_survives_a_rejection() -> None:
 
 
 def test_a_rejection_names_the_process_holding_the_vram() -> None:
-    """"ComfyUI on the same box, 'model failed to load', no visibility"."""
+    """ "ComfyUI on the same box, 'model failed to load', no visibility"."""
     probe = StubProbe(
         [gpu(0, 24, 2)],
         processes=[VramProcess(gpu_index=0, pid=1234, name="python.exe", used_bytes=21 * GB)],
@@ -359,7 +359,7 @@ def test_nvml_enumeration_reads_pid_name_and_bytes(monkeypatch: pytest.MonkeyPat
 
 
 def test_nvml_failure_yields_no_holders(monkeypatch: pytest.MonkeyPatch) -> None:
-    """"Degrade silently if NVML cannot enumerate" -- one empty list, no raise."""
+    """ "Degrade silently if NVML cannot enumerate" -- one empty list, no raise."""
 
     class BrokenNvml:
         def nvmlInit(self) -> None:

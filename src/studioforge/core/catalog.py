@@ -298,9 +298,7 @@ def summarize(
     return " | ".join(parts)
 
 
-def ctx_tiers_for(
-    record: ModelRecord, tiers: Sequence[int] = CTX_TIERS
-) -> list[int]:
+def ctx_tiers_for(record: ModelRecord, tiers: Sequence[int] = CTX_TIERS) -> list[int]:
     """Context tiers worth reporting for this model, ascending.
 
     The standard ladder capped at the trained window, plus the model's own
@@ -327,14 +325,10 @@ def ctx_tiers_for(
 
 def _capacity_for(planner: Planner, devices: Sequence[int], *, forced: bool) -> int:
     gpu_map = {g.index: g for g in planner.probe.list_gpus()}
-    return sum(
-        planner.usable_bytes(gpu_map[d], forced=forced) for d in devices if d in gpu_map
-    )
+    return sum(planner.usable_bytes(gpu_map[d], forced=forced) for d in devices if d in gpu_map)
 
 
-def slots_for_plan(
-    planner: Planner, record: ModelRecord, plan: LoadPlan
-) -> tuple[int, str, int]:
+def slots_for_plan(planner: Planner, record: ModelRecord, plan: LoadPlan) -> tuple[int, str, int]:
     """``(slots, bound, vram_bytes)`` for this placement.
 
     One call to :meth:`Planner.size_slots` -- **the same function a real load
@@ -455,9 +449,7 @@ def estimate_speed(
     speed = at(reference_fill)
     # A window at or below the reference fill *is* the full-context case; a
     # second identical call would only cost arithmetic.
-    speed["gen_tps_full_ctx"] = (
-        speed["gen_tps"] if ctx <= reference_fill else at(ctx)["gen_tps"]
-    )
+    speed["gen_tps_full_ctx"] = speed["gen_tps"] if ctx <= reference_fill else at(ctx)["gen_tps"]
     return speed
 
 
@@ -611,9 +603,7 @@ def _preferred(
     return None
 
 
-def mark_recommended(
-    rows: list[dict[str, Any]], *, chat_class: bool, floor: int = 0
-) -> str | None:
+def mark_recommended(rows: list[dict[str, Any]], *, chat_class: bool, floor: int = 0) -> str | None:
     """Mark exactly one row ``recommended`` and say which rule chose it.
 
     ``floor`` is :func:`recommendation_floor` -- the context below which this

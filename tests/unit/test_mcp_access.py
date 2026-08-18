@@ -253,9 +253,7 @@ def test_non_ascii_credential_is_a_401_not_a_500() -> None:
     """
     config = make_config(api_key="the-key", pin="12345678")
     with pytest.raises(AuthError):
-        check_request(
-            make_request("/api/status", headers={"Authorization": "Bearer kéy"}), config
-        )
+        check_request(make_request("/api/status", headers={"Authorization": "Bearer kéy"}), config)
     with pytest.raises(AuthError):
         check_request(make_request("/mcp", headers={"X-MCP-Pin": "pïn"}), config)
 
@@ -296,9 +294,7 @@ def test_pin_minted_into_a_preexisting_config_is_written_back(tmp_path: Any) -> 
     from studioforge.config import load_config
 
     config_path = tmp_path / "config.yaml"
-    config_path.write_text(
-        yaml.safe_dump({"server": {"port": 1234}}), encoding="utf-8"
-    )
+    config_path.write_text(yaml.safe_dump({"server": {"port": 1234}}), encoding="utf-8")
 
     first = load_config(config_path)
     assert first.mcp.pin

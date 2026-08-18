@@ -196,7 +196,7 @@ def plan(model_id: str = "test/model") -> LoadPlan:
 async def test_stop_verifies_the_pid_is_gone(
     config: Config, fake_binary: Path, tmp_path: Path
 ) -> None:
-    """"the unload API returned success while models stayed resident"."""
+    """ "the unload API returned success while models stayed resident"."""
     supervisor = make_supervisor(config, fake_binary)
     record = make_record(tmp_path)
     info = await supervisor.start(record, plan())

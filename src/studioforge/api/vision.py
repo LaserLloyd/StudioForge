@@ -283,9 +283,7 @@ async def _guard_target(url: str, *, allow_private: bool) -> _PinnedTarget:
         ) from exc
     host = parsed.host or ""
     if not host:
-        raise BadRequestError(
-            "image URL has no host", code="image_fetch_refused", param="messages"
-        )
+        raise BadRequestError("image URL has no host", code="image_fetch_refused", param="messages")
     if parsed.scheme not in ("http", "https"):
         raise BadRequestError(
             "image URLs must be http(s) or data: URLs",
@@ -372,9 +370,7 @@ async def _fetch(url: str, *, config: Config, client: httpx.AsyncClient) -> tupl
 _MAX_REDIRECTS = 3
 
 
-async def _read_capped(
-    response: httpx.Response, gateway: Any
-) -> tuple[bytes, str]:
+async def _read_capped(response: httpx.Response, gateway: Any) -> tuple[bytes, str]:
     """Stream the body with the size cap enforced as it arrives.
 
     The cap is checked while streaming rather than after the fact, so a hostile
@@ -395,8 +391,7 @@ async def _read_capped(
         declared_bytes = 0  # a malformed header is not our 500; the streamed cap still holds
     if declared_bytes > gateway.max_image_bytes:
         raise BadRequestError(
-            f"remote image is {declared} bytes, over the "
-            f"{gateway.max_image_bytes} byte limit.",
+            f"remote image is {declared} bytes, over the {gateway.max_image_bytes} byte limit.",
             code="image_too_large",
             param="messages",
         )

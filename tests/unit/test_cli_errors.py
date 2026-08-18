@@ -35,9 +35,7 @@ def test_corrupt_config_yaml_tracebacks_only_on_request(
     bad.write_text("server:\n\tport: 1234\n", encoding="utf-8")
     monkeypatch.setenv("SF_DEBUG", "1")
     with pytest.raises(ConfigError):
-        CliRunner().invoke(
-            main_cli.app, ["config", "--config", str(bad)], catch_exceptions=False
-        )
+        CliRunner().invoke(main_cli.app, ["config", "--config", str(bad)], catch_exceptions=False)
 
 
 def test_tray_refuses_off_windows_with_a_pointer_to_systemd(

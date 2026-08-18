@@ -1275,9 +1275,7 @@ class Planner:
 
     # -- plan_load helpers -------------------------------------------------
 
-    def _resolve_parallel(
-        self, record: ModelRecord, parallel: int | None
-    ) -> tuple[int, bool]:
+    def _resolve_parallel(self, record: ModelRecord, parallel: int | None) -> tuple[int, bool]:
         """``(slots, auto)`` for this load.
 
         An explicit slot count from anywhere -- the request, the per-model
@@ -1965,7 +1963,7 @@ class Planner:
         kv_cache_type_v: KvCacheType | None = None,
         forced: bool = False,
     ) -> VramEstimate | None:
-        """"Would this model fit on exactly these GPUs?" -- the estimate, or None.
+        """ "Would this model fit on exactly these GPUs?" -- the estimate, or None.
 
         A read-only question, asked by surfaces that are *not* loading anything:
         the pre-download context matrix (:mod:`studioforge.core.hf_meta`) asks it

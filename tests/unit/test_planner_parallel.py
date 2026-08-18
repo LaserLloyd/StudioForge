@@ -394,9 +394,7 @@ def test_an_integer_default_parallel_still_pins_the_slot_count() -> None:
 
 def test_auto_sizes_more_than_one_slot_for_a_small_model() -> None:
     planner = Planner(auto_config(), rig_5090x2_3090x2())
-    plan = planner.plan_load(
-        make_record(meta=make_meta(tensor_bytes=4 * 1024**3)), ctx_size=8192
-    )
+    plan = planner.plan_load(make_record(meta=make_meta(tensor_bytes=4 * 1024**3)), ctx_size=8192)
     assert isinstance(plan, LoadPlan)
     assert plan.parallel > 1
     assert plan.parallel_limited_by in {"vram", "knee", "cap"}

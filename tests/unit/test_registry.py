@@ -1276,6 +1276,7 @@ def test_concurrent_scans_with_virtual_model_churn(
 # Live test over the real library
 # ---------------------------------------------------------------------------
 
+
 def _library_root() -> Path | None:
     """``SF_TEST_MODELS_DIR``, else the library the app itself would detect."""
     env = os.environ.get("SF_TEST_MODELS_DIR", "").strip()
@@ -1290,10 +1291,7 @@ REAL_LIBRARY = _library_root() or Path("<no-model-library-detected>")
 
 live = pytest.mark.skipif(
     not REAL_LIBRARY.is_dir() or not hasattr(gguf, "read_meta"),
-    reason=(
-        "no real model library found; set SF_TEST_MODELS_DIR to run the live "
-        "registry scan"
-    ),
+    reason=("no real model library found; set SF_TEST_MODELS_DIR to run the live registry scan"),
 )
 
 

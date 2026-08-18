@@ -71,9 +71,7 @@ def tailscale_addresses() -> list[str]:
     if binary is None:
         return []
     try:
-        result = subprocess.run(
-            [binary, "ip", "-4"], capture_output=True, text=True, timeout=5
-        )
+        result = subprocess.run([binary, "ip", "-4"], capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.TimeoutExpired):
         return []
     if result.returncode != 0:

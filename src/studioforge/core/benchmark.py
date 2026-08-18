@@ -138,7 +138,7 @@ class BenchmarkMode:
 
 
 def _display_name(name: str) -> str:
-    """"NVIDIA GeForce RTX 5090" -> "RTX 5090"; unknown names pass through."""
+    """ "NVIDIA GeForce RTX 5090" -> "RTX 5090"; unknown names pass through."""
     tokens = [token for token in re.split(r"\s+", name.strip()) if token]
     kept = [token for token in tokens if token.lower().strip(".,") not in _NOISE_WORDS]
     return " ".join(kept) or name.strip() or "GPU"
@@ -575,9 +575,7 @@ class Benchmarker:
         except Exception as exc:
             # One bad mode must not cost the user the other three.
             result.error = str(exc)
-            log.warning(
-                "benchmark.mode_failed", model_id=record.id, mode=mode.key, error=str(exc)
-            )
+            log.warning("benchmark.mode_failed", model_id=record.id, mode=mode.key, error=str(exc))
         _emit(on_progress, mode.key, "done", position, total)
         return result
 

@@ -55,9 +55,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _ENGINE_TAG = "b10425"
 _ENGINE_BIN = "llama-server.exe" if os.name == "nt" else "llama-server"
 _TINY_MODEL_RELPATH = (
-    Path("lmstudio-community")
-    / "Qwen2.5-0.5B-Instruct-GGUF"
-    / "Qwen2.5-0.5B-Instruct-Q8_0.gguf"
+    Path("lmstudio-community") / "Qwen2.5-0.5B-Instruct-GGUF" / "Qwen2.5-0.5B-Instruct-Q8_0.gguf"
 )
 
 
@@ -387,9 +385,7 @@ def test_advanced_numeric_settings(config: Config, tmp_path: Path) -> None:
     assert value_after(argv, "--rope-scaling") == "linear"
 
 
-def test_single_slot_launch_carries_no_concurrency_flags(
-    config: Config, tmp_path: Path
-) -> None:
+def test_single_slot_launch_carries_no_concurrency_flags(config: Config, tmp_path: Path) -> None:
     """One slot must launch byte-identically to before the estimator existed."""
     binary = make_binary(tmp_path)
     argv = sup(config, binary).build_command(
@@ -400,9 +396,7 @@ def test_single_slot_launch_carries_no_concurrency_flags(
     assert "--batch-size" not in argv
 
 
-def test_multi_slot_launch_sets_slot_prompt_similarity(
-    config: Config, tmp_path: Path
-) -> None:
+def test_multi_slot_launch_sets_slot_prompt_similarity(config: Config, tmp_path: Path) -> None:
     """Slot affinity only matters once there is more than one slot to pick."""
     binary = make_binary(tmp_path)
     argv = sup(config, binary).build_command(

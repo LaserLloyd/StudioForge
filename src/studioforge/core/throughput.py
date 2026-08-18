@@ -319,8 +319,10 @@ def dense_trunk_params(meta: Any) -> int:
     n_vocab = int(getattr(meta, "n_vocab", 0) or 0)
     if min(n_layer, n_embd, n_head, head_k) <= 0:
         return 0
-    attn = n_layer * n_embd * (
-        n_head * head_k + n_head_kv * head_k + n_head_kv * head_v + n_head * head_v
+    attn = (
+        n_layer
+        * n_embd
+        * (n_head * head_k + n_head_kv * head_k + n_head_kv * head_v + n_head * head_v)
     )
     return attn + max(0, n_vocab) * n_embd
 

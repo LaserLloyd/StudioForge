@@ -364,8 +364,7 @@ async def test_a_streaming_model_is_never_evicted_until_the_stream_ends() -> Non
 
     while_streaming = planner.plan_load(incoming, ctx_size=2048, loaded=supervisor.list())
     assert isinstance(while_streaming, LoadRejected), (
-        "the only way to fit is evicting a model with an in-flight stream; "
-        "that must be refused"
+        "the only way to fit is evicting a model with an in-flight stream; that must be refused"
     )
 
     # Client hangs up; the slot is released; NOW eviction is fair game.

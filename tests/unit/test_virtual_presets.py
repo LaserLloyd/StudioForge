@@ -212,9 +212,7 @@ def test_db_without_preset_keeps_the_legacy_list_shape(db: Database) -> None:
 
     db.save_virtual_model("vm", "base", "VM", [{"adapter_id": "a", "scale": 1.0}])
     raw = (
-        db.connect()
-        .execute("SELECT adapters_json FROM virtual_models WHERE id = 'vm'")
-        .fetchone()
+        db.connect().execute("SELECT adapters_json FROM virtual_models WHERE id = 'vm'").fetchone()
     )
     assert isinstance(json.loads(raw["adapters_json"]), list)
     row = db.list_virtual_models()[0]

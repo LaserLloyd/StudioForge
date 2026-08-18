@@ -185,7 +185,6 @@ def _file_size(path: Path | None) -> int:
         return 0
 
 
-
 def _cache_key(path: Path) -> str:
     """SQLite key for one file's parsed metadata: the path plus a parser version.
 
@@ -227,6 +226,7 @@ def _newest_mtime(paths: Sequence[Path], *, fallback: float) -> float:
         except OSError:
             continue
     return newest
+
 
 class Registry:
     """In-memory model index backed by the filesystem and SQLite.
@@ -907,9 +907,7 @@ class Registry:
         # doing it in the registry covers every save path (HTTP, MCP, GUI, CLI)
         # rather than one route.
         try:
-            validated.chat_template_file = validate_chat_template_file(
-                validated.chat_template_file
-            )
+            validated.chat_template_file = validate_chat_template_file(validated.chat_template_file)
         except ValueError as exc:
             raise BadRequestError(str(exc), param="chat_template_file") from exc
 

@@ -93,9 +93,7 @@ class TestWatchdogRestartRoute:
         assert status == 401
         assert watchdog.restart_calls == []
 
-        status, body = await _call(
-            app, "POST", "/restart", [(b"authorization", b"Bearer s3cret")]
-        )
+        status, body = await _call(app, "POST", "/restart", [(b"authorization", b"Bearer s3cret")])
         assert status == 200
         assert watchdog.restart_calls == [{"confirm": True}]
 
@@ -244,9 +242,7 @@ class TestWatchdogPinIsEnforcedWithoutAnApiKey:
         assert status == 401
         assert watchdog.restart_calls == []
 
-        status, _ = await _call(
-            app, "POST", "/restart", [(b"authorization", b"Bearer 87654321")]
-        )
+        status, _ = await _call(app, "POST", "/restart", [(b"authorization", b"Bearer 87654321")])
         assert status == 200
         assert watchdog.restart_calls == [{"confirm": True}]
 
@@ -259,9 +255,7 @@ class TestWatchdogPinIsEnforcedWithoutAnApiKey:
         assert status == 401, "recovery tools were reachable with no credential"
         assert body != {"reached": "mcp"}
 
-        status, body = await _call(
-            app, "POST", "/mcp", [(b"authorization", b"Bearer 87654321")]
-        )
+        status, body = await _call(app, "POST", "/mcp", [(b"authorization", b"Bearer 87654321")])
         assert status == 200 and body == {"reached": "mcp"}
 
     @pytest.mark.asyncio

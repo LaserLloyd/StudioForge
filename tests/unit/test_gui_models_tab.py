@@ -22,9 +22,7 @@ class TestResizableColumns:
 
         assert "actions" in {key for key, _ in tab._DEFAULT_WIDTHS}
         # One track per column, in declaration order.
-        assert tab._GRID_TEMPLATE.split() == [
-            f"var(--sfm-{key})" for key, _ in tab._DEFAULT_WIDTHS
-        ]
+        assert tab._GRID_TEMPLATE.split() == [f"var(--sfm-{key})" for key, _ in tab._DEFAULT_WIDTHS]
         for key, _ in tab._DEFAULT_WIDTHS:
             assert f"--sfm-{key}:" in tab._ROOT_VARS
 

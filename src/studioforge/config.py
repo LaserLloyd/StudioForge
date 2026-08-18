@@ -173,6 +173,7 @@ class ServerConfig(BaseModel):
             )
         return self
 
+
 class GuiConfig(BaseModel):
     enabled: bool = True
     host: str = "0.0.0.0"
@@ -379,9 +380,7 @@ class PlannerConfig(BaseModel):
             if index < 0:
                 raise ValueError("planner.reserved_mb keys must be CUDA indices >= 0")
             if amount < 0:
-                raise ValueError(
-                    f"planner.reserved_mb[{index}] must be >= 0 MiB (got {amount})"
-                )
+                raise ValueError(f"planner.reserved_mb[{index}] must be >= 0 MiB (got {amount})")
         return v
 
 

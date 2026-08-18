@@ -544,9 +544,7 @@ class Updater:
             log.error("could not respawn the server", error=str(exc))
             return False
 
-    async def wait_for_health(
-        self, timeout_s: float, *, expect_version: str | None = None
-    ) -> bool:
+    async def wait_for_health(self, timeout_s: float, *, expect_version: str | None = None) -> bool:
         """Poll ``/health`` until it answers ok, or the timeout expires.
 
         ``expect_version`` is what keeps this check honest after a restart: on

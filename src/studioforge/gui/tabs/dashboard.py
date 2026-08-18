@@ -87,7 +87,7 @@ def _gpu_panel(ctx: GuiContext) -> None:
 
 
 def _vram_holders_panel(ctx: GuiContext) -> None:
-    """"Who has my VRAM", including the answers that are not us.
+    """ "Who has my VRAM", including the answers that are not us.
 
     The GPU gauges above show that memory is gone; this shows who took it. It
     exists because on 2026-08-18 ~25 GiB was held by three llama-server

@@ -89,7 +89,7 @@ def _forget_rescan_task(task: asyncio.Task[Any], *, group_id: str) -> None:
 
 
 def _file_in_use_check(supervisor: Any, registry: Any) -> Any:
-    """"Does a loaded model have this file open?" for the downloader.
+    """ "Does a loaded model have this file open?" for the downloader.
 
     A forced re-download unlinks the destination first, and the quarantine path
     renames it; doing either to a file llama-server has mmapped is worse than

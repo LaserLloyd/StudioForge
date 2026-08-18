@@ -265,9 +265,7 @@ class NvmlGpuProbe:
         return sorted(out, key=lambda p: (p.gpu_index, -p.used_bytes, p.pid))
 
     @staticmethod
-    def _running_processes(
-        nvml: Any, handle: Any, index: int, names: Sequence[str]
-    ) -> list[Any]:
+    def _running_processes(nvml: Any, handle: Any, index: int, names: Sequence[str]) -> list[Any]:
         """First NVML getter in ``names`` that answers, or an empty list."""
         for name in names:
             getter = getattr(nvml, name, None)
@@ -565,9 +563,7 @@ def system_ram() -> tuple[int, int]:
     return int(vm.total), int(vm.used)
 
 
-def vram_processes(
-    probe: GpuProbe, *, own_pids: Sequence[int] = ()
-) -> list[VramProcess]:
+def vram_processes(probe: GpuProbe, *, own_pids: Sequence[int] = ()) -> list[VramProcess]:
     """VRAM holders from ``probe``, annotated with whether they are ours.
 
     Goes through ``getattr`` rather than calling the method directly so an
