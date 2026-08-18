@@ -158,6 +158,14 @@ many old engine directories survive a prune.
 All three secrets render masked, with a reveal button. Leaving a masked field untouched keeps the
 current value: the panel never posts the placeholder back over a working credential.
 
+**Network exposure** is a checklist item, not a footnote. Bound to `127.0.0.1` it is green and
+optional — nothing off this box can reach the API. Bound to `0.0.0.0` (or any LAN address) with no
+`server.api_key` it turns **required and amber**: everyone on the LAN or tailnet can then load,
+unload, delete and download models, and the MCP PIN guards only `/mcp`. **Set API key** mints one
+and saves it; copy it into OpenClaw (`Authorization: Bearer <key>`). The same rule decides whether
+`GET /api/mcp/info` and `/api/openclaw-setup` will hand the PIN to a remote caller at all — with no
+key set they answer only on the machine itself.
+
 **Reachable at** lists the concrete addresses another machine can use — Tailscale first, because a
 tailnet address survives a network change where a LAN address silently stops resolving.
 

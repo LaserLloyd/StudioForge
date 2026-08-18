@@ -137,6 +137,8 @@ def _ready_kwargs(**overrides: Any) -> dict[str, Any]:
         "hf_token_set": True,
         "autostart_enabled": True,
         "autostart_mechanism": "Windows Startup folder",
+        "bind_host": "127.0.0.1",
+        "api_key_set": False,
     }
     base.update(overrides)
     return base
@@ -800,3 +802,47 @@ async def test_an_invalid_value_is_rejected_and_nothing_is_written(config: Confi
         await apply_config_updates(ctx, {"planner.headroom_fraction": 5.0})
     assert config.config_path.read_text(encoding="utf-8") == before
     assert config.planner.headroom_fraction == 0.10
+
+
+# ---------------------------------------------------------------------------
+# WP17 F4: network exposure is a checklist item
+# ---------------------------------------------------------------------------
+
+
+def _check(checks: list[Any], key: str) -> Any:
+    return next(c for c in checks if c.key == key)
+
+
+def test_loopback_bind_is_private_and_not_required() -> None:
+    check = _check(st.first_run_checks(**_ready_kwargs(bind_host="127.0.0.1")), "network")
+    assert check.ok is True
+    assert check.required is False
+    assert "this machine only" in check.detail
+
+
+def test_lan_bind_without_key_is_a_required_failure_with_a_fix() -> None:
+    checks = st.first_run_checks(**_ready_kwargs(bind_host="0.0.0.0", api_key_set=False))
+    check = _check(checks, "network")
+    assert check.ok is False
+    assert check.required is True, "an open LAN port with no key gates readiness"
+    assert check.action == "set-api-key"
+    assert "NO API key" in check.detail and "/mcp" in check.detail
+    assert st.checklist_is_ready(checks) is False
+
+
+def test_lan_bind_with_key_is_green() -> None:
+    check = _check(
+        st.first_run_checks(**_ready_kwargs(bind_host="0.0.0.0", api_key_set=True)), "network"
+    )
+    assert check.ok is True
+    assert "protected by server.api_key" in check.detail
+
+
+@pytest.mark.parametrize("host", ["localhost", "::1", "[::1]", "127.0.0.1"])
+def test_loopback_spellings(host: str) -> None:
+    assert st._host_is_loopback(host) is True
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "192.168.1.5", "::", "", None])
+def test_non_loopback_spellings(host: Any) -> None:
+    assert st._host_is_loopback(host) is False

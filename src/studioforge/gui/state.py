@@ -3011,6 +3011,19 @@ class SetupCheck:
         return "required" if self.required else "optional"
 
 
+def _host_is_loopback(host: str | None) -> bool:
+    """``127.0.0.1``, ``::1``, ``localhost`` -- anything only this machine can reach."""
+    import ipaddress
+
+    text = str(host or "").strip().strip("[]").lower()
+    if text in {"localhost", ""}:
+        return text == "localhost"
+    try:
+        return ipaddress.ip_address(text).is_loopback
+    except ValueError:
+        return False
+
+
 def first_run_checks(
     *,
     data_dir: Any,
@@ -3034,6 +3047,8 @@ def first_run_checks(
     hf_token_set: bool = False,
     autostart_enabled: bool = False,
     autostart_mechanism: str = "",
+    bind_host: str = "0.0.0.0",
+    api_key_set: bool = False,
 ) -> list[SetupCheck]:
     """Everything a fresh checkout has to get right, in the order it matters.
 
@@ -3148,6 +3163,39 @@ def first_run_checks(
             ok=bool(api_reachable),
             detail=api_port_detail or f"port {api_port}",
             help="LM Studio uses the same port by default; only one of them can hold it.",
+        )
+    )
+
+    exposed = not _host_is_loopback(bind_host)
+    network_ok = (not exposed) or bool(api_key_set)
+    checks.append(
+        SetupCheck(
+            key="network",
+            name="Network exposure",
+            ok=network_ok,
+            # Required-when-it-matters: a loopback bind or a key makes it green;
+            # 0.0.0.0 with no key is a real gap, not a preference (WP17 F4).
+            required=exposed,
+            detail=(
+                f"bound to {bind_host} (this machine only)"
+                if not exposed
+                else (
+                    f"reachable from the network on {bind_host}, protected by server.api_key"
+                    if api_key_set
+                    else (
+                        f"reachable from the whole network on {bind_host} with NO API key: "
+                        "anyone on the LAN can load, unload and delete models. The MCP PIN "
+                        "guards only /mcp."
+                    )
+                )
+            ),
+            action="" if network_ok else "set-api-key",
+            action_label="Set API key",
+            help=(
+                "server.host 127.0.0.1 keeps it private to this box; 0.0.0.0 serves the LAN "
+                "and Tailscale and then needs server.api_key (OpenClaw sends it as a Bearer "
+                "token)."
+            ),
         )
     )
 

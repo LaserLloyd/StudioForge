@@ -322,6 +322,8 @@ def _collect_checks(ctx: GuiContext) -> list[st.SetupCheck]:
         hf_token_set=bool(config.hf.token),
         autostart_enabled=autostart_enabled,
         autostart_mechanism=autostart_mechanism,
+        bind_host=config.server.host,
+        api_key_set=bool(config.server.api_key),
     )
 
 
@@ -419,6 +421,8 @@ async def _run_action(ctx: GuiContext, action: str, refresh: Any) -> None:
         await install_engine(ctx, ctx.config.engine.pinned_tag, refresh)
     elif action == "generate-pin":
         await _generate_pin(ctx, refresh)
+    elif action == "set-api-key":
+        await _generate_api_key(ctx, refresh)
     elif action == "enable-autostart":
         await _set_autostart(ctx, True, refresh)
     elif action == "open-data-dir":
@@ -931,6 +935,30 @@ def _openclaw_panel(ctx: GuiContext) -> None:
 def _toggle_reveal(state: dict[str, bool], event: Any, reload: Any) -> None:
     state["on"] = bool(getattr(event, "value", False))
     ui.timer(0.01, reload, once=True)
+
+
+async def _generate_api_key(ctx: GuiContext, refresh: Any) -> None:
+    """The one-click fix for "reachable from the network with no key" (WP17 F4).
+
+    Mints a random key and saves it as ``server.api_key``. Shown masked on the
+    panel like every other secret; the user copies it from there into
+    OpenClaw (``Authorization: Bearer <key>``). ``RESTART_REQUIRED_KEYS`` decides
+    whether the change is live or needs a restart -- the save result says which.
+    """
+    import secrets
+
+    try:
+        payload = await apply_config_updates(ctx, {"server.api_key": secrets.token_urlsafe(24)})
+    except Exception as exc:  # noqa: BLE001
+        notify_error(exc, what="set API key")
+        return
+    ui.notify(
+        f"an API key was generated and saved ({st.save_result_text(payload)}). "
+        "Copy it from the Network & access card into your clients; the PIN is unchanged.",
+        type="positive",
+        multi_line=True,
+    )
+    refresh()
 
 
 async def _generate_pin(ctx: GuiContext, refresh: Any) -> None:
