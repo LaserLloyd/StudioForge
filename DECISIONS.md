@@ -1488,3 +1488,39 @@ cleared; the watchdog still spawns when no tray owns the server; tray-argv recog
 `tests/unit/test_restart_handover.py` (the route exits for the tray instead of asking the
 watchdog, `_exit_for_supervisor` drains/sets 75/hands the watchdog over, the graceful hook is
 preferred and the signal remains the fallback).
+
+---
+
+## D29 -- One model load at a time
+
+**Problem.** The planner decides against *live* free VRAM (D14/D16/D20: the numbers are always
+the machine's, never a bookkeeping copy). A `llama-server` child that is still loading has not
+yet taken the memory its plan says it will -- weights stream in over 10-90 s -- so two different
+cold models requested at the same moment were each planned as if the other did not exist. Both
+children launched onto the same cards; one died with `CUDA error: out of memory`; that failure
+is classified transient, so its one retry evicted the LRU idle model -- which was the *other*
+new model, idle for the instant between "ready" and its client's first request -- and that
+client's request then landed on a dead child as a `502`. Two agents asking for two big models at
+once could ping-pong like this indefinitely, each load "succeeding" and each request failing.
+
+**Decision.** `ModelManager` serialises loads behind one `asyncio.Lock` (`_load_gate`), taken
+inside the per-model lock and around the whole plan -> evict -> spawn -> healthy sequence. The
+second load plans only after the first child has actually allocated, and then either fits
+beside it or is refused with the numbers -- which is the documented worst case ("a refusal with
+numbers, never a degraded load"). Waiting is logged once per waiter at INFO; a streaming client
+sees the same keep-alive comments it sees for its own load.
+
+**Why not account for in-flight plans in the planner instead.** Subtracting a loading child's
+planned footprint from usable VRAM double-counts whatever it has already allocated (free VRAM
+already reflects that), so for the duration of every load the planner would refuse loads that
+fit. Charging only the unallocated remainder needs per-pid attribution that Windows cannot give
+(D23). Serialising is exact, needs no arithmetic, and costs only concurrency between cold loads
+-- which share one disk and one PCIe bus and were not faster in parallel anyway.
+
+**Order, so it cannot deadlock.** Per-model lock, then the gate, on every path (`ensure_loaded`,
+`load`, `load(force=True)`, the pinned auto-load, `restart_backend`). Nothing under the gate ever
+starts another load: eviction stops children, the transient retry re-plans and re-spawns the
+same model.
+
+**What pins it.** `tests/unit/test_load_retry.py`: a second cold load is not planned until the
+first child is up, and neither evicts the other.

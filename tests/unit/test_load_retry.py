@@ -312,3 +312,60 @@ async def test_a_rejection_after_eviction_surfaces_as_insufficient_vram() -> Non
         await manager.load("test/model")
 
     assert supervisor.starts == 1
+
+
+# ---------------------------------------------------------------------------
+# D29: one load at a time. Two cold loads planned side by side each see the
+# VRAM the other has not allocated yet -- the second must plan only after
+# the first child has actually come up.
+# ---------------------------------------------------------------------------
+
+
+async def test_a_second_cold_load_plans_only_after_the_first_has_started() -> None:
+    import asyncio
+
+    a, b = make_record("test/a"), make_record("test/b")
+    order: list[str] = []
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    class GatedSupervisor(StubSupervisor):
+        async def start(self, record: ModelRecord, plan: LoadPlan, **kwargs: Any) -> InstanceInfo:
+            order.append(f"start:{record.id}")
+            if record.id == "test/a":
+                first_started.set()
+                await release_first.wait()  # a slow cold load
+            order.append(f"ready:{record.id}")
+            return await super().start(record, plan, **kwargs)
+
+    class OrderedPlanner(StubPlanner):
+        def plan_load(self, record: ModelRecord, **kwargs: Any) -> Any:
+            order.append(f"plan:{record.id}")
+            return super().plan_load(record, **kwargs)
+
+    supervisor = GatedSupervisor()
+    manager = ModelManager(
+        Config(data_dir="/tmp/sf-gate"),
+        registry=StubRegistry({a.id: a, b.id: b}),  # type: ignore[arg-type]
+        planner=OrderedPlanner(),  # type: ignore[arg-type]
+        supervisor=supervisor,  # type: ignore[arg-type]
+        db=None,  # type: ignore[arg-type]
+    )
+
+    load_a = asyncio.create_task(manager.ensure_loaded("test/a"))
+    await first_started.wait()
+    load_b = asyncio.create_task(manager.ensure_loaded("test/b"))
+    await asyncio.sleep(0.05)
+    assert "plan:test/b" not in order, "b must not be planned while a is still allocating"
+
+    release_first.set()
+    await asyncio.gather(load_a, load_b)
+    assert order == [
+        "plan:test/a",
+        "start:test/a",
+        "ready:test/a",
+        "plan:test/b",
+        "start:test/b",
+        "ready:test/b",
+    ]
+    assert supervisor.stopped == [], "neither load evicted the other"

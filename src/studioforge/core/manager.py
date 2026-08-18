@@ -112,6 +112,11 @@ class ModelManager:
         self._started_at = time.time()
         self._locks: dict[str, asyncio.Lock] = {}
         self._locks_guard = asyncio.Lock()
+        #: One load at a time, machine-wide. See :meth:`_load_locked` (D29):
+        #: two cold loads planned side by side each see the VRAM the other has
+        #: not allocated yet, both launch, one OOMs, the retry evicts the
+        #: other, and the first client's request lands on a dead child.
+        self._load_gate = asyncio.Lock()
         self._ttl_task: asyncio.Task[None] | None = None
         self._autoload_task: asyncio.Task[None] | None = None
         self._draining = False
@@ -323,7 +328,40 @@ class ModelManager:
         kv_cache_type: Any = None,
         parallel: int | None = None,
     ) -> InstanceInfo:
-        """Plan, evict if needed, launch. Caller must hold the per-model lock."""
+        """Plan, evict if needed, launch. Caller must hold the per-model lock.
+
+        Loads are also serialised machine-wide behind ``_load_gate`` (D29).
+        The planner decides against *live* free VRAM, and a child that is
+        still loading has not yet taken the memory its plan says it will:
+        two different cold models requested at once were each planned as if
+        the other did not exist, both children launched onto the same cards,
+        one died with ``CUDA error: out of memory``, its one transient retry
+        evicted the other -- idle for the instant between "ready" and its
+        client's first request -- and that client's request then hit a dead
+        child. Behind the gate the second load plans after the first has
+        actually allocated, and either fits beside it or is refused with the
+        numbers. The per-model lock is taken first, then the gate, everywhere,
+        so the two cannot deadlock.
+        """
+        if self._load_gate.locked():
+            log.info(
+                "waiting for another model load to finish before planning",
+                model_id=record.id,
+                queued=sum(self._load_waiters.values()),
+            )
+        async with self._load_gate:
+            return await self._load_gated(
+                record, ctx_size=ctx_size, kv_cache_type=kv_cache_type, parallel=parallel
+            )
+
+    async def _load_gated(
+        self,
+        record: ModelRecord,
+        *,
+        ctx_size: int | None,
+        kv_cache_type: Any,
+        parallel: int | None,
+    ) -> InstanceInfo:
         draft = self._draft_for(record)
         adapters = self._adapters_for(record)
 
