@@ -91,10 +91,16 @@ Everything the app writes — `config.yaml`, `registry.sqlite3`, `engines/`, `lo
 lives in **one** place, resolved in one order:
 
 1. `SF_DATA_DIR` if it is set;
-2. `<repo>/data` when you are running from a checkout (this is the normal case, and `.gitignore`
+2. the directory a `--config` (or `SF_CONFIG`) file lives in, when one was named — `config.yaml`
+   always sits in its data directory, and that is how the tray, the watchdog and autostart pass
+   the location to the processes they spawn;
+3. `<repo>/data` when you are running from a checkout (this is the normal case, and `.gitignore`
    keeps it out of the repository);
-3. the platform data directory (`%LOCALAPPDATA%\studioforge`, `~/.local/share/studioforge`) for an
+4. the platform data directory (`%LOCALAPPDATA%\studioforge`, `~/.local/share/studioforge`) for an
    installed wheel.
+
+`config.yaml` itself never names the data directory (a `data_dir` key left by an older build is
+ignored with a warning), so copying a config between installs cannot silently move one.
 
 The `.bat` launchers, the `justfile`/`Makefile` and the CLI all follow that rule, so a
 double-click and a typed command reach the same install.
@@ -329,6 +335,8 @@ deploy/         systemd units
 - [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) — working on the code: environment, lint, types,
   which tests touch real hardware, and how to run the GUI against a scratch data dir
 - [`DECISIONS.md`](DECISIONS.md) — architectural decisions, each with the measurement behind it
+- [`docs/RUNBOOK.md`](docs/RUNBOOK.md) — the operator's runbook: what `/health` is telling you, and
+  what to do when it will not start, a model will not load, VRAM is held, or a download stalls
 - [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) — known limitations, honestly
 - [`docs/COMPARISON.md`](docs/COMPARISON.md) — what was borrowed from Ollama, oobabooga, KoboldCpp, vLLM
 

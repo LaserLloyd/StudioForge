@@ -158,13 +158,20 @@ many old engine directories survive a prune.
 All three secrets render masked, with a reveal button. Leaving a masked field untouched keeps the
 current value: the panel never posts the placeholder back over a working credential.
 
-**Network exposure** is a checklist item, not a footnote. Bound to `127.0.0.1` it is green and
-optional — nothing off this box can reach the API. Bound to `0.0.0.0` (or any LAN address) with no
-`server.api_key` it turns **required and amber**: everyone on the LAN or tailnet can then load,
-unload, delete and download models, and the MCP PIN guards only `/mcp`. **Set API key** mints one
-and saves it; copy it into OpenClaw (`Authorization: Bearer <key>`). The same rule decides whether
-`GET /api/mcp/info` and `/api/openclaw-setup` will hand the PIN to a remote caller at all — with no
-key set they answer only on the machine itself.
+**Network exposure** is a checklist item, not a footnote. Bound to `127.0.0.1` (all three
+listeners: `server.host`, `gui.host`, `watchdog.host`) it is green and optional — nothing off this
+box can reach the API. Any of them bound to `0.0.0.0` (or a LAN address) with no `server.api_key`
+turns it **required and amber**: everyone on the LAN or tailnet can then load and unload models
+and use the control panel. **Set API key** mints one and saves it; copy it into OpenClaw
+(`Authorization: Bearer <key>`). The same rule decides whether `GET /api/mcp/info` and
+`/api/openclaw-setup` will hand the PIN to a remote caller at all — with no key set they answer
+only on the machine itself.
+
+Even with no key, the routes that change the *box* — `PATCH /api/config`, restarts, engine and
+app installs, deleting model files, queueing downloads, killing processes — are accepted only from
+this machine or with the MCP PIN (`X-MCP-Pin`, or as the bearer token, which is how `sfctl` sends
+it); anything else is `403 remote_admin_requires_credential` (D32). Reads, inference and
+load/unload stay open, as LM Studio's do.
 
 **Reachable at** lists the concrete addresses another machine can use — Tailscale first, because a
 tailnet address survives a network change where a LAN address silently stops resolving.
@@ -182,11 +189,16 @@ shim in the Startup folder on Windows (which launches the tray, and the tray bri
 a `systemd --user` unit on Linux. The system-wide units for a headless server are in [`deploy/`](../deploy).
 
 **Where things live** is read-only, and the last row is the one people ask about — which of the
-three data-directory rules produced the directory in force (D25):
+data-directory rules produced the directory in force (D25, D31):
 
 1. `SF_DATA_DIR` if it is set;
-2. `<repo>/data` when running from a source checkout;
-3. the platform data directory, for an installed wheel.
+2. the directory a `--config`/`SF_CONFIG` file lives in, when one was named (that is how the tray,
+   the watchdog and autostart pass the location on);
+3. `<repo>/data` when running from a source checkout;
+4. the platform data directory, for an installed wheel.
+
+`config.yaml` never carries a `data_dir` key — one left there by an older build is ignored with a
+warning — so copying a config file between installs cannot silently move the install.
 
 **Open data dir** and **Open logs** open a file manager **on the machine running StudioForge**, not
 on the machine you are browsing from. **Restart server** confirms first: it is the one control that
@@ -195,6 +207,13 @@ process brings it back (D28): the tray, when the tray launched the server (the s
 the tray respawns it, without counting a crash); otherwise the watchdog. `GET /health` reports
 `can_serve` and, when false, `cannot_serve_reason` with the next action — an engine to install, a
 GPU the driver does not show, a library to point at.
+
+The port answers **before** the slow half of startup runs (D33): `GET /health` carries
+`boot: {phase, ready, elapsed_s}` — `scanning models`, `installing engine b10425: download 42%`,
+`ready` — and every other request waits (bounded) for the library index, so an early client sees a
+slow answer rather than an empty library. On a fresh box the first start downloads the engine in
+that background phase; the checklist's engine row shows the progress instead of a second Install
+button.
 
 ---
 
