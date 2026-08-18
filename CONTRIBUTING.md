@@ -13,7 +13,7 @@ environments without it.
 ## The three checks
 
 ```bash
-just lint     # ruff check + mypy on the typed core
+just lint     # ruff check + ruff format --check + mypy on the typed core
 just test     # pytest tests/unit
 just check    # both
 ```
@@ -22,13 +22,15 @@ or, without `just`:
 
 ```bash
 .venv/Scripts/python.exe -m ruff check src/ tests/ packages/
+.venv/Scripts/python.exe -m ruff format --check src/ tests/ packages/
 .venv/Scripts/python.exe -m mypy src/studioforge/core src/studioforge/api \
     src/studioforge/db.py src/studioforge/config.py src/studioforge/types.py
 .venv/Scripts/python.exe -m pytest tests/unit -q
 ```
 
-`ruff format` is available (`just format`) but is not enforced in CI; matching the surrounding
-style matters more than running it over a file you barely touched.
+The tree is `ruff format`-clean and `just lint` checks it: run `just format` before committing.
+`ruff` and `mypy` are pinned exactly in the `dev` extra because their output changes between
+releases; bump the pin and reformat in one commit when moving to a newer one.
 
 mypy runs in strict-ish mode (`disallow_untyped_defs`) over `core`, `api`, `db`, `config` and
 `types`. The GUI is exempt (`studioforge.gui.*`), because NiceGUI's declarative style produces a

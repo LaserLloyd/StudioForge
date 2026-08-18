@@ -14,6 +14,7 @@ test-all: test test-contract
 e2e: ; $(PYTHON) scripts/e2e_matrix.py
 lint:
 	$(PYTHON) -m ruff check src/ tests/ packages/
+	$(PYTHON) -m ruff format --check src/ tests/ packages/
 	$(PYTHON) -m mypy src/studioforge/core src/studioforge/api src/studioforge/db.py src/studioforge/config.py src/studioforge/types.py
 format:
 	$(PYTHON) -m ruff format src/ tests/ packages/

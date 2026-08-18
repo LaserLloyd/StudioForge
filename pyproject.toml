@@ -31,12 +31,17 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=8.3",
-    "pytest-asyncio>=0.24",
-    "pytest-timeout>=2.3",
+    # The test stack has an upper bound because pytest-asyncio 0.x -> 1.x
+    # changed fixture loop scoping and pytest majors move collection rules;
+    # the two gate tools are pinned EXACTLY: `ruff format` output differs
+    # between ruff releases, so a floating pin means `just lint` is green on
+    # one machine and red on the next for the same tree.
+    "pytest>=8.3,<10",
+    "pytest-asyncio>=1.0,<2",
+    "pytest-timeout>=2.3,<3",
     "openai>=1.57",
-    "ruff>=0.8",
-    "mypy>=1.13",
+    "ruff==0.16.3",
+    "mypy==2.3.1",
     "types-pyyaml",
     "types-psutil",
     # tests/unit/test_companion.py and test_docs.py import

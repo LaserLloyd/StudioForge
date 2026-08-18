@@ -34,6 +34,7 @@ e2e:
 
 lint:
     {{python}} -m ruff check src/ tests/ packages/
+    {{python}} -m ruff format --check src/ tests/ packages/
     {{python}} -m mypy src/studioforge/core src/studioforge/api src/studioforge/db.py src/studioforge/config.py src/studioforge/types.py
 
 format:
