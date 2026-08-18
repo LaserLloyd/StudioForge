@@ -1,0 +1,149 @@
+# StudioForge configuration -- the generated defaults, annotated.
+#
+# YOU DO NOT NEED THIS FILE. StudioForge writes its own `config.yaml` into the
+# data directory on first run, filling in what it detects about this machine.
+# This copy is a reference: every key the app understands, with the shipped
+# default, so you can see what exists before changing anything.
+#
+# WHERE THE REAL ONE LIVES: `<data dir>/config.yaml`, and the data dir is
+# `SF_DATA_DIR` if set, else `<repo>/data` in a checkout, else the platform
+# data directory. `studioforge config` prints the effective values (secrets
+# redacted). `data_dir` is deliberately absent below because it is derived --
+# setting it here would fight the environment.
+#
+# The keys that actually matter on a new install:
+#
+#   models.dir              your GGUF library. Left null, first run probes for
+#                           an LM Studio one (including the relocated
+#                           `downloadsFolder` in ~/.lmstudio/settings.json).
+#                           models.extra_dirs adds more, scanned after it.
+#   server.port             1234, the port LM Studio uses, so pointing an
+#                           existing OpenAI client here is a host change.
+#   server.api_key          null = open on your LAN/tailnet. Set it and it is
+#                           required on /v1, /api, /mcp and the watchdog.
+#                           Minimum 6 characters so log redaction can catch it.
+#   mcp.pin                 pairing code for the /mcp endpoint ONLY, separate
+#                           from the API key. Auto-generated on first run and
+#                           printed in the startup banner. Blank here on
+#                           purpose -- never commit a real one.
+#   models.default_ctx      the context FLOOR. The planner never recommends
+#                           less than this to buy an extra parallel slot.
+#   models.target_ctx       what every load AIMS for, halving down to what
+#                           actually fits in VRAM, never below default_ctx.
+#   models.default_parallel "auto" sizes conversation slots per model and
+#                           placement; an explicit integer is honoured verbatim.
+#   engine.pinned_tag       the llama.cpp build in use. `studioforge engine
+#                           --update` moves this on only after a smoke test.
+#   engine.cuda_variant     "auto" picks the CUDA build matching your driver;
+#                           pin it ("13.3", "12.4") if the guess is wrong.
+#   planner.excluded_devices  CUDA indices the planner may never touch, for a
+#                           box that also runs ComfyUI or a training job.
+#   planner.reserved_mb     {index: MiB} held back on a card -- the softer
+#                           version of the same knob, applied even to a forced
+#                           placement, because it is the NEIGHBOUR's memory.
+#   planner.headroom_fraction  fraction of every card left free (0.10 = 10%).
+#   hf.token                HuggingFace token for gated repos. A secret: it is
+#                           registered for log redaction, and it does not
+#                           belong in version control.
+#
+# Everything else has a sensible default and a reason in DECISIONS.md.
+
+server:
+  host: 0.0.0.0
+  port: 1234
+  api_key: null
+  cors_origins:
+  - '*'
+  cors_allow_credentials: false
+  drain_timeout_s: 30.0
+  request_timeout_s: 900.0
+gui:
+  enabled: true
+  host: 0.0.0.0
+  port: 8080
+  refresh_interval_s: 2.0
+watchdog:
+  enabled: true
+  host: 0.0.0.0
+  port: 1235
+  poll_interval_s: 10.0
+  health_timeout_s: 5.0
+  wedged_after_failures: 3
+mcp:
+  enabled: true
+  path: /mcp
+  pin: null
+  pin_required: true
+  advertise: true
+models:
+  dir: null
+  extra_dirs: []
+  default_ctx: 8192
+  default_ttl_s: 1800
+  default_kv_cache_type: auto
+  default_parallel: auto
+  ctx_per_slot_default: 32768
+  default_flash_attn: 'on'
+  default_cache_reuse: 256
+  default_reasoning_format: none
+  thinking_default_ctx: 32768
+  target_ctx: 1048576
+  auto_load_pinned: true
+  default_model: null
+  preload_default_model: false
+engine:
+  pinned_tag: b10425
+  cuda_variant: auto
+  keep_versions: 3
+  allow_source_build: true
+  repo: ggml-org/llama.cpp
+  smoke_test_timeout_s: 180.0
+planner:
+  headroom_fraction: 0.1
+  on_insufficient: evict
+  compute_overhead_fraction: 0.06
+  compute_overhead_floor_mb: 400
+  cuda_context_mb: 300
+  image_tokens_default: 1024
+  mmproj_compute_mb: 512
+  prefer_single_gpu: true
+  quant_affinity:
+    NVFP4:
+      min_compute_capability: '12.0'
+      mode: prefer
+    MXFP4:
+      min_compute_capability: '12.0'
+      mode: prefer
+  excluded_devices: []
+  reserved_mb: {}
+gateway:
+  child_port_start: 18100
+  child_port_end: 18200
+  load_timeout_s: 600.0
+  health_poll_interval_s: 0.5
+  max_restarts: 3
+  restart_backoff_s: 2.0
+  max_images_per_request: 8
+  max_image_bytes: 20971520
+  allow_private_image_hosts: false
+  image_fetch_timeout_s: 20.0
+  max_image_dim: 2048
+  ttl_sweep_interval_s: 15.0
+  stream_keepalive_interval_s: 5.0
+  merge_reasoning_into_content: true
+  deep_probe_timeout_s: 20.0
+  deep_probe_max_tokens: 8
+hf:
+  token: null
+  cache_dir: null
+  max_concurrent_downloads: 2
+  chunk_bytes: 8388608
+logging:
+  level: INFO
+  json: false
+update:
+  repo: studioforge/studioforge
+  channel: stable
+  auto_check: true
+  check_interval_h: 24.0
+  health_check_timeout_s: 60.0

@@ -1,0 +1,18 @@
+# Normalise to LF in the repository, and check out what each platform needs.
+* text=auto
+
+# cmd.exe is happiest with CRLF, and a .bat with LF endings has bitten label
+# jumps (`goto :failed`) in the wild.
+*.bat text eol=crlf
+
+# Shell scripts and systemd units must keep LF even when checked out on
+# Windows -- /bin/sh chokes on a trailing \r.
+*.sh      text eol=lf
+*.service text eol=lf
+
+# Binary-ish payloads git should never try to diff or convert.
+*.gguf    binary
+*.whl     binary
+*.png     binary
+*.ico     binary
+*.zip     binary

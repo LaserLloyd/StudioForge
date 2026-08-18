@@ -1,0 +1,112 @@
+[project]
+name = "studioforge"
+version = "0.2.0"
+description = "Self-hosted GPU-only LLM serving system: OpenAI-compatible gateway over llama.cpp llama-server, with model manager, VRAM planner, GUI and MCP control plane."
+readme = "README.md"
+requires-python = ">=3.12"
+# No licence chosen yet: all rights reserved. Do not add a licence
+# classifier or a LICENSE file until one is picked deliberately.
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "httpx>=0.27",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "pyyaml>=6.0",
+    "structlog>=24.4",
+    "nicegui>=2.7",
+    "huggingface-hub>=0.26",
+    "nvidia-ml-py>=12.560",
+    "mcp>=1.2",
+    "pillow>=11.0",
+    "psutil>=6.1",
+    "pystray>=0.19",
+    "typer>=0.15",
+    "rich>=13.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-timeout>=2.3",
+    "openai>=1.57",
+    "ruff>=0.8",
+    "mypy>=1.13",
+    "types-pyyaml",
+    "types-psutil",
+    # tests/unit/test_companion.py and test_docs.py import
+    # packages/studioforge-companion off sys.path rather than installing it, so
+    # its one dependency the server does not already have must be here or the
+    # suite fails at COLLECTION on a fresh checkout. Everything else the
+    # companion needs (typer, rich, httpx, mcp, pydantic) is a runtime dep above.
+    "tomli-w>=1.0",
+]
+
+[project.scripts]
+studioforge = "studioforge.__main__:main"
+studioforge-watchdog = "studioforge.watchdog.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/studioforge"]
+include = ["src/studioforge/migrations/*.sql", "src/studioforge/data/*.json"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "C4", "RET", "PTH", "ASYNC", "TID"]
+ignore = ["B008", "SIM108"]
+
+[tool.mypy]
+python_version = "3.12"
+mypy_path = "src"
+packages = ["studioforge"]
+warn_unused_configs = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+strict_equality = true
+
+[[tool.mypy.overrides]]
+# win32job/win32api/win32pdh: pywin32 ships no stubs (types-pywin32 is a separate
+# package and stale). They are imported inside try-guarded helpers that already
+# degrade on ImportError, so a missing stub buys nothing.
+module = [
+    "pynvml.*",
+    "nicegui.*",
+    "huggingface_hub.*",
+    "mcp.*",
+    "yaml.*",
+    "PIL.*",
+    "win32api.*",
+    "win32job.*",
+    "win32pdh.*",
+]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["studioforge.gui.*"]
+disallow_untyped_defs = false
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+# The contract suite loads REAL models onto the REAL GPUs. `testpaths` means a
+# bare `pytest` collects it, and on 2026-08-18 an agent running `pytest tests`
+# did exactly that: three llama-server children held ~25 GiB after the run
+# "finished". Opting out by default makes the dangerous case the explicit one.
+# `just test-contract` (or -m contract with SF_RUN_CONTRACT=1) opts back in.
+addopts = "-m 'not contract'"
+markers = [
+    "contract: real engine + real GGUF weights on the real GPUs; opt-in (needs SF_RUN_CONTRACT=1)",
+]
+filterwarnings = ["ignore::DeprecationWarning"]
+timeout = 300

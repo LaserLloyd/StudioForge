@@ -1,0 +1,26 @@
+[Unit]
+Description=StudioForge - GPU-only OpenAI-compatible LLM gateway
+Documentation=https://github.com/studioforge/studioforge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+# Config and registry live outside the release tree so updates cannot destroy
+# them; see DECISIONS.md D7.
+Environment=SF_DATA_DIR=%h/.local/share/studioforge
+ExecStart=%h/.local/bin/studioforge serve
+Restart=on-failure
+RestartSec=5
+# Long enough for a drain plus stopping every llama-server child.
+TimeoutStopSec=120
+KillMode=mixed
+KillSignal=SIGTERM
+# The gateway holds model files open and spawns children; do not sandbox the
+# model directory away.
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

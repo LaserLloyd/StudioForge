@@ -1,0 +1,17 @@
+-- 004_throughput_version.sql: stamp every throughput observation with the
+-- estimator that produced its est_* columns.
+--
+-- A calibration factor is measured/estimated, so it is a correction to ONE
+-- specific formula. When the formula changes -- v2 fixed the iSWA/hybrid KV
+-- read term, added a per-token latency floor and split the MoE derate out of
+-- the device-count derate -- every older ratio becomes a correction for a
+-- mistake the estimator no longer makes. Feeding those forward teaches the new
+-- formula the difference between two dead ones.
+--
+-- NULL for every pre-existing row, which is the point: throughput.calibrate()
+-- accepts only rows whose estimator_version equals the current
+-- ESTIMATOR_VERSION, so the 84 rows this rig recorded against v1 stop steering
+-- the catalog the moment this lands. They are NOT deleted -- measured_for()
+-- still reads them, because a measured tokens/second does not expire when our
+-- arithmetic changes; only its ratio to a stale prediction does.
+ALTER TABLE throughput_observations ADD COLUMN estimator_version INTEGER;

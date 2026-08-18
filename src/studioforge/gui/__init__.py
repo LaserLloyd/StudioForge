@@ -1,0 +1,1 @@
+"""NiceGUI control panel."""

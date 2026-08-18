@@ -1,0 +1,57 @@
+# --- runtime state -------------------------------------------------------
+# Everything the app writes lives under the data dir (DECISIONS.md D7, D25):
+# config.yaml, registry.sqlite3, engines/, logs/, downloads/, releases/.
+# None of it belongs in the repository, and some of it is a credential.
+#
+# These are ROOT-ANCHORED on purpose: a bare `data/` would also swallow
+# src/studioforge/data/, which ships engine_capabilities.json inside the wheel.
+/data/
+/logs/
+/downloads/
+/engines/
+/releases/
+/config.yaml
+*.sqlite3
+*.sqlite3-*
+.instance.lock
+*.log
+
+# Machine-specific overrides, sourced by every .bat launcher. This is where
+# your own SF_DATA_DIR goes; it must never be committed.
+local-env.bat
+.env
+.env.*
+
+# --- python --------------------------------------------------------------
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+dist/
+build/
+*.egg-info/
+.eggs/
+
+# --- tool caches ---------------------------------------------------------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.nicegui/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+
+# --- editor / OS junk ----------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- agent scratch -------------------------------------------------------
+.claude/worktrees/

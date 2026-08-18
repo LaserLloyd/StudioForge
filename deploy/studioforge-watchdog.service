@@ -1,0 +1,20 @@
+[Unit]
+Description=StudioForge recovery watchdog (sidecar)
+Documentation=https://github.com/studioforge/studioforge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+Environment=SF_DATA_DIR=%h/.local/share/studioforge
+ExecStart=%h/.local/bin/python -m studioforge.watchdog
+# Restart=always, not on-failure: the watchdog exists to be up when the main
+# app is not. It must come back from any exit, including a clean one.
+Restart=always
+RestartSec=3
+TimeoutStopSec=20
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
