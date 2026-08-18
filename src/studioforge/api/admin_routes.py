@@ -24,6 +24,7 @@ from typing import Any
 import httpx
 from fastapi import APIRouter, Body, Request
 
+from studioforge.api.auth import PIN_WITHHELD_NOTE, may_reveal_pin
 from studioforge.errors import BadRequestError, ModelNotFoundError
 from studioforge.logging import get_logger
 
@@ -468,13 +469,16 @@ async def mcp_info(request: Request) -> dict[str, Any]:
     lan = [e for e in endpoints if e["kind"] in {"lan", "bound"}]
     loopback = [e for e in endpoints if e["kind"] == "loopback"]
 
-    return {
+    # Returning the PIN in full is what makes "pair a new client" a single
+    # request -- but only when reaching this route actually cost a credential.
+    # With server.api_key unset (the shipped default) it costs nothing, and the
+    # PIN is then the only thing standing in front of the MCP control plane.
+    reveal = may_reveal_pin(request, config)
+    payload: dict[str, Any] = {
         "enabled": mcp.enabled,
         "path": mcp.path,
         "transport": "streamable-http",
-        # The caller is already authenticated to reach this route, so returning
-        # the PIN here is what makes "pair a new client" a single request.
-        "pin": mcp.pin if mcp.pin_required else None,
+        "pin": (mcp.pin if mcp.pin_required else None) if reveal else None,
         "pin_required": bool(mcp.pin_required and mcp.pin),
         "auth": {
             "header": "X-MCP-Pin",
@@ -491,3 +495,6 @@ async def mcp_info(request: Request) -> dict[str, Any]:
             "endpoints": reachable_urls(config.watchdog.port, "/mcp", host=config.watchdog.host),
         },
     }
+    if not reveal and mcp.pin_required and mcp.pin:
+        payload["pin_note"] = PIN_WITHHELD_NOTE
+    return payload

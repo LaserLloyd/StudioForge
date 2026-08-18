@@ -16,7 +16,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 
 from studioforge import __version__
-from studioforge.api.auth import redact
+from studioforge.api.auth import PIN_WITHHELD_NOTE, may_reveal_pin, redact_config_dict
 from studioforge.config import RESTART_REQUIRED_KEYS, apply_overrides
 from studioforge.core.benchmark import (
     DEFAULT_CTX_SIZE,
@@ -708,13 +708,17 @@ async def engine_validate_flags(
 
 @router.get("/config")
 async def get_config(request: Request) -> dict[str, Any]:
-    """Config with secrets redacted; never return the raw key or HF token."""
+    """Config with every credential redacted to a short fingerprint.
+
+    ``server.api_key``, ``mcp.pin`` and ``hf.token`` all go through
+    :func:`~studioforge.api.auth.redact_config_dict`. The PIN matters most here:
+    on the shipped default (``server.api_key`` unset) this route needs no
+    credential at all, so returning the PIN in full handed the MCP control
+    plane to any caller who could reach the port.
+    """
     state = _state(request)
     data = state.config.to_yaml_dict()
-    if data.get("server", {}).get("api_key"):
-        data["server"]["api_key"] = redact(state.config.server.api_key)
-    if data.get("hf", {}).get("token"):
-        data["hf"]["token"] = redact(state.config.hf.token)
+    redact_config_dict(data)
     return {
         "config": data,
         "config_path": str(state.config.config_path),
@@ -827,6 +831,10 @@ async def openclaw_setup(request: Request) -> JSONResponse:
     endpoints = reachable_urls(config.server.port, host=config.server.host)
     host = endpoints[0]["ip"] if endpoints else "127.0.0.1"
     key = config.server.api_key or "not-required"
+    # Same rule as /api/mcp/info: the PIN only goes out when a credential was
+    # needed to get here, or when the caller is on this machine. See
+    # studioforge.api.auth.may_reveal_pin.
+    reveal = may_reveal_pin(request, config)
     return JSONResponse(
         {
             "inference": {
@@ -843,7 +851,12 @@ async def openclaw_setup(request: Request) -> JSONResponse:
                 "server.api_key": key,
             },
             "endpoints": endpoints,
-            "mcp_pin": config.mcp.pin if config.mcp.pin_required else None,
+            "mcp_pin": (config.mcp.pin if config.mcp.pin_required else None) if reveal else None,
+            "mcp_pin_note": (
+                None
+                if reveal or not (config.mcp.pin_required and config.mcp.pin)
+                else PIN_WITHHELD_NOTE
+            ),
             "next_steps": [
                 "`sfctl mcp` merges the app's 14 management tools with the "
                 "watchdog's 10 recovery tools into one stdio tool list.",

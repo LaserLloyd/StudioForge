@@ -7,7 +7,11 @@ from typing import Any
 
 from fastapi import Request
 
-from studioforge.config import Config
+from studioforge.config import SECRET_CONFIG_PATHS, Config, redact, redact_config_dict
+
+# Re-exported: these live in ``studioforge.config`` (a leaf the watchdog may import)
+# but every API/MCP surface has always taken them from here.
+__all__ = ["SECRET_CONFIG_PATHS", "redact", "redact_config_dict"]
 from studioforge.errors import AuthError
 
 # Endpoints reachable without a key: liveness probes and CORS preflight. Keeping
@@ -124,11 +128,50 @@ def check_request(request: Request, config: Config) -> None:
     )
 
 
-def redact(value: str | None) -> str | None:
-    """Short prefix of a key, for logs and GUI display."""
-    if not value:
-        return None
-    return f"{value[:4]}...{value[-2:]}" if len(value) > 8 else "***"
+def _is_loopback(host: str) -> bool:
+    import ipaddress
+
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def may_reveal_pin(request: Any, config: Config) -> bool:
+    """Whether this caller may be handed the MCP pairing PIN in full.
+
+    ``/api/mcp/info`` and ``/api/openclaw-setup`` return ``mcp.pin`` verbatim so
+    that pairing a client is one request. That reasoning ("the caller is already
+    authenticated to reach this route") holds only when ``server.api_key`` is
+    set -- and the shipped default leaves it unset, which is precisely the
+    install where the PIN is the *only* credential guarding the MCP control
+    plane. On such a box, bound to ``0.0.0.0`` by default, anything on the LAN
+    could read the PIN off an open endpoint and then use it to load, unload,
+    delete and download models. The PIN was theatre exactly when it mattered.
+
+    So: reveal when a credential was actually required to get here, and
+    otherwise only to a caller on this machine. A request with no peer at all is
+    an in-process call (the GUI renders these panels by invoking the route
+    handler directly) and is trusted -- it never crossed a network.
+    """
+    if config.server.api_key:
+        return True
+    client = getattr(request, "client", None)
+    host = getattr(client, "host", None)
+    if not host:
+        return True
+    return _is_loopback(str(host))
+
+
+#: What to say instead of the PIN when it is withheld. Actionable on purpose:
+#: the two ways to read it locally, and the one setting that makes this endpoint
+#: safe to ask remotely.
+PIN_WITHHELD_NOTE = (
+    "withheld: server.api_key is not set, so this endpoint requires no "
+    "credential and returning the PIN to a remote caller would defeat it. Read "
+    "the PIN from the server's startup banner or `studioforge config` on the "
+    "host itself, or set server.api_key and ask again."
+)
 
 
 def auth_dependency(config: Config) -> Any:

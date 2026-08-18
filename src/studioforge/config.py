@@ -383,6 +383,48 @@ class McpConfig(BaseModel):
         return cleaned
 
 
+# ---------------------------------------------------------------------------
+# Credential redaction (a leaf: the watchdog may import this module, never api.*)
+# ---------------------------------------------------------------------------
+
+
+def redact(value: str | None) -> str | None:
+    """Short prefix of a key, for logs and GUI display."""
+    if not value:
+        return None
+    return f"{value[:4]}...{value[-2:]}" if len(value) > 8 else "***"
+
+
+#: Every dotted config path whose value is a credential, and must therefore
+#: never leave the process in full through a config-dumping surface.
+#:
+#: ``mcp.pin`` belongs here and was missing from all four dump sites (the
+#: ``/api/config`` route, the management-MCP ``get_config`` tool, the watchdog's
+#: ``get_config`` tool and ``studioforge config``). Each had grown its own copy
+#: of the same two-key redaction, so a third secret had to be remembered four
+#: times and was remembered zero. On the shipped default -- ``server.api_key``
+#: unset, so the whole API is open -- that turned ``GET /api/config`` into a
+#: free read of the PIN that is the ONLY credential on the MCP control plane.
+SECRET_CONFIG_PATHS: tuple[tuple[str, str], ...] = (
+    ("server", "api_key"),
+    ("mcp", "pin"),
+    ("hf", "token"),
+)
+
+
+def redact_config_dict(data: dict[str, Any]) -> dict[str, Any]:
+    """Replace every credential in a ``Config.to_yaml_dict()`` with a fingerprint.
+
+    Mutates and returns ``data``. Driven by :data:`SECRET_CONFIG_PATHS` so a new
+    secret is declared once rather than in every surface that dumps config.
+    """
+    for section_name, key in SECRET_CONFIG_PATHS:
+        section = data.get(section_name)
+        if isinstance(section, dict) and section.get(key):
+            section[key] = redact(str(section[key]))
+    return data
+
+
 def generate_pin(length: int = 8) -> str:
     """A readable pairing PIN.
 

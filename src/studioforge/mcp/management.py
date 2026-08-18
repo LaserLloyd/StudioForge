@@ -64,7 +64,7 @@ from fastapi.concurrency import run_in_threadpool
 from mcp.server.mcpserver import MCPServer
 
 from studioforge import __version__
-from studioforge.api.auth import redact
+from studioforge.api.auth import redact_config_dict
 from studioforge.config import RESTART_REQUIRED_KEYS, Config, apply_overrides, load_config
 from studioforge.errors import BadRequestError, ModelNotFoundError, StudioForgeError
 from studioforge.logging import get_logger
@@ -445,14 +445,7 @@ def _compact_context_fit(matrix: Any) -> dict[str, Any]:
 
 
 def _redacted_config(config: Config) -> dict[str, Any]:
-    data = config.to_yaml_dict()
-    server = data.get("server")
-    if isinstance(server, dict) and server.get("api_key"):
-        server["api_key"] = redact(config.server.api_key)
-    hf = data.get("hf")
-    if isinstance(hf, dict) and hf.get("token"):
-        hf["token"] = redact(config.hf.token)
-    return data
+    return redact_config_dict(config.to_yaml_dict())
 
 
 # ---------------------------------------------------------------------------
@@ -1214,9 +1207,10 @@ def build_management_mcp(state: Any) -> MCPServer:
     async def get_config() -> dict[str, Any]:
         """Read the effective configuration, with secrets redacted.
 
-        ``server.api_key`` and ``hf.token`` are never returned in full -- only a
-        short fingerprint -- so this is safe to read into a transcript. Use it
-        to discover the exact dotted key names that ``set_config`` accepts.
+        ``server.api_key``, ``mcp.pin`` and ``hf.token`` are never returned in
+        full -- only a short fingerprint -- so this is safe to read into a
+        transcript. Use it to discover the exact dotted key names that
+        ``set_config`` accepts.
 
         Returns:
             The whole config tree, the path of the file it came from, and the

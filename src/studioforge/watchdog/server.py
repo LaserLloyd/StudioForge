@@ -834,21 +834,16 @@ class Watchdog:
                 if tmp.exists():
                     tmp.unlink()
 
-    @staticmethod
-    def _redact(value: str | None) -> str | None:
-        if not value:
-            return None
-        return f"{value[:4]}...{value[-2:]}" if len(value) > 8 else "***"
-
     def redacted_config(self, config: Config) -> dict[str, Any]:
-        data = config.to_yaml_dict()
-        server = data.get("server")
-        if isinstance(server, dict) and server.get("api_key"):
-            server["api_key"] = self._redact(config.server.api_key)
-        hf = data.get("hf")
-        if isinstance(hf, dict) and hf.get("token"):
-            hf["token"] = self._redact(config.hf.token)
-        return data
+        """Config as YAML-shaped data with every credential fingerprinted.
+
+        Shares :func:`studioforge.config.redact_config_dict` with the three
+        other config-dumping surfaces so a newly added secret cannot be
+        redacted in some of them and returned in full here.
+        """
+        from studioforge.config import redact_config_dict
+
+        return redact_config_dict(config.to_yaml_dict())
 
     # -- HTTP probes -----------------------------------------------------
 
@@ -1742,8 +1737,8 @@ def build_watchdog_mcp(watchdog: Watchdog) -> MCPServer:
         file is currently invalid, the error is reported in `config_error`
         alongside the raw contents, so you can tell exactly what to fix.
 
-        `server.api_key` and `hf.token` come back as short fingerprints, never
-        in full.
+        `server.api_key`, `mcp.pin` and `hf.token` come back as short
+        fingerprints, never in full.
 
         Returns:
             The parsed config, the raw file text, the file path, any validation

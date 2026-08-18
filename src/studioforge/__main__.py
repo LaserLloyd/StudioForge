@@ -557,17 +557,13 @@ def config_cmd(
     """Print the effective configuration (secrets redacted)."""
     import yaml
 
-    from studioforge.api.auth import redact
+    from studioforge.api.auth import redact_config_dict
 
     if show_path:
         typer.echo(str(find_config_path(config_path)))
         return
     config = _load(config_path)
-    data = config.to_yaml_dict()
-    if data["server"].get("api_key"):
-        data["server"]["api_key"] = redact(config.server.api_key)
-    if data["hf"].get("token"):
-        data["hf"]["token"] = redact(config.hf.token)
+    data = redact_config_dict(config.to_yaml_dict())
     typer.echo(f"# {config.config_path}")
     typer.echo(yaml.safe_dump(data, sort_keys=False))
 

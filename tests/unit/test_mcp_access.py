@@ -304,3 +304,54 @@ def test_pin_minted_into_a_preexisting_config_is_written_back(tmp_path: Any) -> 
     assert first.mcp.pin
     second = load_config(config_path)
     assert second.mcp.pin == first.mcp.pin
+
+
+# ---------------------------------------------------------------------------
+# WP17 F2/F3: the PIN is a credential, so no open surface may hand it out
+# ---------------------------------------------------------------------------
+
+
+def _request_from(host: str | None) -> Any:
+    scope: dict[str, Any] = {
+        "type": "http",
+        "method": "GET",
+        "path": "/api/mcp/info",
+        "headers": [],
+        "query_string": b"",
+        "scheme": "http",
+        "server": ("0.0.0.0", 1234),
+        "client": (host, 5000) if host else None,
+        "root_path": "",
+    }
+    return Request(scope)
+
+
+def test_pin_withheld_from_remote_callers_when_no_api_key() -> None:
+    """Shipped default: api_key unset, bound to 0.0.0.0. The PIN is then the only
+    credential on the MCP plane, so an open endpoint must not return it to the LAN."""
+    from studioforge.api.auth import may_reveal_pin
+
+    config = make_config(api_key=None, pin="12345678")
+    assert may_reveal_pin(_request_from("192.168.1.77"), config) is False
+    assert may_reveal_pin(_request_from("127.0.0.1"), config) is True
+    # An in-process call (the GUI invoking the handler) has no peer and is trusted.
+    assert may_reveal_pin(_request_from(None), config) is True
+
+
+def test_pin_revealed_when_a_credential_was_required() -> None:
+    from studioforge.api.auth import may_reveal_pin
+
+    config = make_config(api_key="the-key", pin="12345678")
+    assert may_reveal_pin(_request_from("192.168.1.77"), config) is True
+
+
+def test_redact_config_dict_covers_every_secret_including_the_pin() -> None:
+    from studioforge.api.auth import SECRET_CONFIG_PATHS, redact_config_dict
+
+    config = make_config(api_key="key-value-1234567890", pin="12345678")
+    config.hf.token = "hf_abcdefghijklmnopqrstuvwxyz"
+    data = redact_config_dict(config.to_yaml_dict())
+    assert data["server"]["api_key"] != "key-value-1234567890"
+    assert data["mcp"]["pin"] == "***"
+    assert data["hf"]["token"].startswith("hf_a") and "..." in data["hf"]["token"]
+    assert ("mcp", "pin") in SECRET_CONFIG_PATHS
