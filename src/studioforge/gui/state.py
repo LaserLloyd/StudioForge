@@ -1100,7 +1100,7 @@ def ram_text(total_bytes: int | None, used_bytes: int | None) -> str:
 
 
 # ---------------------------------------------------------------------------
-# VRAM holders (DECISIONS.md D23)
+# VRAM holders (DECISIONS.md D23, D39)
 #
 # The panel these feed answers one question -- "who has my VRAM" -- and it has
 # to answer it for a holder that is NOT ours, because that was the incident: a
@@ -1108,13 +1108,22 @@ def ram_text(total_bytes: int | None, used_bytes: int | None) -> str:
 # said "llama-server.exe, 0 bytes, not ours".
 # ---------------------------------------------------------------------------
 
+#: Mirrors ``vram_holders.HOLDER_MIN_BYTES``. Repeated rather than imported:
+#: this module is pure presentation and importing ``core.vram_holders`` would
+#: drag psutil and the supervisor into it. Below this a device entry is a
+#: llama.cpp CUDA context (~0.2 GiB on every visible card), not a placement, and
+#: printing it turns a two-GPU model into a four-GPU one.
+_DEVICE_MIN_BYTES: Final = 256 * 1024 * 1024
+
 
 def vram_holder_origin(holder: Mapping[str, Any]) -> str:
     """Who owns this holder, in the words an operator needs.
 
     The parent is named for a foreign child because that is the actionable
     fact: "child of pytest.exe (pid 41288)" tells you what to close, whereas
-    "not ours" tells you nothing at all.
+    "not ours" tells you nothing at all. Same reason a llama-server from
+    another install is named by its alias and port rather than filed under
+    "foreign": those two words are what you type to find and stop it.
     """
     classification = str(holder.get("classification") or "")
     if classification == "ours" or holder.get("is_ours"):
@@ -1125,7 +1134,46 @@ def vram_holder_origin(holder: Mapping[str, Any]) -> str:
         parent = holder.get("parent_name") or "an unknown process"
         pid = holder.get("parent_pid")
         return f"child of {parent}" + (f" (pid {pid})" if pid else "")
+    if classification == "other-instance":
+        bits = []
+        if holder.get("alias"):
+            bits.append(f"alias {holder['alias']}")
+        if holder.get("port"):
+            bits.append(f"port {holder['port']}")
+        return "another install" + (f" ({', '.join(bits)})" if bits else "")
     return "foreign"
+
+
+def vram_holder_devices(holder: Mapping[str, Any]) -> str:
+    """The device column: where this holder's memory actually is.
+
+    ``per_gpu_bytes`` is a measurement (PDH per adapter, joined to CUDA
+    ordinals through the adapter LUID -- D39), so it is preferred and quoted
+    with its numbers: ``CUDA0 15.5 GiB, CUDA1 14.5 GiB``. Entries below
+    :data:`_DEVICE_MIN_BYTES` are dropped, because llama.cpp opens a CUDA
+    context on *every* visible device and those contexts were what made a
+    two-GPU model read as ``CUDA0,1,2,3``.
+
+    Without a measurement the only thing left is that same context list, and it
+    is printed in the old bare form -- ``CUDA0,1`` -- so the two cases do not
+    look alike.
+    """
+    per_gpu = holder.get("per_gpu_bytes") or {}
+    if per_gpu:
+        parts = []
+        for key in sorted(per_gpu, key=lambda item: int(item)):
+            used = int(per_gpu[key] or 0)
+            if used < _DEVICE_MIN_BYTES:
+                continue
+            index = int(key)
+            label = f"CUDA{index}" if index >= 0 else "other adapter"
+            parts.append(f"{label} {format_gib(used, precision=1)}")
+        if parts:
+            return ", ".join(parts)
+    gpus = holder.get("gpu_indices") or []
+    if gpus:
+        return "CUDA" + ",".join(str(index) for index in gpus)
+    return ""
 
 
 def vram_holder_line(holder: Mapping[str, Any]) -> str:
@@ -1138,11 +1186,13 @@ def vram_holder_line(holder: Mapping[str, Any]) -> str:
         else f"size {UNKNOWN}"
     )
     parts = [f"{name} (pid {pid})", size, vram_holder_origin(holder)]
-    gpus = holder.get("gpu_indices") or []
-    if gpus:
-        parts.insert(2, "CUDA" + ",".join(str(index) for index in gpus))
+    devices = vram_holder_devices(holder)
+    if devices:
+        parts.insert(2, devices)
     alias = holder.get("alias")
-    if alias:
+    # The origin already carries the alias for another install; repeating it
+    # would push the useful end of the row off the panel.
+    if alias and str(holder.get("classification") or "") != "other-instance":
         parts.append(f"alias {alias}")
     return "  ·  ".join(parts)
 
@@ -1178,6 +1228,14 @@ def vram_holders_note(view: Mapping[str, Any] | None) -> str:
         )
     if str(view.get("per_process_bytes")) == "unavailable":
         tail += " Per-process VRAM is unavailable on this box, so sizes read as unknown."
+    elif str(view.get("per_gpu_bytes_source")) == "nvml-context":
+        # Saying this outright matters: a context list looks exactly like a
+        # placement, and reading one as the other is how a 30 GiB model appears
+        # to be spread over four cards (D39).
+        tail += (
+            " Per-GPU attribution is unavailable, so devices are the ones each "
+            "process has a CUDA context on."
+        )
     return (lead + tail).strip()
 
 
@@ -1289,6 +1347,110 @@ def fit_verdict(preview: Mapping[str, Any]) -> FitVerdict:
 def fit_verdict_text(preview: Mapping[str, Any]) -> str:
     """One-string form of :func:`fit_verdict`, for tooltips and tests."""
     return fit_verdict(preview).as_text()
+
+
+# ---------------------------------------------------------------------------
+# Optimal settings per hardware mode (D36)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PlacementLine:
+    """One hardware mode, as the Models tab shows it.
+
+    The settings half (``summary``) is what this model can do on those cards
+    **with them idle**, and the availability half (``availability``) is what
+    stands in the way right now. They are separate strings because they answer
+    separate questions and change on different timescales: the first is a
+    property of the hardware, the second of the last ten seconds.
+    """
+
+    mode: str
+    label: str
+    devices: list[int]
+    summary: str
+    availability: str
+    fits_now: bool
+    would_evict: list[str]
+    load_args: dict[str, Any]
+
+    @property
+    def colour(self) -> str:
+        if self.fits_now:
+            return "positive"
+        return "warning" if self.would_evict else "negative"
+
+    @property
+    def text(self) -> str:
+        return f"{self.label}: {self.summary} · {self.availability}"
+
+
+def _tps(value: Any) -> str:
+    try:
+        return f"~{float(value):.0f} t/s"
+    except (TypeError, ValueError):
+        return "speed unknown"
+
+
+def placement_availability(entry: Mapping[str, Any]) -> str:
+    """ "fits now" / "needs 2 unloads" / "does not fit" for one mode."""
+    if entry.get("optimal") is None:
+        return "too small for this model"
+    if entry.get("fits_now"):
+        return "fits now"
+    victims = list(entry.get("would_evict") or [])
+    if victims:
+        plural = "" if len(victims) == 1 else "s"
+        return f"needs {len(victims)} unload{plural} ({', '.join(victims)})"
+    return "does not fit right now"
+
+
+def placement_lines(profiles: Mapping[str, Any]) -> list[PlacementLine]:
+    """Render ``ModelManager.placement_profiles`` for the settings dialog.
+
+    Pure, so the wording is testable without a browser -- the Models tab is the
+    one surface where a user compares "what would this do on the 3090s" against
+    "what would it do on everything", and a line that reads well is the whole
+    feature.
+    """
+    lines: list[PlacementLine] = []
+    for entry in profiles.get("modes") or profiles.get("profiles") or []:
+        optimal = entry.get("optimal")
+        if optimal is None:
+            summary = "does not fit on these cards even when empty"
+        else:
+            slots = int(optimal.get("max_parallel") or 1)
+            kv = str(optimal.get("kv_cache_type") or "?")
+            if optimal.get("kv_cache_type_v") and optimal["kv_cache_type_v"] != kv:
+                kv = f"{kv}/{optimal['kv_cache_type_v']}"
+            summary = (
+                f"{optimal.get('ctx_per_slot')} ctx · {kv} · "
+                f"{slots} slot{'' if slots == 1 else 's'} · "
+                f"{_tps(optimal.get('est_gen_tps'))} "
+                f"({_tps(optimal.get('est_gen_tps_full_ctx')).removesuffix(' t/s')} full)"
+            )
+        lines.append(
+            PlacementLine(
+                mode=str(entry.get("mode") or ""),
+                label=str(entry.get("label") or entry.get("mode") or ""),
+                devices=[int(d) for d in (entry.get("devices") or [])],
+                summary=summary,
+                availability=placement_availability(entry),
+                fits_now=bool(entry.get("fits_now")),
+                would_evict=[str(v) for v in (entry.get("would_evict") or [])],
+                load_args=dict((optimal or {}).get("load_args") or {}),
+            )
+        )
+    return lines
+
+
+def placement_headline(profiles: Mapping[str, Any]) -> str:
+    """One sentence naming the default placement, for the dialog header."""
+    lines = [line for line in placement_lines(profiles) if line.load_args]
+    if not lines:
+        return "No hardware mode on this box can hold this model."
+    best = lines[0]
+    return f"Recommended: {best.text}"
 
 
 def per_gpu_projection_lines(verdict: FitVerdict) -> list[str]:
@@ -2045,6 +2207,13 @@ CONFIG_FIELDS: Final[tuple[ConfigField, ...]] = (
         "select",
         "evict = unload LRU unpinned models; reject = refuse the load",
         ("evict", "reject"),
+    ),
+    ConfigField(
+        "planner.preference",
+        "Optimise loads for",
+        "select",
+        "quality = best KV cache first; throughput = biggest window first",
+        ("quality", "throughput"),
     ),
     ConfigField("hf.token", "HuggingFace token", "secret", "Needed for gated repos"),
     ConfigField("gui.port", "GUI port", "int", "This panel's own port"),
@@ -3377,6 +3546,14 @@ def models_dir_status_line(
 
 
 #: Why the numbers in every plan are CUDA ordinals, and why they can move.
+PLANNER_PREFERENCE_NOTE = (
+    "quality (default): pick the best KV cache that still reaches the context floor, then the "
+    "largest context at that quality. A 4-bit K cache is never chosen automatically, and a "
+    "doubled window is not traded for a quantized one — Gemma-4 measures a KL divergence of "
+    "0.108 at q8_0 against f16. throughput: the older rule — the largest window at or above the "
+    "floor, preferring one that also serves two conversations."
+)
+
 DEVICE_RECOGNITION_NOTE: Final = (
     "GPUs are enumerated by NVML and referred to everywhere by their CUDA ordinal "
     "(CUDA0, CUDA1, …) — that is what excluded_devices, reserved_mb and every "
@@ -3954,6 +4131,10 @@ CONFIG_FIELD_HELP: Final[Mapping[str, str]] = {
     "engine.allow_source_build": "Fall back to building llama.cpp when no prebuilt asset fits.",
     "planner.headroom_fraction": "Fraction of EVERY GPU held back from the planner.",
     "planner.on_insufficient": "evict = unload LRU unpinned models; reject = refuse the load.",
+    "planner.preference": (
+        "quality = best KV cache that reaches the context floor, then the biggest window at "
+        "that quality; throughput = the biggest window, preferring one that serves two slots."
+    ),
     "planner.compute_overhead_fraction": "Calibrated allowance for compute and graph buffers.",
     "hf.token": "Needed only for gated or private HuggingFace repositories.",
     "hf.max_concurrent_downloads": "Parallel downloads. Raising it rarely helps a single link.",

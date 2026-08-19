@@ -76,6 +76,7 @@ COVERED_KEYS: tuple[str, ...] = (
     "models.default_model",
     "models.preload_default_model",
     "planner.headroom_fraction",
+    "planner.preference",
     "planner.compute_overhead_fraction",
     "planner.excluded_devices",
     "engine.pinned_tag",
@@ -693,6 +694,8 @@ def _gpu_body(ctx: GuiContext, refresh: Any) -> None:
 
     fields = _Fields(ctx, _payload(ctx))
     fields.row("planner.headroom_fraction", label="VRAM headroom (fraction of every GPU)")
+    fields.row("planner.preference", label="Optimise loads for")
+    ui.label(st.PLANNER_PREFERENCE_NOTE).classes("text-xs opacity-70")
     result = ui.label("").classes("text-xs")
 
     async def save() -> None:

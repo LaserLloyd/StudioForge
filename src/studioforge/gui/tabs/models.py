@@ -563,7 +563,7 @@ async def _draft_ab(ctx: GuiContext, record: Any) -> None:
             with_draft = await ctx.manager.test_model(record.id, None)
         with busy(message="A/B: reloading without the draft model…"):
             await run_blocking(ctx.registry.save_settings, record.id, without)
-            await ctx.manager.load(record.id, force=True)
+            await ctx.manager.load(record.id, force=True, source="gui")
             without_draft = await ctx.manager.test_model(record.id, None)
     except Exception as exc:  # noqa: BLE001
         notify_error(exc, what="A/B comparison")
@@ -658,6 +658,19 @@ def _settings_dialog(ctx: GuiContext, record: Any, table: Any) -> None:  # noqa:
             f"{record.quant} · {st.format_gib(record.size_bytes)} · trained ctx "
             f"{record.meta.n_ctx_train if record.meta else st.UNKNOWN}"
         ).classes("text-xs opacity-70 font-mono")
+
+        # --- optimal settings per hardware mode (D36) --------------------
+        # Filled by a one-shot timer rather than inline: it plans this model at
+        # every context tier on every hardware mode, which is arithmetic but
+        # enough of it to make opening the dialog feel slow on a big library.
+        placements_card = ui.card().classes("w-full bg-black/5 dark:bg-white/5")
+        with placements_card:
+            ui.label("Optimal settings — computing…").classes("text-xs opacity-60")
+        ui.timer(
+            0.05,
+            lambda: _render_placements(ctx, record, placements_card, dialog, table),
+            once=True,
+        )
 
         # --- fit verdict -------------------------------------------------
         verdict_card = ui.card().classes("w-full bg-black/5 dark:bg-white/5")
@@ -886,7 +899,7 @@ def _settings_dialog(ctx: GuiContext, record: Any, table: Any) -> None:  # noqa:
                 return
             with busy(message=f"Loading {record.id}…"):
                 try:
-                    instance = await ctx.manager.load(record.id, force=True)
+                    instance = await ctx.manager.load(record.id, force=True, source="gui")
                 except Exception as exc:  # noqa: BLE001
                     notify_error(exc, what="load")
                     return
@@ -913,6 +926,77 @@ def _as_int(value: Any) -> int | None:
         return int(float(value))
     except (TypeError, ValueError):
         return None
+
+
+def _render_placements(ctx: GuiContext, record: Any, card: Any, dialog: Any, table: Any) -> None:
+    """The "Optimal settings" block: one line per hardware mode, with a Load button.
+
+    Answers the question the settings form cannot: not "does *this* combination
+    fit" but "what is the best this model can do on the 5090s, on the 3090s, on
+    one card, on everything" -- each computed as if those cards were free, with
+    what stands in the way right now said separately (D36).
+    """
+    card.clear()
+    with card:
+        try:
+            profiles = ctx.manager.placement_profiles(record.id)
+        except Exception as exc:  # noqa: BLE001 - never block the dialog on this
+            ui.label(f"optimal settings unavailable: {exc}").classes("text-xs opacity-70")
+            return
+        ui.label("Optimal settings, per set of GPUs (as if those cards were free)").classes(
+            "text-sm font-medium"
+        )
+        for note in profiles.get("quality_notes") or []:
+            ui.label(note).classes("text-xs text-warning")
+        lines = st.placement_lines(profiles)
+        if not lines:
+            ui.label("No GPU on this box can hold this model.").classes("text-xs opacity-70")
+            return
+        for index, line in enumerate(lines):
+            with ui.row().classes("w-full items-center gap-2 flex-nowrap"):
+                ui.badge(line.label, color="primary" if index == 0 else "secondary").classes(
+                    "text-xs shrink-0"
+                )
+                ui.label(line.summary).classes("text-xs font-mono flex-1 min-w-0")
+                ui.label(line.availability).classes(f"text-xs text-{line.colour} shrink-0")
+                if line.load_args:
+                    recipe = ", ".join(f"{k}={v}" for k, v in line.load_args.items())
+                    ui.button(
+                        "Load here",
+                        on_click=lambda ln=line: _load_placement(ctx, ln, dialog, table),
+                    ).props("flat dense size=sm").tooltip(f"load_model({recipe})")
+
+
+async def _load_placement(ctx: GuiContext, line: Any, dialog: Any, table: Any) -> None:
+    """Load one placement, confirming first when it would stop something else."""
+    if line.would_evict:
+        confirmed = await _confirm(
+            f"Loading {line.label} needs {len(line.would_evict)} model(s) unloaded: "
+            f"{', '.join(line.would_evict)}. Continue?"
+        )
+        if not confirmed:
+            return
+    args = dict(line.load_args)
+    model_id = args.pop("model_id", None)
+    with busy(message=f"Loading on {line.label}…"):
+        try:
+            instance = await ctx.manager.load(model_id, **args, force=True, source="gui")
+        except Exception as exc:  # noqa: BLE001
+            notify_error(exc, what="load")
+            return
+    dialog.close()
+    ui.notify(f"{model_id} ready on port {instance.port} ({line.label})", type="positive")
+    table.refresh()
+
+
+async def _confirm(question: str) -> bool:
+    """A yes/no dialog, awaited. Used before anything that stops another model."""
+    with ui.dialog() as confirm, ui.card():
+        ui.label(question).classes("text-sm")
+        with ui.row().classes("w-full justify-end gap-2"):
+            ui.button("Cancel", on_click=lambda: confirm.submit(False)).props("flat")
+            ui.button("Continue", on_click=lambda: confirm.submit(True)).props("color=warning")
+    return bool(await confirm)
 
 
 def _refresh_verdict(
