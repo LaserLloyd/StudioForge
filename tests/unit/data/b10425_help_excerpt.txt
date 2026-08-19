@@ -1,0 +1,69 @@
+# Trimmed excerpt of `llama-server --help` from llama.cpp b10425 -- the
+# pinned engine (DECISIONS.md D2). Only the entries WP20's feature
+# detection reads are kept; every kept line is verbatim, including the
+# continuation indentation and the value placeholders, because the parser
+# under test keys off exactly those.
+
+----- common params -----
+
+-fa,   --flash-attn [on|off|auto]       set Flash Attention use ('on', 'off', or 'auto', default: 'auto')
+                                        (env: LLAMA_ARG_FLASH_ATTN)
+
+-sm,   --split-mode {none,layer,row,tensor}
+                                        how to split the model across multiple GPUs, one of:
+                                        - none: use one GPU only
+                                        - layer (default): split layers and KV across GPUs (pipelined)
+                                        - row: split weight across GPUs by rows (parallelized)
+                                        - tensor: split weights and KV across GPUs (parallelized,
+                                        EXPERIMENTAL)
+                                        (env: LLAMA_ARG_SPLIT_MODE)
+
+-fit,  --fit [on|off]                   whether to adjust unset arguments to fit in device memory ('on' or
+                                        'off', default: 'on')
+                                        (env: LLAMA_ARG_FIT)
+
+-bs,   --backend-sampling               enable backend sampling (experimental) (default: disabled)
+                                        (env: LLAMA_ARG_BACKEND_SAMPLING)
+
+--spec-draft-n-max N                    number of tokens to draft for speculative decoding (default: 3)
+                                        (env: LLAMA_ARG_SPEC_DRAFT_N_MAX)
+
+--spec-draft-model, -md, --model-draft FNAME
+                                        draft model for speculative decoding (default: unused)
+                                        (env: LLAMA_ARG_SPEC_DRAFT_MODEL)
+
+--spec-type none,draft-simple,draft-eagle3,draft-mtp,draft-dflash,draft-dspark,ngram-simple,ngram-map-k,ngram-map-k4v,ngram-mod,ngram-cache
+                                        comma-separated list of types of speculative decoding to use (default:
+                                        none)
+                                        (env: LLAMA_ARG_SPEC_TYPE)
+
+--draft, --draft-n, --draft-max N       the argument has been removed. use --spec-draft-n-max or
+                                        --spec-ngram-mod-n-max
+                                        (env: LLAMA_ARG_DRAFT_MAX)
+
+-ctxcp, --ctx-checkpoints, --swa-checkpoints N
+                                        max number of context checkpoints to create per slot (default:
+                                        32)[(more info)](https://github.com/ggml-org/llama.cpp/pull/15293)
+                                        (env: LLAMA_ARG_CTX_CHECKPOINTS)
+
+-cram, --cache-ram N                    set the maximum cache size in MiB (default: 8192, -1 - no limit, 0 -
+                                        disable)[(more
+                                        info)](https://github.com/ggml-org/llama.cpp/pull/16391)
+                                        (env: LLAMA_ARG_CACHE_RAM)
+
+-kvu,  --kv-unified, -no-kvu, --no-kv-unified
+                                        use single unified KV buffer shared across all sequences (default:
+                                        enabled if number of slots is auto)
+                                        (env: LLAMA_ARG_KV_UNIFIED)
+
+--cache-reuse N                         min chunk size to attempt reusing from the cache via KV shifting,
+                                        requires prompt caching to be enabled (default: 0)
+                                        [(card)](https://ggml.ai/f0.png)
+                                        (env: LLAMA_ARG_CACHE_REUSE)
+
+--reasoning-budget N                    token budget for thinking: -1 for unrestricted, 0 for immediate end,
+                                        N>0 for token budget (default: -1)
+                                        (env: LLAMA_ARG_THINK_BUDGET)
+
+--sleep-idle-seconds SECONDS            number of seconds of idleness after which the server will sleep
+                                        (default: -1; -1 = disabled)

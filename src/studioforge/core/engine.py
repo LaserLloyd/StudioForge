@@ -39,7 +39,7 @@ import subprocess
 import time
 import zipfile
 from collections import deque
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
@@ -383,6 +383,285 @@ def flags_from_help(help_text: str) -> set[str]:
 
 
 # ---------------------------------------------------------------------------
+# Engine feature detection (which of the newer knobs this build actually has)
+# ---------------------------------------------------------------------------
+
+#: Where :func:`parse_engine_features` gets cached, next to the binary.
+FEATURES_FILE = "features.json"
+
+_BRACED_RE = re.compile(r"\{([^}]+)\}")
+_BRACKETED_RE = re.compile(r"\[([^\]]+)\]")
+_DEFAULT_RE = re.compile(r"\(default:\s*([^,)]+)")
+_ENUM_TOKEN_RE = re.compile(r"^[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*$")
+
+
+@dataclass(frozen=True)
+class EngineFeatures:
+    """What one engine build advertises, read from its own ``--help``.
+
+    **Why this exists at all.** D2 recorded the incident this guards against:
+    ``b10425`` renamed the whole speculative-decoding surface and *accepted the
+    old spellings while ignoring them*. A flag that is silently ignored looks
+    exactly like the feature not helping, which is the most expensive kind of
+    wrong. So StudioForge never passes a flag on faith: every optional flag in
+    :mod:`studioforge.core.supervisor` is gated on the active engine declaring
+    it, and the *values* of the enum flags (``--split-mode``,
+    ``--spec-type``, ``--flash-attn``) are read from the same output rather
+    than hardcoded -- upstream adds speculative types faster than this file
+    could track them.
+
+    :attr:`known` is False for the "we could not read the help" case. That is
+    deliberately not the same as "the engine has nothing": an unknown engine
+    keeps the pre-WP20 launch surface (no new flags) instead of guessing.
+    """
+
+    tag: str = ""
+    known: bool = False
+    flags: frozenset[str] = frozenset()
+    #: Values ``-sm/--split-mode`` accepts, e.g. ``("none", "layer", "row", "tensor")``.
+    split_modes: tuple[str, ...] = ()
+    #: Values ``--spec-type`` accepts, e.g. ``("none", "draft-simple", "draft-mtp", ...)``.
+    spec_types: tuple[str, ...] = ()
+    #: Values ``-fa/--flash-attn`` accepts, e.g. ``("on", "off", "auto")``.
+    flash_attn_values: tuple[str, ...] = ()
+    backend_sampling: bool = False
+    kv_unified: bool = False
+    #: The engine's own words for when unified KV is on, e.g. "enabled if
+    #: number of slots is auto". Recorded verbatim because the semantics moved
+    #: between releases and D38 pins them to a measurement, not to a memory.
+    kv_unified_default: str = ""
+    cache_ram: bool = False
+    cache_ram_default_mib: int | None = None
+    ctx_checkpoints: bool = False
+    ctx_checkpoints_default: int | None = None
+    fit: bool = False
+    reasoning_budget: bool = False
+    spec_draft_n_max_default: int | None = None
+
+    @classmethod
+    def unknown(cls, tag: str = "") -> EngineFeatures:
+        """The "could not read this engine's help" value. Advertises nothing."""
+        return cls(tag=tag, known=False)
+
+    def has(self, flag: str) -> bool:
+        return self.known and flag in self.flags
+
+    def supports_spec(self, spec_type: str) -> bool:
+        """Whether every comma-separated member of ``spec_type`` is offered."""
+        if not self.known or "--spec-type" not in self.flags:
+            return False
+        wanted = [part.strip() for part in spec_type.split(",") if part.strip()]
+        return bool(wanted) and all(part in self.spec_types for part in wanted)
+
+    def supports_split(self, mode: str) -> bool:
+        return self.known and mode in self.split_modes
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "tag": self.tag,
+            "known": self.known,
+            "split_modes": list(self.split_modes),
+            "spec_types": list(self.spec_types),
+            "flash_attn_values": list(self.flash_attn_values),
+            "backend_sampling": self.backend_sampling,
+            "kv_unified": self.kv_unified,
+            "kv_unified_default": self.kv_unified_default,
+            "cache_ram": self.cache_ram,
+            "cache_ram_default_mib": self.cache_ram_default_mib,
+            "ctx_checkpoints": self.ctx_checkpoints,
+            "ctx_checkpoints_default": self.ctx_checkpoints_default,
+            "fit": self.fit,
+            "reasoning_budget": self.reasoning_budget,
+            "spec_draft_n_max_default": self.spec_draft_n_max_default,
+            "flags": sorted(self.flags),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> EngineFeatures:
+        def _tuple(key: str) -> tuple[str, ...]:
+            value = data.get(key)
+            return tuple(str(v) for v in value) if isinstance(value, list) else ()
+
+        def _int(key: str) -> int | None:
+            value = data.get(key)
+            return int(value) if isinstance(value, int) else None
+
+        flags = data.get("flags")
+        return cls(
+            tag=str(data.get("tag") or ""),
+            known=bool(data.get("known")),
+            flags=frozenset(str(f) for f in flags) if isinstance(flags, list) else frozenset(),
+            split_modes=_tuple("split_modes"),
+            spec_types=_tuple("spec_types"),
+            flash_attn_values=_tuple("flash_attn_values"),
+            backend_sampling=bool(data.get("backend_sampling")),
+            kv_unified=bool(data.get("kv_unified")),
+            kv_unified_default=str(data.get("kv_unified_default") or ""),
+            cache_ram=bool(data.get("cache_ram")),
+            cache_ram_default_mib=_int("cache_ram_default_mib"),
+            ctx_checkpoints=bool(data.get("ctx_checkpoints")),
+            ctx_checkpoints_default=_int("ctx_checkpoints_default"),
+            fit=bool(data.get("fit")),
+            reasoning_budget=bool(data.get("reasoning_budget")),
+            spec_draft_n_max_default=_int("spec_draft_n_max_default"),
+        )
+
+
+def _entry_descriptions(help_text: str) -> dict[str, str]:
+    """``{flag spelling: description}`` for every entry, aliases included."""
+    table: dict[str, str] = {}
+    for flags, desc in parse_help_entries(help_text):
+        for flag in flags:
+            table[flag] = desc
+    return table
+
+
+def _enum_values(desc: str, pattern: re.Pattern[str], separator: str) -> tuple[str, ...]:
+    """Values from a ``{a,b,c}`` / ``[a|b|c]`` placeholder in a description."""
+    match = pattern.search(desc)
+    if match is None:
+        return ()
+    return tuple(
+        token
+        for token in (part.strip() for part in match.group(1).split(separator))
+        if _ENUM_TOKEN_RE.match(token)
+    )
+
+
+def _default_int(desc: str) -> int | None:
+    match = _DEFAULT_RE.search(desc)
+    if match is None:
+        return None
+    try:
+        return int(match.group(1).strip())
+    except ValueError:
+        return None
+
+
+def _default_text(desc: str) -> str:
+    match = _DEFAULT_RE.search(desc)
+    return match.group(1).strip() if match else ""
+
+
+def parse_engine_features(help_text: str, tag: str = "") -> EngineFeatures:
+    """Read one engine's optional-feature surface out of its ``--help``.
+
+    Pure and total: anything it cannot find is simply absent, because the
+    consumer's rule is "never pass a flag the engine did not advertise" and a
+    missing entry must therefore mean "do not pass it", never "assume yes".
+    """
+    entries = _entry_descriptions(help_text)
+    flags = flags_from_help(help_text) - set(removed_flags_from_help(help_text))
+
+    split_desc = entries.get("--split-mode", "")
+    split_modes = _enum_values(split_desc, _BRACED_RE, ",")
+
+    # ``--spec-type`` lists its values bare (no braces), so the enumeration is
+    # the first whitespace-delimited token of the description.
+    spec_desc = entries.get("--spec-type", "")
+    first = spec_desc.split(" ", 1)[0] if spec_desc else ""
+    spec_types = tuple(
+        token
+        for token in (part.strip() for part in first.split(","))
+        if _ENUM_TOKEN_RE.match(token)
+    )
+
+    kv_desc = entries.get("--kv-unified", "")
+    return EngineFeatures(
+        tag=tag,
+        known=bool(flags),
+        flags=frozenset(flags),
+        split_modes=split_modes,
+        spec_types=spec_types,
+        flash_attn_values=_enum_values(entries.get("--flash-attn", ""), _BRACKETED_RE, "|"),
+        backend_sampling="--backend-sampling" in flags,
+        kv_unified="--kv-unified" in flags and "--no-kv-unified" in flags,
+        kv_unified_default=_default_text(kv_desc),
+        cache_ram="--cache-ram" in flags,
+        cache_ram_default_mib=_default_int(entries.get("--cache-ram", "")),
+        ctx_checkpoints="--ctx-checkpoints" in flags,
+        ctx_checkpoints_default=_default_int(entries.get("--ctx-checkpoints", "")),
+        fit="--fit" in flags,
+        reasoning_budget="--reasoning-budget" in flags,
+        spec_draft_n_max_default=_default_int(entries.get("--spec-draft-n-max", "")),
+    )
+
+
+def read_features_file(directory: Path, tag: str = "") -> EngineFeatures | None:
+    """The cached ``features.json`` for an engine directory, if it is readable."""
+    path = directory / FEATURES_FILE
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or not data.get("known"):
+        return None
+    features = EngineFeatures.from_dict(data)
+    return features if not tag or features.tag == tag else None
+
+
+def write_features_file(directory: Path, features: EngineFeatures) -> None:
+    """Cache ``features`` next to the binary. Best effort; never raises."""
+    with contextlib.suppress(OSError):
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / FEATURES_FILE).write_text(
+            json.dumps(features.to_dict(), indent=2), encoding="utf-8"
+        )
+
+
+def probe_engine_features(binary: Path, tag: str = "") -> EngineFeatures:
+    """Features for the build at ``binary``, reading (or filling) the caches.
+
+    Synchronous on purpose: the supervisor calls it through
+    ``asyncio.to_thread`` on the load path, where an ``await`` into the engine
+    manager would be a new dependency between two modules that deliberately
+    know nothing about each other. Falls back through ``features.json`` ->
+    ``help.txt`` -> actually running ``--help``, and returns
+    :meth:`EngineFeatures.unknown` rather than raising if all three fail: a
+    model must still load on a box where the help cannot be read.
+    """
+    directory = binary.parent
+    cached = read_features_file(directory, tag)
+    if cached is not None:
+        return cached
+
+    text = ""
+    help_path = directory / HELP_FILE
+    if help_path.is_file():
+        with contextlib.suppress(OSError):
+            text = help_path.read_text(encoding="utf-8")
+    if not text.strip():
+        if not binary.is_file():
+            return EngineFeatures.unknown(tag)
+        try:
+            completed = subprocess.run(  # noqa: S603 - our own pinned engine binary
+                [str(binary), "--help"],
+                capture_output=True,
+                cwd=str(directory),
+                timeout=120,
+                check=False,
+                **_spawn_kwargs(),
+            )
+        except (OSError, subprocess.SubprocessError):
+            return EngineFeatures.unknown(tag)
+        text = completed.stdout.decode("utf-8", "replace") + completed.stderr.decode(
+            "utf-8", "replace"
+        )
+        if text.strip():
+            with contextlib.suppress(OSError):
+                help_path.write_text(text, encoding="utf-8")
+    if not text.strip():
+        return EngineFeatures.unknown(tag)
+
+    features = parse_engine_features(text, tag)
+    if features.known:
+        write_features_file(directory, features)
+    return features
+
+
+# ---------------------------------------------------------------------------
 # Archive extraction
 # ---------------------------------------------------------------------------
 
@@ -551,6 +830,7 @@ class EngineManager:
         self._flag_cache: dict[str, set[str]] = {}
         self._removed_cache: dict[str, dict[str, str | None]] = {}
         self._help_cache: dict[str, str] = {}
+        self._features_cache: dict[str, EngineFeatures] = {}
         #: One lock per tag around install/build. Two installs of one tag at
         #: once -- the Setup tab's Install button clicked while boot is already
         #: installing, or clicked twice -- would both stream into the same
@@ -1459,6 +1739,20 @@ class EngineManager:
             info.version_string = smoke.version_string or info.version_string
             self._write_meta(info)
             self._warn_driver_too_old(info)
+            # Warm engines/<tag>/features.json while we are still before the
+            # port bind. The supervisor reads that file synchronously on the
+            # load path; without it the first load would either pay for a
+            # ``--help`` run or fall back to "advertises nothing" and quietly
+            # drop every optional flag (see EngineFeatures).
+            with contextlib.suppress(Exception):
+                features = await self.engine_features(candidate)
+                log.info(
+                    "engine.features",
+                    tag=candidate,
+                    known=features.known,
+                    split_modes=list(features.split_modes),
+                    spec_types=list(features.spec_types),
+                )
             if smoke.ok or smoke.no_model or info.smoke_tested:
                 log.info("engine.ensure.reused", tag=candidate, detail=smoke.detail)
             else:
@@ -1881,6 +2175,33 @@ class EngineManager:
             if flag not in merged and flag not in declared:
                 merged[flag] = replacement
         return merged
+
+    async def engine_features(self, tag: str | None = None) -> EngineFeatures:
+        """The optional-feature surface of ``tag``, cached on disk and in memory.
+
+        The cache file lives next to the binary (``engines/<tag>/features.json``)
+        so the supervisor can read it synchronously on the load path without
+        importing this manager -- see :func:`probe_engine_features`.
+        """
+        resolved = tag or self.config.engine.pinned_tag
+        cached = self._features_cache.get(resolved)
+        if cached is not None:
+            return cached
+        directory = self.engine_dir(resolved)
+        on_disk = read_features_file(directory, resolved)
+        if on_disk is not None:
+            self._features_cache[resolved] = on_disk
+            return on_disk
+        try:
+            text = await self.help_text(resolved)
+        except EngineError as exc:
+            log.warning("engine.features.unavailable", tag=resolved, error=str(exc))
+            return EngineFeatures.unknown(resolved)
+        features = parse_engine_features(text, resolved)
+        if features.known:
+            write_features_file(directory, features)
+        self._features_cache[resolved] = features
+        return features
 
     async def removed_flags(self, tag: str) -> dict[str, str | None]:
         """Flags this engine no longer honours, mapped to their replacement."""
