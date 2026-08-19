@@ -2451,6 +2451,11 @@ is `2 (measured)`, *"2 is the most this placement can hold"*, with levels 4 and 
 measured. Afterwards `/profiles` showed `dual_3090` at basis `measured` and every other mode still
 `estimated` -- the strictness above, working on live data.
 
+**An incidental confirmation.** Before run B, `/profiles` predicted `dual_3090` at
+`est_gen_tps 308.0` for this model at 32768/f16. Run B measured **301.7 t/s** at one stream on that
+exact placement -- 2% out. D22's throughput estimator, with its 1.5 ms per-token floor, is doing
+well on a case (a 1.5B, where the roofline alone claimed 927 t/s) that used to be its worst.
+
 Live checks of the load path on the same instance: `{"ctx_size": 32768}` loaded at exactly 32768 on
 `[0, 1]` with 2 slots and f16; `{"ctx_size": 65536}` against a 32768-token model returned the `400`;
 `{"ctx_size": 12345, "prefer_mode": "dual_3090"}` loaded at exactly 12345 on `[2, 3]` with 6 slots.

@@ -279,6 +279,11 @@ two slots, so the sweep is two rows and the recommendation is capped rather than
 -> `recommended_parallel: 2` (measured), *"2 is the most this placement can hold"*, with levels 4 and
 8 reported as **not measured**: N requests against fewer than N slots measure a queue, not batching.
 
+**An incidental confirmation.** Before run B, `/profiles` predicted `dual_3090` at
+`est_gen_tps 308.0` for this model at 32768/f16. Run B measured **301.7 t/s** at one stream on that
+exact placement -- 2% out. D22's throughput estimator, with its 1.5 ms per-token floor, is doing
+well on a case (a 1.5B, where the roofline alone claimed 927 t/s) that used to be its worst.
+
 Afterwards `GET /api/models/{id}/profiles` showed `dual_3090` at basis `measured` and every other
 mode still `estimated` — which is the strictness above, working.
 
