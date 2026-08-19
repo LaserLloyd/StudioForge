@@ -66,6 +66,7 @@ from mcp.server.mcpserver import MCPServer
 from studioforge import __version__
 from studioforge.api.auth import redact_config_dict
 from studioforge.config import RESTART_REQUIRED_KEYS, Config, apply_overrides, load_config
+from studioforge.core import parallel_bench
 from studioforge.errors import BadRequestError, ModelNotFoundError, StudioForgeError
 from studioforge.logging import get_logger
 from studioforge.types import GB
@@ -888,6 +889,69 @@ def build_management_mcp(state: Any) -> MCPServer:
         return {"ok": True, **result}
 
     @_guard
+    async def benchmark_parallel(
+        model_id: str,
+        mode: str | None = None,
+        ctx_size: int | None = None,
+        max_tokens: int | None = None,
+    ) -> dict[str, Any]:
+        """Measure how many concurrent slots this model is actually worth running.
+
+        Every catalog row carries ``max_parallel`` (how many slots FIT) and
+        ``recommended_parallel`` (how many are worth running). Until this tool
+        has been run for a model on a given set of cards, the second number is
+        an *estimate* -- a bandwidth calculation, not an observation -- and
+        ``recommended_parallel_basis`` says ``"estimated"``. This replaces it
+        with a measurement, and every later ``list_models`` on that placement
+        reports ``"measured"``.
+
+        What it does: loads the model once at that placement with as many slots
+        as it holds, then fires 1, 2, 4 and 8 concurrent completions and records
+        per-stream tokens/second, aggregate tokens/second and p95 latency for
+        each. The engine's own decode counter is read alongside, so the result
+        can prove the requests really batched instead of queueing.
+
+        **This takes minutes and it is synchronous.** It is also refused
+        outright while anything is serving, loading, testing or benchmarking --
+        the numbers here *are* contention, so a busy server cannot produce them.
+        Read ``server_status.busy`` first. It leaves the rig as it found it: a
+        model that was not loaded is unloaded again, and one that was resident
+        is reloaded with the settings it had.
+
+        Args:
+            model_id: Model id or alias.
+            mode: A hardware-mode key from a ``placements[]`` row --
+                ``dual_5090``, ``dual_3090``, ``all_gpus``, ``single_5090`` on
+                this rig. Omit it to measure the placement the planner would
+                choose, which is usually what you want.
+            ctx_size: Context per slot to measure at. Omit it to use the
+                placement's own optimal, so the measurement describes the load
+                the catalog recommends. The knee moves with context, so a run at
+                one context is not evidence about another.
+            max_tokens: Tokens generated per request (default 128). Raise it if
+                a fast small model finishes before the batch stabilises.
+
+        Returns:
+            ``levels`` (one row per concurrency: ``per_stream_tps``,
+            ``aggregate_tps``, ``p95_latency_s``, ``achieved_batch``), the
+            resulting ``recommended_parallel`` with its ``basis`` and a
+            ``detail`` sentence saying which level failed which test, and what
+            the run did to the rig (``loaded_for_benchmark``,
+            ``unloaded_after``, ``restored``).
+        """
+        record = state.registry.resolve(model_id)
+        if record is None:
+            raise ModelNotFoundError(model_id, known=state.registry.known_ids())
+        runner = parallel_bench.for_state(state)
+        report = await runner.run(
+            record,
+            mode=mode,
+            ctx_size=ctx_size,
+            max_tokens=max_tokens or parallel_bench.DEFAULT_MAX_TOKENS,
+        )
+        return {"ok": True, **report.to_dict()}
+
+    @_guard
     async def download_model(
         repo_id: str,
         quant: str | None = None,
@@ -1412,6 +1476,7 @@ def build_management_mcp(state: Any) -> MCPServer:
         delete_model,
         server_status,
         test_model,
+        benchmark_parallel,
         get_config,
         set_config,
     ):

@@ -18,6 +18,7 @@ from fastapi.responses import JSONResponse
 from studioforge import __version__
 from studioforge.api.auth import PIN_WITHHELD_NOTE, may_reveal_pin, redact_config_dict
 from studioforge.config import RESTART_REQUIRED_KEYS, apply_overrides
+from studioforge.core import parallel_bench
 from studioforge.core.benchmark import (
     DEFAULT_CTX_SIZE,
     DEFAULT_MAX_TOKENS,
@@ -27,6 +28,14 @@ from studioforge.core.benchmark import (
     available_modes,
 )
 from studioforge.core.diskspace import disk_report
+from studioforge.core.parallel_bench import (
+    DEFAULT_MAX_TOKENS as PARALLEL_MAX_TOKENS,
+)
+from studioforge.core.parallel_bench import (
+    DEFAULT_PROMPT_TOKENS,
+    DEFAULT_STREAMS,
+    ParallelBenchmarker,
+)
 from studioforge.errors import (
     BadRequestError,
     ModelBusyError,
@@ -1564,3 +1573,145 @@ async def list_model_benchmarks(
         "model_id": record.id,
         "benchmarks": [{"id": row["id"], "ts": row["ts"], "report": row["report"]} for row in rows],
     }
+
+
+# ---------------------------------------------------------------------------
+# Parallel benchmark (WP19 / D37)
+# ---------------------------------------------------------------------------
+
+
+def _parallel_benchmarker(state: Any) -> ParallelBenchmarker:
+    """The process-wide parallel benchmarker, created on first use.
+
+    Shares the placement benchmarker's lock rather than owning one: two
+    measurement runs at once compete for exactly the resource each is
+    measuring, and a concurrency sweep is no less a benchmark than a placement
+    sweep.
+    """
+    # The factory lives in core so the MCP tool reaches the SAME object: two
+    # runners would be two locks, which is no lock. `_benchmarker` is called
+    # first so the placement benchmarker is this route's usual singleton rather
+    # than one the factory happens to create.
+    _benchmarker(state)
+    return parallel_bench.for_state(state)
+
+
+@router.post("/models/{model_id:path}/benchmark-parallel")
+async def start_parallel_benchmark(
+    model_id: str, request: Request, payload: dict[str, Any] | None = Body(None)
+) -> JSONResponse:
+    """Measure how many parallel slots this model is worth running (WP19).
+
+    Loads the model once at the chosen placement with as many slots as it holds,
+    fires 1 / 2 / 4 / 8 concurrent completions, records the curve, and leaves the
+    rig as it found it. A background job for the same reason the placement
+    benchmark is one -- minutes of loading and generating past any HTTP timeout
+    -- and pollable through the same ``/api/benchmark/jobs/{job_id}``.
+
+    Body: ``mode`` (a hardware-mode key such as ``dual_5090``), ``devices``,
+    ``ctx_size``, ``kv_cache_type``, ``streams``, ``prompt_tokens``,
+    ``max_tokens``. All optional; the default is the placement's own optimal on
+    the planner's choice of cards, which is the load the catalog recommends and
+    therefore the one worth measuring.
+    """
+    state = _state(request)
+    record = state.registry.resolve(model_id)
+    if record is None:
+        raise ModelNotFoundError(model_id, known=state.registry.known_ids())
+
+    data = payload or {}
+    mode = data.get("mode")
+    if mode is not None and not isinstance(mode, str):
+        raise BadRequestError("'mode' must be a hardware-mode key or null", param="mode")
+    devices = data.get("devices")
+    if devices is not None and not (
+        isinstance(devices, list) and all(isinstance(d, int) for d in devices)
+    ):
+        raise BadRequestError("'devices' must be a list of CUDA indices or null", param="devices")
+    streams = data.get("streams")
+    if streams is not None and not (
+        isinstance(streams, list) and all(isinstance(n, int) and n >= 1 for n in streams)
+    ):
+        raise BadRequestError(
+            "'streams' must be a list of positive concurrency levels or null", param="streams"
+        )
+    ctx_size = data.get("ctx_size")
+    if ctx_size is not None:
+        ctx_size = _positive_int(ctx_size, 0, "ctx_size")
+    prompt_tokens = _positive_int(data.get("prompt_tokens"), DEFAULT_PROMPT_TOKENS, "prompt_tokens")
+    max_tokens = _positive_int(data.get("max_tokens"), PARALLEL_MAX_TOKENS, "max_tokens")
+
+    runner = _parallel_benchmarker(state)
+    levels = [int(n) for n in (streams or DEFAULT_STREAMS)]
+    job = _benchmark_jobs(state).create(record.id, [str(n) for n in sorted(set(levels))])
+    job.task = asyncio.create_task(
+        _run_parallel_job(
+            state,
+            runner,
+            record,
+            job,
+            mode=mode,
+            devices=devices,
+            ctx_size=ctx_size,
+            kv_cache_type=data.get("kv_cache_type"),
+            kv_cache_type_v=data.get("kv_cache_type_v"),
+            streams=levels,
+            prompt_tokens=prompt_tokens,
+            max_tokens=max_tokens,
+        ),
+        name=f"sf-parallel-{job.job_id}",
+    )
+    return JSONResponse(
+        {"job_id": job.job_id, "model_id": record.id, "streams": sorted(set(levels)), "mode": mode},
+        status_code=202,
+    )
+
+
+async def _run_parallel_job(
+    state: Any,
+    runner: ParallelBenchmarker,
+    record: Any,
+    job: BenchmarkJob,
+    **kwargs: Any,
+) -> None:
+    """Drive one parallel sweep to a terminal state; never lets one escape.
+
+    Deliberately the same job table and the same terminal-state handling as the
+    placement benchmark: a client that already polls ``/api/benchmark/jobs`` has
+    nothing new to learn, and a second job mechanism would be a second set of
+    ways to leak a running task.
+    """
+    try:
+        report = await runner.run(
+            record, on_progress=job.on_progress, cancel_event=job.cancel_event, **kwargs
+        )
+    except asyncio.CancelledError:
+        job.state = "canceled"
+        job.error = "parallel benchmark canceled"
+        raise
+    except StudioForgeError as exc:
+        job.state = "failed"
+        job.error = exc.message
+        log.warning("parallel benchmark job failed", job_id=job.job_id, error=exc.message)
+    except Exception as exc:
+        job.state = "failed"
+        job.error = str(exc)
+        log.error("parallel benchmark job failed", job_id=job.job_id, error=str(exc))
+    else:
+        job.report = report.to_dict()
+        job.phase = "done"
+        job.fraction = 1.0
+        job.state = "canceled" if job.cancel_event.is_set() else "completed"
+
+
+@router.get("/models/{model_id:path}/parallel-observations")
+async def list_parallel_observations(
+    model_id: str, request: Request, limit: int = Query(64, ge=1, le=500)
+) -> dict[str, Any]:
+    """The measured slot sweeps behind this model's ``recommended_parallel``."""
+    state = _state(request)
+    record = state.registry.resolve(model_id)
+    if record is None:
+        raise ModelNotFoundError(model_id, known=state.registry.known_ids())
+    rows = await asyncio.to_thread(state.db.parallel_observations, record.id, limit=limit)
+    return {"model_id": record.id, "observations": rows}

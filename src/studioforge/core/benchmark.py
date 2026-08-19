@@ -50,7 +50,7 @@ import re
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
@@ -412,6 +412,39 @@ class Benchmarker:
         until a restart. Callers use this to refuse the write instead.
         """
         return self._benchmarking
+
+    @contextlib.asynccontextmanager
+    async def exclusive(self, model_id: str) -> AsyncIterator[None]:
+        """Hold the one benchmark slot for the duration of the block.
+
+        Added so :mod:`studioforge.core.parallel_bench` shares this object's
+        lock rather than owning a second one. Two measurement runs at once
+        compete for exactly the resource each is measuring, and a parallel
+        sweep is no less a benchmark than a placement sweep -- giving it its own
+        lock would have let the two interleave and produce two sets of numbers
+        that describe neither run.
+
+        Setting ``_benchmarking`` here is the other half: it is what
+        ``ModelManager._busy_reason`` reads, so a smoke test refuses while
+        either kind of run is in flight (D36).
+
+        Raises :class:`~studioforge.errors.ModelBusyError` rather than queueing.
+        A measurement that waits several minutes for its turn describes a
+        machine that has since moved.
+        """
+        if self._lock.locked():
+            raise ModelBusyError(
+                f"a benchmark of '{self._benchmarking or 'another model'}' is already "
+                f"running; benchmarks are serialized because concurrent runs would "
+                f"compete for the VRAM being measured",
+                code="benchmark_busy",
+            )
+        async with self._lock:
+            self._benchmarking = model_id
+            try:
+                yield
+            finally:
+                self._benchmarking = None
 
     # -- planning ---------------------------------------------------------
 

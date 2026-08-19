@@ -64,6 +64,10 @@ EXPECTED_TOOLS = {
     "delete_model",
     "server_status",
     "test_model",
+    # Turns recommended_parallel from an estimate into a measurement. A tool
+    # rather than a config knob because the answer is per model, per set of
+    # cards and per context, and none of those can be guessed (WP19 / D37).
+    "benchmark_parallel",
     "get_config",
     "set_config",
 }
