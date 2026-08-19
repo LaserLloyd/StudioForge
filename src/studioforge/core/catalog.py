@@ -124,7 +124,10 @@ CATALOG_HINT = (
     "the whole load at this row's max_parallel; parallel_limited_by names what "
     "caps the slot count ('vram', 'knee' = where extra slots stop buying "
     "throughput, or 'cap'); if_gpus_idle repeats the verdict with every GPU "
-    "free. Speeds are tokens/second: est_gen_tps is ONE stream at ~8k of "
+    "free. max_parallel is how many slots FIT and recommended_parallel how many "
+    "are worth running -- what load_args asks for; basis 'measured' means a "
+    "parallel benchmark swept it. Speeds are tokens/second: est_gen_tps is ONE "
+    "stream at ~8k of "
     "context (a typical turn), est_gen_tps_full_ctx the same stream with the "
     "window nearly full -- the truth is between them -- est_gen_tps_batched the "
     "aggregate across slots, est_prompt_tps ingestion. confidence is 'measured' "
@@ -548,8 +551,50 @@ def _idle_variant(
     }
 
 
+def recommended_slots(
+    record: ModelRecord,
+    plan: LoadPlan,
+    max_parallel: int,
+    *,
+    observations: Sequence[Mapping[str, Any]] = (),
+) -> dict[str, Any]:
+    """``recommended_parallel`` for one placement: value, basis and why.
+
+    One helper because three surfaces need the same answer -- the per-context
+    ``options`` table, every ``placements[*].optimal``, and
+    :meth:`ModelManager.load_recommended` -- and the D36 lesson about
+    ``choose_row`` is that a second copy of a rule is a second answer.
+
+    ``max_parallel`` is what the placement can hold (VRAM, plus D17's estimated
+    knee, plus the cap). What comes back is how many of those slots are *worth*
+    running: the measured knee when a parallel benchmark has swept this model on
+    these devices at this context, else the estimate, and ``basis`` says which.
+    """
+    from studioforge.core import parallel as parallel_mod
+
+    rows = parallel_mod.observations_for(
+        observations, devices=plan.devices, ctx_per_slot=int(plan.ctx_size)
+    )
+    return parallel_mod.recommended_parallel(
+        record.meta,
+        weights_bytes=plan.estimate.weights_bytes or int(record.size_bytes),
+        ctx_per_slot=int(plan.ctx_size),
+        kv_cache_type=plan.kv_cache_type,
+        kv_cache_type_v=plan.kv_cache_type_v,
+        max_parallel=int(max_parallel),
+        observations=rows,
+    )
+
+
 def load_args_for(record: ModelRecord, plan: LoadPlan, slots: int) -> dict[str, Any]:
     """The exact argument object ``load_model`` accepts for this placement.
+
+    ``slots`` is ``recommended_parallel``, not ``max_parallel``: the recipe a
+    caller passes verbatim should ask for the number of slots that is worth
+    running, not the number the VRAM would tolerate. The larger figure stays
+    visible on the row beside it, because "this placement could hold eight" is
+    a real fact about the hardware and an operator with eight agents may want
+    it -- it is just not the default.
 
     ``kv_cache_type_v`` appears **only when it differs from K**: the tool
     defaults V to K, so emitting an equal pair would cost every caller tokens
@@ -576,6 +621,7 @@ def _option_row(
     *,
     loaded: Sequence[Any],
     observations: Sequence[Mapping[str, Any]],
+    parallel_observations: Sequence[Mapping[str, Any]] = (),
     calibrate_for: Calibrator,
 ) -> dict[str, Any]:
     """One (model, context) row of the catalog."""
@@ -593,6 +639,8 @@ def _option_row(
             "vram_mb": round(getattr(plan, "required_bytes", 0) / MB) if plan else None,
             "max_parallel": 0,
             "parallel_limited_by": "vram",
+            "recommended_parallel": 0,
+            "recommended_parallel_basis": None,
             "est_prompt_tps": None,
             "est_gen_tps": None,
             "est_gen_tps_full_ctx": None,
@@ -606,10 +654,11 @@ def _option_row(
         }
 
     slots, bound, vram = slots_for_plan(planner, record, plan)
+    recommended = recommended_slots(record, plan, slots, observations=parallel_observations)
     calibration = calibrate_for(plan.devices)
     speed = estimate_speed(planner, record, plan, slots, calibration)
     measured = throughput.measured_for(
-        observations, devices=plan.devices, ctx_size=ctx, parallel=slots
+        observations, devices=plan.devices, ctx_size=ctx, parallel=recommended["value"]
     )
     return {
         "ctx_per_slot": ctx,
@@ -620,6 +669,9 @@ def _option_row(
         "vram_mb": round(vram / MB),
         "max_parallel": slots,
         "parallel_limited_by": bound,
+        # How many slots are worth running, versus how many fit (WP19/D37).
+        "recommended_parallel": recommended["value"],
+        "recommended_parallel_basis": recommended["basis"],
         "est_prompt_tps": speed["prompt_tps"],
         "est_gen_tps": speed["gen_tps"],
         "est_gen_tps_full_ctx": speed["gen_tps_full_ctx"],
@@ -630,7 +682,7 @@ def _option_row(
         "if_gpus_idle": idle,
         # Exactly what the MCP `load_model` tool accepts. Pass it through
         # unchanged; every value here is already the value that tool wants.
-        "load_args": load_args_for(record, plan, slots),
+        "load_args": load_args_for(record, plan, recommended["value"]),
         "best_now": False,
     }
 
@@ -1012,6 +1064,19 @@ def _model_entry(
         except Exception as exc:  # noqa: BLE001 - measurements are a bonus, not a dependency
             log.debug("catalog observations unavailable", model_id=record.id, error=str(exc))
 
+    # Parallel sweeps are per model and rare (one run writes four rows), so the
+    # whole history for this model is a handful of rows and there is no peer
+    # tier: a slot knee belongs to one model's weights-to-KV ratio on one set of
+    # cards, and borrowing another model's would be inventing a measurement.
+    parallel_observations: list[Mapping[str, Any]] = []
+    if db is not None:
+        try:
+            parallel_observations = list(db.parallel_observations(record.id, limit=64))
+        except Exception as exc:  # noqa: BLE001 - measurements are a bonus, not a dependency
+            log.debug(
+                "catalog parallel observations unavailable", model_id=record.id, error=str(exc)
+            )
+
     all_observations = observations
     if db is not None and not observations:
         # No history for this model: the peer tier needs everyone's.
@@ -1093,6 +1158,7 @@ def _model_entry(
             ctx,
             loaded=entry_loaded,
             observations=observations,
+            parallel_observations=parallel_observations,
             calibrate_for=calibrate_for,
         )
         for ctx in ctx_tiers_for(record, ctx_tiers)
@@ -1128,6 +1194,7 @@ def _model_entry(
         preference=preference,
         calibrate_for=calibrate_for,
         modes=modes,
+        parallel_observations=parallel_observations,
     )
     _apply_recommendation(entry, record)
     notes = quality_notes(record)
@@ -1161,6 +1228,8 @@ def _apply_recommendation(entry: dict[str, Any], record: ModelRecord) -> None:
         "kv_cache_type": optimal["kv_cache_type"],
         "kv_cache_type_v": optimal["kv_cache_type_v"],
         "max_parallel": optimal["max_parallel"],
+        "recommended_parallel": optimal.get("recommended_parallel", optimal["max_parallel"]),
+        "recommended_parallel_basis": optimal.get("recommended_parallel_basis"),
         "est_gen_tps": optimal["est_gen_tps"],
         "est_gen_tps_full_ctx": optimal["est_gen_tps_full_ctx"],
         "vram_mb": optimal["vram_mb"],
@@ -1313,6 +1382,27 @@ def compact_entry(entry: dict[str, Any]) -> dict[str, Any]:
     out["options"] = [compact_row(r) for r in entry.get("options", []) if r.get("best_now")]
     if entry.get("placements"):
         out["placements"] = [compact_placement(p) for p in entry["placements"]]
+    if isinstance(out.get("recommended"), dict):
+        out["recommended"] = _compact_recommended(out["recommended"])
+    return out
+
+
+def _compact_recommended(recommended: Mapping[str, Any]) -> dict[str, Any]:
+    """The headline load with its two uninformative concurrency fields dropped.
+
+    Same rule as everywhere else in the compact view: a key goes when its value
+    is null, empty, or identical to a sibling. ``recommended_parallel`` equals
+    ``max_parallel`` until a parallel benchmark has run (D17's knee is already
+    folded into ``max_parallel``), and its basis is ``"estimated"`` until then
+    -- so on a rig that has measured nothing this pays two keys per model to say
+    what the row already said. ``load_args.parallel`` carries the number a
+    caller acts on either way, so nothing is lost.
+    """
+    out = dict(recommended)
+    if out.get("recommended_parallel") == out.get("max_parallel"):
+        out.pop("recommended_parallel", None)
+    if out.get("recommended_parallel_basis") != "measured":
+        out.pop("recommended_parallel_basis", None)
     return out
 
 
@@ -1357,6 +1447,15 @@ def compact_placement(entry: Mapping[str, Any]) -> dict[str, Any]:
     }
     if optimal["kv_cache_type_v"] != optimal["kv_cache_type"]:
         out["optimal"]["kv_cache_type_v"] = optimal["kv_cache_type_v"]
+    # Same rule as kv_cache_type_v: say it only when it says something. With no
+    # parallel benchmark the recommendation lands on max_parallel (D17's knee is
+    # already folded into that number), and repeating it per mode per model
+    # would be paying tokens to be told the same thing twice. When a run has
+    # been recorded the two diverge, and then the basis is worth the bytes too.
+    if optimal.get("recommended_parallel") not in (None, optimal["max_parallel"]):
+        out["optimal"]["recommended_parallel"] = optimal["recommended_parallel"]
+    if optimal.get("recommended_parallel_basis") == "measured":
+        out["optimal"]["recommended_parallel_basis"] = "measured"
     return out
 
 

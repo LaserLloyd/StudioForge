@@ -1174,6 +1174,23 @@ class ModelManager:
             draining=self._draining,
         )
 
+    def parallel_observations(self, model_id: str) -> list[dict[str, Any]]:
+        """Measured slot sweeps for one model, or ``[]``.
+
+        Wrapped rather than called inline because three callers want it and
+        none of them should fail when the table is missing (an older data
+        directory, a manager built with ``db=None`` in a test): a missing
+        measurement means ``recommended_parallel`` falls back to the estimate
+        and says so, which is a worse answer, not a broken surface.
+        """
+        if self.db is None:
+            return []
+        try:
+            return list(self.db.parallel_observations(model_id, limit=64))
+        except Exception as exc:  # noqa: BLE001 - measurements are a bonus
+            log.debug("parallel observations unavailable", model_id=model_id, error=str(exc))
+            return []
+
     def placement_profiles(self, name: str) -> dict[str, Any]:
         """Optimal settings for this model on every hardware mode of this box.
 
@@ -1231,6 +1248,7 @@ class ModelManager:
             loaded=loaded,
             floor=catalog_mod.recommendation_floor(self.config, record),
             preference=str(getattr(self.config.planner, "preference", "quality")),
+            parallel_observations=self.parallel_observations(record.id),
         )
         for entry in entries:
             optimal = entry.get("optimal")

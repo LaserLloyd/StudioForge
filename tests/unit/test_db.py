@@ -399,6 +399,75 @@ def test_throughput_observations_newest_first_and_pruned_per_model(db: Database)
 
 
 # ---------------------------------------------------------------------------
+# Parallel-slot calibration (migration 005)
+# ---------------------------------------------------------------------------
+
+
+def _parallel_row(**overrides: object) -> dict[str, object]:
+    row: dict[str, object] = {
+        "model_id": "m1",
+        "ts": 1000.0,
+        "run_id": "run-a",
+        "devices": "0,1",
+        "gpu_class": "RTX 5090x2",
+        "ctx_per_slot": 8192,
+        "kv_cache_type": "f16",
+        "kv_cache_type_v": "f16",
+        "n_streams": 4,
+        "per_stream_tps": 30.0,
+        "aggregate_tps": 120.0,
+        "p95_latency_s": 4.2,
+        "prompt_tokens": 512,
+        "completion_tokens": 512,
+        "n_busy_slots": 3.9,
+        "engine_tag": "b10425",
+    }
+    row.update(overrides)
+    return row
+
+
+def test_a_parallel_observation_roundtrips_every_column(db: Database) -> None:
+    """Migration 005. Each column exists because something reads it: see the
+    migration's own comment for why n_busy_slots and run_id are not derived."""
+    db.record_parallel_observation(**_parallel_row())
+    row = db.parallel_observations("m1")[0]
+    assert row["n_streams"] == 4
+    assert row["aggregate_tps"] == 120.0
+    assert row["n_busy_slots"] == 3.9
+    assert row["run_id"] == "run-a"
+    assert row["engine_tag"] == "b10425"
+
+
+def test_a_typo_in_a_parallel_field_raises(db: Database) -> None:
+    """Same reasoning as the throughput table: a dropped keyword is invisible."""
+    with pytest.raises(ValueError):
+        db.record_parallel_observation(model_id="m1", n_stream=4)
+    with pytest.raises(ValueError):
+        db.record_parallel_observation(n_streams=4)  # model_id required
+
+
+def test_parallel_observations_filter_on_devices_in_the_writers_encoding(db: Database) -> None:
+    """The caller passes CUDA indices in any order and never learns the encoding."""
+    db.record_parallel_observation(**_parallel_row(devices="0,1"))
+    db.record_parallel_observation(**_parallel_row(devices="2,3", n_streams=2))
+    assert len(db.parallel_observations("m1")) == 2
+    assert len(db.parallel_observations("m1", devices=[1, 0])) == 1
+    assert db.parallel_observations("m1", devices=[2, 3])[0]["n_streams"] == 2
+    assert db.parallel_observations("m1", devices=[0]) == []
+
+
+def test_parallel_observations_are_newest_first(db: Database) -> None:
+    for index in range(3):
+        db.record_parallel_observation(
+            **_parallel_row(ts=1000.0 + index, n_streams=2**index, run_id=f"run-{index}")
+        )
+    rows = db.parallel_observations("m1")
+    assert [r["run_id"] for r in rows] == ["run-2", "run-1", "run-0"]
+    assert len(db.parallel_observations("m1", limit=1)) == 1
+    assert db.parallel_observations()[0]["model_id"] == "m1"
+
+
+# ---------------------------------------------------------------------------
 # Key/value
 # ---------------------------------------------------------------------------
 

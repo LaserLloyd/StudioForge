@@ -231,6 +231,7 @@ def _mode_row(
     record: ModelRecord,
     ctx: int,
     calibrate_for: Any,
+    parallel_observations: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any] | None:
     """One context tier on one mode's idle cards, or ``None`` if it does not fit."""
     from studioforge.core import catalog as catalog_mod
@@ -239,6 +240,9 @@ def _mode_row(
     if not isinstance(plan, LoadPlan):
         return None
     slots, bound, vram = catalog_mod.slots_for_plan(planner, record, plan)
+    recommended = catalog_mod.recommended_slots(
+        record, plan, slots, observations=parallel_observations
+    )
     speed = catalog_mod.estimate_speed(planner, record, plan, slots, calibrate_for(plan.devices))
     row: dict[str, Any] = {
         "ctx_per_slot": int(plan.ctx_size),
@@ -249,10 +253,16 @@ def _mode_row(
         "vram_mb": round(vram / (1024**2)),
         "max_parallel": slots,
         "parallel_limited_by": bound,
+        # How many of those slots are worth running (WP19/D37). ``max_parallel``
+        # is capacity plus D17's estimated knee; this is the number a load
+        # should ask for, and it is the number ``load_args`` carries.
+        "recommended_parallel": recommended["value"],
+        "recommended_parallel_basis": recommended["basis"],
+        "recommended_parallel_detail": recommended["detail"],
         "est_gen_tps": speed["gen_tps"],
         "est_gen_tps_full_ctx": speed["gen_tps_full_ctx"],
         "est_prompt_tps": speed["prompt_tps"],
-        "load_args": catalog_mod.load_args_for(record, plan, slots),
+        "load_args": catalog_mod.load_args_for(record, plan, recommended["value"]),
     }
     row["load_args"]["devices"] = list(plan.devices)
     return row
@@ -268,6 +278,7 @@ def _optimal_for(
     floor: int,
     preference: str,
     calibrate_for: Any,
+    parallel_observations: Sequence[Mapping[str, Any]] = (),
 ) -> tuple[dict[str, Any] | None, str | None]:
     """The best row this mode can reach with its cards idle, and why it won."""
     from studioforge.core import catalog as catalog_mod
@@ -277,7 +288,8 @@ def _optimal_for(
     rows = [
         row
         for ctx in catalog_mod.ctx_tiers_for(record, ctx_tiers)
-        if (row := _mode_row(mode_planner, pinned, ctx, calibrate_for)) is not None
+        if (row := _mode_row(mode_planner, pinned, ctx, calibrate_for, parallel_observations))
+        is not None
     ]
     if not rows:
         return None, None
@@ -305,6 +317,7 @@ def placement_report(
     preference: str = "quality",
     calibrate_for: Any = None,
     modes: Sequence[HardwareMode] | None = None,
+    parallel_observations: Sequence[Mapping[str, Any]] = (),
 ) -> list[dict[str, Any]]:
     """One entry per hardware mode: the optimal load, and what blocks it now.
 
@@ -322,6 +335,11 @@ def placement_report(
         floor: :func:`studioforge.core.catalog.recommendation_floor`.
         preference: ``"quality"`` or ``"throughput"`` (``planner.preference``).
         calibrate_for: ``devices -> calibration`` (the catalog's memoised one).
+        parallel_observations: rows from ``db.parallel_observations`` for this
+            model. Each mode picks out the ones taken on **its** cards at the
+            context it chose (:func:`studioforge.core.parallel.observations_for`)
+            and turns them into ``optimal.recommended_parallel``; without any,
+            that number is D17's estimated knee and says so.
 
     Each entry carries ``optimal`` (idle, this mode's cards), ``fits_now``
     (would ``optimal.load_args`` load right now without disturbing anything),
@@ -354,6 +372,7 @@ def placement_report(
             floor=floor,
             preference=preference,
             calibrate_for=calibrate_for,
+            parallel_observations=parallel_observations,
         )
         entry: dict[str, Any] = {
             "mode": mode.key,
@@ -427,7 +446,10 @@ def _plan_optimal(
     """Plan exactly what ``optimal.load_args`` asks for -- the same slots included.
 
     Quoting a ``fits_now`` for a smaller load than the one ``load_args`` would
-    submit is how a table comes to say yes to a call that then fails.
+    submit is how a table comes to say yes to a call that then fails. Since
+    WP19 the slot count in ``load_args`` is ``recommended_parallel`` rather than
+    ``max_parallel``, so this follows it; falling back to ``max_parallel`` keeps
+    a hand-built ``optimal`` in a test meaning what it used to.
     """
     try:
         return planner.plan_load(
@@ -435,7 +457,7 @@ def _plan_optimal(
             ctx_size=int(optimal["ctx_per_slot"]),
             kv_cache_type=optimal["kv_cache_type"],
             kv_cache_type_v=optimal.get("kv_cache_type_v") or optimal["kv_cache_type"],
-            parallel=int(optimal["max_parallel"]),
+            parallel=int(optimal.get("recommended_parallel") or optimal["max_parallel"]),
             loaded=loaded,
             allow_evict=allow_evict,
         )

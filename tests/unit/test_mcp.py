@@ -450,7 +450,15 @@ async def test_list_models_never_leaks_a_chat_template_or_meta_dump(state: State
     # carry no load_args, `would_evict` is a count rather than a list, and
     # `list_models` still defaults to limit=25 -- so this number must not drift
     # upward again without a reason as good.
-    assert len(raw) < 13500, f"list_models output is {len(raw)} chars"
+    #
+    # Re-anchored again at WP19/D37, by ~170 characters, ALL of them in
+    # `catalog_hint`: the sentence that distinguishes max_parallel ("how many
+    # fit") from recommended_parallel ("how many are worth running"). That is a
+    # fixed cost paid once per call however many models come back, which is the
+    # only kind of growth this budget should tolerate -- the PER-MODEL cost is
+    # unchanged, because both new keys are dropped from the compact entry until
+    # a parallel benchmark makes them say something (`_compact_recommended`).
+    assert len(raw) < 13650, f"list_models output is {len(raw)} chars"
 
 
 async def test_model_options_returns_the_whole_table_for_one_model(state: State) -> None:

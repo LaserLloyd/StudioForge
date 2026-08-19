@@ -328,3 +328,78 @@ def test_a_one_card_box_reports_one_placement() -> None:
     rec = record("pub/iswa-31b", iswa_31b(), mtime=NOW, size_bytes=17 * GB)
     report = placement_report(rec, planner=planner, floor=config.models.default_ctx)
     assert [e["mode"] for e in report] == ["single_5090"]
+
+
+# ---------------------------------------------------------------------------
+# recommended_parallel: how many of those slots are worth running (WP19 / D37)
+# ---------------------------------------------------------------------------
+
+
+def parallel_sweep(devices: str, ctx: int, *rows) -> list[dict[str, object]]:  # noqa: ANN002
+    """``(n_streams, per_stream_tps, aggregate_tps)`` triples as stored rows."""
+    return [
+        {
+            "model_id": "pub/dense-8b",
+            "ts": float(index),
+            "run_id": "run-a",
+            "devices": devices,
+            "ctx_per_slot": ctx,
+            "n_streams": n,
+            "per_stream_tps": per_stream,
+            "aggregate_tps": aggregate,
+        }
+        for index, (n, per_stream, aggregate) in enumerate(rows)
+    ]
+
+
+def test_every_placement_says_how_many_slots_are_worth_running() -> None:
+    rec = record("pub/iswa-31b", iswa_31b(), mtime=NOW, size_bytes=17 * GB)
+    for entry in report_for(rec):
+        optimal = entry["optimal"]
+        assert 1 <= optimal["recommended_parallel"] <= optimal["max_parallel"]
+        assert optimal["recommended_parallel_basis"] == "estimated"
+        # The recipe asks for the recommendation, not the ceiling.
+        assert optimal["load_args"]["parallel"] == optimal["recommended_parallel"]
+
+
+def test_a_measured_sweep_lowers_the_recommendation_and_the_recipe_follows() -> None:
+    """The whole point: a measurement can say fewer slots than the arithmetic did."""
+    config = make_config()
+    planner = Planner(config, rig_5090x2_3090x2(31.0), log_plans=False)
+    # A 32k-window 8B, so the quality-first rule lands on a row with slots to
+    # spare -- a 131072 row is one slot on any placement and has nothing to say.
+    rec = record("pub/dense-8b", dense_meta(32768), mtime=NOW, size_bytes=8 * GB)
+    plain = placement_report(rec, planner=planner, floor=config.models.default_ctx)
+    head = plain[0]["optimal"]
+    assert head["max_parallel"] > 1, "fixture must have room to be lowered"
+
+    measured = placement_report(
+        rec,
+        planner=planner,
+        floor=config.models.default_ctx,
+        parallel_observations=parallel_sweep(
+            ",".join(str(d) for d in sorted(head["devices"])),
+            head["ctx_per_slot"],
+            (1, 100.0, 100.0),
+            (2, 90.0, 102.0),
+        ),
+    )
+    optimal = measured[0]["optimal"]
+    assert optimal["recommended_parallel"] == 1
+    assert optimal["recommended_parallel_basis"] == "measured"
+    assert optimal["max_parallel"] == head["max_parallel"]  # capacity is unchanged
+    assert optimal["load_args"]["parallel"] == 1
+
+
+def test_a_sweep_on_other_cards_does_not_steer_this_mode() -> None:
+    """`basis: measured` has to be literally true of the placement it sits on."""
+    config = make_config()
+    planner = Planner(config, rig_5090x2_3090x2(31.0), log_plans=False)
+    rec = record("pub/dense-8b", dense_meta(32768), mtime=NOW, size_bytes=8 * GB)
+    report = placement_report(
+        rec,
+        planner=planner,
+        floor=config.models.default_ctx,
+        parallel_observations=parallel_sweep("2,3", 8192, (1, 100.0, 100.0), (2, 90.0, 102.0)),
+    )
+    assert report[0]["optimal"]["recommended_parallel_basis"] == "estimated"

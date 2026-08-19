@@ -39,7 +39,7 @@ log = get_logger(__name__)
 
 #: Highest migration version this build of the code ships. ``migrate()``
 #: brings any older database up to this.
-SCHEMA_VERSION: int = 4
+SCHEMA_VERSION: int = 5
 
 #: SQLite's own words for "this file is not a usable database". Only a message
 #: carrying one of these is treated as corruption by ``migrate_with_recovery``;
@@ -130,6 +130,30 @@ _THROUGHPUT_COLUMNS: tuple[str, ...] = (
     # stamped with the current version, so a formula change retires its own
     # history instead of learning from it (see 004_throughput_version.sql).
     "estimator_version",
+)
+
+#: One row per (parallel-benchmark run, concurrency level). See
+#: ``migrations/005_parallel.sql`` for why each column is stored rather than
+#: derived; the short version is that CUDA ordinals, engine builds and KV cache
+#: types all move, and an observation that cannot say which of them produced it
+#: cannot be retired when one of them changes.
+_PARALLEL_COLUMNS: tuple[str, ...] = (
+    "model_id",
+    "ts",
+    "run_id",
+    "devices",
+    "gpu_class",
+    "ctx_per_slot",
+    "kv_cache_type",
+    "kv_cache_type_v",
+    "n_streams",
+    "per_stream_tps",
+    "aggregate_tps",
+    "p95_latency_s",
+    "prompt_tokens",
+    "completion_tokens",
+    "n_busy_slots",
+    "engine_tag",
 )
 
 _ADAPTER_OPTIONAL_COLUMNS: tuple[str, ...] = (
@@ -806,6 +830,70 @@ class Database:
         if removed:
             log.info("db.throughput_pruned", removed=removed)
         return removed
+
+    # ------------------------------------------------------------------
+    # Parallel-slot calibration
+    # ------------------------------------------------------------------
+
+    def record_parallel_observation(self, **fields: Any) -> None:
+        """Insert one concurrency level of one parallel-benchmark run.
+
+        Mirrors :meth:`record_throughput_observation`: an unknown keyword raises
+        rather than being dropped, because a typo would look exactly like "this
+        model has never been measured" and would leave ``recommended_parallel``
+        permanently on its estimate with nothing in the log to say why.
+        """
+        unknown = set(fields) - set(_PARALLEL_COLUMNS)
+        if unknown:
+            raise ValueError(f"unknown parallel_observation fields: {sorted(unknown)}")
+        if "model_id" not in fields:
+            raise ValueError("model_id is required")
+        fields.setdefault("ts", time.time())
+        columns = list(fields)
+        self._write(
+            f"INSERT INTO parallel_observations ({', '.join(columns)}) "
+            f"VALUES ({', '.join('?' * len(columns))})",
+            [fields[col] for col in columns],
+        )
+
+    def parallel_observations(
+        self,
+        model_id: str | None = None,
+        *,
+        devices: Sequence[int] | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """Parallel-slot samples newest-first, optionally narrowed.
+
+        ``devices`` is matched on the same canonical string the writer stores
+        (``",".join(sorted(indices))``, the encoding
+        :func:`studioforge.core.throughput.measured_for` already uses), so the
+        caller passes CUDA indices and never has to know the encoding.
+
+        Filtering in SQL rather than in Python because the catalog asks this
+        once per hardware mode per model per build, and a table that a pinned
+        model's nightly re-measurement grows without bound would otherwise be
+        read whole four times for every row of a forty-model library.
+        """
+        clauses: list[str] = []
+        params: list[Any] = []
+        if model_id is not None:
+            clauses.append("model_id = ?")
+            params.append(model_id)
+        if devices is not None:
+            clauses.append("devices = ?")
+            params.append(",".join(str(int(d)) for d in sorted(devices)))
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(int(limit))
+        rows = (
+            self.connect()
+            .execute(
+                f"SELECT * FROM parallel_observations{where} ORDER BY ts DESC, id DESC LIMIT ?",
+                params,
+            )
+            .fetchall()
+        )
+        return [_row_to_dict(row) for row in rows]
 
     # ------------------------------------------------------------------
     # Benchmarks

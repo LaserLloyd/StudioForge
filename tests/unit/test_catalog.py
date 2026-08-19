@@ -546,7 +546,10 @@ def test_load_args_repeat_the_row_they_belong_to() -> None:
             args = row["load_args"]
             assert args["model_id"] == entry["id"]
             assert args["ctx_size"] == row["ctx_per_slot"]
-            assert args["parallel"] == row["max_parallel"]
+            # Since WP19 the recipe asks for the slots that are WORTH running,
+            # not the ceiling the VRAM would tolerate. Both are on the row.
+            assert args["parallel"] == row["recommended_parallel"]
+            assert 1 <= row["recommended_parallel"] <= row["max_parallel"]
             assert args["kv_cache_type"] == row["kv_cache_type"]
 
 
@@ -1255,3 +1258,74 @@ async def test_the_prediction_is_taken_at_the_same_fill_the_catalog_quotes() -> 
     # ...and deliberately NOT the pessimistic full-window number, which is a
     # different question and is reported as its own column.
     assert quoted["gen_tps_full_ctx"] < quoted["gen_tps"]
+
+
+# ---------------------------------------------------------------------------
+# recommended_parallel on the per-context table (WP19 / D37)
+# ---------------------------------------------------------------------------
+
+
+class FakeParallelDb(FakeDb):
+    """A FakeDb that also answers the parallel-sweep question."""
+
+    def __init__(self, rows: list[dict] | None = None, parallel: list[dict] | None = None) -> None:
+        super().__init__(rows)
+        self.parallel = parallel or []
+
+    def parallel_observations(self, model_id=None, *, devices=None, limit=200):  # noqa: ANN001, ANN201
+        rows = self.parallel
+        if model_id is not None:
+            rows = [r for r in rows if r.get("model_id") == model_id]
+        return list(rows)
+
+
+def test_every_fitting_row_says_how_many_slots_are_worth_running() -> None:
+    for entry in catalog_for()["models"]:
+        for row in entry["options"]:
+            if not row["fits"]:
+                continue
+            assert row["recommended_parallel_basis"] == "estimated"
+            assert 1 <= row["recommended_parallel"] <= row["max_parallel"]
+
+
+def test_a_measured_sweep_reaches_the_option_row_and_its_load_args() -> None:
+    """The catalog is where an agent reads it, so this is the path that matters."""
+    dense = record("pub/dense-8b", dense_meta(32768), mtime=NOW, size_bytes=8 * GB)
+    plain = catalog_for([dense])["models"][0]
+    row = next(r for r in plain["options"] if r["fits"] and r["max_parallel"] > 1)
+
+    sweep = [
+        {
+            "model_id": "pub/dense-8b",
+            "ts": float(index),
+            "run_id": "run-a",
+            "devices": ",".join(str(d) for d in sorted(row["devices"])),
+            "ctx_per_slot": row["ctx_per_slot"],
+            "n_streams": n,
+            "per_stream_tps": per_stream,
+            "aggregate_tps": aggregate,
+        }
+        for index, (n, per_stream, aggregate) in enumerate([(1, 100.0, 100.0), (2, 90.0, 102.0)])
+    ]
+    measured = catalog_for([dense], db=FakeParallelDb(parallel=sweep))["models"][0]
+    after = next(r for r in measured["options"] if r["ctx_per_slot"] == row["ctx_per_slot"])
+    assert after["recommended_parallel"] == 1
+    assert after["recommended_parallel_basis"] == "measured"
+    assert after["max_parallel"] == row["max_parallel"]
+    assert after["load_args"]["parallel"] == 1
+
+
+def test_the_compact_view_stays_quiet_until_the_number_says_something() -> None:
+    """Estimated == max_parallel, so repeating it per model would be pure cost."""
+    entry = catalog_for(compact=True)["models"][0]
+    recommended = entry["recommended"]
+    assert "recommended_parallel" not in recommended
+    assert "recommended_parallel_basis" not in recommended
+    for placement in entry["placements"]:
+        assert "recommended_parallel" not in (placement.get("optimal") or {})
+
+
+def test_the_catalog_hint_explains_the_difference_between_the_two_slot_numbers() -> None:
+    hint = catalog_for()["catalog_hint"]
+    assert "recommended_parallel" in hint
+    assert "max_parallel is how many slots FIT" in hint
