@@ -1637,3 +1637,32 @@ async def test_poll_loop_survives_a_failing_health_check(harness: Harness) -> No
     with pytest.raises(asyncio.CancelledError):
         await task
     assert calls["n"] >= 2, "the loop stopped after the first failure"
+
+
+async def test_watchdog_accepts_the_pin_through_the_main_servers_carriers(
+    harness: Harness,
+) -> None:
+    """A client that paired with the main /mcp via ``X-MCP-Pin`` (or ``?pin=``)
+    must not get a 401 from the recovery surface -- and a wrong PIN in those
+    carriers is still a 401 (2026-08-19)."""
+    raw = yaml.safe_load(harness.config_path.read_text(encoding="utf-8"))
+    raw["server"]["api_key"] = None
+    raw.setdefault("mcp", {})["pin"] = "87654321"
+    harness.config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    body = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
+    accept = {"accept": "application/json, text/event-stream"}
+
+    def post(client: httpx.Client, url: str, headers: dict[str, str]) -> httpx.Response:
+        return client.post(url, json=body, headers={**accept, **headers})
+
+    with (
+        WatchdogHttp(harness.watchdog(), harness.watchdog_port) as http,
+        httpx.Client(timeout=10.0) as client,
+    ):
+        assert post(client, http.url, {"X-MCP-Pin": "87654321"}).status_code != 401
+        assert post(client, http.url, {"X-StudioForge-Pin": "87654321"}).status_code != 401
+        assert post(client, http.url + "?pin=87654321", {}).status_code != 401
+        wrong = post(client, http.url, {"X-MCP-Pin": "00000000"})
+        assert wrong.status_code == 401
+        message = wrong.json()["error"]["message"]
+        assert "X-MCP-Pin" in message and "Setup" in message and "sfctl servers add" in message

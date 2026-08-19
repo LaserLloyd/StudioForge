@@ -1118,3 +1118,25 @@ def test_openclaw_setup_without_auth_renders_honestly(monkeypatch: Any) -> None:
     assert "server.api_key=" not in result.output
     assert "--reveal-key" not in result.output
     assert "server.url=http://rig:1234" in result.output
+
+
+def test_recover_explains_a_credential_refusal_instead_of_cannot_reach(monkeypatch: Any) -> None:
+    """The watchdog guards the recovery tools with the PIN/API key; a 401 must
+    say so and give the pairing recipe, not 'cannot reach the watchdog'."""
+    from studioforge_companion import mcp_proxy as proxy_module
+
+    async def refuse(profile: Any, tool: str, arguments: dict[str, Any]) -> Any:
+        raise RuntimeError("HTTPStatusError: Client error '401 Unauthorized' for url ...")
+
+    monkeypatch.setattr(proxy_module, "call_watchdog_tool", refuse)
+    result = runner.invoke(
+        cli_module.app,
+        ["--url", "http://127.0.0.1:1", "--no-color", "recover"],
+        catch_exceptions=False,
+    )
+    out = _all_output(result)
+    assert result.exit_code != 0
+    assert "needs a credential" in out
+    assert "sfctl servers add" in out and "--api-key <PIN>" in out
+    assert "Setup" in out
+    assert "cannot reach" not in out

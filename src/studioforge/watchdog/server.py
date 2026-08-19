@@ -2299,15 +2299,15 @@ def wrap_asgi(
         # least-protected surface. Open only when neither credential is set.
         if expected_key or expected_pin:
             provided = _bearer_from_headers(scope.get("headers") or [])
+            pin_carrier = _pin_from_request(scope)
             key_ok = (
                 expected_key is not None
                 and provided is not None
                 and _constant_time_eq(provided, expected_key)
             )
-            pin_ok = (
-                expected_pin is not None
-                and provided is not None
-                and _constant_time_eq(provided, expected_pin)
+            pin_ok = expected_pin is not None and any(
+                candidate is not None and _constant_time_eq(candidate, expected_pin)
+                for candidate in (provided, pin_carrier)
             )
             if not key_ok and not pin_ok:
                 await _send_json(
@@ -2318,9 +2318,14 @@ def wrap_asgi(
                             "message": (
                                 "This endpoint needs a credential. The watchdog "
                                 "accepts the same server.api_key as the main server, "
-                                "or the MCP pairing PIN when no key is set; send it "
-                                "as 'Authorization: Bearer <credential>'. The PIN is "
-                                "in the startup banner and at GET /api/mcp/info."
+                                "or the MCP pairing PIN when no key is set -- as "
+                                "'Authorization: Bearer <credential>', as the "
+                                "'X-MCP-Pin' header, or as ?pin=<pin>. The PIN is "
+                                "on the control panel (Setup -> Network & access -> "
+                                "the eye button next to 'MCP pairing PIN'), in "
+                                "`studioforge config` on the host, and at GET "
+                                "/api/mcp/info from the host itself. For sfctl: "
+                                "`sfctl servers add rig <url> --api-key <PIN> --use`."
                             ),
                             "type": "invalid_request_error",
                             "code": "invalid_api_key",
@@ -2365,6 +2370,30 @@ def _bearer_from_headers(headers: Iterable[tuple[bytes, bytes]]) -> str | None:
                 return text
         elif lowered == b"x-api-key":
             return value.decode("latin-1").strip()
+    return None
+
+
+#: Header names the MAIN server accepts the MCP pairing PIN under (see
+#: ``studioforge.api.auth.extract_pin``). The watchdog must accept the same
+#: ones: a client that paired with the main ``/mcp`` using ``X-MCP-Pin`` got a
+#: 401 from the recovery surface with a message that only mentioned Bearer --
+#: the one place a confusing credential error is least affordable is the
+#: endpoint you reach for when everything else is down (2026-08-19).
+_PIN_HEADERS: tuple[bytes, ...] = (b"x-mcp-pin", b"x-studioforge-pin")
+
+
+def _pin_from_request(scope: dict[str, Any]) -> str | None:
+    """The PIN sent as ``X-MCP-Pin``/``X-StudioForge-Pin`` or ``?pin=``."""
+    for name, value in scope.get("headers") or []:
+        if name.lower() in _PIN_HEADERS:
+            text = value.decode("latin-1").strip()
+            if text:
+                return text
+    query = (scope.get("query_string") or b"").decode("latin-1")
+    for part in query.split("&"):
+        key, _, val = part.partition("=")
+        if key == "pin" and val:
+            return val.strip()
     return None
 
 

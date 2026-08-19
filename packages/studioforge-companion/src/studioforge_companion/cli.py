@@ -1360,9 +1360,27 @@ def recover(
         try:
             result = await call_watchdog_tool(profile, tool, arguments)
         except Exception as exc:
+            detail = describe_exception(exc)
+            lowered = detail.lower()
+            if "401" in detail or "credential" in lowered or "unauthor" in lowered:
+                # The watchdog guards the recovery tools with the same
+                # credential as the main server: server.api_key, or the MCP
+                # pairing PIN when no key is set. "Cannot reach" would send the
+                # user off to check a process that is up and answering.
+                have = "this profile has a key" if profile.api_key else "this profile has no key"
+                raise CompanionError(
+                    f"the StudioForge watchdog at {profile.watchdog_mcp_url} needs a credential "
+                    f"({have}).\n"
+                    "  - it accepts the server's API key, or the MCP pairing PIN when no key "
+                    "is set\n"
+                    "  - the PIN is on the control panel: Setup -> Network & access -> the eye "
+                    "button next to 'MCP pairing PIN' (or `studioforge config` on the host)\n"
+                    f"  - pair this profile with it: sfctl servers add {profile.name} "
+                    f"{profile.url} --api-key <PIN> --use"
+                ) from None
             raise CompanionError(
                 f"cannot reach the StudioForge watchdog at {profile.watchdog_mcp_url} "
-                f"({describe_exception(exc)}).\n"
+                f"({detail}).\n"
                 f"  - the watchdog is a separate process: check it is running on the host\n"
                 f"  - it defaults to port 1235; set 'servers.<name>.watchdog_url' if it moved"
             ) from None

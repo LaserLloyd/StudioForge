@@ -234,6 +234,40 @@ def _save_button(ctx: GuiContext, fields: _Fields, refresh: Any = None) -> Any:
     return result
 
 
+def _secret_line(label: str, value: str | None, *, unset_note: str, hint: str = "") -> None:
+    """``currently ***`` with a Show/Hide eye and a Copy button.
+
+    The input above it draws only the redacted placeholder (so a stray save can
+    never post a fingerprint back as the value), which left the operator with
+    no way to *read* the PIN the watchdog and every MCP client demand -- the
+    tray has no console for the startup banner, and the only other place was a
+    collapsed expansion behind a switch. Whoever can use this panel can already
+    rotate the PIN and edit every setting, so showing it on request gives away
+    nothing the panel did not already give away; it just stops the hunt.
+    """
+    masked = st.secret_state_text(value, unset_note=unset_note)
+    with ui.row().classes("items-center gap-1 no-wrap"):
+        shown = ui.label(f"currently {masked}").classes("text-xs font-mono opacity-70")
+        if value:
+            state = {"revealed": False}
+
+            def toggle() -> None:
+                state["revealed"] = not state["revealed"]
+                shown.set_text(f"currently {value if state['revealed'] else masked}")
+                eye.props(f"icon={'visibility_off' if state['revealed'] else 'visibility'}")
+
+            eye = (
+                ui.button(icon="visibility", on_click=toggle)
+                .props("flat dense round size=sm")
+                .tooltip(f"Show / hide the {label}")
+            )
+            ui.button(icon="content_copy", on_click=lambda: copy_text(value)).props(
+                "flat dense round size=sm"
+            ).tooltip(f"Copy the {label}")
+    if hint:
+        ui.label(hint).classes("text-xs opacity-70")
+
+
 def _section(title: str, subtitle: str = "") -> None:
     ui.label(title).classes("text-lg font-medium")
     if subtitle:
@@ -841,14 +875,21 @@ def _network_body(ctx: GuiContext, refresh: Any) -> None:
     ui.separator()
     _section("Credentials", "")
     fields.row("server.api_key", label="API key")
-    api_key_state = st.secret_state_text(
+    _secret_line(
+        "API key",
         ctx.config.server.api_key,
         unset_note="not set — the gateway and this panel are open to anyone who can reach them",
     )
-    ui.label(f"currently {api_key_state}").classes("text-xs font-mono opacity-70")
     fields.row("mcp.pin", label="MCP pairing PIN")
-    ui.label(f"currently {st.secret_state_text(ctx.config.mcp.pin, unset_note='not set')}").classes(
-        "text-xs font-mono opacity-70"
+    _secret_line(
+        "MCP pairing PIN",
+        ctx.config.mcp.pin,
+        unset_note="not set",
+        hint=(
+            "Agents pair the MCP endpoint with it, and the RECOVERY watchdog (port "
+            f"{ctx.config.watchdog.port}) requires it too when no API key is set — "
+            "sfctl: `sfctl servers add rig <url> --api-key <PIN> --use`."
+        ),
     )
     fields.row("mcp.pin_required", label="Require the PIN for MCP")
     with ui.row().classes("items-center gap-2 flex-wrap"):
