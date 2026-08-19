@@ -1300,6 +1300,29 @@ def test_another_install_is_named_by_its_own_alias_and_port() -> None:
     assert st.vram_holder_is_reclaimable(holder) is False
 
 
+def test_the_tooltip_carries_what_the_truncated_row_drops() -> None:
+    tip = st.vram_holder_tooltip(
+        {
+            "name": "llama-server.exe",
+            "pid": 27376,
+            "used_bytes": 20_365_000_000,
+            "per_gpu_bytes": {"2": 20_365_000_000},
+            "gpu_indices": [2],
+            "classification": "other-instance",
+            "alias": "scratch",
+            "port": 1258,
+            "detail": "llama-server from another install (alias scratch, port 1258, exe C:\\temp)",
+        }
+    )
+    assert "exe C:\\temp" in tip
+    assert "measured per device: CUDA2" in tip
+
+    unmeasured = st.vram_holder_tooltip(
+        {"name": "x", "pid": 1, "used_bytes": GIB, "gpu_indices": [0, 1]}
+    )
+    assert "CUDA contexts, not measured placement" in unmeasured
+
+
 def test_bytes_on_an_adapter_with_no_ordinal_are_still_shown() -> None:
     line = st.vram_holder_line(
         {"name": "job.exe", "pid": 7, "used_bytes": 8 * GIB, "per_gpu_bytes": {"-1": 8 * GIB}}

@@ -131,9 +131,12 @@ def _vram_holders_panel(ctx: GuiContext) -> None:
         with container:
             for holder in view.get("holders") or []:
                 with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                    # The row truncates, and the tail of it (alias, or the exe
+                    # directory of another install) is exactly what an operator
+                    # needs to go and stop the thing. Hover gives it back.
                     ui.label(st.vram_holder_line(holder)).classes(
                         "text-xs font-mono opacity-80 grow truncate"
-                    )
+                    ).tooltip(st.vram_holder_tooltip(holder))
                     if st.vram_holder_is_reclaimable(holder):
                         ui.button(
                             "Reclaim",

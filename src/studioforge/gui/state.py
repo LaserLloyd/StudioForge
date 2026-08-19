@@ -1197,6 +1197,34 @@ def vram_holder_line(holder: Mapping[str, Any]) -> str:
     return "  ·  ".join(parts)
 
 
+def vram_holder_tooltip(holder: Mapping[str, Any]) -> str:
+    """The whole row plus the facts the truncated line cannot fit.
+
+    ``detail`` (which install a stray llama-server belongs to) and the exact
+    per-device bytes are the actionable end of a holder, and they are also the
+    end that falls off a narrow panel.
+    """
+    parts = [vram_holder_line(holder)]
+    detail = holder.get("detail")
+    if detail:
+        parts.append(str(detail))
+    per_gpu = holder.get("per_gpu_bytes") or {}
+    if per_gpu:
+        measured = ", ".join(
+            f"CUDA{key} {format_bytes(int(value))}"
+            if int(key) >= 0
+            else f"other adapter {format_bytes(int(value))}"
+            for key, value in sorted(per_gpu.items(), key=lambda item: int(item[0]))
+        )
+        parts.append(f"measured per device: {measured}")
+    elif holder.get("gpu_indices"):
+        parts.append(
+            "devices are CUDA contexts, not measured placement — per-GPU attribution "
+            "is unavailable here"
+        )
+    return "\n".join(parts)
+
+
 def vram_holder_is_reclaimable(holder: Mapping[str, Any]) -> bool:
     """Only an orphan may be killed from the panel. See D23."""
     return str(holder.get("classification") or "") == "orphan"
