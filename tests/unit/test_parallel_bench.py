@@ -460,3 +460,108 @@ async def test_a_failed_sweep_still_puts_the_rig_back(monkeypatch: Any) -> None:
     report = await runner.run(rec, streams=(1,), max_tokens=8)
     assert report.levels[0].error is not None
     assert manager.unloads == [rec.id]
+
+
+# ---------------------------------------------------------------------------
+# The bug the first live run found
+# ---------------------------------------------------------------------------
+
+
+async def test_the_sweep_does_not_refuse_itself_at_its_own_second_check(
+    monkeypatch: Any,
+) -> None:
+    """The re-check inside the lock must not see the marker it just set.
+
+    Found on the reference rig, first real run: `Benchmarker.exclusive` sets
+    `_benchmarking` for this run, `_busy_reason` reports "a benchmark of X is
+    running", and the re-check inside the lock refused the sweep it had itself
+    started. Every run failed with a message about itself. Inside the lock that
+    arm is us; the arms that still matter come off `busy_snapshot`.
+    """
+    runner, manager, rec, _engine = make_runner(monkeypatch=monkeypatch)
+
+    def real_busy_reason() -> str | None:
+        benchmarking = getattr(manager.benchmarker, "benchmarking", None)
+        if benchmarking:
+            return f"a benchmark of {benchmarking} is running"
+        return None
+
+    manager._busy_reason = real_busy_reason  # type: ignore[method-assign]
+    report = await runner.run(rec, streams=(1,), max_tokens=8)
+    assert report.levels, "the sweep refused itself"
+
+
+async def test_a_real_request_landing_between_the_two_checks_still_refuses(
+    monkeypatch: Any,
+) -> None:
+    """...and the re-check is still a re-check: a stream that arrived wins."""
+    runner, manager, rec, _engine = make_runner(monkeypatch=monkeypatch)
+    manager.busy_snapshot = lambda: {  # type: ignore[method-assign]
+        "active_requests": 2,
+        "busy_models": [{"model_id": "pub/other", "active_requests": 2}],
+        "loading": [],
+        "testing": None,
+    }
+    with pytest.raises(ModelBusyError) as excinfo:
+        await runner.run(rec, streams=(1,), max_tokens=8)
+    assert "pub/other" in excinfo.value.message
+    assert manager.loads == []
+
+
+def test_busy_reason_from_covers_the_three_arms_that_are_not_us() -> None:
+    from studioforge.core.parallel_bench import busy_reason_from
+
+    idle = {"busy_models": [], "loading": [], "testing": None}
+    assert busy_reason_from(idle) is None
+    assert "serving requests" in (
+        busy_reason_from({**idle, "busy_models": [{"model_id": "m", "active_requests": 1}]}) or ""
+    )
+    assert "load is in flight" in (busy_reason_from({**idle, "loading": ["m"]}) or "")
+    assert "smoke test" in (busy_reason_from({**idle, "testing": "m"}) or "")
+
+
+async def test_the_row_names_the_engine_that_actually_served_the_sweep(
+    monkeypatch: Any,
+) -> None:
+    """A record pins no engine, so the first live run wrote every row with a null tag.
+
+    Migration 005 stores engine_tag precisely so a run can be retired when the
+    llama.cpp build changes, and a null makes that impossible.
+    """
+    runner, manager, rec, _engine = make_runner(monkeypatch=monkeypatch)
+    original = manager.load
+
+    async def load_with_engine(name: str, **kwargs: Any) -> InstanceInfo:
+        info = await original(name, **kwargs)
+        info.engine_tag = "b10425"
+        return info
+
+    manager.load = load_with_engine  # type: ignore[method-assign]
+    report = await runner.run(rec, streams=(1,), max_tokens=8)
+    assert report.engine_tag == "b10425"
+    assert manager.db.rows[0]["engine_tag"] == "b10425"
+
+
+async def test_the_active_engine_is_the_last_resort_for_the_tag(monkeypatch: Any) -> None:
+    """Nothing pins an engine on a normal rig, so without this the tag stays null."""
+
+    class ActiveEngine:
+        tag = "b10441"
+
+    class EngineManager:
+        def active(self) -> ActiveEngine:
+            return ActiveEngine()
+
+    rec = record("pub/dense-8b", dense_meta(32768), mtime=NOW, size_bytes=8 * GB)
+    manager = StubManager(rec)
+    benchmarker = Benchmarker(manager, probe=manager.planner.probe)  # type: ignore[arg-type]
+    runner = ParallelBenchmarker(
+        manager,  # type: ignore[arg-type]
+        benchmarker,
+        db=manager.db,
+        probe=manager.planner.probe,
+        engine_manager=EngineManager(),
+    )
+    monkeypatch.setattr(parallel_bench, "httpx", FakeHttpx(FakeEngine()))
+    report = await runner.run(rec, streams=(1,), max_tokens=8)
+    assert report.engine_tag == "b10441"

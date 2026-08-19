@@ -120,6 +120,27 @@ def build_prompt(target_tokens: int, *, stream_index: int = 0) -> str:
 _METRIC_RE = re.compile(r"^llamacpp:(\w+)\s+([\d.eE+-]+)\s*$")
 
 
+def busy_reason_from(snapshot: Mapping[str, Any]) -> str | None:
+    """The busy sentence for a snapshot, minus the "a benchmark is running" arm.
+
+    ``ModelManager._busy_reason`` builds the same sentence and adds that arm on
+    the end. Inside :meth:`Benchmarker.exclusive` the running benchmark is this
+    call, so the extra arm would refuse every sweep at its own second check --
+    which is exactly what the first live run did.
+    """
+    busy = list(snapshot.get("busy_models") or [])
+    if busy:
+        names = ", ".join(f"{b['model_id']} ({b['active_requests']} in flight)" for b in busy)
+        return f"{names} is serving requests"
+    loading = list(snapshot.get("loading") or [])
+    if loading:
+        return f"a model load is in flight ({', '.join(loading)})"
+    testing = snapshot.get("testing")
+    if testing:
+        return f"a smoke test of {testing} is running"
+    return None
+
+
 def parse_metrics(text: str) -> dict[str, float]:
     """llama.cpp's Prometheus text format as ``{name: value}``.
 
@@ -311,11 +332,17 @@ class ParallelBenchmarker:
         *,
         db: Any = None,
         probe: Any = None,
+        engine_manager: Any = None,
     ) -> None:
         self.manager = manager
         self.benchmarker = benchmarker
         self.db = db if db is not None else getattr(manager, "db", None)
         self._probe = probe if probe is not None else manager.planner.probe
+        # Only ever asked for the ACTIVE engine tag. The supervisor deliberately
+        # knows nothing about the engine manager, so `InstanceInfo.engine_tag`
+        # is None unless the record pins one -- which is almost never, and which
+        # is why the first live run wrote every observation with a null tag.
+        self._engine_manager = engine_manager
 
     # -- placement --------------------------------------------------------
 
@@ -340,8 +367,23 @@ class ParallelBenchmarker:
             )
         return list(found.devices)
 
-    def _refuse_if_busy(self) -> None:
-        reason = self.manager._busy_reason()
+    def _refuse_if_busy(self, *, ignore_benchmark: bool = False) -> None:
+        """Refuse while anything else is using the rig (the D36 rule).
+
+        ``ignore_benchmark`` drops the "a benchmark is running" arm, and exists
+        because of a bug the first live run found: the re-check *inside*
+        :meth:`Benchmarker.exclusive` saw the marker that context manager had
+        just set for this very run and refused itself, so no sweep could ever
+        get past its own second check. Inside the lock, "a benchmark is running"
+        is a statement about us; the arms that still matter are a model serving,
+        a load in flight and a smoke test, and those come straight off
+        ``busy_snapshot``.
+        """
+        reason = (
+            busy_reason_from(self.manager.busy_snapshot())
+            if ignore_benchmark
+            else self.manager._busy_reason()
+        )
         if reason is None:
             return
         raise ModelBusyError(
@@ -404,8 +446,9 @@ class ParallelBenchmarker:
 
         async with self.benchmarker.exclusive(record.id):
             # Re-checked inside the lock: the gap between the first check and
-            # taking the slot is exactly where a JIT request lands.
-            self._refuse_if_busy()
+            # taking the slot is exactly where a JIT request lands. The
+            # benchmark arm is skipped because inside the lock that arm is us.
+            self._refuse_if_busy(ignore_benchmark=True)
             return await self._run_locked(
                 record,
                 mode=mode,
@@ -556,6 +599,16 @@ class ParallelBenchmarker:
             "max_parallel": int(slots),
         }
 
+    def _active_engine_tag(self) -> str | None:
+        """The engine this server is running, or ``None`` if it cannot be asked."""
+        if self._engine_manager is None:
+            return None
+        try:
+            active = self._engine_manager.active()
+        except Exception:  # noqa: BLE001 - a label is not worth failing a run for
+            return None
+        return getattr(active, "tag", None)
+
     def _gpu_class(self) -> str | None:
         try:
             return throughput.gpu_class(self._probe.list_gpus())
@@ -581,6 +634,15 @@ class ParallelBenchmarker:
         base = self.manager.supervisor.base_url(instance.model_id)
         if base is None:
             raise ModelLoadError(f"model '{record.id}' is not serving after load")
+        # The engine that ACTUALLY served the sweep, not the one the record
+        # pins -- which is normally nothing, so the first live run recorded
+        # every row with a null tag. A llama.cpp build can change the batching
+        # behaviour being measured, so an observation that cannot name its
+        # engine cannot be retired when that engine is replaced (005's comment
+        # says exactly this, and the code was not keeping the promise).
+        report.engine_tag = (
+            instance.engine_tag or record.settings.engine_tag or self._active_engine_tag()
+        )
 
         total = len(levels) or 1
         async with httpx.AsyncClient(
@@ -822,7 +884,11 @@ def for_state(state: Any) -> ParallelBenchmarker:
         benchmarker = Benchmarker(state.manager, probe=state.probe)
         state.benchmarker = benchmarker
     runner = ParallelBenchmarker(
-        state.manager, benchmarker, db=getattr(state, "db", None), probe=state.probe
+        state.manager,
+        benchmarker,
+        db=getattr(state, "db", None),
+        probe=state.probe,
+        engine_manager=getattr(state, "engine_manager", None),
     )
     state.parallel_benchmarker = runner
     return runner

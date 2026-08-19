@@ -84,11 +84,22 @@ StudioForge management plane: control a GPU-only llama.cpp serving host.
 Use these tools to see what models exist, load/unload them, watch VRAM, find
 and download new ones, and change configuration.
 
-START WITH list_models. It returns a catalog sorted newest-download-first. Pass
-limit=5 when the user means "the model I just got". Each model's `recommended`
-block is the load to take by default: the optimal settings on this rig's best
-pair of GPUs, computed as if those cards were free, with `load_args` you pass to
-load_model verbatim -- it carries `devices`, so the placement comes with it.
+TWO WAYS TO LOAD, and the first is usually the one you want.
+
+If what you know is the CONTEXT you need, say so and stop:
+load_recommended(model_id, ctx_size=262144) picks the GPUs, the KV cache type
+and the slot count and loads at EXACTLY that context per conversation. It is the
+only load path that never quietly shrinks your window: if the window does not
+fit, you get a structured refusal naming, per set of cards, the largest context
+that would work and what is in the way -- so ask again with that number. Above
+the model's trained window it refuses with the number that would be accepted.
+
+If what you know is the HARDWARE, START WITH list_models. It returns a catalog
+sorted newest-download-first. Pass limit=5 when the user means "the model I just
+got". Each model's `recommended` block is the load to take by default: the
+optimal settings on this rig's best pair of GPUs, computed as if those cards were
+free, with `load_args` you pass to load_model verbatim -- it carries `devices`,
+so the placement comes with it.
 
 `placements` answers "which hardware should this model use" for every mode of
 this box (on this rig: dual_5090, dual_3090, all_gpus, single_5090), each with
@@ -104,9 +115,14 @@ Settings are chosen QUALITY FIRST: the best KV cache that reaches the server's
 context floor, then the largest context at that quality, then whatever slots
 fit. A 4-bit K cache is never chosen automatically, and a doubled window is not
 traded for a quantized cache. Every number you need is already there: which GPUs,
-how many conversations the placement sustains (max_parallel, parallel_limited_by
-saying what caps it), tokens/second for one stream at an ordinary ~8k of context
-(est_gen_tps) and with the window nearly full (est_gen_tps_full_ctx). The model's
+how many concurrent conversations fit (max_parallel, parallel_limited_by saying
+what caps it) and how many are WORTH RUNNING (recommended_parallel, which is what
+load_args asks for -- match your own client concurrency to it), tokens/second for
+one stream at an ordinary ~8k of context (est_gen_tps) and with the window nearly
+full (est_gen_tps_full_ctx). recommended_parallel_basis is 'measured' only when
+benchmark_parallel has swept that model on those cards at that context; otherwise
+it is a bandwidth estimate. benchmark_parallel takes minutes, needs an idle
+server, and is worth running once per model per set of cards. The model's
 attention_kind explains why its context tiers are priced the way they are:
 'iswa' and 'hybrid' models keep only a fraction of the window in KV, so their
 huge contexts stay cheap. Speeds are estimates unless confidence says otherwise
@@ -127,10 +143,11 @@ fit verdicts and the exact context each GPU placement reaches ->
 download_model(repo_id, quant). The download runs in the background; the model
 appears in list_models when it lands.
 
-BEFORE load_model OR test_model ON A SHARED SERVER: check server_status.busy.
-A load that must evict a model mid-request is REFUSED (pass force=true only if
-you can see what you are interrupting), and test_model refuses outright while
-anything is serving, loading or benchmarking -- both come back with
+BEFORE load_model, load_recommended, test_model OR benchmark_parallel ON A
+SHARED SERVER: check server_status.busy. A load that must evict a model
+mid-request is REFUSED (pass force=true only if you can see what you are
+interrupting), and test_model and benchmark_parallel refuse outright while
+anything is serving, loading or benchmarking -- all of them come back with
 retry_after_s, so waiting is usually cheaper than retrying.
 
 WHEN VRAM IS MISSING: server_status reports free VRAM per GPU plus who is

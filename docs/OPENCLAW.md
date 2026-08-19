@@ -55,11 +55,11 @@ Then register it as a local stdio MCP server in OpenClaw's config:
 }
 ```
 
-`sfctl mcp` merges **two** upstream toolsets into one list of 24 tools:
+`sfctl mcp` merges **two** upstream toolsets into one list of 26 tools:
 
 | Tools | Source | Available when the main server is wedged? |
 | --- | --- | --- |
-| `list_models`, `model_options`, `model_info`, `load_model`, `unload_model`, `test_model`, `search_models`, `repo_details`, `download_model`, `delete_model`, `server_status`, `connection_info`, `get_config`, `set_config` | main app | no |
+| `list_models`, `model_options`, `model_info`, `load_model`, `load_recommended`, `unload_model`, `test_model`, `benchmark_parallel`, `search_models`, `repo_details`, `download_model`, `delete_model`, `server_status`, `connection_info`, `get_config`, `set_config` | main app | no |
 | `restart_server`, `kill_model`, `nuke_all_models`, `reclaim_orphan_engines`, `tail_logs`, `gpu_status`, `rollback_update`, `recovery_health`, `recovery_get_config`, `recovery_set_config` | watchdog sidecar | **yes** |
 
 That split is the point: when the main server locks up, OpenClaw still holds working tools to
@@ -201,6 +201,45 @@ depth, the active engine tag — and who is holding the VRAM (next section).
 answers on, tailnet first (those survive network changes), with the OpenAI base URL alongside.
 
 ---
+
+## "I need a 262144-token window" — `load_recommended`
+
+When what you know is the *window* rather than the hardware, skip the table entirely:
+
+```
+load_recommended(model_id="pub/big-model", ctx_size=262144)
+```
+
+The server walks its hardware modes in headline order, picks the KV cache type and the slot count
+under the same quality-first policy the catalog uses, and loads at **exactly** that context per
+conversation. `prefer_mode` ("dual_3090") pins the cards if you care.
+
+It is the one load path that never quietly shrinks your window. Everywhere else a context that does
+not fit steps down to one that does; here a window that does not fit is a structured refusal listing,
+per set of cards, the largest context that *would* work and what is in the way — a model that is
+serving (with `retry_after_s`, so waiting is the right move), memory held by something that is not
+us, or the model's own trained window. Ask again with the number it names and it will load. Above
+`n_ctx_train` it is a `400` carrying that number, because serving past the trained window needs RoPE
+scaling and degrades quality.
+
+Use `list_models` -> a `placements[]` row -> `load_model` when you want to choose the hardware
+yourself. Use `load_recommended` the rest of the time.
+
+## How many conversations at once? — `recommended_parallel`
+
+Every row carries two slot numbers. `max_parallel` is how many slots **fit**;
+`recommended_parallel` is how many are **worth running**, and it is the one `load_args.parallel`
+asks for. Match your client concurrency to the second.
+
+`recommended_parallel_basis` says where it came from. `estimated` is a bandwidth calculation;
+`measured` means somebody ran `benchmark_parallel(model_id)`, which loads the model once, sweeps 1 /
+2 / 4 / 8 concurrent requests and records the curve. On this rig a 1.5B model whose estimate said 8
+slots measured out at 2: aggregate throughput kept climbing to 8, but a single conversation had
+collapsed to 27% of its solo speed by then. That is the trade the estimate could not see.
+
+`benchmark_parallel` takes minutes and refuses outright on a busy server — the contention *is* the
+measurement — so read `server_status.busy` first, and expect to run it once per model per set of
+cards rather than routinely.
 
 ## "Which hardware should I use for this model?"
 

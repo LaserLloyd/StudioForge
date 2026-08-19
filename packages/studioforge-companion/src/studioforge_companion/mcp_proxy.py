@@ -98,6 +98,11 @@ MANAGEMENT_FALLBACK_TOOLS: tuple[tuple[str, str], ...] = (
     ("model_options", "Every loading option for ONE model: all context sizes, with speeds."),
     ("model_info", "Full detail for one model, including what it is actually running as."),
     ("load_model", "Load a model into VRAM now, returning once it is serving."),
+    (
+        "load_recommended",
+        "Say the model and the context you need; the server picks the GPUs, the KV "
+        "cache and the slot count and loads at exactly that context.",
+    ),
     ("unload_model", "Unload a model, freeing its VRAM immediately."),
     ("search_models", "Find GGUF repos on HuggingFace. One compact row per repo."),
     (
@@ -111,6 +116,11 @@ MANAGEMENT_FALLBACK_TOOLS: tuple[tuple[str, str], ...] = (
         "Live snapshot: VRAM, who is holding it, loaded models, queue, engine.",
     ),
     ("test_model", "Smoke-test a model end to end and report its speed."),
+    (
+        "benchmark_parallel",
+        "Measure how many concurrent slots this model is worth running, so "
+        "recommended_parallel stops being an estimate.",
+    ),
     ("get_config", "Read the effective configuration, with secrets redacted."),
     ("set_config", "Change configuration values, validate them, and persist to disk."),
     ("connection_info", "Every address this server can be reached on, best first."),

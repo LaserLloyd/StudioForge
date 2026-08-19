@@ -12,6 +12,10 @@ table of rows the agent hands straight back.
 ## For an LLM: the whole workflow
 
 ```
+# I know the window I need, and not much else:
+load_recommended(model_id, ctx_size=262144)   -> loaded at exactly that, or told why not
+
+# I want to choose the hardware:
 list_models()                                 -> catalog, newest download first
 load_model(**model["recommended"]["load_args"])  -> loaded, serving
 server_status()                               -> confirm; read busy before you load again
@@ -30,9 +34,13 @@ window, more concurrency, or the `load_args` of a `placements` mode other than t
 - `fits: false` means it will not load *right now*. Check that row's `if_gpus_idle`: if that says
   `fits: true`, the VRAM exists and something else is holding it — `unload_model` on another model
   makes the row available.
-- Match your client concurrency to `max_parallel`. Beyond it, llama.cpp queues rather than
-  refusing, so extra streams show up as latency, not errors (watch `requests_deferred` in
-  `/api/status`).
+- Match your client concurrency to `recommended_parallel`, not to `max_parallel`. The first is how
+  many slots are worth running; the second is how many fit. Beyond `max_parallel`, llama.cpp queues
+  rather than refusing, so extra streams show up as latency, not errors (watch `requests_deferred`
+  in `/api/status`).
+- If all you know is "I need a 256k window", skip the table: `load_recommended(model_id, ctx_size)`
+  picks the cards, the KV cache and the slot count for you and loads at **exactly** that context,
+  or refuses with the largest context each set of cards would take.
 - A row's `parallel` is the most its placement sustained *when the row was built*. If VRAM has
   moved by the time you call `load_model`, the `507` names the slot count that fits now at the
   same window (`max_parallel_that_fits`, and the first suggestion) -- the window outranks the
@@ -48,6 +56,11 @@ window, more concurrency, or the `load_args` of a `placements` mode other than t
 | `model_options(model_id)` (MCP) | Every context tier for one model. |
 | `GET /api/catalog` | The same data over HTTP. `?compact=1`, `?model=<id>`, `?refresh=1`. |
 | `GET /api/models/{id}/profiles` | The *hardware-mode* cut instead of the context cut: the same `placements` list, in full, with every mode's `load_args`. |
+| `load_recommended(model_id, ctx_size)` (MCP) | Name the model and the window; the server picks the rest and loads at **exactly** that context, or refuses with numbers. |
+| `POST /api/models/{id}/load-recommended` | The same over HTTP: `{"ctx_size": 262144, "prefer_mode": "dual_3090"}`. |
+| `benchmark_parallel(model_id)` (MCP) | Measure the slot knee, so `recommended_parallel` stops being an estimate. |
+| `POST /api/models/{id}/benchmark-parallel` | The same as a background job on `/api/benchmark/jobs/{id}`. |
+| `GET /api/models/{id}/parallel-observations` | The measured rows behind `recommended_parallel`. |
 
 Both catalog surfaces are built by `core/catalog.py:build_catalog` and cached for 20 seconds:
 `fits` is a claim about free VRAM at an instant, and a stale yes sends an agent into a load that
@@ -66,6 +79,8 @@ gets refused. `refresh` bypasses it — worth doing right after loading or unloa
   "vram_mb": 27416,
   "max_parallel": 2,
   "parallel_limited_by": "vram",
+  "recommended_parallel": 2,
+  "recommended_parallel_basis": "estimated",
   "est_prompt_tps": 1190.4,
   "est_gen_tps": 100.1,
   "est_gen_tps_full_ctx": 71.8,
@@ -96,8 +111,13 @@ the same thing twice.
 (DECISIONS.md D4), so the engine is launched with `ctx_per_slot * parallel` and every slot really
 gets the number in the row.
 
-`vram_mb` is sized at this row's own `max_parallel`, so it describes the load `load_args` produces
-— not whatever slot count the planner happened to pick while checking the fit.
+`vram_mb` is sized at this row's own `max_parallel`, so it describes the widest load this
+placement could carry — not whatever slot count the planner happened to pick while checking the fit.
+
+`max_parallel` is how many slots **fit**; `recommended_parallel` is how many are **worth running**,
+and it is the one `load_args.parallel` asks for. Until a parallel benchmark has run they are the
+same number and the basis reads `estimated`
+— see [recommended_parallel](#recommended_parallel--how-many-are-worth-running-d37).
 
 **Two generation speeds, because one number cannot describe the row.** Every decode step re-reads
 the KV cache, so generation slows as the window fills. `est_gen_tps` is one stream with about 8k
@@ -190,6 +210,83 @@ carries an estimated slot count when `models.default_parallel` is `"auto"`. With
 configured — a legitimate choice, and what this rig runs — every plan reports one slot and the whole
 concurrency column would collapse to 1. "What could this placement sustain" is well defined
 regardless of current policy.
+
+### recommended_parallel — how many are *worth* running (D37)
+
+`max_parallel` is how many slots **fit**. `recommended_parallel` is how many are **worth running**,
+and it is the number `load_args.parallel` asks for. `recommended_parallel_basis` says where it came
+from:
+
+| basis | meaning |
+| --- | --- |
+| `measured` | a parallel benchmark swept this model on **these devices at this context**, and the rule below picked the level |
+| `estimated` | nobody has measured it; this is D17's bandwidth knee, clamped to `max_parallel` |
+
+**The rule, over a measured sweep:** the largest level in 1 / 2 / 4 / 8 whose per-stream rate is
+still at least **65%** of the solo rate *and* whose aggregate is at least **1.15x** the level below
+it — walked upward, stopping at the first level that fails. Stopping matters: past the knee the
+aggregate flattens, so a higher level can still beat its (depressed) predecessor by 15% and would
+promote a slot count the run has already shown to be useless.
+
+The two thresholds encode a priority, not a measurement. Aggregate throughput can always be bought
+with per-stream latency; this server's answer is that a conversation running at under two-thirds of
+its solo speed is a conversation the user notices, and a level that adds under 15% is the plateau.
+
+`"measured"` is meant literally: a sweep on other cards, or at another context, is **not** used. The
+knee is set by how many KV bytes each busy slot reads per decode step, so a run at 8192 says nothing
+about the same model at 131072, and a run on one card says nothing about two.
+
+**With no measurement, `recommended_parallel` equals `max_parallel`.** That is not redundancy, it is
+the honest statement that D17's knee is already folded into `max_parallel` and there is nothing more
+to say until somebody measures. The compact catalog view drops both keys while they are equal, so
+they cost nothing until they mean something.
+
+### Recommended parallel — an example run
+
+Measured on the reference rig, 2026-08-19, on a scratch instance (ports 1256/8102/1257, its own data
+directory, engine `b10425` copied read-only) so the live server was never touched.
+`Qwen2.5-1.5B-Instruct-Q4_K_M`, **one RTX 3090**, 8192 tokens per slot, f16 KV, launched with 8
+slots, 512-token prompts and 192 generated tokens per request:
+
+| N | per-stream t/s | aggregate t/s | p50 (s) | p95 (s) | achieved batch |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 302.8 | 302.8 | 0.41 | 0.41 | 1.00 |
+| 2 | 225.3 | 425.3 | 0.46 | 0.49 | 1.84 |
+| 4 | 134.5 | 436.0 | 0.83 | 1.00 | 3.46 |
+| 8 | 83.3 | 576.9 | 1.57 | 1.77 | 6.03 |
+
+-> **`recommended_parallel: 2` (measured)** — *"at 4 each stream drops to 44% of its solo speed
+(floor 65%)"*. The estimate for this placement was **8**.
+
+Read the last column first: `achieved batch` rising 1.00 -> 1.84 -> 3.46 -> 6.03 is the proof that
+the requests really were batched into shared decode steps rather than queued. Without it the table
+would be indistinguishable from eight requests served one after another.
+
+Then read the two throughput columns against each other. This is exactly the shape D17 predicted and
+exactly why the knee needed measuring: **the aggregate never stops climbing** — 8 slots move 1.9x
+the tokens 1 slot does — while a single conversation collapses to 27% of its solo speed. A rule that
+maximised aggregate would pick 8, and every user would experience a model three times slower than
+the card can run it. The knee in the *useful* sense arrives at 2.
+
+The same model on **two RTX 3090s** at that placement's own optimal (32768 per slot, f16) holds only
+two slots, so the sweep is two rows and the recommendation is capped rather than measured at a knee:
+
+| N | per-stream t/s | aggregate t/s | p95 (s) | achieved batch |
+| --- | --- | --- | --- | --- |
+| 1 | 301.7 | 301.7 | 0.41 | 1.00 |
+| 2 | 230.5 | 433.8 | 0.48 | 1.84 |
+
+-> `recommended_parallel: 2` (measured), *"2 is the most this placement can hold"*, with levels 4 and
+8 reported as **not measured**: N requests against fewer than N slots measure a queue, not batching.
+
+Afterwards `GET /api/models/{id}/profiles` showed `dual_3090` at basis `measured` and every other
+mode still `estimated` — which is the strictness above, working.
+
+**How to run it:** `benchmark_parallel(model_id)` (MCP), `POST /api/models/{id}/benchmark-parallel`
+(a background job on `/api/benchmark/jobs/{id}`), or "Measure parallel" in the Models tab. It loads
+the model once, sweeps, records a row per level, and leaves the rig as it found it. It refuses
+outright while anything is serving, loading, testing or benchmarking — on a busy server the numbers
+are the contention, not the model.
 
 ### Speed — `core/throughput.py`
 
@@ -416,6 +513,41 @@ honoured verbatim, and the only correct action is to show the size of the choice
 
 ---
 
+## Loading at an exact context: `load_recommended` (D37)
+
+```
+load_recommended(model_id, ctx_size=262144)                    # MCP
+POST /api/models/{id}/load-recommended {"ctx_size": 262144}    # HTTP
+```
+
+Name the model and the window. The server walks the hardware modes in headline order (`dual_5090` ->
+`dual_3090` -> `all_gpus` -> `single_5090`, or `prefer_mode`), asks the planner for **exactly** that
+context per slot under the quality-first KV rule with `parallel = recommended_parallel`, and loads
+the first placement that fits. Every mode is tried with eviction off before any is tried with it on,
+and a model that is serving is never a candidate either way.
+
+**This is the one load path that is strict about context.** Everywhere else a window that does not
+fit steps down the halving ladder (D14), because a roomier window is a nicety. Here the window is the
+request: an agent that asked for 262144 because its transcript is 200k long is not helped by silently
+getting 131072 and finding out mid-conversation. So:
+
+| Situation | Answer |
+| --- | --- |
+| Above `n_ctx_train` | `400`, `param: "ctx_size"`, naming the number that would be accepted |
+| No placement reaches it | `507` with a `modes` list — per mode, the largest context that *would* fit and what is in the way |
+| A serving model is what is in the way | the same `507`, plus `busy_models` and `retry_after_s` |
+| Nothing transient is in the way | the same `507` with `retry_after_s: null` — "try again later" is bad advice when nothing will change |
+
+`kv_min` ("give me 262144, but not at the cost of the cache") refuses a placement that only reaches
+the window by quantizing, and walks on to one that can afford it.
+
+Measured live on the scratch instance, 2026-08-19: `{"ctx_size": 32768}` loaded at exactly 32768 on
+`[0, 1]` with 2 slots and an f16 cache; `{"ctx_size": 65536}` against a 32768-token model returned
+the `400` above; `{"ctx_size": 12345, "prefer_mode": "dual_3090"}` loaded at exactly 12345 on
+`[2, 3]` with 6 slots.
+
+---
+
 ## Placements: which GPUs should this model use
 
 `hardware_modes()` derives the modes from the inventory rather than hard-coding CUDA indices, so a
@@ -441,6 +573,7 @@ the way *right now* travels beside it:
 | `fits_now` | Would `optimal.load_args` load this second, without disturbing anything? Planned at exactly the slot count `load_args` asks for. |
 | `would_evict` | The model ids this placement would have to stop if it were allowed to. May be empty beside `fits_now: false` — something the planner may not touch (a pinned model, a busy one) can be what is in the way. |
 | `fits_now_ctx` | The largest context tier that does fit on that mode as things stand, or `null`. |
+| `optimal.recommended_parallel` | Slots worth running on this mode, with `recommended_parallel_basis` (`measured` / `estimated`). This is what `optimal.load_args.parallel` asks for. |
 | `ranking` | Any of `fastest`, `largest_context`, `cheapest` (fewest cards reaching the largest context). |
 | `if_unpinned` | Present only when saved settings pin a KV type: what the same cards reach without the pin. |
 
@@ -555,7 +688,11 @@ other filters, which is usually what "the model I just got" means.
   planned against live VRAM, so the worst case is a refusal with numbers, never a degraded load.
 - The concurrency bound's VRAM half is exact, but the knee inherits D17's approximations:
   `CTX_FILL_FRACTION = 0.5` and the MoE knee derate of 0.5 are deliberate, unmeasured, and err
-  toward *fewer* slots.
+  toward *fewer* slots. `recommended_parallel_basis: "measured"` is the signal that a row has escaped
+  that estimate; one 1.5B model on one 3090 has, and nothing else on this rig yet has.
+- The slot rule's two thresholds (65% of solo per-stream, +15% aggregate per doubling) are a stated
+  priority, not a measurement. A host that genuinely wants maximum aggregate throughput would set
+  them differently, and there is no config knob for that today.
 - A model whose per-layer KV geometry cannot be derived reports `attention_kind: "unknown"` and one
   slot. Read that as "distrust these numbers", not as "this model is cheap".
 - A model whose GGUF metadata could not be parsed at all is listed with an empty `options` list and

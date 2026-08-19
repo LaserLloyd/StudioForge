@@ -2292,3 +2292,212 @@ crossover; `test_benchmark.py` pins that the default mode list did not change le
   `InstanceInfo` carry `speculative` and the resolved `split_mode`, and
   `capabilities.engine_feature_rows` renders the Engine card, but the surfaces themselves belong to
   work packages running alongside this one.
+
+---
+
+## D37 -- How many slots are worth running, and loading at exactly the context you asked for
+
+**Problem.** Two things the server could not say, and a user's sentence that named both:
+
+> *"do research and implement recommended parallel for processing (example benchmark); also include
+> a Load Recommended option, for 64k, 128, 256, 512k. So it can simply specify the model and context
+> needed, and the server works the rest, or returns an error if it can't load the requested context
+> for some reason."*
+
+*The slot count was arithmetic pretending to be advice.* D17 gave every placement a `max_parallel`
+-- the smaller of an exact VRAM bound and a **knee** derived from memory bandwidth -- and said so
+out loud: `CTX_FILL_FRACTION = 0.5` and the MoE derate of 0.5 are "deliberate approximations in the
+safe direction, not measurements -- the real curves want a benchmark this rig has not run". That
+number then went into `load_args.parallel`, so every catalog row was quietly advising a slot count
+nobody had ever checked. `scripts/bench_parallel.py` existed to check it and had to be driven by
+hand against an already-loaded model.
+
+*And loading meant knowing the hardware.* Every path into a load was shaped around "which cards, at
+what settings". An agent whose actual problem is "my transcript is 200k tokens long" had to read a
+table, pick a placement, and hope. Worse, D14's context ladder is a *halving* ladder: ask for a
+window that does not fit anywhere and you silently get half of it, which for a transcript-sized
+request is a failure discovered mid-conversation.
+
+### The research
+
+Batch-1 decode is memory-bandwidth bound. Each step streams the active weights through the memory
+system **once** regardless of how many sequences are in the batch, then reads each busy slot's KV
+cache on top. So while weight traffic dominates, N busy slots amortise one weight read across N
+tokens: aggregate throughput rises close to linearly and per-slot throughput falls slowly. Once the
+N slots' KV reads match the weight read, another slot buys nothing and costs VRAM and latency --
+D17's knee, `active_weights / (ctx_fill * kv_bytes_per_token)`.
+
+Sources, all of which say the useful slot count is workload- and hardware-specific:
+
+* <https://github.com/ggml-org/llama.cpp/discussions/4130> -- llama.cpp's own explanation of why
+  continuous batching scales the aggregate.
+* <https://markaicode.com/architecture/llamacpp-system-design-architecture-1158/> -- a system-design
+  writeup measuring roughly **3.8x aggregate** over sequential decode from slot batching on a single
+  T4.
+* <https://manpages.debian.org/testing/llama.cpp-tools/llama-server.1.en.html> -- `--parallel`,
+  `--cont-batching`, `/slots`, and the `/metrics` counter `llamacpp:n_busy_slots_per_decode`.
+* <https://www.promptsicle.com/tips/boosting-llama-server-performance-with-batch-settings/> --
+  the `--batch-size` / `--ubatch-size` dimension that sits underneath all of it.
+
+MoE complicates it: expert fan-out grows with batch (at batch N roughly
+`min(N * n_expert_used, n_expert)` experts are touched), so weight traffic stops being flat and the
+knee arrives sooner. D17 derates it by half. That is still a guess, and a guess a measurement
+replaces.
+
+**Quality is not involved.** A slot count changes nothing about the answer a model gives; what each
+conversation gets is `ctx_per_slot`, and that is per slot by construction (D4). "Recommended
+parallel" is a throughput-and-latency decision only, which is why it can be benchmarked and why it
+never touches the quality-first KV choice (D36).
+
+### Decision
+
+**1. `recommended_parallel` beside `max_parallel`, everywhere.** `max_parallel` is how many slots
+**fit**; `recommended_parallel` is how many are **worth running**, and it is the number
+`load_args.parallel` now asks for -- on every `options` row, every `placements[*].optimal` and the
+entry's `recommended`. `fits_now` is planned at that same number, so the table still describes
+exactly the call it hands the caller. `recommended_parallel_basis` is `"measured"` or `"estimated"`,
+and `"measured"` is meant literally: a sweep on other cards, or at another context, is not used,
+because the knee is set by the KV bytes a busy slot reads per step.
+
+**The rule** (`core/parallel.py`): the largest level in 1 / 2 / 4 / 8 whose per-stream rate is still
+at least **65%** of the solo rate **and** whose aggregate is at least **1.15x** the level below,
+walked upward and stopping at the first failure. Stopping is the substantive part -- past the knee
+the aggregate flattens, so a higher level can still beat its own depressed predecessor by 15%, and
+promoting it would mean the run arguing against itself. The two thresholds are a stated *priority*,
+not a measurement: aggregate can always be bought with per-stream latency, and this server's answer
+is that a conversation at under two-thirds of its solo speed is one the user notices.
+
+**With no measurement, `recommended_parallel` equals `max_parallel`,** because D17's knee is already
+folded into `max_parallel`. That is written down rather than hidden: the field earns its keep the
+moment a run exists, and until then the compact catalog view drops both keys so they cost nothing.
+
+**2. The parallel benchmark** (`core/parallel_bench.py`), productising the D17 harness. It loads the
+model **once** at the placement being measured with as many slots as it holds, then fires N
+concurrent non-streamed completions for each N and records per-stream t/s (median of the streams'
+own rates, not the aggregate over N -- one straggler would otherwise read as a knee), aggregate t/s,
+p50/p95 latency, and a row per level in the new `parallel_observations` table (migration 005).
+
+Three method decisions:
+
+* **One load for the sweep.** Reloading between levels measures four cold caches and spends most of
+  the run on loading. The one load asks for the *maximum* slots, and levels above what was launched
+  are reported as **not measured**: N requests against fewer than N slots measure a queue.
+* **Unique prompts per stream.** llama.cpp routes by prompt similarity (`--slot-prompt-similarity`,
+  which D17 raises above one slot), so identical prompts would land several streams on one slot's
+  prefix cache and the level would report the cost of a cache hit.
+* **The engine's decode counter is the control.** A client that sends 8 requests to a 1-slot server
+  still gets 8 answers, just serialized, and no throughput table can tell those runs apart. Each
+  level takes the delta in `llamacpp:n_decode_total` and reports `completion_tokens / decode_steps`
+  as `achieved_batch`. The `n_busy_slots_per_decode` gauge is recorded too but is *not* the control:
+  it is a cumulative average over the child's whole life, so every earlier level drags it down. A
+  run whose batch never rose says so in its notes.
+
+It refuses while anything is serving, loading, testing or benchmarking (D36's rule, and here the
+contention *is* the measurement), shares the placement benchmarker's one lock through a new
+`Benchmarker.exclusive()`, is cancelable between levels, and leaves the rig as it found it: a model
+it loaded is unloaded, a model that was resident is reloaded with the plan it had.
+
+**3. `load_recommended(model, ctx)`.** Name the model and the window. The manager walks the hardware
+modes in headline order (`dual_5090` -> `dual_3090` -> `all_gpus` -> `single_5090`, or
+`prefer_modes`), asks the planner for **exactly** that context per slot under the quality-first KV
+ladder with `parallel = recommended_parallel`, and loads the first placement that fits. **Every mode
+is tried with eviction off before any is tried with it on** -- D14's "a roomier window must never be
+the reason somebody else's model is unloaded", extended from context rungs to hardware modes -- and
+a busy model is never a candidate either way.
+
+**This is the one load path that is strict about context**, and that is the whole point of it. A
+window that does not fit is a `507` listing, per mode, the largest context that *would* work and
+what is in the way, with `retry_after_s` only when a model that is serving right now is the cause.
+Above `n_ctx_train` it is a `400` carrying the number that would be accepted. `kv_min` is the other
+half of strict: "give me 262144, but not at the cost of the cache" refuses a placement that only
+reaches the window by quantizing and walks on to one that can afford f16.
+
+Surfaces: MCP `load_recommended` / `benchmark_parallel`, `POST
+/api/models/{id}/load-recommended`, `POST /api/models/{id}/benchmark-parallel` (a background job on
+the existing `/api/benchmark/jobs` machinery), `GET /api/models/{id}/parallel-observations`, and in
+the Models tab a slot line per mode, a "Measure parallel" button per mode, and 64k / 128k / 256k /
+512k buttons plus a free-form field. The MCP benchmark tool is **synchronous**: there was no
+existing MCP benchmark job/poll pair to mirror, and adding two tools so an agent can poll something
+it runs once per model is worse than one tool that answers.
+
+### The example run
+
+Measured 2026-08-19 on the reference rig, on a scratch instance (ports 1256/8102/1257, its own data
+directory, engine `b10425` copied read-only) so the live server was never touched. Both 5090s were
+busy serving the live rig's embedding models, so this used the free 3090s.
+`Qwen2.5-1.5B-Instruct-Q4_K_M`, **one RTX 3090**, 8192 tokens/slot, f16 KV, launched with 8 slots,
+512-token prompts, 192 generated tokens per request:
+
+| N | per-stream t/s | aggregate t/s | p50 (s) | p95 (s) | achieved batch |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 302.8 | 302.8 | 0.41 | 0.41 | 1.00 |
+| 2 | 225.3 | 425.3 | 0.46 | 0.49 | 1.84 |
+| 4 | 134.5 | 436.0 | 0.83 | 1.00 | 3.46 |
+| 8 | 83.3 | 576.9 | 1.57 | 1.77 | 6.03 |
+
+**`recommended_parallel: 2` (measured)** -- *"at 4 each stream drops to 44% of its solo speed (floor
+65%)"*. **The estimate for this placement was 8.** Reproduced across three runs within 2%.
+
+This is the whole argument for the work package in one table. `achieved_batch` rising 1.00 -> 6.03
+proves the requests really shared decode steps. And the aggregate **never stops climbing** -- 8
+slots move 1.9x the tokens 1 slot does -- while a single conversation collapses to 27% of its solo
+speed. A rule that maximised aggregate would have picked 8 and every user would have experienced a
+model three times slower than the card can run it. D17's knee, which is a bandwidth crossover,
+lands at 8; the knee in the *useful* sense is at 2. Only a measurement could have found that gap.
+
+The same model on **two RTX 3090s** at that placement's own optimal (32768/slot, f16) holds two
+slots, so the sweep is two rows (301.7 -> 230.5 per stream, 301.7 -> 433.8 aggregate) and the answer
+is `2 (measured)`, *"2 is the most this placement can hold"*, with levels 4 and 8 reported as not
+measured. Afterwards `/profiles` showed `dual_3090` at basis `measured` and every other mode still
+`estimated` -- the strictness above, working on live data.
+
+Live checks of the load path on the same instance: `{"ctx_size": 32768}` loaded at exactly 32768 on
+`[0, 1]` with 2 slots and f16; `{"ctx_size": 65536}` against a 32768-token model returned the `400`;
+`{"ctx_size": 12345, "prefer_mode": "dual_3090"}` loaded at exactly 12345 on `[2, 3]` with 6 slots.
+
+**Two bugs the live run found that no unit test would have.** The busy re-check *inside* the
+exclusive lock read the `benchmarking` marker that lock had just set for this very run, so every
+sweep refused itself with a message about itself -- the first real run failed on it. And the
+observation rows recorded a null `engine_tag`, because `InstanceInfo.engine_tag` is only set when a
+record *pins* an engine, which is almost never; migration 005 stores that column precisely so a run
+can be retired when the llama.cpp build changes, and the code was not keeping the promise. Both are
+now pinned by tests that name the incident.
+
+**`scripts/bench_parallel.py` is kept as-is**, not rewritten as a thin CLI. It is a standalone
+single-file harness that talks to a *running* gateway over HTTP and needs nothing from this
+codebase, which is exactly what makes it useful against a server this build does not control -- an
+older install, a different machine, a hand-launched `llama-server`. Its header now points at the
+in-server benchmark as the thing to use here.
+
+### What pins it
+
+`tests/unit/test_parallel.py` (the rule's branches, the walk-stopping-at-the-knee case, the
+thresholds, the strict definition of "measured"), `tests/unit/test_parallel_bench.py` (the busy
+refusal, the shared lock, the decode-counter control, leave-as-found in all three of its shapes, the
+two live bugs), `tests/unit/test_load_recommended.py` (the mode walk, fits-now before eviction,
+never a busy model, the trained-window 400, the refusal's per-mode detail, `kv_min` both ways),
+`tests/unit/test_db.py` (the new table and its device filter), `tests/unit/test_catalog.py` and
+`tests/unit/test_placements.py` (the column, that a sweep on other cards does not steer it, that
+`load_args` follows the recommendation), `tests/unit/test_catalog_routes.py` and
+`tests/unit/test_mcp.py` (the surfaces), `tests/unit/test_gui_models_tab.py` (the slot line and the
+context buttons).
+
+### What remains
+
+* **One model measured, on one card.** A 1.5B is the *easy* case: its weights are small, so weight
+  traffic stops dominating early and the knee is near. A 30B dense and a big MoE would test the
+  interesting half of the curve, and the MoE derate of 0.5 remains entirely unmeasured.
+* **The thresholds are a policy with no knob.** 65% and 1.15x are hard-coded. A host that genuinely
+  wants maximum aggregate throughput (D20's `planner.preference: "throughput"` audience) should
+  arguably get different ones, and does not.
+* **A measurement never expires.** Rows carry `engine_tag` and `gpu_class` so a stale run *can* be
+  retired, but nothing retires one yet: swap the engine for a build with different batching and the
+  old sweep goes on steering the recommendation. The throughput table solved the same problem with
+  `estimator_version` (migration 004) and this one should follow.
+* **`load_recommended` re-plans between deciding and loading.** The mode walk plans, then
+  `manager.load` plans again with the winner's arguments, so a VRAM change in that gap turns into a
+  refusal rather than a wrong load. D29's gate bounds it; it is still two decisions where one would
+  be better.
+* **`ctx_size` is not remembered.** Asking for 262144 loads at 262144, and the next unqualified load
+  goes back to the planner's ladder. That is deliberate -- this path never writes settings -- but a
+  user who wants 262144 *every* time still has to pin `ctx_size` in the model's settings.

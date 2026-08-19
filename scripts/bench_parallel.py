@@ -2,6 +2,19 @@
 """
 Concurrency-calibration harness for StudioForge (FastAPI-over-llama.cpp LLM server).
 
+PREFER THE IN-SERVER BENCHMARK (D37). `benchmark_parallel(model_id)` over MCP, or
+`POST /api/models/{id}/benchmark-parallel`, or "Measure parallel" in the Models
+tab, does everything this script does and more: it loads the model itself at the
+placement being measured, refuses to run on a busy server, records a row per
+level in `parallel_observations`, applies the recommendation rule, and leaves the
+rig as it found it -- after which `recommended_parallel_basis` reads "measured"
+on that placement for good.
+
+This script is kept because it needs NOTHING from this codebase. It talks to a
+running gateway over plain HTTP, so it still works against a server this build
+does not control: an older install, another machine, a hand-launched
+`llama-server`. Reach for it there, and for the in-server benchmark here.
+
 Measures aggregate throughput and latency as a function of client concurrency for
 ONE loaded model, cross-checking against llama.cpp's slot accounting. A client that
 sends N requests to a 1-slot server still gets N answers, just serialized; only
