@@ -337,6 +337,9 @@ deploy/         systemd units
 - [`DECISIONS.md`](DECISIONS.md) — architectural decisions, each with the measurement behind it
 - [`docs/RUNBOOK.md`](docs/RUNBOOK.md) — the operator's runbook: what `/health` is telling you, and
   what to do when it will not start, a model will not load, VRAM is held, or a download stalls
+- [`docs/ENGINE-FEATURES.md`](docs/ENGINE-FEATURES.md) — the llama.cpp features StudioForge turns
+  on and the ones it deliberately does not: speculative decoding, the host-RAM prompt cache, the
+  KV pool shape, tensor parallelism — each with its default, its quality cost and its measurement
 - [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) — known limitations, honestly
 - [`docs/COMPARISON.md`](docs/COMPARISON.md) — what was borrowed from Ollama, oobabooga, KoboldCpp, vLLM
 

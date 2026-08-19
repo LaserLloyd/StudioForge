@@ -230,6 +230,54 @@ than a single-GPU one — which is why the planner exhausts every single-GPU opt
 
 Mixing GPU generations in one split works but runs at the slower card's pace.
 
+### `--split-mode row` does not work on CUDA
+
+`row` is in the engine's own value list and is accepted by the flag parser, then fails at load
+with `error loading model: device CUDA2 does not support split buffers`. It is reachable through
+per-model `split_mode` and is left in the type only because the engine still lists it. Reproduced
+on b10425 with two RTX 3090s.
+
+### `--split-mode tensor` is opt-in and was slower here
+
+Tensor parallelism is marked EXPERIMENTAL upstream and is never chosen by default. Measured on
+b10425, Qwen2.5-1.5B Q4_K_M on two RTX 3090s at 8k context: **layer 344 tok/s, tensor 294 tok/s,
+one card alone 353 tok/s**; prompt processing 2722 vs 1182 tok/s. A small model is the worst case
+(the per-layer all-reduce is fixed while the halved weight read shrinks with the model), so a large
+one may well win — which is why the benchmark now offers a tensor variant of every multi-GPU mode.
+Measure before you enable it.
+
+Its prerequisites are enforced *before* the child is launched, because llama.cpp enforces one of
+them by exiting: flash attention must be on (`SPLIT_MODE_TENSOR requires flash_attn to be
+enabled`), the placement needs at least two devices, and the model must be dense and
+non-hybrid — MoE and state-space/recurrent architectures are refused upstream by name. An
+unquantized KV cache is required by upstream's documentation and is *not* enforced by b10425
+(a scratch load with `-sm tensor --cache-type-k q8_0` started and answered correctly), but
+StudioForge still declines the combination rather than run something documented as unimplemented.
+
+Note also that `--backend-sampling` is silently downgraded under tensor mode: the engine logs
+`backend sampling not supported with SPLIT_MODE_TENSOR; using CPU` and starts anyway.
+
+### Tensor-mode measurements land in the same calibration bucket as layer-mode ones
+
+Throughput observations are keyed on model, device set and GPU class — not on split mode. A model
+benchmarked in tensor mode therefore teaches the layer-mode estimate a correction it should not
+have. Benchmarks are rare enough that the medians absorb it, but if you make tensor mode your
+normal placement for a model, expect its catalog speed number to drift.
+
+## The context each slot gets is a floor, not a ceiling — unless it is
+
+`--ctx-size` is the TOTAL across slots (D4), and the pool is **partitioned** by default: with
+`--parallel 2 --ctx-size 16384` each slot gets exactly 8192 tokens and a longer request is refused
+up front with a 400 naming the limit. That is what makes the catalog's `ctx_per_slot` a promise,
+and StudioForge now passes `--no-kv-unified` on every multi-slot launch to keep it one — the
+engine's own default is "enabled if the slot count is auto", which is not a guarantee to build on.
+
+The per-model `kv_unified` opt-in flips it: one shared pool at **the same VRAM**, so a lone
+conversation can use the whole `--ctx-size`. The cost is measured and real — two concurrent
+12k-token requests on a 2x8192 unified load both failed with an HTTP **500 "Context size has been
+exceeded"** *mid-generation*, where the partitioned pool had refused them cleanly before any work
+started. Turn it on for a single-user long-context model; leave it off for an agent host.
+
 ## LoRA
 
 * Adapters must be **GGUF** adapters. PEFT `.bin`/`.safetensors` adapters are not loadable by
@@ -245,13 +293,25 @@ Mixing GPU generations in one split works but runs at the slower card's pace.
 
 ## Speculative decoding
 
+Chosen automatically per model (`spec_type: auto`); see `docs/ENGINE-FEATURES.md` for the ladder.
+It is distribution-preserving, so it is a speed knob with no quality cost — but the *cost* side is
+real:
+
 * Target and draft must share a tokenizer. Vocab size is checked and a mismatch is refused; a
-  matching vocab with a different tokenizer only warns.
+  matching vocab with a different tokenizer only warns. (`draft-mtp` and `ngram-mod` use no draft
+  model at all, so this applies only to `draft-simple`.)
 * Drafting can be **slower** than not drafting. Use the Test action's A/B, which reports the
   acceptance rate — below roughly 60% the draft is usually costing more than it saves.
 * `llama-server` reports drafting only via the per-slot `speculative` flag and a completion's
   `draft_n`/`draft_n_accepted`. `/props` reports `speculative.types: "none"` even while actively
-  drafting; do not trust that field.
+  drafting; do not trust that field. `/slots[].speculative` is `true` for `ngram-mod` too, so it
+  says "drafting is configured", not "drafting is working" — only `draft_n`/`draft_n_accepted`
+  say that.
+* `draft-mtp` needs a GGUF with `nextn_predict_layers >= 1`. A repository *named* "...-MTP-GGUF"
+  is not evidence: one such model in the reference library carries no such key and gets no MTP.
+* `ngram-mod` learns from text it has already seen, so a benchmark that sends the same prompt
+  repeatedly will report enormous gains that no real workload sees. On a 27B, four *distinct*
+  prompts measured +0.4%; the same prompt three times measured +751%. Vary the prompt.
 
 ## Reasoning / thinking models
 
