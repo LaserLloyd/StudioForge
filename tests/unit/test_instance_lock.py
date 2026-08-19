@@ -216,6 +216,11 @@ def _neutered_state(config: Config, downloader: Any) -> Any:
         async def stop(self) -> None:
             return None
 
+        def busy_snapshot(self) -> dict[str, Any]:
+            # /health reports what the server is in the middle of (D36); a stub
+            # that stands in for the real manager has to answer it too.
+            return {"active_requests": 0, "busy_models": [], "loading": [], "testing": None}
+
     class _EngineManager:
         async def ensure_engine(self) -> Any:
             raise RuntimeError("no engine in this test")
