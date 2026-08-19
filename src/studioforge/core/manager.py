@@ -12,12 +12,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from studioforge.config import Config, KvCacheType
 from studioforge.core.gpu import vram_processes
-from studioforge.core.planner import OBSERVATION_NOTE_PER_PID, Planner
+from studioforge.core.planner import BUSY_RETRY_AFTER_S, OBSERVATION_NOTE_PER_PID, Planner
 from studioforge.core.registry import Registry
 from studioforge.core.supervisor import Supervisor
 from studioforge.db import Database
@@ -31,6 +31,7 @@ from studioforge.errors import (
 )
 from studioforge.logging import get_logger
 from studioforge.types import (
+    MB,
     AdapterRecord,
     InstanceInfo,
     LoadPlan,
@@ -476,6 +477,329 @@ class ModelManager:
                 force=force,
                 source=source,
             )
+
+    #: Contexts the "Load recommended" buttons offer, and the ones the MCP
+    #: docstring names. Not a limit -- any integer up to the trained window is
+    #: accepted -- but these four are what an agent asks for in practice, and
+    #: naming them turns "how much context can I have" into a button.
+    RECOMMENDED_CTX_TIERS: tuple[int, ...] = (65536, 131072, 262144, 524288)
+
+    async def load_recommended(
+        self,
+        name: str,
+        ctx_size: int,
+        *,
+        prefer_modes: Sequence[str] | None = None,
+        kv_min: str | None = None,
+        source: str = "api",
+    ) -> InstanceInfo:
+        """Load at **exactly** ``ctx_size`` per slot, letting the server pick the rest.
+
+        The user's sentence this exists for: *"so it can simply specify the
+        model and context needed, and the server works the rest, or returns an
+        error if it can't load the requested context for some reason"*.
+
+        So the caller names two things and nothing else. This walks the hardware
+        modes in headline order (``dual_5090`` -> ``dual_3090`` -> ``all_gpus``
+        -> ``single_5090`` on this rig, or ``prefer_modes``) and for each asks
+        the planner for that exact context per slot under the quality-first KV
+        ladder (D36: f16 -> q8_0/q8_0 -> q8_0 K + q4_0 V, never a q4_0 K) with
+        ``parallel = recommended_parallel``. The first mode that fits **now**
+        wins; if none does, the same walk runs with eviction of **idle** models
+        allowed -- never a busy one (D36) -- and only then does it refuse.
+
+        **This is the one load path that is strict about context.** Everywhere
+        else, a context that does not fit steps down a ladder (D14) because a
+        roomier window is a nicety. Here the window is the request: an agent
+        that asked for 262144 because its transcript is 200k long is not helped
+        by silently getting 131072 and discovering it mid-conversation. So the
+        refusal is structured and says, per mode, the largest context that
+        *would* work and what is in the way.
+
+        Args:
+            name: model id or alias.
+            ctx_size: tokens per slot, exactly. Above the model's
+                ``n_ctx_train`` this is a 400 rather than an attempt -- serving
+                past the trained window needs RoPE scaling and quietly degrades
+                quality (D14), so it is refused with the number that would work.
+            prefer_modes: hardware-mode keys to try, in this order, instead of
+                the headline order. An unknown key is a 400 naming the ones this
+                box has.
+            kv_min: the lowest KV cache quality to accept -- ``"f16"`` means "do
+                not quantize the cache to reach this window at all". Omitted,
+                the full quality-first ladder is available.
+            source: who asked, stamped on the instance and the log lines (D36).
+        """
+        from studioforge.core import catalog as catalog_mod
+        from studioforge.core import placements as placements_mod
+
+        validate_load_args(ctx_size=ctx_size, parallel=None, kv_cache_type=None)
+        await self._await_boot()
+        record = self.registry.resolve(name)
+        if record is None:
+            raise ModelNotFoundError(name, known=self.registry.known_ids())
+        record = self.serving_record(record)
+
+        trained = int(getattr(record.meta, "n_ctx_train", 0) or 0) if record.meta else 0
+        if trained > 0 and int(ctx_size) > trained:
+            raise BadRequestError(
+                f"'{record.id}' is trained to {trained} tokens; ask for {trained} or "
+                f"fewer. Serving past the trained window needs RoPE scaling and "
+                f"degrades quality, so this server will not do it silently.",
+                param="ctx_size",
+                details={"n_ctx_train": trained, "requested_ctx": int(ctx_size)},
+            )
+
+        modes = self._modes_for_recommendation(prefer_modes)
+        observations = self.parallel_observations(record.id)
+        planner = Planner(self.config, self.planner.probe, log_plans=False)
+        loaded = [i for i in self.supervisor.list() if i.model_id != record.id]
+
+        attempts: list[dict[str, Any]] = []
+        for allow_evict in (False, True):
+            attempts = [
+                self._mode_attempt(
+                    record,
+                    mode,
+                    ctx_size=int(ctx_size),
+                    kv_min=kv_min,
+                    planner=planner,
+                    loaded=loaded,
+                    observations=observations,
+                    allow_evict=allow_evict,
+                    catalog_mod=catalog_mod,
+                    placements_mod=placements_mod,
+                )
+                for mode in modes
+            ]
+            winner = next((a for a in attempts if a["fits"]), None)
+            if winner is None:
+                continue
+            log.info(
+                "loading at the requested context",
+                model_id=record.id,
+                ctx_size=int(ctx_size),
+                mode=winner["mode"],
+                devices=winner["devices"],
+                kv_cache_type=winner["kv_cache_type"],
+                parallel=winner["parallel"],
+                evicting=winner["would_evict"],
+                source=source,
+            )
+            return await self.load(
+                record.id,
+                ctx_size=int(ctx_size),
+                kv_cache_type=winner["kv_cache_type"],
+                kv_cache_type_v=winner["kv_cache_type_v"],
+                parallel=winner["parallel"],
+                devices=winner["devices"],
+                force=True,
+                source=source,
+            )
+
+        raise self._recommendation_refused(record, int(ctx_size), attempts, trained=trained)
+
+    def _modes_for_recommendation(self, prefer_modes: Sequence[str] | None) -> list[Any]:
+        """The hardware modes to walk, in the order to walk them."""
+        from studioforge.core import placements as placements_mod
+
+        modes = placements_mod.hardware_modes(self.planner.probe.list_gpus())
+        if not modes:
+            raise InsufficientVramError(
+                "no usable GPU was found, and this server is GPU-only",
+                details={"suggestions": ["check the driver and `nvidia-smi`"]},
+            )
+        if prefer_modes is None:
+            return modes
+        by_key = {m.key: m for m in modes}
+        unknown = [key for key in prefer_modes if key not in by_key]
+        if unknown:
+            raise BadRequestError(
+                f"unknown hardware mode(s): {', '.join(unknown)}; this box has: "
+                + ", ".join(by_key),
+                param="prefer_modes",
+            )
+        return [by_key[key] for key in prefer_modes]
+
+    def _mode_attempt(
+        self,
+        record: ModelRecord,
+        mode: Any,
+        *,
+        ctx_size: int,
+        kv_min: str | None,
+        planner: Planner,
+        loaded: Sequence[InstanceInfo],
+        observations: Sequence[Mapping[str, Any]],
+        allow_evict: bool,
+        catalog_mod: Any,
+        placements_mod: Any,
+    ) -> dict[str, Any]:
+        """Can this mode hold ``ctx_size`` per slot, and if not, what is in the way?
+
+        One planner call at one slot decides the fit and the KV rung (the ladder
+        is the planner's, so this cannot drift from what an ordinary load would
+        choose), then the slot count is worked out and the plan re-checked at it.
+        Re-checked rather than assumed: the slot count comes from a capacity
+        figure, and a placement that fits at one slot and not at four must come
+        back as four-does-not-fit rather than as a load that fails.
+        """
+        from studioforge.core.kv_sensitivity import kv_quality_label, kv_quality_rank
+
+        pinned = placements_mod.forced_onto(record, mode.devices)
+        attempt: dict[str, Any] = {
+            "mode": mode.key,
+            "label": mode.label,
+            "devices": list(mode.devices),
+            "fits": False,
+            "would_evict": [],
+        }
+        result = planner.plan_load(
+            pinned,
+            ctx_size=ctx_size,
+            parallel=1,
+            loaded=loaded,
+            draft=self._draft_for(record),
+            adapters=[a for a, _ in self._adapters_for(record)],
+            allow_evict=allow_evict,
+        )
+        if not isinstance(result, LoadPlan):
+            attempt["reason"] = result.reason
+            attempt["max_ctx_that_fits"] = result.max_ctx_that_fits
+            attempt["busy_models"] = list(result.busy_models)
+            attempt["vram_holders"] = [h.model_dump() for h in result.vram_holders]
+            attempt["rejected"] = result
+            return attempt
+
+        if kv_min is not None and kv_quality_rank(
+            result.kv_cache_type, result.kv_cache_type_v
+        ) > kv_quality_rank(kv_min, kv_min):
+            attempt["reason"] = (
+                f"only reaches {ctx_size} tokens with a "
+                f"{kv_quality_label(result.kv_cache_type, result.kv_cache_type_v)} KV "
+                f"cache, below the {kv_min} minimum this call asked for"
+            )
+            attempt["max_ctx_that_fits"] = None
+            attempt["busy_models"] = []
+            attempt["vram_holders"] = []
+            return attempt
+
+        slots, _bound, _vram = catalog_mod.slots_for_plan(planner, pinned, result)
+        wanted = catalog_mod.recommended_slots(record, result, slots, observations=observations)
+        plan = result
+        parallel = int(wanted["value"])
+        while parallel > 1:
+            candidate = planner.plan_load(
+                pinned,
+                ctx_size=ctx_size,
+                kv_cache_type=result.kv_cache_type,
+                kv_cache_type_v=result.kv_cache_type_v,
+                parallel=parallel,
+                loaded=loaded,
+                draft=self._draft_for(record),
+                adapters=[a for a, _ in self._adapters_for(record)],
+                allow_evict=allow_evict,
+            )
+            if isinstance(candidate, LoadPlan):
+                plan = candidate
+                break
+            parallel -= 1
+
+        attempt.update(
+            fits=True,
+            ctx_size=ctx_size,
+            kv_cache_type=plan.kv_cache_type,
+            kv_cache_type_v=plan.kv_cache_type_v,
+            parallel=parallel,
+            recommended_parallel_basis=wanted["basis"],
+            devices=list(plan.devices),
+            would_evict=list(plan.evict_model_ids),
+            vram_mb=round(plan.estimate.total_bytes / MB),
+        )
+        return attempt
+
+    def _recommendation_refused(
+        self,
+        record: ModelRecord,
+        ctx_size: int,
+        attempts: Sequence[Mapping[str, Any]],
+        *,
+        trained: int,
+    ) -> InsufficientVramError:
+        """The structured "no", with the largest context each mode *would* take.
+
+        A refusal here is terminal for the request (there is no CPU fallback and
+        this path will not quietly shrink the window), so it has to be
+        actionable in one read: per mode, the largest context that fits and what
+        stands in the way; a ``retry_after_s`` only when something transient --
+        a model that is serving right now -- is the cause, because "try again
+        later" is bad advice when nothing is going to change (D36).
+        """
+        busy: list[dict[str, Any]] = []
+        for attempt in attempts:
+            for entry in attempt.get("busy_models") or []:
+                if entry not in busy:
+                    busy.append(dict(entry))
+        best_ctx = max(
+            (int(a.get("max_ctx_that_fits") or 0) for a in attempts),
+            default=0,
+        )
+        modes = [
+            {
+                "mode": a["mode"],
+                "label": a["label"],
+                "devices": list(a["devices"]),
+                "largest_ctx_that_fits": a.get("max_ctx_that_fits"),
+                "reason": a.get("reason"),
+                "busy_models": list(a.get("busy_models") or []),
+            }
+            for a in attempts
+        ]
+        suggestions: list[str] = []
+        if best_ctx:
+            suggestions.append(
+                f"ask for {best_ctx} tokens instead -- that is the largest context "
+                f"that fits on any of these placements right now"
+            )
+        if busy:
+            names = ", ".join(f"{b['model_id']} ({b['active_requests']} in flight)" for b in busy)
+            suggestions.append(
+                f"or wait for {names} to finish; a load never interrupts a stream, "
+                f"so this context becomes available when they do"
+            )
+        elif not best_ctx:
+            suggestions.append(
+                "unload something, or ask for a smaller context: no placement on this "
+                "box reaches the requested window even with eviction allowed"
+            )
+        if trained:
+            suggestions.append(f"this model's trained window is {trained} tokens")
+
+        rejected = next(
+            (a.get("rejected") for a in attempts if a.get("rejected") is not None), None
+        )
+        details: dict[str, Any] = {
+            "requested_ctx": ctx_size,
+            "n_ctx_train": trained or None,
+            "modes": modes,
+            "largest_ctx_that_fits": best_ctx or None,
+            "busy_models": busy,
+            "retry_after_s": BUSY_RETRY_AFTER_S if busy else None,
+            "suggestions": suggestions,
+        }
+        if rejected is not None:
+            details.update(
+                required_bytes=rejected.required_bytes,
+                available_bytes=rejected.available_bytes,
+                per_gpu_free=rejected.per_gpu_free,
+                vram_holders=[h.model_dump() for h in rejected.vram_holders],
+                estimate_mb=rejected.estimate.breakdown_mb(),
+            )
+        return InsufficientVramError(
+            f"Cannot load '{record.id}' at exactly {ctx_size} tokens per slot on any "
+            f"placement of this box. " + " ".join(suggestions),
+            details=details,
+        )
 
     def _known_devices(self) -> list[int] | None:
         """CUDA indices the probe reports, or ``None`` when it cannot be asked.

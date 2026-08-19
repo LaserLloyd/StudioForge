@@ -832,6 +832,63 @@ def build_management_mcp(state: Any) -> MCPServer:
         }
 
     @_guard
+    async def load_recommended(
+        model_id: str,
+        ctx_size: int,
+        prefer_mode: str | None = None,
+    ) -> dict[str, Any]:
+        """**The easy way to load.** Say the model and the context you need.
+
+        Say the model and the context you need -- 65536, 131072, 262144, 524288,
+        or any number up to the model's trained window -- and the server picks
+        the GPUs, the KV cache type and the slot count under the quality-first
+        policy and loads at **exactly** that context. Or it tells you why it
+        cannot.
+
+        Use this instead of ``load_model`` whenever what you know is "I need a
+        200k window for this transcript" rather than "I want these two cards".
+        Use ``list_models`` -> a ``placements[]`` row -> ``load_model`` when you
+        want to choose the hardware yourself.
+
+        **This is the one load path that never quietly shrinks your window.**
+        Everywhere else a context that does not fit steps down to one that does,
+        because a roomier window is a nicety. Here the window is the request, so
+        a refusal is a structured error listing, per set of cards, the largest
+        context that *would* work and what is in the way -- a model that is
+        serving (with ``retry_after_s``, so waiting is the right move), memory
+        held by something that is not us, or the model's own trained window. Ask
+        again with the number it names and it will load.
+
+        It never interrupts anyone: only idle models are evicted to make room,
+        never one that is mid-request.
+
+        Args:
+            model_id: Model id or alias.
+            ctx_size: Tokens **per concurrent conversation**, exactly. Above the
+                model's ``n_ctx_train`` this is refused with the number that
+                would be accepted, because serving past the trained window needs
+                RoPE scaling and degrades quality.
+            prefer_mode: A hardware-mode key from a ``placements[]`` row
+                (``dual_5090``, ``dual_3090``, ``all_gpus``, ``single_5090`` on
+                this rig) to try that placement instead of the default order.
+
+        Returns:
+            The running instance: port, pid, devices, the KV cache type chosen,
+            the slot count, and the planned VRAM breakdown.
+        """
+        instance = await state.manager.load_recommended(
+            model_id,
+            int(ctx_size),
+            prefer_modes=[prefer_mode] if prefer_mode else None,
+            source="mcp:load_recommended",
+        )
+        return {
+            "ok": True,
+            **_compact_instance(instance),
+            "plan": instance.plan.model_dump(mode="json") if instance.plan else None,
+        }
+
+    @_guard
     async def unload_model(model_id: str) -> dict[str, Any]:
         """Unload a model, freeing its VRAM immediately.
 
@@ -1469,6 +1526,7 @@ def build_management_mcp(state: Any) -> MCPServer:
         model_options,
         model_info,
         load_model,
+        load_recommended,
         unload_model,
         search_models,
         repo_details,

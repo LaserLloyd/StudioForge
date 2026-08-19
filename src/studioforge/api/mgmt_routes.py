@@ -384,6 +384,38 @@ async def load_model(
     return instance.model_dump(mode="json")
 
 
+@router.post("/models/{model_id:path}/load-recommended")
+async def load_recommended(
+    model_id: str,
+    request: Request,
+    ctx_size: int = Body(..., embed=True),
+    prefer_mode: str | None = Body(None),
+    kv_min: str | None = Body(None),
+) -> dict[str, Any]:
+    """Load at exactly ``ctx_size`` per slot; the server picks everything else.
+
+    Name the model and the context you need. This walks the hardware modes in
+    headline order, asks for that exact context per slot under the quality-first
+    KV rule with the recommended slot count, and loads the first placement that
+    fits -- evicting only idle models, never a busy one.
+
+    **Strict about context, unlike every other load path.** A window that does
+    not fit is a structured 507 naming, per mode, the largest context that would
+    work and what is in the way, with ``retry_after_s`` when the cause is a
+    model that is serving right now. Above the model's trained window it is a
+    400 with the number that would be accepted.
+    """
+    state = _state(request)
+    instance = await state.manager.load_recommended(
+        model_id,
+        int(ctx_size),
+        prefer_modes=[prefer_mode] if prefer_mode else None,
+        kv_min=kv_min,
+        source="api:/api/models/{id}/load-recommended",
+    )
+    return instance.model_dump(mode="json")
+
+
 @router.post("/models/{model_id:path}/unload")
 async def unload_model(model_id: str, request: Request) -> dict[str, Any]:
     state = _state(request)

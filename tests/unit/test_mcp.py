@@ -54,6 +54,10 @@ EXPECTED_TOOLS = {
     "model_options",
     "model_info",
     "load_model",
+    # "the model and the context, and the server works the rest" -- the load
+    # path an agent should reach for first, and the only one that is strict
+    # about the context it was asked for (WP19 / D37).
+    "load_recommended",
     "unload_model",
     # The HuggingFace pair, split for the same reason list_models and
     # model_options are: browsing is cheap and knows nothing about sizes,
