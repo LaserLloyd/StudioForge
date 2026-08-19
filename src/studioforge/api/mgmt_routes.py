@@ -28,6 +28,7 @@ from studioforge.core.benchmark import (
     available_modes,
 )
 from studioforge.core.diskspace import disk_report
+from studioforge.core.manager import validate_load_args
 from studioforge.core.parallel_bench import (
     DEFAULT_MAX_TOKENS as PARALLEL_MAX_TOKENS,
 )
@@ -881,8 +882,11 @@ async def get_model_log(
 
 @router.post("/models/unload-all")
 async def unload_all(request: Request) -> dict[str, Any]:
+    """Unload every resident model, freeing all VRAM."""
     state = _state(request)
-    return {"unloaded": await state.manager.unload_all()}
+    unloaded = await state.manager.unload_all()
+    log.info("unloaded all models", count=len(unloaded))
+    return {"unloaded": unloaded, "count": len(unloaded)}
 
 
 @router.get("/version")
@@ -1672,6 +1676,18 @@ async def start_parallel_benchmark(
         ctx_size = _positive_int(ctx_size, 0, "ctx_size")
     prompt_tokens = _positive_int(data.get("prompt_tokens"), DEFAULT_PROMPT_TOKENS, "prompt_tokens")
     max_tokens = _positive_int(data.get("max_tokens"), PARALLEL_MAX_TOKENS, "max_tokens")
+    # The same validation an ordinary load gets, BEFORE the 202: a bad cache
+    # type or a CUDA index this box does not have would otherwise be accepted
+    # here and fail minutes later inside the job, where the caller has to go
+    # and read it off /api/benchmark/jobs.
+    validate_load_args(
+        ctx_size=ctx_size,
+        parallel=None,
+        kv_cache_type=data.get("kv_cache_type"),
+        kv_cache_type_v=data.get("kv_cache_type_v"),
+        devices=devices,
+        known_devices=state.manager._known_devices(),
+    )
 
     runner = _parallel_benchmarker(state)
     levels = [int(n) for n in (streams or DEFAULT_STREAMS)]
@@ -1745,5 +1761,7 @@ async def list_parallel_observations(
     record = state.registry.resolve(model_id)
     if record is None:
         raise ModelNotFoundError(model_id, known=state.registry.known_ids())
-    rows = await asyncio.to_thread(state.db.parallel_observations, record.id, limit=limit)
+    # Through the manager, which answers [] for a data directory that predates
+    # the table (or a test's db=None) instead of a 500.
+    rows = await asyncio.to_thread(state.manager.parallel_observations, record.id, limit=limit)
     return {"model_id": record.id, "observations": rows}

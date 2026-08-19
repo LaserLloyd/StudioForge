@@ -605,8 +605,16 @@ class ModelManager:
         if record is None:
             raise ModelNotFoundError(name, known=self.registry.known_ids())
         record = self.serving_record(record)
+        if record.meta is None:
+            raise ModelLoadError(
+                f"'{record.id}' has no readable GGUF metadata, so its trained context "
+                f"window and KV geometry are unknown and a load at an exact context "
+                f"cannot be planned. Rescan the library; if the file is damaged, "
+                f"re-download it.",
+                details={"model_id": record.id, "stale_reason": record.stale_reason},
+            )
 
-        trained = int(getattr(record.meta, "n_ctx_train", 0) or 0) if record.meta else 0
+        trained = int(getattr(record.meta, "n_ctx_train", 0) or 0)
         if trained > 0 and int(ctx_size) > trained:
             raise BadRequestError(
                 f"'{record.id}' is trained to {trained} tokens; ask for {trained} or "
@@ -1634,19 +1642,20 @@ class ModelManager:
             draining=self._draining,
         )
 
-    def parallel_observations(self, model_id: str) -> list[dict[str, Any]]:
+    def parallel_observations(self, model_id: str, *, limit: int = 64) -> list[dict[str, Any]]:
         """Measured slot sweeps for one model, or ``[]``.
 
-        Wrapped rather than called inline because three callers want it and
-        none of them should fail when the table is missing (an older data
-        directory, a manager built with ``db=None`` in a test): a missing
+        Wrapped rather than called inline because four callers want it (the
+        catalog, the placements, ``load_recommended`` and the observations
+        route) and none of them should fail when the table is missing (an older
+        data directory, a manager built with ``db=None`` in a test): a missing
         measurement means ``recommended_parallel`` falls back to the estimate
         and says so, which is a worse answer, not a broken surface.
         """
         if self.db is None:
             return []
         try:
-            return list(self.db.parallel_observations(model_id, limit=64))
+            return list(self.db.parallel_observations(model_id, limit=limit))
         except Exception as exc:  # noqa: BLE001 - measurements are a bonus
             log.debug("parallel observations unavailable", model_id=model_id, error=str(exc))
             return []

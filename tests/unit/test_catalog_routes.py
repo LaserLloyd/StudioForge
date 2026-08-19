@@ -351,6 +351,20 @@ def test_parallel_observations_start_empty_and_are_readable(app: Any) -> None:
     assert response.json() == {"model_id": MODEL_ID, "observations": []}
 
 
+def test_parallel_observations_answer_empty_when_the_table_cannot_be_read(app: Any) -> None:
+    """A data directory that predates migration 005 is a [] here, not a 500."""
+
+    class NoTable:
+        def parallel_observations(self, *a: Any, **k: Any) -> list[dict[str, Any]]:
+            raise RuntimeError("no such table: parallel_observations")
+
+    with TestClient(app) as http:
+        app.state.manager.db = NoTable()
+        response = http.get(f"/api/models/{MODEL_ID}/parallel-observations")
+    assert response.status_code == 200
+    assert response.json()["observations"] == []
+
+
 def test_the_parallel_benchmark_validates_its_body_before_starting_a_job(app: Any) -> None:
     with TestClient(app) as http:
         response = http.post(
@@ -358,6 +372,20 @@ def test_the_parallel_benchmark_validates_its_body_before_starting_a_job(app: An
         )
     assert response.status_code == 400
     assert response.json()["error"]["param"] == "streams"
+
+
+def test_the_parallel_benchmark_refuses_a_bad_cache_type_before_the_202(app: Any) -> None:
+    """The same validation an ordinary load gets, up front -- not a job that
+    fails minutes later where the caller has to go and find it."""
+    with TestClient(app) as http:
+        response = http.post(
+            f"/api/models/{MODEL_ID}/benchmark-parallel", json={"kv_cache_type": "pwned"}
+        )
+        assert response.status_code == 400
+        assert response.json()["error"]["param"] == "kv_cache_type"
+        response = http.post(f"/api/models/{MODEL_ID}/benchmark-parallel", json={"devices": [7]})
+        assert response.status_code == 400
+        assert response.json()["error"]["param"] == "devices"
 
 
 def test_the_parallel_benchmark_starts_a_job_on_the_shared_table(app: Any) -> None:

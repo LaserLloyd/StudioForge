@@ -104,6 +104,17 @@ def test_admin_mutations_from_the_lan_need_a_credential_on_an_open_install(
         ("PUT", "/api/models/vendor/Some-Model/settings"),
         ("POST", "/api/models/scan"),
         ("POST", "/api/virtual-models"),
+        # The WP18-21 surfaces. Residency stays open (LM Studio parity, D32):
+        # an exact-context load, a per-model restart (a forced reload of one
+        # model, not a process restart -- /api/restart/* is the guarded one),
+        # the two benchmarks, and the three new reads.
+        ("POST", "/api/models/vendor/Some-Model/load-recommended"),
+        ("POST", "/api/models/vendor/Some-Model/restart"),
+        ("POST", "/api/models/vendor/Some-Model/benchmark"),
+        ("POST", "/api/models/vendor/Some-Model/benchmark-parallel"),
+        ("GET", "/api/models/vendor/Some-Model/profiles"),
+        ("GET", "/api/models/vendor/Some-Model/parallel-observations"),
+        ("GET", "/api/vram/holders"),
     ],
 )
 def test_reads_inference_and_residency_stay_open_from_the_lan(method: str, path: str) -> None:

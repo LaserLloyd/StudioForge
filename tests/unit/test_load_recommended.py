@@ -445,3 +445,23 @@ async def test_the_real_load_never_evicts_a_busy_model_even_though_it_is_forced(
     await manager.load_recommended(MODEL, 32768)
     assert seen, "the final load plans through the manager's planner"
     assert all(call.get("evict_busy") is False for call in seen)
+
+
+async def test_a_model_without_metadata_is_a_structured_refusal_not_a_traceback() -> None:
+    """No GGUF metadata -> no trained window, no KV geometry -> a 502 that says so."""
+    from studioforge.errors import ModelLoadError
+
+    rec = record(MODEL, None, mtime=1.0, size_bytes=8 * GB)
+    config = make_config()
+    planner = Planner(config, rig_5090x2_3090x2(), log_plans=False)
+    manager = ModelManager(
+        config,
+        registry=Registry([rec]),  # type: ignore[arg-type]
+        planner=planner,
+        supervisor=StubSupervisor(),  # type: ignore[arg-type]
+        db=None,  # type: ignore[arg-type]
+    )
+    with pytest.raises(ModelLoadError) as excinfo:
+        await manager.load_recommended(MODEL, 65536)
+    assert excinfo.value.status_code == 502
+    assert "metadata" in excinfo.value.message

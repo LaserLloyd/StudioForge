@@ -115,15 +115,6 @@ def _watchdog_credential(config: Any) -> tuple[str | None, str]:
     return None, "none"
 
 
-@router.post("/models/unload-all")
-async def unload_all_models(request: Request) -> dict[str, Any]:
-    """Unload every resident model, freeing all VRAM."""
-    state = _state(request)
-    unloaded = await state.manager.unload_all()
-    log.info("unloaded all models", count=len(unloaded))
-    return {"unloaded": unloaded, "count": len(unloaded)}
-
-
 @router.post("/models/{model_id:path}/restart")
 async def restart_model(model_id: str, request: Request) -> dict[str, Any]:
     """Reload one model's ``llama-server`` child with its current settings.
