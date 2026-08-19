@@ -663,6 +663,11 @@ def _nvml_bus_to_index() -> dict[int, int]:
 def luid_to_cuda_index(luids: Iterable[LuidKey] = ()) -> dict[LuidKey, int]:
     """``{adapter LUID: CUDA ordinal}`` for the adapters in ``luids``.
 
+    The LUIDs have to be supplied: there is no enumeration here, they come from
+    the PDH instance names that need mapping (:func:`pdh_process_gpu_bytes`).
+    A bare call answers for the adapters already asked about, which is ``{}`` in
+    a process that has not sampled PDH yet.
+
     **Why this is needed at all.** PDH knows how much VRAM a process holds and
     on which *adapter LUID*; NVML knows the CUDA ordinals but cannot size a
     process on Windows (D23) and exposes no LUID. Neither side can be joined to
@@ -1104,9 +1109,9 @@ def holders_view(
         "desktop_processes_count": desktop_count,
         "desktop_processes_bytes": desktop_bytes,
         "per_process_bytes": _bytes_source(sources),
-        #: "pdh" when at least one row's device column is a measurement rather
-        #: than an NVML context list, so a client can tell a real placement
-        #: from "every device this process can see".
+        # "pdh" when at least one row's device column is a measurement rather
+        # than an NVML context list, so a client can tell a real placement
+        # from "every device this process can see".
         "per_gpu_bytes_source": (
             DEVICES_FROM_PDH
             if any(row.get("gpu_indices_source") == DEVICES_FROM_PDH for row in holders)
