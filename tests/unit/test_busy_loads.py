@@ -353,6 +353,20 @@ async def test_the_test_slot_is_released_even_when_the_test_fails() -> None:
     assert manager.busy_snapshot()["testing"] is None
 
 
+async def test_a_running_benchmark_refuses_a_smoke_test() -> None:
+    """A benchmark loads the model once per mode and rewrites its settings; a
+    smoke test landing inside that window measures the benchmark."""
+
+    class Running:
+        benchmarking = "pub/under-test"
+
+    manager, _supervisor = smoke_manager()
+    manager.benchmarker = Running()
+    with pytest.raises(ModelBusyError) as excinfo:
+        await run_test_model(manager)
+    assert "benchmark" in excinfo.value.message
+
+
 async def test_the_load_gate_is_held_for_the_whole_test_load() -> None:
     """D29's gate plus its own lock: a test cannot race a concurrent load."""
     manager, _supervisor = smoke_manager()

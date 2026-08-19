@@ -201,6 +201,10 @@ class ModelManager:
         #: a health check.
         self._test_gate = asyncio.Lock()
         self._testing: str | None = None
+        #: Set by :class:`~studioforge.core.benchmark.Benchmarker` when one is
+        #: constructed, so `busy` can see a run in progress. The benchmarker
+        #: lives on the app state, which this object cannot reach.
+        self.benchmarker: Any = None
         self._ttl_task: asyncio.Task[None] | None = None
         self._autoload_task: asyncio.Task[None] | None = None
         self._draining = False
@@ -1399,7 +1403,7 @@ class ModelManager:
         loading = [m for m in busy["loading"] if m != ignore]
         if loading:
             return f"a model load is in flight ({', '.join(loading)})"
-        benchmarking = getattr(getattr(self, "benchmarker", None), "benchmarking", None)
+        benchmarking = getattr(self.benchmarker, "benchmarking", None)
         if benchmarking:
             return f"a benchmark of {benchmarking} is running"
         return None
