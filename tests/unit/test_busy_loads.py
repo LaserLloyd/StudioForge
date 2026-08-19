@@ -298,6 +298,15 @@ async def test_a_smoke_test_is_refused_while_another_model_is_serving() -> None:
     assert excinfo.value.details["retry_after_s"] == manager.TEST_RETRY_AFTER_S
 
 
+async def test_testing_a_model_that_is_itself_mid_conversation_is_refused() -> None:
+    """Otherwise the smoke test measures the queue instead of the model."""
+    manager, supervisor = smoke_manager()
+    supervisor.instances["test/model"] = serving("test/model", requests=2)
+    with pytest.raises(ModelBusyError) as excinfo:
+        await run_test_model(manager)
+    assert "test/model" in excinfo.value.message
+
+
 async def test_a_second_concurrent_test_is_refused_not_queued() -> None:
     """A queued smoke test answers about a server that has since moved."""
     manager, _supervisor = smoke_manager()

@@ -1387,22 +1387,24 @@ class ModelManager:
             "testing": self._testing,
         }
 
-    def _busy_reason(self, *, ignore: str | None = None) -> str | None:
+    def _busy_reason(self) -> str | None:
         """Why a smoke test must not start right now, or ``None``.
 
-        ``ignore`` is the model being tested when it was *already* loaded: its
-        own idle instance is not a reason to refuse a test of itself.
+        No exemption for the model being tested. An earlier draft ignored its
+        own instance on the theory that "its own idle instance is not a reason
+        to refuse a test of itself" -- but an *idle* instance never appears here
+        (it has no in-flight requests), so the exemption could only ever fire
+        for a model that was **busy**, which is precisely the case that must be
+        refused. Testing a model that is mid-conversation measures the queue.
         """
         busy = self.busy_snapshot()
-        serving = [b for b in busy["busy_models"] if b["model_id"] != ignore]
-        if serving:
+        if busy["busy_models"]:
             names = ", ".join(
-                f"{b['model_id']} ({b['active_requests']} in flight)" for b in serving
+                f"{b['model_id']} ({b['active_requests']} in flight)" for b in busy["busy_models"]
             )
             return f"{names} is serving requests"
-        loading = [m for m in busy["loading"] if m != ignore]
-        if loading:
-            return f"a model load is in flight ({', '.join(loading)})"
+        if busy["loading"]:
+            return f"a model load is in flight ({', '.join(busy['loading'])})"
         benchmarking = getattr(self.benchmarker, "benchmarking", None)
         if benchmarking:
             return f"a benchmark of {benchmarking} is running"
@@ -1462,7 +1464,7 @@ class ModelManager:
         async with self._test_gate:
             resident = self.supervisor.get(serving.id)
             was_loaded = resident is not None and resident.state == "ready"
-            reason = self._busy_reason(ignore=serving.id if was_loaded else None)
+            reason = self._busy_reason()
             if reason is not None:
                 raise ModelBusyError(
                     f"the server is busy ({reason}); a smoke test must run on an idle "
