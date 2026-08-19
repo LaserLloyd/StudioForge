@@ -182,8 +182,28 @@ class ModelSettings(BaseModel):
     top_k: int | None = None
     min_p: float | None = None
     repeat_penalty: float | None = None
-    # Speculative decoding (b10425 flag names; see engine flag validation)
-    spec_type: str | None = None
+    # --- speculative decoding (b10425 flag names; gated on engine features) ---
+    #: Which drafting strategy to launch with. StudioForge's own sentinel
+    #: ``"auto"`` (the default) resolves at launch, in this order:
+    #:
+    #: 1. ``draft-mtp`` when the GGUF carries ``nextn_predict_layers >= 1`` --
+    #:    the model's own multi-token-prediction head, no draft model, no extra
+    #:    VRAM. Measured on Qwen3.8-27B Q5_K_S: 37.8 -> 50.7 tok/s (+34%) at
+    #:    53% draft acceptance (DECISIONS.md D38).
+    #: 2. ``draft-simple`` when a ``draft_model_id`` is set (the pre-WP20
+    #:    behaviour).
+    #: 3. ``ngram-mod`` for thinking and MoE models -- llama.cpp recommends it
+    #:    for output that repeats itself (reasoning, code iteration). Measured
+    #:    free on unseen prose (+0.4%, and it emits no drafts at all there).
+    #: 4. ``none`` otherwise.
+    #:
+    #: Every value is distribution-preserving: speculative decoding proposes
+    #: tokens and the full model verifies them, so the sampled distribution is
+    #: unchanged. This is a speed knob with no quality cost.
+    #: Any explicit value (``none``, ``draft-mtp``, ``ngram-mod``, or a comma
+    #: list) is honoured verbatim -- and refused with a clear error if the
+    #: active engine does not advertise it.
+    spec_type: str = "auto"
     spec_draft_n_max: int | None = None
     spec_draft_n_min: int | None = None
     spec_draft_p_min: float | None = None
@@ -212,6 +232,18 @@ class ModelSettings(BaseModel):
     def _positive_ctx(cls, v: int | None) -> int | None:
         if v is not None and v <= 0:
             raise ValueError("ctx_size must be positive")
+        return v
+
+    @field_validator("spec_type", mode="before")
+    @classmethod
+    def _spec_type_default(cls, v: Any) -> Any:
+        # Rows saved before WP20 carry ``null`` here, and ``null`` meant "the
+        # supervisor's own default", which is what "auto" now spells. Coercing
+        # rather than widening the annotation keeps exactly one sentinel: a
+        # settings object read back from SQLite must not resolve differently
+        # from one built in code.
+        if v is None or (isinstance(v, str) and not v.strip()):
+            return "auto"
         return v
 
     @field_validator("ttl_s")
@@ -685,6 +717,22 @@ class LoadPlan(BaseModel):
     #: ``planner.effective_kv_bytes_per_token``.
     kv_bytes_per_token: int = 0
 
+    # --- launch-time feature resolution (DECISIONS.md D38) --------------
+    #: What speculative decoding this launch actually asked the engine for::
+    #:
+    #:     {"type": "draft-mtp", "draft_n_max": 3, "reason": "...", "draft_model_id": None}
+    #:
+    #: ``None`` until the supervisor resolves it (the planner does not know the
+    #: engine's feature list). ``{"type": "none", ...}`` is a real answer and
+    #: means drafting was considered and declined, which is a different thing
+    #: from "not yet decided" -- the catalog's `speculative` column needs to be
+    #: able to tell those apart.
+    speculative: dict[str, Any] | None = None
+    #: Why :attr:`split_mode` is not what was asked for, if it is not. Set by
+    #: the supervisor when ``auto`` (or an ineligible ``tensor``) is downgraded
+    #: to ``layer``; also appended to :attr:`notes`.
+    split_mode_reason: str | None = None
+
     @property
     def fits_single_gpu(self) -> bool:
         return len(self.devices) == 1
@@ -722,6 +770,16 @@ class LoadRejected(BaseModel):
     #: Processes holding VRAM when the refusal was computed. Empty when NVML
     #: cannot enumerate them (containers, WSL, older drivers).
     vram_holders: list[VramProcess] = Field(default_factory=list)
+    #: ``[{"model_id": ..., "active_requests": N}]`` -- models the eviction
+    #: ladder skipped because they are serving somebody (D36). This is the
+    #: difference between "the box is full" and "the box is busy": the first
+    #: needs a smaller load, the second needs a wait, and only the second has a
+    #: ``retry_after_s``.
+    busy_models: list[dict[str, Any]] = Field(default_factory=list)
+    #: Seconds worth waiting before retrying, when a *busy* model is what stood
+    #: in the way. ``None`` for every other refusal, because "try again later"
+    #: is bad advice when nothing is going to change.
+    retry_after_s: float | None = None
 
     def message(self) -> str:
         required_gb = self.required_bytes / GB
@@ -757,10 +815,24 @@ class InstanceInfo(BaseModel):
     ttl_s: int | None = None
     active_requests: int = 0
     total_requests: int = 0
+    #: WHO asked for this load: ``"mcp:load_model"``, ``"jit:/v1/chat/completions"``,
+    #: ``"gui"``, ``"autoload"``, ``"benchmark"``... On a box several clients
+    #: share, "a 262144-token model appeared on three GPUs" is not a diagnosable
+    #: event without a requester, and the 2026-08-19 log review could not tell
+    #: an OpenClaw load from the GUI's (D36).
+    loaded_by: str | None = None
     restarts: int = 0
     last_error: str | None = None
     log_path: Path | None = None
     last_tokens_per_second: float | None = None
+    #: The resolved speculative-decoding block for this child, mirroring
+    #: :attr:`LoadPlan.speculative`. Carried on the instance too because that is
+    #: what the Dashboard and ``GET /api/models`` render, and "is this model
+    #: drafting?" is not answerable from ``/props`` -- the truthful runtime
+    #: signals are ``/slots[].speculative`` (configured) and
+    #: ``timings.draft_n`` / ``draft_n_accepted`` (actually working). See
+    #: DECISIONS.md D38.
+    speculative: dict[str, Any] | None = None
 
     @property
     def ttl_remaining_s(self) -> float | None:

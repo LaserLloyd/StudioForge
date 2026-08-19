@@ -21,10 +21,16 @@ of them wrong fails silently rather than loudly:
   with 4 slots reports ``n_ctx: 4096`` and ``total_slots: 4``, i.e. 1024 tokens
   per conversation. Without the multiplication a user who asks for 8192 gets a
   quarter of it.
-* **Speculative decoding needs ``--spec-type draft-simple``.** b10425 renamed
-  every drafting flag and defaults ``--spec-type`` to ``none``; the old names
-  are *accepted and ignored* ("the argument has been removed"), so a wrong
-  spelling here looks like speculative decoding simply not helping.
+* **Speculative decoding needs ``--spec-type``.** b10425 renamed every drafting
+  flag and defaults ``--spec-type`` to ``none``; the old names are *accepted and
+  ignored* ("the argument has been removed"), so a wrong spelling here looks
+  like speculative decoding simply not helping.
+* **No optional flag is passed on faith.** Every flag below the mandatory core
+  is gated on the *active engine* advertising it
+  (:class:`studioforge.core.engine.EngineFeatures`, read from that build's own
+  ``--help``). An engine whose help cannot be read advertises nothing, and the
+  launch falls back to the flag surface that predates this gating rather than
+  guessing. See DECISIONS.md D38.
 """
 
 from __future__ import annotations
@@ -48,7 +54,9 @@ from typing import IO, TYPE_CHECKING, Any
 import httpx
 import psutil
 
-from studioforge.config import Config
+from studioforge.config import Config, resolve_cache_ram_mb
+from studioforge.core.engine import EngineFeatures, probe_engine_features
+from studioforge.core.planner import attention_kind, is_moe
 from studioforge.errors import ModelLoadError, ModelUnloadError
 from studioforge.logging import get_logger
 from studioforge.types import AdapterRecord, InstanceInfo, LoadPlan, ModelRecord
@@ -64,12 +72,35 @@ CHILD_HOST = "127.0.0.1"
 #: GPU-only means *all* layers, unconditionally. Not a tunable.
 ALL_GPU_LAYERS = "999"
 
-#: b10425 default for ``--spec-draft-n-max``; emitted explicitly so the GUI's
-#: displayed command line matches what the child actually runs.
-DEFAULT_SPEC_DRAFT_N_MAX = 16
+#: Draft depth, emitted explicitly so the GUI's displayed command line matches
+#: what the child actually runs. **3, not 16**: b10425's ``--help`` says
+#: "number of tokens to draft for speculative decoding (default: 3)", and the
+#: value used to be 16 here under a comment claiming it *was* the engine
+#: default. Measured on Qwen3.8-27B Q5_K_S with its own MTP head (one RTX 3090,
+#: 8k context, four unseen prompts): n_max 3 gave 50.7 tok/s at 53% draft
+#: acceptance, n_max 4 gave 47.5 tok/s at 45%. Deeper drafts are past the knee
+#: -- every rejected token was verified for nothing. See DECISIONS.md D38.
+DEFAULT_SPEC_DRAFT_N_MAX = 3
 
+#: StudioForge's own sentinel for ``ModelSettings.spec_type``.
+SPEC_AUTO = "auto"
+#: ``--spec-type`` value that disables drafting entirely.
+SPEC_TYPE_NONE = "none"
 #: ``--spec-type`` value that enables draft-model speculative decoding.
 SPEC_TYPE_DRAFT = "draft-simple"
+#: ``--spec-type`` value that uses the model's own multi-token-prediction heads
+#: (GGUF ``nextn_predict_layers >= 1``). No draft model, no extra VRAM.
+SPEC_TYPE_MTP = "draft-mtp"
+#: Draftless n-gram speculation. llama.cpp recommends it for output that
+#: repeats itself: reasoning models re-treading their own thoughts, code
+#: iteration, MoE models. ~16 MiB of host state.
+SPEC_TYPE_NGRAM = "ngram-mod"
+
+#: ``--split-mode`` value that shards weights *and* KV across GPUs in parallel.
+#: EXPERIMENTAL upstream, and gated hard -- see :func:`tensor_split_blockers`.
+SPLIT_MODE_TENSOR = "tensor"
+#: The pipelined default: layers are dealt out to devices and run in sequence.
+SPLIT_MODE_LAYER = "layer"
 
 #: ``--batch-size`` used once a model serves more than four slots. The engine
 #: default (2048) is a *shared* logical batch, so many slots ingesting prompts
@@ -385,6 +416,249 @@ def _port_is_bindable(port: int, host: str = CHILD_HOST) -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------
+# Launch-time feature resolution (DECISIONS.md D38)
+# ---------------------------------------------------------------------------
+
+#: KV cache types ``--split-mode tensor`` is documented to work with. Upstream's
+#: multi-GPU doc says quantized KV is "not implemented" for tensor mode. b10425
+#: does *not* enforce it -- a scratch load with ``-sm tensor --cache-type-k q8_0``
+#: started and answered correctly -- so this list is policy, not a crash guard:
+#: a quality-first server does not run a combination its own engine documents as
+#: unimplemented just because it happens not to fall over on a 1.5B.
+TENSOR_SPLIT_KV_TYPES = frozenset({"f32", "f16", "bf16"})
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedFeatures:
+    """What the optional-feature knobs resolved to for one launch.
+
+    Kept as a value rather than mutated onto the plan so the same resolution can
+    be computed for a *preview* (the GUI's "command line" panel) without any
+    side effect, and applied once, in one place, when the child is really
+    spawned.
+    """
+
+    spec_type: str = SPEC_TYPE_NONE
+    spec_draft_n_max: int | None = None
+    spec_reason: str = ""
+    split_mode: str = SPLIT_MODE_LAYER
+    split_mode_reason: str | None = None
+
+    @property
+    def drafting(self) -> bool:
+        return self.spec_type != SPEC_TYPE_NONE
+
+    def speculative_dict(self, *, draft_model_id: str | None = None) -> dict[str, Any]:
+        """The block carried on :class:`~studioforge.types.LoadPlan` / InstanceInfo."""
+        return {
+            "type": self.spec_type,
+            "draft_n_max": self.spec_draft_n_max,
+            "draft_model_id": draft_model_id,
+            "reason": self.spec_reason,
+        }
+
+
+def _nextn_heads(record: ModelRecord) -> int:
+    """``nextn_predict_layers`` from the GGUF, or 0.
+
+    Captured by the scanner into ``meta.extra``; it is the *only* honest signal
+    that a model has multi-token-prediction heads. Repository names lie about it
+    both ways -- a library "…-MTP-GGUF" on this box carries no such key at all.
+    """
+    meta = record.meta
+    extra = getattr(meta, "extra", None) if meta is not None else None
+    if not isinstance(extra, dict):
+        return 0
+    try:
+        return int(extra.get("nextn_predict_layers") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def resolve_spec_type(
+    record: ModelRecord, features: EngineFeatures, *, has_draft: bool
+) -> tuple[str, str]:
+    """Pick the ``--spec-type`` for this model. Returns ``(type, reason)``.
+
+    Speculative decoding is *distribution-preserving*: the draft proposes, the
+    full model verifies, and rejected tokens are resampled from the true
+    distribution. It is therefore the rare feature that is pure speed with no
+    quality cost, which is why ``auto`` is allowed to turn it on by itself.
+
+    Raises :class:`ModelLoadError` when an explicitly configured type is not one
+    the active engine offers -- b10425 accepts unknown values on some flags and
+    ignores them, and "speculation configured but silently off" is precisely the
+    failure this whole module refuses to allow (D2).
+    """
+    requested = (record.settings.spec_type or SPEC_AUTO).strip()
+
+    if requested != SPEC_AUTO:
+        if requested == SPEC_TYPE_NONE:
+            return SPEC_TYPE_NONE, "turned off for this model"
+        if not features.known:
+            log.warning(
+                "spec_type_unverified",
+                model_id=record.id,
+                spec_type=requested,
+                detail=(
+                    "the active engine's --help could not be read, so this explicitly "
+                    "configured --spec-type is passed without being checked against it"
+                ),
+            )
+            return requested, "set on this model (engine feature list unavailable)"
+        if not features.supports_spec(requested):
+            offered = ", ".join(features.spec_types) or "none"
+            raise ModelLoadError(
+                f"'{record.id}' asks for --spec-type {requested}, which engine "
+                f"{features.tag or '(active)'} does not offer. It offers: {offered}. "
+                "Change the model's spec_type, or pin an engine that has it.",
+                details={"model_id": record.id, "spec_type": requested, "offered": offered},
+            )
+        return requested, "set on this model"
+
+    # --- auto ---------------------------------------------------------
+    if not features.known:
+        # Unknown engine: keep exactly the pre-gating behaviour, no guesses.
+        if has_draft:
+            return SPEC_TYPE_DRAFT, "a draft model is attached"
+        return SPEC_TYPE_NONE, "engine feature list unavailable"
+
+    heads = _nextn_heads(record)
+    if heads >= 1 and features.supports_spec(SPEC_TYPE_MTP):
+        return SPEC_TYPE_MTP, f"the model carries {heads} multi-token-prediction head(s)"
+    if has_draft and features.supports_spec(SPEC_TYPE_DRAFT):
+        return SPEC_TYPE_DRAFT, "a draft model is attached"
+    thinking = bool(record.capabilities.thinking)
+    moe = is_moe(record.meta)
+    if (thinking or moe) and features.supports_spec(SPEC_TYPE_NGRAM):
+        why = "a thinking model" if thinking else "a mixture-of-experts model"
+        return SPEC_TYPE_NGRAM, f"{why}; its output repeats itself often enough to draft from"
+    return SPEC_TYPE_NONE, "nothing to draft from: no MTP heads, no draft model"
+
+
+def spec_draft_n_max_for(record: ModelRecord, spec_type: str) -> int | None:
+    """``--spec-draft-n-max`` for ``spec_type``, or ``None`` to omit the flag.
+
+    The n-gram types do not read it (they have ``--spec-ngram-*-n-max`` instead),
+    so emitting it there would be a flag that looks like it is doing something.
+    """
+    if not any(part.strip().startswith("draft-") for part in spec_type.split(",")):
+        return None
+    explicit = record.settings.spec_draft_n_max
+    return int(explicit) if explicit is not None else DEFAULT_SPEC_DRAFT_N_MAX
+
+
+def tensor_split_model_blockers(record: ModelRecord) -> list[str]:
+    """Reasons *this model* cannot use ``--split-mode tensor``, model-only.
+
+    Split out from :func:`tensor_split_blockers` so the benchmark can decide
+    which modes to even offer without a plan or an engine in hand.
+    """
+    reasons: list[str] = []
+    meta = record.meta
+    if meta is None:
+        return ["the model's GGUF metadata could not be read, so it cannot be proven dense"]
+    if is_moe(meta):
+        reasons.append("it is a mixture-of-experts model (llama.cpp refuses MoE in tensor mode)")
+    kind = attention_kind(meta)
+    if kind == "hybrid":
+        reasons.append(
+            "it is a hybrid/state-space model (recurrent layers are not supported in tensor mode)"
+        )
+    elif kind == "unknown":
+        reasons.append("its attention layout could not be determined from the GGUF")
+    return reasons
+
+
+def tensor_split_blockers(
+    record: ModelRecord, plan: LoadPlan, features: EngineFeatures
+) -> list[str]:
+    """Every reason ``--split-mode tensor`` cannot be used for this launch.
+
+    Empty means it can. Each entry is a sentence the user can act on, because
+    the alternative -- letting the child start and die -- costs a model load and
+    produces a stack trace instead of a suggestion. Two of these are hard errors
+    in b10425 and were reproduced on the rig: flash attention off exits with
+    ``SPLIT_MODE_TENSOR requires flash_attn to be enabled``, and a single device
+    makes the mode meaningless.
+    """
+    reasons: list[str] = []
+    if len(plan.devices) < 2:
+        reasons.append("the placement uses a single GPU, where tensor mode does nothing")
+    if not features.known:
+        reasons.append("the active engine's feature list could not be read")
+    elif not features.supports_split(SPLIT_MODE_TENSOR):
+        offered = ", ".join(features.split_modes) or "unknown"
+        reasons.append(
+            f"engine {features.tag or '(active)'} has no --split-mode tensor (it offers: {offered})"
+        )
+    if plan.flash_attn != "on":
+        reasons.append(
+            f"tensor mode requires flash attention on, and this plan uses '{plan.flash_attn}'"
+        )
+    quantized = sorted(
+        {plan.kv_cache_type, plan.kv_cache_type_v} - TENSOR_SPLIT_KV_TYPES,
+    )
+    if quantized:
+        reasons.append(
+            f"tensor mode needs an unquantized KV cache and this plan uses {', '.join(quantized)} "
+            "(lower the context, or set kv_cache_type f16, to get one)"
+        )
+    reasons.extend(tensor_split_model_blockers(record))
+    return reasons
+
+
+def resolve_split_mode(
+    record: ModelRecord, plan: LoadPlan, features: EngineFeatures
+) -> tuple[str, str | None]:
+    """Resolve ``plan.split_mode`` for the launch. Returns ``(mode, reason)``.
+
+    ``auto`` downgrades to ``layer`` with a logged reason; an explicit
+    ``tensor`` that cannot run is refused, because a user who typed "tensor" and
+    silently got "layer" would go on to benchmark the wrong thing.
+    """
+    requested = plan.split_mode
+    if len(plan.devices) < 2:
+        # One device: the engine wants 'none', and that is what _placement_args
+        # has always emitted. Nothing to resolve.
+        return "none", None
+    if requested not in (SPLIT_MODE_TENSOR, SPEC_AUTO):
+        return requested, None
+
+    blockers = tensor_split_blockers(record, plan, features)
+    if not blockers:
+        return SPLIT_MODE_TENSOR, None
+    detail = "; ".join(blockers)
+    if requested == SPLIT_MODE_TENSOR:
+        raise ModelLoadError(
+            f"'{record.id}' asks for --split-mode tensor, which cannot be used here: {detail}.",
+            details={"model_id": record.id, "blockers": blockers},
+        )
+    reason = f"split_mode auto chose layer over tensor: {detail}"
+    log.info("split_mode_downgraded", model_id=record.id, detail=detail)
+    return SPLIT_MODE_LAYER, reason
+
+
+def resolve_launch_features(
+    record: ModelRecord,
+    plan: LoadPlan,
+    features: EngineFeatures,
+    *,
+    has_draft: bool,
+) -> ResolvedFeatures:
+    """Resolve every ``auto``/gated knob for one launch. Pure; may raise."""
+    spec_type, spec_reason = resolve_spec_type(record, features, has_draft=has_draft)
+    split_mode, split_reason = resolve_split_mode(record, plan, features)
+    return ResolvedFeatures(
+        spec_type=spec_type,
+        spec_draft_n_max=spec_draft_n_max_for(record, spec_type),
+        spec_reason=spec_reason,
+        split_mode=split_mode,
+        split_mode_reason=split_reason,
+    )
+
+
 class _Instance:
     """Mutable supervisor-side state for one child process."""
 
@@ -488,9 +762,16 @@ class Supervisor:
         client: httpx.AsyncClient | None = None,
         launch_prefix: Sequence[str] = (),
         probe: GpuProbe | None = None,
+        engine_features: Callable[[str | None], EngineFeatures] | None = None,
     ) -> None:
         self._config = config
         self._resolve_binary = resolve_binary
+        # Same injection story as resolve_binary: a callable, not the engine
+        # manager, so this module keeps knowing nothing about it. The default
+        # reads engines/<tag>/features.json (written at boot), falling back to
+        # help.txt and finally to running --help once.
+        self._resolve_features = engine_features or self._probe_features
+        self._features: dict[str, EngineFeatures] = {}
         # Optional purely so a supervisor can be built without hardware; when
         # present it is used to log the VRAM an unload actually reclaimed.
         self._probe = probe
@@ -509,6 +790,33 @@ class Supervisor:
         _register_atexit()
 
     # ------------------------------------------------------------------
+    # Engine features
+    # ------------------------------------------------------------------
+
+    def _probe_features(self, tag: str | None) -> EngineFeatures:
+        """Default feature lookup: read (or fill) the cache next to the binary."""
+        try:
+            binary = self._resolve_binary(tag)
+        except Exception as exc:  # noqa: BLE001 - a missing engine fails at spawn, loudly
+            log.warning("engine_features_unresolved", engine_tag=tag, error=str(exc))
+            return EngineFeatures.unknown(tag or "")
+        return probe_engine_features(binary, tag or "")
+
+    async def features_for(self, tag: str | None) -> EngineFeatures:
+        """The active engine's advertised feature set, memoised per tag.
+
+        Awaited on the load path so the (rare) fallback that actually runs
+        ``llama-server --help`` cannot block the event loop.
+        """
+        key = tag or ""
+        cached = self._features.get(key)
+        if cached is not None:
+            return cached
+        features = await asyncio.to_thread(self._resolve_features, tag)
+        self._features[key] = features
+        return features
+
+    # ------------------------------------------------------------------
     # Command building
     # ------------------------------------------------------------------
 
@@ -521,6 +829,8 @@ class Supervisor:
         engine_tag: str | None = None,
         draft: ModelRecord | None = None,
         adapters: Sequence[tuple[AdapterRecord, float]] = (),
+        features: EngineFeatures | None = None,
+        resolved: ResolvedFeatures | None = None,
     ) -> list[str]:
         """Build the full argv for one ``llama-server`` child.
 
@@ -531,9 +841,17 @@ class Supervisor:
         See the module docstring for why ``--n-gpu-layers`` is hardcoded, why
         ``--ctx-size`` is multiplied by ``parallel``, and why ``--spec-type`` is
         mandatory for drafting.
+
+        ``features`` is what the active engine advertises; omitted (as by the
+        GUI's command-line preview and by tests) it defaults to "advertises
+        nothing", which yields the pre-gating flag surface -- never a guess.
+        ``resolved`` lets :meth:`_spawn` pass in a resolution it has already
+        recorded on the plan instead of computing it twice.
         """
         settings = record.settings
         binary = self._resolve_binary(engine_tag or settings.engine_tag)
+        engine = features if features is not None else EngineFeatures.unknown(engine_tag or "")
+        decided = resolved if resolved is not None else self.resolve(record, plan, engine, draft)
 
         argv: list[str] = [
             str(binary),
@@ -555,7 +873,7 @@ class Supervisor:
             str(plan.parallel),
         ]
 
-        argv += self._placement_args(plan)
+        argv += self._placement_args(plan, decided)
         argv += ["--cache-type-k", plan.kv_cache_type, "--cache-type-v", plan.kv_cache_type_v]
         # b10425: --flash-attn takes a value (on|off|auto), it is not a switch.
         argv += ["--flash-attn", plan.flash_attn]
@@ -570,8 +888,8 @@ class Supervisor:
         # genuine over-commit fail loudly instead. Verified accepted by b10425.
         argv += ["--fit", "off"]
 
-        argv += self._optional_args(record)
-        argv += self._concurrency_args(record, plan)
+        argv += self._optional_args(record, engine)
+        argv += self._concurrency_args(record, plan, engine)
 
         if record.kind == "embedding":
             argv.append("--embedding")
@@ -586,8 +904,7 @@ class Supervisor:
             else:
                 argv += ["--lora-scaled", str(adapter.path), _fmt_float(scale)]
 
-        if draft is not None:
-            argv += self._draft_args(record, plan, draft)
+        argv += self._spec_args(record, plan, draft, decided, engine)
 
         if settings.extra_flags.strip():
             # posix=False on Windows so backslash paths survive verbatim.
@@ -595,13 +912,27 @@ class Supervisor:
 
         return argv
 
-    def _placement_args(self, plan: LoadPlan) -> list[str]:
+    def resolve(
+        self,
+        record: ModelRecord,
+        plan: LoadPlan,
+        features: EngineFeatures,
+        draft: ModelRecord | None = None,
+    ) -> ResolvedFeatures:
+        """Resolve the ``auto``/gated knobs for a launch. See D38."""
+        return resolve_launch_features(record, plan, features, has_draft=draft is not None)
+
+    def _placement_args(self, plan: LoadPlan, decided: ResolvedFeatures) -> list[str]:
         """Device selection, split mode and main GPU.
 
         ``--main-gpu`` indexes the *filtered* device list produced by
         ``--device``, not the physical CUDA ordinal: passing ``--device CUDA1
         --main-gpu 1`` makes llama.cpp reject the load with an out-of-range main
         GPU. So the physical ordinal in the plan is translated to its position.
+
+        The split mode comes from ``decided``, not from the plan: the planner
+        cannot judge ``tensor`` because it does not know what the engine offers
+        (see :func:`resolve_split_mode`).
         """
         devices = list(plan.devices) or [0]
         device_arg = ",".join(f"CUDA{i}" for i in devices)
@@ -611,19 +942,26 @@ class Supervisor:
         args = ["--device", device_arg]
         if plan.tensor_split:
             args += ["--tensor-split", ",".join(_fmt_float(v) for v in plan.tensor_split)]
-        args += ["--split-mode", plan.split_mode]
+        args += ["--split-mode", decided.split_mode]
+        # --main-gpu is only read for split modes 'none' and 'row', but passing
+        # it under tensor mode is harmless and keeps the argv shape stable.
         main = devices.index(plan.main_gpu) if plan.main_gpu in devices else 0
         args += ["--main-gpu", str(main)]
         return args
 
-    def _optional_args(self, record: ModelRecord) -> list[str]:
+    def _optional_args(self, record: ModelRecord, features: EngineFeatures) -> list[str]:
         settings = record.settings
         args: list[str] = []
 
         if settings.batch_size is not None:
             args += ["--batch-size", str(settings.batch_size)]
-        if settings.ubatch_size is not None:
-            args += ["--ubatch-size", str(settings.ubatch_size)]
+        ubatch = (
+            settings.ubatch_size
+            if settings.ubatch_size is not None
+            else self._config.engine.ubatch_size
+        )
+        if ubatch is not None:
+            args += ["--ubatch-size", str(ubatch)]
         if settings.threads is not None:
             args += ["--threads", str(settings.threads)]
         if settings.threads_batch is not None:
@@ -641,6 +979,23 @@ class Supervisor:
         )
         if cache_reuse and cache_reuse > 0:
             args += ["--cache-reuse", str(cache_reuse)]
+
+        # Host-RAM prompt cache. The other half of the same win as
+        # --cache-reuse: reuse recovers a prefix that is still in the slot,
+        # --cache-ram keeps a prefix that has been evicted from one, in system
+        # memory, so the next request that carries it does not re-prefill.
+        # Costs no VRAM (measured identical at 8192 and 32768 MiB) and cannot
+        # change a token, so it is on by default under the quality-first rule.
+        if features.cache_ram:
+            cache_ram = resolve_cache_ram_mb(self._config.engine.cache_ram_mb)
+            if cache_ram is not None:
+                args += ["--cache-ram", str(cache_ram)]
+
+        # GPU-side sampling. Marked EXPERIMENTAL by b10425 and silently
+        # downgraded ("backend sampling not supported with SPLIT_MODE_TENSOR;
+        # using CPU") under tensor split, so it stays opt-in.
+        if self._config.engine.backend_sampling and features.backend_sampling:
+            args.append("--backend-sampling")
 
         # Reasoning/thinking models: llama.cpp defaults --reasoning-format to
         # 'auto', which routes thoughts into message.reasoning_content and can
@@ -703,7 +1058,9 @@ class Supervisor:
 
         return args
 
-    def _concurrency_args(self, record: ModelRecord, plan: LoadPlan) -> list[str]:
+    def _concurrency_args(
+        self, record: ModelRecord, plan: LoadPlan, features: EngineFeatures
+    ) -> list[str]:
         """Flags that only make sense once a model serves more than one slot.
 
         Emitted from the *plan*, not from settings, because the slot count can
@@ -732,41 +1089,68 @@ class Supervisor:
         if slots > 1:
             args += ["--slot-prompt-similarity", _fmt_float(SLOT_PROMPT_SIMILARITY_MULTI)]
 
-        # One shared KV pool instead of an equal slice per slot. Same VRAM
-        # either way. Opt-in per model: llama.cpp enables it only when the slot
-        # count is auto, and we always pass an explicit one, so switching it on
-        # is a real change to how a long request behaves -- verify with a real
-        # load before recommending it (D17).
+        # KV pool shape across slots. Measured on b10425 with the 0.5B, two
+        # slots and --ctx-size 16384 (DECISIONS.md D38):
+        #
+        #   nothing passed  -> kv_unified='false', n_ctx_slot 8192; a 12k-token
+        #                      request is refused up front with a 400 naming the
+        #                      limit. `ctx_per_slot` is a real guarantee.
+        #   --kv-unified    -> kv_unified='true',  n_ctx_slot 16384, SAME VRAM
+        #                      (997 vs 1005 MiB). A lone request reaches the
+        #                      whole pool -- but two 12k requests at once both
+        #                      died mid-generation with a 500 "Context size has
+        #                      been exceeded".
+        #
+        # An agent host would rather be told "no" before the work starts than be
+        # 500ed halfway through one of four concurrent agents, so the partitioned
+        # pool stays the default and `--no-kv-unified` is passed *explicitly*:
+        # the engine's own default is "enabled if the slot count is auto", and a
+        # guarantee that depends on a flag we happen to pass is not a guarantee.
         if settings.kv_unified:
             args.append("--kv-unified")
+        elif slots > 1 and features.has("--no-kv-unified"):
+            args.append("--no-kv-unified")
 
         return args
 
-    def _draft_args(self, record: ModelRecord, plan: LoadPlan, draft: ModelRecord) -> list[str]:
+    def _spec_args(
+        self,
+        record: ModelRecord,
+        plan: LoadPlan,
+        draft: ModelRecord | None,
+        decided: ResolvedFeatures,
+        features: EngineFeatures,
+    ) -> list[str]:
         """Speculative decoding flags, b10425 spelling.
 
-        ``--spec-type`` defaults to ``none``; without it the draft model is
-        loaded (costing VRAM) and then never used, which is invisible except as
+        ``--spec-type`` defaults to ``none``; without it a draft model is loaded
+        (costing VRAM) and then never used, which is invisible except as
         "speculation did not help". The old ``--draft*`` names are accepted and
         ignored by b10425, so they must never appear here.
+
+        The draft-model flags are emitted only for a type that actually uses
+        one: ``draft-mtp`` reads the base model's own heads and ``ngram-*`` read
+        the generated text, so pointing either at a ``--spec-draft-model`` would
+        load a second model for nothing.
         """
         settings = record.settings
-        args: list[str] = [
-            "--spec-type",
-            settings.spec_type or SPEC_TYPE_DRAFT,
-            "--spec-draft-model",
-            str(draft.path),
-            "--spec-draft-n-max",
-            str(
-                settings.spec_draft_n_max
-                if settings.spec_draft_n_max is not None
-                else DEFAULT_SPEC_DRAFT_N_MAX
-            ),
-        ]
+        if not decided.drafting:
+            return []
+        if features.known and not features.has("--spec-type"):  # pragma: no cover - ancient build
+            return []
+
+        args: list[str] = ["--spec-type", decided.spec_type]
+        if decided.spec_draft_n_max is not None:
+            args += ["--spec-draft-n-max", str(decided.spec_draft_n_max)]
         if settings.spec_draft_n_min is not None:
             args += ["--spec-draft-n-min", str(settings.spec_draft_n_min)]
         if settings.spec_draft_p_min is not None:
             args += ["--spec-draft-p-min", _fmt_float(settings.spec_draft_p_min)]
+
+        if draft is None:
+            return args
+
+        args += ["--spec-draft-model", str(draft.path)]
         # The draft model is GPU-only too; a CPU-resident draft is slower than
         # not drafting at all.
         args += ["--spec-draft-ngl", ALL_GPU_LAYERS]
@@ -839,8 +1223,15 @@ class Supervisor:
         engine_tag: str | None = None,
         draft: ModelRecord | None = None,
         adapters: Sequence[tuple[AdapterRecord, float]] = (),
+        source: str | None = None,
     ) -> InstanceInfo:
-        """Launch (or return) the child for ``record``; returns once /health is ok."""
+        """Launch (or return) the child for ``record``; returns once /health is ok.
+
+        ``source`` names the caller ("mcp:load_model", "jit:/v1/chat/completions",
+        "gui"...). It is stamped on the instance and carried into the spawn and
+        ready log lines so a model appearing on the GPUs can be traced back to
+        whoever asked for it (D36).
+        """
         async with self._lock(record.id):
             existing = self._instances.get(record.id)
             if existing is not None and existing.info.state in ("ready", "loading"):
@@ -856,6 +1247,7 @@ class Supervisor:
                 engine_tag=tag,
                 plan=plan,
                 ttl_s=record.settings.ttl_s,
+                loaded_by=source,
                 log_path=self._log_path_for(record.id),
             )
             inst = _Instance(
@@ -889,12 +1281,20 @@ class Supervisor:
             inst.info.last_activity_at = time.time()
             inst.watcher = asyncio.create_task(self._watch(inst), name=f"sf-watch-{record.id}")
             log.info(
-                "model_ready", model_id=record.id, port=port, pid=inst.info.pid, engine_tag=tag
+                "model_ready",
+                model_id=record.id,
+                port=port,
+                pid=inst.info.pid,
+                engine_tag=tag,
+                source=source,
             )
             return inst.info
 
     async def _spawn(self, inst: _Instance) -> None:
         """Create the child process and start pumping its output."""
+        features = await self.features_for(inst.engine_tag)
+        decided = self.resolve(inst.record, inst.plan, features, inst.draft)
+        self._record_resolution(inst, decided)
         argv = self.build_command(
             inst.record,
             inst.plan,
@@ -902,6 +1302,8 @@ class Supervisor:
             engine_tag=inst.engine_tag,
             draft=inst.draft,
             adapters=inst.adapters,
+            features=features,
+            resolved=decided,
         )
         inst.argv = argv
         full_argv = [*self._launch_prefix, *_pdeathsig_prefix(), *argv]
@@ -930,7 +1332,13 @@ class Supervisor:
         # Run from the engine directory: the CUDA/ggml DLLs (or .so files) ship
         # alongside llama-server and are found relative to it.
         engine_dir = Path(argv[0]).parent
-        log.info("model_spawn", model_id=inst.record.id, port=inst.port, argv=" ".join(argv))
+        log.info(
+            "model_spawn",
+            model_id=inst.record.id,
+            port=inst.port,
+            source=inst.info.loaded_by,
+            argv=" ".join(argv),
+        )
         try:
             proc = await asyncio.create_subprocess_exec(
                 *full_argv,
@@ -963,6 +1371,26 @@ class Supervisor:
         if proc.stderr is not None:
             inst.pumps.append(asyncio.create_task(self._pump(inst, proc.stderr, stderr=True)))
         inst.wait_task = asyncio.create_task(proc.wait(), name=f"sf-wait-{inst.record.id}")
+
+    @staticmethod
+    def _record_resolution(inst: _Instance, decided: ResolvedFeatures) -> None:
+        """Publish the resolved knobs on the plan and the instance.
+
+        The plan object is the one carried by ``InstanceInfo.plan``, so writing
+        the *resolved* split mode back onto it is what makes every surface that
+        renders a placement -- the catalog, the Dashboard, ``GET /api/models`` --
+        show what the child is really doing rather than what was asked for.
+        """
+        speculative = decided.speculative_dict(
+            draft_model_id=inst.draft.id if inst.draft is not None else None
+        )
+        inst.plan.speculative = speculative
+        inst.info.speculative = speculative
+        if len(inst.plan.devices) > 1:
+            inst.plan.split_mode = decided.split_mode  # type: ignore[assignment]
+        inst.plan.split_mode_reason = decided.split_mode_reason
+        if decided.split_mode_reason and decided.split_mode_reason not in inst.plan.notes:
+            inst.plan.notes.append(decided.split_mode_reason)
 
     @staticmethod
     def _resume(inst: _Instance, proc: asyncio.subprocess.Process) -> None:

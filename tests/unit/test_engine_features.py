@@ -99,7 +99,7 @@ def test_unknown_engine_advertises_nothing() -> None:
 
 
 def test_empty_help_is_unknown_not_empty_support() -> None:
-    """"Nothing parsed" must never read as "the engine offers nothing"."""
+    """Nothing parsed must never read as "the engine offers nothing"."""
     assert parse_engine_features("", "b10425").known is False
 
 

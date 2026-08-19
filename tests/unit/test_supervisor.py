@@ -534,12 +534,19 @@ def test_draft_model_requires_spec_type(config: Config, tmp_path: Path) -> None:
 def test_draft_defaults_n_max_and_no_draft_flags_without_draft(
     config: Config, tmp_path: Path
 ) -> None:
+    """The draft depth default is the engine's own 3, not 16.
+
+    b10425's ``--help`` says "(default: 3)". The value here used to be 16 under
+    a comment claiming it *was* the engine default, so every draft-model load
+    ran four times deeper than intended; measured on a real MTP model, depth 3
+    beat depth 4 on both acceptance and tokens/second (DECISIONS.md D38).
+    """
     binary = make_binary(tmp_path)
     supervisor = sup(config, binary)
     argv = supervisor.build_command(
         make_record(tmp_path), make_plan(), port=18100, draft=make_record(tmp_path, "tiny")
     )
-    assert value_after(argv, "--spec-draft-n-max") == "16"
+    assert value_after(argv, "--spec-draft-n-max") == "3"
 
     plain = supervisor.build_command(make_record(tmp_path), make_plan(), port=18100)
     assert not [flag for flag in plain if flag.startswith("--spec")]

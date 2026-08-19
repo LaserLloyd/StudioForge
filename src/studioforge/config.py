@@ -33,8 +33,25 @@ from studioforge.errors import ConfigError
 #: "auto" is resolved by the planner per model: it takes the best-quality KV
 #: cache that still reaches the chosen context on the hardware available.
 KvCacheType = Literal["auto", "f32", "f16", "bf16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0"]
-SplitMode = Literal["none", "layer", "row", "tensor"]
+#: ``auto`` is StudioForge's own sentinel, resolved at launch by the supervisor:
+#: ``tensor`` when every gate passes (engine offers it, >= 2 devices, dense
+#: non-hybrid model, flash attention on, unquantized KV) and ``layer`` with a
+#: logged reason otherwise. ``layer`` remains the default because tensor mode is
+#: EXPERIMENTAL upstream and measured *slower* than layer on this PCIe rig
+#: (DECISIONS.md D38). ``row`` is accepted by the flag parser but the CUDA
+#: backend rejects it at load time ("device CUDAn does not support split
+#: buffers") -- see docs/LIMITATIONS.md.
+SplitMode = Literal["none", "layer", "row", "tensor", "auto"]
 FlashAttn = Literal["on", "off", "auto"]
+
+#: Ceiling for the automatic host-RAM prompt cache, in MiB. 32 GiB on a 128 GiB
+#: box: big enough to hold many agent prefixes, small enough that the cache can
+#: never be the reason the machine starts swapping.
+CACHE_RAM_AUTO_MAX_MIB = 32768
+#: Fraction of system RAM the automatic setting will claim.
+CACHE_RAM_AUTO_FRACTION = 0.25
+#: What ``cache_ram_mb: "auto"`` falls back to when system RAM cannot be read.
+CACHE_RAM_AUTO_FALLBACK_MIB = 8192
 
 APP_NAME = "studioforge"
 
@@ -282,6 +299,70 @@ class EngineConfig(BaseModel):
     allow_source_build: bool = True
     repo: str = "ggml-org/llama.cpp"
     smoke_test_timeout_s: PositiveFloat = 180.0
+
+    #: ``--cache-ram``: host-RAM prompt cache, in MiB. Costs no VRAM (measured:
+    #: identical VRAM at 8192 and 32768) and is quality-neutral -- it only lets
+    #: the engine keep evicted prompt prefixes in system memory instead of
+    #: recomputing them, which is exactly the OpenClaw pattern of re-sending a
+    #: long, near-identical agent prompt. ``"auto"`` = 25% of system RAM capped
+    #: at 32 GiB; ``0`` disables it; ``-1`` is the engine's "no limit".
+    cache_ram_mb: int | Literal["auto"] = "auto"
+    #: ``-ub/--ubatch-size`` default for every model that does not set its own.
+    #: ``None`` leaves the engine's 512. Raising it buys prompt-processing
+    #: speed for compute-buffer VRAM -- measured on a 1.5B on one RTX 3090 with
+    #: a 5166-token prompt: 512 -> 15232 tok/s at 1492 MiB, 1024 -> 17307 tok/s
+    #: at 1562 MiB, 2048 -> 18061 tok/s at 1702 MiB. Left unset because the
+    #: planner's compute-buffer estimate is calibrated against the 512 default
+    #: (DECISIONS.md D38).
+    #:
+    #: Spelled ``int | None`` rather than ``PositiveInt | None`` deliberately:
+    #: an *optional* Annotated int survives into the pydantic annotation as
+    #: ``Optional[Annotated[int, Gt(0)]]``, which the Setup tab's field-spec
+    #: generator classifies as unsupported and silently drops from the form.
+    #: The bound lives in the validator below instead.
+    ubatch_size: int | None = None
+    #: ``-bs/--backend-sampling``: run sampling on the GPU. Faster, but marked
+    #: EXPERIMENTAL by b10425 and silently downgraded to CPU sampling under
+    #: ``--split-mode tensor``. Off by default under the quality-first rule --
+    #: only features that are lossless *and* not experimental ship enabled.
+    backend_sampling: bool = False
+
+    @field_validator("ubatch_size")
+    @classmethod
+    def _positive_ubatch(cls, v: int | None) -> int | None:
+        if v is not None and v < 1:
+            raise ValueError("engine.ubatch_size must be >= 1 (null = the engine's own 512)")
+        return v
+
+    @field_validator("cache_ram_mb")
+    @classmethod
+    def _sane_cache_ram(cls, v: int | str) -> int | str:
+        if isinstance(v, str):
+            if v != "auto":
+                raise ValueError("engine.cache_ram_mb must be an int (MiB), -1, 0, or 'auto'")
+            return v
+        if v < -1:
+            raise ValueError("engine.cache_ram_mb must be >= -1 (-1 = no limit, 0 = disabled)")
+        return v
+
+
+def resolve_cache_ram_mb(value: int | str) -> int | None:
+    """Turn ``engine.cache_ram_mb`` into the number that reaches ``--cache-ram``.
+
+    ``None`` means "pass nothing" -- reserved for a value we cannot resolve, so
+    the engine keeps its own default rather than being handed a guess.
+    """
+    if isinstance(value, int):
+        return value
+    try:
+        import psutil
+
+        total_mib = int(psutil.virtual_memory().total // (1024 * 1024))
+    except Exception:  # pragma: no cover - psutil is a hard dep, but never fail here
+        return CACHE_RAM_AUTO_FALLBACK_MIB
+    if total_mib <= 0:  # pragma: no cover - defensive
+        return CACHE_RAM_AUTO_FALLBACK_MIB
+    return max(1024, min(CACHE_RAM_AUTO_MAX_MIB, int(total_mib * CACHE_RAM_AUTO_FRACTION)))
 
 
 class QuantAffinity(BaseModel):
