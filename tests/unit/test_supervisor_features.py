@@ -555,3 +555,40 @@ def test_a_downgraded_split_mode_lands_in_the_plan_notes(config: Config, tmp_pat
     assert plan.split_mode == "layer"
     assert plan.split_mode_reason is not None
     assert any("mixture-of-experts" in note for note in plan.notes)
+
+
+def test_a_micro_batch_above_the_logical_batch_raises_the_batch(
+    config: Config, tmp_path: Path
+) -> None:
+    """llama.cpp clamps ``n_ubatch`` to ``n_batch``: ``-ub 4096`` against the
+    default ``-b 2048`` silently runs at 2048 (D40). The automatic batch is
+    raised to cover it; an explicit ``batch_size`` is the user's and stays."""
+    from studioforge.core.supervisor import BATCH_SIZE_MANY_SLOTS
+
+    binary = make_binary(tmp_path)
+    big = make_record(tmp_path, settings=ModelSettings(ubatch_size=4096))
+    argv = sup(config, binary).build_command(big, make_plan(), port=18100, features=B10425)
+    assert value_after(argv, "--ubatch-size") == "4096"
+    assert value_after(argv, "--batch-size") == "4096"
+    assert argv.count("--batch-size") == 1
+
+    # Below the default logical batch nothing is added.
+    small = make_record(tmp_path, settings=ModelSettings(ubatch_size=1024))
+    argv = sup(config, binary).build_command(small, make_plan(), port=18100, features=B10425)
+    assert "--batch-size" not in argv
+
+    # Many slots already raise the batch; a micro-batch above THAT raises it further.
+    argv = sup(config, binary).build_command(
+        make_record(tmp_path, settings=ModelSettings(ubatch_size=8192)),
+        make_plan(parallel=6),
+        port=18100,
+        features=B10425,
+    )
+    assert argv.count("--batch-size") == 1
+    assert int(value_after(argv, "--batch-size")) == max(BATCH_SIZE_MANY_SLOTS, 8192)
+
+    # The user's own batch_size is honoured verbatim, even below the micro-batch.
+    pinned = make_record(tmp_path, settings=ModelSettings(ubatch_size=4096, batch_size=1024))
+    argv = sup(config, binary).build_command(pinned, make_plan(), port=18100, features=B10425)
+    assert argv.count("--batch-size") == 1
+    assert value_after(argv, "--batch-size") == "1024"

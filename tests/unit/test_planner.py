@@ -1057,3 +1057,142 @@ def test_reserved_mb_can_make_a_load_not_fit() -> None:
     result = planner.plan_load(make_record(), ctx_size=8192)
     assert isinstance(result, LoadRejected)
     assert any("reserved_mb" in s for s in result.suggestions)
+
+
+# ---------------------------------------------------------------------------
+# D40: where the bytes land -- the output layer, and the micro-batch
+# ---------------------------------------------------------------------------
+
+
+def _meta_with_vocab(*, tensor_bytes: int, n_embd: int = 4096, n_vocab: int = 151936) -> GgufMeta:
+    meta = make_meta(tensor_bytes=tensor_bytes, n_embd=n_embd)
+    return meta.model_copy(update={"n_vocab": n_vocab, "param_count": tensor_bytes * 8 // 5})
+
+
+def test_output_layer_bytes_is_vocab_times_embd_at_the_file_density() -> None:
+    from studioforge.core.planner import OUTPUT_LAYER_DEFAULT_BPW, output_layer_bytes
+
+    meta = _meta_with_vocab(tensor_bytes=40 * GB)  # 5 bits per weight declared
+    assert output_layer_bytes(meta) == int(151936 * 4096 * 5 / 8)
+    # Without a declared parameter count the default density applies.
+    undeclared = make_meta(tensor_bytes=40 * GB).model_copy(update={"n_vocab": 151936})
+    assert output_layer_bytes(undeclared) == int(151936 * 4096 * OUTPUT_LAYER_DEFAULT_BPW / 8)
+    # No vocabulary in the metadata: nothing to charge, nothing guessed.
+    assert output_layer_bytes(make_meta()) == 0
+    assert output_layer_bytes(None) == 0
+
+
+def test_split_charges_the_output_layer_to_the_last_device() -> None:
+    """llama.cpp puts the output layer on the last device of the list (D40).
+
+    Measured on the scratch rig: a 0.5,0.5 split of two small models landed
+    104-110 MiB more on the last card, independent of -ub; the live rig's 27B
+    planned at 0.5079,0.4921 landed 0.76 GiB MORE on the card the split gave
+    less to. So the plan charges it there and tilts the split away from it.
+    """
+    from studioforge.core.planner import output_layer_bytes
+
+    probe = StubProbe([gpu(0, 32.0, 30.0, (12, 0)), gpu(1, 32.0, 30.0, (12, 0))])
+    planner = Planner(make_config(headroom_fraction=0.0), probe)
+    meta = _meta_with_vocab(tensor_bytes=40 * GB)
+    record = make_record(meta=meta, size_bytes=40 * GB)
+    plan = planner.plan_load(record, ctx_size=4096)
+    assert isinstance(plan, LoadPlan)
+    assert len(plan.devices) == 2
+    first, last = plan.devices
+    shift = output_layer_bytes(meta)
+    assert shift > 0
+    # Equal cards: the split leans toward the FIRST card (fewer blocks on the
+    # one that also holds the output layer)...
+    assert plan.tensor_split is not None
+    assert plan.tensor_split[0] > plan.tensor_split[1]
+    # ...and the last card's share is its block share PLUS the output layer,
+    # so it still ends up the heavier of the two.
+    body = plan.estimate.total_bytes - shift
+    assert plan.per_gpu_bytes[last] == pytest.approx(body * plan.tensor_split[1] + shift, rel=0.01)
+    assert plan.per_gpu_bytes[first] == pytest.approx(body * plan.tensor_split[0], rel=0.01)
+    assert plan.per_gpu_bytes[last] > plan.per_gpu_bytes[first]
+    assert sum(plan.per_gpu_bytes.values()) == pytest.approx(plan.estimate.total_bytes, abs=4)
+
+
+def test_the_output_layer_shift_can_refuse_a_last_card_that_is_too_tight() -> None:
+    """Totals that add up are not enough: the last card must hold its layer too."""
+    from studioforge.core.planner import output_layer_bytes
+
+    meta = _meta_with_vocab(tensor_bytes=40 * GB)
+    shift = output_layer_bytes(meta)
+    need = 40 * GB + 400 * MB  # weights + compute floor, roughly; ctx is tiny here
+    # Two cards that together hold the total with a hair to spare, but the
+    # second one cannot hold its proportional share PLUS the output layer.
+    free0 = need // 2 + shift
+    free1 = need // 2 - shift // 2
+    probe = StubProbe([gpu(0, 32.0, free0 / GB, (12, 0)), gpu(1, 32.0, free1 / GB, (12, 0))])
+    planner = Planner(make_config(headroom_fraction=0.0, cuda_context_mb=0), probe)
+    record = make_record(meta=meta, size_bytes=40 * GB)
+    result = planner.plan_load(record, ctx_size=256, kv_cache_type="f16")
+    # Either it refuses, or every card is within its capacity with the shift applied.
+    if isinstance(result, LoadPlan):
+        caps = {g.index: planner.usable_bytes(g) for g in probe.list_gpus()}
+        for dev, want in result.per_gpu_bytes.items():
+            assert want <= caps[dev]
+        assert result.per_gpu_bytes[result.devices[-1]] >= shift
+    else:
+        assert isinstance(result, LoadRejected)
+
+
+def test_ubatch_scratch_grows_per_token_per_embd_per_device() -> None:
+    from studioforge.core.planner import (
+        DEFAULT_UBATCH,
+        UBATCH_SCRATCH_BYTES_PER_TOKEN_PER_EMBD,
+        ubatch_scratch_bytes,
+    )
+
+    meta = make_meta(n_embd=1536)
+    assert ubatch_scratch_bytes(meta, ubatch=DEFAULT_UBATCH) == 0
+    assert ubatch_scratch_bytes(meta, ubatch=256) == 0
+    one = ubatch_scratch_bytes(meta, ubatch=2048)
+    assert one == 1536 * 1536 * UBATCH_SCRATCH_BYTES_PER_TOKEN_PER_EMBD
+    # Every device of a split holds the whole micro-batch.
+    assert ubatch_scratch_bytes(meta, ubatch=2048, n_devices=2) == 2 * one
+    # Measured on the 1.5B (n_embd 1536): +198 MiB single, +270 MiB per card of
+    # a pair, for -ub 512 -> 2048. The charge must cover both.
+    assert one >= 270 * MB
+
+
+def test_estimate_is_ubatch_aware_with_the_supervisor_precedence() -> None:
+    """``-ub`` reaches the estimate: per-model, else engine.ubatch_size, else 512."""
+    from studioforge.core.planner import DEFAULT_UBATCH
+
+    config = make_config()
+    planner = Planner(config, rig_5090x2_3090x2())
+    record = make_record(meta=make_meta(n_embd=4096))
+    base = planner.estimate(
+        record, ctx_size=8192, parallel=1, kv_cache_type="f16", kv_cache_type_v="f16"
+    )
+    assert planner.ubatch_for(record) == DEFAULT_UBATCH
+
+    config.engine.ubatch_size = 2048
+    assert planner.ubatch_for(record) == 2048
+    global_raised = planner.estimate(
+        record, ctx_size=8192, parallel=1, kv_cache_type="f16", kv_cache_type_v="f16"
+    )
+    assert global_raised.compute_bytes > base.compute_bytes
+    assert global_raised.total_bytes - base.total_bytes == 1536 * 4096 * 128
+
+    pinned = make_record(meta=make_meta(n_embd=4096), settings=ModelSettings(ubatch_size=1024))
+    assert planner.ubatch_for(pinned) == 1024
+    per_model = planner.estimate(
+        pinned, ctx_size=8192, parallel=1, kv_cache_type="f16", kv_cache_type_v="f16"
+    )
+    assert base.compute_bytes < per_model.compute_bytes < global_raised.compute_bytes
+
+    # An explicit argument wins over both, and the default costs nothing extra.
+    explicit = planner.estimate(
+        pinned,
+        ctx_size=8192,
+        parallel=1,
+        kv_cache_type="f16",
+        kv_cache_type_v="f16",
+        ubatch=DEFAULT_UBATCH,
+    )
+    assert explicit.compute_bytes == base.compute_bytes

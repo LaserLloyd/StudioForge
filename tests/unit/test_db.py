@@ -320,6 +320,26 @@ def test_load_observation_default_ts(db: Database) -> None:
     assert before <= row["ts"] <= time.time()
 
 
+def test_load_observations_carry_the_per_device_split(db: Database) -> None:
+    """Migration 006 (D40): where the load landed, per card, beside the plan's share."""
+    import json
+
+    planned = {"0": 16 * 2**30, "1": 15 * 2**30}
+    actual = {"0": 15 * 2**30, "1": 16 * 2**30}
+    db.record_load_observation(
+        model_id="m1",
+        ok=True,
+        note="per_pid_v2",
+        per_gpu_planned=json.dumps(planned),
+        per_gpu_actual=json.dumps(actual),
+    )
+    db.record_load_observation(model_id="m1", ok=True, note="per_pid_v2")  # no split known
+    rows = db.load_observations("m1")
+    assert json.loads(rows[1]["per_gpu_planned"]) == planned
+    assert json.loads(rows[1]["per_gpu_actual"]) == actual
+    assert rows[0]["per_gpu_actual"] is None
+
+
 # ---------------------------------------------------------------------------
 # Throughput calibration
 # ---------------------------------------------------------------------------

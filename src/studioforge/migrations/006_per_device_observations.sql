@@ -1,0 +1,26 @@
+-- 006_per_device_observations.sql: record WHERE a load landed, not just how much.
+--
+-- load_observations carried one predicted_bytes and one actual_bytes per load,
+-- and the actual figure was our child's PDH per-process total summed ONCE PER
+-- NVML ROW -- so on Windows a two-GPU plan recorded twice its real footprint
+-- and a four-GPU plan four times (29 live rows on the reference rig: every
+-- multi-device load at ratio ~= its device count, one 17 GB model "measuring"
+-- 134 GB). D18's calibration read those rows and pegged
+-- compute_overhead_fraction at its ceiling on every boot.
+--
+-- Two JSON columns, {"<cuda index>": bytes}, stored as text so SQLite needs no
+-- schema change when a box has five cards:
+--
+-- * per_gpu_planned -- the plan's own per_gpu_bytes: the share the planner gave
+--   each card, output-layer shift included (D40).
+-- * per_gpu_actual  -- what the child really held on each card once ready, from
+--   the PDH LUID->CUDA join (D39) on Windows or NVML's per-process, per-GPU
+--   figure on Linux. NULL when neither could answer; the row then carries only
+--   the per-process total in actual_bytes.
+--
+-- Rows written with the corrected measurement are marked note='per_pid_v2'
+-- (see planner.OBSERVATION_NOTE_PER_PID_DEVICE); calibration reads only those,
+-- exactly as D18 did with 'per_pid' against the device-total rows before it.
+-- Older rows are kept for the record and ignored by the calibrator.
+ALTER TABLE load_observations ADD COLUMN per_gpu_planned TEXT;
+ALTER TABLE load_observations ADD COLUMN per_gpu_actual TEXT;

@@ -107,6 +107,10 @@ SPLIT_MODE_LAYER = "layer"
 #: at once queue behind each other. ``--ubatch-size`` stays at its 512 default
 #: -- that one is a VRAM term the planner models (planner.DEFAULT_UBATCH).
 BATCH_SIZE_MANY_SLOTS = 4096
+#: llama.cpp's own default logical batch. A micro-batch is clamped to the
+#: logical batch (``n_ubatch = min(n_batch, n_ubatch)``), so an ``-ub`` above
+#: this needs ``-b`` raised with it or it is silently not what was asked for.
+ENGINE_DEFAULT_BATCH_SIZE = 2048
 
 #: ``--slot-prompt-similarity`` for a multi-slot launch. The 0.10 default makes
 #: slot reuse almost accidental; 0.3 keeps an agent's near-identical prompts
@@ -955,11 +959,7 @@ class Supervisor:
 
         if settings.batch_size is not None:
             args += ["--batch-size", str(settings.batch_size)]
-        ubatch = (
-            settings.ubatch_size
-            if settings.ubatch_size is not None
-            else self._config.engine.ubatch_size
-        )
+        ubatch = self.ubatch_for(record)
         if ubatch is not None:
             args += ["--ubatch-size", str(ubatch)]
         if settings.threads is not None:
@@ -1058,6 +1058,19 @@ class Supervisor:
 
         return args
 
+    def ubatch_for(self, record: ModelRecord) -> int | None:
+        """The ``-ub`` this launch passes: per-model, else ``engine.ubatch_size``, else none.
+
+        ``None`` means the flag is not emitted and the engine keeps its 512. The
+        planner resolves the same precedence (``Planner.ubatch_for``) so the
+        VRAM it charges for the micro-batch is the micro-batch the child runs.
+        """
+        settings = record.settings
+        if settings.ubatch_size is not None:
+            return int(settings.ubatch_size)
+        configured = self._config.engine.ubatch_size
+        return int(configured) if configured is not None else None
+
     def _concurrency_args(
         self, record: ModelRecord, plan: LoadPlan, features: EngineFeatures
     ) -> list[str]:
@@ -1079,8 +1092,17 @@ class Supervisor:
         # reason. Only when the user has not pinned a batch size: llama.cpp
         # takes the last occurrence of a repeated flag, so appending here would
         # otherwise silently overrule an explicit setting.
-        if slots > 4 and settings.batch_size is None:
-            args += ["--batch-size", str(BATCH_SIZE_MANY_SLOTS)]
+        #
+        # The logical batch must also be at least the micro-batch: llama.cpp
+        # clamps ``n_ubatch`` to ``n_batch``, so ``-ub 4096`` against the
+        # default ``-b 2048`` would silently run at 2048 -- a flag that looks
+        # like it did something. An explicit batch_size is still honoured
+        # verbatim (the user chose both numbers); the automatic one is raised
+        # to cover the micro-batch.
+        auto_batch = BATCH_SIZE_MANY_SLOTS if slots > 4 else ENGINE_DEFAULT_BATCH_SIZE
+        ubatch = self.ubatch_for(record) or 0
+        if settings.batch_size is None and (slots > 4 or ubatch > auto_batch):
+            args += ["--batch-size", str(max(auto_batch, ubatch))]
 
         # Slot affinity. With --cache-reuse on, routing a request to the slot
         # that already holds a similar prefix is what makes the prompt cache

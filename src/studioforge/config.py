@@ -311,9 +311,10 @@ class EngineConfig(BaseModel):
     #: ``None`` leaves the engine's 512. Raising it buys prompt-processing
     #: speed for compute-buffer VRAM -- measured on a 1.5B on one RTX 3090 with
     #: a 5166-token prompt: 512 -> 15232 tok/s at 1492 MiB, 1024 -> 17307 tok/s
-    #: at 1562 MiB, 2048 -> 18061 tok/s at 1702 MiB. Left unset because the
-    #: planner's compute-buffer estimate is calibrated against the 512 default
-    #: (DECISIONS.md D38).
+    #: at 1562 MiB, 2048 -> 18061 tok/s at 1702 MiB. The planner charges that
+    #: growth per device (``planner.ubatch_scratch_bytes``, D40), so raising it
+    #: costs context rather than risking an OOM; it stays unset because it is a
+    #: VRAM-for-prefill trade the operator should make knowingly, not a default.
     #:
     #: Spelled ``int | None`` rather than ``PositiveInt | None`` deliberately:
     #: an *optional* Annotated int survives into the pydantic annotation as

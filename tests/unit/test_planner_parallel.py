@@ -24,6 +24,7 @@ from studioforge.core.planner import (
     CALIBRATION_MIN_ROWS,
     MAX_PARALLEL_CAP,
     OBSERVATION_NOTE_PER_PID,
+    OBSERVATION_NOTE_PER_PID_DEVICE,
     OVERHEAD_FRACTION_MAX,
     OVERHEAD_FRACTION_MIN,
     Planner,
@@ -574,14 +575,28 @@ def observation(*, note: str | None, shortfall: float = 0.5) -> dict[str, object
     }
 
 
-def test_only_per_pid_observations_are_trusted() -> None:
+def test_only_per_device_observations_are_trusted() -> None:
     rows = [observation(note=None) for _ in range(10)]
-    rows += [observation(note=OBSERVATION_NOTE_PER_PID) for _ in range(3)]
+    rows += [observation(note=OBSERVATION_NOTE_PER_PID_DEVICE) for _ in range(3)]
     assert len(clean_observations(rows)) == 3
 
 
+def test_per_pid_rows_are_no_longer_trusted() -> None:
+    """D40: on Windows the ``per_pid`` rows summed one PDH total once per card.
+
+    29 live rows on the reference rig: every multi-GPU load at a ratio of its
+    device count (a 17 GB model "measuring" 134 GB across three cards). They
+    would peg the factor at its ceiling, so they are history, not evidence.
+    """
+    rows = [observation(note=OBSERVATION_NOTE_PER_PID, shortfall=3.0) for _ in range(50)]
+    assert clean_observations(rows) == []
+    assert calibrated_overhead_fraction(rows, current=0.06) is None
+
+
 def test_too_little_clean_data_changes_nothing() -> None:
-    rows = [observation(note=OBSERVATION_NOTE_PER_PID) for _ in range(CALIBRATION_MIN_ROWS - 1)]
+    rows = [
+        observation(note=OBSERVATION_NOTE_PER_PID_DEVICE) for _ in range(CALIBRATION_MIN_ROWS - 1)
+    ]
     assert calibrated_overhead_fraction(rows, current=0.06) is None
 
 
@@ -592,13 +607,13 @@ def test_contaminated_history_alone_changes_nothing() -> None:
 
 
 def test_a_wild_suggestion_is_clamped_to_the_ceiling() -> None:
-    rows = [observation(note=OBSERVATION_NOTE_PER_PID, shortfall=5.0) for _ in range(20)]
+    rows = [observation(note=OBSERVATION_NOTE_PER_PID_DEVICE, shortfall=5.0) for _ in range(20)]
     tuned = calibrated_overhead_fraction(rows, current=0.06)
     assert tuned == OVERHEAD_FRACTION_MAX
 
 
 def test_a_modest_shortfall_raises_the_factor_within_the_clamp() -> None:
-    rows = [observation(note=OBSERVATION_NOTE_PER_PID, shortfall=0.02) for _ in range(20)]
+    rows = [observation(note=OBSERVATION_NOTE_PER_PID_DEVICE, shortfall=0.02) for _ in range(20)]
     tuned = calibrated_overhead_fraction(rows, current=0.06)
     assert tuned is not None
     assert OVERHEAD_FRACTION_MIN <= tuned <= OVERHEAD_FRACTION_MAX
@@ -608,7 +623,7 @@ def test_a_modest_shortfall_raises_the_factor_within_the_clamp() -> None:
 def test_calibrate_applies_the_value_to_the_live_config() -> None:
     config = make_config()
     planner = Planner(config, rig_5090x2_3090x2())
-    rows = [observation(note=OBSERVATION_NOTE_PER_PID, shortfall=5.0) for _ in range(20)]
+    rows = [observation(note=OBSERVATION_NOTE_PER_PID_DEVICE, shortfall=5.0) for _ in range(20)]
     assert planner.calibrate(rows) == OVERHEAD_FRACTION_MAX
     assert config.planner.compute_overhead_fraction == OVERHEAD_FRACTION_MAX
     # Idempotent: a second pass with the same data must not keep ratcheting.
@@ -638,7 +653,31 @@ def recording_manager(probe: object) -> tuple[object, list[dict[str, object]]]:
     return manager, seen
 
 
-def test_the_observation_measures_our_child_not_the_whole_card() -> None:
+class no_pdh:
+    """Make the Windows counters answer "nothing" so a test is deterministic."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, **split: dict[int, int]) -> None:
+        self._mp = monkeypatch
+        self._split = {int(k): v for k, v in split.items()}
+
+    def __enter__(self) -> None:
+        from studioforge.core import vram_holders
+
+        split = self._split
+        self._mp.setattr(vram_holders, "process_gpu_bytes", lambda pid: dict(split.get(pid, {})))
+        self._mp.setattr(
+            vram_holders,
+            "pdh_process_dedicated_bytes",
+            lambda **_: {pid: sum(b.values()) for pid, b in split.items()},
+        )
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+
+def test_the_observation_measures_our_child_not_the_whole_card(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """P3: whole-device ``used_bytes`` answered a question nobody asked.
 
     The card here holds 28 GiB: 9 of ours, 19 belonging to something else on
@@ -678,14 +717,20 @@ def test_the_observation_measures_our_child_not_the_whole_card() -> None:
     )
     instance = InstanceInfo(model_id="test/model", state="ready", pid=4242, plan=plan)
 
-    manager._record_actual_vram(make_record(), plan, instance)  # type: ignore[attr-defined]
+    with no_pdh(monkeypatch):
+        manager._record_actual_vram(make_record(), plan, instance)  # type: ignore[attr-defined]
 
     assert len(seen) == 1
     assert seen[0]["actual_bytes"] == 9 * GB
-    assert seen[0]["note"] == OBSERVATION_NOTE_PER_PID
+    assert seen[0]["note"] == OBSERVATION_NOTE_PER_PID_DEVICE
+    # The per-GPU figure NVML gave is kept per device beside the plan's share.
+    assert json.loads(seen[0]["per_gpu_actual"]) == {"0": 9 * GB}
+    assert json.loads(seen[0]["per_gpu_planned"]) == {}
 
 
-def test_no_observation_is_recorded_when_nvml_cannot_attribute() -> None:
+def test_no_observation_is_recorded_when_nvml_cannot_attribute(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """No data beats data that quietly means something else."""
     from studioforge.core.gpu import FakeGpuProbe
     from studioforge.types import GB, GpuInfo, InstanceInfo
@@ -707,6 +752,151 @@ def test_no_observation_is_recorded_when_nvml_cannot_attribute() -> None:
     plan = LoadPlan(model_id="test/model", devices=[0], ctx_size=8192)
     instance = InstanceInfo(model_id="test/model", state="ready", pid=4242, plan=plan)
 
-    manager._record_actual_vram(make_record(), plan, instance)  # type: ignore[attr-defined]
+    with no_pdh(monkeypatch):
+        manager._record_actual_vram(make_record(), plan, instance)  # type: ignore[attr-defined]
 
     assert seen == []
+
+
+# ---------------------------------------------------------------------------
+# Per-device observations (D40)
+# ---------------------------------------------------------------------------
+
+
+def test_windows_per_process_total_is_counted_once_not_once_per_card(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The D40 incident: PDH's per-process total sat on every NVML row of the pid.
+
+    A two-GPU plan used to record 2x its footprint (a four-GPU one 4x), and
+    D18's calibration read that as a shortfall worth the whole ceiling. With
+    the LUID map unavailable the total is still our child's bytes -- counted
+    once, with no per-device split claimed.
+    """
+    from studioforge.core.gpu import FakeGpuProbe
+    from studioforge.core.manager import measure_child_vram
+    from studioforge.types import GB, GpuInfo, VramProcess
+
+    probe = FakeGpuProbe(
+        [
+            GpuInfo(index=i, name=f"GPU{i}", total_bytes=32 * GB, free_bytes=10 * GB)
+            for i in range(2)
+        ]
+    )
+    # Zero from NVML (WDDM), so vram_processes back-fills the PDH total on BOTH rows.
+    probe.set_processes(
+        [
+            VramProcess(gpu_index=0, pid=4242, name="llama-server.exe", used_bytes=0),
+            VramProcess(gpu_index=1, pid=4242, name="llama-server.exe", used_bytes=0),
+        ]
+    )
+    from studioforge.core import vram_holders
+
+    monkeypatch.setattr(vram_holders, "process_gpu_bytes", lambda pid: {})
+    monkeypatch.setattr(vram_holders, "pdh_process_dedicated_bytes", lambda **_: {4242: 30 * GB})
+
+    total, per_device = measure_child_vram(probe, 4242, [0, 1])
+
+    assert total == 30 * GB
+    assert per_device is None
+
+
+def test_pdh_per_adapter_split_is_the_per_device_answer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With the LUID->CUDA join the observation is per card, plan devices only."""
+    from studioforge.core.gpu import FakeGpuProbe
+    from studioforge.core.manager import measure_child_vram
+    from studioforge.types import GB, GpuInfo
+
+    probe = FakeGpuProbe(
+        [
+            GpuInfo(index=i, name=f"GPU{i}", total_bytes=32 * GB, free_bytes=10 * GB)
+            for i in range(4)
+        ]
+    )
+    with no_pdh(
+        monkeypatch,
+        **{"4242": {0: 16 * GB, 1: 15 * GB, 2: 200 * 1024 * 1024, 3: 200 * 1024 * 1024}},
+    ):
+        total, per_device = measure_child_vram(probe, 4242, [1, 0])
+
+    # The CUDA contexts on the two cards the plan did not use are left out,
+    # exactly as the plan leaves them out.
+    assert per_device == {1: 15 * GB, 0: 16 * GB}
+    assert total == 31 * GB
+
+
+def test_linux_nvml_rows_are_summed_per_device(monkeypatch: pytest.MonkeyPatch) -> None:
+    """NVML's per-process, per-GPU figures (Linux) are genuinely summable."""
+    from studioforge.core.gpu import FakeGpuProbe
+    from studioforge.core.manager import measure_child_vram
+    from studioforge.types import GB, GpuInfo, VramProcess
+
+    probe = FakeGpuProbe(
+        [
+            GpuInfo(index=i, name=f"GPU{i}", total_bytes=32 * GB, free_bytes=10 * GB)
+            for i in range(2)
+        ]
+    )
+    probe.set_processes(
+        [
+            VramProcess(gpu_index=0, pid=4242, name="llama-server", used_bytes=16 * GB),
+            VramProcess(gpu_index=1, pid=4242, name="llama-server", used_bytes=14 * GB),
+        ]
+    )
+    with no_pdh(monkeypatch):
+        total, per_device = measure_child_vram(probe, 4242, [0, 1])
+
+    assert per_device == {0: 16 * GB, 1: 14 * GB}
+    assert total == 30 * GB
+
+
+def test_a_device_over_its_planned_share_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The 27B that landed 0.76 GiB more on the card the split gave less to."""
+    from studioforge.core.planner import PER_DEVICE_OVERRUN_WARN, per_device_overruns
+    from studioforge.types import GB, LoadPlan
+
+    plan = LoadPlan(
+        model_id="x",
+        devices=[1, 0],
+        per_gpu_bytes={1: int(15.2 * GB), 0: int(14.8 * GB)},
+    )
+    # 14.8 planned on CUDA0, 15.5 landed: under the 15% bar -- noise.
+    assert per_device_overruns(plan, {1: int(14.5 * GB), 0: int(15.5 * GB)}) == []
+    # A card planned at 10 that ends up holding 12 is the one that OOMs.
+    over = per_device_overruns(plan, {1: int(15.2 * GB), 0: int(14.8 * GB * 1.2)})
+    assert [d for d, _, _ in over] == [0]
+    assert over[0][2] > over[0][1] * PER_DEVICE_OVERRUN_WARN
+
+
+def test_observe_stores_the_plan_share_and_the_measured_split() -> None:
+    from studioforge.types import GB, LoadPlan, VramEstimate
+
+    seen: list[dict[str, object]] = []
+    planner = Planner(make_config(), rig_5090x2_3090x2(), observation_sink=seen.append)
+    plan = LoadPlan(
+        model_id="x",
+        devices=[0, 1],
+        per_gpu_bytes={0: 10 * GB, 1: 9 * GB},
+        estimate=VramEstimate(weights_bytes=16 * GB),
+    )
+    planner.observe(
+        model_id="x",
+        plan=plan,
+        actual_bytes=20 * GB,
+        note=OBSERVATION_NOTE_PER_PID_DEVICE,
+        per_gpu_actual={0: int(9.5 * GB), 1: int(10.5 * GB)},
+    )
+    assert len(seen) == 1
+    assert json.loads(seen[0]["per_gpu_planned"]) == {"0": 10 * GB, "1": 9 * GB}
+    assert json.loads(seen[0]["per_gpu_actual"]) == {"0": int(9.5 * GB), "1": int(10.5 * GB)}
+    assert seen[0]["note"] == OBSERVATION_NOTE_PER_PID_DEVICE
+
+
+def test_observe_without_a_split_stores_null_not_a_guess() -> None:
+    from studioforge.types import GB, LoadPlan, VramEstimate
+
+    seen: list[dict[str, object]] = []
+    planner = Planner(make_config(), rig_5090x2_3090x2(), observation_sink=seen.append)
+    plan = LoadPlan(model_id="x", devices=[0, 1], estimate=VramEstimate(weights_bytes=16 * GB))
+    planner.observe(model_id="x", plan=plan, actual_bytes=20 * GB)
+    assert seen[0]["per_gpu_actual"] is None

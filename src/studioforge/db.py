@@ -39,7 +39,7 @@ log = get_logger(__name__)
 
 #: Highest migration version this build of the code ships. ``migrate()``
 #: brings any older database up to this.
-SCHEMA_VERSION: int = 5
+SCHEMA_VERSION: int = 6
 
 #: SQLite's own words for "this file is not a usable database". Only a message
 #: carrying one of these is treated as corruption by ``migrate_with_recovery``;
@@ -108,6 +108,10 @@ _OBSERVATION_COLUMNS: tuple[str, ...] = (
     "weights_bytes",
     "ok",
     "note",
+    # Where the load landed, per CUDA index, as JSON text (migration 006, D40):
+    # the plan's share and the child's measured footprint on each card.
+    "per_gpu_planned",
+    "per_gpu_actual",
 )
 
 _THROUGHPUT_COLUMNS: tuple[str, ...] = (

@@ -14,8 +14,9 @@ records predicted-vs-actual through :meth:`Planner.observe`, and
 from __future__ import annotations
 
 import itertools
+import json
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -123,6 +124,66 @@ def kv_bytes_per_element(kv_type: str) -> float:
 #: is an OOM at load, so this mirrors the real formula instead.
 SWA_CELL_ALIGN = 256
 DEFAULT_UBATCH = 512
+
+#: Compute-buffer growth per extra micro-batch token, per unit of ``n_embd``,
+#: per device. The activation scratch every device keeps for a forward pass
+#: scales with ``n_ubatch * n_embd``; measured on the scratch rig (D40, two
+#: Qwen2.5 sizes, ``-ub`` 512 -> 2048): 76-94 bytes per token per ``n_embd``
+#: on a single card, 113-126 on each card of a two-way layer split (each holds
+#: the full micro-batch plus the cross-device copy buffers). 128 covers the
+#: split case with a little room, and errs toward refusing rather than OOM.
+UBATCH_SCRATCH_BYTES_PER_TOKEN_PER_EMBD = 128
+
+#: Bits per weight assumed for the output projection when the GGUF does not
+#: declare ``general.parameter_count``. Quantizers keep the embedding/output
+#: tensors at Q6_K/Q8_0 even in a Q4 file, so this is deliberately above the
+#: body's typical density.
+OUTPUT_LAYER_DEFAULT_BPW = 6.5
+
+
+def output_layer_bytes(meta: Any) -> int:
+    """Weight bytes of the output projection (``lm_head``), or 0 when unknown.
+
+    llama.cpp assigns the output layer -- and the scratch that goes with it --
+    to the **last** device of a ``--split-mode layer`` placement, on top of
+    that device's proportional share of the blocks (``llama_model::load_tensors``
+    puts ``dev_output`` on the device holding layer ``n_layer``, which the
+    split arithmetic always makes the last one). Measured here (D40): the last
+    device of a 0.5,0.5 split held 104 MiB (0.5B) and 110 MiB (1.5B) more than
+    the first, independent of ``-ub``; on the live rig a 27B planned at
+    ``0.5079,0.4921`` landed 0.76 GiB *more* on the card the split gave less to.
+    The planner charges this figure to the last device so that card is not the
+    one that OOMs on a tight fit.
+
+    Derived from ``n_vocab * n_embd`` at the file's average bytes per weight
+    when ``general.parameter_count`` is declared, else at
+    :data:`OUTPUT_LAYER_DEFAULT_BPW`. A model with tied embeddings still pays
+    it: llama.cpp duplicates ``token_embd`` onto the output device.
+    """
+    n_vocab = int(getattr(meta, "n_vocab", 0) or 0)
+    n_embd = int(getattr(meta, "n_embd", 0) or 0)
+    if n_vocab <= 0 or n_embd <= 0:
+        return 0
+    weights = int(getattr(meta, "tensor_bytes", 0) or 0)
+    params = int(getattr(meta, "param_count", 0) or 0)
+    bpw = (weights * 8 / params) if weights > 0 and params > 0 else OUTPUT_LAYER_DEFAULT_BPW
+    return int(n_vocab * n_embd * bpw / 8)
+
+
+def ubatch_scratch_bytes(meta: Any, *, ubatch: int, n_devices: int = 1) -> int:
+    """Extra compute-buffer bytes a micro-batch above the engine's 512 costs.
+
+    Zero at or below :data:`DEFAULT_UBATCH`; grows linearly above it by
+    :data:`UBATCH_SCRATCH_BYTES_PER_TOKEN_PER_EMBD` per token per ``n_embd``
+    **on every device** of the placement, because each device runs its layers
+    over the whole micro-batch. This is what makes ``-ub`` safe to raise: the
+    planner's compute term used to be calibrated against 512 only (D38).
+    """
+    n_embd = int(getattr(meta, "n_embd", 0) or 0)
+    extra_tokens = max(0, int(ubatch) - DEFAULT_UBATCH)
+    if n_embd <= 0 or extra_tokens <= 0:
+        return 0
+    return extra_tokens * UBATCH_SCRATCH_BYTES_PER_TOKEN_PER_EMBD * n_embd * max(1, n_devices)
 
 
 # ---------------------------------------------------------------------------
@@ -803,6 +864,7 @@ class Planner:
         draft: ModelRecord | None = None,
         draft_ctx_size: int | None = None,
         adapters: Sequence[AdapterRecord] = (),
+        ubatch: int | None = None,
     ) -> VramEstimate:
         """Project VRAM for one load.
 
@@ -811,11 +873,18 @@ class Planner:
         * weights -- summed tensor bytes across every shard
         * KV cache + recurrent state -- sized per layer on the *total* context
           (``ctx_size * parallel``); see :func:`kv_alloc_bytes`
-        * compute/graph buffers -- scratch that scales with model width
+        * compute/graph buffers -- scratch that scales with model width, plus
+          the growth a micro-batch above the engine's 512 costs on every
+          device (:func:`ubatch_scratch_bytes`, D40)
         * mmproj weights + the image-encoding buffer, for vision models
         * adapter weights
         * draft model weights + its own KV cache
         * a per-GPU CUDA context/cuBLAS workspace charge
+
+        ``ubatch`` is the ``-ub`` the child will be launched with; omitted, it
+        is resolved from the record's settings and ``engine.ubatch_size`` (the
+        same precedence the supervisor uses), so every caller that does not
+        know about micro-batches still gets the right answer.
         """
         meta = record.meta
         if meta is None:
@@ -825,6 +894,7 @@ class Planner:
 
         planner_cfg = self.config.planner
         ctx_total = max(1, ctx_size) * max(1, parallel)
+        micro_batch = int(ubatch) if ubatch is not None else self.ubatch_for(record)
 
         weights = int(meta.tensor_bytes) or int(record.size_bytes)
         # One call for all four shapes: uniform, iSWA, hybrid, per-layer array.
@@ -836,15 +906,19 @@ class Planner:
             kv_k=kv_cache_type,
             kv_v=kv_cache_type_v,
             parallel=max(1, parallel),
+            ubatch=micro_batch,
         )
 
         # Graph/activation buffers track model width and batch size far more than
         # depth. A fraction of the weight size is a crude but stable proxy, with a
-        # floor so tiny models still get room for their scratch buffers.
+        # floor so tiny models still get room for their scratch buffers. Above the
+        # engine's default micro-batch the scratch grows with -ub on every device,
+        # and that growth is charged explicitly rather than folded into the
+        # fraction (which is calibrated against loads at the default).
         compute = max(
             planner_cfg.compute_overhead_floor_mb * MB,
             int(weights * planner_cfg.compute_overhead_fraction),
-        )
+        ) + ubatch_scratch_bytes(meta, ubatch=micro_batch, n_devices=n_devices)
 
         mmproj_bytes = 0
         mmproj_compute = 0
@@ -1985,8 +2059,26 @@ class Planner:
         # Proportional split by usable capacity. Every device must actually be
         # able to hold its share, otherwise the split is not viable even though
         # the totals add up.
-        split = [capacities[d] / total_capacity for d in devices]
-        per_gpu = {d: int(total_needed * frac) for d, frac in zip(devices, split, strict=True)}
+        #
+        # The output layer is not split: llama.cpp puts it on the LAST device of
+        # the list, beyond that device's share of the blocks (D40). So the last
+        # device's capacity is reduced by that layer before the fractions are
+        # taken -- which both charges it where it really lands and tilts the
+        # tensor-split a little away from that card -- and the bytes are added
+        # back onto it in per_gpu_bytes. Measured 0.5,0.5 splits here landed
+        # 104-110 MiB more on the last card of two small models; the live rig
+        # saw 0.76 GiB on a 27B.
+        output_shift = min(output_layer_bytes(record.meta), total_needed)
+        last = devices[-1]
+        effective = dict(capacities)
+        effective[last] = max(0, effective[last] - output_shift)
+        effective_total = sum(effective.values())
+        body = total_needed - output_shift
+        if effective_total <= 0 or body > effective_total:
+            return None
+        split = [effective[d] / effective_total for d in devices]
+        per_gpu = {d: int(body * frac) for d, frac in zip(devices, split, strict=True)}
+        per_gpu[last] += output_shift
         for dev, want in per_gpu.items():
             if want > capacities[dev]:
                 return None
@@ -2637,6 +2729,19 @@ class Planner:
     def _flash_attn_for(self, record: ModelRecord) -> FlashAttn:
         return record.settings.flash_attn or self.config.models.default_flash_attn
 
+    def ubatch_for(self, record: ModelRecord) -> int:
+        """The ``-ub`` a launch of ``record`` gets: per-model, else global, else 512.
+
+        The same precedence the supervisor applies when it builds the argv, so
+        the VRAM the planner charges for the micro-batch is the micro-batch the
+        child really runs with.
+        """
+        explicit = record.settings.ubatch_size
+        if explicit is not None:
+            return int(explicit)
+        configured = getattr(self.config.engine, "ubatch_size", None)
+        return int(configured) if configured is not None else DEFAULT_UBATCH
+
     def _split_mode_for(self, record: ModelRecord) -> SplitMode:
         return record.settings.split_mode or "layer"
 
@@ -2732,11 +2837,20 @@ class Planner:
         actual_bytes: int,
         ok: bool = True,
         note: str | None = None,
+        per_gpu_actual: Mapping[int, int] | None = None,
     ) -> None:
         """Record predicted-vs-actual VRAM so the fudge factor can be tuned.
 
         Logged at INFO with the ratio, and forwarded to the observation sink
         (the SQLite table) when one is wired in.
+
+        ``per_gpu_actual`` is what the child really holds on each of the plan's
+        devices (D39's per-adapter measurement). It is stored beside the plan's
+        own ``per_gpu_bytes`` (D40) and compared here: a device that ended up
+        holding more than :data:`PER_DEVICE_OVERRUN_WARN` times its planned
+        share is a WARNING naming the card and both numbers, because that is
+        the delta a tight placement OOMs on -- and it was invisible while the
+        observation was one total.
         """
         predicted = plan.estimate.total_bytes
         ratio = (actual_bytes / predicted) if predicted else 0.0
@@ -2748,7 +2862,28 @@ class Planner:
             ratio=round(ratio, 3),
             ctx=plan.ctx_size,
             devices=plan.devices,
+            per_device_mb=(
+                {str(d): round(b / MB) for d, b in sorted(per_gpu_actual.items())}
+                if per_gpu_actual
+                else None
+            ),
         )
+        overruns = per_device_overruns(plan, per_gpu_actual)
+        if overruns:
+            log.warning(
+                "a device holds more than its planned share",
+                model_id=model_id,
+                devices=plan.devices,
+                overruns={
+                    f"CUDA{d}": {"planned_mb": round(p / MB), "actual_mb": round(a / MB)}
+                    for d, p, a in overruns
+                },
+                detail=(
+                    "llama.cpp places the output layer on the last device of the list; "
+                    "the planner now charges it there (D40), so a persistent overrun "
+                    "means the charge is too small for this model"
+                ),
+            )
         if self._observation_sink is not None:
             self._observation_sink(
                 {
@@ -2762,15 +2897,63 @@ class Planner:
                     "weights_bytes": plan.estimate.weights_bytes,
                     "ok": 1 if ok else 0,
                     "note": note,
+                    "per_gpu_planned": json.dumps(
+                        {str(d): int(b) for d, b in sorted(plan.per_gpu_bytes.items())}
+                    ),
+                    "per_gpu_actual": (
+                        json.dumps({str(d): int(b) for d, b in sorted(per_gpu_actual.items())})
+                        if per_gpu_actual
+                        else None
+                    ),
                 }
             )
+
+
+#: A device holding more than this multiple of its planned share is worth a
+#: WARNING in the load observation (D40). 15%: below the 10% headroom plus the
+#: CUDA context charge the planner already keeps per card, a smaller overrun
+#: is noise; above it the card was genuinely planned too tight.
+PER_DEVICE_OVERRUN_WARN = 1.15
+
+
+def per_device_overruns(
+    plan: LoadPlan, per_gpu_actual: Mapping[int, int] | None
+) -> list[tuple[int, int, int]]:
+    """``(device, planned_bytes, actual_bytes)`` for every device over the bar.
+
+    Only devices the plan named and measured are compared; a card with no
+    planned share (``0``) is skipped rather than reported as infinitely over.
+    """
+    if not per_gpu_actual:
+        return []
+    out: list[tuple[int, int, int]] = []
+    for device in plan.devices:
+        planned = int(plan.per_gpu_bytes.get(device, 0) or 0)
+        actual = int(per_gpu_actual.get(device, 0) or 0)
+        if planned <= 0 or actual <= 0:
+            continue
+        if actual > planned * PER_DEVICE_OVERRUN_WARN:
+            out.append((device, planned, actual))
+    return out
 
 
 #: Written into ``load_observations.note`` when ``actual_bytes`` is our own
 #: child's VRAM, attributed per pid. Rows without it summed whole-device
 #: ``used_bytes`` and are contaminated by every other process on the card --
-#: see docs/LIMITATIONS.md. Calibration reads only the marked rows.
+#: see docs/LIMITATIONS.md.
+#:
+#: Superseded by :data:`OBSERVATION_NOTE_PER_PID_DEVICE`: on Windows these rows
+#: summed the PDH per-process total once per NVML (gpu, pid) row, so a two-GPU
+#: load recorded twice its footprint and a four-GPU load four times (D40). The
+#: calibrator no longer reads them; the marker is kept so the rows can still be
+#: told apart from the device-total ones that came before.
 OBSERVATION_NOTE_PER_PID = "per_pid"
+
+#: The marker calibration reads (D40): ``actual_bytes`` is our child's own
+#: VRAM on the plan's devices, measured per device -- PDH per adapter joined to
+#: CUDA ordinals on Windows (D39), NVML per process per GPU on Linux -- and
+#: never the same total counted once per card.
+OBSERVATION_NOTE_PER_PID_DEVICE = "per_pid_v2"
 
 #: Bounds the auto-calibrated ``compute_overhead_fraction`` may move between.
 #: Below the floor the compute term stops covering real graph buffers on small
@@ -2792,14 +2975,17 @@ def clean_observations(
 
     Everything recorded before the per-pid fix summed whole-device usage, so a
     desktop compositor or a ComfyUI run inflated it -- over 540 historical rows
-    the median actual/predicted ratio is 2.97 and p90 is 12.0. Feeding those to
-    the calibrator would ratchet the overhead fraction to its ceiling and start
+    the median actual/predicted ratio is 2.97 and p90 is 12.0. The ``per_pid``
+    rows that replaced them were right on Linux and wrong on Windows, where the
+    per-process total was counted once per card (29 live rows, every multi-GPU
+    load at a ratio of its device count; D40). Feeding either to the
+    calibrator ratchets the overhead fraction to its ceiling and starts
     refusing loads that fit. The marker is the only thing separating them.
     """
     return [
         row
         for row in observations
-        if str(row.get("note") or "") == OBSERVATION_NOTE_PER_PID and row.get("ok", True)
+        if str(row.get("note") or "") == OBSERVATION_NOTE_PER_PID_DEVICE and row.get("ok", True)
     ]
 
 

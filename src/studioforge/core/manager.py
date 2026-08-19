@@ -17,7 +17,7 @@ from typing import Any
 
 from studioforge.config import Config, KvCacheType
 from studioforge.core.gpu import vram_processes
-from studioforge.core.planner import BUSY_RETRY_AFTER_S, OBSERVATION_NOTE_PER_PID, Planner
+from studioforge.core.planner import BUSY_RETRY_AFTER_S, OBSERVATION_NOTE_PER_PID_DEVICE, Planner
 from studioforge.core.registry import Registry
 from studioforge.core.supervisor import Supervisor
 from studioforge.db import Database
@@ -162,6 +162,56 @@ def classify_load_failure(stderr_tail: Sequence[str]) -> str:
     if any(marker in blob for marker in TRANSIENT_LOAD_MARKERS):
         return "transient"
     return "unknown"
+
+
+def measure_child_vram(
+    probe: Any, pid: int, devices: Sequence[int]
+) -> tuple[int, dict[int, int] | None]:
+    """Our child's VRAM on ``devices``: ``(total_bytes, {device: bytes} | None)``.
+
+    Three answers, tried in order (D40):
+
+    1. **PDH per adapter, joined to CUDA ordinals** (Windows, D39) -- the only
+       per-device figure Windows has. Summed over the plan's devices; a CUDA
+       context the child opened on a card it was not placed on is left out,
+       exactly as the plan leaves it out.
+    2. **NVML per process per GPU** (Linux) -- ``vram_processes`` rows whose
+       ``used_bytes`` NVML itself measured. Detected by their NOT all equalling
+       the PDH per-process total: on Windows :func:`gpu._fill_missing_used_bytes`
+       writes that one total onto every row of the pid, which is what made the
+       old sum wrong, and which is why this path never sums rows that match it.
+    3. **The PDH per-process total, once**, with no per-device split -- when
+       the LUID map is unavailable. Still our child's bytes, still not counted
+       per card.
+
+    ``(0, None)`` when nothing can attribute, so the caller skips the row.
+    """
+    from studioforge.core.vram_holders import (
+        OTHER_ADAPTER,
+        pdh_process_dedicated_bytes,
+        process_gpu_bytes,
+    )
+
+    wanted = [int(d) for d in devices]
+    split = process_gpu_bytes(pid)
+    measured = {d: int(b) for d, b in split.items() if d != OTHER_ADAPTER and b > 0}
+    if measured:
+        per_device = {d: measured.get(d, 0) for d in wanted} if wanted else dict(measured)
+        total = sum(per_device.values()) if wanted else sum(measured.values())
+        if total > 0:
+            return total, per_device
+    pdh_total = int(pdh_process_dedicated_bytes().get(pid, 0) or 0)
+    rows = [h for h in vram_processes(probe, own_pids=[pid]) if h.pid == pid and h.used_bytes > 0]
+    rows = [h for h in rows if not wanted or h.gpu_index in wanted]
+    if rows and not (pdh_total > 0 and all(h.used_bytes == pdh_total for h in rows)):
+        # Genuine per-GPU figures (NVML on Linux): one row per device, summable.
+        per_device = {}
+        for row in rows:
+            per_device[row.gpu_index] = per_device.get(row.gpu_index, 0) + int(row.used_bytes)
+        return sum(per_device.values()), per_device
+    if pdh_total > 0:
+        return pdh_total, None
+    return 0, None
 
 
 class ModelManager:
@@ -1147,34 +1197,39 @@ class ModelManager:
     ) -> None:
         """Log predicted-vs-actual so the planner's fudge factor can be tuned.
 
-        Measures **our child's own** VRAM, per pid, not the devices' total
-        ``used_bytes``. The device total is whatever else happens to be on the
-        card -- the desktop compositor, ComfyUI, another model of ours -- so it
-        answered a question nobody asked and answered it differently every
-        time. Over 540 historical rows it produced a median actual/predicted
-        ratio of 2.97 against a documented 0.81-1.23.
+        Measures **our child's own** VRAM, per pid **and per device**, not the
+        devices' total ``used_bytes``. The device total is whatever else happens
+        to be on the card -- the desktop compositor, ComfyUI, another model of
+        ours -- so it answered a question nobody asked and answered it
+        differently every time. Over 540 historical rows it produced a median
+        actual/predicted ratio of 2.97 against a documented 0.81-1.23.
 
-        NVML cannot enumerate per-process VRAM everywhere (containers, WSL,
-        MIG). When it cannot, the observation is skipped rather than falling
-        back to the device total: no data beats data that means something else.
+        The per-device split matters as much as the pid (D40). The previous
+        version summed :func:`vram_processes` rows over the plan's devices, and
+        on Windows every one of those rows carries the *same* PDH per-process
+        total -- so a two-GPU load was recorded at twice its footprint and a
+        four-GPU load at four times, and D18's calibration pegged the overhead
+        fraction at its ceiling on every boot. :func:`measure_child_vram`
+        reads the per-adapter figure instead, and the observation carries both
+        the plan's share and the measured bytes per card.
+
+        Neither PDH nor NVML can attribute per process everywhere (containers,
+        WSL, MIG). When nothing can, the observation is skipped rather than
+        falling back to the device total: no data beats data that means
+        something else.
         """
         try:
             pid = instance.pid
             if pid is None:
                 return
-            devices = set(plan.devices)
-            holders = vram_processes(self.planner.probe, own_pids=[pid])
-            actual = sum(
-                h.used_bytes
-                for h in holders
-                if h.pid == pid and (not devices or h.gpu_index in devices)
-            )
+            actual, per_device = measure_child_vram(self.planner.probe, pid, plan.devices)
             if actual > 0:
                 self.planner.observe(
                     model_id=record.id,
                     plan=plan,
                     actual_bytes=actual,
-                    note=OBSERVATION_NOTE_PER_PID,
+                    note=OBSERVATION_NOTE_PER_PID_DEVICE,
+                    per_gpu_actual=per_device,
                 )
             else:
                 log.debug(
