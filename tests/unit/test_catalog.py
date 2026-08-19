@@ -1339,3 +1339,21 @@ def test_the_catalog_hint_explains_the_difference_between_the_two_slot_numbers()
     hint = catalog_for()["catalog_hint"]
     assert "recommended_parallel" in hint
     assert "max_parallel is how many slots FIT" in hint
+
+
+def test_catalog_placements_skip_excluded_cards() -> None:
+    """An agent must not be handed a recipe for the cards reserved for ComfyUI."""
+    config = make_config(excluded_devices=[0, 1])
+    planner = Planner(config, rig_5090x2_3090x2(31.0))
+    result = build_catalog(
+        registry=FakeRegistry(library()),
+        planner=planner,
+        supervisor=FakeSupervisor(),
+        db=None,
+        now=NOW,
+    )
+    for model in result["models"]:
+        for placement in model["placements"]:
+            assert not ({0, 1} & set(placement["devices"])), (model["id"], placement["mode"])
+        if model["recommended"]:
+            assert not ({0, 1} & set(model["recommended"]["devices"]))

@@ -734,11 +734,18 @@ class ModelManager:
         """The hardware modes to walk, in the order to walk them."""
         from studioforge.core import placements as placements_mod
 
-        modes = placements_mod.hardware_modes(self.planner.probe.list_gpus())
+        modes = placements_mod.hardware_modes(
+            self.planner.probe.list_gpus(), excluded=self.config.planner.excluded_devices
+        )
         if not modes:
             raise InsufficientVramError(
                 "no usable GPU was found, and this server is GPU-only",
-                details={"suggestions": ["check the driver and `nvidia-smi`"]},
+                details={
+                    "suggestions": [
+                        "check the driver and `nvidia-smi`",
+                        "planner.excluded_devices may be reserving every card",
+                    ]
+                },
             )
         if prefer_modes is None:
             return modes

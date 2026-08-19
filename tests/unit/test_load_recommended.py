@@ -465,3 +465,26 @@ async def test_a_model_without_metadata_is_a_structured_refusal_not_a_traceback(
         await manager.load_recommended(MODEL, 65536)
     assert excinfo.value.status_code == 502
     assert "metadata" in excinfo.value.message
+
+
+async def test_an_excluded_card_is_never_chosen_even_though_the_walk_pins_devices() -> None:
+    """Found live on a scratch server (WP22): planner.excluded_devices [0, 1] and
+    load_recommended put the model on CUDA 0,1 -- the mode walk plans through a
+    device_override, and an override beats an exclusion. The modes themselves
+    must not contain the card."""
+    manager, _supervisor = make_manager()
+    manager.config.planner.excluded_devices = [0, 1]
+    instance = await manager.load_recommended(MODEL, 16384)
+    assert instance.plan is not None
+    assert sorted(instance.plan.devices) == [2, 3]
+    with pytest.raises(BadRequestError) as excinfo:
+        await manager.load_recommended(MODEL, 16384, prefer_modes=["dual_5090"])
+    assert excinfo.value.param == "prefer_modes"
+
+
+async def test_every_card_excluded_is_a_structured_refusal() -> None:
+    manager, _supervisor = make_manager()
+    manager.config.planner.excluded_devices = [0, 1, 2, 3]
+    with pytest.raises(InsufficientVramError) as excinfo:
+        await manager.load_recommended(MODEL, 16384)
+    assert any("excluded_devices" in s for s in excinfo.value.details["suggestions"])

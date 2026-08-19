@@ -978,8 +978,10 @@ def build_catalog(
     peer_moe = _density_map(registry)
     # Derived once: the mode list is a property of the box, not of a model, and
     # deriving it per model would ask the probe thirty-three times for an answer
-    # that cannot have changed inside one snapshot.
-    modes = placements_mod.hardware_modes(gpus)
+    # that cannot have changed inside one snapshot. Excluded cards are not part
+    # of any mode (D19): a mode is planned through a device override, which is
+    # the one thing that beats an exclusion.
+    modes = placements_mod.hardware_modes(gpus, excluded=planner.config.planner.excluded_devices)
 
     entries: list[dict[str, Any]] = []
     for record in records:

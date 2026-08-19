@@ -105,6 +105,35 @@ def test_no_gpus_means_no_modes_rather_than_a_crash() -> None:
     assert hardware_modes([]) == []
 
 
+def test_an_excluded_card_is_not_part_of_any_mode() -> None:
+    """D19 meets D36: a mode is planned through a device override, which is the
+    one thing that beats an exclusion -- so the exclusion has to happen here.
+    Found live (WP22): with planner.excluded_devices [0, 1], load_recommended
+    placed a model on CUDA 0,1 with a note saying the override wins."""
+    gpus = [gpu(i, "NVIDIA GeForce RTX 5090", 31.84) for i in range(2)]
+    gpus += [gpu(i, "NVIDIA GeForce RTX 3090", 24.0) for i in (2, 3)]
+    modes = hardware_modes(gpus, excluded=[0, 1])
+    assert [m.key for m in modes] == ["dual_3090", "single_3090"]
+    assert all(0 not in m.devices and 1 not in m.devices for m in modes)
+    assert hardware_modes(gpus, excluded=[0, 1, 2, 3]) == []
+    # One card of a pair excluded: the pair is gone, the box is the rest.
+    modes = hardware_modes(gpus, excluded=[1])
+    assert [m.key for m in modes] == ["dual_3090", "all_gpus", "single_5090"]
+    assert modes[1].devices == (0, 2, 3)
+
+
+def test_the_placement_report_never_names_an_excluded_card() -> None:
+    rec = record("pub/iswa-31b", iswa_31b(), mtime=NOW, size_bytes=17 * GB)
+    config = make_config(excluded_devices=[0, 1])
+    planner = Planner(config, rig_5090x2_3090x2(31.0), log_plans=False)
+    report = placement_report(rec, planner=planner, floor=config.models.default_ctx)
+    assert [e["mode"] for e in report] == ["dual_3090", "single_3090"]
+    for entry in report:
+        assert not ({0, 1} & set(entry["devices"]))
+        if entry["optimal"]:
+            assert not ({0, 1} & set(entry["optimal"]["devices"]))
+
+
 # ---------------------------------------------------------------------------
 # The per-mode optimal
 # ---------------------------------------------------------------------------

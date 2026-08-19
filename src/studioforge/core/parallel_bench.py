@@ -357,7 +357,9 @@ class ParallelBenchmarker:
         """
         if mode is None:
             return None
-        modes = placements_mod.hardware_modes(self._probe.list_gpus())
+        modes = placements_mod.hardware_modes(
+            self._probe.list_gpus(), excluded=self.manager.config.planner.excluded_devices
+        )
         found = next((m for m in modes if m.key == mode), None)
         if found is None:
             raise BadRequestError(

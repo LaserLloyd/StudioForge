@@ -33,7 +33,7 @@ model's ``recommended`` load.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -84,7 +84,7 @@ def _mix(gpus: Sequence[GpuInfo]) -> str:
     return " + ".join(f"{n}x {label}" for label, n in counts.items())
 
 
-def hardware_modes(gpus: Sequence[GpuInfo]) -> list[HardwareMode]:
+def hardware_modes(gpus: Sequence[GpuInfo], *, excluded: Iterable[int] = ()) -> list[HardwareMode]:
     """The sets of cards worth reporting on, best-and-fewest first.
 
     Order: ``dual_<best class>``, ``dual_<second class>``, ``all_gpus``,
@@ -96,8 +96,18 @@ def hardware_modes(gpus: Sequence[GpuInfo]) -> list[HardwareMode]:
     Deduplicated on the device set, keeping the first (and therefore
     best-named) description: on a two-card box "2x RTX 5090" and "all 2 GPUs"
     are the same placement, and the first says more.
+
+    ``excluded`` is ``planner.excluded_devices`` (D19): a card the planner may
+    never place on is not part of any mode. It has to be removed HERE, because
+    every mode is planned through a ``device_override`` copy of the record
+    (:func:`forced_onto`), and an override is exactly the one thing that beats
+    an exclusion -- so without this filter ``placements``, ``/profiles`` and
+    ``load_recommended`` all landed loads on the cards reserved for ComfyUI,
+    with a note saying "the explicit override wins" about an override nobody
+    had written (WP22).
     """
-    usable = list(gpus)
+    banned = {int(index) for index in excluded}
+    usable = [g for g in gpus if g.index not in banned]
     if not usable:
         return []
 
@@ -358,7 +368,11 @@ def placement_report(
             return {}
 
     tiers = tuple(ctx_tiers) or catalog_mod.CTX_TIERS
-    all_modes = list(modes) if modes is not None else hardware_modes(probe.list_gpus())
+    all_modes = (
+        list(modes)
+        if modes is not None
+        else hardware_modes(probe.list_gpus(), excluded=planner.config.planner.excluded_devices)
+    )
     pinned_kv = record.settings.kv_cache_type is not None
 
     entries: list[dict[str, Any]] = []
