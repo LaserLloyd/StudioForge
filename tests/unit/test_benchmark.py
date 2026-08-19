@@ -733,6 +733,52 @@ async def test_second_run_while_one_is_in_flight_is_rejected(engine: FakeEngine)
     assert bench.busy is False
 
 
+async def test_a_busy_server_refuses_the_placement_benchmark(engine: FakeEngine) -> None:
+    """D36/WP22: the same rule as test_model and the parallel benchmark.
+
+    Each mode is a forced reload; before this the run could start while a
+    model was mid-stream and evict it. Now it refuses with retry_after_s and
+    names what is busy, exactly like the parallel sweep.
+    """
+    from studioforge.core.planner import BUSY_RETRY_AFTER_S
+
+    probe = StubProbe(reference_rig())
+    record = make_record()
+    manager = StubManager(record, probe)
+    manager.busy_snapshot = lambda: {  # type: ignore[attr-defined]
+        "active_requests": 2,
+        "busy_models": [{"model_id": "pub/other", "active_requests": 2}],
+        "loading": [],
+        "testing": None,
+    }
+    bench = Benchmarker(manager, probe=probe)
+    with pytest.raises(ModelBusyError) as excinfo:
+        await bench.run(record)
+    assert "pub/other" in str(excinfo.value)
+    assert excinfo.value.details["retry_after_s"] == BUSY_RETRY_AFTER_S
+    assert manager.loads == []
+    assert bench.busy is False
+
+
+async def test_a_benchmark_load_is_a_reload_that_never_evicts_a_serving_model(
+    engine: FakeEngine,
+) -> None:
+    """``force=True`` (fresh child per mode) with ``evict_busy=False`` (D36)."""
+    probe = StubProbe(reference_rig())
+    record = make_record()
+    manager = StubManager(record, probe)
+    seen: list[dict[str, Any]] = []
+    original = manager.load
+
+    async def spy(name: str, **kwargs: Any) -> InstanceInfo:
+        seen.append(kwargs)
+        return await original(name, **kwargs)
+
+    manager.load = spy  # type: ignore[method-assign]
+    await Benchmarker(manager, probe=probe).run(record, modes=["rtx-5090-x1"])
+    assert seen and all(k.get("force") is True and k.get("evict_busy") is False for k in seen)
+
+
 async def test_unknown_mode_key_is_a_bad_request(engine: FakeEngine) -> None:
     from studioforge.errors import BadRequestError
 

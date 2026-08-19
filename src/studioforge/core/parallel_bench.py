@@ -530,6 +530,10 @@ class ParallelBenchmarker:
                 parallel=report.parallel_launched,
                 devices=report.devices,
                 force=True,
+                # force here is the reload half only: the busy check above is
+                # what guards a serving model, and the load must not be able
+                # to evict one that started in the gap (D36).
+                evict_busy=False,
                 source="benchmark:parallel",
             )
             report.loaded_for_benchmark = True
@@ -806,7 +810,11 @@ class ParallelBenchmarker:
             return
         try:
             await self.manager.load(
-                record.id, **previous, force=True, source="benchmark:parallel-restore"
+                record.id,
+                **previous,
+                force=True,
+                evict_busy=False,
+                source="benchmark:parallel-restore",
             )
             report.restored = True
         except Exception as exc:  # noqa: BLE001 - a failed restore must be reported, not raised

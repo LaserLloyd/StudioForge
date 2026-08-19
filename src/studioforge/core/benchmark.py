@@ -57,6 +57,7 @@ from typing import TYPE_CHECKING, Any
 import httpx
 
 from studioforge.core.gpu import fastest_gpu_order
+from studioforge.core.planner import BUSY_RETRY_AFTER_S
 from studioforge.core.supervisor import SPLIT_MODE_TENSOR, tensor_split_model_blockers
 from studioforge.errors import BadRequestError, ModelBusyError, ModelLoadError
 from studioforge.logging import get_logger
@@ -446,6 +447,33 @@ class Benchmarker:
             finally:
                 self._benchmarking = None
 
+    def _refuse_if_busy(self) -> None:
+        """Refuse while anything is serving, loading or smoke-testing (D36).
+
+        The same rule the parallel benchmark applies, for the same two reasons:
+        the numbers would measure the contention rather than the model, and
+        each mode's load is a forced reload that must not be the thing that
+        evicts somebody's mid-stream model. The benchmark arm of the manager's
+        own ``_busy_reason`` is deliberately not consulted -- inside this
+        object the running benchmark is us, and the lock above already refuses
+        a second one. A manager without ``busy_snapshot`` (a test stub) is
+        treated as idle.
+        """
+        snapshot_fn = getattr(self.manager, "busy_snapshot", None)
+        if snapshot_fn is None:
+            return
+        from studioforge.core.parallel_bench import busy_reason_from
+
+        snapshot = snapshot_fn()
+        reason = busy_reason_from(snapshot)
+        if reason is None:
+            return
+        raise ModelBusyError(
+            f"the server is busy ({reason}); a benchmark loads the model once per "
+            f"placement and measures it alone, so it waits for an idle server",
+            details={"busy": snapshot, "retry_after_s": BUSY_RETRY_AFTER_S},
+        )
+
     # -- planning ---------------------------------------------------------
 
     def split_modes_for(self, record: ModelRecord) -> list[str]:
@@ -551,7 +579,11 @@ class Benchmarker:
                 "concurrent runs would compete for the VRAM being measured",
                 code="benchmark_busy",
             )
+        self._refuse_if_busy()
         async with self._lock:
+            # Re-checked inside the lock: the gap between the first check and
+            # taking the slot is exactly where a JIT request lands.
+            self._refuse_if_busy()
             return await self._run_locked(
                 record,
                 modes=modes,
@@ -716,8 +748,10 @@ class Benchmarker:
             free_before = self._free_by_device()
             _emit(on_progress, mode.key, "loading", position, total)
             started = time.perf_counter()
+            # force reloads (a fresh child per mode); evict_busy=False keeps
+            # D36's rule that a load never interrupts a stream.
             instance = await self.manager.load(
-                record.id, ctx_size=ctx_size, force=True, source="benchmark"
+                record.id, ctx_size=ctx_size, force=True, evict_busy=False, source="benchmark"
             )
             result.load_time_s = round(time.perf_counter() - started, 3)
             result.vram_used_bytes = self._vram_delta(free_before, mode.devices)

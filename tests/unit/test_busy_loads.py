@@ -173,6 +173,30 @@ def test_busy_snapshot_separates_the_three_kinds_of_busy() -> None:
     assert snapshot["testing"] is None
 
 
+async def test_a_load_queued_behind_the_gate_is_already_visible_as_loading() -> None:
+    """``/health.busy.loading`` from the moment a load is asked for (WP22).
+
+    ``_loading`` used to be set only once the D29 gate was taken, so a second
+    load waiting on the first was invisible -- and "the box was idle when we
+    looked" could be true for a caller who looked in exactly that window.
+    """
+    supervisor, planner = StubSupervisor(), StubPlanner(probe=StubProbe())
+    manager = make_manager(supervisor, planner)
+    await manager._load_gate.acquire()  # somebody else is mid-load
+    try:
+        task = asyncio.create_task(manager.load("test/model", source="mcp:load_model"))
+        for _ in range(50):
+            await asyncio.sleep(0)
+            if "test/model" in manager.busy_snapshot()["loading"]:
+                break
+        assert manager.busy_snapshot()["loading"] == ["test/model"]
+        assert not task.done()
+    finally:
+        manager._load_gate.release()
+    await task
+    assert manager.busy_snapshot()["loading"] == []
+
+
 def test_an_idle_server_is_reported_as_idle() -> None:
     manager = make_manager(StubSupervisor(), StubPlanner(probe=StubProbe()))
     assert manager.busy_snapshot() == {

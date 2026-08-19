@@ -26,7 +26,7 @@ import pytest
 
 from studioforge.core.manager import ModelManager
 from studioforge.core.planner import BUSY_RETRY_AFTER_S, Planner
-from studioforge.errors import BadRequestError, InsufficientVramError
+from studioforge.errors import BadRequestError, InsufficientVramError, ModelBusyError
 from studioforge.types import GB, InstanceInfo, LoadPlan, ModelSettings
 from tests.unit.test_catalog import dense_meta, record
 from tests.unit.test_load_retry import StubSupervisor
@@ -330,6 +330,10 @@ async def test_kv_min_refuses_a_placement_that_only_reaches_the_window_by_quanti
     assert plain.plan is not None
     assert plain.plan.kv_cache_type != "f16", "fixture must need a quantized cache here"
 
+    # A fresh box for the second call: the stub probe does not lose free VRAM
+    # when a model loads, so a resident model's credited footprint (below)
+    # would otherwise hand this call phantom room.
+    manager, _supervisor = make_manager(free_gib=17.0, n_ctx_train=262144)
     with pytest.raises(InsufficientVramError) as excinfo:
         await manager.load_recommended(MODEL, 262144, prefer_modes=["dual_5090"], kv_min="f16")
     reasons = [entry["reason"] or "" for entry in excinfo.value.details["modes"]]
@@ -344,3 +348,98 @@ async def test_kv_min_walks_on_to_a_mode_that_can_afford_the_cache() -> None:
     assert instance.plan.kv_cache_type == "f16"
     assert instance.plan.ctx_size == 262144
     assert len(instance.plan.devices) > 2, "it had to reach for more cards to afford f16"
+
+
+# ---------------------------------------------------------------------------
+# The model is already resident (WP22)
+# ---------------------------------------------------------------------------
+
+
+def resident_self(*, ctx: int, requests: int = 0, devices: list[int] | None = None) -> InstanceInfo:
+    devs = devices or [0, 1]
+    return InstanceInfo(
+        model_id=MODEL,
+        state="ready",
+        port=18101,
+        ttl_s=1800,
+        started_at=1.0,
+        last_activity_at=1.0,
+        active_requests=requests,
+        loaded_by="mcp:load_model",
+        plan=LoadPlan(
+            model_id=MODEL,
+            devices=devs,
+            ctx_size=ctx,
+            ctx_per_slot=ctx,
+            parallel=1,
+            kv_cache_type="f16",
+            kv_cache_type_v="f16",
+            per_gpu_bytes={d: int(29 * GB) for d in devs},
+        ),
+    )
+
+
+async def test_a_resident_model_that_is_serving_is_not_reloaded_under_its_clients() -> None:
+    """A load never interrupts a stream (D36) -- this one included.
+
+    Before: ``load_recommended`` always forced a reload, so agent B asking for
+    a bigger window killed agent A's stream on the same model.
+    """
+    manager, supervisor = make_manager(loaded=[resident_self(ctx=32768, requests=2)])
+    with pytest.raises(ModelBusyError) as excinfo:
+        await manager.load_recommended(MODEL, 65536)
+    assert excinfo.value.details["retry_after_s"] == BUSY_RETRY_AFTER_S
+    assert excinfo.value.details["busy"]["busy_models"] == [
+        {"model_id": MODEL, "active_requests": 2}
+    ]
+    assert supervisor.starts == 0
+    assert supervisor.stopped == []
+
+
+async def test_a_resident_model_already_at_that_context_is_returned_as_is() -> None:
+    """Reloading to arrive exactly where we are costs a cold start for nothing."""
+    manager, supervisor = make_manager(loaded=[resident_self(ctx=65536)])
+    instance = await manager.load_recommended(MODEL, 65536)
+    assert instance.plan is not None
+    assert instance.plan.ctx_per_slot == 65536
+    assert supervisor.starts == 0
+    assert supervisor.stopped == []
+
+
+async def test_a_resident_model_is_credited_with_its_own_footprint_for_the_walk() -> None:
+    """The walk must see the machine the reload will see (D30's credit).
+
+    The model holds 29 GiB on each 5090 and the cards show 2 GiB free. Without
+    the credit, 131072 "does not fit" and the call refused a window the reload
+    one line later would have fitted. With it, the reload is planned on the
+    same cards and the old instance is the one stopped.
+    """
+    manager, supervisor = make_manager(
+        probe=lopsided_rig(), n_ctx_train=262144, loaded=[resident_self(ctx=32768)]
+    )
+    instance = await manager.load_recommended(MODEL, 131072, prefer_modes=["dual_5090"])
+    assert instance.plan is not None
+    assert instance.plan.ctx_per_slot == 131072
+    assert sorted(instance.plan.devices) == [0, 1]
+    assert supervisor.starts == 1
+    assert supervisor.stopped == [MODEL]
+
+
+async def test_the_real_load_never_evicts_a_busy_model_even_though_it_is_forced() -> None:
+    """``force=True`` is the reload half only; ``evict_busy`` is passed False.
+
+    Pinned at the manager boundary: whatever the mode walk decided, the plan
+    that actually runs is made with ``evict_busy=False``.
+    """
+    seen: list[dict[str, Any]] = []
+    manager, _supervisor = make_manager()
+    real_plan_load = manager.planner.plan_load
+
+    def spy(record: Any, **kwargs: Any) -> Any:
+        seen.append(dict(kwargs))
+        return real_plan_load(record, **kwargs)
+
+    manager.planner.plan_load = spy  # type: ignore[method-assign]
+    await manager.load_recommended(MODEL, 32768)
+    assert seen, "the final load plans through the manager's planner"
+    assert all(call.get("evict_busy") is False for call in seen)

@@ -164,6 +164,12 @@ def classify_load_failure(stderr_tail: Sequence[str]) -> str:
     return "unknown"
 
 
+def _kv_rank(kv_k: str, kv_v: str) -> int:
+    from studioforge.core.kv_sensitivity import kv_quality_rank
+
+    return int(kv_quality_rank(kv_k, kv_v))
+
+
 def measure_child_vram(
     probe: Any, pid: int, devices: Sequence[int]
 ) -> tuple[int, dict[int, int] | None]:
@@ -465,6 +471,7 @@ class ModelManager:
         devices: Sequence[int] | None = None,
         force: bool = False,
         source: str = "api",
+        evict_busy: bool | None = None,
     ) -> InstanceInfo:
         """Explicit load (GUI/CLI/MCP). ``force`` reloads an already-running model.
 
@@ -487,6 +494,14 @@ class ModelManager:
         -- the persisted settings are never touched, so the next load without
         it goes back to letting the planner choose. ``kv_cache_type_v``
         likewise, for the ladder's asymmetric rung (q8_0 K with a q4_0 V).
+
+        ``evict_busy`` is whether the eviction ladder may stop a model that is
+        serving a request (D36). ``None`` (the default) follows ``force``: a
+        caller who can see what they are interrupting and says ``force=true``
+        means it. The two are separable because ``force`` also means "reload
+        the running instance", and three callers need the reload without the
+        licence to interrupt a stream -- ``load_recommended``, the parallel
+        benchmark and the placement benchmark all pass ``evict_busy=False``.
         """
         validate_load_args(
             ctx_size=ctx_size,
@@ -526,6 +541,7 @@ class ModelManager:
                 reload_of=reload_of,
                 force=force,
                 source=source,
+                evict_busy=force if evict_busy is None else evict_busy,
             )
 
     #: Contexts the "Load recommended" buttons offer, and the ones the MCP
@@ -602,7 +618,59 @@ class ModelManager:
 
         modes = self._modes_for_recommendation(prefer_modes)
         observations = self.parallel_observations(record.id)
-        planner = Planner(self.config, self.planner.probe, log_plans=False)
+
+        # A model that is already resident is about to be RELOADED at the new
+        # context (the load below is a forced reload), so the walk must see the
+        # machine the way that reload will: with this instance's own footprint
+        # credited back (D30's reload_of credit, D36's CreditedProbe -- the same
+        # figure). Without the credit the walk planned against VRAM the model
+        # itself was holding, refused "not enough VRAM" for a window the reload
+        # one line later would have fitted, and under-reported the slot count.
+        # And a resident model that is mid-conversation is not reloaded at all:
+        # a load never interrupts a stream (D36), this one included.
+        resident = self.supervisor.get(record.id)
+        if resident is not None and resident.state != "ready":
+            resident = None
+        if resident is not None:
+            if resident.active_requests > 0:
+                raise ModelBusyError(
+                    f"'{record.id}' is serving {resident.active_requests} request(s); "
+                    f"loading it at {int(ctx_size)} tokens would interrupt them. Wait for "
+                    f"the stream(s) to finish, or pass force=true to load_model to do it "
+                    f"anyway.",
+                    details={
+                        "busy": self.busy_snapshot(),
+                        "retry_after_s": BUSY_RETRY_AFTER_S,
+                        "loaded_by": resident.loaded_by,
+                    },
+                )
+            plan_now = resident.plan
+            if (
+                plan_now is not None
+                and int(plan_now.ctx_per_slot or plan_now.ctx_size) == int(ctx_size)
+                and (
+                    kv_min is None
+                    or _kv_rank(plan_now.kv_cache_type, plan_now.kv_cache_type_v)
+                    <= _kv_rank(kv_min, kv_min)
+                )
+            ):
+                # Already exactly that. Reloading would cost a cold start and
+                # a window of "loading" for every client, to arrive where we are.
+                log.info(
+                    "already loaded at the requested context",
+                    model_id=record.id,
+                    ctx_size=int(ctx_size),
+                    devices=plan_now.devices,
+                    source=source,
+                )
+                return resident
+
+        probe: Any = self.planner.probe
+        if resident is not None:
+            footprint = Planner.instance_footprint(resident)
+            if footprint:
+                probe = catalog_mod.CreditedProbe(self.planner.probe, footprint)
+        planner = Planner(self.config, probe, log_plans=False)
         loaded = [i for i in self.supervisor.list() if i.model_id != record.id]
 
         attempts: list[dict[str, Any]] = []
@@ -636,6 +704,10 @@ class ModelManager:
                 evicting=winner["would_evict"],
                 source=source,
             )
+            # force=True is the RELOAD half of force (the model may be resident
+            # at another context); evict_busy=False keeps D36's rule -- a model
+            # that is serving is never a candidate, and this path has no
+            # override for that by design.
             return await self.load(
                 record.id,
                 ctx_size=int(ctx_size),
@@ -645,6 +717,7 @@ class ModelManager:
                 devices=winner["devices"],
                 force=True,
                 source=source,
+                evict_busy=False,
             )
 
         raise self._recommendation_refused(record, int(ctx_size), attempts, trained=trained)
@@ -874,6 +947,7 @@ class ModelManager:
         reload_of: str | None = None,
         force: bool = False,
         source: str = "api",
+        evict_busy: bool | None = None,
     ) -> InstanceInfo:
         """Plan, evict if needed, launch. Caller must hold the per-model lock.
 
@@ -896,9 +970,13 @@ class ModelManager:
                 model_id=record.id,
                 queued=sum(self._load_waiters.values()),
             )
-        async with self._load_gate:
-            self._loading.add(record.id)
-            try:
+        # Visible in /health.busy.loading from the moment the load is asked
+        # for, gate wait included: a load queued behind another one is still a
+        # load in flight, and "the box was idle when we looked" must not be
+        # true only between the gate and the spawn.
+        self._loading.add(record.id)
+        try:
+            async with self._load_gate:
                 return await self._load_gated(
                     record,
                     ctx_size=ctx_size,
@@ -908,9 +986,10 @@ class ModelManager:
                     reload_of=reload_of,
                     force=force,
                     source=source,
+                    evict_busy=force if evict_busy is None else evict_busy,
                 )
-            finally:
-                self._loading.discard(record.id)
+        finally:
+            self._loading.discard(record.id)
 
     async def _load_gated(
         self,
@@ -923,6 +1002,7 @@ class ModelManager:
         reload_of: str | None = None,
         force: bool = False,
         source: str = "api",
+        evict_busy: bool | None = None,
     ) -> InstanceInfo:
         existing = self.supervisor.get(record.id)
         if reload_of is not None and (existing is None or existing.state != "ready"):
@@ -959,8 +1039,9 @@ class ModelManager:
             # A model serving a request is never evicted to make room for
             # another one (D36); only an explicit force=true from a caller who
             # can see what they are interrupting overrides that, and a JIT load
-            # can never set it.
-            evict_busy=force,
+            # can never set it. A caller that needs force's RELOAD half without
+            # that licence passes evict_busy=False explicitly.
+            evict_busy=force if evict_busy is None else evict_busy,
             source=source,
         )
 
