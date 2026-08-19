@@ -1048,3 +1048,89 @@ def test_confidence_says_measured_only_for_an_exact_observation() -> None:
     assert confidence_for({"exact": True, "gen_tps": 40.0}, {"basis": "none"}) == "measured"
     assert confidence_for({"exact": False, "gen_tps": 40.0}, {"basis": "gpu_class"}) == "calibrated"
     assert confidence_for({"exact": None, "gen_tps": None}, {"basis": "none"}) == "estimated"
+
+
+# ---------------------------------------------------------------------------
+# Tensor split (WP20 / DECISIONS.md D38)
+# ---------------------------------------------------------------------------
+
+
+def meta_31b_dense() -> Meta:
+    """A 31B dense model: the size where tensor parallelism starts to pay."""
+    return Meta(param_count=31_000_000_000, quant_label="Q4_K_M", n_layer=62)
+
+
+def split_pair(**kwargs: object) -> dict:
+    return estimate(
+        meta_31b_dense(),
+        int(18 * GB),
+        {0: int(9 * GB), 1: int(9 * GB)},
+        kv_read_bytes_per_slot=8 * MB,
+        parallel=1,
+        gpus=rig(),
+        **kwargs,  # type: ignore[arg-type]
+    )
+
+
+def test_tensor_split_beats_a_layer_split_on_two_equal_cards() -> None:
+    """The whole point of tensor parallelism: both cards read their half of the
+    weights at the same time instead of one waiting for the other."""
+    layer = split_pair()
+    tensor = split_pair(split_mode="tensor")
+    assert tensor["gen_tps"] > layer["gen_tps"]
+    assert tensor["basis"]["split_mode"] == "tensor"
+    assert tensor["basis"]["t_tensor_sync_s"] == pytest.approx(62 * throughput.T_TENSOR_SYNC_S)
+
+
+def test_tensor_split_never_claims_more_than_perfect_scaling() -> None:
+    """Two cards can at best halve the weight read. Anything above 2x the
+    single-card rate would be the estimator inventing hardware."""
+    single = estimate(
+        meta_31b_dense(),
+        int(18 * GB),
+        {0: int(18 * GB)},
+        kv_read_bytes_per_slot=8 * MB,
+        parallel=1,
+        gpus=rig(),
+    )
+    tensor = split_pair(split_mode="tensor")
+    assert tensor["gen_tps"] < 2 * single["gen_tps"]
+
+
+def test_the_sync_term_keeps_small_models_on_the_layer_split() -> None:
+    """Measured on the rig: a 1.5B on two 3090s ran SLOWER under tensor mode
+    than under layer mode and slower than one card alone (D38). The per-layer
+    all-reduce is fixed while the halved weight read shrinks with the model, so
+    the estimator has to reproduce that crossover rather than promise a win.
+    """
+    tiny = Meta(param_count=1_500_000_000, quant_label="Q4_K_M", n_layer=28)
+    common: dict[str, object] = {
+        "kv_read_bytes_per_slot": 1 * MB,
+        "parallel": 1,
+        "gpus": rig(),
+    }
+    layer = estimate(tiny, int(1 * GB), {2: int(0.5 * GB), 3: int(0.5 * GB)}, **common)  # type: ignore[arg-type]
+    tensor = estimate(
+        tiny,
+        int(1 * GB),
+        {2: int(0.5 * GB), 3: int(0.5 * GB)},
+        split_mode="tensor",
+        **common,  # type: ignore[arg-type]
+    )
+    assert tensor["gen_tps"] < layer["gen_tps"]
+
+
+def test_tensor_split_on_one_device_is_just_the_single_card_estimate() -> None:
+    """`-sm tensor` with one GPU is accepted by the engine and means nothing;
+    charging a sync term for it would invent a penalty out of a no-op."""
+    one = est8b()
+    tensor = est8b(split_mode="tensor")
+    assert tensor["gen_tps"] == one["gen_tps"]
+    assert tensor["prompt_tps"] == one["prompt_tps"]
+    assert tensor["basis"]["t_tensor_sync_s"] == 0.0
+
+
+def test_prefill_is_deliberately_unchanged_by_the_split_mode() -> None:
+    """A parallel roofline would advertise a prefill win; the rig measured a
+    57% prefill LOSS on the same placement. See estimate()'s docstring."""
+    assert split_pair(split_mode="tensor")["prompt_tps"] == split_pair()["prompt_tps"]

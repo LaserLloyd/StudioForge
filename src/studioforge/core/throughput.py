@@ -180,6 +180,21 @@ DECODE_EFFICIENCY_PER_EXTRA_DEVICE_MOE = 0.10
 #: opposite directions.
 MOE_PROMPT_EFFICIENCY = 0.4
 
+#: Seconds of cross-device synchronisation one layer costs under
+#: ``--split-mode tensor``. Tensor parallelism shards every weight matrix *and*
+#: the KV across the devices, so each device does 1/N of the work -- and then
+#: every layer has to all-reduce its partial results twice (after the attention
+#: projection and after the MLP). On NVLink that is nearly free; on this rig the
+#: cards talk over PCIe and it is not.
+#:
+#: 60 us is an approximation, not a measurement of this rig's bus: two small
+#: all-reduces at PCIe 4.0 x16 latency. It is the term that decides where tensor
+#: mode stops paying, and it is deliberately large enough to keep small models
+#: on the layer split -- which is what the rig actually measured. Qwen2.5-1.5B
+#: Q4_K_M on 2x RTX 3090, 8k context: layer 344 tok/s, tensor 294 tok/s, single
+#: card 353 tok/s (DECISIONS.md D38). Calibration corrects the rest.
+T_TENSOR_SYNC_S = 60e-6
+
 #: Bumped whenever :func:`estimate` changes shape. Every observation records the
 #: version that produced its ``est_*`` columns, and :func:`calibrate` reads only
 #: rows from the *current* version.
@@ -402,6 +417,7 @@ def estimate(
     efficiency: float = 1.0,
     prompt_efficiency: float = 1.0,
     knee: int | None = None,
+    split_mode: str = "layer",
 ) -> dict[str, Any]:
     """Projected prompt and generation speed for one placement.
 
@@ -428,6 +444,11 @@ def estimate(
         knee: slot count past which extra slots stop buying throughput. Taken
             from :func:`~studioforge.core.planner.max_parallel_for` when the
             caller has already computed it.
+        split_mode: how the placement shards the model. ``"layer"`` (and
+            ``"none"``/``"row"``) keeps the pipeline model below, where the
+            per-device times ADD. ``"tensor"`` runs the devices in parallel, so
+            the *slowest* device sets the pace and every layer pays
+            :data:`T_TENSOR_SYNC_S` of cross-device synchronisation on top.
 
     Returns a dict with ``prompt_tps``, ``gen_tps``, ``gen_tps_batched`` and a
     ``basis`` block carrying every intermediate value, so a number that looks
@@ -476,6 +497,28 @@ def estimate(
     the fast card sits idle while the slow one works. Over-stating a mixed
     split's prefill is what made the planner's ``prefer_single_gpu`` exceptions
     look free.
+
+    **Tensor split.** Under ``--split-mode tensor`` every device holds a slice of
+    every weight matrix and of the KV, so they work *at the same time* and the
+    per-device times take a ``max`` instead of a sum -- but each layer then pays
+    two cross-device all-reduces::
+
+        t_weights = max_dev(active_bytes * share_dev / BW_dev) / eff_decode
+        t_kv      = max_dev(kv_read_bytes_per_slot * share_dev / BW_dev)
+        t_token   = t_weights + t_kv + n_layer * T_TENSOR_SYNC_S + T_TOKEN_OVERHEAD_S
+
+    The sync term is why this is not free money: it is fixed per layer while the
+    halved weight read shrinks with the model, so tensor mode only pays above a
+    crossover in model size. Measured on this rig, a 1.5B on two 3090s came out
+    *slower* than the layer split and slower than one card (D38), which is what
+    the constant is calibrated to reproduce.
+
+    **Prefill is deliberately modelled the same for both modes.** Tensor mode
+    parallelises the GEMMs, so a roofline would predict a prefill win -- and the
+    rig measured a 57% prefill *loss* on the same 1.5B. Claiming the win would be
+    a fabrication and claiming the loss would be an unmeasured constant, so
+    prefill keeps the pipeline arithmetic and the benchmark's layer-vs-tensor
+    modes are the honest way to know.
     """
     split = {int(k): max(0, int(v)) for k, v in devices_split.items() if int(v) > 0}
     total_split = sum(split.values())
@@ -498,8 +541,9 @@ def estimate(
         eff_decode *= MOE_DECODE_EFFICIENCY
     eff_prompt = PROMPT_EFFICIENCY * (MOE_PROMPT_EFFICIENCY if moe else 1.0)
 
-    t_weights_raw = 0.0
-    t_kv = 0.0
+    tensor_parallel = split_mode == "tensor" and len(split) > 1
+    weight_times: list[float] = []
+    kv_times: list[float] = []
     t_prompt_raw = 0.0
     perf_by_device: dict[int, str] = {}
     for index, bytes_here in split.items():
@@ -509,16 +553,29 @@ def estimate(
             int(getattr(gpu_map.get(index), "total_bytes", 0) or 0),
         )
         perf_by_device[index] = perf.label
-        t_weights_raw += (active * share) / perf.bw_bytes_per_s
-        t_kv += (kv_per_slot * share) / perf.bw_bytes_per_s
+        weight_times.append((active * share) / perf.bw_bytes_per_s)
+        kv_times.append((kv_per_slot * share) / perf.bw_bytes_per_s)
+        # Prefill uses the pipeline sum for BOTH split modes -- see the
+        # docstring: the rig measured tensor prefill *slower*, so a parallel
+        # roofline here would advertise a win that does not exist.
         t_prompt_raw += (2.0 * params_active * share) / perf.flops_fp16
 
     if not split:
         # No placement to reason about. Say so rather than dividing by zero.
         return _unknown_result(active, params_active, eff_decode, eff_prompt)
 
+    # Devices run in sequence under a layer split and together under a tensor
+    # split, so the times add in one case and the slowest device sets the pace
+    # in the other.
+    reduce = max if tensor_parallel else sum
+    t_weights_raw = float(reduce(weight_times))
+    t_kv = float(reduce(kv_times))
+    t_sync = (
+        max(0, int(getattr(meta, "n_layer", 0) or 0)) * T_TENSOR_SYNC_S if tensor_parallel else 0.0
+    )
+
     t_weights = t_weights_raw / eff_decode
-    t_token = t_weights + t_kv + T_TOKEN_OVERHEAD_S
+    t_token = t_weights + t_kv + t_sync + T_TOKEN_OVERHEAD_S
     if t_token <= 0:  # pragma: no cover - the overhead floor makes this unreachable
         return _unknown_result(active, params_active, eff_decode, eff_prompt)
 
@@ -527,7 +584,7 @@ def estimate(
     slots = max(1, int(parallel))
     if knee is not None and knee >= 1:
         slots = min(slots, int(knee))
-    t_step = t_weights + slots * t_kv + T_TOKEN_OVERHEAD_S
+    t_step = t_weights + slots * t_kv + t_sync + T_TOKEN_OVERHEAD_S
     gen_tps_batched = (max(0.0, efficiency) * slots / t_step) if t_step > 0 else 0.0
     # A batch can never be slower in aggregate than a single stream.
     gen_tps_batched = max(gen_tps_batched, gen_tps)
@@ -553,6 +610,8 @@ def estimate(
             "prompt_calibration": round(prompt_efficiency, 3),
             "t_token_s": t_token,
             "t_overhead_s": T_TOKEN_OVERHEAD_S,
+            "t_tensor_sync_s": t_sync,
+            "split_mode": split_mode,
             "slots_used": slots,
             "is_moe": moe,
             "estimator_version": ESTIMATOR_VERSION,
@@ -584,6 +643,8 @@ def _unknown_result(
             "prompt_calibration": 1.0,
             "t_token_s": 0.0,
             "t_overhead_s": T_TOKEN_OVERHEAD_S,
+            "t_tensor_sync_s": 0.0,
+            "split_mode": "layer",
             "slots_used": 0,
             "is_moe": False,
             "estimator_version": ESTIMATOR_VERSION,
