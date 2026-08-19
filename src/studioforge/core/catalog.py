@@ -51,9 +51,14 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any
+from typing import Any, NamedTuple
 
 from studioforge.core import throughput
+from studioforge.core.kv_sensitivity import (
+    allows_q8,
+    kv_quality_label,
+    kv_quality_rank,
+)
 from studioforge.core.planner import (
     Planner,
     attention_kind,
@@ -505,6 +510,7 @@ def _idle_variant(
         "fits": True,
         "devices": list(plan.devices),
         "kv_cache_type": plan.kv_cache_type,
+        "kv_cache_type_v": plan.kv_cache_type_v,
         "vram_mb": round(vram / MB),
         "max_parallel": slots,
         "parallel_limited_by": bound,
@@ -512,6 +518,26 @@ def _idle_variant(
         "est_gen_tps_full_ctx": speed["gen_tps_full_ctx"],
         "est_gen_tps_batched": speed["gen_tps_batched"],
     }
+
+
+def load_args_for(record: ModelRecord, plan: LoadPlan, slots: int) -> dict[str, Any]:
+    """The exact argument object ``load_model`` accepts for this placement.
+
+    ``kv_cache_type_v`` appears **only when it differs from K**: the tool
+    defaults V to K, so emitting an equal pair would cost every caller tokens
+    to be told the same thing twice. It does differ on the ladder's third rung
+    (``q8_0`` K with a ``q4_0`` V), which is the rung that exists precisely
+    because K and V are not equally sensitive to quantization.
+    """
+    args: dict[str, Any] = {
+        "model_id": record.id,
+        "ctx_size": int(plan.ctx_size),
+        "parallel": int(slots),
+        "kv_cache_type": plan.kv_cache_type,
+    }
+    if plan.kv_cache_type_v != plan.kv_cache_type:
+        args["kv_cache_type_v"] = plan.kv_cache_type_v
+    return args
 
 
 def _option_row(
@@ -548,7 +574,7 @@ def _option_row(
             "confidence": "estimated",
             "if_gpus_idle": idle,
             "load_args": None,
-            "recommended": False,
+            "best_now": False,
         }
 
     slots, bound, vram = slots_for_plan(planner, record, plan)
@@ -562,6 +588,7 @@ def _option_row(
         "fits": True,
         "devices": list(plan.devices),
         "kv_cache_type": plan.kv_cache_type,
+        "kv_cache_type_v": plan.kv_cache_type_v,
         "vram_mb": round(vram / MB),
         "max_parallel": slots,
         "parallel_limited_by": bound,
@@ -575,13 +602,8 @@ def _option_row(
         "if_gpus_idle": idle,
         # Exactly what the MCP `load_model` tool accepts. Pass it through
         # unchanged; every value here is already the value that tool wants.
-        "load_args": {
-            "model_id": record.id,
-            "ctx_size": ctx,
-            "parallel": slots,
-            "kv_cache_type": plan.kv_cache_type,
-        },
-        "recommended": False,
+        "load_args": load_args_for(record, plan, slots),
+        "best_now": False,
     }
 
 
@@ -607,26 +629,62 @@ def _best(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
     return max(rows, key=lambda r: int(r["ctx_per_slot"]))
 
 
-def _live_slots(row: Mapping[str, Any]) -> int:
-    return int(row.get("max_parallel") or 0)
+class _RowView(NamedTuple):
+    """The four facts a chooser compares, read off whichever half of a row holds them."""
+
+    ctx: int
+    kv_k: str
+    kv_v: str
+    slots: int
 
 
-def _idle_slots(row: Mapping[str, Any]) -> int:
-    return int((row.get("if_gpus_idle") or {}).get("max_parallel") or 0)
+#: A row carries two verdicts -- the live one at the top level and the idle one
+#: under ``if_gpus_idle`` -- and the chooser must be able to rank either without
+#: knowing which. Passing an accessor rather than duplicating the rule is what
+#: keeps "highest ctx at the best KV quality" a single implementation.
+RowView = Callable[[Mapping[str, Any]], _RowView]
 
 
-def _preferred(
+def live_view(row: Mapping[str, Any]) -> _RowView:
+    kv_k = str(row.get("kv_cache_type") or "")
+    return _RowView(
+        int(row.get("ctx_per_slot") or 0),
+        kv_k,
+        str(row.get("kv_cache_type_v") or kv_k),
+        int(row.get("max_parallel") or 0),
+    )
+
+
+def idle_view(row: Mapping[str, Any]) -> _RowView:
+    idle = row.get("if_gpus_idle") or {}
+    kv_k = str(idle.get("kv_cache_type") or "")
+    return _RowView(
+        int(row.get("ctx_per_slot") or 0),
+        kv_k,
+        str(idle.get("kv_cache_type_v") or kv_k),
+        int(idle.get("max_parallel") or 0),
+    )
+
+
+def _throughput_preferred(
     rows: Sequence[dict[str, Any]],
     *,
     chat_class: bool,
     floor: int,
-    slots_of: Callable[[Mapping[str, Any]], int],
+    view: RowView,
 ) -> tuple[dict[str, Any], str] | None:
-    """The three-way preference, applied to one pool of already-usable rows."""
-    above = [r for r in rows if int(r["ctx_per_slot"]) >= floor]
+    """D20's rule: the largest window, preferring one that also serves two slots.
+
+    Kept, and reachable through ``planner.preference: "throughput"``, because
+    it is the right answer for a host whose job is to serve many short
+    conversations: there, a doubled window nobody fills is worth less than a
+    second slot, and the KV cache quality that buys the window is a cost the
+    operator has decided to pay. It is no longer the *default* (D36).
+    """
+    above = [r for r in rows if view(r).ctx >= floor]
     if above:
         if chat_class:
-            concurrent = [r for r in above if slots_of(r) >= 2]
+            concurrent = [r for r in above if view(r).slots >= 2]
             if concurrent:
                 return _best(concurrent), "highest ctx >= floor with max_parallel >= 2"
         return _best(above), "highest ctx that fits >= floor"
@@ -635,47 +693,139 @@ def _preferred(
     return None
 
 
-def mark_recommended(rows: list[dict[str, Any]], *, chat_class: bool, floor: int = 0) -> str | None:
-    """Mark exactly one row ``recommended`` and say which rule chose it.
+def _quality_preferred(
+    rows: Sequence[dict[str, Any]],
+    *,
+    floor: int,
+    meta: Any,
+    view: RowView,
+) -> tuple[dict[str, Any], str] | None:
+    """Quality first, then context, then slots (D36) -- the default rule.
 
-    ``floor`` is :func:`recommendation_floor` -- the context below which this
-    server does not consider a model usefully loaded. **The floor outranks the
-    second slot**, which is the one thing this rule got wrong before: it would
-    take 16384 tokens with two slots over 32768 with one, and 16k is where an
-    OpenClaw agent's tool transcript stops fitting. A queued second
-    conversation is a latency problem; a window that cannot hold the task is a
-    failed task, and D14 already decided which of those the server optimises
-    for. (The old rule picked 16k for the resident 122B for precisely this
-    reason, off a knee that was itself wrong -- see D22.)
+    The order is the user's, stated plainly: *"quality is more important than
+    speed"*. So:
 
-    In order:
+    1. **The best KV cache quality that reaches the floor** at one slot or
+       more. Rows are ranked by
+       :func:`~studioforge.core.kv_sensitivity.kv_quality_rank`, which puts
+       ``f16`` ahead of ``q8_0`` ahead of ``q8_0`` K + ``q4_0`` V. Quantizing
+       to reach a *bigger* window is not a trade this rule makes; quantizing to
+       reach the floor at all is, because the alternative is not serving the
+       model.
+    2. **The highest context at that quality** (already capped at
+       ``n_ctx_train`` by :func:`ctx_tiers_for`).
+    3. **Whatever slots that placement sustains** -- reported, never bought.
+       A slot count is a latency property; a KV cache type is a correctness
+       one, and D14/D22 already settled that the floor outranks the second slot.
 
-    1. **Chat-class models** (anything an agent talks to): the highest context
-       **at or above the floor** that also sustains at least two slots. One slot
-       means every concurrent request queues behind the one before it, so above
-       the floor the second conversation is worth a context doubling. Non-chat
-       models (embeddings, rerankers) skip this: they are called in bursts and a
-       single slot is not a bottleneck in the same way.
-    2. The highest context at or above the floor that fits at all.
-    3. If nothing reaches the floor, the highest context that fits -- said
-       plainly, with ``"(below floor)"`` in the basis, because a small window is
-       still better than no recommendation.
-    4. If nothing fits right now, the same three-way preference applied to the
-       ``if_gpus_idle`` column, so the agent is told "unload something" rather
-       than "impossible". The basis is ``"if_gpus_idle"``.
+    **One exception, and it is measured.** A family whose KV cache is *known*
+    to survive quantization (:mod:`studioforge.core.kv_sensitivity`: Qwen 3.6
+    measures KL 0.024 at ``q8_0``, inside sampler noise) may take ``q8_0`` when
+    it buys at least a **doubling** of the window. A sensitive family (Gemma
+    3/4 at KL 0.108 dense / 0.377 MoE, and every unmeasured architecture) never
+    does.
 
-    Returns the basis string, or ``None`` when there is nothing to recommend.
+    Below the floor the same order applies to whatever does fit, with
+    ``"(below floor)"`` said out loud -- a small window beats no answer.
+    """
+    usable = [r for r in rows if view(r).slots >= 1]
+    above = [r for r in usable if view(r).ctx >= floor]
+    pool = above or usable
+    if not pool:
+        return None
+
+    by_rank: dict[int, list[dict[str, Any]]] = {}
+    for row in pool:
+        seen = view(row)
+        by_rank.setdefault(kv_quality_rank(seen.kv_k, seen.kv_v), []).append(row)
+    rank = min(by_rank)
+
+    if rank == 0 and 1 in by_rank:
+        f16_ctx = max(view(r).ctx for r in by_rank[0])
+        q8_ctx = max(view(r).ctx for r in by_rank[1])
+        if q8_ctx >= 2 * f16_ctx and allows_q8(
+            meta, f16_reaches_floor=bool(above), buys_doubling=True
+        ):
+            rank = 1
+
+    chosen = max(by_rank[rank], key=lambda r: (view(r).ctx, view(r).slots))
+    seen = view(chosen)
+    basis = (
+        f"{kv_quality_label(seen.kv_k, seen.kv_v)} KV, highest ctx "
+        f"{seen.ctx}, {seen.slots} slot{'' if seen.slots == 1 else 's'}"
+    )
+    if not above:
+        basis += " (below floor)"
+    return chosen, basis
+
+
+def choose_row(
+    rows: Sequence[dict[str, Any]],
+    *,
+    chat_class: bool,
+    floor: int,
+    meta: Any = None,
+    preference: str = "quality",
+    view: RowView = live_view,
+) -> tuple[dict[str, Any], str] | None:
+    """The ONE chooser, used by the per-context table and by every placement.
+
+    Both surfaces answer the same question -- "of these rows, which is the one
+    to load?" -- and answering it twice is how ``/profiles`` came to recommend
+    a 262144-token q4_0 row while the catalog recommended something else for
+    the same model on the same hardware.
+    """
+    if preference == "throughput":
+        return _throughput_preferred(rows, chat_class=chat_class, floor=floor, view=view)
+    return _quality_preferred(rows, floor=floor, meta=meta, view=view)
+
+
+def mark_best_now(
+    rows: list[dict[str, Any]],
+    *,
+    chat_class: bool,
+    floor: int = 0,
+    meta: Any = None,
+    preference: str = "quality",
+) -> str | None:
+    """Flag the one row of the per-context table that is best **right now**.
+
+    The entry-level ``recommended`` is a *placement* (D36): the best this model
+    can do on the rig's headline hardware mode, computed as if that hardware
+    were free, because "which GPUs should I give this model" is the question a
+    caller actually has. This flag is the drill-down's own answer to a narrower
+    question -- given the machine exactly as it is this second, which context
+    row would load without disturbing anything -- and it is what the compact
+    view keeps.
+
+    Falls back to the ``if_gpus_idle`` column when nothing fits now, so the
+    answer is "unload something" rather than "impossible"; the basis then says
+    ``if_gpus_idle``.
     """
     fitting = [r for r in rows if r.get("fits")]
-    chosen = _preferred(fitting, chat_class=chat_class, floor=floor, slots_of=_live_slots)
+    chosen = choose_row(
+        fitting,
+        chat_class=chat_class,
+        floor=floor,
+        meta=meta,
+        preference=preference,
+        view=live_view,
+    )
     if chosen is not None:
-        chosen[0]["recommended"] = True
+        chosen[0]["best_now"] = True
         return chosen[1]
 
     reachable = [r for r in rows if (r.get("if_gpus_idle") or {}).get("fits")]
-    chosen = _preferred(reachable, chat_class=chat_class, floor=floor, slots_of=_idle_slots)
+    chosen = choose_row(
+        reachable,
+        chat_class=chat_class,
+        floor=floor,
+        meta=meta,
+        preference=preference,
+        view=idle_view,
+    )
     if chosen is not None:
-        chosen[0]["recommended"] = True
+        chosen[0]["best_now"] = True
         return "if_gpus_idle"
     return None
 
@@ -900,16 +1050,20 @@ def _model_entry(
         )
         for ctx in ctx_tiers_for(record, ctx_tiers)
     ]
-    basis = mark_recommended(
+    floor = recommendation_floor(entry_live.config, record)
+    preference = str(getattr(entry_live.config.planner, "preference", "quality"))
+    basis = mark_best_now(
         rows,
         chat_class=record.kind == "chat",
-        floor=recommendation_floor(entry_live.config, record),
+        floor=floor,
+        meta=meta,
+        preference=preference,
     )
-    entry["recommended_basis"] = basis
+    entry["best_now_basis"] = basis
     # The entry-level block describes the factor the recommended row was quoted
     # with -- the row a caller is being told to take. Reporting a model-wide
     # average instead would name a number no row in the table actually used.
-    chosen = next((r for r in rows if r.get("recommended")), None)
+    chosen = next((r for r in rows if r.get("best_now")), None)
     if chosen is not None:
         placed = chosen.get("devices") or (chosen.get("if_gpus_idle") or {}).get("devices") or ()
         entry["calibration"] = _calibration_block(calibrate_for(placed))
@@ -1022,7 +1176,7 @@ def compact_entry(entry: dict[str, Any]) -> dict[str, Any]:
         out["settings_pinned"] = entry["settings_pinned"]
     if entry.get("params_active_b") == entry.get("params_total_b"):
         out.pop("params_active_b", None)
-    out["options"] = [compact_row(r) for r in entry.get("options", []) if r.get("recommended")]
+    out["options"] = [compact_row(r) for r in entry.get("options", []) if r.get("best_now")]
     return out
 
 

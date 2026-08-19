@@ -90,6 +90,9 @@ def validate_load_args(
     ctx_size: int | None,
     parallel: int | None,
     kv_cache_type: Any,
+    kv_cache_type_v: Any = None,
+    devices: Sequence[int] | None = None,
+    known_devices: Sequence[int] | None = None,
 ) -> None:
     """Raise :class:`BadRequestError` for a load argument no load could use.
 
@@ -97,6 +100,11 @@ def validate_load_args(
     GUI and the benchmark all get it) rather than by each caller. ``0``/negative
     values used to fall through the planner's ``x or default`` idiom -- ``0``
     silently meant "default", ``-1`` was honoured verbatim into the argv.
+
+    ``devices`` is checked against ``known_devices`` -- the CUDA indices the
+    probe actually reports -- so ``devices: [7]`` on a four-card box is a 400
+    naming the parameter rather than a planner refusal several frames deeper
+    that reads like a VRAM problem.
     """
     if ctx_size is not None and not (1 <= int(ctx_size) <= MAX_REQUEST_CTX):
         raise BadRequestError(
@@ -110,11 +118,33 @@ def validate_load_args(
             "omit it to let the planner choose",
             param="parallel",
         )
-    if kv_cache_type is not None and str(kv_cache_type) not in KV_CACHE_TYPES:
+    for param, value in (("kv_cache_type", kv_cache_type), ("kv_cache_type_v", kv_cache_type_v)):
+        if value is not None and str(value) not in KV_CACHE_TYPES:
+            raise BadRequestError(
+                f"{param} must be one of {', '.join(KV_CACHE_TYPES)} (got {value!r})",
+                param=param,
+            )
+    if devices is None:
+        return
+    indices = list(devices)
+    if not indices:
         raise BadRequestError(
-            f"kv_cache_type must be one of {', '.join(KV_CACHE_TYPES)} (got {kv_cache_type!r})",
-            param="kv_cache_type",
+            "devices must name at least one CUDA index; omit it to let the planner choose",
+            param="devices",
         )
+    if len(set(indices)) != len(indices):
+        raise BadRequestError(
+            f"devices must not repeat a CUDA index (got {indices})",
+            param="devices",
+        )
+    if known_devices is not None:
+        unknown = sorted(set(indices) - set(known_devices))
+        if unknown:
+            raise BadRequestError(
+                f"devices names CUDA index/indices {unknown}, which this machine does not "
+                f"have (it has {sorted(known_devices)})",
+                param="devices",
+            )
 
 
 def classify_load_failure(stderr_tail: Sequence[str]) -> str:
@@ -361,7 +391,9 @@ class ModelManager:
         *,
         ctx_size: int | None = None,
         kv_cache_type: Any = None,
+        kv_cache_type_v: Any = None,
         parallel: int | None = None,
+        devices: Sequence[int] | None = None,
         force: bool = False,
     ) -> InstanceInfo:
         """Explicit load (GUI/CLI/MCP). ``force`` reloads an already-running model.
@@ -377,13 +409,36 @@ class ModelManager:
         ComfyUI, the engine is gone -- raises with the numbers while the model
         that was serving a moment ago goes on serving. The old order (stop,
         then plan) turned every refused reload into an outage.
+
+        ``devices`` is a **one-shot placement for this load only** (D36): the
+        catalog's per-hardware-mode rows carry one in their ``load_args``, so
+        "run this on the two 5090s" is a load argument rather than a settings
+        edit. It is applied as a ``device_override`` on a *copy* of the record
+        -- the persisted settings are never touched, so the next load without
+        it goes back to letting the planner choose. ``kv_cache_type_v``
+        likewise, for the ladder's asymmetric rung (q8_0 K with a q4_0 V).
         """
-        validate_load_args(ctx_size=ctx_size, parallel=parallel, kv_cache_type=kv_cache_type)
+        validate_load_args(
+            ctx_size=ctx_size,
+            parallel=parallel,
+            kv_cache_type=kv_cache_type,
+            kv_cache_type_v=kv_cache_type_v,
+            devices=list(devices) if devices is not None else None,
+            known_devices=self._known_devices(),
+        )
         await self._await_boot()
         record = self.registry.resolve(name)
         if record is None:
             raise ModelNotFoundError(name, known=self.registry.known_ids())
         record = self.serving_record(record)
+        if devices is not None:
+            record = record.model_copy(
+                update={
+                    "settings": record.settings.model_copy(
+                        update={"device_override": [int(d) for d in devices]}
+                    )
+                }
+            )
         lock = await self._lock_for(record.id)
         async with lock:
             existing = self.supervisor.get(record.id)
@@ -396,9 +451,22 @@ class ModelManager:
                 record,
                 ctx_size=ctx_size,
                 kv_cache_type=kv_cache_type,
+                kv_cache_type_v=kv_cache_type_v,
                 parallel=parallel,
                 reload_of=reload_of,
             )
+
+    def _known_devices(self) -> list[int] | None:
+        """CUDA indices the probe reports, or ``None`` when it cannot be asked.
+
+        ``None`` rather than ``[]``: a probe that failed says nothing about what
+        the box has, and refusing every device because NVML was unavailable
+        would turn a diagnostic problem into a serving outage.
+        """
+        try:
+            return [g.index for g in self.planner.probe.list_gpus()]
+        except Exception:  # noqa: BLE001 - validation must not fail on a sick probe
+            return None
 
     async def _load_locked(
         self,
@@ -406,6 +474,7 @@ class ModelManager:
         *,
         ctx_size: int | None = None,
         kv_cache_type: Any = None,
+        kv_cache_type_v: Any = None,
         parallel: int | None = None,
         reload_of: str | None = None,
     ) -> InstanceInfo:
@@ -435,6 +504,7 @@ class ModelManager:
                 record,
                 ctx_size=ctx_size,
                 kv_cache_type=kv_cache_type,
+                kv_cache_type_v=kv_cache_type_v,
                 parallel=parallel,
                 reload_of=reload_of,
             )
@@ -445,6 +515,7 @@ class ModelManager:
         *,
         ctx_size: int | None,
         kv_cache_type: Any,
+        kv_cache_type_v: Any = None,
         parallel: int | None,
         reload_of: str | None = None,
     ) -> InstanceInfo:
@@ -474,6 +545,7 @@ class ModelManager:
             record,
             ctx_size=ctx_size,
             kv_cache_type=kv_cache_type,
+            kv_cache_type_v=kv_cache_type_v,
             parallel=parallel,
             loaded=self.supervisor.list(),
             draft=draft,
@@ -515,6 +587,7 @@ class ModelManager:
                 adapters=adapters,
                 ctx_size=ctx_size,
                 kv_cache_type=kv_cache_type,
+                kv_cache_type_v=kv_cache_type_v,
                 parallel=parallel,
             )
         except StudioForgeError:
@@ -588,6 +661,7 @@ class ModelManager:
         adapters: Sequence[tuple[AdapterRecord, float]],
         ctx_size: int | None = None,
         kv_cache_type: Any = None,
+        kv_cache_type_v: Any = None,
         parallel: int | None = None,
     ) -> InstanceInfo:
         """Launch the child, retrying **once** after a transient OOM.
@@ -639,6 +713,7 @@ class ModelManager:
             record,
             ctx_size=ctx_size,
             kv_cache_type=kv_cache_type,
+            kv_cache_type_v=kv_cache_type_v,
             parallel=parallel,
             loaded=self.supervisor.list(),
             draft=draft,

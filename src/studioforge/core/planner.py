@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from studioforge.config import Config, FlashAttn, KvCacheType, QuantAffinity, SplitMode
 from studioforge.core.gpu import vram_processes
+from studioforge.core.kv_sensitivity import KV_QUALITY_LADDER
 from studioforge.logging import get_logger
 from studioforge.types import (
     MB,
@@ -1319,7 +1320,7 @@ class Planner:
                 f"wanted up to {aim} tokens of context but only {floor} fits in the "
                 f"VRAM available right now"
             )
-        if len(kv_options) > 1 and kv_k != KV_DOWNGRADE_ORDER[0]:
+        if len(kv_options) > 1 and kv_k != KV_QUALITY_LADDER[0][0]:
             notes.append(
                 f"KV cache set to {kv_k} automatically: the best-quality cache "
                 f"that reaches {ctx} tokens here."
@@ -1432,14 +1433,24 @@ class Planner:
         """KV cache types to try, best quality first.
 
         An explicit type is used verbatim -- one option, no substitution. Only
-        ``"auto"`` fans out, and it fans out over K and V together: llama.cpp
-        supports mixed K/V types but a mismatched pair is a sharp edge (some
-        builds require flash attention for a quantized V), and there is no
-        evidence it beats the matched pair on this hardware.
+        ``"auto"`` fans out, and it fans out over
+        :data:`~studioforge.core.kv_sensitivity.KV_QUALITY_LADDER`::
+
+            f16/f16  ->  q8_0/q8_0  ->  q8_0 K + q4_0 V
+
+        The symmetric ``q4_0/q4_0`` rung this used to end on is **gone** (D36).
+        K and V are not equally sensitive: a q4_0 **K** cache alone drops
+        Qwen2.5-7B to 11.7% token agreement with its f16 self, while a q4_0
+        **V** cache alone is nearly free (llama.cpp #23470). Fanning out over
+        matched pairs therefore skipped the one useful cheap rung and offered
+        the one rung that ruins the model -- and because a q4_0 cache reaches
+        the biggest window, that was the rung the catalog then recommended. A
+        q4_0 K cache is still reachable by setting it explicitly, which this
+        method honours verbatim like every other explicit value.
         """
         if kv_k != "auto" and kv_v != "auto":
             return [(kv_k, kv_v)]
-        return [(t, t) for t in KV_DOWNGRADE_ORDER]
+        return list(KV_QUALITY_LADDER)
 
     def _ctx_note(self, ctx: int, aim: int, floor: int, *, thinking: bool) -> str:
         why = (

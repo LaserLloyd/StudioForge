@@ -338,15 +338,26 @@ async def load_model(
     request: Request,
     ctx_size: int | None = Body(None),
     kv_cache_type: str | None = Body(None),
+    kv_cache_type_v: str | None = Body(None),
     parallel: int | None = Body(None),
+    devices: list[int] | None = Body(None),
     force: bool = Body(False),
 ) -> dict[str, Any]:
+    """Load one model, optionally onto named GPUs.
+
+    ``devices`` is a one-shot placement for this load only (D36) -- the
+    catalog's per-hardware-mode ``load_args`` carry one -- and never touches the
+    model's saved settings. A CUDA index this box does not have is a 400 naming
+    the parameter, not a planner refusal that reads like a VRAM problem.
+    """
     state = _state(request)
     instance = await state.manager.load(
         model_id,
         ctx_size=ctx_size,
         kv_cache_type=kv_cache_type,
+        kv_cache_type_v=kv_cache_type_v,
         parallel=parallel,
+        devices=devices,
         force=force,
     )
     return instance.model_dump(mode="json")

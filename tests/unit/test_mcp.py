@@ -49,7 +49,7 @@ EXPECTED_TOOLS = {
     "connection_info",
     "list_models",
     # The per-model loading table. Separate from list_models so the common
-    # case (one recommended row per model) stays cheap and the detailed case
+    # case (one best-right-now row per model) stays cheap and the detailed case
     # is opt-in for the one model the agent actually cares about.
     "model_options",
     "model_info",
@@ -409,10 +409,10 @@ async def test_list_models_carries_the_catalog_columns(state: State) -> None:
     assert row["summary"]
     assert row["n_ctx_train"] == 32768
     assert row["attention_kind"] in {"full", "iswa", "hybrid", "unknown"}
-    # Compact by default: the recommended row only.
+    # Compact by default: the best-right-now row only.
     assert len(row["options"]) == 1
     option = row["options"][0]
-    assert option["recommended"] is True
+    assert option["best_now"] is True
     assert set(option["load_args"]) == {"model_id", "ctx_size", "parallel", "kv_cache_type"}
     # Both ends of the window, because decode slows as the KV cache fills.
     assert option["est_gen_tps"] > 0
@@ -444,7 +444,7 @@ async def test_list_models_never_leaks_a_chat_template_or_meta_dump(state: State
     assert "{% for m in messages %}" not in raw
     # Compact by default, so three models with load recipes stay affordable
     # (the budget includes the two truncation keys, ~50 bytes).
-    assert len(raw) < 7100, f"list_models output is {len(raw)} chars"
+    assert len(raw) < 7300, f"list_models output is {len(raw)} chars"
 
 
 async def test_model_options_returns_the_whole_table_for_one_model(state: State) -> None:
@@ -454,7 +454,7 @@ async def test_model_options_returns_the_whole_table_for_one_model(state: State)
     model = result["model"]
     assert model["id"] == TINY
     assert len(model["options"]) > 1
-    assert sum(1 for r in model["options"] if r["recommended"]) == 1
+    assert sum(1 for r in model["options"] if r["best_now"]) == 1
     for option in model["options"]:
         assert "ctx_per_slot" in option
         assert "fits" in option
@@ -518,6 +518,29 @@ async def test_load_of_unknown_model_returns_error_result(state: State) -> None:
     payload = await call(server, "load_model", model_id="nope")
     assert payload["ok"] is False
     assert payload["error"]["code"] == "model_not_found"
+
+
+async def test_load_model_accepts_a_placements_row_load_args_shape(state: State) -> None:
+    """`devices` and `kv_cache_type_v` are arguments, so a placements row passes verbatim."""
+    server = build_management_mcp(state)
+    schema = next(t for t in await server.list_tools() if t.name == "load_model").input_schema
+    assert {
+        "model_id",
+        "ctx_size",
+        "parallel",
+        "kv_cache_type",
+        "kv_cache_type_v",
+        "devices",
+    } <= set(schema["properties"])
+
+
+async def test_load_model_rejects_a_cuda_index_this_box_does_not_have(state: State) -> None:
+    """A structured 400 naming the parameter, not a protocol error or a 500."""
+    server = build_management_mcp(state)
+    payload = await call(server, "load_model", model_id=TINY, devices=[9])
+    assert payload["ok"] is False
+    assert payload["error"]["param"] == "devices"
+    assert "9" in payload["error"]["message"]
 
 
 async def test_unload_of_unloaded_model_is_not_an_error(state: State) -> None:

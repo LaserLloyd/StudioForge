@@ -709,7 +709,9 @@ def build_management_mcp(state: Any) -> MCPServer:
         model_id: str,
         ctx_size: int | None = None,
         kv_cache_type: str | None = None,
+        kv_cache_type_v: str | None = None,
         parallel: int | None = None,
+        devices: list[int] | None = None,
         force: bool = False,
     ) -> dict[str, Any]:
         """Load a model into VRAM now, returning once it is serving.
@@ -736,18 +738,25 @@ def build_management_mcp(state: Any) -> MCPServer:
         Loading may evict other idle models to make room (this is normal and is
         reported in the plan's ``evict_model_ids``).
 
-        Placement (which GPUs, and how the model is split across them) is
-        decided by the planner against live free VRAM and is not an argument
-        here -- the catalog's ``devices`` column tells you what it will choose.
+        Placement is normally the planner's decision against live free VRAM,
+        and the catalog's ``devices`` column tells you what it will choose. To
+        pick the hardware yourself, pass ``devices`` -- which is what a
+        ``placements[]`` row's ``load_args`` does.
 
         Args:
             model_id: Model id or alias.
             ctx_size: Context tokens per parallel slot. None uses the saved
                 per-model setting, else the global default.
-            kv_cache_type: KV cache quantization -- "f16", "q8_0" or "q4_0"
-                (those three only). Each step down roughly halves KV cache
-                VRAM at some quality cost. None lets the planner pick the
-                best-quality cache that reaches the requested context.
+            kv_cache_type: KV cache quantization for the K cache -- "f16",
+                "q8_0" or "q4_0" (those three only). Each step down roughly
+                halves KV cache VRAM at a quality cost that is real and
+                family-dependent, and the K cache is the sensitive one: a q4_0
+                K cache is never chosen automatically. None lets the planner
+                pick the best-quality cache that reaches the requested context.
+            kv_cache_type_v: The V cache, when it should differ from K. Omit it
+                and V follows K. The one combination worth asking for is
+                "q8_0" K with "q4_0" V: the V cache tolerates 4 bits where the
+                K cache does not.
             parallel: Number of concurrent slots, i.e. how many conversations
                 this load can serve at once. The engine is launched with
                 ctx_size * parallel total context, so each slot really gets
@@ -755,6 +764,11 @@ def build_management_mcp(state: Any) -> MCPServer:
                 catalog row's ``parallel`` is the **most** that placement
                 sustains, not a requirement -- asking for fewer is always fine
                 and simply leaves VRAM free for something else.
+            devices: CUDA indices to place this load on, for this load only --
+                it does not change the model's saved settings, so the next load
+                without it goes back to the planner's choice. Take it from a
+                ``placements[]`` row's ``load_args``; naming an index this box
+                does not have is rejected immediately.
             force: Reload even if the model is already running (use after
                 changing its settings).
 
@@ -766,7 +780,9 @@ def build_management_mcp(state: Any) -> MCPServer:
             model_id,
             ctx_size=ctx_size,
             kv_cache_type=kv_cache_type,
+            kv_cache_type_v=kv_cache_type_v,
             parallel=parallel,
+            devices=devices,
             force=force,
         )
         return {

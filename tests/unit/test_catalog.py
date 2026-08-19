@@ -29,7 +29,7 @@ from studioforge.core.catalog import (
     capability_list,
     compact_row,
     ctx_tiers_for,
-    mark_recommended,
+    mark_best_now,
     model_type,
     pinned_settings,
     summarize,
@@ -304,88 +304,148 @@ def test_tiers_are_the_documented_ladder() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_exactly_one_row_per_model_is_recommended() -> None:
-    """ "Pick the recommended row" must always have exactly one answer."""
+def _row(ctx: int, kv: str = "f16", *, slots: int = 1, kv_v: str | None = None) -> dict:
+    """A synthetic option row: only the fields the chooser reads."""
+    return {
+        "ctx_per_slot": ctx,
+        "fits": True,
+        "kv_cache_type": kv,
+        "kv_cache_type_v": kv_v or kv,
+        "max_parallel": slots,
+        "best_now": False,
+    }
+
+
+def test_exactly_one_row_per_model_is_flagged_best_now() -> None:
+    """ "Which row loads right now" must always have exactly one answer."""
     for entry in catalog_for()["models"]:
-        marked = [r for r in entry["options"] if r["recommended"]]
+        marked = [r for r in entry["options"] if r["best_now"]]
         assert len(marked) == 1, entry["id"]
 
 
-def test_a_chat_model_trades_context_for_a_second_conversation() -> None:
-    """Above the floor, one slot means every request queues -- fatal on an agent host."""
-    dense = next(m for m in catalog_for()["models"] if m["id"] == "pub/dense-8b")
-    chosen = next(r for r in dense["options"] if r["recommended"])
-    assert chosen["max_parallel"] >= 2
-    assert dense["recommended_basis"] == "highest ctx >= floor with max_parallel >= 2"
-    # ...and it really is the *highest* such context, not merely one of them.
-    better = [
-        r
-        for r in dense["options"]
-        if r["fits"] and r["max_parallel"] >= 2 and r["ctx_per_slot"] > chosen["ctx_per_slot"]
-    ]
-    assert better == []
+# -- quality first (D36) ----------------------------------------------------
 
 
-def test_a_non_chat_model_just_takes_the_biggest_window() -> None:
-    """Embeddings are called in bursts; a single slot is not the bottleneck."""
-    rows = [
-        {"ctx_per_slot": 16384, "fits": True, "max_parallel": 8, "recommended": False},
-        {"ctx_per_slot": 32768, "fits": True, "max_parallel": 1, "recommended": False},
-    ]
-    basis = mark_recommended(rows, chat_class=False, floor=16384)
-    assert basis == "highest ctx that fits >= floor"
-    assert rows[1]["recommended"] is True
+def test_quality_outranks_context_a_doubling_is_not_worth_a_quantized_cache() -> None:
+    """The user's order: quality is more important than speed."""
+    rows = [_row(131072, "f16", slots=3), _row(262144, "q8_0", slots=1)]
+    basis = mark_best_now(rows, chat_class=True, floor=32768, meta=dense_meta())
+    assert rows[0]["best_now"] is True
+    assert basis == "f16 KV, highest ctx 131072, 3 slots"
 
 
-def test_a_chat_model_with_no_concurrent_row_falls_back_to_the_biggest() -> None:
-    rows = [
-        {"ctx_per_slot": 16384, "fits": True, "max_parallel": 1, "recommended": False},
-        {"ctx_per_slot": 32768, "fits": True, "max_parallel": 1, "recommended": False},
-    ]
-    assert mark_recommended(rows, chat_class=True, floor=16384) == "highest ctx that fits >= floor"
-    assert rows[1]["recommended"] is True
+def test_the_highest_context_is_taken_at_the_chosen_quality() -> None:
+    rows = [_row(65536, "f16", slots=4), _row(131072, "f16", slots=2)]
+    mark_best_now(rows, chat_class=True, floor=32768, meta=dense_meta())
+    assert rows[1]["best_now"] is True
 
 
-# -- the context floor (D22) ------------------------------------------------
+def test_slots_are_reported_never_bought() -> None:
+    """A slot count is a latency property; the KV cache type is a correctness one."""
+    rows = [_row(131072, "f16", slots=1), _row(65536, "f16", slots=8)]
+    basis = mark_best_now(rows, chat_class=True, floor=32768, meta=dense_meta())
+    assert rows[0]["best_now"] is True
+    assert basis.endswith("1 slot")
 
 
-def test_the_floor_outranks_a_second_slot() -> None:
-    """The failure this rule exists to stop: 16k with two slots over 32k with one.
-
-    An OpenClaw agent's tool transcript stops fitting below the configured
-    default context. A queued second conversation is a latency problem; a
-    window that cannot hold the task is a failed task.
-    """
-    rows = [
-        {"ctx_per_slot": 16384, "fits": True, "max_parallel": 2, "recommended": False},
-        {"ctx_per_slot": 32768, "fits": True, "max_parallel": 1, "recommended": False},
-    ]
-    basis = mark_recommended(rows, chat_class=True, floor=32768)
-    assert basis == "highest ctx that fits >= floor"
-    assert rows[1]["recommended"] is True
-    assert rows[0]["recommended"] is False
+def test_quantizing_is_allowed_when_f16_cannot_reach_the_floor() -> None:
+    """Then the alternative is not serving the model at all."""
+    rows = [_row(16384, "f16", slots=2), _row(65536, "q8_0", slots=1)]
+    basis = mark_best_now(rows, chat_class=True, floor=32768, meta=dense_meta())
+    assert rows[1]["best_now"] is True
+    assert basis.startswith("q8_0 KV")
 
 
-def test_the_second_slot_still_wins_among_rows_above_the_floor() -> None:
-    """The floor only removes candidates; above it, concurrency is still worth a doubling."""
-    rows = [
-        {"ctx_per_slot": 32768, "fits": True, "max_parallel": 4, "recommended": False},
-        {"ctx_per_slot": 65536, "fits": True, "max_parallel": 1, "recommended": False},
-    ]
-    basis = mark_recommended(rows, chat_class=True, floor=32768)
-    assert basis == "highest ctx >= floor with max_parallel >= 2"
-    assert rows[0]["recommended"] is True
+def test_a_kv_tolerant_family_may_take_q8_0_for_a_doubling() -> None:
+    """Qwen 3.6 measures KL 0.024 at q8_0 -- inside sampler noise (D36)."""
+    tolerant = GgufMeta(architecture="qwen35", n_layer=48, n_head=32, n_head_kv=2)
+    rows = [_row(131072, "f16", slots=1), _row(262144, "q8_0", slots=1)]
+    mark_best_now(rows, chat_class=True, floor=32768, meta=tolerant)
+    assert rows[1]["best_now"] is True
 
 
-def test_nothing_reaching_the_floor_still_gets_a_recommendation() -> None:
+def test_a_kv_sensitive_family_never_does() -> None:
+    """Gemma-4 measures KL 0.108 dense / 0.377 MoE at the same q8_0 cache."""
+    sensitive = GgufMeta(architecture="gemma4", n_layer=60, n_head=32, n_head_kv=8)
+    rows = [_row(131072, "f16", slots=1), _row(262144, "q8_0", slots=1)]
+    mark_best_now(rows, chat_class=True, floor=32768, meta=sensitive)
+    assert rows[0]["best_now"] is True
+
+
+def test_an_unmeasured_family_is_treated_as_sensitive() -> None:
+    rows = [_row(131072, "f16", slots=1), _row(262144, "q8_0", slots=1)]
+    mark_best_now(rows, chat_class=True, floor=32768, meta=dense_meta())
+    assert rows[0]["best_now"] is True
+
+
+def test_a_tolerant_family_still_needs_a_full_doubling() -> None:
+    tolerant = GgufMeta(architecture="qwen35moe", n_layer=48, n_head=32, n_head_kv=2)
+    rows = [_row(131072, "f16", slots=1), _row(196608, "q8_0", slots=1)]
+    mark_best_now(rows, chat_class=True, floor=32768, meta=tolerant)
+    assert rows[0]["best_now"] is True
+
+
+def test_a_mixed_q8_k_q4_v_row_ranks_below_a_matched_q8_pair() -> None:
+    rows = [_row(131072, "q8_0", slots=1), _row(262144, "q8_0", kv_v="q4_0", slots=1)]
+    basis = mark_best_now(rows, chat_class=True, floor=32768, meta=dense_meta())
+    assert rows[0]["best_now"] is True
+    assert basis.startswith("q8_0 KV")
+
+
+def test_the_basis_names_the_asymmetric_pair_when_that_is_all_there_is() -> None:
+    rows = [_row(262144, "q8_0", kv_v="q4_0", slots=2)]
+    basis = mark_best_now(rows, chat_class=True, floor=32768, meta=dense_meta())
+    assert basis == "q8_0 K + q4_0 V KV, highest ctx 262144, 2 slots"
+
+
+def test_nothing_reaching_the_floor_still_gets_an_answer() -> None:
     """A small window beats no answer -- but the basis says so out loud."""
-    rows = [
-        {"ctx_per_slot": 16384, "fits": True, "max_parallel": 4, "recommended": False},
-        {"ctx_per_slot": 32768, "fits": True, "max_parallel": 1, "recommended": False},
-    ]
-    basis = mark_recommended(rows, chat_class=True, floor=131072)
-    assert basis == "highest ctx that fits (below floor)"
-    assert rows[1]["recommended"] is True
+    rows = [_row(16384, "f16", slots=4), _row(32768, "f16", slots=1)]
+    basis = mark_best_now(rows, chat_class=True, floor=131072, meta=dense_meta())
+    assert rows[1]["best_now"] is True
+    assert basis.endswith("(below floor)")
+
+
+# -- the throughput preference, kept and reachable ---------------------------
+
+
+def test_the_throughput_preference_still_trades_context_for_a_second_slot() -> None:
+    """D20's rule, now planner.preference "throughput" rather than the default."""
+    rows = [_row(32768, "f16", slots=4), _row(65536, "f16", slots=1)]
+    basis = mark_best_now(
+        rows, chat_class=True, floor=32768, meta=dense_meta(), preference="throughput"
+    )
+    assert basis == "highest ctx >= floor with max_parallel >= 2"
+    assert rows[0]["best_now"] is True
+
+
+def test_the_throughput_preference_still_puts_the_floor_first() -> None:
+    rows = [_row(16384, "f16", slots=2), _row(32768, "f16", slots=1)]
+    basis = mark_best_now(
+        rows, chat_class=True, floor=32768, meta=dense_meta(), preference="throughput"
+    )
+    assert basis == "highest ctx that fits >= floor"
+    assert rows[1]["best_now"] is True
+
+
+def test_a_non_chat_model_under_throughput_just_takes_the_biggest_window() -> None:
+    """Embeddings are called in bursts; a single slot is not the bottleneck."""
+    rows = [_row(16384, "f16", slots=8), _row(32768, "f16", slots=1)]
+    basis = mark_best_now(rows, chat_class=False, floor=16384, preference="throughput")
+    assert basis == "highest ctx that fits >= floor"
+    assert rows[1]["best_now"] is True
+
+
+def test_the_two_preferences_disagree_exactly_where_the_user_cares() -> None:
+    """131072 f16 against 262144 q8_0 -- the whole reason D36 has a knob."""
+    quality_rows = [_row(131072, "f16", slots=3), _row(262144, "q8_0", slots=2)]
+    throughput_rows = [_row(131072, "f16", slots=3), _row(262144, "q8_0", slots=2)]
+    mark_best_now(quality_rows, chat_class=True, floor=32768, meta=dense_meta())
+    mark_best_now(
+        throughput_rows, chat_class=True, floor=32768, meta=dense_meta(), preference="throughput"
+    )
+    assert quality_rows[0]["best_now"] is True
+    assert throughput_rows[1]["best_now"] is True
 
 
 def test_a_thinking_model_gets_the_higher_floor() -> None:
@@ -404,46 +464,40 @@ def test_the_idle_fallback_applies_the_same_preference_order() -> None:
     """ "Unload something" still deserves the best row, not merely the biggest."""
     rows = [
         {
-            "ctx_per_slot": 16384,
+            "ctx_per_slot": 131072,
             "fits": False,
-            "if_gpus_idle": {"fits": True, "max_parallel": 4},
-            "recommended": False,
+            "if_gpus_idle": {"fits": True, "kv_cache_type": "f16", "max_parallel": 2},
+            "best_now": False,
         },
         {
-            "ctx_per_slot": 32768,
+            "ctx_per_slot": 262144,
             "fits": False,
-            "if_gpus_idle": {"fits": True, "max_parallel": 4},
-            "recommended": False,
-        },
-        {
-            "ctx_per_slot": 65536,
-            "fits": False,
-            "if_gpus_idle": {"fits": True, "max_parallel": 1},
-            "recommended": False,
+            "if_gpus_idle": {"fits": True, "kv_cache_type": "q8_0", "max_parallel": 4},
+            "best_now": False,
         },
     ]
-    assert mark_recommended(rows, chat_class=True, floor=16384) == "if_gpus_idle"
-    assert rows[1]["recommended"] is True
+    assert mark_best_now(rows, chat_class=True, floor=32768, meta=dense_meta()) == "if_gpus_idle"
+    assert rows[0]["best_now"] is True
 
 
-def test_when_nothing_fits_the_recommendation_points_at_freeing_vram() -> None:
+def test_when_nothing_fits_the_answer_points_at_freeing_vram() -> None:
     """ "Unload something" is actionable; "impossible" is not."""
     rows = [
         {
             "ctx_per_slot": 16384,
             "fits": False,
-            "if_gpus_idle": {"fits": True},
-            "recommended": False,
+            "if_gpus_idle": {"fits": True, "kv_cache_type": "f16", "max_parallel": 1},
+            "best_now": False,
         },
         {
             "ctx_per_slot": 32768,
             "fits": False,
             "if_gpus_idle": {"fits": False},
-            "recommended": False,
+            "best_now": False,
         },
     ]
-    assert mark_recommended(rows, chat_class=True) == "if_gpus_idle"
-    assert rows[0]["recommended"] is True
+    assert mark_best_now(rows, chat_class=True, meta=dense_meta()) == "if_gpus_idle"
+    assert rows[0]["best_now"] is True
 
 
 def test_a_model_that_fits_nowhere_recommends_nothing() -> None:
@@ -452,10 +506,10 @@ def test_a_model_that_fits_nowhere_recommends_nothing() -> None:
             "ctx_per_slot": 16384,
             "fits": False,
             "if_gpus_idle": {"fits": False},
-            "recommended": False,
+            "best_now": False,
         }
     ]
-    assert mark_recommended(rows, chat_class=True) is None
+    assert mark_best_now(rows, chat_class=True, meta=dense_meta()) is None
 
 
 # ---------------------------------------------------------------------------
@@ -474,9 +528,12 @@ def test_load_args_keys_match_the_load_model_tool_signature() -> None:
     tool = next(t for t in server._tool_manager.list_tools() if t.name == "load_model")
     accepted = set(tool.parameters["properties"])
 
-    row = next(r for m in catalog_for()["models"] for r in m["options"] if r["recommended"])
+    row = next(r for m in catalog_for()["models"] for r in m["options"] if r["best_now"])
     assert set(row["load_args"]) <= accepted
     assert set(row["load_args"]) == {"model_id", "ctx_size", "parallel", "kv_cache_type"}
+    # The V type appears only when it differs from K: the tool defaults V to K,
+    # so an equal pair would cost every caller tokens to be told the same twice.
+    assert "kv_cache_type_v" in accepted
 
 
 def test_load_args_repeat_the_row_they_belong_to() -> None:

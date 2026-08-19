@@ -179,10 +179,10 @@ def test_catalog_endpoint_returns_models_with_options(app: Any) -> None:
     assert entry["id"] == MODEL_ID
     assert entry["downloaded_at"].endswith("Z")
     assert entry["options"]
-    assert sum(1 for r in entry["options"] if r["recommended"]) == 1
+    assert sum(1 for r in entry["options"] if r["best_now"]) == 1
 
 
-def test_catalog_compact_keeps_only_the_recommended_row(app: Any) -> None:
+def test_catalog_compact_keeps_only_the_best_now_row(app: Any) -> None:
     with TestClient(app) as http:
         full = http.get("/api/catalog").json()
         compact = http.get("/api/catalog", params={"compact": 1}).json()

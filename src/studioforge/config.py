@@ -336,6 +336,17 @@ class PlannerConfig(BaseModel):
     image_tokens_default: PositiveInt = 1024
     mmproj_compute_mb: NonNegativeInt = 512
     prefer_single_gpu: bool = True
+    #: What the catalog optimises for when it names one load per model (D36).
+    #:
+    #: ``"quality"`` (the default): the best KV cache quality that reaches the
+    #: context floor, then the largest context at that quality, then whatever
+    #: slots still fit. ``"throughput"`` is D20's original rule -- the largest
+    #: context at or above the floor, preferring one that also sustains two
+    #: slots. The two disagree exactly where the user cares: on this rig the
+    #: quality rule takes 131072 tokens with an f16 cache over 262144 with a
+    #: quantized one, and a Gemma-4 measures a KL divergence of 0.108 between
+    #: those two caches (see core/kv_sensitivity.py).
+    preference: Literal["quality", "throughput"] = "quality"
     # Quant family -> hardware affinity. Keys are matched case-insensitively
     # against the model's quant label. See default_quant_affinity().
     quant_affinity: dict[str, QuantAffinity] = Field(default_factory=default_quant_affinity)

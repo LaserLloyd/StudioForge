@@ -12,16 +12,18 @@ changing anything would fail identically, just slower.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 import pytest
 
 from studioforge.config import Config
 from studioforge.core.manager import ModelManager, classify_load_failure
-from studioforge.errors import InsufficientVramError, ModelLoadError
+from studioforge.errors import BadRequestError, InsufficientVramError, ModelLoadError
 from studioforge.types import (
     GB,
     GgufMeta,
+    GpuInfo,
     InstanceInfo,
     LoadPlan,
     LoadRejected,
@@ -74,15 +76,39 @@ class StubRegistry:
         return None
 
 
-class StubPlanner:
-    """Always plans successfully; records how often it was asked."""
+class StubProbe:
+    """Just enough of a probe to answer "which CUDA indices exist"."""
 
-    def __init__(self, result: Any = None) -> None:
+    def __init__(self, indices: Sequence[int] = (0, 1)) -> None:
+        self.indices = list(indices)
+
+    def list_gpus(self) -> list[Any]:
+        return [
+            GpuInfo(
+                index=i,
+                name=f"FakeGPU{i}",
+                total_bytes=32 * GB,
+                free_bytes=30 * GB,
+                used_bytes=2 * GB,
+            )
+            for i in self.indices
+        ]
+
+
+class StubPlanner:
+    """Always plans successfully; records how often it was asked, and with what."""
+
+    def __init__(self, result: Any = None, probe: Any = None) -> None:
         self.calls = 0
         self.result = result
+        self.seen: list[ModelRecord] = []
+        self.kwargs: list[dict[str, Any]] = []
+        self._probe = probe
 
     def plan_load(self, record: ModelRecord, **kwargs: Any) -> Any:
         self.calls += 1
+        self.seen.append(record)
+        self.kwargs.append(kwargs)
         if self.result is not None:
             return self.result
         return LoadPlan(model_id=record.id, devices=[0], ctx_size=8192)
@@ -92,8 +118,10 @@ class StubPlanner:
         return sorted(candidates, key=lambda i: i.last_activity_at or 0.0)
 
     @property
-    def probe(self) -> Any:  # pragma: no cover - only used by status()
-        raise AssertionError("not used")
+    def probe(self) -> Any:
+        if self._probe is None:  # pragma: no cover - only used by status()
+            raise AssertionError("not used")
+        return self._probe
 
 
 class StubSupervisor:
@@ -482,3 +510,68 @@ async def test_a_plain_load_never_passes_reload_of() -> None:
     await manager.load("test/model")
     assert seen.get("reload_of") is None
     assert supervisor.stopped == []
+
+
+# ---------------------------------------------------------------------------
+# One-shot placement and the asymmetric KV pair (D36)
+# ---------------------------------------------------------------------------
+
+
+async def test_devices_place_this_load_without_touching_saved_settings() -> None:
+    """A placements row's load_args carries `devices`; the record must not learn it.
+
+    The mechanism is a `device_override` on a *copy* of the record, so the next
+    load with no `devices` goes back to letting the planner choose. Writing it
+    into the stored settings would turn "run this once on the 5090s" into a
+    permanent pin nobody asked for.
+    """
+    supervisor, planner = StubSupervisor(), StubPlanner(probe=StubProbe())
+    manager = make_manager(supervisor, planner)
+    await manager.load("test/model", devices=[1, 0])
+    assert planner.seen[-1].settings.device_override == [1, 0]
+    assert manager.registry.get("test/model").settings.device_override is None
+
+
+async def test_a_load_without_devices_leaves_placement_to_the_planner() -> None:
+    supervisor, planner = StubSupervisor(), StubPlanner(probe=StubProbe())
+    manager = make_manager(supervisor, planner)
+    await manager.load("test/model")
+    assert planner.seen[-1].settings.device_override is None
+
+
+async def test_a_cuda_index_this_box_does_not_have_is_a_structured_400() -> None:
+    """Not a 500, and not a VRAM refusal several frames deeper."""
+    supervisor, planner = StubSupervisor(), StubPlanner(probe=StubProbe([0, 1]))
+    manager = make_manager(supervisor, planner)
+    with pytest.raises(BadRequestError) as excinfo:
+        await manager.load("test/model", devices=[7])
+    assert excinfo.value.param == "devices"
+    assert "7" in excinfo.value.message
+    assert planner.calls == 0
+    assert supervisor.starts == 0
+
+
+async def test_an_empty_or_repeated_device_list_is_rejected() -> None:
+    supervisor, planner = StubSupervisor(), StubPlanner(probe=StubProbe())
+    manager = make_manager(supervisor, planner)
+    for bad in ([], [0, 0]):
+        with pytest.raises(BadRequestError) as excinfo:
+            await manager.load("test/model", devices=bad)
+        assert excinfo.value.param == "devices"
+
+
+async def test_the_v_cache_type_reaches_the_planner_separately() -> None:
+    """The ladder's third rung is q8_0 K with a q4_0 V; it has to survive the trip."""
+    supervisor, planner = StubSupervisor(), StubPlanner(probe=StubProbe())
+    manager = make_manager(supervisor, planner)
+    await manager.load("test/model", kv_cache_type="q8_0", kv_cache_type_v="q4_0")
+    assert planner.kwargs[-1]["kv_cache_type"] == "q8_0"
+    assert planner.kwargs[-1]["kv_cache_type_v"] == "q4_0"
+
+
+async def test_a_bogus_v_cache_type_names_its_own_parameter() -> None:
+    supervisor, planner = StubSupervisor(), StubPlanner(probe=StubProbe())
+    manager = make_manager(supervisor, planner)
+    with pytest.raises(BadRequestError) as excinfo:
+        await manager.load("test/model", kv_cache_type_v="pwned")
+    assert excinfo.value.param == "kv_cache_type_v"
