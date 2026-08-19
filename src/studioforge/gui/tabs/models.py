@@ -521,7 +521,9 @@ async def _toggle_pin(ctx: GuiContext, record: Any, table: Any) -> None:
 
 
 async def _test(ctx: GuiContext, record: Any) -> None:
-    with busy(message=f"Testing {record.id} (loads it if needed)…"):
+    # A smoke test loads a cold model small and unloads it again (D36), so say
+    # so: a user who watched the Loaded badge flicker deserves to know why.
+    with busy(message=f"Testing {record.id} (loads and unloads it if it is cold)…"):
         try:
             result = await ctx.manager.test_model(record.id, None)
         except Exception as exc:  # noqa: BLE001
@@ -559,12 +561,15 @@ async def _draft_ab(ctx: GuiContext, record: Any) -> None:
     original = record.settings.model_copy(deep=True)
     without = original.model_copy(update={"draft_model_id": None})
     try:
+        # keep_loaded on both halves: this is explicitly a comparison of two
+        # loads of the same model, so the smoke test's "leave the rig as found"
+        # rule would only make it reload between the measurements.
         with busy(message="A/B: measuring with the draft model…"):
-            with_draft = await ctx.manager.test_model(record.id, None)
+            with_draft = await ctx.manager.test_model(record.id, None, keep_loaded=True)
         with busy(message="A/B: reloading without the draft model…"):
             await run_blocking(ctx.registry.save_settings, record.id, without)
             await ctx.manager.load(record.id, force=True, source="gui")
-            without_draft = await ctx.manager.test_model(record.id, None)
+            without_draft = await ctx.manager.test_model(record.id, None, keep_loaded=True)
     except Exception as exc:  # noqa: BLE001
         notify_error(exc, what="A/B comparison")
         return

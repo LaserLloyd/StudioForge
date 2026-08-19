@@ -384,10 +384,19 @@ async def unload_model(model_id: str, request: Request) -> dict[str, Any]:
 
 @router.post("/models/{model_id:path}/test")
 async def test_model(
-    model_id: str, request: Request, prompt: str | None = Body(None, embed=True)
+    model_id: str,
+    request: Request,
+    prompt: str | None = Body(None),
+    keep_loaded: bool = Body(False),
 ) -> dict[str, Any]:
+    """One canned request through the model, on an otherwise idle server (D36).
+
+    A cold model is loaded small (one slot, the default context) and unloaded
+    again unless ``keep_loaded``. Refused with a 503 and ``retry_after_s`` while
+    anything is serving, loading or benchmarking, and while another test runs.
+    """
     state = _state(request)
-    return await state.manager.test_model(model_id, prompt)
+    return await state.manager.test_model(model_id, prompt, keep_loaded=keep_loaded)
 
 
 @router.get("/models/{model_id:path}/settings")
