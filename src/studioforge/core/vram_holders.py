@@ -62,6 +62,16 @@ ENGINE_EXE_NAMES = frozenset({"llama-server", "llama-server.exe"})
 #: anything doing real work on a GPU.
 HOLDER_MIN_BYTES = 256 * 1024 * 1024
 
+#: The per-DEVICE floor for the placement column (D39/D40): a card holding less
+#: than this for a pid is a CUDA context, not a placement. Separate from
+#: :data:`HOLDER_MIN_BYTES` because the two questions have different scales --
+#: llama.cpp's context is ~0.22 GiB on an RTX 3090 and **~0.43 GiB on an RTX
+#: 5090** (measured on the reference rig, WP22), so a 256 MiB floor named the
+#: two idle 5090s as holding a model that lived on the 3090s. 512 MiB clears the
+#: Blackwell context and is still well under the smallest real placement seen
+#: here (a 0.5B at 4k context: 568 MiB on the lighter card of a pair).
+DEVICE_PLACEMENT_MIN_BYTES = 512 * 1024 * 1024
+
 #: Process stems that are always worth listing however little they hold: these
 #: are the things that take VRAM *from* us on this class of box.
 INTERESTING_STEMS = frozenset(
@@ -931,8 +941,9 @@ def _device_column(split: Mapping[int, int], contexts: Sequence[int]) -> tuple[l
 
     PDH wins when it can name a CUDA device for the pid, because it is a
     measurement: the devices listed are the ones holding at least
-    :data:`HOLDER_MIN_BYTES`, which drops llama.cpp's ~0.2 GiB per-device CUDA
-    context and keeps the cards the weights are actually on. An empty list with
+    :data:`DEVICE_PLACEMENT_MIN_BYTES`, which drops llama.cpp's per-device CUDA
+    context (~0.22 GiB on a 3090, ~0.43 GiB on a 5090) and keeps the cards the
+    weights are actually on. An empty list with
     source ``pdh`` is a real answer -- "measured, and nothing on any GPU crosses
     the floor".
 
@@ -944,7 +955,9 @@ def _device_column(split: Mapping[int, int], contexts: Sequence[int]) -> tuple[l
     """
     if any(index >= 0 for index in split):
         named = sorted(
-            index for index, used in split.items() if index >= 0 and used >= HOLDER_MIN_BYTES
+            index
+            for index, used in split.items()
+            if index >= 0 and used >= DEVICE_PLACEMENT_MIN_BYTES
         )
         return named, DEVICES_FROM_PDH
     return sorted({int(index) for index in contexts}), DEVICES_FROM_NVML_CONTEXT

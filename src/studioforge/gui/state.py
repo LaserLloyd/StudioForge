@@ -1108,12 +1108,12 @@ def ram_text(total_bytes: int | None, used_bytes: int | None) -> str:
 # said "llama-server.exe, 0 bytes, not ours".
 # ---------------------------------------------------------------------------
 
-#: Mirrors ``vram_holders.HOLDER_MIN_BYTES``. Repeated rather than imported:
-#: this module is pure presentation and importing ``core.vram_holders`` would
-#: drag psutil and the supervisor into it. Below this a device entry is a
-#: llama.cpp CUDA context (~0.2 GiB on every visible card), not a placement, and
-#: printing it turns a two-GPU model into a four-GPU one.
-_DEVICE_MIN_BYTES: Final = 256 * 1024 * 1024
+#: Mirrors ``vram_holders.DEVICE_PLACEMENT_MIN_BYTES``. Repeated rather than
+#: imported: this module is pure presentation and importing ``core.vram_holders``
+#: would drag psutil and the supervisor into it. Below this a device entry is a
+#: llama.cpp CUDA context (~0.22 GiB on a 3090, ~0.43 GiB on a 5090), not a
+#: placement, and printing it turns a two-GPU model into a four-GPU one.
+_DEVICE_MIN_BYTES: Final = 512 * 1024 * 1024
 
 
 def vram_holder_origin(holder: Mapping[str, Any]) -> str:

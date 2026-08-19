@@ -2605,3 +2605,10 @@ precedence), `tests/unit/test_supervisor_features.py` (`--batch-size` follows `-
   They are ignored rather than corrected.
 * `UBATCH_SCRATCH_BYTES_PER_TOKEN_PER_EMBD = 128` is two models on two cards; a 30B at `-ub 2048`
   on a 4-way split is unmeasured. The direction of error is refusal, not OOM.
+
+**Also, from the same scratch run.** D39's device column named the two idle RTX 5090s as holding
+a model that lived on the 3090s: llama.cpp's per-device CUDA context is ~0.22 GiB on a 3090 but
+**~0.43 GiB on a 5090**, above the 256 MiB floor. The placement column now has its own floor,
+`DEVICE_PLACEMENT_MIN_BYTES = 512 MiB` (the listing floor `HOLDER_MIN_BYTES` stays 256 MiB, a
+different question), which clears the Blackwell context and is still under the smallest real
+placement seen here (568 MiB, the lighter card of a 0.5B pair at 4k).

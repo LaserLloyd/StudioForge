@@ -696,6 +696,8 @@ def test_unmappable_adapters_land_under_minus_one(monkeypatch: pytest.MonkeyPatc
     [
         # The measurement wins, and the sub-threshold CUDA contexts go.
         ({0: 16 * GIB, 1: 15 * GIB, 2: 236 * MIB}, [0, 1, 2, 3], [0, 1], "pdh"),
+        # The RTX 5090's CUDA context is ~432 MiB (WP22): still a context.
+        ({0: 432 * MIB, 1: 432 * MIB, 2: 568 * MIB, 3: 668 * MIB}, [0, 1, 2, 3], [2, 3], "pdh"),
         # Measured, and nothing crosses the floor: an empty list is an answer.
         ({0: 100 * MIB}, [0, 1], [], "pdh"),
         # No measurement at all -- fall back, and say that is what happened.

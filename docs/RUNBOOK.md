@@ -88,7 +88,7 @@ GPU. Ours are marked; an `orphan` is a `llama-server` from a dead StudioForge �
 it.
 
 **Which GPU is it actually on.** Each holder carries `per_gpu_bytes` (`{"0": 16663000000, "1":
-15547000000}`) and a `gpu_indices` list of the devices holding at least 256 MiB, so a row reads
+15547000000}`) and a `gpu_indices` list of the devices holding at least 512 MiB, so a row reads
 `llama-server.exe (pid 32188) · 30.44 GiB · CUDA0 15.5 GiB, CUDA1 14.5 GiB`. Check
 `gpu_indices_source` before trusting it: `pdh` is a measurement, `nvml-context` means only NVML
 could answer and the devices listed are the ones the process has a CUDA *context* on — llama.cpp
