@@ -1807,3 +1807,188 @@ which is exactly what D28/D34 made happen for the first time on the rig itself.
 
 Tests: `tests/unit/test_ports_preflight.py` (wildcard listener), `tests/unit/test_tray.py`
 (retry, bound, report names the real port).
+
+---
+
+## D36 -- The catalog answers "which GPUs, at what quality", and a load never interrupts a stream
+
+**Problem.** Four faults, all visible on the live rig on 2026-08-19, and each of them made the
+others harder to see. What the user wanted instead was one sentence: *"these should be the optimal
+settings to run on either the 5090s, the 3090s, a single 5090, or all"* -- and, on what to assume
+about the machine, *"quality is more important than speed; when possible get max quality on dual
+5090s (assume you can fill them both) and dual 3090s (assume both free)"*.
+
+*A loaded model's own VRAM was counted against it.* `HauhauCS/Gemma4-31B-QAT-...-Q4_K_M` (17.4 GB,
+`gemma4` iSWA) was resident at ctx 262144 f16 on `[1, 0, 2]`, with the four GPUs at 5.6 / 7.4 / 6.5
+/ 22.9 GiB free. Its own catalog rows were computed with `loaded=<everything including itself>`, so
+the model that *was* loaded was told it fitted only at 262144 with a **q4_0** cache spread over
+three cards:
+
+```
+16384  dev=[1,3]   f16  np=1  gen 34.3        131072 dev=[1,3,2] q8_0 np=1
+262144 dev=[1,3,2] q4_0 np=1  gen 32.8  <- RECOMMENDED
+```
+
+A reload frees its allocation before the replacement takes any, so those rows were judged against
+37 GB the row itself would release.
+
+*The per-hardware view was hard-coded, live, and used a second rule.*
+`ModelManager.PLACEMENT_MODES` listed `(0, 1)`, `(2, 3)` and "all" as literals -- no single-GPU
+mode, and false labels on any other box. Each was planned against **live** free VRAM, so "what can
+this model do on the two 5090s" was answered as "...given whatever is on them this second". And it
+asked the planner for the largest context that fits, which is not the rule `/api/catalog` used --
+so the two surfaces could recommend different loads for the same model on the same hardware.
+
+*No surface looked at KV cache quality.* The auto ladder walked `f16 -> q8_0 -> q4_0` over matched
+K/V pairs and the recommendation took the largest window, so **262144 on a q4_0 cache outranked
+131072 on f16**. That is backwards for this box.
+
+*And nothing said who was doing what.* Between 21:11 and 21:14 an external client loaded a 27B at
+32768 on `[1, 0]`, then the 31B at 262144 on `[1, 0, 2]`, then fetched `/profiles` for every model
+in the library (three planner walks each, at INFO). Not one log line named a requester, and nothing
+stopped a `test_model` call from doing a full planner-sized load, on whatever cards were free,
+while other agents were mid-conversation.
+
+**Decision.**
+
+**1. A resident model's rows are credited with its own footprint.** `catalog.CreditedProbe` adds
+`Planner.instance_footprint(instance)` back to each GPU's free bytes and the entry is planned with
+itself removed from `loaded` -- exactly the view D30's `reload_of` takes when the same reload is
+really performed, so the table and the load cannot drift apart. The credit reaches
+`slots_for_plan` too, which measures capacity off the planner's own probe: a credited fit with an
+uncredited capacity would have advertised one slot. `_instance_footprint` became public
+`instance_footprint` because three surfaces now credit the same figure.
+
+**2. Hardware modes are derived, idle, and ordered by what is asked for first.** New
+`core/placements.py`. `hardware_modes(gpus)` reads the inventory: `dual_<best class>`,
+`dual_<second class>`, `all_gpus`, `single_<best class>` -- on this rig `dual_5090` `[0,1]`,
+`dual_3090` `[2,3]`, `all_gpus` `[0,1,2,3]`, `single_5090` `[0]`, deduplicated on the device set so
+a two-card box gets one dual mode rather than two names for it. Each mode is planned against **its
+own cards, idle** ("assume you can fill them both"); `headroom_fraction`, `reserved_mb` and
+`excluded_devices` still apply, because those describe memory that is never ours. What stands in
+the way *right now* is reported separately -- `fits_now` (planned at exactly the slots `load_args`
+asks for), `would_evict`, `fits_now_ctx` -- plus a `ranking` of `fastest` / `largest_context` /
+`cheapest`.
+
+`placements[0]` becomes the entry's `recommended`: a complete load recipe naming the GPUs, with
+`recommended_basis` reading `2x RTX 5090: f16 KV, highest ctx 131072, 1 slot`. The per-context
+table stays as the drill-down and its flag is renamed `recommended` -> `best_now`, which is the
+narrower claim it was always making: "this row loads on the machine exactly as it stands".
+
+Measured, reference rig, 17.4 GB Gemma-4 31B: `dual_5090` 131072/f16, `dual_3090` 65536/f16,
+`all_gpus` 262144/f16, `single_5090` 32768/f16 -- no quantized cache anywhere, where the live
+catalog had recommended 262144/q4_0.
+
+**3. Quality first, and the KV ladder stops at a cache that works.** One function,
+`catalog.choose_row`, serves the per-context table and every placement. Order: **the best KV cache
+quality that reaches the context floor** at one slot or more, then the highest context at that
+quality, then whatever slots that placement sustains -- reported, never bought.
+
+The auto ladder is now `f16/f16 -> q8_0/q8_0 -> q8_0 K + q4_0 V`. **Symmetric `q4_0` is gone from
+every automatic path.** K and V are not equally sensitive: llama.cpp discussion #23470 measures a
+q4_0 **K** cache alone dropping Qwen2.5-7B to **11.7%** token agreement with its f16 self, a q4_0
+**V** cache alone as nearly free, and the matched `q8_0/q8_0` pair at KL 0.0018. So fanning out
+over matched pairs skipped the one useful cheap rung and offered the one that ruins the model --
+and because a q4_0 cache reaches the biggest window, that was the rung the catalog recommended. A
+q4_0 K cache remains reachable by asking for it explicitly, like every other explicit value.
+
+Families differ by a factor of ten, and `core/kv_sensitivity.py` carries the measurements (KL over
+top-40 logprobs, ~250k tokens, against a BF16 GGUF with an f16 KV cache;
+`localbench.substack.com/p/kv-cache-quantization-benchmark`):
+
+| Family | q8_0 KV | q4_0 KV | Verdict |
+| --- | --- | --- | --- |
+| Gemma-4 31B dense (`gemma4`) | 0.108 | 0.524 | sensitive |
+| Gemma-4 26B-A4B MoE (`gemma4`) | 0.377 | 1.088 | sensitive |
+| Qwen 3.6 (`qwen35` / `qwen35moe`) | 0.024 | 0.039 | tolerant |
+
+A tolerant family may take `q8_0` when it buys a **full doubling** of the window; a sensitive one
+never does, and **every unmeasured architecture is treated as sensitive**. Three measurements on
+two families do not describe a library of forty models, and guessing "tolerant" is the guess whose
+failure mode is a server that quietly answers worse. Gemma's iSWA layout is the plausible reason it
+minds: only every sixth layer holds the full window, so each retained KV element carries more of
+the model's memory of the conversation.
+
+D20's rule survives as `planner.preference: "throughput"` -- the largest window at or above the
+floor, preferring one that also sustains two slots. It is right for a host serving many short
+conversations. The default is `"quality"`, and the Setup tab exposes the switch.
+
+A record that *pins* `kv_cache_type` (the two Gemma-4 QAT records on this rig pin `q8_0`) gets a
+`quality_notes` entry naming what the pin costs, and every placement carries an `if_unpinned` block
+showing what the same cards reach at f16. Nothing here rewrites a saved setting: an explicit value
+is honoured verbatim, and the only correct action is to show the size of the choice.
+
+**4. `devices` is a load argument.** `load_model(..., devices=[0, 1])`, `POST
+/api/models/{id}/load` and `ModelManager.load` accept a one-shot placement, applied as a
+`device_override` on a *copy* of the record so the persisted settings are never touched. A CUDA
+index this box does not have is a `400` naming the parameter, validated before the planner or the
+supervisor is reached. `kv_cache_type_v` rides the same path, for the ladder's asymmetric rung; it
+appears in `load_args` only when it differs from K, because the tool defaults V to K.
+
+**5. Busy-aware loading and testing.** Three parts:
+
+* **Every load carries a `source`** -- `"mcp:load_model"`, `"jit:/v1/chat/completions"`, `"gui"`,
+  `"autoload"`, `"benchmark"`, `"restart-resume"`... It is stamped on `InstanceInfo.loaded_by` (so
+  `/api/status`, `server_status` and the dashboard show it) and carried into the `load planned`,
+  `model_spawn` and `model_ready` log lines. "A 262144-token model appeared on three GPUs" is not a
+  diagnosable event without a requester.
+* **The eviction ladder never kills a busy model.** It already skipped `active_requests > 0`; what
+  was missing is that the *refusal* now says so. A rejection blocked by a serving model carries
+  `busy_models` (id and in-flight count), `retry_after_s = 15`, and a suggestion naming it with
+  "pass force=true to evict it anyway". `force=true` is the only override and a JIT load can never
+  set it: an inference request arriving mid-stream for somebody else must queue or be refused,
+  never win by killing the stream. A refusal that is *not* about a busy model carries no
+  `retry_after_s`, because "try again later" is bad advice when nothing is going to change. An
+  instance that is still `loading` is not an eviction candidate either -- it has not taken the VRAM
+  its plan promises, so evicting it frees a figure that does not exist yet.
+* **`test_model` is one-at-a-time, idle-only, small, and leaves the rig as found.** A second
+  concurrent call is refused rather than queued (a queued smoke test answers about a server that
+  has since moved). Any instance serving a request, any load in flight, or a running benchmark
+  refuses the call with `retry_after_s`. A cold model is loaded at
+  `min(models.default_ctx, n_ctx_train)` with **one** slot -- a canned one-sentence prompt proves
+  nothing extra at 262144 -- and unloaded again unless `keep_loaded=True` or it was already
+  resident. The result says what it did: `loaded_for_test`, `unloaded_after`, `ctx_size_used`. The
+  docstring says out loud that this is a smoke test and `load_model` is how you pre-warm.
+
+`/health` and `server_status` gain `busy: {active_requests, busy_models, loading, testing}`, built
+from in-memory state only -- the watchdog polls `/health` constantly, so it must not touch NVML or
+a child. The MCP instructions tell an agent to read it before loading or testing on a shared box.
+
+**Also.** `placement_profiles` and the placement report run a `Planner(log_plans=False)`. Planning
+is not loading (D16/D20 made that rule for the catalog); one `/profiles` sweep of the library was
+several hundred INFO lines describing loads nobody requested.
+
+**Cost, measured.** A 33-model catalog against four hardware modes builds in **806 ms** (was ~150
+ms), behind the existing 20-second cache and off the event loop, with a new INFO line above
+`SLOW_BUILD_MS = 1000`. The compact `list_models` payload roughly doubles per model. It is held
+down deliberately: the non-recommended modes carry settings and devices but **no `load_args`**
+(repeating one recipe per mode costs ~40% of a compact entry to describe four loads of which at
+most one happens), `would_evict` collapses to a count, and the default `limit=25` stands. The
+budget test is re-anchored with that reasoning written into it.
+
+**What pins it.** `tests/unit/test_placements.py` (the four modes and their dedupe on other
+inventories, each mode against its own idle cards, `fits_now` / `would_evict`, the rankings, the
+pinned-KV pair, and that no placement ever writes back to a record),
+`tests/unit/test_catalog.py` (the credit and that another model does not get it, the quality rule's
+branches, both KV-sensitivity verdicts, the throughput preference, `best_now`),
+`tests/unit/test_busy_loads.py` (the requester on every load, a busy model is never evicted, the
+refusal names it, `force` is the one override, `busy_snapshot`, and every `test_model` rule),
+`tests/unit/test_load_retry.py` (`devices` is one-shot and never persisted; a bogus index is a
+structured 400), `tests/unit/test_gui_models_tab.py` (the "Optimal settings" lines).
+
+**What remains.**
+
+* **The KV numbers are three measurements on two families**, from one published benchmark, and this
+  rig has reproduced none of them itself. The conservative default (unmeasured = sensitive) is what
+  makes that acceptable; measuring a third family is the next thing that would improve it.
+* **`fits_now` is an estimate of an estimate.** It plans against live free VRAM at build time and
+  the catalog is cached for twenty seconds, so a `true` can go stale exactly as `fits` always
+  could. The refusal path is what makes that safe, and it now carries `retry_after_s` when the
+  cause is transient.
+* **The per-context table still shows the planner's own minimal placement**, so "8 slots at 16384
+  on two 5090s" is visible through `placements` but not in `options`. Giving every context tier a
+  per-mode row would multiply the payload by four to answer a question `placements` already
+  answers.
+* **`busy` cannot see a request that has not reached the supervisor yet.** A load and a request
+  racing inside the same millisecond can still interleave; D29's gate bounds the damage, and
+  nothing here promises more than "the box was idle when we looked".

@@ -12,18 +12,20 @@ table of rows the agent hands straight back.
 ## For an LLM: the whole workflow
 
 ```
-list_models()                      -> catalog, newest download first
-   pick the row with recommended: true
-load_model(**row["load_args"])     -> loaded, serving
-server_status()                    -> confirm, see VRAM and queue depth
+list_models()                                 -> catalog, newest download first
+load_model(**model["recommended"]["load_args"])  -> loaded, serving
+server_status()                               -> confirm; read busy before you load again
 ```
 
-Only reach for `model_options(model_id)` when the recommended row is not what you need — a bigger
-context window, or more concurrent conversations than its `max_parallel`.
+`recommended` is the **default load**: this model's optimal settings on the rig's best pair of
+GPUs, computed as if those cards were free, with `load_args` that already name the `devices`.
+`placements` is the same answer for every other set of cards on the box, and `options` is the
+per-context drill-down. Reach for `model_options(model_id)` when you need a different context
+window, more concurrency, or the `load_args` of a `placements` mode other than the recommended one.
 
 **Rules that make this reliable:**
 
-- Take the `recommended` row unless your task needs more context than it offers.
+- Take `recommended` unless your task needs a different window or a different set of cards.
 - Pass `load_args` **verbatim**. Do not add fields, convert units or recompute anything.
 - `fits: false` means it will not load *right now*. Check that row's `if_gpus_idle`: if that says
   `fits: true`, the VRAM exists and something else is holding it — `unload_model` on another model
@@ -45,7 +47,7 @@ context window, or more concurrent conversations than its `max_parallel`.
 | `list_models` (MCP) | The catalog. Compact by default — one row per model. `full=true` for every context tier. |
 | `model_options(model_id)` (MCP) | Every context tier for one model. |
 | `GET /api/catalog` | The same data over HTTP. `?compact=1`, `?model=<id>`, `?refresh=1`. |
-| `GET /api/models/{id}/profiles` | The *hardware-mode* cut instead of the context cut: best achievable on the 5090 pair, the 3090 pair, and the whole rig. Same columns. |
+| `GET /api/models/{id}/profiles` | The *hardware-mode* cut instead of the context cut: the same `placements` list, in full, with every mode's `load_args`. |
 
 Both catalog surfaces are built by `core/catalog.py:build_catalog` and cached for 20 seconds:
 `fits` is a claim about free VRAM at an instant, and a stale yes sends an agent into a load that
@@ -78,9 +80,17 @@ gets refused. `refresh` bypasses it — worth doing right after loading or unloa
     "parallel": 2,
     "kv_cache_type": "f16"
   },
-  "recommended": true
+  "best_now": true
 }
 ```
+
+`best_now` marks the one row of this table that would load on the machine exactly as it stands.
+It is not the same claim as the entry's `recommended`, which is a **placement** computed with its
+cards idle — when you get to choose the hardware, `recommended` is the better answer.
+
+`kv_cache_type_v` appears only when it differs from `kv_cache_type` (and likewise inside
+`load_args`): the tool defaults V to K, so an equal pair would cost every caller tokens to be told
+the same thing twice.
 
 `ctx_per_slot` is the context **each conversation** gets. `--ctx-size` is the *total* across slots
 (DECISIONS.md D4), so the engine is launched with `ctx_per_slot * parallel` and every slot really
@@ -342,38 +352,134 @@ quoted with, so it always names a number some row in the table actually used.
 
 ---
 
-## The recommendation rule
+## Quality first: how one load is chosen (D36)
 
-Exactly one row per model is marked `recommended`, so "pick the recommended one" always has an
-answer.
+Every surface that names *one* load — the entry's `recommended`, each `placements[].optimal`, the
+`best_now` flag on the per-context table — goes through one function,
+`catalog.choose_row`. Two implementations is how `/profiles` came to recommend 262144 tokens on a
+q4_0 cache while `/api/catalog` recommended something else for the same model on the same hardware.
+
+**The order is quality, then context, then slots.**
+
+1. **The best KV cache quality that reaches the floor**, at one slot or more. Quantizing to reach a
+   *bigger* window is not a trade this rule makes; quantizing to reach the floor at all is, because
+   the alternative is not serving the model.
+2. **The highest context at that quality** (already capped at `n_ctx_train`).
+3. **Whatever slots that placement sustains** — reported, never bought. A slot count is a latency
+   property; a KV cache type is a correctness one.
+
+`recommended_basis` reads like `2x RTX 5090: f16 KV, highest ctx 131072, 1 slot`.
 
 **There is a floor.** `models.default_ctx`, raised to `models.thinking_default_ctx` for a
-thinking-capable model. It is the same floor the planner's context ladder never walks below (D14),
-and the catalog must agree with it: the two surfaces disagreeing about what "enough context" means is
-how an agent ends up loading a window the server itself would have refused to settle for.
+thinking-capable model — the same floor the planner's context ladder never walks below (D14). Below
+it the same order applies to whatever does fit, with `(below floor)` said out loud in the basis. If
+nothing fits right now, `best_now` falls back to the `if_gpus_idle` column and the basis says
+`if_gpus_idle`: "unload something" is actionable, "impossible" is not.
 
-**The floor outranks the second slot.** This is the one thing the rule got wrong before: it would
-take 16384 tokens with two slots over 32768 with one, and 16k is where an OpenClaw agent's tool
-transcript stops fitting. A queued second conversation is a latency problem; a window that cannot
-hold the task is a failed task. (It picked exactly that for the resident 122B, off a knee that was
-itself wrong — D22.)
+### Why quality outranks a doubled window
 
-In order:
+The KV cache ladder is `f16/f16 -> q8_0/q8_0 -> q8_0 K + q4_0 V`. **Symmetric `q4_0` is gone from
+every automatic path.** K and V are not equally sensitive: with a q4_0 **K** cache and an f16 V
+cache, Qwen2.5-7B reproduces only **11.7%** of its f16 tokens, while a q4_0 **V** cache alone is
+nearly free, and the matched `q8_0/q8_0` pair sits at a KL divergence of 0.0018 (llama.cpp
+discussion #23470). A q4_0 K cache is still reachable by asking for it explicitly.
 
-1. **Chat-class models** — the highest context **at or above the floor** that also sustains at least
-   two slots. One slot means every concurrent request queues behind the one before it, so *above the
-   floor* the second conversation is worth a context doubling.
-   `recommended_basis: "highest ctx >= floor with max_parallel >= 2"`.
-2. Otherwise (embeddings, rerankers, or when no row above the floor reaches two slots) — the highest
-   context at or above the floor. `"highest ctx that fits >= floor"`.
-3. If nothing reaches the floor — the highest context that fits, said out loud:
-   `"highest ctx that fits (below floor)"`. A small window beats no recommendation, but the basis
-   admits what happened.
-4. If nothing fits right now — the same three-way preference applied to the `if_gpus_idle` column,
-   and `recommended_basis` says `if_gpus_idle`. "Unload something" is actionable; "impossible" is
-   not.
+Families differ by a factor of ten, measured as KL divergence over top-40 logprobs across ~250k
+tokens against a BF16 GGUF with an f16 KV cache
+(`localbench.substack.com/p/kv-cache-quantization-benchmark`):
 
-`recommended_basis` on each model names which rule fired.
+| Family | q8_0 KV | q4_0 KV | Verdict |
+| --- | --- | --- | --- |
+| Gemma-4 31B dense (`gemma4`) | 0.108 | 0.524 | sensitive |
+| Gemma-4 26B-A4B MoE (`gemma4`) | 0.377 | 1.088 | sensitive |
+| Qwen 3.6 (`qwen35` / `qwen35moe`) | 0.024 | 0.039 | tolerant |
+
+A **tolerant** family may take `q8_0` when it buys at least a full doubling of the window — 0.024 is
+inside sampler noise, and 2x the context is a real capability. A **sensitive** family never does,
+and **every unmeasured architecture is treated as sensitive**: three measurements on two families do
+not describe a library of forty models, and guessing "tolerant" is the guess whose failure mode is a
+server that quietly answers worse. The table lives in `core/kv_sensitivity.py`.
+
+### The other rule, if you want it
+
+`planner.preference: "throughput"` restores D20's original rule — the largest window at or above the
+floor, preferring one that also sustains two slots. It is the right answer for a host serving many
+short conversations, where a window nobody fills is worth less than a second slot. The default is
+`"quality"`.
+
+### A pinned KV type
+
+A model whose saved settings pin `kv_cache_type` gets a `quality_notes` entry naming what the pin
+costs on a KV-sensitive family, and every placement carries an `if_unpinned` block showing what the
+same cards would reach at f16. Nothing here ever rewrites a saved setting: an explicit value is
+honoured verbatim, and the only correct action is to show the size of the choice.
+
+---
+
+## Placements: which GPUs should this model use
+
+`hardware_modes()` derives the modes from the inventory rather than hard-coding CUDA indices, so a
+different box gets honest labels. On the reference rig, in this order:
+
+| Mode | Devices | Label |
+| --- | --- | --- |
+| `dual_5090` | `[0, 1]` | 2x RTX 5090 |
+| `dual_3090` | `[2, 3]` | 2x RTX 3090 |
+| `all_gpus` | `[0, 1, 2, 3]` | all 4 GPUs (2x RTX 5090 + 2x RTX 3090) |
+| `single_5090` | `[0]` | 1x RTX 5090 |
+
+The best pair leads because it is the fastest placement that still leaves the rest of the box free,
+and `placements[0]` is what the entry promotes to `recommended`.
+
+**Each mode is computed against its own cards, idle.** "What can this model do on the two 5090s" is
+a question about the hardware, not about the last ten seconds, so `headroom_fraction`,
+`reserved_mb` and `excluded_devices` still apply but whatever is loaded does not. What stands in
+the way *right now* travels beside it:
+
+| Field | Meaning |
+| --- | --- |
+| `fits_now` | Would `optimal.load_args` load this second, without disturbing anything? Planned at exactly the slot count `load_args` asks for. |
+| `would_evict` | The model ids this placement would have to stop if it were allowed to. May be empty beside `fits_now: false` — something the planner may not touch (a pinned model, a busy one) can be what is in the way. |
+| `fits_now_ctx` | The largest context tier that does fit on that mode as things stand, or `null`. |
+| `ranking` | Any of `fastest`, `largest_context`, `cheapest` (fewest cards reaching the largest context). |
+| `if_unpinned` | Present only when saved settings pin a KV type: what the same cards reach without the pin. |
+
+Worked, on the reference rig, for a 17.4 GB Gemma-4 31B (iSWA, 60 layers):
+
+| Mode | Optimal |
+| --- | --- |
+| `dual_5090` | 131072 ctx, f16 — 262144 needs 80 GB of f16 KV against 58 GB usable |
+| `dual_3090` | 65536 ctx, f16 |
+| `all_gpus` | 262144 ctx, f16 |
+| `single_5090` | 32768 ctx, f16 |
+
+In the **compact** list (`list_models` default) each mode gives its settings and `devices` but only
+`recommended` carries a `load_args` object; call `model_options` for the mode you settle on. That
+is a deliberate token trade — repeating one recipe per mode costs about 40% of a compact entry to
+describe four loads of which at most one happens, on a payload asked for twenty-five models at a
+time.
+
+**`devices` is a load argument.** `load_model(..., devices=[0, 1])` and
+`POST /api/models/{id}/load` with `"devices": [0, 1]` place one load on named cards without
+touching the model's saved settings, so the next load without it goes back to the planner's choice.
+A CUDA index this box does not have is a `400` naming the parameter. `kv_cache_type_v` is accepted
+the same way, for the ladder's asymmetric rung; omit it and V follows K.
+
+---
+
+## A loaded model is credited with its own VRAM
+
+A resident model's rows describe **reloading** it, and a reload frees the allocation it currently
+holds before the replacement takes any. Judged against a machine that still contained the model,
+the live 17.4 GB Gemma-4 31B — running at 262144 on `[1, 0, 2]` with the GPUs at 5.6/7.4/6.5/22.9
+GiB free — was told by its own catalog that it fitted only at 262144 with a q4_0 cache spread over
+three cards, against 37 GB the row itself would release.
+
+`catalog.CreditedProbe` hands that footprint back as free VRAM, using
+`Planner.instance_footprint` — exactly the figure D30's `reload_of` credits when the same reload is
+really performed, and the same one the eviction ladder credits for a victim. The credit reaches
+`slots_for_plan` too: it measures capacity off the planner's own probe, so a credited fit with an
+uncredited capacity would have advertised one slot.
 
 ---
 
@@ -392,13 +498,29 @@ list_models()
       "downloaded_at": "2026-08-16T09:14:02Z",
       "state": "loaded",
       "loaded_plan": { "ctx_per_slot": 8192, "parallel": 1, "devices": [0, 1, 2, 3] },
-      "recommended_basis": "highest ctx >= floor with max_parallel >= 2",
+      "recommended": {
+        "mode": "dual_5090", "label": "2x RTX 5090", "devices": [0, 1],
+        "ctx_per_slot": 65536, "kv_cache_type": "f16", "max_parallel": 4,
+        "est_gen_tps": 37.0, "est_gen_tps_full_ctx": 31.2,
+        "fits_now": true, "would_evict": [],
+        "load_args": { "model_id": "trohrbaugh/...-Q5_K_M", "ctx_size": 65536,
+                       "parallel": 4, "kv_cache_type": "f16", "devices": [0, 1] }
+      },
+      "recommended_basis": "2x RTX 5090: f16 KV, highest ctx 65536, 4 slots",
+      "placements": [
+        { "mode": "dual_5090", "label": "2x RTX 5090", "devices": [0, 1],
+          "fits_now": true, "would_evict": 0,
+          "ranking": ["fastest", "cheapest"],
+          "optimal": { "ctx_per_slot": 65536, "kv_cache_type": "f16",
+                       "max_parallel": 4, "est_gen_tps": 37.0,
+                       "est_gen_tps_full_ctx": 31.2, "vram_mb": 58112 } }
+      ],
       "options": [
         {
           "ctx_per_slot": 65536, "fits": true, "devices": [0, 1, 2, 3],
           "max_parallel": 4, "parallel_limited_by": "knee",
           "est_gen_tps": 37.0, "est_gen_tps_full_ctx": 31.2,
-          "confidence": "calibrated", "recommended": true,
+          "confidence": "calibrated", "best_now": true,
           "load_args": { "model_id": "trohrbaugh/...-Q5_K_M", "ctx_size": 65536,
                          "parallel": 4, "kv_cache_type": "f16" }
         }
@@ -407,14 +529,14 @@ list_models()
   ]
 }
 
-// 2. Need more room than the recommended row? Get the whole table.
+// 2. Need a different window, or another mode's load_args? Get the whole thing.
 model_options(model_id="trohrbaugh/...-Q5_K_M")
 
-// 3. Load the row you chose, verbatim.
+// 3. Load what you chose, verbatim -- devices included.
 load_model(model_id="trohrbaugh/...-Q5_K_M", ctx_size=65536,
-           parallel=4, kv_cache_type="f16")
+           parallel=4, kv_cache_type="f16", devices=[0, 1])
 
-// 4. Confirm.
+// 4. Confirm -- and read `busy` before the next load.
 server_status()
 ```
 

@@ -202,6 +202,37 @@ answers on, tailnet first (those survive network changes), with the OpenAI base 
 
 ---
 
+## "Which hardware should I use for this model?"
+
+Every catalog entry answers that before you ask. `recommended` is the default load — the model's
+optimal settings on this rig's best pair of GPUs, computed **as if those cards were free** — and
+its `load_args` name the `devices`, so passing it to `load_model` places the model as well as
+sizing it. `placements` repeats the answer for every other set of cards the box has (here
+`dual_5090`, `dual_3090`, `all_gpus`, `single_5090`), each with a `ranking` of `fastest`,
+`largest_context` and `cheapest`, so "run it on the 3090s and leave the 5090s free for something
+else" is a row you pick rather than arithmetic you do. Because an optimal is computed on idle
+cards, `fits_now` tells you whether it would load right now and `would_evict` says what is in the
+way; in the compact `list_models` view the non-recommended modes carry settings and devices but no
+`load_args`, so call `model_options` for the one you choose. The settings are chosen quality first:
+the best KV cache that reaches the server's context floor, then the largest context at that
+quality. A 4-bit K cache is never chosen for you.
+
+## Loading on a server other agents are using
+
+Two rules, both aimed at the same failure: an agent rearranging a box mid-conversation.
+
+**A load never evicts a model that is serving a request.** If the only way to make room is to stop
+somebody's stream, the load is refused with the busy model named, its in-flight request count, and
+a `retry_after_s` — waiting is usually cheaper than retrying. `force=true` overrides it, and is the
+only thing that does; a just-in-time load from an inference request can never set it.
+
+**`test_model` is a smoke test, not a way to pre-warm a model** — use `load_model` for that. It is
+one-at-a-time, refuses outright while anything is serving, loading or benchmarking, loads at the
+server's default context with one slot when the model is cold, and unloads it again afterwards.
+Read `server_status.busy` (`active_requests`, `loading`, `testing`) before either call and you will
+not meet these refusals. Every loaded model also reports `loaded_by`, so on a shared box you can
+see which client asked for what.
+
 ## When the VRAM is gone
 
 A row that says `fits: false` but whose `if_gpus_idle.fits` is true is not a hardware limit — the

@@ -54,6 +54,21 @@ The watchdog has its own open `/health` on `:1235` that keeps answering when the
 * **`no llama-server engine is installed`** — Setup tab → Install, or `studioforge engine
   --update`. A model pinning `engine_tag` that is not installed says which model pins it.
 
+## A load was refused and the box looks half empty
+
+Read the refusal's `busy_models` and `retry_after_s`. A model serving a request is never evicted to
+make room for another one (D36), so a box that is *busy* rather than *full* refuses a load that
+would have succeeded ten seconds earlier — and says which model and how many requests it has in
+flight. `GET /health` carries the same picture cheaply as
+`busy: {active_requests, busy_models, loading, testing}`. Wait, or re-issue the load with
+`force=true` if you know what you are interrupting. `loaded_by` on each loaded model
+(`/api/status`, `server_status`) names whoever asked for it — MCP, a JIT inference request, the
+GUI, the autoloader.
+
+`test_model` refuses on the same grounds and additionally refuses a second concurrent test; it
+loads cold models small (one slot, the default context) and unloads them again, so it never leaves
+the rig rearranged.
+
 ## VRAM is held and nothing is loaded
 
 `GET /api/vram/holders` (or the Dashboard's VRAM holders panel) names every process on every
@@ -62,6 +77,15 @@ GPU. Ours are marked; an `orphan` is a `llama-server` from a dead StudioForge �
 `child-of-live-process` belongs to something running (another instance, a test) and is left alone
 (D23). On Linux, children die with a killed server (PDEATHSIG shim); on Windows the job object does
 it.
+
+**Which GPU is it actually on.** Each holder carries `per_gpu_bytes` (`{"0": 16663000000, "1":
+15547000000}`) and a `gpu_indices` list of the devices holding at least 256 MiB, so a row reads
+`llama-server.exe (pid 32188) · 30.44 GiB · CUDA0 15.5 GiB, CUDA1 14.5 GiB`. Check
+`gpu_indices_source` before trusting it: `pdh` is a measurement, `nvml-context` means only NVML
+could answer and the devices listed are the ones the process has a CUDA *context* on — llama.cpp
+opens one on every visible card, so a two-GPU model looks like a four-GPU one (D39). A holder
+classified `other-instance` is a `llama-server` from a different install; its `detail` gives the
+`--alias`, `--port` and directory to go and stop it, and nothing here will ever kill it for you.
 
 ## The server is up but wedged
 
