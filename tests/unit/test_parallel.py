@@ -37,6 +37,8 @@ def level(
     run_id: str = "run-a",
     devices: str = "0,1",
     ctx: int = 8192,
+    kv: str = "f16",
+    kv_v: str | None = None,
 ) -> dict[str, object]:
     return {
         "n_streams": n,
@@ -46,6 +48,8 @@ def level(
         "run_id": run_id,
         "devices": devices,
         "ctx_per_slot": ctx,
+        "kv_cache_type": kv,
+        "kv_cache_type_v": kv_v or kv,
     }
 
 
@@ -257,6 +261,24 @@ def test_a_sweep_at_another_context_does_not_describe_this_row() -> None:
 def test_a_sweep_on_other_cards_does_not_describe_this_row() -> None:
     rows = sweep((1, 100.0, 100.0), (2, 98.0, 196.0), devices="2,3")
     assert observations_for(rows, devices=[0, 1], ctx_per_slot=8192) == []
+
+
+def test_a_sweep_on_another_kv_cache_type_does_not_describe_this_row() -> None:
+    """Half the KV bytes per token moves the knee, so f16 says nothing about q8_0."""
+    rows = sweep((1, 100.0, 100.0), (2, 98.0, 196.0), kv="f16")
+    assert observations_for(rows, devices=[0, 1], ctx_per_slot=8192, kv_cache_type="q8_0") == []
+    assert len(observations_for(rows, devices=[0, 1], ctx_per_slot=8192, kv_cache_type="f16")) == 2
+    # The asymmetric rung is its own placement too.
+    mixed = sweep((1, 100.0, 100.0), kv="q8_0", kv_v="q4_0")
+    assert observations_for(mixed, devices=[0, 1], ctx_per_slot=8192, kv_cache_type="q8_0") == []
+    assert observations_for(
+        mixed, devices=[0, 1], ctx_per_slot=8192, kv_cache_type="q8_0", kv_cache_type_v="q4_0"
+    )
+    # A row that never recorded its cache type cannot claim to describe a named one...
+    bare = [{k: v for k, v in row.items() if not k.startswith("kv_")} for row in rows]
+    assert observations_for(bare, devices=[0, 1], ctx_per_slot=8192, kv_cache_type="f16") == []
+    # ...while a caller that names none still gets the device+context match.
+    assert len(observations_for(bare, devices=[0, 1], ctx_per_slot=8192)) == 2
 
 
 def test_device_order_does_not_matter() -> None:

@@ -305,20 +305,38 @@ def observations_for(
     *,
     devices: Sequence[int],
     ctx_per_slot: int,
+    kv_cache_type: str | None = None,
+    kv_cache_type_v: str | None = None,
 ) -> list[Mapping[str, Any]]:
     """The measured rows that describe *this* placement, or an empty list.
 
-    Same devices **and** the same context per slot. Both halves matter: a sweep
-    on one 5090 does not describe two, and a sweep at 8192 does not describe
-    131072, because the knee is set by how many KV bytes each busy slot reads
-    per step. Being strict here is what lets ``basis: "measured"`` be read
-    literally -- the same standard :func:`throughput.confidence_for` holds
-    itself to.
+    Same devices, the same context per slot, **and the same KV cache types**.
+    All three matter for the same reason: the knee is set by how many KV bytes
+    each busy slot reads per step, and a sweep on one 5090 does not describe
+    two, a sweep at 8192 does not describe 131072, and a sweep on an f16 cache
+    does not describe a q8_0 one (half the bytes per token, so the knee moves).
+    Being strict here is what lets ``basis: "measured"`` be read literally --
+    the same standard :func:`throughput.confidence_for` holds itself to.
+
+    ``kv_cache_type`` / ``kv_cache_type_v`` are compared only when the caller
+    names them; a row that does not record its cache type cannot match a named
+    one (the benchmark always records both).
     """
     key = ",".join(str(int(d)) for d in sorted(devices))
+    want_k = str(kv_cache_type) if kv_cache_type else None
+    want_v = str(kv_cache_type_v or kv_cache_type) if (kv_cache_type_v or kv_cache_type) else None
+
+    def same_kv(row: Mapping[str, Any]) -> bool:
+        if want_k is None:
+            return True
+        row_k = row.get("kv_cache_type")
+        row_v = row.get("kv_cache_type_v") or row_k
+        return str(row_k) == want_k and str(row_v) == want_v
+
     return [
         row
         for row in observations
         if str(row.get("devices") or "") == key
         and int(row.get("ctx_per_slot") or 0) == int(ctx_per_slot)
+        and same_kv(row)
     ]

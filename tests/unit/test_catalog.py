@@ -1301,6 +1301,8 @@ def test_a_measured_sweep_reaches_the_option_row_and_its_load_args() -> None:
             "run_id": "run-a",
             "devices": ",".join(str(d) for d in sorted(row["devices"])),
             "ctx_per_slot": row["ctx_per_slot"],
+            "kv_cache_type": row["kv_cache_type"],
+            "kv_cache_type_v": row.get("kv_cache_type_v") or row["kv_cache_type"],
             "n_streams": n,
             "per_stream_tps": per_stream,
             "aggregate_tps": aggregate,
@@ -1310,6 +1312,14 @@ def test_a_measured_sweep_reaches_the_option_row_and_its_load_args() -> None:
     measured = catalog_for([dense], db=FakeParallelDb(parallel=sweep))["models"][0]
     after = next(r for r in measured["options"] if r["ctx_per_slot"] == row["ctx_per_slot"])
     assert after["recommended_parallel"] == 1
+
+    # The same sweep recorded on another KV cache type does not steer this row:
+    # the knee is set by KV bytes per slot, and a quantized cache halves them.
+    other_kv = [{**r, "kv_cache_type": "q8_0", "kv_cache_type_v": "q8_0"} for r in sweep]
+    unmoved = catalog_for([dense], db=FakeParallelDb(parallel=other_kv))["models"][0]
+    still = next(r for r in unmoved["options"] if r["ctx_per_slot"] == row["ctx_per_slot"])
+    assert still["recommended_parallel_basis"] == "estimated"
+    assert still["recommended_parallel"] == row["recommended_parallel"]
     assert after["recommended_parallel_basis"] == "measured"
     assert after["max_parallel"] == row["max_parallel"]
     assert after["load_args"]["parallel"] == 1

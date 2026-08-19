@@ -573,7 +573,11 @@ def recommended_slots(
     from studioforge.core import parallel as parallel_mod
 
     rows = parallel_mod.observations_for(
-        observations, devices=plan.devices, ctx_per_slot=int(plan.ctx_size)
+        observations,
+        devices=plan.devices,
+        ctx_per_slot=int(plan.ctx_size),
+        kv_cache_type=plan.kv_cache_type,
+        kv_cache_type_v=plan.kv_cache_type_v,
     )
     return parallel_mod.recommended_parallel(
         record.meta,

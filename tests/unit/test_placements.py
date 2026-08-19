@@ -344,6 +344,8 @@ def parallel_sweep(devices: str, ctx: int, *rows) -> list[dict[str, object]]:  #
             "run_id": "run-a",
             "devices": devices,
             "ctx_per_slot": ctx,
+            "kv_cache_type": "f16",
+            "kv_cache_type_v": "f16",
             "n_streams": n,
             "per_stream_tps": per_stream,
             "aggregate_tps": aggregate,

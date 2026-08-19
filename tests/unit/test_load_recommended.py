@@ -190,6 +190,8 @@ async def test_the_slot_count_is_the_recommendation_not_the_ceiling() -> None:
             "run_id": "run-a",
             "devices": "0,1",
             "ctx_per_slot": 16384,
+            "kv_cache_type": "f16",
+            "kv_cache_type_v": "f16",
         }
         for n, per_stream, aggregate in [(1, 100.0, 100.0), (2, 90.0, 102.0)]
     ]
