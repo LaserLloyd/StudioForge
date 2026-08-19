@@ -642,13 +642,21 @@ def probe_engine_features(binary: Path, tag: str = "") -> EngineFeatures:
     ``help.txt`` -> actually running ``--help``, and returns
     :meth:`EngineFeatures.unknown` rather than raising if all three fail: a
     model must still load on a box where the help cannot be read.
+
+    **The subprocess only ever runs a file actually named like the engine
+    binary.** Anything else that a ``resolve_binary`` hook returns -- a test
+    stub, a wrapper script -- is read from disk or reported unknown, never
+    executed. Executing whatever was handed to us as a side effect of *building
+    a command line* is a side effect nobody asked for: it cost two flaky test
+    failures here, where launching the fake ``fake_llama_server.py`` with
+    ``--help`` started a real HTTP server on the port the next test wanted.
     """
     directory = binary.parent
     from_disk = cached_engine_features(directory, tag)
     if from_disk.known:
         return from_disk
 
-    if not binary.is_file():
+    if not binary.is_file() or binary.name.lower() != BIN_NAME.lower():
         return EngineFeatures.unknown(tag)
     try:
         completed = subprocess.run(  # noqa: S603 - our own pinned engine binary

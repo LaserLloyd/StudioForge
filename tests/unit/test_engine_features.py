@@ -153,6 +153,33 @@ def test_probe_without_a_binary_degrades_to_unknown(tmp_path: Path) -> None:
     assert caps.known is False
 
 
+def test_probe_never_executes_something_that_is_not_the_engine(tmp_path: Path) -> None:
+    """Building a command line must not run whatever ``resolve_binary`` returned.
+
+    A ``resolve_binary`` hook can legitimately return a wrapper or a test stub.
+    Launching it with ``--help`` to see what it supports is a side effect nobody
+    asked for -- it cost two flaky failures here, where the supervisor's fake
+    child was started with ``--help`` and bound the port the next test wanted.
+    """
+    from studioforge.core import engine as engine_module
+
+    stub = tmp_path / "fake_llama_server.py"
+    stub.write_text("raise SystemExit('this must never run')", encoding="utf-8")
+    ran: list[object] = []
+    monkeypatched = engine_module.subprocess.run
+
+    def _spy(*args: object, **kwargs: object) -> object:  # pragma: no cover - must not fire
+        ran.append(args)
+        return monkeypatched(*args, **kwargs)  # type: ignore[arg-type]
+
+    engine_module.subprocess.run = _spy  # type: ignore[assignment]
+    try:
+        assert probe_engine_features(stub, "b10425").known is False
+    finally:
+        engine_module.subprocess.run = monkeypatched  # type: ignore[assignment]
+    assert ran == []
+
+
 # ---------------------------------------------------------------------------
 # The capabilities report
 # ---------------------------------------------------------------------------

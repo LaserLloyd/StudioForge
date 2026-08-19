@@ -464,7 +464,7 @@ def _nextn_heads(record: ModelRecord) -> int:
 
     Captured by the scanner into ``meta.extra``; it is the *only* honest signal
     that a model has multi-token-prediction heads. Repository names lie about it
-    both ways -- a library "…-MTP-GGUF" on this box carries no such key at all.
+    both ways -- a library "...-MTP-GGUF" on this box carries no such key at all.
     """
     meta = record.meta
     extra = getattr(meta, "extra", None) if meta is not None else None
