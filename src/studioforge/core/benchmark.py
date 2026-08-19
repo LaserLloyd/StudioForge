@@ -51,12 +51,13 @@ import time
 import uuid
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 import httpx
 
 from studioforge.core.gpu import fastest_gpu_order
+from studioforge.core.supervisor import SPLIT_MODE_TENSOR, tensor_split_model_blockers
 from studioforge.errors import BadRequestError, ModelBusyError, ModelLoadError
 from studioforge.logging import get_logger
 from studioforge.types import GpuInfo, LoadRejected, ModelRecord, ModelSettings
@@ -116,17 +117,27 @@ ProgressFn = Callable[[str | None, str, float], None]
 
 @dataclass(frozen=True)
 class BenchmarkMode:
-    """One GPU placement to benchmark.
+    """One launch configuration to benchmark: a placement, and how it is run.
 
     ``key`` is a stable, slug-safe identifier: it travels in URLs and is stored
     inside persisted reports, so it must not change shape between releases for
-    the same hardware.
+    the same hardware. The extra dimensions append a suffix rather than
+    reshaping the key, so ``rtx-5090-x2`` still means what it always meant.
     """
 
     key: str
     label: str
     devices: list[int]
     gpu_name: str | None
+    #: ``--split-mode`` for this mode. Only ever something other than ``layer``
+    #: on a multi-device mode, and only when the model is eligible: tensor mode
+    #: is experimental upstream and measured slower than layer on this rig, so
+    #: it is offered as something to *measure*, never as a default.
+    split_mode: str = "layer"
+    #: ``-ub/--ubatch-size`` for this mode, or ``None`` for the engine's 512.
+    #: Trades compute-buffer VRAM for prompt-processing speed, so it is a
+    #: prefill dimension and is off unless the caller asks for it.
+    ubatch: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -134,6 +145,8 @@ class BenchmarkMode:
             "label": self.label,
             "devices": list(self.devices),
             "gpu_name": self.gpu_name,
+            "split_mode": self.split_mode,
+            "ubatch": self.ubatch,
         }
 
 
@@ -150,8 +163,53 @@ def _slug(text: str) -> str:
     return slug or "gpu"
 
 
-def available_modes(gpus: Sequence[GpuInfo]) -> list[BenchmarkMode]:
-    """Placements worth benchmarking on this machine, fastest-first.
+def _expand(
+    mode: BenchmarkMode, split_modes: Sequence[str], ubatch_sizes: Sequence[int]
+) -> list[BenchmarkMode]:
+    """One placement -> its split-mode and ubatch variants.
+
+    Ordered so the plain mode always comes first and keeps its original key:
+    the variants are additive, and a report from before they existed still
+    lines up row for row with one from after.
+    """
+    variants: list[BenchmarkMode] = []
+    modes = list(split_modes) or ["layer"]
+    if len(mode.devices) < 2:
+        # Split mode is meaningless on one device (the supervisor emits
+        # ``--split-mode none``), so a "tensor" variant there would benchmark
+        # the identical launch twice.
+        modes = ["layer"]
+    for split in modes:
+        base = (
+            mode
+            if split == "layer"
+            else replace(
+                mode,
+                key=f"{mode.key}-{split}",
+                label=f"{mode.label}, {split} split",
+                split_mode=split,
+            )
+        )
+        variants.append(base)
+        for ubatch in ubatch_sizes:
+            variants.append(
+                replace(
+                    base,
+                    key=f"{base.key}-ub{ubatch}",
+                    label=f"{base.label}, ubatch {ubatch}",
+                    ubatch=ubatch,
+                )
+            )
+    return variants
+
+
+def available_modes(
+    gpus: Sequence[GpuInfo],
+    *,
+    split_modes: Sequence[str] = ("layer",),
+    ubatch_sizes: Sequence[int] = (),
+) -> list[BenchmarkMode]:
+    """Configurations worth benchmarking on this machine, fastest-first.
 
     Grouping is by ``(name, compute capability)`` so two identical cards form
     one family; ordering within and between groups follows
@@ -161,6 +219,12 @@ def available_modes(gpus: Sequence[GpuInfo]) -> list[BenchmarkMode]:
     than one GPU and it is not already identical to a group mode (on a box with
     four identical cards, "all" *is* ``x4``, and offering both would benchmark
     the same placement twice).
+
+    ``split_modes`` and ``ubatch_sizes`` add dimensions on top of the placement.
+    Both default to "just the placement", so every existing caller gets exactly
+    the list it always got: a benchmark suite that silently doubled in length
+    would turn a two-minute job into a four-minute one for people who never
+    asked about tensor parallelism.
     """
     if not gpus:
         return []
@@ -201,24 +265,32 @@ def available_modes(gpus: Sequence[GpuInfo]) -> list[BenchmarkMode]:
             if fingerprint in seen_devices:
                 continue
             seen_devices.add(fingerprint)
-            modes.append(
-                BenchmarkMode(
-                    key=f"{candidate}-x{width}",
-                    label=f"{width}x {display}",
-                    devices=list(devices),
-                    gpu_name=name,
+            modes.extend(
+                _expand(
+                    BenchmarkMode(
+                        key=f"{candidate}-x{width}",
+                        label=f"{width}x {display}",
+                        devices=list(devices),
+                        gpu_name=name,
+                    ),
+                    split_modes,
+                    ubatch_sizes,
                 )
             )
 
     all_devices = tuple(order)
     if len(order) > 1 and all_devices not in seen_devices:
         seen_devices.add(all_devices)
-        modes.append(
-            BenchmarkMode(
-                key="all",
-                label=f"All {len(order)} GPUs",
-                devices=list(all_devices),
-                gpu_name=None,
+        modes.extend(
+            _expand(
+                BenchmarkMode(
+                    key="all",
+                    label=f"All {len(order)} GPUs",
+                    devices=list(all_devices),
+                    gpu_name=None,
+                ),
+                split_modes,
+                ubatch_sizes,
             )
         )
     return modes
@@ -236,6 +308,11 @@ class BenchmarkResult:
     mode: str
     label: str
     devices: list[int]
+    #: How the mode was launched, so a persisted report stays interpretable
+    #: after the mode list changes shape. ``layer`` and ``None`` are the
+    #: defaults every pre-WP20 report implicitly used.
+    split_mode: str = "layer"
+    ubatch: int | None = None
     applicable: bool = True
     skipped_reason: str | None = None
     load_time_s: float | None = None
@@ -314,6 +391,11 @@ class Benchmarker:
         # would compete for the VRAM they are measuring.
         self._lock = asyncio.Lock()
         self._benchmarking: str | None = None
+        # Back-reference so the manager can see a run in progress. A benchmark
+        # rewrites a record's settings and loads the model once per mode, which
+        # is exactly the state in which a smoke test must not start (D36) --
+        # and the manager cannot reach `app.state`, where this object lives.
+        manager.benchmarker = self
 
     @property
     def busy(self) -> bool:
@@ -333,29 +415,59 @@ class Benchmarker:
 
     # -- planning ---------------------------------------------------------
 
+    def split_modes_for(self, record: ModelRecord) -> list[str]:
+        """Split modes worth offering for ``record``: ``layer``, maybe ``tensor``.
+
+        Model-only gating, deliberately: whether the *engine* offers tensor mode
+        and whether *this plan's* KV cache and flash-attn setting allow it are
+        decided at launch by the supervisor, which is the one place that knows
+        both. Offering a mode the launch then refuses costs one clearly-worded
+        error; hiding a mode the launch would have accepted costs a measurement
+        the user asked for.
+        """
+        if tensor_split_model_blockers(record):
+            return ["layer"]
+        return ["layer", SPLIT_MODE_TENSOR]
+
     def modes_for(
-        self, record: ModelRecord, *, ctx_size: int
+        self,
+        record: ModelRecord,
+        *,
+        ctx_size: int,
+        ubatch_sizes: Sequence[int] = (),
     ) -> list[tuple[BenchmarkMode, bool, str | None]]:
         """Every mode with the planner's verdict on whether it can run.
 
         Inapplicable modes are *returned*, not dropped, so the caller can show
         the rejection reason next to the mode the user was hoping for.
         """
-        return [
-            (mode, *self._applicability(record, mode, ctx_size=ctx_size))
-            for mode in available_modes(self._probe.list_gpus())
-        ]
+        modes = available_modes(
+            self._probe.list_gpus(),
+            split_modes=self.split_modes_for(record),
+            ubatch_sizes=ubatch_sizes,
+        )
+        return [(mode, *self._applicability(record, mode, ctx_size=ctx_size)) for mode in modes]
+
+    @staticmethod
+    def _settings_for(record: ModelRecord, mode: BenchmarkMode) -> ModelSettings:
+        """The record's settings, steered at one mode. One place, two callers.
+
+        ``_applicability`` and ``_run_mode`` have to agree exactly: a mode
+        planned with a layer split and then *run* with a tensor one would report
+        the wrong verdict for the wrong launch.
+        """
+        update: dict[str, Any] = {
+            "device_override": list(mode.devices),
+            "split_mode": mode.split_mode,
+        }
+        if mode.ubatch is not None:
+            update["ubatch_size"] = mode.ubatch
+        return record.settings.model_copy(update=update)
 
     def _applicability(
         self, record: ModelRecord, mode: BenchmarkMode, *, ctx_size: int
     ) -> tuple[bool, str | None]:
-        candidate = record.model_copy(
-            update={
-                "settings": record.settings.model_copy(
-                    update={"device_override": list(mode.devices)}
-                )
-            }
-        )
+        candidate = record.model_copy(update={"settings": self._settings_for(record, mode)})
         try:
             result = self.manager.planner.plan_load(
                 candidate,
@@ -387,6 +499,7 @@ class Benchmarker:
         prompt: str | None = None,
         on_progress: ProgressFn | None = None,
         cancel_event: asyncio.Event | None = None,
+        ubatch_sizes: Sequence[int] = (),
     ) -> BenchmarkReport:
         """Benchmark ``record`` across ``modes`` (default: every applicable one).
 
@@ -394,6 +507,10 @@ class Benchmarker:
         in flight. ``cancel_event`` is checked between modes, so a cancel stops
         cleanly at a mode boundary rather than mid-load; task cancellation also
         works and restores state the same way.
+
+        ``ubatch_sizes`` adds a prompt-processing dimension (e.g. ``(1024,
+        2048)``): each placement is measured again at that ``-ub``. Empty by
+        default -- it multiplies the run length, and it only moves prefill.
         """
         if self._lock.locked():
             raise ModelBusyError(
@@ -410,6 +527,7 @@ class Benchmarker:
                 prompt=prompt,
                 on_progress=on_progress,
                 cancel_event=cancel_event,
+                ubatch_sizes=ubatch_sizes,
             )
 
     async def _run_locked(
@@ -422,6 +540,7 @@ class Benchmarker:
         prompt: str | None,
         on_progress: ProgressFn | None,
         cancel_event: asyncio.Event | None,
+        ubatch_sizes: Sequence[int] = (),
     ) -> BenchmarkReport:
         text = DEFAULT_PROMPT if prompt is None else prompt
         report = BenchmarkReport(
@@ -439,7 +558,7 @@ class Benchmarker:
         )
 
         _emit(on_progress, None, "planning", 0, 1)
-        planned = self.modes_for(record, ctx_size=ctx_size)
+        planned = self.modes_for(record, ctx_size=ctx_size, ubatch_sizes=ubatch_sizes)
         if modes is not None:
             wanted = list(dict.fromkeys(modes))
             known = {mode.key for mode, _, _ in planned}
@@ -473,6 +592,8 @@ class Benchmarker:
                             mode=mode.key,
                             label=mode.label,
                             devices=list(mode.devices),
+                            split_mode=mode.split_mode,
+                            ubatch=mode.ubatch,
                             applicable=False,
                             skipped_reason=reason,
                         )
@@ -545,14 +666,19 @@ class Benchmarker:
         on_progress: ProgressFn | None,
     ) -> BenchmarkResult:
         """Measure one placement. Never raises for engine/model failures."""
-        result = BenchmarkResult(mode=mode.key, label=mode.label, devices=list(mode.devices))
+        result = BenchmarkResult(
+            mode=mode.key,
+            label=mode.label,
+            devices=list(mode.devices),
+            split_mode=mode.split_mode,
+            ubatch=mode.ubatch,
+        )
         try:
             # A fresh process per mode: reusing a running instance would measure
             # a warm cache on whichever devices happened to be selected first.
             await self.manager.unload(record.id)
-            record.settings = base_settings.model_copy(
-                update={"device_override": list(mode.devices)}
-            )
+            steered = record.model_copy(update={"settings": base_settings})
+            record.settings = self._settings_for(steered, mode)
 
             free_before = self._free_by_device()
             _emit(on_progress, mode.key, "loading", position, total)

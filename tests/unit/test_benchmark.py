@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,7 @@ from studioforge.db import SCHEMA_VERSION, Database
 from studioforge.errors import ModelBusyError
 from studioforge.types import (
     GB,
+    GgufMeta,
     GpuInfo,
     InstanceInfo,
     LoadPlan,
@@ -291,6 +293,50 @@ def test_available_modes_on_reference_rig() -> None:
     assert modes[-1].gpu_name is None
 
 
+def test_the_default_mode_list_is_unchanged_by_the_new_dimensions() -> None:
+    """Split mode and ubatch are opt-in dimensions. A suite that silently
+    doubled in length would turn a two-minute job into a four-minute one for
+    someone who never asked about tensor parallelism."""
+    assert [m.key for m in available_modes(reference_rig())] == [
+        m.key for m in available_modes(reference_rig(), split_modes=("layer",), ubatch_sizes=())
+    ]
+    assert all(
+        m.split_mode == "layer" and m.ubatch is None for m in available_modes(reference_rig())
+    )
+
+
+def test_tensor_variants_are_added_only_to_multi_device_modes() -> None:
+    """`--split-mode` is meaningless on one GPU (the supervisor emits
+    ``--split-mode none`` there), so a tensor variant would benchmark the
+    identical launch twice."""
+    modes = available_modes(reference_rig(), split_modes=("layer", "tensor"))
+    assert [m.key for m in modes] == [
+        "rtx-5090-x1",
+        "rtx-5090-x2",
+        "rtx-5090-x2-tensor",
+        "rtx-3090-x1",
+        "rtx-3090-x2",
+        "rtx-3090-x2-tensor",
+        "all",
+        "all-tensor",
+    ]
+    tensor = next(m for m in modes if m.key == "rtx-5090-x2-tensor")
+    assert tensor.split_mode == "tensor"
+    assert tensor.devices == [0, 1]
+    assert "tensor split" in tensor.label
+
+
+def test_ubatch_variants_multiply_every_placement() -> None:
+    modes = available_modes(
+        [gpu(0, "NVIDIA GeForce RTX 4090", 24, (8, 9))], ubatch_sizes=(1024, 2048)
+    )
+    assert [(m.key, m.ubatch) for m in modes] == [
+        ("rtx-4090-x1", None),
+        ("rtx-4090-x1-ub1024", 1024),
+        ("rtx-4090-x1-ub2048", 2048),
+    ]
+
+
 def test_available_modes_orders_fastest_family_first_regardless_of_index() -> None:
     """The 3090s occupy the low CUDA indices; the 5090 family must still lead."""
     gpus = [
@@ -371,6 +417,71 @@ def _reject_small_cards(devices: list[int]) -> Any:
             available_bytes=24_000_000_000,
         )
     return None
+
+
+def dense_record() -> ModelRecord:
+    """A record whose GGUF metadata proves it dense and full-attention, which
+    is what makes it eligible for a tensor-split measurement."""
+    return ModelRecord(
+        id="acme/dense-Q4_K_M",
+        name="dense",
+        path=Path("E:/models/dense-Q4_K_M.gguf"),
+        size_bytes=8 * GB,
+        meta=GgufMeta(architecture="qwen2", n_layer=32, n_embd=4096, n_head=32, n_head_kv=8),
+        settings=ModelSettings(),
+    )
+
+
+def test_tensor_modes_are_offered_only_for_an_eligible_model() -> None:
+    """Model-only gating here; the engine's feature list and the plan's KV type
+    are the supervisor's business, and it refuses with a sentence."""
+    probe = StubProbe(reference_rig())
+    bench = Benchmarker(StubManager(dense_record(), probe), probe=probe)
+
+    assert bench.split_modes_for(dense_record()) == ["layer", "tensor"]
+
+    moe = dense_record()
+    moe.meta = GgufMeta(
+        architecture="qwen35moe",
+        n_layer=32,
+        n_embd=4096,
+        n_head=32,
+        n_head_kv=8,
+        n_expert=128,
+        n_expert_used=8,
+    )
+    assert bench.split_modes_for(moe) == ["layer"]
+
+    hybrid = dense_record()
+    hybrid.meta = GgufMeta(
+        architecture="qwen35",
+        n_layer=64,
+        n_embd=5120,
+        n_head=24,
+        n_head_kv=4,
+        extra={"full_attention_interval": 4},
+    )
+    assert bench.split_modes_for(hybrid) == ["layer"]
+
+
+def test_a_tensor_mode_is_planned_and_run_with_the_same_settings() -> None:
+    """A mode planned with a layer split and then RUN with a tensor one would
+    report the wrong verdict for the wrong launch."""
+    probe = StubProbe(reference_rig())
+    record = dense_record()
+    bench = Benchmarker(StubManager(record, probe), probe=probe)
+    mode = next(
+        m
+        for m in available_modes(reference_rig(), split_modes=("layer", "tensor"))
+        if m.key == "rtx-5090-x2-tensor"
+    )
+    settings = bench._settings_for(record, mode)
+    assert settings.split_mode == "tensor"
+    assert settings.device_override == [0, 1]
+    assert settings.ubatch_size is None
+
+    with_ub = bench._settings_for(record, replace(mode, ubatch=1024))
+    assert with_ub.ubatch_size == 1024
 
 
 def test_modes_for_reports_inapplicable_modes_with_the_planner_reason() -> None:
@@ -753,8 +864,17 @@ async def test_report_is_json_serializable(engine: FakeEngine) -> None:
 
 
 def test_mode_to_dict_shape() -> None:
+    """The launch dimensions travel with the mode, so a persisted report stays
+    interpretable when the mode list grows another one."""
     mode = BenchmarkMode(key="k", label="L", devices=[0, 1], gpu_name="G")
-    assert mode.to_dict() == {"key": "k", "label": "L", "devices": [0, 1], "gpu_name": "G"}
+    assert mode.to_dict() == {
+        "key": "k",
+        "label": "L",
+        "devices": [0, 1],
+        "gpu_name": "G",
+        "split_mode": "layer",
+        "ubatch": None,
+    }
 
 
 # ---------------------------------------------------------------------------
