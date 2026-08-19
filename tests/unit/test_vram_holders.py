@@ -151,6 +151,25 @@ def pytest_parent(pid: int = 900, create_time: float = 900.0) -> FakeProcess:
     )
 
 
+def fake_pdh(
+    monkeypatch: pytest.MonkeyPatch,
+    totals: dict[int, int],
+    per_gpu: dict[int, dict[int, int]] | None = None,
+) -> None:
+    """Stub both PDH views at once.
+
+    They share one sample in production, and a test that stubbed only the total
+    would let the per-GPU call reach the real performance counters -- on this
+    box that means a live PDH sample and a live NVML/D3DKMT probe inside a unit
+    test.
+    """
+    split = {pid: dict(entry) for pid, entry in (per_gpu or {}).items()}
+    monkeypatch.setattr(vh, "pdh_process_dedicated_bytes", lambda **_kw: dict(totals))
+    monkeypatch.setattr(
+        vh, "pdh_process_gpu_bytes", lambda **_kw: {p: dict(e) for p, e in split.items()}
+    )
+
+
 # ---------------------------------------------------------------------------
 # find_engine_processes
 # ---------------------------------------------------------------------------
@@ -441,6 +460,257 @@ def test_non_windows_returns_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 # ---------------------------------------------------------------------------
+# LUID -> PCI bus -> CUDA ordinal (D39)
+# ---------------------------------------------------------------------------
+
+
+class FakeGdi32:
+    """The three D3DKMT thunks, over the real ctypes structures.
+
+    Deliberately driven through ``byref`` rather than by stubbing
+    ``_luid_pci_buses``: the part that can silently break is the struct layout
+    and the out-parameter plumbing, and a stub of the function that does it
+    would test nothing at all.
+    """
+
+    def __init__(self, buses: dict[tuple[int, int], int]) -> None:
+        self.buses = buses
+        self.open_handles: dict[int, tuple[int, int]] = {}
+        self.closed: list[int] = []
+        self._next_handle = 1
+
+    def D3DKMTOpenAdapterFromLuid(self, ref: Any) -> int:  # noqa: N802 - win32 spelling
+        opened = ref._obj
+        key = (opened.AdapterLuid.HighPart & 0xFFFFFFFF, opened.AdapterLuid.LowPart)
+        if key not in self.buses:
+            return -1073741811  # STATUS_INVALID_PARAMETER
+        handle = self._next_handle
+        self._next_handle += 1
+        opened.hAdapter = handle
+        self.open_handles[handle] = key
+        return 0
+
+    def D3DKMTQueryAdapterInfo(self, ref: Any) -> int:  # noqa: N802
+        query = ref._obj
+        key = self.open_handles.get(query.hAdapter)
+        if key is None or query.Type != vh._KMTQAITYPE_ADAPTERADDRESS:
+            return -1073741811
+        import ctypes
+
+        address = ctypes.cast(
+            query.pPrivateDriverData, ctypes.POINTER(vh._D3DKMT_ADAPTERADDRESS)
+        ).contents
+        address.BusNumber = self.buses[key]
+        return 0
+
+    def D3DKMTCloseAdapter(self, ref: Any) -> int:  # noqa: N802
+        self.closed.append(ref._obj.hAdapter)
+        return 0
+
+
+class FakePciInfo:
+    def __init__(self, *, bus: int | None = None, bus_id: str | None = None) -> None:
+        if bus is not None:
+            self.bus = bus
+        if bus_id is not None:
+            self.busId = bus_id.encode()  # noqa: N815 - NVML spelling
+
+
+class FakeNvml:
+    def __init__(self, infos: list[Any]) -> None:
+        self.infos = infos
+        self.inits = 0
+        self.shutdowns = 0
+
+    def nvmlInit(self) -> None:  # noqa: N802 - NVML spelling
+        self.inits += 1
+
+    def nvmlShutdown(self) -> None:  # noqa: N802
+        self.shutdowns += 1
+
+    def nvmlDeviceGetCount(self) -> int:  # noqa: N802
+        return len(self.infos)
+
+    def nvmlDeviceGetHandleByIndex(self, index: int) -> int:  # noqa: N802
+        return index
+
+    def nvmlDeviceGetPciInfo(self, handle: int) -> Any:  # noqa: N802
+        return self.infos[handle]
+
+
+#: The reference rig, measured 2026-08-19: two 5090s on buses 0x01/0x42 and two
+#: 3090s on 0xC1/0xC2, plus the Microsoft Basic Render adapter, which has a LUID
+#: and no PCI address at all.
+RIG_BUSES = {(0, 0x13C35): 0x01, (0, 0x155BF): 0x42, (0, 0x1671A): 0xC1, (0, 0x175FB): 0xC2}
+BASIC_RENDER = (0, 0x1852C)
+
+
+def install_luid_stack(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    buses: dict[tuple[int, int], int] | None = None,
+    infos: list[Any] | None = None,
+) -> tuple[FakeGdi32, FakeNvml]:
+    monkeypatch.setattr(os, "name", "nt")
+    gdi32 = FakeGdi32(dict(RIG_BUSES if buses is None else buses))
+    nvml = FakeNvml(
+        infos
+        if infos is not None
+        else [
+            FakePciInfo(bus=0x01),
+            FakePciInfo(bus=0x42),
+            FakePciInfo(bus=0xC1),
+            FakePciInfo(bus=0xC2),
+        ]
+    )
+    monkeypatch.setattr(vh, "_load_gdi32", lambda: gdi32)
+    monkeypatch.setattr(vh, "_load_nvml", lambda: nvml)
+    return gdi32, nvml
+
+
+@pytest.mark.parametrize(
+    ("instance", "expected"),
+    [
+        ("pid_19544_luid_0x00000000_0x0000E5F5_phys_0", (0x0, 0xE5F5)),
+        ("pid_32188_luid_0x00000000_0x00013C35_phys_0", (0x0, 0x13C35)),
+        # A linked adapter is still one CUDA device: phys_ is not part of the key.
+        ("pid_32188_luid_0x00000000_0x00013C35_phys_1", (0x0, 0x13C35)),
+        ("pid_2468_luid_0x0_0x1_phys_0#1", (0x0, 0x1)),
+        ("engtype_3D", vh.UNKNOWN_LUID),
+        ("pid_7_luid_0xZZ_0x1_phys_0", vh.UNKNOWN_LUID),
+        ("pid_7_luid_0x0", vh.UNKNOWN_LUID),
+    ],
+)
+def test_instance_names_yield_adapter_luids(instance: str, expected: tuple[int, int]) -> None:
+    assert vh._luid_from_instance(instance) == expected
+
+
+def test_the_rigs_four_cards_map_onto_their_cuda_ordinals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The join D23 said could not be made: LUID -> PCI bus -> CUDA ordinal."""
+    gdi32, nvml = install_luid_stack(monkeypatch)
+    mapping = vh.luid_to_cuda_index([*RIG_BUSES, BASIC_RENDER])
+    assert mapping == {(0, 0x13C35): 0, (0, 0x155BF): 1, (0, 0x1671A): 2, (0, 0x175FB): 3}
+    # The Basic Render adapter has no PCI address and is simply absent, never
+    # guessed onto a card.
+    assert BASIC_RENDER not in mapping
+    # Every adapter handle that opened was closed again.
+    assert sorted(gdi32.closed) == sorted(gdi32.open_handles)
+    assert (nvml.inits, nvml.shutdowns) == (1, 1)
+
+
+def test_a_pci_bus_id_string_is_read_as_hex(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``"00000000:42:00.0"`` is bus 0x42, i.e. 66 -- not 42."""
+    install_luid_stack(
+        monkeypatch,
+        infos=[FakePciInfo(bus_id="00000000:01:00.0"), FakePciInfo(bus_id="00000000:42:00.0")],
+    )
+    mapping = vh.luid_to_cuda_index([(0, 0x13C35), (0, 0x155BF)])
+    assert mapping == {(0, 0x13C35): 0, (0, 0x155BF): 1}
+
+
+def test_an_adapter_with_no_cuda_device_is_left_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A card excluded by CUDA_VISIBLE_DEVICES has a bus and no ordinal."""
+    install_luid_stack(monkeypatch, infos=[FakePciInfo(bus=0x01)])
+    assert vh.luid_to_cuda_index([*RIG_BUSES]) == {(0, 0x13C35): 0}
+
+
+def test_the_map_is_cached_and_rebuilt_for_an_unseen_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cheap enough to rebuild, never persisted -- ordinals renumber (D39)."""
+    _gdi32, nvml = install_luid_stack(monkeypatch)
+    vh.luid_to_cuda_index([(0, 0x13C35)])
+    vh.luid_to_cuda_index([(0, 0x13C35)])
+    assert nvml.inits == 1, "a repeat of the same LUID must not re-probe"
+    vh.luid_to_cuda_index([(0, 0x155BF)])
+    assert nvml.inits == 2, "an adapter never seen before forces a rebuild"
+
+
+def test_a_broken_mapping_is_empty_rather_than_wrong(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Diagnostics must never raise, and a guessed ordinal is worse than none."""
+    monkeypatch.setattr(os, "name", "nt")
+
+    def boom() -> Any:
+        raise OSError("gdi32 is not what you think it is")
+
+    monkeypatch.setattr(vh, "_load_gdi32", boom)
+    assert vh.luid_to_cuda_index([(0, 0x13C35)]) == {}
+
+
+def test_the_map_is_not_attempted_off_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr(vh, "_load_gdi32", lambda: pytest.fail("no D3DKMT off Windows"))
+    assert vh.luid_to_cuda_index([(0, 0x13C35)]) == {}
+
+
+def test_a_split_model_is_attributed_to_the_cards_it_is_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The live shape on 2026-08-19: 30.44 GiB that is *not* on four cards.
+
+    llama.cpp opens a CUDA context on every visible device, so NVML listed pid
+    32188 on CUDA0-3. PDH per adapter says 15.52 + 14.48 on the two 5090s and
+    0.22 of context on each 3090.
+    """
+    install_luid_stack(monkeypatch)
+    fake = FakePdh(
+        {
+            "pid_32188_luid_0x00000000_0x00013C35_phys_0": 16_663_000_000,
+            "pid_32188_luid_0x00000000_0x000155BF_phys_0": 15_547_000_000,
+            "pid_32188_luid_0x00000000_0x0001671A_phys_0": 236_000_000,
+            "pid_32188_luid_0x00000000_0x000175FB_phys_0": 236_000_000,
+            # An adapter with no CUDA ordinal: reported, never dropped.
+            "pid_32188_luid_0x00000000_0x0001852C_phys_0": 1_000_000,
+        }
+    )
+    monkeypatch.setattr(vh, "_load_win32pdh", lambda: fake)
+    split = vh.pdh_process_gpu_bytes()
+    assert split == {
+        32188: {
+            0: 16_663_000_000,
+            1: 15_547_000_000,
+            2: 236_000_000,
+            3: 236_000_000,
+            vh.OTHER_ADAPTER: 1_000_000,
+        }
+    }
+    # The split still adds up to the total the D23 counter reported.
+    assert sum(split[32188].values()) == vh.pdh_process_dedicated_bytes()[32188]
+    assert vh.process_gpu_bytes(32188)[0] == 16_663_000_000
+    assert vh.process_gpu_bytes(999) == {}
+
+
+def test_unmappable_adapters_land_under_minus_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No LUID map (no NVML, no D3DKMT) must not invent an ordinal."""
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(vh, "luid_to_cuda_index", lambda _luids: {})
+    fake = FakePdh({"pid_101_luid_0x0_0xA_phys_0": 8 * GIB, "pid_101_luid_0x0_0xB_phys_0": 2 * GIB})
+    monkeypatch.setattr(vh, "_load_win32pdh", lambda: fake)
+    assert vh.pdh_process_gpu_bytes() == {101: {vh.OTHER_ADAPTER: 10 * GIB}}
+
+
+@pytest.mark.parametrize(
+    ("split", "contexts", "expected", "source"),
+    [
+        # The measurement wins, and the sub-threshold CUDA contexts go.
+        ({0: 16 * GIB, 1: 15 * GIB, 2: 236 * MIB}, [0, 1, 2, 3], [0, 1], "pdh"),
+        # Measured, and nothing crosses the floor: an empty list is an answer.
+        ({0: 100 * MIB}, [0, 1], [], "pdh"),
+        # No measurement at all -- fall back, and say that is what happened.
+        ({}, [0, 1, 2, 3], [0, 1, 2, 3], "nvml-context"),
+        # Measured only on adapters with no ordinal: nothing to name.
+        ({-1: 8 * GIB}, [0], [0], "nvml-context"),
+    ],
+)
+def test_the_device_column_prefers_a_measurement_and_says_so(
+    split: dict[int, int], contexts: list[int], expected: list[int], source: str
+) -> None:
+    assert vh._device_column(split, contexts) == (expected, source)
+
+
+# ---------------------------------------------------------------------------
 # gpu.vram_processes enrichment
 # ---------------------------------------------------------------------------
 
@@ -517,8 +787,10 @@ def test_holders_view_names_the_parent_of_a_foreign_child(
             FakeProcess(303, "msedgewebview2.exe", create_time=10.0),
         ],
     )
-    monkeypatch.setattr(
-        vh, "pdh_process_dedicated_bytes", lambda **_kw: {101: 10 * GIB, 102: 15 * GIB}
+    fake_pdh(
+        monkeypatch,
+        {101: 10 * GIB, 102: 15 * GIB},
+        {101: {0: 10 * GIB}, 102: {1: 15 * GIB}},
     )
     view = vh.holders_view(_incident_probe(), ENGINES)
 
@@ -554,7 +826,7 @@ def test_a_big_foreign_holder_is_kept_and_a_small_one_collapsed(
             FakeProcess(1, "services.exe", create_time=1.0),
         ],
     )
-    monkeypatch.setattr(vh, "pdh_process_dedicated_bytes", lambda **_kw: {})
+    fake_pdh(monkeypatch, {})
     view = vh.holders_view(probe, ENGINES)
     assert [row["pid"] for row in view["holders"]] == [401]
     assert view["holders"][0]["classification"] == vh.CLASS_FOREIGN
@@ -584,11 +856,113 @@ def test_a_split_model_is_one_row_not_two_added_together(
         ]
     )
     install_table(monkeypatch, [engine_proc(101, ppid=900), pytest_parent()])
-    monkeypatch.setattr(vh, "pdh_process_dedicated_bytes", lambda **_kw: {101: 15 * GIB})
+    fake_pdh(monkeypatch, {101: 15 * GIB})
     view = vh.holders_view(probe, ENGINES)
     (row,) = view["holders"]
     assert row["used_bytes"] == 15 * GIB
     assert row["gpu_indices"] == [0, 1]
+
+
+def test_the_holder_row_names_the_cards_its_memory_is_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """What the user saw on 2026-08-19: a two-GPU model reported on four cards.
+
+    NVML's ``nvmlDeviceGetComputeRunningProcesses`` lists a llama-server on
+    every visible device because llama.cpp opens a CUDA context on every one of
+    them. The bytes say the model is on CUDA0 and CUDA1, and the row must say
+    that, with the two numbers.
+    """
+    probe = FakeGpuProbe(
+        [
+            GpuInfo(index=index, name="RTX", total_bytes=32 * GIB, free_bytes=32 * GIB)
+            for index in range(4)
+        ]
+    )
+    probe.set_processes(
+        [VramProcess(gpu_index=index, pid=101, name="llama-server.exe") for index in range(4)]
+    )
+    install_table(monkeypatch, [engine_proc(101, ppid=900), pytest_parent()])
+    fake_pdh(
+        monkeypatch,
+        {101: 30 * GIB},
+        {101: {0: 16 * GIB, 1: 14 * GIB, 2: 236 * MIB, 3: 236 * MIB}},
+    )
+    view = vh.holders_view(probe, ENGINES)
+    (row,) = view["holders"]
+    assert row["gpu_indices"] == [0, 1], "the two 3090s hold a context, not the model"
+    assert row["gpu_indices_source"] == "pdh"
+    # The sub-threshold contexts stay in the payload: they are real bytes, and
+    # dropping them would stop the split adding up to the total.
+    assert row["per_gpu_bytes"] == {
+        "0": 16 * GIB,
+        "1": 14 * GIB,
+        "2": 236 * MIB,
+        "3": 236 * MIB,
+    }
+    assert row["used_bytes"] == 30 * GIB
+    assert view["per_gpu_bytes_source"] == "pdh"
+
+
+def test_without_a_measurement_the_device_column_admits_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe = FakeGpuProbe(
+        [
+            GpuInfo(index=index, name="RTX", total_bytes=32 * GIB, free_bytes=32 * GIB)
+            for index in range(2)
+        ]
+    )
+    probe.set_processes(
+        [VramProcess(gpu_index=index, pid=101, name="llama-server.exe") for index in range(2)]
+    )
+    install_table(monkeypatch, [engine_proc(101, ppid=900), pytest_parent()])
+    fake_pdh(monkeypatch, {101: 15 * GIB})
+    view = vh.holders_view(probe, ENGINES)
+    (row,) = view["holders"]
+    assert row["gpu_indices"] == [0, 1]
+    assert row["gpu_indices_source"] == "nvml-context"
+    assert row["per_gpu_bytes"] == {}
+    assert view["per_gpu_bytes_source"] == "nvml-context"
+
+
+def test_a_llama_server_from_another_install_is_named_not_foreign(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The 18.95 GiB "foreign" holder of 2026-08-19 knew who it was all along.
+
+    It was a llama-server child of a scratch StudioForge -- ``--alias scratch
+    --port 1258``, the binary copied to a temp directory by a measurement run --
+    and "foreign" is a true label that hides every fact needed to go and stop
+    it.
+    """
+    scratch = str(
+        Path("C:/temp/sf-scratch/llama-server.exe")
+        if os.name == "nt"
+        else Path("/tmp/sf-scratch/llama-server")
+    )
+    probe = FakeGpuProbe(
+        [GpuInfo(index=2, name="RTX 3090", total_bytes=24 * GIB, free_bytes=24 * GIB)]
+    )
+    probe.set_processes([VramProcess(gpu_index=2, pid=27376, name="llama-server.exe")])
+    install_table(
+        monkeypatch,
+        [engine_proc(27376, alias="scratch", port=1258, exe=scratch, ppid=900), pytest_parent()],
+    )
+    fake_pdh(monkeypatch, {27376: 19 * GIB}, {27376: {2: 19 * GIB}})
+    view = vh.holders_view(probe, ENGINES)
+    (row,) = view["holders"]
+    assert row["classification"] == vh.CLASS_OTHER_INSTANCE
+    assert (row["alias"], row["port"]) == ("scratch", 1258)
+    assert "alias scratch" in row["detail"]
+    assert "port 1258" in row["detail"]
+    assert "sf-scratch" in row["detail"]
+    assert row["gpu_indices"] == [2]
+    # Not ours, not an engine process, and therefore never a kill candidate.
+    assert row["engine_process"] is False
+    assert view["orphan_count"] == 0
+    assert view["other_instance_count"] == 1
+    assert vh.find_engine_processes(ENGINES) == []
 
 
 def test_an_engine_process_nvml_cannot_see_is_still_listed(
@@ -599,7 +973,7 @@ def test_an_engine_process_nvml_cannot_see_is_still_listed(
         [GpuInfo(index=0, name="RTX 5090", total_bytes=32 * GIB, free_bytes=32 * GIB)]
     )
     install_table(monkeypatch, [engine_proc(101, ppid=900)])
-    monkeypatch.setattr(vh, "pdh_process_dedicated_bytes", lambda **_kw: {})
+    fake_pdh(monkeypatch, {})
     view = vh.holders_view(probe, ENGINES)
     assert [row["pid"] for row in view["holders"]] == [101]
     assert view["holders"][0]["classification"] == vh.CLASS_ORPHAN
@@ -641,7 +1015,7 @@ def test_status_entries_keep_their_keys_and_gain_attribution(
             FakeProcess(302, "explorer.exe", create_time=10.0),
         ],
     )
-    monkeypatch.setattr(vh, "pdh_process_dedicated_bytes", lambda **_kw: {101: 10 * GIB})
+    fake_pdh(monkeypatch, {101: 10 * GIB}, {101: {0: 10 * GIB}})
     payload = _incident_status_payload()
     vh.annotate_status_payload(payload, engines_dir=ENGINES)
 
@@ -663,11 +1037,78 @@ def test_status_entries_keep_their_keys_and_gain_attribution(
 
 def test_status_reports_orphans_it_finds(monkeypatch: pytest.MonkeyPatch) -> None:
     install_table(monkeypatch, [engine_proc(101, ppid=900)])
-    monkeypatch.setattr(vh, "pdh_process_dedicated_bytes", lambda **_kw: {})
+    fake_pdh(monkeypatch, {})
     payload = _incident_status_payload()
     vh.annotate_status_payload(payload, engines_dir=ENGINES)
     assert payload["vram_orphan_count"] == 1
     assert payload["vram_processes"][0]["classification"] == vh.CLASS_ORPHAN
+
+
+def test_status_rows_say_what_is_held_on_their_own_gpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``device_bytes`` is the one figure here that may be summed across rows."""
+    install_table(monkeypatch, [engine_proc(101, alias="qwen", ppid=900), pytest_parent()])
+    fake_pdh(monkeypatch, {101: 30 * GIB}, {101: {0: 16 * GIB, 1: 14 * GIB, 2: 236 * MIB}})
+    payload: dict[str, Any] = {
+        "vram_processes": [
+            {"gpu_index": 0, "pid": 101, "name": "llama-server.exe", "used_bytes": 0},
+            {"gpu_index": 2, "pid": 101, "name": "llama-server.exe", "used_bytes": 0},
+        ]
+    }
+    vh.annotate_status_payload(payload, engines_dir=ENGINES)
+    rows = payload["vram_processes"]
+    assert [row["device_bytes"] for row in rows] == [16 * GIB, 236 * MIB]
+    # ...while used_bytes stays the per-process total on every row, as D23 set it.
+    assert [row["used_bytes"] for row in rows] == [30 * GIB, 30 * GIB]
+    assert rows[0]["gpu_indices_source"] == "pdh"
+    assert rows[0]["per_gpu_bytes"] == {"0": 16 * GIB, "1": 14 * GIB, "2": 236 * MIB}
+
+
+def test_status_names_another_installs_llama_server(monkeypatch: pytest.MonkeyPatch) -> None:
+    scratch = str(
+        Path("C:/temp/sf-scratch/llama-server.exe")
+        if os.name == "nt"
+        else Path("/tmp/sf-scratch/llama-server")
+    )
+    install_table(
+        monkeypatch,
+        [engine_proc(27376, alias="scratch", port=1258, exe=scratch, ppid=900), pytest_parent()],
+    )
+    fake_pdh(monkeypatch, {27376: 19 * GIB}, {27376: {2: 19 * GIB}})
+    payload: dict[str, Any] = {
+        "vram_processes": [
+            {"gpu_index": 2, "pid": 27376, "name": "llama-server.exe", "used_bytes": 0}
+        ]
+    }
+    vh.annotate_status_payload(payload, engines_dir=ENGINES)
+    (entry,) = payload["vram_processes"]
+    assert entry["classification"] == vh.CLASS_OTHER_INSTANCE
+    assert entry["alias"] == "scratch"
+    assert "port 1258" in entry["detail"]
+    # It is not an engine process of ours, so it is not counted as an orphan.
+    assert payload["vram_orphan_count"] == 0
+
+
+def test_a_llama_server_nvml_never_reported_is_listed_whoever_owns_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scratch = str(
+        Path("C:/temp/sf-scratch/llama-server.exe")
+        if os.name == "nt"
+        else Path("/tmp/sf-scratch/llama-server")
+    )
+    install_table(
+        monkeypatch,
+        [engine_proc(27376, alias="scratch", port=1258, exe=scratch, ppid=900), pytest_parent()],
+    )
+    fake_pdh(monkeypatch, {27376: 19 * GIB}, {27376: {2: 19 * GIB}})
+    payload: dict[str, Any] = {"vram_processes": []}
+    vh.annotate_status_payload(payload, engines_dir=ENGINES)
+    (entry,) = payload["vram_processes"]
+    assert entry["pid"] == 27376
+    assert entry["used_bytes"] == 19 * GIB
+    assert entry["classification"] == vh.CLASS_OTHER_INSTANCE
 
 
 def test_status_annotation_survives_a_missing_key() -> None:
@@ -814,6 +1255,58 @@ def test_holder_line_reads_as_one_row() -> None:
     assert "alias qwen3-8b" in line
 
 
+def test_the_line_names_each_card_and_what_it_holds() -> None:
+    """The row the user should have seen on 2026-08-19, not ``CUDA0,1,2,3``."""
+    line = st.vram_holder_line(
+        {
+            "name": "llama-server.exe",
+            "pid": 32188,
+            "used_bytes": 32_682_000_000,
+            "per_gpu_bytes": {
+                "0": 16_663_000_000,
+                "1": 15_547_000_000,
+                "2": 236_000_000,
+                "3": 236_000_000,
+            },
+            "gpu_indices": [0, 1],
+            "gpu_indices_source": "pdh",
+            "classification": "ours",
+            "alias": "Qwen3.8-27B-ABLITERATED",
+        }
+    )
+    assert "CUDA0 15.5 GiB, CUDA1 14.5 GiB" in line
+    assert "CUDA2" not in line, "a 0.22 GiB CUDA context is not a placement"
+    assert "ours" in line
+    assert "alias Qwen3.8-27B-ABLITERATED" in line
+
+
+def test_another_install_is_named_by_its_own_alias_and_port() -> None:
+    holder = {
+        "name": "llama-server.exe",
+        "pid": 27376,
+        "used_bytes": 20_365_000_000,
+        "per_gpu_bytes": {"2": 20_365_000_000},
+        "gpu_indices": [2],
+        "classification": "other-instance",
+        "alias": "scratch",
+        "port": 1258,
+        "detail": "llama-server from another install (alias scratch, port 1258, exe C:\\temp)",
+    }
+    assert st.vram_holder_origin(holder) == "another install (alias scratch, port 1258)"
+    line = st.vram_holder_line(holder)
+    assert "CUDA2 19.0 GiB" in line
+    # The alias is in the origin already; repeating it pushes the row off screen.
+    assert line.count("scratch") == 1
+    assert st.vram_holder_is_reclaimable(holder) is False
+
+
+def test_bytes_on_an_adapter_with_no_ordinal_are_still_shown() -> None:
+    line = st.vram_holder_line(
+        {"name": "job.exe", "pid": 7, "used_bytes": 8 * GIB, "per_gpu_bytes": {"-1": 8 * GIB}}
+    )
+    assert "other adapter 8.0 GiB" in line
+
+
 def test_an_unknown_size_says_so_rather_than_zero() -> None:
     line = st.vram_holder_line({"name": "dwm.exe", "pid": 1, "used_bytes": 0})
     assert "size —" in line
@@ -839,6 +1332,15 @@ def test_the_note_says_something_in_every_state() -> None:
 
     blind = st.vram_holders_note({"holders": [{"pid": 1}], "per_process_bytes": "unavailable"})
     assert "Per-process VRAM is unavailable" in blind
+
+    contexts = st.vram_holders_note(
+        {
+            "holders": [{"pid": 1}],
+            "per_process_bytes": "pdh",
+            "per_gpu_bytes_source": "nvml-context",
+        }
+    )
+    assert "CUDA context" in contexts
     assert st.vram_holders_note(None) == "VRAM holders unavailable."
 
 

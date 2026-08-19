@@ -1992,3 +1992,106 @@ structured 400), `tests/unit/test_gui_models_tab.py` (the "Optimal settings" lin
 * **`busy` cannot see a request that has not reached the supervisor yet.** A load and a request
   racing inside the same millisecond can still interleave; D29's gate bounds the damage, and
   nothing here promises more than "the box was idle when we looked".
+
+---
+
+## D39 -- Which GPU the memory is on: LUID -> PCI bus -> CUDA ordinal
+
+**Problem (2026-08-19).** The Dashboard's holders panel said this:
+
+```
+llama-server.exe (pid 32188) · 30.44 GiB · CUDA0,1,2,3 · ours · alias Qwen3.8-27B-ABLITERATED-…
+llama-server.exe (pid 31140) · 21.43 GiB · CUDA0,1,2,3 · ours · alias Gemma4-31B-QAT-…
+llama-server.exe (pid 27376) · 18.95 GiB · CUDA0,1,2,3 · foreign
+```
+
+Every size was right and every device list was wrong. Measured on the same box at the same moment:
+pid 32188 held 15.52 GiB on CUDA0 and 14.48 GiB on CUDA1 and **nothing** on the two 3090s; pid
+31140 10.89 + 10.10 on CUDA0/1; the "foreign" one held 18.97 GiB on CUDA2 alone. The device column
+came from NVML's `nvmlDeviceGetComputeRunningProcesses`, which enumerates the devices a process has
+a CUDA **context** on -- and llama.cpp opens one on every visible device at startup, whether or not
+a byte of the model lands there. So three models on two cards read as three models on four cards,
+which is the opposite of the answer this panel exists to give: it made the 3090s look occupied when
+they were free, and hid the fact that the "foreign" 19 GiB was sitting on exactly one of them.
+
+D23 had already looked at this and concluded it could not be done: PDH knows the bytes and the
+adapter **LUID**, NVML knows the CUDA ordinals and no LUID, and "inventing a split per GPU would be
+worse than saying so". That reasoning was right about NVML and wrong about the conclusion, because
+the two sides can be joined through a third identifier neither of them is named after.
+
+**Decision: join on the PCI address.**
+
+| Step | Call | Gives |
+| --- | --- | --- |
+| PDH instance name | `pid_32188_luid_0x00000000_0x00013C35_phys_0` | pid + adapter LUID + bytes |
+| LUID -> handle | `D3DKMTOpenAdapterFromLuid` (gdi32) | a kernel adapter handle |
+| handle -> address | `D3DKMTQueryAdapterInfo(KMTQAITYPE_ADAPTERADDRESS=6)` | `BusNumber`/`DeviceNumber`/`FunctionNumber` |
+| ordinal -> address | `nvmlDeviceGetPciInfo(h).bus` | the same bus, per CUDA ordinal |
+
+Measured on the reference rig: LUID `0x13C35` -> bus `0x01` -> CUDA0 (RTX 5090), `0x155BF` ->
+`0x42` -> CUDA1, `0x1671A` -> `0xC1` -> CUDA2 (RTX 3090), `0x175FB` -> `0xC2` -> CUDA3. A fifth
+LUID, `0x1852C`, is the Microsoft Basic Render adapter; it opens but answers `0xFFFFFFFF` for its
+address, so it resolves to nothing and its bytes land under device `-1` rather than being guessed
+onto a card.
+
+Three details are load-bearing:
+
+* **The bus in `busId` is hex.** `"00000000:42:00.0"` is bus 66, not 42. Reading it as decimal
+  silently attributes one card's memory to whatever sits at bus 42, which is the worst possible
+  failure here -- a confident wrong answer, indistinguishable from a right one.
+* **The map is rebuilt, never persisted.** `CUDA_VISIBLE_DEVICES`, a driver reset and a hot-plugged
+  eGPU all renumber CUDA ordinals, and the whole value of this is that the number matches what
+  `--device CUDA<n>` means *to this process, now*. Cached 30 s, and rebuilt immediately when a LUID
+  turns up that the current map has never seen. An adapter that failed to resolve is remembered as
+  tried, so the Basic Render adapter does not force a rebuild on every poll.
+* **`phys_<n>` is not part of the key.** It is the physical adapter *within* a LUID (linked display
+  adapters); a linked pair is one CUDA device and its instances fold into one bucket.
+
+**What the payload says now.** Every holder carries `per_gpu_bytes`
+(`{"0": 16664092672, "1": 15550488576, "2": 234725376, "3": 234721280}`) whose values always add
+back up to `used_bytes` -- nothing is dropped or spread -- and `gpu_indices` lists only the devices
+holding at least `HOLDER_MIN_BYTES` (256 MiB), which is what removes llama.cpp's ~0.22 GiB
+per-device context and leaves the cards the weights are on. `gpu_indices_source` says which
+question was answered: `pdh` is a measurement, `nvml-context` means only NVML could answer and the
+list is contexts, not placement. `used_bytes` keeps its D23 meaning exactly -- a per-process total,
+still not summable across per-GPU rows. `/api/status` entries additionally carry `device_bytes`,
+what that row's pid holds on **that** row's `gpu_index`, which is the one figure in the payload
+that may be summed across rows.
+
+The Dashboard row therefore reads
+`llama-server.exe (pid 32188) · 30.44 GiB · CUDA0 15.5 GiB, CUDA1 14.5 GiB · ours · alias …`,
+verified against the live rig on 2026-08-19.
+
+**And a "foreign" holder that knew who it was.** The third row above was a `llama-server` child of a
+*scratch* StudioForge -- `--alias scratch --port 1258`, the binary copied to a temp directory by a
+measurement run -- and its own argv said so the whole time. `foreign` is true and useless. A
+`llama-server` binary that is **not** under our engines directory is now classified
+`other-instance`, with `detail` naming its alias, port and directory. This changes nothing about
+safety: `find_engine_processes` still scopes kill candidates to our own engines tree exactly as D23
+requires, and an `other-instance` is never a kill candidate. `foreign` now means what it says --
+ComfyUI, a browser, a game.
+
+**What pins it.** `tests/unit/test_vram_holders.py`: the LUID parse (including `phys_1` folding and
+the unparseable cases), the four-card map built over the real ctypes structures against a fake
+gdi32 and a fake NVML, the hex `busId` trap, an adapter with no CUDA ordinal, the cache and its
+rebuild-on-unseen-LUID, the live per-adapter aggregation (two LUIDs -> two ordinals, unmapped ->
+-1, and that the split still sums to the D23 total), the four branches of the device column, the
+`other-instance` classification from a fake cmdline, `device_bytes` on status rows, and the rendered
+Dashboard line.
+
+**What remains.**
+
+* **Windows only.** D3DKMT is a Windows kernel-mode thunk and PDH is a Windows counter. On Linux
+  NVML reports real per-process, per-GPU bytes and needs none of this; in a container, in WSL or
+  under MIG neither side answers and the column falls back to `nvml-context`, which the payload and
+  the panel both say out loud.
+* **The per-device split is not yet fed back into calibration.** `process_gpu_bytes(pid)` exists for
+  exactly that and nothing calls it: `load_observations` records the plan's intended
+  `per_gpu_bytes` and could now record the achieved one beside it (D18, per device). It matters --
+  the load above planned `--device CUDA1,CUDA0 --tensor-split 0.5079,0.4921`, i.e. *more* on CUDA1,
+  and CUDA0 ended up holding 15.52 against CUDA1's 14.48, because llama.cpp puts the output layer
+  and its scratch on one end of the device list. A tight card can OOM on exactly that delta, and
+  today nothing learns it. Left out here because `planner.py`/`manager.py` are WP18's.
+* **A holder measured only on unresolvable adapters shows no device at all.** It reports
+  `gpu_indices: []` with source `nvml-context` and its bytes under `-1`; that is honest and it is
+  also the least useful row in the payload.

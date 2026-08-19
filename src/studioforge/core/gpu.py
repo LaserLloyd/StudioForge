@@ -600,12 +600,15 @@ def _fill_missing_used_bytes(entries: list[VramProcess]) -> None:
     counters do know (it is what Task Manager's "Dedicated GPU memory" column
     reads), so they fill the gap.
 
-    Two deliberate limits. The PDH figure is a per-process total across
-    adapters -- there is no sound instance-to-CUDA-ordinal mapping, since NVML
-    exposes no adapter LUID -- so a process split over two GPUs shows its full
-    total on each of its rows and those rows must not be summed. And a real
-    NVML number is never overwritten: on Linux NVML is authoritative and
-    per-GPU, which is strictly better.
+    Two deliberate limits. The figure filled in here is the PDH *per-process
+    total across adapters*, so a process split over two GPUs shows its full
+    total on each of its rows and those rows must not be summed. The per-device
+    split does exist (``vram_holders.pdh_process_gpu_bytes``, D39) but it is not
+    applied here: this function's contract is one number per NVML row, and
+    callers that want placement read ``per_gpu_bytes``/``device_bytes`` from
+    ``/api/status`` or ``/api/vram/holders`` instead. And a real NVML number is
+    never overwritten: on Linux NVML is authoritative and per-GPU, which is
+    strictly better.
     """
     if not entries or all(entry.used_bytes > 0 for entry in entries):
         return
