@@ -673,7 +673,9 @@ def probe_engine_features(binary: Path, tag: str = "") -> EngineFeatures:
     if not text.strip():
         return EngineFeatures.unknown(tag)
     with contextlib.suppress(OSError):
-        (directory / HELP_FILE).write_text(text, encoding="utf-8")
+        # newline="\n": the engine already emits \r\n on Windows, and text-mode
+        # translation would write \r\r\n -- a double-spaced help.txt (D38).
+        (directory / HELP_FILE).write_text(text, encoding="utf-8", newline="\n")
 
     features = parse_engine_features(text, tag)
     if features.known:
@@ -2139,7 +2141,7 @@ class EngineManager:
         self._help_cache[tag] = text
         with contextlib.suppress(OSError):
             directory.mkdir(parents=True, exist_ok=True)
-            path.write_text(text, encoding="utf-8")
+            path.write_text(text, encoding="utf-8", newline="\n")
         return text
 
     async def supported_flags(self, tag: str) -> set[str]:

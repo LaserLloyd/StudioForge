@@ -12,6 +12,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from studioforge.core.engine import (
     FEATURES_FILE,
     EngineFeatures,
@@ -178,6 +180,30 @@ def test_probe_never_executes_something_that_is_not_the_engine(tmp_path: Path) -
     finally:
         engine_module.subprocess.run = monkeypatched  # type: ignore[assignment]
     assert ran == []
+
+
+def test_the_help_cache_is_written_without_doubling_the_engines_crlf(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The engine emits \\r\\n on Windows; text-mode translation wrote \\r\\r\\n and
+    every cached help.txt came out double-spaced (D38's loose end)."""
+    import subprocess
+
+    from studioforge.core import engine as engine_module
+
+    binary = tmp_path / "llama-server.exe"
+    binary.write_bytes(b"stub")
+    crlf_help = HELP_EXCERPT.replace("\n", "\r\n").encode("utf-8")
+
+    def fake_run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(args=[], returncode=0, stdout=crlf_help, stderr=b"")
+
+    monkeypatch.setattr(engine_module.subprocess, "run", fake_run)
+    features = probe_engine_features(binary, "b10425")
+    assert features.known
+    raw = (tmp_path / "help.txt").read_bytes()
+    assert b"\r\r\n" not in raw
+    assert raw.count(b"\n") == crlf_help.count(b"\n")
 
 
 # ---------------------------------------------------------------------------

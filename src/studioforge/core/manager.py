@@ -199,14 +199,16 @@ def measure_child_vram(
     )
 
     wanted = [int(d) for d in devices]
-    split = process_gpu_bytes(pid)
+    # A fresh sample: the child just became ready, and a cached counter read
+    # from before its weights landed would say it holds nothing.
+    split = process_gpu_bytes(pid, ttl_s=0.0)
     measured = {d: int(b) for d, b in split.items() if d != OTHER_ADAPTER and b > 0}
     if measured:
         per_device = {d: measured.get(d, 0) for d in wanted} if wanted else dict(measured)
         total = sum(per_device.values()) if wanted else sum(measured.values())
         if total > 0:
             return total, per_device
-    pdh_total = int(pdh_process_dedicated_bytes().get(pid, 0) or 0)
+    pdh_total = int(pdh_process_dedicated_bytes(ttl_s=0.0).get(pid, 0) or 0)
     rows = [h for h in vram_processes(probe, own_pids=[pid]) if h.pid == pid and h.used_bytes > 0]
     rows = [h for h in rows if not wanted or h.gpu_index in wanted]
     if rows and not (pdh_total > 0 and all(h.used_bytes == pdh_total for h in rows)):

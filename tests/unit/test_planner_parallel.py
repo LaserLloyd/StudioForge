@@ -664,7 +664,9 @@ class no_pdh:
         from studioforge.core import vram_holders
 
         split = self._split
-        self._mp.setattr(vram_holders, "process_gpu_bytes", lambda pid: dict(split.get(pid, {})))
+        self._mp.setattr(
+            vram_holders, "process_gpu_bytes", lambda pid, **_: dict(split.get(pid, {}))
+        )
         self._mp.setattr(
             vram_holders,
             "pdh_process_dedicated_bytes",
@@ -792,7 +794,7 @@ def test_windows_per_process_total_is_counted_once_not_once_per_card(
     )
     from studioforge.core import vram_holders
 
-    monkeypatch.setattr(vram_holders, "process_gpu_bytes", lambda pid: {})
+    monkeypatch.setattr(vram_holders, "process_gpu_bytes", lambda pid, **_: {})
     monkeypatch.setattr(vram_holders, "pdh_process_dedicated_bytes", lambda **_: {4242: 30 * GB})
 
     total, per_device = measure_child_vram(probe, 4242, [0, 1])

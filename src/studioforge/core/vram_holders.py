@@ -867,15 +867,17 @@ def pdh_process_gpu_bytes(*, ttl_s: float = PDH_CACHE_TTL_S) -> dict[int, dict[i
     return out
 
 
-def process_gpu_bytes(pid: int) -> dict[int, int]:
+def process_gpu_bytes(pid: int, *, ttl_s: float = PDH_CACHE_TTL_S) -> dict[int, int]:
     """Per-device bytes held by one pid, ``{}`` when unknown.
 
     The single-process form of :func:`pdh_process_gpu_bytes`, for callers that
     have a pid and want to know what its load actually placed where -- notably
     the calibration loop, which records a plan's *intended* per-device split and
-    can now record the achieved one beside it (D18/D39).
+    records the achieved one beside it (D18/D39/D40). ``ttl_s=0`` forces a fresh
+    counter sample: a child that became ready inside the cache window would
+    otherwise be read off a sample taken before it allocated anything.
     """
-    return dict(pdh_process_gpu_bytes().get(int(pid), {}))
+    return dict(pdh_process_gpu_bytes(ttl_s=ttl_s).get(int(pid), {}))
 
 
 def reset_pdh_cache() -> None:
