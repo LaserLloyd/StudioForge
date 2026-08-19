@@ -190,6 +190,20 @@ class TestSlotsAndExactContext:
         summary = st.parallel_summary(self._entry(max_parallel=7, recommended=2, basis="measured"))
         assert summary == "2 of 7 slots (measured)"
 
+    def test_a_measurement_that_confirms_the_ceiling_still_says_it_was_measured(self) -> None:
+        """Otherwise a benchmarked placement is indistinguishable from an unmeasured one."""
+        from studioforge.gui import state as st
+
+        summary = st.parallel_summary(self._entry(max_parallel=2, recommended=2, basis="measured"))
+        assert summary == "2 of 2 slots (measured)"
+
+    def test_an_estimate_that_lands_below_the_ceiling_is_still_worth_a_line(self) -> None:
+        from studioforge.gui import state as st
+
+        assert st.parallel_summary(self._entry(max_parallel=8, recommended=3)) == (
+            "3 of 8 slots (estimated)"
+        )
+
     def test_the_four_context_buttons_are_the_ones_the_mcp_tool_names(self) -> None:
         """A user asking for "256k" and an agent asking for 262144 mean one load."""
         from studioforge.gui import state as st

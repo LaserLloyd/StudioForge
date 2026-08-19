@@ -1487,20 +1487,28 @@ def placement_headline(profiles: Mapping[str, Any]) -> str:
 
 
 def parallel_summary(entry: Mapping[str, Any]) -> str:
-    """ "4 of 7 slots (measured)" for one placement, or ``""`` when there is nothing to say.
+    """ "2 of 7 slots (measured)" for one placement, or ``""`` when nothing was learned.
 
-    Empty when the recommendation equals the ceiling, which is the case on a rig
-    that has never run a parallel benchmark -- D17's knee is already folded into
-    ``max_parallel``, so printing both would be printing one number twice. The
-    line appears exactly when the two diverge, which is exactly when the user
-    has learned something.
+    Two cases are worth a line and one is not.
+
+    *Worth it:* the recommendation is **below** the ceiling (a real trade-off the
+    user should see), or it was **measured** at all -- a sweep that confirms the
+    estimate is still a fact about this placement, and "measured" beside the
+    ceiling is how the user knows the button has already been pressed.
+
+    *Not worth it:* an estimate that equals the ceiling, which is every
+    placement on a rig that has never benchmarked anything. D17's knee is
+    already folded into ``max_parallel``, so that line would print one number
+    twice on every row of the dialog.
     """
     optimal = entry.get("optimal") or {}
     ceiling = int(optimal.get("max_parallel") or 0)
     recommended = optimal.get("recommended_parallel")
-    if not ceiling or recommended is None or int(recommended) == ceiling:
+    if not ceiling or recommended is None:
         return ""
     basis = str(optimal.get("recommended_parallel_basis") or "estimated")
+    if int(recommended) == ceiling and basis != "measured":
+        return ""
     return f"{int(recommended)} of {ceiling} slots ({basis})"
 
 
