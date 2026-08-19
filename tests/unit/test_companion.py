@@ -1140,3 +1140,47 @@ def test_recover_explains_a_credential_refusal_instead_of_cannot_reach(monkeypat
     assert "sfctl servers add" in out and "--api-key <PIN>" in out
     assert "Setup" in out
     assert "cannot reach" not in out
+
+
+def test_recover_probes_the_watchdog_when_the_mcp_error_hides_the_status(monkeypatch: Any) -> None:
+    """The MCP client says only 'Server returned an error response' for a 401;
+    recover must probe the watchdog itself and still name the credential fix."""
+    from studioforge_companion import mcp_proxy as proxy_module
+
+    async def opaque(profile: Any, tool: str, arguments: dict[str, Any]) -> Any:
+        raise RuntimeError("MCPError: Server returned an error response")
+
+    async def probe(profile: Any, **kwargs: Any) -> str:
+        return "unauthorized"
+
+    monkeypatch.setattr(proxy_module, "call_watchdog_tool", opaque)
+    monkeypatch.setattr(proxy_module, "probe_watchdog_auth", probe)
+    result = runner.invoke(
+        cli_module.app,
+        ["--url", "http://127.0.0.1:1", "--no-color", "recover"],
+        catch_exceptions=False,
+    )
+    out = _all_output(result)
+    assert result.exit_code != 0
+    assert "needs a credential" in out and "--api-key <PIN>" in out
+
+
+def test_recover_still_says_unreachable_when_the_watchdog_is_down(monkeypatch: Any) -> None:
+    from studioforge_companion import mcp_proxy as proxy_module
+
+    async def opaque(profile: Any, tool: str, arguments: dict[str, Any]) -> Any:
+        raise RuntimeError("ConnectError: All connection attempts failed")
+
+    async def probe(profile: Any, **kwargs: Any) -> str:
+        return "unreachable"
+
+    monkeypatch.setattr(proxy_module, "call_watchdog_tool", opaque)
+    monkeypatch.setattr(proxy_module, "probe_watchdog_auth", probe)
+    result = runner.invoke(
+        cli_module.app,
+        ["--url", "http://127.0.0.1:1", "--no-color", "recover"],
+        catch_exceptions=False,
+    )
+    out = _all_output(result)
+    assert "cannot reach the StudioForge watchdog" in out
+    assert "needs a credential" not in out

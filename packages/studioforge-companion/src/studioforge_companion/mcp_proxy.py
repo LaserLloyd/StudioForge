@@ -425,6 +425,43 @@ async def call_watchdog_tool(
     return await upstream.call(name, arguments)
 
 
+async def probe_watchdog_auth(profile: ServerProfile, *, timeout_s: float = 5.0) -> str:
+    """``"ok"`` | ``"unauthorized"`` | ``"unreachable"`` -- what the watchdog says to us.
+
+    The MCP client collapses every non-2xx into "Server returned an error
+    response", which hides the one distinction the operator needs after a
+    failed ``recover``: is the watchdog DOWN, or is it UP and refusing our
+    credential? One plain HTTP round-trip with the profile's credential tells
+    them apart; ``/health`` alone would not, because it is deliberately open.
+    """
+    import httpx
+
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+    if profile.api_key:
+        headers["Authorization"] = f"Bearer {profile.api_key}"
+    body = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "sfctl-probe", "version": "0"},
+        },
+    }
+    try:
+        async with httpx.AsyncClient(timeout=timeout_s) as client:
+            response = await client.post(profile.watchdog_mcp_url, json=body, headers=headers)
+    except Exception:  # noqa: BLE001 - any transport failure is "unreachable"
+        return "unreachable"
+    if response.status_code in (401, 403):
+        return "unauthorized"
+    return "ok"
+
+
 def result_text(result: types.CallToolResult) -> str:
     """Flatten a tool result's text blocks for terminal display."""
     parts: list[str] = []

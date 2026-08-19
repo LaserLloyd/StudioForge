@@ -1333,6 +1333,7 @@ def recover(
     from studioforge_companion.mcp_proxy import (
         call_watchdog_tool,
         describe_exception,
+        probe_watchdog_auth,
         result_text,
     )
 
@@ -1362,7 +1363,11 @@ def recover(
         except Exception as exc:
             detail = describe_exception(exc)
             lowered = detail.lower()
-            if "401" in detail or "credential" in lowered or "unauthor" in lowered:
+            refused = "401" in detail or "credential" in lowered or "unauthor" in lowered
+            if not refused:
+                # The MCP client hides the status code; ask the watchdog directly.
+                refused = await probe_watchdog_auth(profile) == "unauthorized"
+            if refused:
                 # The watchdog guards the recovery tools with the same
                 # credential as the main server: server.api_key, or the MCP
                 # pairing PIN when no key is set. "Cannot reach" would send the
