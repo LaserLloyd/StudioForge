@@ -117,7 +117,7 @@ placement could carry — not whatever slot count the planner happened to pick w
 `max_parallel` is how many slots **fit**; `recommended_parallel` is how many are **worth running**,
 and it is the one `load_args.parallel` asks for. Until a parallel benchmark has run they are the
 same number and the basis reads `estimated`
-— see [recommended_parallel](#recommended_parallel--how-many-are-worth-running-d37).
+— see [recommended_parallel](#recommendedparallel--how-many-are-worth-running-d37).
 
 **Two generation speeds, because one number cannot describe the row.** Every decode step re-reads
 the KV cache, so generation slows as the window fills. `est_gen_tps` is one stream with about 8k
