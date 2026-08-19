@@ -113,9 +113,9 @@ Register the stdio bridge once:
 
 Add `"args": ["-s", "rig", "mcp"]` to pin a profile.
 
-`sfctl mcp` merges **two** upstream MCP servers into one list of **24 tools**.
+`sfctl mcp` merges **two** upstream MCP servers into one list of **26 tools**.
 
-**Management** (the main app, `<url>/mcp`) — 14 tools:
+**Management** (the main app, `<url>/mcp`) — 16 tools:
 
 | Tool | What it does |
 | --- | --- |
@@ -123,8 +123,10 @@ Add `"args": ["-s", "rig", "mcp"]` to pin a profile.
 | `model_options` | Every context tier for one model, when the recommended row is not what you need |
 | `model_info` | One model in detail, including what the running engine *actually* reports |
 | `load_model` | Load now; pass a catalog row's `load_args` verbatim |
+| `load_recommended` | Name the model and the context; the server picks the GPUs, KV cache and slots and loads at exactly that window, or refuses with numbers |
 | `unload_model` | Free its VRAM immediately |
-| `test_model` | Smoke-test end to end and report tokens/second |
+| `test_model` | Smoke-test end to end on an idle server and report tokens/second |
+| `benchmark_parallel` | Measure how many concurrent slots a model is worth running on a set of cards |
 | `search_models` | Browse HuggingFace. One thin row per repo — **no sizes**, HF publishes none at search time |
 | `repo_details` | One repo in full: per-quant sizes, fit verdicts, and the context each GPU placement reaches |
 | `download_model` | Queue a download; it runs in the background and appears in `list_models` when it lands |

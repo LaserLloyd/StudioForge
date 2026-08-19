@@ -1995,306 +1995,6 @@ structured 400), `tests/unit/test_gui_models_tab.py` (the "Optimal settings" lin
 
 ---
 
-## D39 -- Which GPU the memory is on: LUID -> PCI bus -> CUDA ordinal
-
-**Problem (2026-08-19).** The Dashboard's holders panel said this:
-
-```
-llama-server.exe (pid 32188) · 30.44 GiB · CUDA0,1,2,3 · ours · alias Qwen3.8-27B-ABLITERATED-…
-llama-server.exe (pid 31140) · 21.43 GiB · CUDA0,1,2,3 · ours · alias Gemma4-31B-QAT-…
-llama-server.exe (pid 27376) · 18.95 GiB · CUDA0,1,2,3 · foreign
-```
-
-Every size was right and every device list was wrong. Measured on the same box at the same moment:
-pid 32188 held 15.52 GiB on CUDA0 and 14.48 GiB on CUDA1 and **nothing** on the two 3090s; pid
-31140 10.89 + 10.10 on CUDA0/1; the "foreign" one held 18.97 GiB on CUDA2 alone. The device column
-came from NVML's `nvmlDeviceGetComputeRunningProcesses`, which enumerates the devices a process has
-a CUDA **context** on -- and llama.cpp opens one on every visible device at startup, whether or not
-a byte of the model lands there. So three models on two cards read as three models on four cards,
-which is the opposite of the answer this panel exists to give: it made the 3090s look occupied when
-they were free, and hid the fact that the "foreign" 19 GiB was sitting on exactly one of them.
-
-D23 had already looked at this and concluded it could not be done: PDH knows the bytes and the
-adapter **LUID**, NVML knows the CUDA ordinals and no LUID, and "inventing a split per GPU would be
-worse than saying so". That reasoning was right about NVML and wrong about the conclusion, because
-the two sides can be joined through a third identifier neither of them is named after.
-
-**Decision: join on the PCI address.**
-
-| Step | Call | Gives |
-| --- | --- | --- |
-| PDH instance name | `pid_32188_luid_0x00000000_0x00013C35_phys_0` | pid + adapter LUID + bytes |
-| LUID -> handle | `D3DKMTOpenAdapterFromLuid` (gdi32) | a kernel adapter handle |
-| handle -> address | `D3DKMTQueryAdapterInfo(KMTQAITYPE_ADAPTERADDRESS=6)` | `BusNumber`/`DeviceNumber`/`FunctionNumber` |
-| ordinal -> address | `nvmlDeviceGetPciInfo(h).bus` | the same bus, per CUDA ordinal |
-
-Measured on the reference rig: LUID `0x13C35` -> bus `0x01` -> CUDA0 (RTX 5090), `0x155BF` ->
-`0x42` -> CUDA1, `0x1671A` -> `0xC1` -> CUDA2 (RTX 3090), `0x175FB` -> `0xC2` -> CUDA3. A fifth
-LUID, `0x1852C`, is the Microsoft Basic Render adapter; it opens but answers `0xFFFFFFFF` for its
-address, so it resolves to nothing and its bytes land under device `-1` rather than being guessed
-onto a card.
-
-Three details are load-bearing:
-
-* **The bus in `busId` is hex.** `"00000000:42:00.0"` is bus 66, not 42. Reading it as decimal
-  silently attributes one card's memory to whatever sits at bus 42, which is the worst possible
-  failure here -- a confident wrong answer, indistinguishable from a right one.
-* **The map is rebuilt, never persisted.** `CUDA_VISIBLE_DEVICES`, a driver reset and a hot-plugged
-  eGPU all renumber CUDA ordinals, and the whole value of this is that the number matches what
-  `--device CUDA<n>` means *to this process, now*. Cached 30 s, and rebuilt immediately when a LUID
-  turns up that the current map has never seen. An adapter that failed to resolve is remembered as
-  tried, so the Basic Render adapter does not force a rebuild on every poll.
-* **`phys_<n>` is not part of the key.** It is the physical adapter *within* a LUID (linked display
-  adapters); a linked pair is one CUDA device and its instances fold into one bucket.
-
-**What the payload says now.** Every holder carries `per_gpu_bytes`
-(`{"0": 16664092672, "1": 15550488576, "2": 234725376, "3": 234721280}`) whose values always add
-back up to `used_bytes` -- nothing is dropped or spread -- and `gpu_indices` lists only the devices
-holding at least `HOLDER_MIN_BYTES` (256 MiB), which is what removes llama.cpp's ~0.22 GiB
-per-device context and leaves the cards the weights are on. `gpu_indices_source` says which
-question was answered: `pdh` is a measurement, `nvml-context` means only NVML could answer and the
-list is contexts, not placement. `used_bytes` keeps its D23 meaning exactly -- a per-process total,
-still not summable across per-GPU rows. `/api/status` entries additionally carry `device_bytes`,
-what that row's pid holds on **that** row's `gpu_index`, which is the one figure in the payload
-that may be summed across rows.
-
-The Dashboard row therefore reads
-`llama-server.exe (pid 32188) · 30.44 GiB · CUDA0 15.5 GiB, CUDA1 14.5 GiB · ours · alias …`,
-verified against the live rig on 2026-08-19.
-
-**And a "foreign" holder that knew who it was.** The third row above was a `llama-server` child of a
-*scratch* StudioForge -- `--alias scratch --port 1258`, the binary copied to a temp directory by a
-measurement run -- and its own argv said so the whole time. `foreign` is true and useless. A
-`llama-server` binary that is **not** under our engines directory is now classified
-`other-instance`, with `detail` naming its alias, port and directory. This changes nothing about
-safety: `find_engine_processes` still scopes kill candidates to our own engines tree exactly as D23
-requires, and an `other-instance` is never a kill candidate. `foreign` now means what it says --
-ComfyUI, a browser, a game.
-
-**What pins it.** `tests/unit/test_vram_holders.py`: the LUID parse (including `phys_1` folding and
-the unparseable cases), the four-card map built over the real ctypes structures against a fake
-gdi32 and a fake NVML, the hex `busId` trap, an adapter with no CUDA ordinal, the cache and its
-rebuild-on-unseen-LUID, the live per-adapter aggregation (two LUIDs -> two ordinals, unmapped ->
--1, and that the split still sums to the D23 total), the four branches of the device column, the
-`other-instance` classification from a fake cmdline, `device_bytes` on status rows, and the rendered
-Dashboard line.
-
-**What remains.**
-
-* **Windows only.** D3DKMT is a Windows kernel-mode thunk and PDH is a Windows counter. On Linux
-  NVML reports real per-process, per-GPU bytes and needs none of this; in a container, in WSL or
-  under MIG neither side answers and the column falls back to `nvml-context`, which the payload and
-  the panel both say out loud.
-* **The per-device split is not yet fed back into calibration.** `process_gpu_bytes(pid)` exists for
-  exactly that and nothing calls it: `load_observations` records the plan's intended
-  `per_gpu_bytes` and could now record the achieved one beside it (D18, per device). It matters --
-  the load above planned `--device CUDA1,CUDA0 --tensor-split 0.5079,0.4921`, i.e. *more* on CUDA1,
-  and CUDA0 ended up holding 15.52 against CUDA1's 14.48, because llama.cpp puts the output layer
-  and its scratch on one end of the device list. A tight card can OOM on exactly that delta, and
-  today nothing learns it. Left out here because `planner.py`/`manager.py` are WP18's.
-* **A holder measured only on unresolvable adapters shows no device at all.** It reports
-  `gpu_indices: []` with source `nvml-context` and its bytes under `-1`; that is honest and it is
-  also the least useful row in the payload.
-
-## D38 -- The engine's newer features, each one measured before it was switched on
-
-**Problem.** `b10425` shipped a pile of things StudioForge was not using: MTP and n-gram
-speculative decoding (`--spec-type` grew from two useful values to eleven), tensor parallelism
-(`-sm tensor`), a host-RAM prompt cache (`-cram`), GPU-side sampling (`-bs`), an explicit unified-KV
-switch. Two of them are large wins on this rig. One of them is a loss. Nothing in the codebase
-could tell them apart, and worse, nothing could tell whether a flag it passed was even *read* --
-D2 recorded `b10425` accepting the renamed `--draft*` family and silently ignoring it, which looks
-exactly like a feature that does not help.
-
-Everything below was measured on a **scratch** instance: the engine copied read-only out of the
-live data directory, port 1258, the 3090 pair (which `nvidia-smi` showed idle), and every child
-killed and verified gone afterwards. The live rig was never touched.
-
-### 1. A flag is passed only when the active engine advertises it
-
-`EngineFeatures` parses each build's own `--help` into `engines/<tag>/features.json`: the flag list
-**and the value lists** -- `--split-mode {none,layer,row,tensor}`, `--spec-type`'s eleven types,
-`--flash-attn [on|off|auto]` -- plus the defaults that decide what we must *not* re-emit
-(`--spec-draft-n-max 3`, `--cache-ram 8192`, `--ctx-checkpoints 32`). Warmed at boot by
-`ensure_engine`, readable synchronously next to the binary so the supervisor needs no dependency on
-the engine manager, and readable *without spawning anything* by the capabilities report.
-
-The important case is the one that is easy to get wrong: **"the help could not be read" is not "the
-engine has nothing".** An unknown build advertises nothing and the launch falls back to the flag
-surface that predates this gating -- a draft model still drafts, no new flag appears. Guessing
-either way is how a feature silently stops working.
-
-### 2. `spec_type: auto` -- MTP where it exists, n-grams where they pay, nothing otherwise
-
-Speculative decoding is distribution-preserving: the draft proposes, the full model verifies,
-rejected tokens are resampled from the true distribution. It is the rare feature that is pure speed
-with no quality cost, so `auto` is allowed to turn it on by itself. The ladder:
-
-1. `draft-mtp` when the GGUF carries `nextn_predict_layers >= 1` -- the model's own head, no second
-   model, no extra VRAM;
-2. `draft-simple` when a `draft_model_id` is attached (the previous behaviour);
-3. `ngram-mod` for thinking and MoE models -- draftless, ~16 MiB of host state;
-4. `none`.
-
-Measured on **Qwen3.8-27B Q5_K_S** (`qwen35`, `nextn_predict_layers=1`), one RTX 3090, 8k context,
-four *distinct* 256-token prose prompts, greedy, `cache_prompt: false`:
-
-| `--spec-type` | tok/s | vs none | acceptance (`draft_n_accepted/draft_n`) |
-| --- | --- | --- | --- |
-| `none` | 37.75 | -- | -- |
-| `draft-mtp`, n_max 3 | **50.70** | **+34.3%** | 0.528 |
-| `draft-mtp`, n_max 4 | 47.48 | +25.8% | 0.446 |
-| `ngram-mod` | 37.91 | +0.4% | no drafts emitted at all |
-| `draft-mtp,ngram-mod`, n_max 4 | 47.05 | +24.6% | 0.446 (draft counts identical to mtp alone) |
-
-On a code-rewrite turn the same model measured +95% with `draft-mtp` and +114% with `ngram-mod`.
-That inversion is the reason for a ladder rather than one answer: the strategies are good at
-different things, and `ngram-mod` is free when it is wrong. Combining them added nothing
-measurable, so `auto` picks exactly one.
-
-**`ngram-mod` clears the "does not slow a non-repetitive request by ~10%" bar with room to spare**
-(+0.4%, and `timings.draft_n` is null on unseen prose -- it does not even try), so it ships on for
-thinking/MoE models. On the 1.5B the same check gave parity on the first, cold request.
-
-**Benchmarking trap worth writing down.** `ngram-mod` learns from what it has already generated.
-Sending the *same* prompt three times measured **+751%** on the 27B and +20% on the 1.5B; four
-distinct prompts measured +0.4%. Every ngram number in this section is from distinct prompts.
-
-**`--spec-draft-n-max` is 3, not 16.** The constant here was 16 under a comment claiming that was
-the b10425 default; the help text says `(default: 3)`. Depth is not free: at n_max 4 acceptance
-fell from 0.528 to 0.446 and throughput with it, because every extra rejected token was verified
-for nothing. The flag is emitted only for `draft-*` types -- the n-gram types read
-`--spec-ngram-*-n-max` instead, and emitting it there would be a flag that looks like it does
-something.
-
-**Reading it.** `/props` is still not to be trusted (it reports `speculative.types: "none"` while
-drafting). `/slots[].speculative` came back `true` for `ngram-mod` too, so it means "configured",
-not "working"; only `timings.draft_n` / `draft_n_accepted` mean working. Both signals were read off
-the scratch loads above; `/props` was not relied on for any of them.
-
-### 3. Tensor split is opt-in, gated, and was *slower* here
-
-Qwen2.5-1.5B Q4_K_M, two RTX 3090s, 8k context, three runs each, median:
-
-| placement | generation | prompt |
-| --- | --- | --- |
-| one 3090 | 352.5 tok/s | 2803.6 tok/s |
-| two, `-sm layer` | 344.4 tok/s | 2722.5 tok/s |
-| two, `-sm tensor` | **294.3 tok/s** | **1182.0 tok/s** |
-| two, `-sm row` | fails to load | -- |
-
-A small model is tensor mode's worst case -- the per-layer all-reduce is fixed while the halved
-weight read shrinks with the model -- so a 31B may well win. That is precisely why this is a
-*benchmark dimension* (every multi-GPU mode now has a `-tensor` variant for an eligible model) and
-not a default. `layer` stays the default and `split_mode: auto` resolves to `layer` unless every
-gate passes.
-
-`throughput.estimate` grew a `split_mode`: layer sums the per-device times (a pipeline), tensor
-takes their `max` and adds `n_layer * T_TENSOR_SYNC_S` with `T_TENSOR_SYNC_S = 60e-6` -- two PCIe
-all-reduces per layer, an approximation calibrated to reproduce the crossover above, not a
-measurement of this bus. Prefill is deliberately modelled *identically* for both modes: a parallel
-roofline would advertise a prefill win and the rig measured a 57% prefill loss, so claiming either
-would be inventing a constant.
-
-**The gates**, all checked before the child is spawned, because llama.cpp enforces one of them by
-exiting -- `-fa off -sm tensor` dies with `SPLIT_MODE_TENSOR requires flash_attn to be enabled`:
-at least two devices; the engine lists `tensor`; flash attention on; an unquantized KV cache; a
-dense, non-hybrid model. An explicit `tensor` that fails a gate is **refused with the reasons**;
-`auto` downgrades to `layer` and records why on the plan. Someone who typed "tensor" and quietly
-got "layer" would go on to benchmark the wrong thing.
-
-Two findings the gates are *not* derived from a crash: `-sm tensor` with a `q8_0` KV cache
-**started and answered correctly** on b10425 (upstream documents quantized KV as unimplemented
-there, so declining it is StudioForge policy and is the gate most likely to be relaxed), and
-`--backend-sampling` under tensor mode logs `backend sampling not supported with
-SPLIT_MODE_TENSOR; using CPU` and carries on.
-
-`-sm row` is dead on CUDA: `error loading model: device CUDA2 does not support split buffers`. It
-stays in the `SplitMode` type only because the engine still lists it; it is documented in
-LIMITATIONS.
-
-### 4. Unified KV: verified, and deliberately turned *off* -- explicitly
-
-D17 left this "unverified, and not recommended anywhere until it is". Measured with the 0.5B,
-`--parallel 2 --ctx-size 16384`:
-
-| | engine log | `n_ctx` per slot | VRAM | one 12k-token request | two concurrent 12k requests |
-| --- | --- | --- | --- | --- | --- |
-| nothing passed | `kv_unified = 'false'` | 8192 | 997 MiB | **400** up front, naming the limit | **400** each, up front |
-| `--kv-unified` | `kv_unified = 'true'` | 16384 | 1005 MiB | **accepted** | **500 "Context size has been exceeded"**, mid-generation |
-| `--no-kv-unified` | `kv_unified = 'false'` | 8192 | -- | 400 | -- |
-
-So the working assumption going in was wrong in a useful way: StudioForge passing nothing does
-**not** leave unified on. The engine's help says "default: enabled if number of slots is auto", and
-StudioForge always passes an explicit `--parallel`, so the partitioned pool was already what
-happened -- by accident of another setting.
-
-**Decision: keep the partitioned pool, and say so.** Multi-slot launches now pass
-`--no-kv-unified` explicitly. That makes the catalog's `ctx_per_slot` literally true rather than
-true-by-coincidence, and it survives an engine release changing its default. The quality-first
-argument decides the tie between the two things worth wanting: unified buys a lone conversation the
-whole pool at the same VRAM, but it buys it by over-committing, and the way an over-commit surfaces
-is a **500 during generation** on an agent that had already spent a minute thinking. A 400 before
-any work starts is the better failure. `kv_unified: true` remains a per-model opt-in for a
-single-user long-context model, now documented with the number above instead of a shrug.
-
-Same VRAM either way is now measured, not assumed: 997 vs 1005 MiB.
-
-### 5. `--cache-ram` on by default; `-ub` measured and left alone
-
-`--cache-ram` keeps evicted prompt prefixes in *system* memory. It is the other half of
-`--cache-reuse` -- reuse recovers a prefix still in the slot, this recovers one that left it, which
-is exactly what happens to an OpenClaw agent's system prompt while another model borrows the slot.
-Measured VRAM at `-cram 8192` and `-cram 32768`: **identical, 1492 MiB**. No token can change. On
-by default at `min(32 GiB, 25% of system RAM)`.
-
-`-ub` was measured and deliberately **not** turned on (1.5B, one 3090, 5166-token prompt):
-
-| `-ub` | prompt processing | VRAM |
-| --- | --- | --- |
-| 512 (default) | 15232 tok/s | 1492 MiB |
-| 1024 | 17307 tok/s (+13.6%) | 1562 MiB (+70) |
-| 2048 (with `-b 2048`) | 18061 tok/s (+18.6%) | 1702 MiB (+210) |
-
-The compute buffer grows with `-ub` and `planner.compute_overhead_fraction` does not model it.
-Raising `-ub` globally would make every VRAM estimate optimistic by roughly that much, scaled to
-the model -- on a GPU-only server that turns a fit into an OOM. So `engine.ubatch_size` exists,
-defaults to unset, and the benchmark can measure it (`ubatch_sizes=(1024, 2048)`); making the
-planner ubatch-aware is left for whoever owns `planner.py` next.
-
-`--backend-sampling` stays off: b10425 labels it experimental, and under the quality-first rule
-"experimental with no measured quality claim" is itself the reason.
-
-`--sleep-idle-seconds` is never passed -- StudioForge owns model lifetime through TTL, and a second
-idle timer inside the child would unload state the supervisor believes is resident. `--fit off`
-stays (D11). `--flash-attn on` stays, and tensor mode now depends on it.
-
-**What pins it.** `tests/unit/test_engine_features.py` parses a *verbatim* trimmed excerpt of
-b10425's help (`tests/unit/data/b10425_help_excerpt.txt`) -- a parser tested only against a fixture
-its author invented would pass and then drop every flag in production.
-`tests/unit/test_supervisor_features.py` covers the whole spec-type matrix, the refusal for a type
-the engine lacks, the tensor gates one by one, refuse-vs-downgrade, and that no new flag reaches an
-engine that does not advertise it. `test_throughput.py` pins the tensor arithmetic including the
-crossover; `test_benchmark.py` pins that the default mode list did not change length.
-
-**What remains.**
-
-* **Calibration does not know about split mode.** Throughput observations key on model, device set
-  and GPU class. A model benchmarked in tensor mode teaches the layer-mode estimate a correction it
-  should not have. Rare enough that medians absorb it; a `split_mode` column would fix it.
-* **The planner's compute-buffer term is not ubatch-aware** (above).
-* **MTP was measured at one slot only.** `draft-mtp` with `--parallel > 1` is untested here; there
-  is no reason to expect trouble and no evidence either.
-* **`help.txt` is written with translated newlines on Windows**, so the cached copy is
-  double-spaced. Harmless -- `parse_help_entries` skips blank lines -- but it is why the fixture
-  generator had to filter them.
-* **The catalog, placements and the Setup tab do not show any of this yet.** `LoadPlan` and
-  `InstanceInfo` carry `speculative` and the resolved `split_mode`, and
-  `capabilities.engine_feature_rows` renders the Engine card, but the surfaces themselves belong to
-  work packages running alongside this one.
-
----
-
 ## D37 -- How many slots are worth running, and loading at exactly the context you asked for
 
 **Problem.** Two things the server could not say, and a user's sentence that named both:
@@ -2506,3 +2206,402 @@ context buttons).
 * **`ctx_size` is not remembered.** Asking for 262144 loads at 262144, and the next unqualified load
   goes back to the planner's ladder. That is deliberate -- this path never writes settings -- but a
   user who wants 262144 *every* time still has to pin `ctx_size` in the model's settings.
+
+---
+
+## D38 -- The engine's newer features, each one measured before it was switched on
+
+**Problem.** `b10425` shipped a pile of things StudioForge was not using: MTP and n-gram
+speculative decoding (`--spec-type` grew from two useful values to eleven), tensor parallelism
+(`-sm tensor`), a host-RAM prompt cache (`-cram`), GPU-side sampling (`-bs`), an explicit unified-KV
+switch. Two of them are large wins on this rig. One of them is a loss. Nothing in the codebase
+could tell them apart, and worse, nothing could tell whether a flag it passed was even *read* --
+D2 recorded `b10425` accepting the renamed `--draft*` family and silently ignoring it, which looks
+exactly like a feature that does not help.
+
+Everything below was measured on a **scratch** instance: the engine copied read-only out of the
+live data directory, port 1258, the 3090 pair (which `nvidia-smi` showed idle), and every child
+killed and verified gone afterwards. The live rig was never touched.
+
+### 1. A flag is passed only when the active engine advertises it
+
+`EngineFeatures` parses each build's own `--help` into `engines/<tag>/features.json`: the flag list
+**and the value lists** -- `--split-mode {none,layer,row,tensor}`, `--spec-type`'s eleven types,
+`--flash-attn [on|off|auto]` -- plus the defaults that decide what we must *not* re-emit
+(`--spec-draft-n-max 3`, `--cache-ram 8192`, `--ctx-checkpoints 32`). Warmed at boot by
+`ensure_engine`, readable synchronously next to the binary so the supervisor needs no dependency on
+the engine manager, and readable *without spawning anything* by the capabilities report.
+
+The important case is the one that is easy to get wrong: **"the help could not be read" is not "the
+engine has nothing".** An unknown build advertises nothing and the launch falls back to the flag
+surface that predates this gating -- a draft model still drafts, no new flag appears. Guessing
+either way is how a feature silently stops working.
+
+### 2. `spec_type: auto` -- MTP where it exists, n-grams where they pay, nothing otherwise
+
+Speculative decoding is distribution-preserving: the draft proposes, the full model verifies,
+rejected tokens are resampled from the true distribution. It is the rare feature that is pure speed
+with no quality cost, so `auto` is allowed to turn it on by itself. The ladder:
+
+1. `draft-mtp` when the GGUF carries `nextn_predict_layers >= 1` -- the model's own head, no second
+   model, no extra VRAM;
+2. `draft-simple` when a `draft_model_id` is attached (the previous behaviour);
+3. `ngram-mod` for thinking and MoE models -- draftless, ~16 MiB of host state;
+4. `none`.
+
+Measured on **Qwen3.8-27B Q5_K_S** (`qwen35`, `nextn_predict_layers=1`), one RTX 3090, 8k context,
+four *distinct* 256-token prose prompts, greedy, `cache_prompt: false`:
+
+| `--spec-type` | tok/s | vs none | acceptance (`draft_n_accepted/draft_n`) |
+| --- | --- | --- | --- |
+| `none` | 37.75 | -- | -- |
+| `draft-mtp`, n_max 3 | **50.70** | **+34.3%** | 0.528 |
+| `draft-mtp`, n_max 4 | 47.48 | +25.8% | 0.446 |
+| `ngram-mod` | 37.91 | +0.4% | no drafts emitted at all |
+| `draft-mtp,ngram-mod`, n_max 4 | 47.05 | +24.6% | 0.446 (draft counts identical to mtp alone) |
+
+On a code-rewrite turn the same model measured +95% with `draft-mtp` and +114% with `ngram-mod`.
+That inversion is the reason for a ladder rather than one answer: the strategies are good at
+different things, and `ngram-mod` is free when it is wrong. Combining them added nothing
+measurable, so `auto` picks exactly one.
+
+**`ngram-mod` clears the "does not slow a non-repetitive request by ~10%" bar with room to spare**
+(+0.4%, and `timings.draft_n` is null on unseen prose -- it does not even try), so it ships on for
+thinking/MoE models. On the 1.5B the same check gave parity on the first, cold request.
+
+**Benchmarking trap worth writing down.** `ngram-mod` learns from what it has already generated.
+Sending the *same* prompt three times measured **+751%** on the 27B and +20% on the 1.5B; four
+distinct prompts measured +0.4%. Every ngram number in this section is from distinct prompts.
+
+**`--spec-draft-n-max` is 3, not 16.** The constant here was 16 under a comment claiming that was
+the b10425 default; the help text says `(default: 3)`. Depth is not free: at n_max 4 acceptance
+fell from 0.528 to 0.446 and throughput with it, because every extra rejected token was verified
+for nothing. The flag is emitted only for `draft-*` types -- the n-gram types read
+`--spec-ngram-*-n-max` instead, and emitting it there would be a flag that looks like it does
+something.
+
+**Reading it.** `/props` is still not to be trusted (it reports `speculative.types: "none"` while
+drafting). `/slots[].speculative` came back `true` for `ngram-mod` too, so it means "configured",
+not "working"; only `timings.draft_n` / `draft_n_accepted` mean working. Both signals were read off
+the scratch loads above; `/props` was not relied on for any of them.
+
+### 3. Tensor split is opt-in, gated, and was *slower* here
+
+Qwen2.5-1.5B Q4_K_M, two RTX 3090s, 8k context, three runs each, median:
+
+| placement | generation | prompt |
+| --- | --- | --- |
+| one 3090 | 352.5 tok/s | 2803.6 tok/s |
+| two, `-sm layer` | 344.4 tok/s | 2722.5 tok/s |
+| two, `-sm tensor` | **294.3 tok/s** | **1182.0 tok/s** |
+| two, `-sm row` | fails to load | -- |
+
+A small model is tensor mode's worst case -- the per-layer all-reduce is fixed while the halved
+weight read shrinks with the model -- so a 31B may well win. That is precisely why this is a
+*benchmark dimension* (every multi-GPU mode now has a `-tensor` variant for an eligible model) and
+not a default. `layer` stays the default and `split_mode: auto` resolves to `layer` unless every
+gate passes.
+
+`throughput.estimate` grew a `split_mode`: layer sums the per-device times (a pipeline), tensor
+takes their `max` and adds `n_layer * T_TENSOR_SYNC_S` with `T_TENSOR_SYNC_S = 60e-6` -- two PCIe
+all-reduces per layer, an approximation calibrated to reproduce the crossover above, not a
+measurement of this bus. Prefill is deliberately modelled *identically* for both modes: a parallel
+roofline would advertise a prefill win and the rig measured a 57% prefill loss, so claiming either
+would be inventing a constant.
+
+**The gates**, all checked before the child is spawned, because llama.cpp enforces one of them by
+exiting -- `-fa off -sm tensor` dies with `SPLIT_MODE_TENSOR requires flash_attn to be enabled`:
+at least two devices; the engine lists `tensor`; flash attention on; an unquantized KV cache; a
+dense, non-hybrid model. An explicit `tensor` that fails a gate is **refused with the reasons**;
+`auto` downgrades to `layer` and records why on the plan. Someone who typed "tensor" and quietly
+got "layer" would go on to benchmark the wrong thing.
+
+Two findings the gates are *not* derived from a crash: `-sm tensor` with a `q8_0` KV cache
+**started and answered correctly** on b10425 (upstream documents quantized KV as unimplemented
+there, so declining it is StudioForge policy and is the gate most likely to be relaxed), and
+`--backend-sampling` under tensor mode logs `backend sampling not supported with
+SPLIT_MODE_TENSOR; using CPU` and carries on.
+
+`-sm row` is dead on CUDA: `error loading model: device CUDA2 does not support split buffers`. It
+stays in the `SplitMode` type only because the engine still lists it; it is documented in
+LIMITATIONS.
+
+### 4. Unified KV: verified, and deliberately turned *off* -- explicitly
+
+D17 left this "unverified, and not recommended anywhere until it is". Measured with the 0.5B,
+`--parallel 2 --ctx-size 16384`:
+
+| | engine log | `n_ctx` per slot | VRAM | one 12k-token request | two concurrent 12k requests |
+| --- | --- | --- | --- | --- | --- |
+| nothing passed | `kv_unified = 'false'` | 8192 | 997 MiB | **400** up front, naming the limit | **400** each, up front |
+| `--kv-unified` | `kv_unified = 'true'` | 16384 | 1005 MiB | **accepted** | **500 "Context size has been exceeded"**, mid-generation |
+| `--no-kv-unified` | `kv_unified = 'false'` | 8192 | -- | 400 | -- |
+
+So the working assumption going in was wrong in a useful way: StudioForge passing nothing does
+**not** leave unified on. The engine's help says "default: enabled if number of slots is auto", and
+StudioForge always passes an explicit `--parallel`, so the partitioned pool was already what
+happened -- by accident of another setting.
+
+**Decision: keep the partitioned pool, and say so.** Multi-slot launches now pass
+`--no-kv-unified` explicitly. That makes the catalog's `ctx_per_slot` literally true rather than
+true-by-coincidence, and it survives an engine release changing its default. The quality-first
+argument decides the tie between the two things worth wanting: unified buys a lone conversation the
+whole pool at the same VRAM, but it buys it by over-committing, and the way an over-commit surfaces
+is a **500 during generation** on an agent that had already spent a minute thinking. A 400 before
+any work starts is the better failure. `kv_unified: true` remains a per-model opt-in for a
+single-user long-context model, now documented with the number above instead of a shrug.
+
+Same VRAM either way is now measured, not assumed: 997 vs 1005 MiB.
+
+### 5. `--cache-ram` on by default; `-ub` measured and left alone
+
+`--cache-ram` keeps evicted prompt prefixes in *system* memory. It is the other half of
+`--cache-reuse` -- reuse recovers a prefix still in the slot, this recovers one that left it, which
+is exactly what happens to an OpenClaw agent's system prompt while another model borrows the slot.
+Measured VRAM at `-cram 8192` and `-cram 32768`: **identical, 1492 MiB**. No token can change. On
+by default at `min(32 GiB, 25% of system RAM)`.
+
+`-ub` was measured and deliberately **not** turned on (1.5B, one 3090, 5166-token prompt):
+
+| `-ub` | prompt processing | VRAM |
+| --- | --- | --- |
+| 512 (default) | 15232 tok/s | 1492 MiB |
+| 1024 | 17307 tok/s (+13.6%) | 1562 MiB (+70) |
+| 2048 (with `-b 2048`) | 18061 tok/s (+18.6%) | 1702 MiB (+210) |
+
+The compute buffer grows with `-ub` and `planner.compute_overhead_fraction` does not model it.
+Raising `-ub` globally would make every VRAM estimate optimistic by roughly that much, scaled to
+the model -- on a GPU-only server that turns a fit into an OOM. So `engine.ubatch_size` exists,
+defaults to unset, and the benchmark can measure it (`ubatch_sizes=(1024, 2048)`); making the
+planner ubatch-aware is left for whoever owns `planner.py` next.
+
+`--backend-sampling` stays off: b10425 labels it experimental, and under the quality-first rule
+"experimental with no measured quality claim" is itself the reason.
+
+`--sleep-idle-seconds` is never passed -- StudioForge owns model lifetime through TTL, and a second
+idle timer inside the child would unload state the supervisor believes is resident. `--fit off`
+stays (D11). `--flash-attn on` stays, and tensor mode now depends on it.
+
+**What pins it.** `tests/unit/test_engine_features.py` parses a *verbatim* trimmed excerpt of
+b10425's help (`tests/unit/data/b10425_help_excerpt.txt`) -- a parser tested only against a fixture
+its author invented would pass and then drop every flag in production.
+`tests/unit/test_supervisor_features.py` covers the whole spec-type matrix, the refusal for a type
+the engine lacks, the tensor gates one by one, refuse-vs-downgrade, and that no new flag reaches an
+engine that does not advertise it. `test_throughput.py` pins the tensor arithmetic including the
+crossover; `test_benchmark.py` pins that the default mode list did not change length.
+
+**What remains.**
+
+* **Calibration does not know about split mode.** Throughput observations key on model, device set
+  and GPU class. A model benchmarked in tensor mode teaches the layer-mode estimate a correction it
+  should not have. Rare enough that medians absorb it; a `split_mode` column would fix it.
+* **The planner's compute-buffer term is not ubatch-aware** (above).
+* **MTP was measured at one slot only.** `draft-mtp` with `--parallel > 1` is untested here; there
+  is no reason to expect trouble and no evidence either.
+* **`help.txt` is written with translated newlines on Windows**, so the cached copy is
+  double-spaced. Harmless -- `parse_help_entries` skips blank lines -- but it is why the fixture
+  generator had to filter them.
+* **The catalog, placements and the Setup tab do not show any of this yet.** `LoadPlan` and
+  `InstanceInfo` carry `speculative` and the resolved `split_mode`, and
+  `capabilities.engine_feature_rows` renders the Engine card, but the surfaces themselves belong to
+  work packages running alongside this one.
+
+---
+
+## D39 -- Which GPU the memory is on: LUID -> PCI bus -> CUDA ordinal
+
+**Problem (2026-08-19).** The Dashboard's holders panel said this:
+
+```
+llama-server.exe (pid 32188) · 30.44 GiB · CUDA0,1,2,3 · ours · alias Qwen3.8-27B-ABLITERATED-…
+llama-server.exe (pid 31140) · 21.43 GiB · CUDA0,1,2,3 · ours · alias Gemma4-31B-QAT-…
+llama-server.exe (pid 27376) · 18.95 GiB · CUDA0,1,2,3 · foreign
+```
+
+Every size was right and every device list was wrong. Measured on the same box at the same moment:
+pid 32188 held 15.52 GiB on CUDA0 and 14.48 GiB on CUDA1 and **nothing** on the two 3090s; pid
+31140 10.89 + 10.10 on CUDA0/1; the "foreign" one held 18.97 GiB on CUDA2 alone. The device column
+came from NVML's `nvmlDeviceGetComputeRunningProcesses`, which enumerates the devices a process has
+a CUDA **context** on -- and llama.cpp opens one on every visible device at startup, whether or not
+a byte of the model lands there. So three models on two cards read as three models on four cards,
+which is the opposite of the answer this panel exists to give: it made the 3090s look occupied when
+they were free, and hid the fact that the "foreign" 19 GiB was sitting on exactly one of them.
+
+D23 had already looked at this and concluded it could not be done: PDH knows the bytes and the
+adapter **LUID**, NVML knows the CUDA ordinals and no LUID, and "inventing a split per GPU would be
+worse than saying so". That reasoning was right about NVML and wrong about the conclusion, because
+the two sides can be joined through a third identifier neither of them is named after.
+
+**Decision: join on the PCI address.**
+
+| Step | Call | Gives |
+| --- | --- | --- |
+| PDH instance name | `pid_32188_luid_0x00000000_0x00013C35_phys_0` | pid + adapter LUID + bytes |
+| LUID -> handle | `D3DKMTOpenAdapterFromLuid` (gdi32) | a kernel adapter handle |
+| handle -> address | `D3DKMTQueryAdapterInfo(KMTQAITYPE_ADAPTERADDRESS=6)` | `BusNumber`/`DeviceNumber`/`FunctionNumber` |
+| ordinal -> address | `nvmlDeviceGetPciInfo(h).bus` | the same bus, per CUDA ordinal |
+
+Measured on the reference rig: LUID `0x13C35` -> bus `0x01` -> CUDA0 (RTX 5090), `0x155BF` ->
+`0x42` -> CUDA1, `0x1671A` -> `0xC1` -> CUDA2 (RTX 3090), `0x175FB` -> `0xC2` -> CUDA3. A fifth
+LUID, `0x1852C`, is the Microsoft Basic Render adapter; it opens but answers `0xFFFFFFFF` for its
+address, so it resolves to nothing and its bytes land under device `-1` rather than being guessed
+onto a card.
+
+Three details are load-bearing:
+
+* **The bus in `busId` is hex.** `"00000000:42:00.0"` is bus 66, not 42. Reading it as decimal
+  silently attributes one card's memory to whatever sits at bus 42, which is the worst possible
+  failure here -- a confident wrong answer, indistinguishable from a right one.
+* **The map is rebuilt, never persisted.** `CUDA_VISIBLE_DEVICES`, a driver reset and a hot-plugged
+  eGPU all renumber CUDA ordinals, and the whole value of this is that the number matches what
+  `--device CUDA<n>` means *to this process, now*. Cached 30 s, and rebuilt immediately when a LUID
+  turns up that the current map has never seen. An adapter that failed to resolve is remembered as
+  tried, so the Basic Render adapter does not force a rebuild on every poll.
+* **`phys_<n>` is not part of the key.** It is the physical adapter *within* a LUID (linked display
+  adapters); a linked pair is one CUDA device and its instances fold into one bucket.
+
+**What the payload says now.** Every holder carries `per_gpu_bytes`
+(`{"0": 16664092672, "1": 15550488576, "2": 234725376, "3": 234721280}`) whose values always add
+back up to `used_bytes` -- nothing is dropped or spread -- and `gpu_indices` lists only the devices
+holding at least `HOLDER_MIN_BYTES` (256 MiB), which is what removes llama.cpp's ~0.22 GiB
+per-device context and leaves the cards the weights are on. `gpu_indices_source` says which
+question was answered: `pdh` is a measurement, `nvml-context` means only NVML could answer and the
+list is contexts, not placement. `used_bytes` keeps its D23 meaning exactly -- a per-process total,
+still not summable across per-GPU rows. `/api/status` entries additionally carry `device_bytes`,
+what that row's pid holds on **that** row's `gpu_index`, which is the one figure in the payload
+that may be summed across rows.
+
+The Dashboard row therefore reads
+`llama-server.exe (pid 32188) · 30.44 GiB · CUDA0 15.5 GiB, CUDA1 14.5 GiB · ours · alias …`,
+verified against the live rig on 2026-08-19.
+
+**And a "foreign" holder that knew who it was.** The third row above was a `llama-server` child of a
+*scratch* StudioForge -- `--alias scratch --port 1258`, the binary copied to a temp directory by a
+measurement run -- and its own argv said so the whole time. `foreign` is true and useless. A
+`llama-server` binary that is **not** under our engines directory is now classified
+`other-instance`, with `detail` naming its alias, port and directory. This changes nothing about
+safety: `find_engine_processes` still scopes kill candidates to our own engines tree exactly as D23
+requires, and an `other-instance` is never a kill candidate. `foreign` now means what it says --
+ComfyUI, a browser, a game.
+
+**What pins it.** `tests/unit/test_vram_holders.py`: the LUID parse (including `phys_1` folding and
+the unparseable cases), the four-card map built over the real ctypes structures against a fake
+gdi32 and a fake NVML, the hex `busId` trap, an adapter with no CUDA ordinal, the cache and its
+rebuild-on-unseen-LUID, the live per-adapter aggregation (two LUIDs -> two ordinals, unmapped ->
+-1, and that the split still sums to the D23 total), the four branches of the device column, the
+`other-instance` classification from a fake cmdline, `device_bytes` on status rows, and the rendered
+Dashboard line.
+
+**What remains.**
+
+* **Windows only.** D3DKMT is a Windows kernel-mode thunk and PDH is a Windows counter. On Linux
+  NVML reports real per-process, per-GPU bytes and needs none of this; in a container, in WSL or
+  under MIG neither side answers and the column falls back to `nvml-context`, which the payload and
+  the panel both say out loud.
+* **The per-device split is not yet fed back into calibration.** `process_gpu_bytes(pid)` exists for
+  exactly that and nothing calls it: `load_observations` records the plan's intended
+  `per_gpu_bytes` and could now record the achieved one beside it (D18, per device). It matters --
+  the load above planned `--device CUDA1,CUDA0 --tensor-split 0.5079,0.4921`, i.e. *more* on CUDA1,
+  and CUDA0 ended up holding 15.52 against CUDA1's 14.48, because llama.cpp puts the output layer
+  and its scratch on one end of the device list. A tight card can OOM on exactly that delta, and
+  today nothing learns it. Left out here because `planner.py`/`manager.py` are WP18's.
+* **A holder measured only on unresolvable adapters shows no device at all.** It reports
+  `gpu_indices: []` with source `nvml-context` and its bytes under `-1`; that is honest and it is
+  also the least useful row in the payload.
+
+---
+
+## D40 -- Where a load's bytes land: observed per device, the output layer charged to the last card, `-ub` modelled
+
+**Problem (WP22 review, 2026-08-20).** Three things that were one thing, found while closing the
+follow-ups D38 and D39 left open.
+
+*D18's calibration had been reading a number that was wrong by the device count.*
+`ModelManager._record_actual_vram` summed `vram_processes` rows over the plan's devices. On Windows
+every row of a pid carries the **same** PDH per-process total (D23's back-fill, one total written
+onto each NVML `(gpu, pid)` row), so a two-GPU load was recorded at twice its footprint and a
+four-GPU one at four times. The live registry held 29 `per_pid` rows on 2026-08-19 and every
+multi-device load sat at a ratio of its device count -- a 17.4 GB model "measuring" 134 GB across
+three cards, 104 GB across four -- and even a single-card 1.5B read 1.30 because the per-process
+total includes the ~0.22 GiB CUDA context the child opens on every *other* card. `calibrate()`
+takes the worst shortfall over weights, so on every boot of the reference rig
+`compute_overhead_fraction` was pegged at its 0.15 ceiling: ~9% of every model's weights silently
+subtracted from every estimate, which is the direction that refuses loads that fit.
+
+*Nothing knew which card the bytes were on.* D39 left `process_gpu_bytes(pid)` with no caller, and
+its evidence standing: the live 27B planned at `--device CUDA1,CUDA0 --tensor-split 0.5079,0.4921`
+landed 15.52 GiB on CUDA0 and 14.48 on CUDA1 -- 0.76 GiB *more* on the card the split gave less to.
+
+*And `-ub` could not be raised safely* (D38): the compute term was calibrated at the engine's 512
+and did not move with the micro-batch.
+
+**Measured** on a scratch `llama-server` (engine `b10425` copied read-only, port 1260, the 3090
+pair, per-GPU bytes through D39's PDH LUID->CUDA join; every child killed and verified gone):
+
+| model | `--device` / `--tensor-split` | `-ub` | first card | last card |
+| --- | --- | --- | --- | --- |
+| Qwen2.5-0.5B Q8_0 | `CUDA3,CUDA2` / `0.6,0.4` | 512 | 576 MiB | **608 MiB** |
+| Qwen2.5-0.5B Q8_0 | `CUDA2,CUDA3` / `0.6,0.4` | 512 | 576 MiB | **608 MiB** |
+| Qwen2.5-0.5B Q8_0 | `CUDA2,CUDA3` / `0.5,0.5` | 512 | 542 MiB | **646 MiB** (+104) |
+| Qwen2.5-0.5B Q8_0 | `CUDA2,CUDA3` / `0.5,0.5` | 2048 | 712 MiB | **816 MiB** (+104) |
+| Qwen2.5-1.5B Q4_K_M | `CUDA2,CUDA3` / `0.5,0.5` | 512 | 820 MiB | **930 MiB** (+110) |
+| Qwen2.5-1.5B Q4_K_M | `CUDA2,CUDA3` / `0.5,0.5` | 2048 | 1090 MiB | **1200 MiB** (+110) |
+
+Two facts fall out. **The last device of the list holds more**, whichever physical card it is, and
+the card given the *smaller* fraction still ends up heavier: llama.cpp assigns the output layer to
+`dev_output`, the device holding layer `n_layer`, which the split arithmetic always makes the last
+one. **The delta does not move with `-ub`** (+104 at both 512 and 2048), so it is weights, not the
+logits scratch -- 0.75x (0.5B) and 0.6x (1.5B) of the tied-embedding tensor; the 27B's 0.76 GiB
+sits between its Q6_K and Q8_0 output-tensor sizes. Meanwhile the micro-batch grows *both* cards:
++170 MiB each for +1536 tokens on the 0.5B (113 B/token/`n_embd`), +270 MiB each on the 1.5B
+(180 B/token/`n_embd`), against +114 / +198 MiB on a single card (76-94 and 132 B/token/`n_embd`).
+
+**Decision.**
+
+1. **`measure_child_vram(probe, pid, devices)`** answers `(total, {device: bytes} | None)` in this
+   order: PDH per adapter joined to CUDA ordinals (Windows, D39), restricted to the plan's devices
+   so a context on a card the model is not on is left out exactly as the plan leaves it out; NVML's
+   genuine per-process, per-GPU rows (Linux) -- recognised by *not* all equalling the PDH total,
+   which is how the back-fill betrays itself; the PDH total **once**, with no split claimed. The
+   observation carries `per_gpu_planned` and `per_gpu_actual` (migration 006, JSON text per CUDA
+   index) beside the totals, and is marked `note = "per_pid_v2"`. **Calibration reads only
+   `per_pid_v2` rows**, as D18 did with `per_pid` against the device-total rows before it; the old
+   rows stay for the record and are inert.
+2. **A device holding more than 1.15x its planned share is a WARNING** naming the card and both
+   numbers (`planner.per_device_overruns`). 15%: under the 10% headroom plus the per-card CUDA
+   context charge a smaller overrun is noise; above it the card was genuinely planned too tight.
+3. **The planner charges the output layer to the last device** of a multi-GPU plan.
+   `output_layer_bytes(meta)` is `n_vocab * n_embd` at the file's average bytes per weight (from
+   `general.parameter_count`; 6.5 bpw when undeclared -- quantizers keep the embedding tensors at
+   Q6_K/Q8_0 in a Q4 file). The split fractions are taken from the cards' capacities with that
+   charge removed from the last one, so `--tensor-split` leans a little toward the first card and
+   `per_gpu_bytes[last]` carries its block share plus the layer. It is an approximation in the
+   safe direction for the card that OOMs (the first card's share is under-stated by at most the
+   same figure, well inside headroom), and the per-device observation now measures it.
+4. **`Planner.estimate` is micro-batch aware.** `ubatch_for(record)` resolves per-model, then
+   `engine.ubatch_size`, then 512 (the supervisor's precedence); `kv_alloc_bytes` gets the real
+   `-ub` for the iSWA cell formula it always took as a parameter, and `ubatch_scratch_bytes`
+   charges `128 B x (ub - 512) x n_embd` **per device** -- covering the two-card figure with a
+   little room. `engine.ubatch_size` is therefore safe to raise; it stays unset because it is a
+   VRAM-for-prefill trade the operator should make knowingly. The supervisor raises the automatic
+   `--batch-size` to at least the micro-batch, because llama.cpp clamps `n_ubatch` to `n_batch`
+   silently and `-ub 4096` against the default `-b 2048` would be a flag that looks like it did
+   something; an explicit `batch_size` is still the user's.
+
+**What pins it.** `tests/unit/test_planner_parallel.py` (the Windows total counted once, the PDH
+split restricted to plan devices, Linux rows summed per device, the overrun bar, the stored split,
+`per_pid` rows no longer trusted), `tests/unit/test_planner.py` (the output-layer charge and the
+tilted split, a last card too tight for its layer, `ubatch_scratch_bytes`, the estimate's
+precedence), `tests/unit/test_supervisor_features.py` (`--batch-size` follows `-ub`),
+`tests/unit/test_db.py` (migration 006 round-trip).
+
+**What remains.**
+
+* The output-layer charge is derived from `n_vocab * n_embd * bpw`, not read from the tensor
+  table; the scanner could record the real `output.weight` / `token_embd.weight` byte count and
+  make it exact. The observation rows now say how far off it is per model.
+* The existing `per_pid` rows are not re-interpretable: a single-card row is only inflated by the
+  other cards' contexts, a multi-card row by its device count, and the row does not say which.
+  They are ignored rather than corrected.
+* `UBATCH_SCRATCH_BYTES_PER_TOKEN_PER_EMBD = 128` is two models on two cards; a 30B at `-ub 2048`
+  on a 4-way split is unmeasured. The direction of error is refusal, not OOM.

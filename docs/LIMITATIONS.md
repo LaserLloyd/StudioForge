@@ -38,10 +38,20 @@ number is mostly other processes. Across 540 recorded rows the median actual/pre
 **2.97** and p90 is **12.0** — earlier versions of this document claimed 0.81–1.23, which was never
 what the column measured.
 
-Measurement is now per-pid, and rows recorded that way carry `note = "per_pid"` in
-`load_observations`. **Calibration ignores every row without that marker**, so the old rows are
-inert rather than harmful — but do not read them as evidence about the estimate, and do not expect
-a tuned factor until enough post-fix loads have accumulated.
+Measurement is now per-pid **and per device**, and rows recorded that way carry
+`note = "per_pid_v2"` in `load_observations` with `per_gpu_planned` / `per_gpu_actual` beside the
+totals (D40). **Calibration ignores every row without that marker**, so the old rows are inert
+rather than harmful — but do not read them as evidence about the estimate, and do not expect a
+tuned factor until enough post-fix loads have accumulated.
+
+### ...and so is the `per_pid` history before 2026-08-20, on Windows
+
+The first per-pid fix summed `vram_processes` rows over the plan's devices, and on Windows every
+row of a pid carries the *same* PDH per-process total, so a two-GPU load was recorded at twice its
+footprint and a four-GPU load at four times (29 live rows on the reference rig, every multi-device
+load at a ratio of its device count). Those rows pegged the overhead fraction at its 0.15 ceiling
+on every boot until D40; they are now ignored like the device-total rows before them. A box that
+only ever ran single-card loads on Linux lost nothing but a few rows of history.
 
 Where per-process VRAM cannot be enumerated at all (containers, WSL, MIG) no observation is recorded
 rather than a device total being substituted, so on those platforms the factor never self-tunes.

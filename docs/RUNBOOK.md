@@ -67,7 +67,16 @@ GUI, the autoloader.
 
 `test_model` refuses on the same grounds and additionally refuses a second concurrent test; it
 loads cold models small (one slot, the default context) and unloads them again, so it never leaves
-the rig rearranged.
+the rig rearranged. Both benchmarks refuse a busy rig the same way. `load_recommended` on a model
+that is itself serving is a **503** with `retry_after_s` rather than a reload under its clients;
+`load_model(force=true)` is the only thing that interrupts a stream.
+
+**A device OOMs while the plan said it fits.** The `load observation` INFO line now carries
+`per_device_mb`, and a card holding more than 15% over its planned share logs *"a device holds more
+than its planned share"* with both numbers (D40). llama.cpp puts the output layer on the **last**
+device of the list and the planner charges it there; a persistent overrun on one model means that
+charge is too small for it -- raise `planner.headroom_fraction` a little, or pin `device_override`
+with the roomier card last.
 
 ## VRAM is held and nothing is loaded
 

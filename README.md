@@ -192,15 +192,25 @@ sfctl servers add rig http://<studioforge-host>:1234 --api-key <PIN or server.ap
 ```
 
 `sfctl mcp` speaks MCP over stdio locally and proxies to **both** the server's management-plane MCP
-(14 tools) and the watchdog's recovery MCP (10) as one merged toolset — so the agent keeps working
+(16 tools) and the watchdog's recovery MCP (10) as one merged toolset — so the agent keeps working
 recovery tools (`restart_server`, `kill_model`, `gpu_status`, `tail_logs`,
 `reclaim_orphan_engines`) even when the main server is wedged. There is no inference tool by
 design; generation goes over `/v1/chat/completions`, which streams.
 
 ### 3. Let the agent pick its own model
 
-`list_models` over MCP returns a **catalog**: every model in the library, newest download first,
-each with a table of loading options and the exact arguments to load one.
+Two ways, and the first is usually the one an agent wants:
+
+```
+load_recommended(model_id, ctx_size=131072)   # name the model and the window; the server picks
+                                              # the GPUs, the KV cache and the slot count, and loads
+                                              # at EXACTLY that context -- or refuses with numbers
+```
+
+Or start from the catalog. `list_models` over MCP returns every model in the library, newest
+download first, each with a `recommended` load (its optimal settings on the rig's best pair of
+GPUs, chosen quality first), one `placements` entry per set of cards, and a per-context `options`
+table:
 
 ```jsonc
 {
@@ -208,22 +218,33 @@ each with a table of loading options and the exact arguments to load one.
   "summary": "qwen35moe | 122B-A9.5B MoE | Q5_K_M | hybrid | tools+thinking | 82.9 GB | 262144 ctx train",
   "attention_kind": "hybrid",
   "downloaded_at": "2026-08-16T09:14:02Z",
+  "recommended": {
+    "mode": "dual_5090", "label": "2x RTX 5090", "devices": [0, 1],
+    "ctx_per_slot": 65536, "kv_cache_type": "f16",
+    "max_parallel": 4, "recommended_parallel": 2,
+    "est_gen_tps": 37.0, "est_gen_tps_full_ctx": 31.2, "fits_now": true,
+    "load_args": { "model_id": "...", "ctx_size": 65536, "parallel": 2,
+                   "kv_cache_type": "f16", "devices": [0, 1] }
+  },
+  "placements": [ { "mode": "dual_5090", ... }, { "mode": "dual_3090", ... } ],
   "options": [{
     "ctx_per_slot": 65536, "fits": true, "devices": [0, 1, 2, 3],
-    "max_parallel": 4, "parallel_limited_by": "knee",
+    "max_parallel": 4, "recommended_parallel": 4,
     "est_gen_tps": 37.0, "est_gen_tps_full_ctx": 31.2,
-    "confidence": "calibrated", "recommended": true,
+    "confidence": "calibrated", "best_now": true,
     "load_args": { "model_id": "...", "ctx_size": 65536, "parallel": 4, "kv_cache_type": "f16" }
   }]
 }
 ```
 
-The agent takes the `recommended` row and passes its `load_args` verbatim to `load_model`. Whether
-it fits in the VRAM free *right now*, which GPUs it would use, how many conversations it can serve
-at once, and roughly how fast at an ordinary turn (`est_gen_tps`) and with the window nearly full
-(`est_gen_tps_full_ctx`) — all already in the row, so there is nothing left to compute or guess.
-The recommendation never drops below the server's default context floor to buy a second slot: a
-window that cannot hold the task is a failed task. The same data is on `GET /api/catalog`.
+The agent passes `recommended.load_args` verbatim to `load_model` (it names the `devices`), or an
+`options` row's to load a different context tier. Whether it fits in the VRAM free *right now*,
+which GPUs it would use, how many conversations fit (`max_parallel`) and how many are worth running
+(`recommended_parallel`, measured or estimated), and roughly how fast at an ordinary turn
+(`est_gen_tps`) and with the window nearly full (`est_gen_tps_full_ctx`) — all already there, so
+there is nothing left to compute or guess. The recommendation never quantizes the KV cache to buy a
+bigger window, and never drops below the server's default context floor to buy a second slot. The
+same data is on `GET /api/catalog`; [`docs/CATALOG.md`](docs/CATALOG.md) explains every column.
 
 ### 4. Let the agent find and fetch new models
 
@@ -307,7 +328,7 @@ src/studioforge/
   api/          FastAPI app: OpenAI routes, /api/* management, admin, auth
   core/         registry, planner, supervisor, engine, downloader, gpu, updater
   gui/          NiceGUI control panel (tabs/: dashboard, models, download, server, setup)
-  mcp/          management-plane MCP server (14 tools)
+  mcp/          management-plane MCP server (16 tools)
   watchdog/     recovery sidecar: separate process, separate port, 10 MCP tools
   tray/         Windows notification-area app
   migrations/   SQL schema, applied at startup

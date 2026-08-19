@@ -232,9 +232,10 @@ The two thresholds encode a priority, not a measurement. Aggregate throughput ca
 with per-stream latency; this server's answer is that a conversation running at under two-thirds of
 its solo speed is a conversation the user notices, and a level that adds under 15% is the plateau.
 
-`"measured"` is meant literally: a sweep on other cards, or at another context, is **not** used. The
-knee is set by how many KV bytes each busy slot reads per decode step, so a run at 8192 says nothing
-about the same model at 131072, and a run on one card says nothing about two.
+`"measured"` is meant literally: a sweep on other cards, at another context, **or on another KV
+cache type** is **not** used. The knee is set by how many KV bytes each busy slot reads per decode
+step, so a run at 8192 says nothing about the same model at 131072, a run on one card says nothing
+about two, and a run on an f16 cache says nothing about a q8_0 one (half the bytes per token).
 
 **With no measurement, `recommended_parallel` equals `max_parallel`.** That is not redundancy, it is
 the honest statement that D17's knee is already folded into `max_parallel` and there is nothing more
@@ -542,6 +543,9 @@ getting 131072 and finding out mid-conversation. So:
 | No placement reaches it | `507` with a `modes` list — per mode, the largest context that *would* fit and what is in the way |
 | A serving model is what is in the way | the same `507`, plus `busy_models` and `retry_after_s` |
 | Nothing transient is in the way | the same `507` with `retry_after_s: null` — "try again later" is bad advice when nothing will change |
+| The model is already loaded at exactly that context | `200`, the resident instance — no reload to arrive where it is |
+| The model is already loaded at another context, idle | reloaded at the new window; its own footprint is credited to the plan (D30), so the walk sees the machine the reload will see |
+| The model is already loaded **and serving** | `503` `ModelBusyError` with `retry_after_s` — a load never interrupts a stream (D36), this one included; `load_model(force=true)` is the only override |
 
 `kv_min` ("give me 262144, but not at the cost of the cache") refuses a placement that only reaches
 the window by quantizing, and walks on to one that can afford it.

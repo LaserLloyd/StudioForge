@@ -39,7 +39,7 @@ the full runs are in DECISIONS.md **D38**.
 | Flash attention | `--flash-attn on` | **on** | none |
 | Partitioned KV pool | `--no-kv-unified` | **on** above one slot | none (a capacity trade, not a quality one) |
 | Engine auto-fit | `--fit off` | **off** | n/a — it would break the GPU-only policy (D11) |
-| Larger micro-batch | `-ub` | off (engine's 512) | none, costs VRAM |
+| Larger micro-batch | `-ub` | off (engine's 512) | none, costs VRAM (modelled per device, D40) |
 | Tensor parallelism | `--split-mode tensor` | off | none, but EXPERIMENTAL upstream |
 | GPU sampling | `--backend-sampling` | off | none claimed, but EXPERIMENTAL upstream |
 | Engine idle sleep | `--sleep-idle-seconds` | **never passed** | StudioForge owns TTL; two idle timers would fight |
@@ -113,7 +113,10 @@ a prefix that left it. Exactly the OpenClaw pattern — a long, near-identical a
 again after another model borrowed the slot.
 
 **Default.** On. `engine.cache_ram_mb: auto` = 25% of system RAM capped at 32 GiB (32 GiB on this
-128 GiB box). Set an integer for MiB, `0` to disable, `-1` for the engine's "no limit".
+128 GiB box). Set an integer for MiB, `0` to disable, `-1` for the engine's "no limit". The figure
+is a **per-child cap**, not a reservation: each loaded model may keep up to that much of evicted
+prompt prefixes in host memory, so four resident models could between them use up to four times
+it under sustained, prefix-heavy traffic. Lower it on a box where host RAM is tight.
 
 **Quality cost.** None: it is a cache of computed KV, not an approximation of it. **VRAM cost:
 none** — measured identical VRAM (1492 MiB) at `--cache-ram 8192` and at `32768`.
@@ -207,10 +210,13 @@ per-model `ubatch_size` overrides it.
 | 1024 | 17307 tok/s (+14%) | 1562 MiB (+70) |
 | 2048 | 18061 tok/s (+19%) | 1702 MiB (+210) |
 
-**Quality cost.** None. **Why it is off:** the planner's compute-buffer estimate
-(`planner.compute_overhead_fraction`) is calibrated against the 512 default and does *not* grow
-with `-ub`. Raising it globally would make every VRAM estimate optimistic by roughly the numbers
-above, scaled to the model. Raise it per model, or after re-calibrating, and benchmark it with
+**Quality cost.** None. **Why it is off:** it is a VRAM-for-prefill trade, and a default
+should not make it for you. It is *safe* to raise (D40): the planner charges the growth explicitly
+-- 128 bytes per extra token per `n_embd`, **on every device** of the placement, which covers the
+per-card growth measured on a two-way split (113-126 B/token/`n_embd`) with a little room -- so a
+larger micro-batch costs context rather than risking an out-of-memory, and the supervisor raises
+`--batch-size` to match (llama.cpp silently clamps `n_ubatch` to `n_batch`). Set
+`engine.ubatch_size` globally or `ubatch_size` per model, and benchmark it with
 `ubatch_sizes=(1024, 2048)`.
 
 ---
