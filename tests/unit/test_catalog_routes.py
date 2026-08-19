@@ -388,6 +388,21 @@ def test_the_parallel_benchmark_refuses_a_bad_cache_type_before_the_202(app: Any
         assert response.json()["error"]["param"] == "devices"
 
 
+def test_the_parallel_benchmark_refuses_a_busy_server_before_the_202(app: Any) -> None:
+    """Found on the scratch server: a busy rig got a 202 and a job that failed
+    on its first line. The route answers 503 with retry_after_s up front."""
+    with TestClient(app) as http:
+        app.state.manager.busy_snapshot = lambda: {
+            "active_requests": 1,
+            "busy_models": [{"model_id": "pub/other", "active_requests": 1}],
+            "loading": [],
+            "testing": None,
+        }
+        response = http.post(f"/api/models/{MODEL_ID}/benchmark-parallel", json={"streams": [1]})
+    assert response.status_code == 503
+    assert response.json()["error"]["studioforge"]["retry_after_s"] == 15.0
+
+
 def test_the_parallel_benchmark_starts_a_job_on_the_shared_table(app: Any) -> None:
     """Same job table as the placement benchmark: one thing for a client to poll."""
     with TestClient(app) as http:

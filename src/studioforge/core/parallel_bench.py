@@ -369,6 +369,10 @@ class ParallelBenchmarker:
             )
         return list(found.devices)
 
+    def refuse_if_busy(self) -> None:
+        """The up-front half of the busy rule, for a route that answers before it runs."""
+        self._refuse_if_busy()
+
     def _refuse_if_busy(self, *, ignore_benchmark: bool = False) -> None:
         """Refuse while anything else is using the rig (the D36 rule).
 

@@ -1690,6 +1690,10 @@ async def start_parallel_benchmark(
     )
 
     runner = _parallel_benchmarker(state)
+    # Refused here, as a 503 with retry_after_s, rather than accepted as a job
+    # that fails on its first line: the MCP tool answers the same way, and a
+    # caller polling a job for "the server was busy" learns it minutes late.
+    runner.refuse_if_busy()
     levels = [int(n) for n in (streams or DEFAULT_STREAMS)]
     job = _benchmark_jobs(state).create(record.id, [str(n) for n in sorted(set(levels))])
     job.task = asyncio.create_task(
