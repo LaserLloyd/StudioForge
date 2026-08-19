@@ -806,6 +806,18 @@ def capabilities_cmd(
     )
     typer.echo(f"  list source     {engine.source} ({engine.source_detail})")
 
+    # What THIS BINARY advertises, as opposed to what the project supports at
+    # the pinned tag. StudioForge refuses to pass a flag a build does not
+    # declare (D2/D38), so "what does it declare?" is an operator question.
+    from studioforge.core.capabilities import engine_feature_rows
+
+    typer.echo("")
+    typer.echo("ENGINE FEATURES")
+    if not engine.features.get("known"):
+        typer.echo("  the engine's --help could not be read; no optional flags will be passed")
+    for row in engine_feature_rows(engine.features):
+        typer.echo(f"  {row['name']:<20} {row['value']}")
+
     typer.echo("")
     typer.echo("HARDWARE")
     for gpu in hardware.gpus:

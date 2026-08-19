@@ -151,3 +151,39 @@ def test_probe_without_a_binary_degrades_to_unknown(tmp_path: Path) -> None:
     """A model must still load on a box whose engine help cannot be read."""
     caps = probe_engine_features(tmp_path / "does-not-exist.exe", "b10425")
     assert caps.known is False
+
+
+# ---------------------------------------------------------------------------
+# The capabilities report
+# ---------------------------------------------------------------------------
+
+
+def test_the_report_carries_the_engines_own_feature_surface(tmp_path: Path) -> None:
+    """The architecture/quant lists say what llama.cpp supports at the pinned
+    tag; this says what the binary on this disk will accept. They are different
+    questions and the report has to answer both."""
+    from studioforge.config import Config
+    from studioforge.core.capabilities import engine_capabilities
+
+    config = Config(data_dir=tmp_path)
+    engine_dir = config.engines_dir / config.engine.pinned_tag
+    engine_dir.mkdir(parents=True, exist_ok=True)
+    (engine_dir / "help.txt").write_text(HELP_EXCERPT, encoding="utf-8")
+
+    caps = engine_capabilities(config)
+    assert caps.features["known"] is True
+    assert "tensor" in caps.features["split_modes"]
+    assert "draft-mtp" in caps.features["spec_types"]
+
+
+def test_feature_rows_distinguish_absent_from_off() -> None:
+    """ "Not advertised" and "off" are different facts; conflating them makes a
+    missing feature read as a disabled one."""
+    from studioforge.core.capabilities import engine_feature_rows
+
+    rows = {row["name"]: row["value"] for row in engine_feature_rows(features().to_dict())}
+    assert rows["Split modes"] == "none, layer, row, tensor"
+    assert rows["GPU sampling"] == "yes"
+
+    unknown = {row["name"]: row["value"] for row in engine_feature_rows({"known": False})}
+    assert set(unknown.values()) == {"unknown"}

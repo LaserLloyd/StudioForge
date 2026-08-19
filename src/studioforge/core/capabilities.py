@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -46,10 +47,61 @@ FEATURE_NOTES: dict[str, str] = {
     "tools": "function calling, when the model's chat template handles tools",
     "thinking": "reasoning models; thoughts stay inline in content by default",
     "lora": "GGUF LoRA adapters, with runtime scale changes where supported",
-    "speculative": "draft-model decoding (--spec-type draft-simple)",
+    "speculative": (
+        "speculative decoding, chosen per model: the model's own MTP heads "
+        "(--spec-type draft-mtp) when it has them, a draft model "
+        "(draft-simple) when one is attached, n-gram drafting (ngram-mod) for "
+        "thinking and MoE models. Distribution-preserving: speed, not a trade"
+    ),
     "multi_part": "sharded GGUFs (-00001-of-0000N) treated as one model",
-    "prompt_cache": "prompt-cache reuse (--cache-reuse), the big agent-workload win",
+    "prompt_cache": (
+        "prompt-cache reuse (--cache-reuse) plus a host-RAM cache (--cache-ram) "
+        "for prefixes that left the slot -- the big agent-workload win"
+    ),
+    "tensor_split": (
+        "opt-in tensor parallelism (--split-mode tensor): weights and KV shard "
+        "across GPUs. EXPERIMENTAL upstream and measured SLOWER than the layer "
+        "split on this PCIe rig, so it is something to benchmark, not a default"
+    ),
 }
+
+#: The optional-feature keys the Setup tab's Engine card shows, in the order it
+#: shows them, with the one-line explanation each needs. Lives here rather than
+#: in the GUI so the CLI's ``studioforge capabilities`` and the card cannot
+#: disagree about what a feature is.
+ENGINE_FEATURE_LABELS: tuple[tuple[str, str, str], ...] = (
+    ("split_modes", "Split modes", "how a multi-GPU placement shards the model"),
+    ("spec_types", "Speculative types", "drafting strategies --spec-type accepts"),
+    ("flash_attn_values", "Flash attention", "values -fa accepts; StudioForge passes 'on'"),
+    ("backend_sampling", "GPU sampling", "--backend-sampling (experimental, opt-in)"),
+    ("cache_ram", "Host prompt cache", "--cache-ram, host RAM, no VRAM, on by default"),
+    ("kv_unified", "Unified KV switch", "--kv-unified / --no-kv-unified"),
+    ("ctx_checkpoints", "Context checkpoints", "--ctx-checkpoints, per slot"),
+    ("fit", "Engine auto-fit", "--fit; StudioForge always passes 'off' (D11)"),
+)
+
+
+def engine_feature_rows(features: Mapping[str, Any]) -> list[dict[str, str]]:
+    """``[{"name", "value", "note"}]`` for the Engine card and the CLI.
+
+    Renders "not advertised" rather than "off" for anything a build does not
+    declare: those are different facts, and conflating them is how a missing
+    feature reads as a disabled one.
+    """
+    rows: list[dict[str, str]] = []
+    known = bool(features.get("known"))
+    for key, name, note in ENGINE_FEATURE_LABELS:
+        raw = features.get(key)
+        if not known:
+            value = "unknown"
+        elif isinstance(raw, list):
+            value = ", ".join(str(item) for item in raw) or "none"
+        elif isinstance(raw, bool):
+            value = "yes" if raw else "not advertised"
+        else:
+            value = str(raw) if raw else "not advertised"
+        rows.append({"name": name, "value": value, "note": note})
+    return rows
 
 
 @dataclass
@@ -66,6 +118,12 @@ class EngineCapabilities:
     ggml_types: list[str]
     source: str  # "checkout" | "snapshot"
     source_detail: str
+    #: What this *build* advertises, read from its own ``--help``
+    #: (:class:`studioforge.core.engine.EngineFeatures`). Distinct from the
+    #: architecture/quant lists above, which come from llama.cpp's source at the
+    #: pinned tag: those say what the project supports, this says what the
+    #: binary on this disk will actually accept.
+    features: dict[str, Any] = field(default_factory=dict)
 
     def supports_architecture(self, arch: str) -> bool:
         return arch.lower() in {a.lower() for a in self.architectures}
@@ -105,6 +163,8 @@ class CapabilityReport:
                 "ggml_types": self.engine.ggml_types,
                 "capability_source": self.engine.source,
                 "capability_source_detail": self.engine.source_detail,
+                "features": self.engine.features,
+                "feature_rows": engine_feature_rows(self.engine.features),
             },
             "hardware": {
                 "gpus": self.hardware.gpus,
@@ -205,6 +265,24 @@ def _quant_labels(file_types: list[str]) -> list[str]:
     return sorted(t for t in file_types if t not in skip)
 
 
+def detect_engine_features(config: Config, tag: str) -> dict[str, Any]:
+    """The pinned build's advertised feature surface, from the on-disk cache.
+
+    Deliberately the *cached* reader: this runs inside an async route and a GUI
+    refresh, and a cold cache would otherwise spawn ``llama-server --help``
+    there. Boot warms the cache (``EngineManager.ensure_engine``), so a miss
+    here means the engine is not installed -- which is worth reporting as
+    "unknown", not worth blocking a page for.
+    """
+    from studioforge.core.engine import cached_engine_features
+
+    try:
+        return cached_engine_features(config.engines_dir / tag, tag).to_dict()
+    except Exception as exc:  # noqa: BLE001 - a report must never fail on this
+        log.warning("engine feature detection failed", tag=tag, error=str(exc))
+        return {"tag": tag, "known": False}
+
+
 def engine_capabilities(config: Config, engine_manager: Any = None) -> EngineCapabilities:
     tag = config.engine.pinned_tag
     variant = "unknown"
@@ -223,6 +301,8 @@ def engine_capabilities(config: Config, engine_manager: Any = None) -> EngineCap
             smoke_tested = info.smoke_tested
             installed_at = info.installed_at
 
+    features = detect_engine_features(config, tag)
+
     for root in checkout_candidates(config):
         extracted = extract_from_checkout(root)
         if extracted is not None:
@@ -237,6 +317,7 @@ def engine_capabilities(config: Config, engine_manager: Any = None) -> EngineCap
                 ggml_types=extracted["ggml_types"],
                 source="checkout",
                 source_detail=str(root),
+                features=features,
             )
 
     snapshot = load_snapshot()
@@ -256,6 +337,7 @@ def engine_capabilities(config: Config, engine_manager: Any = None) -> EngineCap
         ggml_types=list(snapshot["ggml_types"]),
         source="snapshot",
         source_detail=detail,
+        features=features,
     )
 
 

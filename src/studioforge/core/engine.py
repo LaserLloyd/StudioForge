@@ -611,6 +611,27 @@ def write_features_file(directory: Path, features: EngineFeatures) -> None:
         )
 
 
+def cached_engine_features(directory: Path, tag: str = "") -> EngineFeatures:
+    """Features from the files already on disk. Never spawns a process.
+
+    ``features.json`` -> ``help.txt`` -> "unknown". For every caller that must
+    not block: a report route, a GUI panel, anything on an event loop.
+    """
+    cached = read_features_file(directory, tag)
+    if cached is not None:
+        return cached
+    help_path = directory / HELP_FILE
+    if help_path.is_file():
+        with contextlib.suppress(OSError):
+            text = help_path.read_text(encoding="utf-8")
+            if text.strip():
+                features = parse_engine_features(text, tag)
+                if features.known:
+                    write_features_file(directory, features)
+                return features
+    return EngineFeatures.unknown(tag)
+
+
 def probe_engine_features(binary: Path, tag: str = "") -> EngineFeatures:
     """Features for the build at ``binary``, reading (or filling) the caches.
 
@@ -623,37 +644,28 @@ def probe_engine_features(binary: Path, tag: str = "") -> EngineFeatures:
     model must still load on a box where the help cannot be read.
     """
     directory = binary.parent
-    cached = read_features_file(directory, tag)
-    if cached is not None:
-        return cached
+    from_disk = cached_engine_features(directory, tag)
+    if from_disk.known:
+        return from_disk
 
-    text = ""
-    help_path = directory / HELP_FILE
-    if help_path.is_file():
-        with contextlib.suppress(OSError):
-            text = help_path.read_text(encoding="utf-8")
-    if not text.strip():
-        if not binary.is_file():
-            return EngineFeatures.unknown(tag)
-        try:
-            completed = subprocess.run(  # noqa: S603 - our own pinned engine binary
-                [str(binary), "--help"],
-                capture_output=True,
-                cwd=str(directory),
-                timeout=120,
-                check=False,
-                **_spawn_kwargs(),
-            )
-        except (OSError, subprocess.SubprocessError):
-            return EngineFeatures.unknown(tag)
-        text = completed.stdout.decode("utf-8", "replace") + completed.stderr.decode(
-            "utf-8", "replace"
+    if not binary.is_file():
+        return EngineFeatures.unknown(tag)
+    try:
+        completed = subprocess.run(  # noqa: S603 - our own pinned engine binary
+            [str(binary), "--help"],
+            capture_output=True,
+            cwd=str(directory),
+            timeout=120,
+            check=False,
+            **_spawn_kwargs(),
         )
-        if text.strip():
-            with contextlib.suppress(OSError):
-                help_path.write_text(text, encoding="utf-8")
+    except (OSError, subprocess.SubprocessError):
+        return EngineFeatures.unknown(tag)
+    text = completed.stdout.decode("utf-8", "replace") + completed.stderr.decode("utf-8", "replace")
     if not text.strip():
         return EngineFeatures.unknown(tag)
+    with contextlib.suppress(OSError):
+        (directory / HELP_FILE).write_text(text, encoding="utf-8")
 
     features = parse_engine_features(text, tag)
     if features.known:
