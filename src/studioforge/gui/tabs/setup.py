@@ -725,18 +725,33 @@ def _gpu_body(ctx: GuiContext, refresh: Any) -> None:
 
 
 def _holder_dicts(ctx: GuiContext) -> list[dict[str, Any]]:
-    """VRAM holders per GPU, in the shape ``gpu_setup_rows`` expects."""
+    """VRAM holders per GPU, in the shape ``gpu_setup_rows`` expects.
+
+    One dict per (gpu, pid) row, carrying ``device_bytes`` -- what the pid
+    holds on that row's card, from the PDH per-adapter split joined to CUDA
+    ordinals (D39) -- so the per-GPU "N process(es) holding X" line no longer
+    counts a two-card model's whole total on each of its cards. Where the split
+    is unavailable ``device_bytes`` is ``None`` and the summary falls back to
+    ``used_bytes`` as before.
+    """
     from studioforge.core.gpu import vram_processes
+    from studioforge.core.vram_holders import pdh_process_gpu_bytes
 
     if ctx.probe is None:
         return []
+    try:
+        per_gpu = pdh_process_gpu_bytes()
+    except Exception:  # noqa: BLE001 - the split is a bonus, the row is not
+        per_gpu = {}
     out: list[dict[str, Any]] = []
     for entry in vram_processes(ctx.probe):
+        split = per_gpu.get(entry.pid) or {}
         out.append(
             {
                 "pid": entry.pid,
                 "name": entry.name,
                 "used_bytes": entry.used_bytes,
+                "device_bytes": split.get(entry.gpu_index) if split else None,
                 "gpu_indices": [entry.gpu_index],
                 "is_ours": entry.is_ours,
             }

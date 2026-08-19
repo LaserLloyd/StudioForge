@@ -316,24 +316,12 @@ class EngineConfig(BaseModel):
     #: costs context rather than risking an OOM; it stays unset because it is a
     #: VRAM-for-prefill trade the operator should make knowingly, not a default.
     #:
-    #: Spelled ``int | None`` rather than ``PositiveInt | None`` deliberately:
-    #: an *optional* Annotated int survives into the pydantic annotation as
-    #: ``Optional[Annotated[int, Gt(0)]]``, which the Setup tab's field-spec
-    #: generator classifies as unsupported and silently drops from the form.
-    #: The bound lives in the validator below instead.
-    ubatch_size: int | None = None
+    ubatch_size: PositiveInt | None = None
     #: ``-bs/--backend-sampling``: run sampling on the GPU. Faster, but marked
     #: EXPERIMENTAL by b10425 and silently downgraded to CPU sampling under
     #: ``--split-mode tensor``. Off by default under the quality-first rule --
     #: only features that are lossless *and* not experimental ship enabled.
     backend_sampling: bool = False
-
-    @field_validator("ubatch_size")
-    @classmethod
-    def _positive_ubatch(cls, v: int | None) -> int | None:
-        if v is not None and v < 1:
-            raise ValueError("engine.ubatch_size must be >= 1 (null = the engine's own 512)")
-        return v
 
     @field_validator("cache_ram_mb")
     @classmethod

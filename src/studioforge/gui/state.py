@@ -3790,10 +3790,20 @@ def gpu_setup_rows(
 
 
 def _holder_summary(holders: Sequence[Mapping[str, Any]]) -> str:
-    """ "2 process(es) holding 5.10 GiB", or nothing at all."""
+    """ "2 process(es) holding 5.10 GiB", or nothing at all.
+
+    A holder row may carry ``device_bytes`` -- what the process holds on THIS
+    card (D39's per-adapter measurement) -- and when it does, that is the
+    figure summed. ``used_bytes`` is a per-process total across every card, so
+    summing it per GPU double-counted a model split over two of them (WP21's
+    follow-up); it remains the fallback when no per-device figure exists.
+    """
     if not holders:
         return ""
-    total = sum(int(h.get("used_bytes") or 0) for h in holders)
+    total = 0
+    for h in holders:
+        device = h.get("device_bytes")
+        total += int(device) if device is not None else int(h.get("used_bytes") or 0)
     if total <= 0:
         return f"{len(holders)} process(es) holding VRAM (size unavailable)"
     return f"{len(holders)} process(es) holding {format_gib(total)}"
@@ -4071,6 +4081,17 @@ def _spec_kind(annotation: Any) -> tuple[str, tuple[str, ...]]:
     widget instead.
     """
     origin = typing.get_origin(annotation)
+    if origin is typing.Annotated:
+        # ``PositiveInt | None`` reaches pydantic as
+        # ``Optional[Annotated[int, Gt(0)]]``: pydantic strips a TOP-level
+        # Annotated into ``FieldInfo.metadata`` but leaves one nested inside a
+        # Union alone, and the bare-scalar checks below never saw the ``int``.
+        # The field was then "unsupported" and silently missing from the form
+        # -- which is how ``engine.ubatch_size`` came to be typed ``int | None``
+        # with its bound in a validator (WP20). The constraint still belongs to
+        # the config model, which validates what was typed; the widget only
+        # needs the scalar underneath.
+        return _spec_kind(typing.get_args(annotation)[0])
     if origin is typing.Literal:
         return "select", tuple(str(arg) for arg in typing.get_args(annotation))
     if origin in (types.UnionType, typing.Union):

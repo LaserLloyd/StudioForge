@@ -520,6 +520,87 @@ def test_gpu_rows_join_the_probe_with_the_planner_policy() -> None:
     assert "8.00 GiB free of 24.00 GiB" in summary
 
 
+def test_a_split_model_is_counted_per_card_not_per_card_times_its_total() -> None:
+    """WP21's follow-up: the per-GPU line read a two-card model's whole total on
+    each of its cards. With ``device_bytes`` (D39) each card shows what it holds."""
+    gpus = _Probe().list_gpus()
+    rows = st.gpu_setup_rows(
+        gpus,
+        holders=[
+            {
+                "pid": 9,
+                "name": "llama-server.exe",
+                "used_bytes": 30 * GIB,
+                "device_bytes": 16 * GIB,
+                "gpu_indices": [0],
+            },
+            {
+                "pid": 9,
+                "name": "llama-server.exe",
+                "used_bytes": 30 * GIB,
+                "device_bytes": 14 * GIB,
+                "gpu_indices": [3],
+            },
+        ],
+    )
+    assert "1 process(es) holding 16.00 GiB" in rows[0].summary()
+    assert "1 process(es) holding 14.00 GiB" in rows[1].summary()
+    # Without a per-device figure the per-process total is still the fallback.
+    rows = st.gpu_setup_rows(
+        gpus[:1],
+        holders=[
+            {
+                "pid": 9,
+                "name": "x",
+                "used_bytes": 30 * GIB,
+                "device_bytes": None,
+                "gpu_indices": [0],
+            }
+        ],
+    )
+    assert "holding 30.00 GiB" in rows[0].summary()
+
+
+def test_setup_tab_holder_dicts_carry_device_bytes(monkeypatch: pytest.MonkeyPatch) -> None:
+    from studioforge.core import vram_holders
+    from studioforge.gui.tabs import setup as setup_tab
+    from studioforge.types import VramProcess
+
+    class Probe(_Probe):
+        def compute_processes(self) -> list[VramProcess]:
+            return [
+                VramProcess(gpu_index=0, pid=9, name="llama-server.exe", used_bytes=30 * GIB),
+                VramProcess(gpu_index=3, pid=9, name="llama-server.exe", used_bytes=30 * GIB),
+            ]
+
+    monkeypatch.setattr(
+        vram_holders, "pdh_process_gpu_bytes", lambda **_: {9: {0: 16 * GIB, 3: 14 * GIB}}
+    )
+
+    class Ctx:
+        probe = Probe()
+
+    dicts = setup_tab._holder_dicts(Ctx())  # type: ignore[arg-type]
+    assert [(d["gpu_indices"], d["device_bytes"]) for d in dicts] == [
+        ([0], 16 * GIB),
+        ([3], 14 * GIB),
+    ]
+
+
+def test_an_optional_constrained_int_is_still_an_int_field() -> None:
+    """``PositiveInt | None`` is ``Optional[Annotated[int, Gt(0)]]`` to pydantic;
+    the generator used to classify the inner Annotated as unsupported and drop
+    the key from the form (WP20's engine.ubatch_size workaround)."""
+    from typing import Annotated
+
+    from pydantic import Field
+
+    assert st._spec_kind(Annotated[int, Field(gt=0)] | None) == ("int", ())
+    assert st._spec_kind(Annotated[float, Field(ge=0)]) == ("float", ())
+    specs = st.spec_by_key(st.config_field_specs())
+    assert specs["engine.ubatch_size"].kind == "int"
+
+
 def test_a_holder_with_no_measurable_size_still_gets_named() -> None:
     rows = st.gpu_setup_rows(
         _Probe().list_gpus()[:1],
