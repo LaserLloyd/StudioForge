@@ -83,18 +83,29 @@ StudioForge management plane: control a GPU-only llama.cpp serving host.
 Use these tools to see what models exist, load/unload them, watch VRAM, find
 and download new ones, and change configuration.
 
-START WITH list_models. It returns a catalog sorted newest-download-first, and
-each model carries a table of loading options. Pass limit=5 when the user means
-"the model I just got". Pick the option row marked recommended:true -- the
-highest context at or above this server's default context floor, preferring one
-that also serves two conversations; the floor is never traded away for a second
-slot. Call model_options for the full table when you need a different context
-size or more concurrency. Then pass that row's `load_args` object verbatim to
-load_model. Every number you need to choose is already in the row: whether it
-fits in the VRAM free right now, which GPUs it would use, how many conversations
-the placement sustains (max_parallel, and parallel_limited_by saying what caps
-it), tokens/second for one stream at an ordinary ~8k of context (est_gen_tps)
-and with the window nearly full (est_gen_tps_full_ctx). The model's
+START WITH list_models. It returns a catalog sorted newest-download-first. Pass
+limit=5 when the user means "the model I just got". Each model's `recommended`
+block is the load to take by default: the optimal settings on this rig's best
+pair of GPUs, computed as if those cards were free, with `load_args` you pass to
+load_model verbatim -- it carries `devices`, so the placement comes with it.
+
+`placements` answers "which hardware should this model use" for every mode of
+this box (on this rig: dual_5090, dual_3090, all_gpus, single_5090), each with
+its own optimal settings and a ranking of fastest / largest_context / cheapest.
+Because those are computed on idle cards, `fits_now` says whether the mode would
+load right now and `would_evict` says what stands in the way; in the compact
+list the non-recommended modes give settings and devices but no `load_args`, so
+call model_options for the one you choose. Call model_options too when you need
+a different context size or more concurrency -- it returns the full per-context
+table.
+
+Settings are chosen QUALITY FIRST: the best KV cache that reaches the server's
+context floor, then the largest context at that quality, then whatever slots
+fit. A 4-bit K cache is never chosen automatically, and a doubled window is not
+traded for a quantized cache. Every number you need is already there: which GPUs,
+how many conversations the placement sustains (max_parallel, parallel_limited_by
+saying what caps it), tokens/second for one stream at an ordinary ~8k of context
+(est_gen_tps) and with the window nearly full (est_gen_tps_full_ctx). The model's
 attention_kind explains why its context tiers are priced the way they are:
 'iswa' and 'hybrid' models keep only a fraction of the window in KV, so their
 huge contexts stay cheap. Speeds are estimates unless confidence says otherwise
@@ -489,17 +500,28 @@ def build_management_mcp(state: Any) -> MCPServer:
         1. Read ``catalog_hint`` once; it explains every column.
         2. Models are ordered by ``downloaded_at``, **newest first**, which is
            usually the order the user thinks in ("the model I just got").
-        3. In each model's ``options``, take the row with
-           ``recommended: true`` -- the highest context that fits at or above
-           this server's default context floor, preferring one that also serves
-           two conversations. Only look at another row if your task needs more
-           context than it offers, or more concurrency than its
-           ``max_parallel``.
-        4. Pass that row's ``load_args`` object **verbatim** to ``load_model``.
-           Do not modify it, recompute it, or fill in extra fields.
+        3. Take the model's ``recommended`` block. It is the default load: the
+           optimal settings on this rig's best pair of GPUs, chosen quality
+           first (the best KV cache that reaches the context floor, then the
+           largest context at that quality, then whatever slots fit).
+        4. Pass its ``load_args`` object **verbatim** to ``load_model``. Do not
+           modify it, recompute it, or fill in extra fields -- it already names
+           the ``devices``.
 
-        A row with ``fits: false`` will not load right now. Check its
-        ``if_gpus_idle`` block: if that says ``fits: true``, the VRAM exists
+        ``placements`` is the same answer for every other set of cards this box
+        has, so "run it on the 3090s and leave the 5090s free" is a row you
+        pick rather than arithmetic you do. Each carries a ``ranking``
+        (``fastest`` / ``largest_context`` / ``cheapest``). An ``optimal`` is
+        computed as if that mode's cards were **idle**, which is what makes it
+        a property of the hardware rather than of this second; ``fits_now``
+        tells you whether it would load right now and ``would_evict`` counts
+        what is in the way, with ``fits_now_ctx`` giving the largest context
+        that does fit on that mode as things stand. Only ``recommended``
+        carries ``load_args`` in this compact view -- call ``model_options``
+        for the mode you settle on.
+
+        An ``options`` row with ``fits: false`` will not load right now. Check
+        its ``if_gpus_idle`` block: if that says ``fits: true``, the VRAM exists
         but something else is holding it, and ``unload_model`` on another model
         makes the row available.
 
@@ -522,10 +544,11 @@ def build_management_mcp(state: Any) -> MCPServer:
         Args:
             loaded_only: Only models with a running llama-server child.
             kind: Filter by kind -- "chat", "embedding" or "rerank".
-            full: Return every context-size row. The default returns only the
-                recommended row per model, which is roughly seven times
-                smaller and is what you want unless you are comparing context
-                sizes.
+            full: Return every context-size row, and every placement's
+                ``load_args``. The default returns the recommended load, one
+                compact row per hardware mode, and the single context row that
+                fits best right now -- which is what you want unless you are
+                comparing context sizes.
             refresh: Rebuild instead of serving the few-second cache. Only
                 needed right after loading or unloading something, because
                 ``fits`` depends on free VRAM.
@@ -600,10 +623,12 @@ def build_management_mcp(state: Any) -> MCPServer:
     async def model_options(model_id: str, refresh: bool = False) -> dict[str, Any]:
         """Every loading option for ONE model: all context sizes, with speeds.
 
-        Use this after ``list_models`` when the recommended row is not what you
-        want -- for example you need a 262144-token window and the recommended
-        row offers 65536, or you need six concurrent conversations and it
-        offers two.
+        Use this after ``list_models`` when the ``recommended`` load is not what
+        you want -- you need a 262144-token window and it offers 65536, you
+        need six concurrent conversations and it offers two, or you want one of
+        the other ``placements`` modes and need its ``load_args``. This view
+        returns every placement in full, including the ``load_args`` the
+        compact list omits.
 
         Each row is independent and complete: ``ctx_per_slot`` (context per
         conversation), ``fits`` (right now, on current free VRAM), ``devices``,
@@ -622,10 +647,13 @@ def build_management_mcp(state: Any) -> MCPServer:
         with the window nearly full -- the wider the row, the further those two
         numbers sit apart, and that gap is the real price of the context.
 
-        The row marked ``recommended`` is the highest context at or above this
-        server's default context floor, preferring one that also sustains two
-        conversations; a second slot is never bought by dropping below the
-        floor. Reach past it when your task genuinely needs more.
+        The row marked ``best_now`` is what would load on the machine exactly as
+        it stands; the model-level ``recommended`` is the better answer when you
+        can choose the hardware, because it is computed with its cards idle.
+        Both are chosen quality first: the best KV cache that reaches the
+        server's context floor, then the largest context at that quality. A
+        4-bit K cache is never chosen for you -- ask for it explicitly with
+        ``kv_cache_type`` if you have decided the trade is worth it.
 
         Args:
             model_id: Model id or alias, as returned by ``list_models``.

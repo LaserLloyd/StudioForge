@@ -1130,104 +1130,88 @@ class ModelManager:
             draining=self._draining,
         )
 
-    #: Hardware modes OpenClaw can choose between. 5090s first: they are the
-    #: fastest cards and leaving the 3090s free lets a second model run beside
-    #: this one. "all" is the fallback for anything that will not fit on a pair.
-    PLACEMENT_MODES: tuple[tuple[str, tuple[int, ...] | None, str], ...] = (
-        ("dual_5090", (0, 1), "Both RTX 5090s. Fastest, and leaves the 3090s free."),
-        ("dual_3090", (2, 3), "Both RTX 3090s. Slower, but keeps the 5090s free."),
-        ("all_gpus", None, "All four GPUs. Largest capacity; uses the whole rig."),
-    )
-
     def placement_profiles(self, name: str) -> dict[str, Any]:
-        """Best achievable load for this model in each hardware mode.
+        """Optimal settings for this model on every hardware mode of this box.
 
-        Answers "which model should I run, and how?" in one call, so an agent
-        does not have to probe context sizes by trial and error. Each mode
-        reports the largest context that fits and the best-quality KV cache
-        that reaches it -- the same decision a real load would make.
+        Answers "which GPUs should I give this model, and what do I get" in one
+        call. Each mode is judged **with its own cards idle** -- the user's
+        "assume you can fill them both" -- and what stands in the way right now
+        travels beside it as ``fits_now`` / ``would_evict``.
 
-        Carries the concurrency and speed columns too (``max_parallel``,
-        ``parallel_limited_by``, ``ctx_per_slot``, ``kv_bytes_per_token``,
-        ``est_gen_tps`` at the reference fill and ``est_gen_tps_full_ctx`` at
-        the whole window, ``est_prompt_tps``), so this endpoint and
-        ``/api/catalog`` never disagree about the same placement. The
-        difference between them is the question asked: ``/profiles`` asks "what
-        is the best this model can do on each *hardware mode*", the catalog
-        asks "what does this model do at each *context size*".
+        Three things this used to get wrong, all fixed by delegating to
+        :func:`studioforge.core.placements.placement_report` (D36):
+
+        * the modes were the literals ``(0, 1)``, ``(2, 3)`` and "all", so a box
+          with other hardware was described wrongly and the single-best-card
+          mode the user asks about did not exist;
+        * each mode was planned against **live** free VRAM, which answers a
+          different question from the one the endpoint's own name asks;
+        * it asked the planner for the largest context that fits, a *second*
+          recommendation rule, so this endpoint and ``/api/catalog`` could
+          recommend different loads for the same model on the same hardware.
+          Both now call :func:`studioforge.core.catalog.choose_row`.
+
+        The pre-D36 keys (``mode``, ``gpus``, ``fits``, ``ctx_size``,
+        ``load_args``) are kept inside each entry so an existing caller is not
+        broken by the richer shape; ``fits`` now means "fits on this mode with
+        its cards idle", which is what the mode was always meant to describe.
         """
         from studioforge.core import catalog as catalog_mod
+        from studioforge.core import placements as placements_mod
 
         record = self.registry.resolve(name)
         if record is None:
             raise ModelNotFoundError(name, known=self.registry.known_ids())
 
-        trained = record.meta.n_ctx_train if record.meta else None
-        profiles: list[dict[str, Any]] = []
-        original = record.settings
-        try:
-            for key, devices, description in self.PLACEMENT_MODES:
-                record.settings = original.model_copy(
-                    update={"device_override": list(devices) if devices else None}
+        # Planning is not loading (D16/D20), and /profiles is pure planning: at
+        # INFO one call would log a line per model per mode per rung, which is
+        # exactly the flood the 2026-08-19 log review found when an external
+        # client fetched profiles for the whole library.
+        planner = Planner(self.config, self.planner.probe, log_plans=False)
+        instance = self.supervisor.get(record.id)
+        loaded = [i for i in self.supervisor.list() if i.model_id != record.id]
+        live = planner
+        if instance is not None:
+            footprint = Planner.instance_footprint(instance)
+            if footprint:
+                live = Planner(
+                    self.config,
+                    catalog_mod.CreditedProbe(self.planner.probe, footprint),
+                    log_plans=False,
                 )
-                result = self.planner.plan_load(record, loaded=())
-                entry: dict[str, Any] = {
-                    "mode": key,
-                    "description": description,
-                    "gpus": list(devices) if devices else "all",
-                }
-                if isinstance(result, LoadPlan):
-                    slots, bound, vram = catalog_mod.slots_for_plan(self.planner, record, result)
-                    speed = catalog_mod.estimate_speed(self.planner, record, result, slots, {})
-                    entry.update(
-                        fits=True,
-                        ctx_size=result.ctx_size,
-                        ctx_per_slot=result.ctx_size,
-                        kv_cache_type=result.kv_cache_type,
-                        kv_bytes_per_token=result.kv_bytes_per_token,
-                        devices=list(result.devices),
-                        max_parallel=slots,
-                        parallel_limited_by=bound,
-                        est_gen_tps=speed["gen_tps"],
-                        est_gen_tps_full_ctx=speed["gen_tps_full_ctx"],
-                        est_prompt_tps=speed["prompt_tps"],
-                        est_gen_tps_batched=speed["gen_tps_batched"],
-                        load_args={
-                            "model_id": record.id,
-                            "ctx_size": result.ctx_size,
-                            "parallel": slots,
-                            "kv_cache_type": result.kv_cache_type,
-                        },
-                        # Sized at max_parallel, matching load_args, not at
-                        # whatever slot count the plan happened to carry.
-                        vram_gib=round(vram / (1024**3), 2),
-                    )
-                else:
-                    entry.update(
-                        fits=False,
-                        reason=result.reason,
-                        max_ctx_that_fits=result.max_ctx_that_fits,
-                    )
-                profiles.append(entry)
-        finally:
-            record.settings = original
 
-        usable = [p for p in profiles if p["fits"]]
-        best = max(usable, key=lambda p: p["ctx_size"], default=None)
-        # Cheapest = fewest/fastest cards that still reach the best context, so
-        # an agent can leave the rest of the rig free for something else.
-        cheapest = next(
-            (p for p in profiles if p["fits"] and best and p["ctx_size"] == best["ctx_size"]),
-            None,
+        entries = placements_mod.placement_report(
+            record,
+            planner=planner,
+            live_planner=live,
+            loaded=loaded,
+            floor=catalog_mod.recommendation_floor(self.config, record),
+            preference=str(getattr(self.config.planner, "preference", "quality")),
         )
+        for entry in entries:
+            optimal = entry.get("optimal")
+            entry["gpus"] = list(entry["devices"])
+            entry["fits"] = optimal is not None
+            if optimal is not None:
+                entry["ctx_size"] = optimal["ctx_per_slot"]
+                entry["load_args"] = optimal["load_args"]
+
+        usable = [e for e in entries if e.get("optimal")]
+        best = max(usable, key=lambda e: int(e["optimal"]["ctx_per_slot"]), default=None)
+        cheapest = next((e for e in usable if "cheapest" in e.get("ranking", [])), None)
         return {
             "model_id": record.id,
-            "n_ctx_train": trained,
+            "n_ctx_train": record.meta.n_ctx_train if record.meta else None,
             "size_gib": round(record.size_bytes / (1024**3), 2),
-            "profiles": profiles,
-            "best_mode": best["mode"] if best else None,
-            "max_ctx": best["ctx_size"] if best else None,
-            "recommended_mode": cheapest["mode"] if cheapest else None,
+            "floor": catalog_mod.recommendation_floor(self.config, record),
+            "modes": entries,
+            # The pre-D36 name for the same list.
+            "profiles": entries,
+            "best_mode": usable[0]["mode"] if usable else None,
+            "cheapest_mode": cheapest["mode"] if cheapest else None,
+            "max_ctx": int(best["optimal"]["ctx_per_slot"]) if best else None,
+            "recommended_mode": usable[0]["mode"] if usable else None,
+            "quality_notes": catalog_mod.quality_notes(record),
         }
 
     # -- catalog ----------------------------------------------------------

@@ -442,9 +442,15 @@ async def test_list_models_never_leaks_a_chat_template_or_meta_dump(state: State
     assert "tensor_bytes" not in raw
     assert "tokenizer_model" not in raw
     assert "{% for m in messages %}" not in raw
-    # Compact by default, so three models with load recipes stay affordable
-    # (the budget includes the two truncation keys, ~50 bytes).
-    assert len(raw) < 7300, f"list_models output is {len(raw)} chars"
+    # Compact by default, so three models with load recipes stay affordable.
+    # Re-anchored at WP18/D36: an entry now carries `recommended` (a complete
+    # load recipe naming the GPUs) and one `placements` row per hardware mode,
+    # which is roughly double the old per-model cost and is the feature the
+    # payload exists for. It is held down deliberately -- the alternatives
+    # carry no load_args, `would_evict` is a count rather than a list, and
+    # `list_models` still defaults to limit=25 -- so this number must not drift
+    # upward again without a reason as good.
+    assert len(raw) < 13500, f"list_models output is {len(raw)} chars"
 
 
 async def test_model_options_returns_the_whole_table_for_one_model(state: State) -> None:

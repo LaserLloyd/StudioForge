@@ -14,19 +14,25 @@ Shape of the answer::
       "models": [                       # NEWEST DOWNLOAD FIRST
         {
           "id": ..., "summary": ..., "downloaded_at": ...,
-          "quantization": ..., "architecture": ..., "capabilities": [...],
           "attention_kind": "iswa",     # why its long windows are cheap
-          "options": [                  # one row per context tier
+          "recommended": {              # THE default load: best pair of cards
+            "mode": "dual_5090", "label": "2x RTX 5090", "devices": [0, 1],
+            "ctx_per_slot": 131072, "kv_cache_type": "f16", "max_parallel": 3,
+            "fits_now": true, "would_evict": [],
+            "load_args": {"model_id": ..., "ctx_size": 131072,
+                          "parallel": 3, "kv_cache_type": "f16",
+                          "devices": [0, 1]}},
+          "placements": [...],          # the same, per hardware mode
+          "options": [                  # the drill-down, one row per ctx tier
             {"ctx_per_slot": 65536, "fits": true, "devices": [0, 1],
-             "max_parallel": 4, "est_gen_tps": 58.0,
-             "est_gen_tps_full_ctx": 41.0, "recommended": true,
-             "load_args": {"model_id": ..., "ctx_size": 65536, ...}}
+             "max_parallel": 4, "est_gen_tps": 58.0, "best_now": true,
+             "load_args": {...}}
           ]
         }
       ]
     }
 
-Three design rules, all of them about the consumer being a language model:
+Four design rules, all of them about the consumer being a language model:
 
 **Newest first, always.** The user works from the last thing they downloaded,
 so ``downloaded_at`` (the newest mtime across a model's GGUF shards -- a
@@ -38,13 +44,24 @@ exactly the argument object the ``load_model`` tool accepts. An agent that has
 chosen a row is done choosing: it passes the object through. No field in it
 needs to be computed, converted or looked up.
 
+**The headline answer is a placement, not a context size.** The question a
+caller has is "which GPUs should this model get", so ``recommended`` names a
+set of cards and the settings that are optimal on them **with those cards
+idle** -- the user's "assume you can fill them both". What is in the way right
+now travels beside it as ``fits_now`` / ``would_evict``, which is the half a
+caller can act on. ``placements`` answers the same question for every other
+mode this box has; ``options`` remains the per-context drill-down, with
+``best_now`` flagging the row that would load on the machine as it stands.
+
 **The planner is the only authority on placement.** The rows do not
 re-implement fitting -- they call :meth:`Planner.plan_load` once per context
 tier, so exclusions, reservations, quant affinity, per-model device overrides
-and *current free VRAM* are all respected by construction. Each row is computed
-twice: once against the machine as it is now (``fits``/``devices``) and once
-against every GPU idle (``if_gpus_idle``), so the agent can tell "impossible"
-apart from "possible after unloading something".
+and *current free VRAM* are all respected by construction. Each ``options`` row
+is computed twice: once against the machine as it is now (``fits``/``devices``)
+and once against every GPU idle (``if_gpus_idle``), so the agent can tell
+"impossible" apart from "possible after unloading something". A model that is
+already loaded is judged against a machine credited with its own footprint,
+because its rows describe reloading it (D36).
 """
 
 from __future__ import annotations
@@ -53,11 +70,13 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, NamedTuple
 
+from studioforge.core import placements as placements_mod
 from studioforge.core import throughput
 from studioforge.core.kv_sensitivity import (
     allows_q8,
     kv_quality_label,
     kv_quality_rank,
+    sensitivity_for,
 )
 from studioforge.core.planner import (
     Planner,
@@ -82,42 +101,51 @@ CTX_TIERS: tuple[int, ...] = (16384, 32768, 65536, 131072, 262144, 524288, 10485
 #: human: it is the difference between an agent that picks a row and an agent
 #: that asks the user which context size it should use.
 CATALOG_HINT = (
-    "Each model lists loading options, one row per context size; models are "
-    "sorted by download date, newest first. Per row: ctx_per_slot is the "
-    "context EACH concurrent conversation gets; fits says whether it loads on "
-    "the VRAM free right now; devices are the CUDA indices it would use; "
-    "kv_cache_type is the KV quantization picked to reach that context; "
-    "vram_mb is the whole load at this row's max_parallel; max_parallel is "
-    "how many conversations the placement sustains, and parallel_limited_by "
-    "names what caps it ('vram', 'knee' = where extra slots stop buying "
-    "throughput, or 'cap'). Speeds are tokens/second: est_gen_tps is ONE "
-    "stream with ~8k tokens of context in the window (a typical turn); "
-    "est_gen_tps_full_ctx is that same stream with the window nearly full -- "
-    "generation slows as context fills, so the truth is between the two; "
-    "est_gen_tps_batched is the aggregate across all slots; est_prompt_tps is "
-    "prompt ingestion. measured_gen_tps / measured_prompt_tps are real "
-    "observations of this exact placement, and confidence is 'measured', "
-    "'calibrated' (corrected by a learned factor -- calibration.basis says "
-    "from what: 'model+devices', 'model', 'peers' = other models of the same "
-    "density on the same hardware, or 'none') or 'estimated' (nominal "
-    "hardware numbers: an order of magnitude, not a promise). The model's "
-    "attention_kind explains its context prices: 'full' keeps every token on "
-    "every layer, while 'iswa' and 'hybrid' keep only a fraction of the "
-    "context in KV, which is why their huge windows stay cheap and fast. "
-    "if_gpus_idle repeats the verdict as it would be with every GPU free, so "
-    "a row that does not fit now may still be reachable by unloading "
-    "something. Exactly one row is recommended:true -- the highest context "
-    "that fits at or above this server's default context floor, preferring "
-    "one that also sustains two slots; a second slot is never bought by "
-    "dropping under the floor, because an agent transcript that does not fit "
-    "is a failed task. Take that row unless you need more context, then pass "
-    "its load_args object verbatim to the load_model tool."
+    "Models are sorted by download date, newest first. START AT recommended: "
+    "the default load for that model -- the optimal settings on this rig's best "
+    "pair of GPUs, computed as if those cards were free -- whose load_args go "
+    "verbatim to load_model, devices included. Never edit or recompute a "
+    "load_args object. placements answers the same question for every hardware "
+    "mode of this box, each with its own optimal and a ranking of fastest / "
+    "largest_context / cheapest; the compact list gives their settings and "
+    "devices but only recommended carries load_args, so call model_options for "
+    "the mode you pick. An optimal is computed on IDLE cards, so fits_now says "
+    "whether it loads right now, would_evict names (or counts) what is in the "
+    "way, and fits_now_ctx is the largest context that does fit on that mode "
+    "this second. Settings are chosen QUALITY FIRST: the best KV cache that "
+    "reaches this server's context floor, then the largest context at that "
+    "quality, then whatever slots fit -- a 4-bit K cache is never chosen "
+    "automatically, and a doubled window does not justify a quantized one "
+    "(planner.preference 'throughput' restores the older largest-window rule). "
+    "options is the per-context drill-down for when you need a different "
+    "window, with best_now on the row that fits the machine as it stands. Per "
+    "row: ctx_per_slot is the context EACH concurrent conversation gets; fits "
+    "is against the VRAM free right now; devices are CUDA indices; vram_mb is "
+    "the whole load at this row's max_parallel; parallel_limited_by names what "
+    "caps the slot count ('vram', 'knee' = where extra slots stop buying "
+    "throughput, or 'cap'); if_gpus_idle repeats the verdict with every GPU "
+    "free. Speeds are tokens/second: est_gen_tps is ONE stream at ~8k of "
+    "context (a typical turn), est_gen_tps_full_ctx the same stream with the "
+    "window nearly full -- the truth is between them -- est_gen_tps_batched the "
+    "aggregate across slots, est_prompt_tps ingestion. confidence is 'measured' "
+    "(this exact placement was observed), 'calibrated' (a learned factor; "
+    "calibration.basis says from what) or 'estimated' (nominal hardware "
+    "numbers: an order of magnitude, not a promise). attention_kind explains a "
+    "model's context prices: 'iswa' and 'hybrid' keep only a fraction of the "
+    "window in KV, which is why their huge contexts stay cheap."
 )
 
 #: How long a built catalog stays servable before it is rebuilt. Short, because
 #: `fits` is a statement about free VRAM *right now* and a stale yes is worse
 #: than a slow no.
 CACHE_TTL_S = 20.0
+
+#: Above this, one INFO line naming the cost. The build is pure arithmetic and
+#: runs off the event loop behind a 20-second cache, so it is not on any hot
+#: path -- but it now plans every model at every context tier on every hardware
+#: mode, and that product grows with the library. A number that is drifting
+#: upward should be visible in the log before somebody notices it as a stall.
+SLOW_BUILD_MS = 1000
 
 
 # ---------------------------------------------------------------------------
@@ -193,7 +221,7 @@ class _IdleProbe(_SnapshotProbe):
         return []
 
 
-class _CreditedProbe(_SnapshotProbe):
+class CreditedProbe(_SnapshotProbe):
     """The same GPUs, with one resident child's own VRAM handed back as free.
 
     A loaded model's catalog rows describe *reloading it*, and a reload frees
@@ -401,7 +429,7 @@ def slots_for_plan(planner: Planner, record: ModelRecord, plan: LoadPlan) -> tup
     return slots, bound, estimate.total_bytes
 
 
-def _plan_at(
+def plan_at(
     planner: Planner,
     record: ModelRecord,
     ctx: int,
@@ -501,7 +529,7 @@ def _idle_variant(
     idle_planner: Planner, record: ModelRecord, ctx: int, calibrate_for: Calibrator
 ) -> dict[str, Any]:
     """The same tier, judged against every GPU idle."""
-    plan = _plan_at(idle_planner, record, ctx)
+    plan = plan_at(idle_planner, record, ctx)
     if not isinstance(plan, LoadPlan):
         return {"fits": False}
     slots, bound, vram = slots_for_plan(idle_planner, record, plan)
@@ -552,7 +580,7 @@ def _option_row(
 ) -> dict[str, Any]:
     """One (model, context) row of the catalog."""
     idle = _idle_variant(idle_planner, record, ctx, calibrate_for)
-    plan = _plan_at(planner, record, ctx, loaded=loaded)
+    plan = plan_at(planner, record, ctx, loaded=loaded)
 
     if not isinstance(plan, LoadPlan):
         reason = getattr(plan, "reason", None) or "does not fit in the VRAM free right now"
@@ -892,6 +920,10 @@ def build_catalog(
     gpus = live_probe.list_gpus()
     class_label = throughput.gpu_class(gpus)
     peer_moe = _density_map(registry)
+    # Derived once: the mode list is a property of the box, not of a model, and
+    # deriving it per model would ask the probe thirty-three times for an answer
+    # that cannot have changed inside one snapshot.
+    modes = placements_mod.hardware_modes(gpus)
 
     entries: list[dict[str, Any]] = []
     for record in records:
@@ -908,6 +940,7 @@ def build_catalog(
                 peer_moe=peer_moe,
                 ctx_tiers=ctx_tiers,
                 compact=compact,
+                modes=modes,
             )
         )
 
@@ -916,10 +949,23 @@ def build_catalog(
     for entry in entries:
         entry.pop("downloaded_at_ts", None)
 
+    build_ms = round((time.perf_counter() - started) * 1000)
+    if build_ms > SLOW_BUILD_MS:
+        # Not an error -- the result is cached for CACHE_TTL_S and built off the
+        # event loop -- but a build that keeps growing is how a "cheap" call
+        # becomes a stall, and the number belongs in the log before it does.
+        log.info(
+            "catalog build is slow",
+            build_ms=build_ms,
+            models=len(entries),
+            modes=len(modes),
+            detail="each model is planned per context tier and per hardware mode",
+        )
+
     return {
         "catalog_hint": CATALOG_HINT,
         "generated_at": _iso(generated_at),
-        "build_ms": round((time.perf_counter() - started) * 1000),
+        "build_ms": build_ms,
         "compact": compact,
         "gpu_class": class_label,
         "gpus": [
@@ -950,6 +996,7 @@ def _model_entry(
     peer_moe: Mapping[str, bool],
     ctx_tiers: Sequence[int],
     compact: bool,
+    modes: Sequence[placements_mod.HardwareMode],
 ) -> dict[str, Any]:
     meta = record.meta
     weights = int(getattr(meta, "tensor_bytes", 0) or 0) or int(record.size_bytes)
@@ -1034,7 +1081,7 @@ def _model_entry(
 
     # A resident model's rows describe RELOADING it, so its own allocation is
     # credited back and it is not one of the obstacles (D36 / see
-    # :class:`_CreditedProbe`). Every other model's rows see the machine as it
+    # :class:`CreditedProbe`). Every other model's rows see the machine as it
     # is, because their load frees nothing.
     entry_live, entry_loaded = _live_view_for(record, live, live_probe, loaded, instance)
 
@@ -1060,7 +1107,7 @@ def _model_entry(
         preference=preference,
     )
     entry["best_now_basis"] = basis
-    # The entry-level block describes the factor the recommended row was quoted
+    # The entry-level block describes the factor the chosen row was quoted
     # with -- the row a caller is being told to take. Reporting a model-wide
     # average instead would name a number no row in the table actually used.
     chosen = next((r for r in rows if r.get("best_now")), None)
@@ -1068,7 +1115,89 @@ def _model_entry(
         placed = chosen.get("devices") or (chosen.get("if_gpus_idle") or {}).get("devices") or ()
         entry["calibration"] = _calibration_block(calibrate_for(placed))
     entry["options"] = rows
+
+    # -- what this model does on each set of cards, and the default load ----
+    entry["placements"] = placements_mod.placement_report(
+        record,
+        planner=live,
+        live_planner=entry_live,
+        probe=live_probe,
+        loaded=entry_loaded,
+        ctx_tiers=ctx_tiers,
+        floor=floor,
+        preference=preference,
+        calibrate_for=calibrate_for,
+        modes=modes,
+    )
+    _apply_recommendation(entry, record)
+    notes = quality_notes(record)
+    if notes:
+        entry["quality_notes"] = notes
     return compact_entry(entry) if compact else entry
+
+
+def _apply_recommendation(entry: dict[str, Any], record: ModelRecord) -> None:
+    """Promote the headline placement to the entry's ``recommended`` load.
+
+    ``placements[0]`` is the two best cards of this box, computed as if they
+    were empty -- "assume you can fill them both". That is the load a caller
+    should take by default, so it is stated once at the top of the entry with
+    its own ``fits_now`` / ``would_evict`` beside it rather than left for the
+    caller to dig out of a list. A mode that cannot hold the model at all is
+    skipped, so ``recommended`` is the best mode that *can*.
+    """
+    usable = [p for p in entry.get("placements", []) if p.get("optimal")]
+    if not usable:
+        entry["recommended"] = None
+        entry["recommended_basis"] = None
+        return
+    head = usable[0]
+    optimal = head["optimal"]
+    entry["recommended"] = {
+        "mode": head["mode"],
+        "label": head["label"],
+        "devices": list(head["devices"]),
+        "ctx_per_slot": optimal["ctx_per_slot"],
+        "kv_cache_type": optimal["kv_cache_type"],
+        "kv_cache_type_v": optimal["kv_cache_type_v"],
+        "max_parallel": optimal["max_parallel"],
+        "est_gen_tps": optimal["est_gen_tps"],
+        "est_gen_tps_full_ctx": optimal["est_gen_tps_full_ctx"],
+        "vram_mb": optimal["vram_mb"],
+        "fits_now": head["fits_now"],
+        "would_evict": list(head["would_evict"]),
+        "load_args": optimal["load_args"],
+    }
+    entry["recommended_basis"] = f"{head['label']}: {head['basis']}"
+
+
+def quality_notes(record: ModelRecord) -> list[str]:
+    """Warnings about *saved settings* that cap this model's quality.
+
+    Only one so far, and it is aimed at a real pair of records on this rig: the
+    two Gemma-4 QAT models pin ``kv_cache_type: q8_0``, and Gemma is precisely
+    the family that measurably minds (KL 0.108 dense / 0.377 MoE against f16 --
+    :mod:`studioforge.core.kv_sensitivity`). The planner honours an explicit
+    setting verbatim and must go on doing so, so the only correct action here
+    is to *say* what it costs and where to clear it. The placements carry an
+    ``if_unpinned`` block beside the pinned one so the size of the choice is
+    visible rather than asserted.
+    """
+    pinned = record.settings.kv_cache_type
+    if pinned is None or pinned in ("auto", "f16"):
+        return []
+    sensitivity = sensitivity_for(record.meta)
+    if not sensitivity.sensitive:
+        return []
+    measured = (
+        f" ({sensitivity.family}: KL {sensitivity.kl_q8} at q8_0 vs f16)"
+        if sensitivity.kl_q8 is not None
+        else ""
+    )
+    return [
+        f"pinned kv_cache_type {pinned} caps quality on a KV-sensitive family"
+        f"{measured}; clear it in Models -> settings to let the planner use f16"
+    ]
 
 
 def _live_view_for(
@@ -1082,7 +1211,7 @@ def _live_view_for(
 
     For a model that is **not** loaded this is the shared live planner and the
     whole loaded list. For a model that **is** loaded it is a planner over a
-    :class:`_CreditedProbe` -- its own footprint handed back as free VRAM --
+    :class:`CreditedProbe` -- its own footprint handed back as free VRAM --
     with itself removed from the obstacles, which is precisely the view D30's
     ``reload_of`` takes when the same reload is actually performed. Both halves
     matter: the credited probe is what ``fits`` is decided against, and it is
@@ -1097,7 +1226,7 @@ def _live_view_for(
         # A child with no plan (an adopted instance, a fake in a test): there is
         # nothing to credit, and inventing a figure would be worse than none.
         return live, others
-    credited = Planner(live.config, _CreditedProbe(live_probe, footprint), log_plans=False)
+    credited = Planner(live.config, CreditedProbe(live_probe, footprint), log_plans=False)
     return credited, others
 
 
@@ -1156,7 +1285,7 @@ def loaded_plan_of(instance: Any) -> dict[str, Any] | None:
 
 
 def compact_entry(entry: dict[str, Any]) -> dict[str, Any]:
-    """Strip an entry to its recommended row and drop uninformative fields.
+    """Strip an entry to its headline answers and drop uninformative fields.
 
     Everything removed is null, empty, or identical to a sibling, so a client
     reading the compact view never sees a *different* answer -- only a shorter
@@ -1164,6 +1293,11 @@ def compact_entry(entry: dict[str, Any]) -> dict[str, Any]:
     matters because the cost is real: a forty-model library at full detail is
     tens of thousands of tokens charged to an agent that asked a one-line
     question.
+
+    What survives is the two things a caller acts on: ``recommended`` (the
+    default load, on the best pair of cards) and ``placements`` (the same
+    question answered for every other set of cards), plus the single option row
+    that is best on this machine right now.
     """
     out = {
         k: v
@@ -1177,6 +1311,52 @@ def compact_entry(entry: dict[str, Any]) -> dict[str, Any]:
     if entry.get("params_active_b") == entry.get("params_total_b"):
         out.pop("params_active_b", None)
     out["options"] = [compact_row(r) for r in entry.get("options", []) if r.get("best_now")]
+    if entry.get("placements"):
+        out["placements"] = [compact_placement(p) for p in entry["placements"]]
+    return out
+
+
+def compact_placement(entry: Mapping[str, Any]) -> dict[str, Any]:
+    """One hardware mode, at the size a list of forty models can afford.
+
+    ``would_evict`` collapses from the model ids to a count -- "two models are
+    in the way" is the decision, and *which* two is a ``model_options`` call
+    away. ``est_prompt_tps``, ``parallel_limited_by``, ``fits_now_ctx`` and the
+    ``if_unpinned`` comparison go for the same reason: they inform a choice
+    between modes that this view has already framed.
+
+    **``load_args`` goes too, and only here.** The catalog's rule is that a
+    chosen row needs no assembly, and the rule is kept where it is used: the
+    entry's ``recommended`` -- the mode a caller takes by default -- carries a
+    complete, verbatim-passable object. Repeating one per mode costs about 40%
+    of a compact entry to describe four loads of which at most one happens, on
+    a payload a caller asks for twenty-five models at a time. The alternatives
+    keep ``mode``, ``devices`` and their settings, and ``model_options`` returns
+    their ``load_args`` in full for the one mode that is actually chosen.
+    """
+    optimal = entry.get("optimal")
+    out: dict[str, Any] = {
+        "mode": entry["mode"],
+        "label": entry["label"],
+        "devices": list(entry["devices"]),
+        "fits_now": bool(entry.get("fits_now")),
+        "would_evict": len(entry.get("would_evict") or []),
+    }
+    if entry.get("ranking"):
+        out["ranking"] = list(entry["ranking"])
+    if optimal is None:
+        out["optimal"] = None
+        return out
+    out["optimal"] = {
+        "ctx_per_slot": optimal["ctx_per_slot"],
+        "kv_cache_type": optimal["kv_cache_type"],
+        "max_parallel": optimal["max_parallel"],
+        "est_gen_tps": optimal["est_gen_tps"],
+        "est_gen_tps_full_ctx": optimal["est_gen_tps_full_ctx"],
+        "vram_mb": optimal["vram_mb"],
+    }
+    if optimal["kv_cache_type_v"] != optimal["kv_cache_type"]:
+        out["optimal"]["kv_cache_type_v"] = optimal["kv_cache_type_v"]
     return out
 
 
