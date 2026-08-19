@@ -135,7 +135,9 @@ async def restart_model(model_id: str, request: Request) -> dict[str, Any]:
     record = state.registry.resolve(model_id)
     if record is None:
         raise ModelNotFoundError(model_id, known=state.registry.known_ids())
-    instance = await state.manager.load(record.id, force=True)
+    instance = await state.manager.load(
+        record.id, force=True, source="api:/api/models/{id}/restart"
+    )
     return {
         "model_id": record.id,
         "restarted": True,
@@ -158,7 +160,7 @@ async def restart_backend(request: Request) -> dict[str, Any]:
     failed: list[dict[str, str]] = []
     for model_id in loaded:
         try:
-            await state.manager.load(model_id, force=True)
+            await state.manager.load(model_id, force=True, source="restart-resume")
             restarted.append(model_id)
         except Exception as exc:
             log.warning("could not restart model", model_id=model_id, error=str(exc))

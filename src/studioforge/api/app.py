@@ -653,6 +653,14 @@ def create_app(
             "version": __version__,
             "uptime_s": round(time.time() - app.state.started_at, 1),
             "loaded_models": [i.model_id for i in loaded],
+            # What this server is in the middle of (D36). Cheap by
+            # construction -- in-memory state only, no NVML and no HTTP to a
+            # child -- because the watchdog polls this endpoint constantly. A
+            # caller about to load or smoke-test a model on a shared box reads
+            # this first: a load that would have to evict a model mid-request
+            # is refused, and test_model refuses outright while anything here
+            # is non-zero.
+            "busy": app.state.manager.busy_snapshot(),
             "draining": app.state.manager.draining,
             # "secondary" means another process owns this data directory, so
             # this one runs no background work: downloads do not resume, models

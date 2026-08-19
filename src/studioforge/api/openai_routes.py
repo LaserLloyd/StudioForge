@@ -193,7 +193,7 @@ async def chat_completions(request: Request) -> Any:
             headers=SSE_HEADERS,
         )
 
-    await state.manager.ensure_loaded(serving.id)
+    await state.manager.ensure_loaded(serving.id, source="jit:/v1/chat/completions")
     _apply_ttl_override(state, serving.id, ttl_override)
     return await _forward(state, serving, "/v1/chat/completions", payload)
 
@@ -216,7 +216,9 @@ async def _stream_with_jit_load(
     server looks broken when it is not. ``:`` comment lines are valid SSE that
     every compliant parser ignores.
     """
-    loader = asyncio.ensure_future(state.manager.ensure_loaded(record.id))
+    loader = asyncio.ensure_future(
+        state.manager.ensure_loaded(record.id, source="jit:/v1/chat/completions")
+    )
     # If the client disconnects mid-load this generator is closed while the task
     # is still running. The load is deliberately NOT cancelled -- the model will
     # finish loading and then idle-unload on its TTL, which is much cheaper than
@@ -284,7 +286,7 @@ async def completions(request: Request) -> Any:
         # Sampler defaults only: there are no messages to carry a system prompt.
         record.preset.apply_to_payload(payload, chat=False)
     serving = state.manager.serving_record(record)
-    await state.manager.ensure_loaded(serving.id)
+    await state.manager.ensure_loaded(serving.id, source="jit:/v1/completions")
     _apply_ttl_override(state, serving.id, ttl_override)
     return await _forward(state, serving, "/v1/completions", payload)
 
@@ -312,7 +314,7 @@ async def embeddings(request: Request) -> Any:
     if "input" not in payload:
         raise BadRequestError("'input' is required", param="input")
     serving = state.manager.serving_record(record)
-    await state.manager.ensure_loaded(serving.id)
+    await state.manager.ensure_loaded(serving.id, source="jit:/v1/embeddings")
     return await _forward(state, serving, "/v1/embeddings", payload)
 
 
@@ -324,7 +326,7 @@ async def rerank(request: Request) -> Any:
     payload = dict(body)
     payload["model"] = record.id
     serving = state.manager.serving_record(record)
-    await state.manager.ensure_loaded(serving.id)
+    await state.manager.ensure_loaded(serving.id, source="jit:/v1/rerank")
     return await _forward(state, serving, "/v1/rerank", payload)
 
 
@@ -334,7 +336,7 @@ async def tokenize(request: Request) -> Any:
     body = await _json_body(request)
     record = _resolve_or_404(state, _require_model(body, state.config))
     serving = state.manager.serving_record(record)
-    await state.manager.ensure_loaded(serving.id)
+    await state.manager.ensure_loaded(serving.id, source="jit:/v1/tokenize")
     return await _forward(state, serving, "/tokenize", dict(body))
 
 

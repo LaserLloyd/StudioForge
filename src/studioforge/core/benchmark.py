@@ -557,7 +557,9 @@ class Benchmarker:
             free_before = self._free_by_device()
             _emit(on_progress, mode.key, "loading", position, total)
             started = time.perf_counter()
-            instance = await self.manager.load(record.id, ctx_size=ctx_size, force=True)
+            instance = await self.manager.load(
+                record.id, ctx_size=ctx_size, force=True, source="benchmark"
+            )
             result.load_time_s = round(time.perf_counter() - started, 3)
             result.vram_used_bytes = self._vram_delta(free_before, mode.devices)
 

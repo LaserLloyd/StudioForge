@@ -670,7 +670,7 @@ async def activate_engine(ctx: GuiContext, tag: str, refresh: Any) -> None:
             await run_blocking(ctx.config.save)
             loaded = [i.model_id for i in ctx.supervisor.list()]
             for model_id in loaded:
-                await ctx.manager.load(model_id, force=True)
+                await ctx.manager.load(model_id, force=True, source="gui")
         except Exception as exc:  # noqa: BLE001
             notify_error(exc, what="activate engine")
             return

@@ -62,6 +62,7 @@ async def health(request: Request) -> dict[str, Any]:
         "version": __version__,
         "uptime_s": round(time.time() - state.started_at, 1),
         "loaded_models": [i.model_id for i in state.supervisor.list()],
+        "busy": state.manager.busy_snapshot(),
         "draining": state.manager.draining,
     }
 
@@ -76,8 +77,9 @@ async def status(request: Request) -> dict[str, Any]:
     payload = state.manager.status(engine=engine, active_downloads=downloads)
     data = payload.model_dump(mode="json")
     _attach_child_metrics(state, data)
-    # Names every VRAM holder and collapses desktop noise. Off the event loop:
-    # it walks the process table. See DECISIONS.md D23.
+    # Names every VRAM holder, says which GPU each one's memory is actually on
+    # (``device_bytes``/``per_gpu_bytes``), and collapses desktop noise. Off the
+    # event loop: it walks the process table. See DECISIONS.md D23 and D39.
     await run_in_threadpool(_attach_vram_attribution, state, data)
     return data
 
@@ -171,6 +173,8 @@ async def vram_holders(request: Request) -> dict[str, Any]:
       run, a second instance). Reported, never killed automatically; the parent
       is named so you can go and stop it.
     * ``orphan`` -- our engine binary with a dead parent. Pure leak; reclaim it.
+    * ``other-instance`` -- a ``llama-server`` from a different install, named
+      by its own ``--alias``/``--port`` in ``detail``. Never killed from here.
     * ``foreign`` -- not one of our binaries at all (browser, compositor,
       ComfyUI).
 
@@ -178,6 +182,13 @@ async def vram_holders(request: Request) -> dict[str, Any]:
     listed. ``used_bytes_source`` says where each byte figure came from: NVML
     cannot measure per-process VRAM on Windows, so ``pdh`` numbers are
     per-process totals across adapters and must not be summed across GPUs.
+
+    ``per_gpu_bytes`` splits that total per CUDA ordinal (D39) --
+    ``{"0": 16660000000, "1": 15550000000}`` -- and ``gpu_indices`` lists only
+    the devices holding at least 256 MiB. ``gpu_indices_source`` says which
+    question was answered: ``pdh`` means "this is where the memory is",
+    ``nvml-context`` means "these are the devices the process has a CUDA
+    context on", which llama.cpp opens on every visible card.
     """
     state = _state(request)
     from studioforge.core.vram_holders import holders_view
@@ -359,6 +370,7 @@ async def load_model(
         parallel=parallel,
         devices=devices,
         force=force,
+        source="api:/api/models/{id}/load",
     )
     return instance.model_dump(mode="json")
 

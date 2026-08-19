@@ -63,6 +63,12 @@ KV_BYTES_PER_ELEMENT: dict[str, float] = {
 #: this engine can actually run in VRAM belong here.
 KV_DOWNGRADE_ORDER: tuple[KvCacheType, ...] = ("f16", "q8_0", "q4_0")
 
+#: How long a caller is told to wait when a *busy* model is what blocked a
+#: load. Long enough that an ordinary agent turn has finished, short enough that
+#: a retry loop is not a stall. It is advice attached to a refusal, never a
+#: sleep this process takes.
+BUSY_RETRY_AFTER_S = 15.0
+
 # Context sizes we are willing to suggest as a fallback, descending.
 _CTX_LADDER = (
     262144,
@@ -1020,6 +1026,8 @@ class Planner:
         adapters: Sequence[AdapterRecord] = (),
         allow_evict: bool | None = None,
         reload_of: str | None = None,
+        evict_busy: bool = False,
+        source: str | None = None,
     ) -> PlanResult:
         """Decide where (and whether) a model can be loaded.
 
@@ -1056,6 +1064,8 @@ class Planner:
                 draft=draft,
                 adapters=adapters,
                 allow_evict=allow_evict,
+                evict_busy=evict_busy,
+                source=source,
             )
         resident = next((i for i in loaded if i.model_id == reload_of), None)
         others = [i for i in loaded if i.model_id != reload_of]
@@ -1073,6 +1083,8 @@ class Planner:
             allow_evict=allow_evict,
             gpus=gpus_view,
             extra_own_pids=own,
+            evict_busy=evict_busy,
+            source=source,
         )
         if isinstance(result, LoadPlan) and resident is not None:
             if reload_of not in result.evict_model_ids:
@@ -1126,6 +1138,8 @@ class Planner:
         allow_evict: bool | None,
         gpus: Sequence[GpuInfo] | None = None,
         extra_own_pids: Sequence[int] = (),
+        evict_busy: bool = False,
+        source: str | None = None,
     ) -> PlanResult:
         """:meth:`plan_load` proper; ``gpus``/``extra_own_pids`` are the reload view."""
         settings = record.settings
@@ -1175,12 +1189,13 @@ class Planner:
                     terminal=False,
                     gpus=gpus,
                     extra_own_pids=extra_own_pids,
+                    evict_busy=evict_busy,
                     extra_notes=self._rung_notes(
                         ctx, aim, floor, thinking=thinking, kv_k=cand_k, kv_options=kv_options
                     ),
                 )
                 if isinstance(attempt, LoadPlan):
-                    self._log_plan(record, attempt, tried)
+                    self._log_plan(record, attempt, tried, source=source)
                     return attempt
 
         if not evict_allowed:
@@ -1200,6 +1215,8 @@ class Planner:
                 tried=tried,
                 gpus=gpus,
                 extra_own_pids=extra_own_pids,
+                evict_busy=evict_busy,
+                source=source,
             )
 
         # Pass 2 (DECISIONS.md D16): even the floor does not fit, so eviction is
@@ -1208,7 +1225,7 @@ class Planner:
         # available + reclaimable and take the highest rung that fits. Loading
         # at the 8192 floor after freeing 19 GB, when 65536 would have fitted
         # for the identical cost, is the defect this pass exists to fix.
-        reclaimable = self._reclaimable_bytes(loaded)
+        reclaimable = self._reclaimable_bytes(loaded, evict_busy=evict_busy)
         for ctx in ladder:
             for cand_k, cand_v in kv_options:
                 tried.append(f"{ctx}/{cand_k}+evict")
@@ -1226,6 +1243,7 @@ class Planner:
                     terminal=False,
                     gpus=gpus,
                     extra_own_pids=extra_own_pids,
+                    evict_busy=evict_busy,
                     extra_notes=self._rung_notes(
                         ctx, aim, floor, thinking=thinking, kv_k=cand_k, kv_options=kv_options
                     ),
@@ -1253,7 +1271,7 @@ class Planner:
                             f"ctx={attempt.ctx_size} kv={attempt.kv_cache_type}"
                         ),
                     )
-                    self._log_plan(record, attempt, tried)
+                    self._log_plan(record, attempt, tried, source=source)
                     return attempt
 
         return self._terminal_rejection(
@@ -1272,6 +1290,8 @@ class Planner:
             tried=tried,
             gpus=gpus,
             extra_own_pids=extra_own_pids,
+            evict_busy=evict_busy,
+            source=source,
         )
 
     # -- plan_load helpers -------------------------------------------------
@@ -1327,10 +1347,12 @@ class Planner:
             )
         return notes
 
-    def _reclaimable_bytes(self, loaded: Sequence[InstanceInfo]) -> int:
+    def _reclaimable_bytes(
+        self, loaded: Sequence[InstanceInfo], *, evict_busy: bool = False
+    ) -> int:
         """VRAM the planner is allowed to take back by evicting idle models."""
         total = 0
-        for instance in self._evictable(loaded):
+        for instance in self._evictable(loaded, include_busy=evict_busy):
             total += sum(self.instance_footprint(instance).values())
         return total
 
@@ -1352,6 +1374,8 @@ class Planner:
         tried: Sequence[str],
         gpus: Sequence[GpuInfo] | None = None,
         extra_own_pids: Sequence[int] = (),
+        evict_busy: bool = False,
+        source: str | None = None,
     ) -> PlanResult:
         """Recompute the floor rung as the *terminal* refusal, and log it.
 
@@ -1406,7 +1430,13 @@ class Planner:
         )
         return result
 
-    def _log_plan(self, record: ModelRecord, plan: LoadPlan, tried: Sequence[str]) -> None:
+    def _log_plan(
+        self,
+        record: ModelRecord,
+        plan: LoadPlan,
+        tried: Sequence[str],
+        source: str | None = None,
+    ) -> None:
         """One INFO line per plan: what was tried, and what was chosen.
 
         Replaces the per-rung ``load rejected`` spam (fifteen INFO lines for one
@@ -1417,6 +1447,11 @@ class Planner:
         emit(
             "load planned",
             model_id=record.id,
+            # WHO asked. The 2026-08-19 log review could not tell an OpenClaw
+            # load from the GUI's from a JIT one, on a box several clients
+            # share; "a 262144-token model appeared on three GPUs" with no
+            # requester is not a diagnosable event.
+            source=source,
             chosen=f"ctx={plan.ctx_size} kv={plan.kv_cache_type} parallel={plan.parallel}",
             devices=plan.devices,
             rungs_tried=len(tried),
@@ -1540,6 +1575,7 @@ class Planner:
         terminal: bool = True,
         gpus: Sequence[GpuInfo] | None = None,
         extra_own_pids: Sequence[int] = (),
+        evict_busy: bool = False,
     ) -> PlanResult:
         """Plan a load at one specific context size.
 
@@ -1617,6 +1653,7 @@ class Planner:
                 auto_parallel=auto_parallel,
                 terminal=terminal,
                 extra_own_pids=extra_own_pids,
+                evict_busy=evict_busy,
             )
 
         order = self._candidate_order(gpus)
@@ -1698,7 +1735,7 @@ class Planner:
 
         # Nothing fits as-is. Try again with LRU unpinned models evicted.
         if evict_allowed:
-            evictable = self._evictable(loaded)
+            evictable = self._evictable(loaded, include_busy=evict_busy)
             if evictable:
                 freed: dict[int, int] = {}
                 evicted: list[str] = []
@@ -1755,6 +1792,7 @@ class Planner:
             affinity=affinity,
             terminal=terminal,
             extra_own_pids=extra_own_pids,
+            evict_busy=evict_busy,
         )
 
     def _wider_split_for_parallel(
@@ -2177,6 +2215,7 @@ class Planner:
         evict_allowed: bool,
         notes: list[str],
         forced: bool,
+        evict_busy: bool = False,
         auto_parallel: bool = False,
         terminal: bool = True,
         extra_own_pids: Sequence[int] = (),
@@ -2221,7 +2260,7 @@ class Planner:
         if evict_allowed:
             freed: dict[int, int] = {}
             evicted: list[str] = []
-            for instance in self._evictable(loaded):
+            for instance in self._evictable(loaded, include_busy=evict_busy):
                 evicted.append(instance.model_id)
                 for dev, amount in self.instance_footprint(instance).items():
                     freed[dev] = freed.get(dev, 0) + amount
@@ -2260,6 +2299,7 @@ class Planner:
             terminal=terminal,
             forced=forced,
             extra_own_pids=extra_own_pids,
+            evict_busy=evict_busy,
         )
         if forced:
             rejection.suggestions.append(
@@ -2285,6 +2325,7 @@ class Planner:
         terminal: bool = True,
         forced: bool = False,
         extra_own_pids: Sequence[int] = (),
+        evict_busy: bool = False,
     ) -> LoadRejected:
         estimate = self._safe_estimate(
             record,
@@ -2455,6 +2496,38 @@ class Planner:
                 + ", ".join(f"{mb} MiB on CUDA{index}" for index, mb in sorted(reserved.items()))
             )
 
+        # 9. The box may be BUSY rather than full. A model serving a request is
+        # not an eviction candidate (D36) -- killing a child mid-stream fails a
+        # live request to save a future one -- so a refusal that would have
+        # succeeded against an idle machine must say so, and say it is worth
+        # waiting. "Not enough VRAM" for a condition that clears itself in
+        # seconds is the least actionable message this planner can produce.
+        busy: list[dict[str, Any]] = []
+        retry_after: float | None = None
+        if evict_allowed and not evict_busy:
+            blocked = [
+                i
+                for i in self.busy_instances(loaded)
+                if not self._is_pinned(i) and i.model_id != record.id
+            ]
+            if blocked:
+                busy = [
+                    {"model_id": i.model_id, "active_requests": i.active_requests} for i in blocked
+                ]
+                retry_after = BUSY_RETRY_AFTER_S
+                names = ", ".join(
+                    f"{i.model_id} ({i.active_requests} in flight)"
+                    if i.active_requests
+                    else f"{i.model_id} (still loading)"
+                    for i in blocked
+                )
+                suggestions.insert(
+                    0,
+                    f"wait ~{BUSY_RETRY_AFTER_S:.0f}s: {names} would free the VRAM but is "
+                    f"serving right now and is never evicted mid-request; pass force=true "
+                    f"to evict it anyway",
+                )
+
         if not suggestions:
             suggestions.append("free VRAM on the box, or choose a smaller model")
 
@@ -2465,6 +2538,8 @@ class Planner:
             required_bytes=estimate.total_bytes,
             available_bytes=available,
             per_gpu_free=per_gpu_free,
+            busy_models=busy,
+            retry_after_s=retry_after,
             max_ctx_that_fits=max_ctx,
             max_parallel_that_fits=max_parallel,
             suggestions=suggestions,
@@ -2510,18 +2585,36 @@ class Planner:
         """A TTL of 0 means pinned; that is the wire representation everywhere."""
         return instance.ttl_s == 0
 
-    def _evictable(self, loaded: Sequence[InstanceInfo]) -> list[InstanceInfo]:
+    def _evictable(
+        self, loaded: Sequence[InstanceInfo], *, include_busy: bool = False
+    ) -> list[InstanceInfo]:
         """Unpinned, idle instances, least-recently-used first.
 
         Instances with in-flight requests are never evicted -- killing a child
-        mid-stream would fail a live request to save a future one.
+        mid-stream fails a live request to save a future one, which is the
+        wrong trade on a server several agents share. Nor is one that is still
+        ``loading``: it has not taken the VRAM its plan promises, so evicting it
+        frees a figure that does not exist yet (the same reasoning D29 used to
+        serialise loads in the first place).
+
+        ``include_busy`` is the ONE override, reached only by an explicit
+        ``force=True`` from a human-driven caller (D36). A JIT load never sets
+        it: an inference request that arrives mid-stream for somebody else must
+        queue or be refused, never win by killing the stream.
         """
         candidates = [
             i
             for i in loaded
-            if not self._is_pinned(i) and i.active_requests == 0 and i.state == "ready"
+            if not self._is_pinned(i)
+            and i.state == "ready"
+            and (include_busy or i.active_requests == 0)
         ]
         return sorted(candidates, key=lambda i: i.last_activity_at or i.started_at or 0.0)
+
+    @staticmethod
+    def busy_instances(loaded: Sequence[InstanceInfo]) -> list[InstanceInfo]:
+        """Instances a load must not disturb: serving a request, or still loading."""
+        return [i for i in loaded if i.active_requests > 0 or i.state == "loading"]
 
     @staticmethod
     def instance_footprint(instance: InstanceInfo) -> dict[int, int]:

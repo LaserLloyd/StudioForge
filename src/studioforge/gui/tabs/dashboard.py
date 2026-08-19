@@ -95,6 +95,11 @@ def _vram_holders_panel(ctx: GuiContext) -> None:
     them -- ``/api/status`` said ``llama-server.exe``, ``0 bytes``,
     ``is_ours: false``, which is three facts and no answer.
 
+    Each row names the devices the memory is *on* with its per-GPU numbers
+    (D39). The row used to list every device the process had a CUDA context on,
+    which for llama.cpp is all of them: a 30 GiB model on two 5090s read as
+    ``CUDA0,1,2,3`` and looked like it was touching the 3090s as well.
+
     Reclaim is offered for orphans only (parent dead: pure leak). A holder that
     belongs to a live foreign process is named, not killed -- something is
     still using it.
@@ -350,7 +355,7 @@ async def _restart_model(ctx: GuiContext, model_id: str, refresh: Any) -> None:
             # A force-load rather than unload-then-load: the planner runs once
             # against current free VRAM, and a failure never leaves the model
             # unloaded when it was working a moment ago.
-            instance = await ctx.manager.load(model_id, force=True)
+            instance = await ctx.manager.load(model_id, force=True, source="gui")
         except Exception as exc:  # noqa: BLE001
             notify_error(exc, what="restart model")
             return

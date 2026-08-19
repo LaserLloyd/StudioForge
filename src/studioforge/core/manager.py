@@ -24,6 +24,7 @@ from studioforge.db import Database
 from studioforge.errors import (
     BadRequestError,
     InsufficientVramError,
+    ModelBusyError,
     ModelLoadError,
     ModelNotFoundError,
     StudioForgeError,
@@ -189,6 +190,17 @@ class ModelManager:
         #: not allocated yet, both launch, one OOMs, the retry evicts the
         #: other, and the first client's request lands on a dead child.
         self._load_gate = asyncio.Lock()
+        #: model ids whose load is in flight behind the gate, for /health.busy.
+        #: The supervisor's "loading" state only appears once a child exists;
+        #: this covers the planning window too, which is where two callers used
+        #: to collide.
+        self._loading: set[str] = set()
+        #: One smoke test at a time, and never while the server is busy (D36).
+        #: `test_model` loads a model to poke it and unloads it afterwards; two
+        #: of those at once, or one during somebody's stream, is the opposite of
+        #: a health check.
+        self._test_gate = asyncio.Lock()
+        self._testing: str | None = None
         self._ttl_task: asyncio.Task[None] | None = None
         self._autoload_task: asyncio.Task[None] | None = None
         self._draining = False
@@ -341,7 +353,9 @@ class ModelManager:
         if lock is not None and not lock.locked():
             self._locks.pop(model_id, None)
 
-    async def ensure_loaded(self, name: str) -> tuple[ModelRecord, InstanceInfo]:
+    async def ensure_loaded(
+        self, name: str, *, source: str = "jit"
+    ) -> tuple[ModelRecord, InstanceInfo]:
         """Resolve a model name and make sure it is serving, loading if needed.
 
         Concurrent callers for the same model all wait on one lock, so a burst
@@ -374,7 +388,7 @@ class ModelManager:
                 if instance is not None and instance.state == "ready":
                     self.registry.touch(record.id)
                     return record, instance
-                instance = await self._load_locked(serving)
+                instance = await self._load_locked(serving, source=source)
                 self.registry.touch(record.id)
                 return record, instance
         finally:
@@ -395,6 +409,7 @@ class ModelManager:
         parallel: int | None = None,
         devices: Sequence[int] | None = None,
         force: bool = False,
+        source: str = "api",
     ) -> InstanceInfo:
         """Explicit load (GUI/CLI/MCP). ``force`` reloads an already-running model.
 
@@ -454,6 +469,8 @@ class ModelManager:
                 kv_cache_type_v=kv_cache_type_v,
                 parallel=parallel,
                 reload_of=reload_of,
+                force=force,
+                source=source,
             )
 
     def _known_devices(self) -> list[int] | None:
@@ -477,6 +494,8 @@ class ModelManager:
         kv_cache_type_v: Any = None,
         parallel: int | None = None,
         reload_of: str | None = None,
+        force: bool = False,
+        source: str = "api",
     ) -> InstanceInfo:
         """Plan, evict if needed, launch. Caller must hold the per-model lock.
 
@@ -500,14 +519,20 @@ class ModelManager:
                 queued=sum(self._load_waiters.values()),
             )
         async with self._load_gate:
-            return await self._load_gated(
-                record,
-                ctx_size=ctx_size,
-                kv_cache_type=kv_cache_type,
-                kv_cache_type_v=kv_cache_type_v,
-                parallel=parallel,
-                reload_of=reload_of,
-            )
+            self._loading.add(record.id)
+            try:
+                return await self._load_gated(
+                    record,
+                    ctx_size=ctx_size,
+                    kv_cache_type=kv_cache_type,
+                    kv_cache_type_v=kv_cache_type_v,
+                    parallel=parallel,
+                    reload_of=reload_of,
+                    force=force,
+                    source=source,
+                )
+            finally:
+                self._loading.discard(record.id)
 
     async def _load_gated(
         self,
@@ -518,6 +543,8 @@ class ModelManager:
         kv_cache_type_v: Any = None,
         parallel: int | None,
         reload_of: str | None = None,
+        force: bool = False,
+        source: str = "api",
     ) -> InstanceInfo:
         existing = self.supervisor.get(record.id)
         if reload_of is not None and (existing is None or existing.state != "ready"):
@@ -551,6 +578,12 @@ class ModelManager:
             draft=draft,
             adapters=[a for a, _ in adapters],
             reload_of=reload_of,
+            # A model serving a request is never evicted to make room for
+            # another one (D36); only an explicit force=true from a caller who
+            # can see what they are interrupting overrides that, and a JIT load
+            # can never set it.
+            evict_busy=force,
+            source=source,
         )
 
         if isinstance(plan_result, LoadRejected):
@@ -589,6 +622,7 @@ class ModelManager:
                 kv_cache_type=kv_cache_type,
                 kv_cache_type_v=kv_cache_type_v,
                 parallel=parallel,
+                source=source,
             )
         except StudioForgeError:
             raise
@@ -648,6 +682,11 @@ class ModelManager:
                 # the actual answer to "why did this stop working".
                 "vram_holders": [h.model_dump() for h in rejected.vram_holders],
                 "estimate_mb": rejected.estimate.breakdown_mb(),
+                # A box that is BUSY rather than full: these models would have
+                # freed the VRAM but are serving right now, so the refusal is
+                # worth retrying and says how long to wait (D36).
+                "busy_models": rejected.busy_models,
+                "retry_after_s": rejected.retry_after_s,
             },
         )
 
@@ -663,6 +702,7 @@ class ModelManager:
         kv_cache_type: Any = None,
         kv_cache_type_v: Any = None,
         parallel: int | None = None,
+        source: str = "api",
     ) -> InstanceInfo:
         """Launch the child, retrying **once** after a transient OOM.
 
@@ -682,7 +722,7 @@ class ModelManager:
         """
         try:
             return await self.supervisor.start(
-                record, plan, engine_tag=engine_tag, draft=draft, adapters=adapters
+                record, plan, engine_tag=engine_tag, draft=draft, adapters=adapters, source=source
             )
         except ModelLoadError as exc:
             stderr = exc.details.get("stderr")
@@ -722,7 +762,7 @@ class ModelManager:
         if isinstance(replanned, LoadRejected):
             raise self._vram_error(replanned)
         instance = await self.supervisor.start(
-            record, replanned, engine_tag=engine_tag, draft=draft, adapters=adapters
+            record, replanned, engine_tag=engine_tag, draft=draft, adapters=adapters, source=source
         )
         log.info("load succeeded on retry", model_id=record.id)
         return instance
@@ -1069,7 +1109,7 @@ class ModelManager:
 
         for model_id in wanted:
             try:
-                await self.load(model_id)
+                await self.load(model_id, source="autoload")
                 log.info("preloaded model", model_id=model_id)
             except Exception as exc:
                 log.warning("failed to preload model", model_id=model_id, error=str(exc))
@@ -1317,17 +1357,160 @@ class ModelManager:
             "single_gpu": result.fits_single_gpu,
         }
 
-    async def test_model(self, name: str, prompt: str | None = None) -> dict[str, Any]:
-        """Canned one-sentence completion; reports latency and tokens/sec."""
+    #: What a caller is told to wait when the server is too busy to smoke-test.
+    #: One agent turn, roughly; short enough that a poll is not a stall.
+    TEST_RETRY_AFTER_S = 15.0
+
+    def busy_snapshot(self) -> dict[str, Any]:
+        """What this server is in the middle of, cheaply (D36).
+
+        ``/health`` is polled constantly by the watchdog, so this reads only
+        in-memory state: no NVML, no HTTP to a child, no planner. Three
+        independent kinds of busy, because they have different remedies -- an
+        in-flight request clears itself, a load in flight means the VRAM answer
+        is about to change, and a test in flight means another caller has taken
+        the one-at-a-time smoke-test slot.
+        """
+        loaded = self.supervisor.list()
+        return {
+            "active_requests": sum(i.active_requests for i in loaded),
+            "busy_models": [
+                {"model_id": i.model_id, "active_requests": i.active_requests}
+                for i in loaded
+                if i.active_requests > 0
+            ],
+            "loading": sorted(self._loading | {i.model_id for i in loaded if i.state == "loading"}),
+            "testing": self._testing,
+        }
+
+    def _busy_reason(self, *, ignore: str | None = None) -> str | None:
+        """Why a smoke test must not start right now, or ``None``.
+
+        ``ignore`` is the model being tested when it was *already* loaded: its
+        own idle instance is not a reason to refuse a test of itself.
+        """
+        busy = self.busy_snapshot()
+        serving = [b for b in busy["busy_models"] if b["model_id"] != ignore]
+        if serving:
+            names = ", ".join(
+                f"{b['model_id']} ({b['active_requests']} in flight)" for b in serving
+            )
+            return f"{names} is serving requests"
+        loading = [m for m in busy["loading"] if m != ignore]
+        if loading:
+            return f"a model load is in flight ({', '.join(loading)})"
+        benchmarking = getattr(getattr(self, "benchmarker", None), "benchmarking", None)
+        if benchmarking:
+            return f"a benchmark of {benchmarking} is running"
+        return None
+
+    async def test_model(
+        self,
+        name: str,
+        prompt: str | None = None,
+        *,
+        keep_loaded: bool = False,
+    ) -> dict[str, Any]:
+        """Smoke-test one model on an otherwise idle server, and leave it as found.
+
+        This is a **health check**, not a way to pre-warm a model, and D36 made
+        it behave like one. Live evidence, 2026-08-19: an external client walked
+        the library testing models, and each test was an ordinary load -- at the
+        planner's full target context, on whatever cards were free, evicting
+        whatever was in the way, concurrently with everything else. A tool whose
+        job is to answer "does this model work" must not be able to rearrange a
+        server that several agents are using.
+
+        So:
+
+        * **One at a time.** A second concurrent ``test_model`` is refused
+          rather than queued: a queued smoke test is a smoke test whose answer
+          arrives after the state it described has changed.
+        * **Idle only.** Any instance serving a request, any load in flight, or
+          a running benchmark refuses the call with ``retry_after_s``. It also
+          takes the D29 load gate for the load itself, so it cannot race one.
+        * **Small.** If the model is not already loaded it is loaded at
+          ``min(models.default_ctx, n_ctx_train)`` with **one** slot: a canned
+          one-sentence prompt needs no 262144-token window, and sizing one costs
+          VRAM the rest of the box wanted.
+        * **Left as found.** A model this call loaded is unloaded again, unless
+          ``keep_loaded=True``. A model that was already resident is never
+          touched.
+
+        The result says what it did (``loaded_for_test``, ``unloaded_after``,
+        ``ctx_size_used``) so a caller can tell a test of a warm model from a
+        test that cost a cold load.
+        """
         import httpx
 
-        record, instance = await self.ensure_loaded(name)
+        record = self.registry.resolve(name)
+        if record is None:
+            raise ModelNotFoundError(name, known=self.registry.known_ids())
+        serving = self.serving_record(record)
+
+        if self._testing is not None:
+            raise ModelBusyError(
+                f"a test of '{self._testing}' is already running; test_model is "
+                f"one-at-a-time so its answer describes a server that is not moving",
+                details={"testing": self._testing, "retry_after_s": self.TEST_RETRY_AFTER_S},
+            )
+
+        async with self._test_gate:
+            resident = self.supervisor.get(serving.id)
+            was_loaded = resident is not None and resident.state == "ready"
+            reason = self._busy_reason(ignore=serving.id if was_loaded else None)
+            if reason is not None:
+                raise ModelBusyError(
+                    f"the server is busy ({reason}); a smoke test must run on an idle "
+                    f"server or it measures the queue instead of the model",
+                    details={
+                        "busy": self.busy_snapshot(),
+                        "retry_after_s": self.TEST_RETRY_AFTER_S,
+                    },
+                )
+            self._testing = record.id
+            try:
+                return await self._run_test(
+                    record,
+                    serving,
+                    prompt,
+                    was_loaded=was_loaded,
+                    keep_loaded=keep_loaded,
+                    httpx=httpx,
+                )
+            finally:
+                self._testing = None
+
+    async def _run_test(
+        self,
+        record: ModelRecord,
+        serving: ModelRecord,
+        prompt: str | None,
+        *,
+        was_loaded: bool,
+        keep_loaded: bool,
+        httpx: Any,
+    ) -> dict[str, Any]:
+        ctx_used: int | None = None
+        if not was_loaded:
+            ctx_used = self.smoke_test_ctx(serving)
+            await self.load(
+                serving.id,
+                ctx_size=ctx_used,
+                parallel=1,
+                source="mcp:test_model",
+            )
+        instance = self.supervisor.get(serving.id)
+        if instance is None or instance.state != "ready":
+            raise ModelLoadError(f"model '{record.id}' is not serving")
         # A preset-only virtual model serves from its base's instance, so the
         # URL and request accounting key off instance.model_id, not record.id.
         serving_id = instance.model_id
         base = self.supervisor.base_url(serving_id)
         if base is None:
             raise ModelLoadError(f"model '{record.id}' is not serving")
+        if was_loaded and instance.plan is not None:
+            ctx_used = instance.plan.ctx_per_slot or instance.plan.ctx_size
 
         started = time.perf_counter()
         if record.kind == "embedding":
@@ -1354,15 +1537,25 @@ class ModelManager:
             self.supervisor.mark_request_end(serving_id)
 
         elapsed = time.perf_counter() - started
+        # Leave the rig as found. Only ever unloads what this call loaded, and
+        # only when the caller did not ask to keep it.
+        unloaded = False
+        if not was_loaded and not keep_loaded:
+            unloaded = await self.unload(serving.id)
+
+        result: dict[str, Any] = {
+            "model_id": record.id,
+            "latency_s": round(elapsed, 3),
+            "loaded_for_test": not was_loaded,
+            "unloaded_after": unloaded,
+            "ctx_size_used": ctx_used,
+        }
         if record.kind == "embedding":
             vectors = data.get("data", [])
             dims = len(vectors[0]["embedding"]) if vectors else 0
-            return {
-                "model_id": record.id,
-                "ok": dims > 0,
-                "latency_s": round(elapsed, 3),
-                "embedding_dims": dims,
-            }
+            result["ok"] = dims > 0
+            result["embedding_dims"] = dims
+            return result
 
         usage = data.get("usage") or {}
         completion_tokens = int(usage.get("completion_tokens") or 0)
@@ -1370,16 +1563,30 @@ class ModelManager:
         choices = data.get("choices") or []
         if choices:
             text = (choices[0].get("message") or {}).get("content") or ""
-        result: dict[str, Any] = {
-            "model_id": record.id,
-            "ok": bool(text),
-            "latency_s": round(elapsed, 3),
-            "completion_tokens": completion_tokens,
-            "tokens_per_second": round(completion_tokens / elapsed, 2) if elapsed > 0 else None,
-            "text": text[:400],
-        }
+        result.update(
+            ok=bool(text),
+            completion_tokens=completion_tokens,
+            tokens_per_second=round(completion_tokens / elapsed, 2) if elapsed > 0 else None,
+            text=text[:400],
+        )
         result.update(draft_stats(data.get("timings")))
         return result
+
+    def smoke_test_ctx(self, record: ModelRecord) -> int:
+        """Context a smoke test loads at: the server floor, capped at the window.
+
+        Deliberately not the planner's target: a canned one-sentence prompt
+        proves the model generates at 4096 tokens exactly as well as at 262144,
+        and the difference is tens of gigabytes of KV cache taken from whatever
+        else the box is doing. An explicit per-model ``ctx_size`` still wins,
+        because an explicit value always does.
+        """
+        pinned = record.settings.ctx_size
+        if pinned:
+            return int(pinned)
+        floor = int(self.config.models.default_ctx)
+        trained = int(getattr(record.meta, "n_ctx_train", 0) or 0) if record.meta else 0
+        return min(floor, trained) if trained > 0 else floor
 
     async def introspect(self, model_id: str) -> dict[str, Any]:
         """Actual running settings as llama-server reports them, plus slot state."""

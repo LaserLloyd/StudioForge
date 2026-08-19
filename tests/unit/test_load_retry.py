@@ -141,7 +141,13 @@ class StubSupervisor:
                 f"llama-server for '{record.id}' exited with code 1 during startup.",
                 details={"stderr": self.stderr, "argv": ["llama-server"]},
             )
-        info = InstanceInfo(model_id=record.id, state="ready", port=18100, plan=plan)
+        info = InstanceInfo(
+            model_id=record.id,
+            state="ready",
+            port=18100,
+            plan=plan,
+            loaded_by=kwargs.get("source"),
+        )
         self.instances[record.id] = info
         return info
 

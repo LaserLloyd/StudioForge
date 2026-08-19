@@ -126,6 +126,12 @@ fit verdicts and the exact context each GPU placement reaches ->
 download_model(repo_id, quant). The download runs in the background; the model
 appears in list_models when it lands.
 
+BEFORE load_model OR test_model ON A SHARED SERVER: check server_status.busy.
+A load that must evict a model mid-request is REFUSED (pass force=true only if
+you can see what you are interrupting), and test_model refuses outright while
+anything is serving, loading or benchmarking -- both come back with
+retry_after_s, so waiting is usually cheaper than retrying.
+
 WHEN VRAM IS MISSING: server_status reports free VRAM per GPU plus who is
 holding it. A row whose fits is false but whose if_gpus_idle.fits is true only
 needs an unload_model. vram_orphan_count above zero means leaked llama-server
@@ -273,6 +279,10 @@ def _compact_instance(instance: Any) -> dict[str, Any]:
         "parallel_limited_by": (
             instance.plan.parallel_limited_by if instance.plan is not None else None
         ),
+        # WHO asked for this load: "mcp:load_model", "jit:/v1/chat/completions",
+        # "gui", "autoload"... On a box several clients share, a model that
+        # appeared without a requester is not a diagnosable event (D36).
+        "loaded_by": instance.loaded_by,
         "ttl_s": instance.ttl_s,
         "ttl_remaining_s": (
             round(instance.ttl_remaining_s) if instance.ttl_remaining_s is not None else None
@@ -812,6 +822,7 @@ def build_management_mcp(state: Any) -> MCPServer:
             parallel=parallel,
             devices=devices,
             force=force,
+            source="mcp:load_model",
         )
         return {
             "ok": True,
@@ -839,27 +850,41 @@ def build_management_mcp(state: Any) -> MCPServer:
         return {"ok": True, "model_id": model_id, "unloaded": unloaded}
 
     @_guard
-    async def test_model(model_id: str, prompt: str | None = None) -> dict[str, Any]:
-        """Smoke-test a model end to end and report its speed.
+    async def test_model(
+        model_id: str, prompt: str | None = None, keep_loaded: bool = False
+    ) -> dict[str, Any]:
+        """Smoke-test a model end to end on an idle server, leaving it as found.
 
-        Loads the model if needed, sends one short canned request through it and
-        reports latency and tokens/second. This is a *health and performance*
-        check, not an inference API -- the response text is truncated and there
-        is no streaming, no system prompt and no sampling control. For real
+        **This is a smoke test, not a way to pre-warm a model -- use
+        ``load_model`` for that.** It sends one short canned request and reports
+        latency and tokens/second; the response text is truncated and there is
+        no streaming, no system prompt and no sampling control. For real
         generation use the OpenAI endpoints.
 
-        Use it to confirm a freshly loaded model actually produces coherent
-        output, or to compare tokens/second after changing settings.
+        Because it is a health check, it refuses to rearrange a server other
+        people are using:
+
+        * **One at a time.** A second concurrent call is refused, not queued.
+        * **Idle only.** Any model serving a request, any load in flight or a
+          running benchmark refuses the call with ``retry_after_s``. Check
+          ``server_status.busy`` first and you will not hit this.
+        * **Small and temporary.** If the model is not already loaded it is
+          loaded at this server's default context with ONE slot, and unloaded
+          again afterwards. A model that was already resident is left alone.
 
         Args:
             model_id: Model id or alias.
             prompt: Optional replacement for the default one-sentence prompt.
+            keep_loaded: Leave a model this call loaded resident afterwards.
+                Off by default: a health check should not change what is loaded.
 
         Returns:
             ``latency_s``, ``tokens_per_second``, ``completion_tokens`` and a
-            truncated ``text`` (or ``embedding_dims`` for embedding models).
+            truncated ``text`` (or ``embedding_dims`` for embedding models),
+            plus what the call did: ``loaded_for_test``, ``unloaded_after`` and
+            ``ctx_size_used``.
         """
-        result = await state.manager.test_model(model_id, prompt)
+        result = await state.manager.test_model(model_id, prompt, keep_loaded=keep_loaded)
         return {"ok": True, **result}
 
     @_guard
@@ -1166,11 +1191,20 @@ def build_management_mcp(state: Any) -> MCPServer:
         those and nothing else. Both counts are ``null`` if the process table
         could not be read, which is not the same as zero.
 
+        **Before load_model or test_model on a shared server, read ``busy``.**
+        It carries ``active_requests`` (and which models are serving),
+        ``loading`` (model ids whose load is in flight) and ``testing`` (the
+        model a smoke test has claimed, or null). A load that would have to
+        evict a model mid-request is refused rather than granted, and
+        ``test_model`` refuses outright while any of those is non-zero -- so
+        checking here first turns a refusal into a short wait.
+
         Returns:
-            Per-GPU VRAM and utilization, every loaded model with its port and
-            remaining TTL, the active llama.cpp engine tag, the total number of
-            models in the library, queue depth, active downloads, engine-process
-            attribution and whether the server is draining for shutdown.
+            Per-GPU VRAM and utilization, every loaded model with its port,
+            remaining TTL and who loaded it (``loaded_by``), the active
+            llama.cpp engine tag, the total number of models in the library,
+            queue depth, what the server is busy with, active downloads,
+            engine-process attribution and whether the server is draining.
         """
         engine = state.engine_manager.active() if state.engine_manager is not None else None
         downloader = getattr(state, "downloader", None)
@@ -1192,6 +1226,7 @@ def build_management_mcp(state: Any) -> MCPServer:
             "loaded": [_compact_instance(i) for i in status.loaded],
             "model_count": status.model_count,
             "queue_depth": status.queue_depth,
+            "busy": state.manager.busy_snapshot(),
             "active_downloads": status.active_downloads,
             "draining": status.draining,
             "engine_tag": status.engine.tag if status.engine is not None else None,
