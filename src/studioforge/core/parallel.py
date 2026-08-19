@@ -43,6 +43,15 @@ A MoE complicates it: expert fan-out grows with batch size (at batch N roughly
 stops being flat and the knee arrives sooner. D17 derates it by half. That is
 still a guess, and it is a guess a measurement replaces.
 
+**Measured here, and the reason this module exists** (D37, 2026-08-19, a
+Qwen2.5-1.5B on one RTX 3090 at 8192 tokens per slot): 1 / 2 / 4 / 8 slots gave
+per-stream 302.8 / 225.3 / 134.5 / 83.3 t/s against aggregate 302.8 / 425.3 /
+436.0 / 576.9. The **bandwidth** knee -- what the estimate finds -- is at 8: the
+aggregate is still climbing there. The **useful** knee is at 2, because by 8
+slots a single conversation is running at 27% of its solo speed. The two are not
+the same quantity, and no amount of refining the arithmetic would have found the
+second one.
+
 **Quality is not involved.** A slot count changes nothing about the answer a
 model gives; what each conversation gets is ``ctx_per_slot``, and that is per
 slot by construction (D4). "Recommended parallel" is a throughput-and-latency
