@@ -311,3 +311,70 @@ def test_v1_models_stays_quiet_about_concurrency_when_nothing_is_loaded(app: Any
     entry = body["data"][0]
     assert entry["state"] == "not-loaded"
     assert "max_parallel" not in entry["studioforge"]
+
+
+# ---------------------------------------------------------------------------
+# The WP19 routes
+# ---------------------------------------------------------------------------
+
+
+def test_load_recommended_refuses_a_context_past_the_trained_window(app: Any) -> None:
+    """A 400 naming the number that would work, not an attempt that fails later."""
+    with TestClient(app) as http:
+        response = http.post(
+            f"/api/models/{MODEL_ID}/load-recommended", json={"ctx_size": 4_000_000}
+        )
+    assert response.status_code == 400
+    body = response.json()["error"]
+    assert body["param"] == "ctx_size"
+    assert "trained to" in body["message"]
+
+
+def test_load_recommended_rejects_a_nonsense_context_without_planning(app: Any) -> None:
+    with TestClient(app) as http:
+        response = http.post(f"/api/models/{MODEL_ID}/load-recommended", json={"ctx_size": 0})
+    assert response.status_code == 400
+    assert response.json()["error"]["param"] == "ctx_size"
+
+
+def test_load_recommended_404s_on_an_unknown_model(app: Any) -> None:
+    with TestClient(app) as http:
+        response = http.post("/api/models/nope/load-recommended", json={"ctx_size": 8192})
+    assert response.status_code == 404
+
+
+def test_parallel_observations_start_empty_and_are_readable(app: Any) -> None:
+    """The rows behind recommended_parallel, so a caller can see the evidence."""
+    with TestClient(app) as http:
+        response = http.get(f"/api/models/{MODEL_ID}/parallel-observations")
+    assert response.status_code == 200
+    assert response.json() == {"model_id": MODEL_ID, "observations": []}
+
+
+def test_the_parallel_benchmark_validates_its_body_before_starting_a_job(app: Any) -> None:
+    with TestClient(app) as http:
+        response = http.post(
+            f"/api/models/{MODEL_ID}/benchmark-parallel", json={"streams": ["four"]}
+        )
+    assert response.status_code == 400
+    assert response.json()["error"]["param"] == "streams"
+
+
+def test_the_parallel_benchmark_starts_a_job_on_the_shared_table(app: Any) -> None:
+    """Same job table as the placement benchmark: one thing for a client to poll."""
+    with TestClient(app) as http:
+        started = http.post(f"/api/models/{MODEL_ID}/benchmark-parallel", json={"streams": [1, 2]})
+        assert started.status_code == 202
+        job_id = started.json()["job_id"]
+        polled = http.get(f"/api/benchmark/jobs/{job_id}")
+    assert polled.status_code == 200
+    assert polled.json()["model_id"] == MODEL_ID
+
+
+def test_catalog_rows_say_how_many_slots_are_worth_running(app: Any) -> None:
+    with TestClient(app) as http:
+        body = http.get("/api/catalog").json()
+    row = next(r for r in body["models"][0]["options"] if r["fits"])
+    assert 1 <= row["recommended_parallel"] <= row["max_parallel"]
+    assert row["recommended_parallel_basis"] == "estimated"
+    assert row["load_args"]["parallel"] == row["recommended_parallel"]

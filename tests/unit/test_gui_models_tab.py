@@ -163,3 +163,111 @@ class TestOptimalSettingsBlock:
         source = inspect.getsource(tab._settings_dialog)
         assert "ui.timer(" in source
         assert "_render_placements" in source
+
+
+class TestSlotsAndExactContext:
+    """The WP19 half of the placements block: slot counts, and "load at 256k"."""
+
+    @staticmethod
+    def _entry(*, max_parallel: int, recommended: int | None, basis: str = "estimated") -> dict:
+        optimal: dict = {"max_parallel": max_parallel}
+        if recommended is not None:
+            optimal["recommended_parallel"] = recommended
+            optimal["recommended_parallel_basis"] = basis
+        return {"optimal": optimal}
+
+    def test_the_slot_line_stays_quiet_until_it_has_something_to_say(self) -> None:
+        """Estimated == ceiling, so printing both would print one number twice."""
+        from studioforge.gui import state as st
+
+        assert st.parallel_summary(self._entry(max_parallel=4, recommended=4)) == ""
+        assert st.parallel_summary(self._entry(max_parallel=4, recommended=None)) == ""
+        assert st.parallel_summary({"optimal": None}) == ""
+
+    def test_a_measurement_that_lowers_the_count_is_shown_with_its_basis(self) -> None:
+        from studioforge.gui import state as st
+
+        summary = st.parallel_summary(self._entry(max_parallel=7, recommended=2, basis="measured"))
+        assert summary == "2 of 7 slots (measured)"
+
+    def test_the_four_context_buttons_are_the_ones_the_mcp_tool_names(self) -> None:
+        """A user asking for "256k" and an agent asking for 262144 mean one load."""
+        from studioforge.gui import state as st
+
+        assert [ctx for _label, ctx in st.CTX_BUTTONS] == [65536, 131072, 262144, 524288]
+
+    def test_a_size_past_the_trained_window_is_greyed_and_says_why(self) -> None:
+        from studioforge.gui import state as st
+
+        profiles = {
+            "n_ctx_train": 131072,
+            "modes": [{"optimal": {"ctx_per_slot": 131072}}],
+        }
+        buttons = {b.label: b for b in st.ctx_buttons(profiles)}
+        assert buttons["128k"].enabled is True
+        assert buttons["256k"].enabled is False
+        assert "trained to 131072" in buttons["256k"].tooltip
+
+    def test_a_size_no_placement_reaches_is_greyed_for_a_different_reason(self) -> None:
+        """One is permanent and about the model; the other may change on an unload."""
+        from studioforge.gui import state as st
+
+        profiles = {
+            "n_ctx_train": 1048576,
+            "modes": [{"optimal": {"ctx_per_slot": 65536}}],
+        }
+        buttons = {b.label: b for b in st.ctx_buttons(profiles)}
+        assert buttons["64k"].enabled is True
+        assert buttons["128k"].enabled is False
+        assert "no set of cards" in buttons["128k"].tooltip
+
+    def test_the_measured_curve_renders_as_an_aligned_table(self) -> None:
+        from studioforge.gui import state as st
+
+        report = {
+            "levels": [
+                {
+                    "n_streams": 1,
+                    "per_stream_tps": 48.0,
+                    "aggregate_tps": 48.0,
+                    "p95_latency_s": 2.7,
+                    "achieved_batch": 1.0,
+                },
+                {
+                    "n_streams": 2,
+                    "per_stream_tps": 44.0,
+                    "aggregate_tps": 88.0,
+                    "p95_latency_s": 3.0,
+                    "achieved_batch": 2.0,
+                },
+            ],
+            "recommended_parallel_detail": "2 slots: aggregate 88.0 t/s",
+        }
+        lines = st.parallel_level_lines(report)
+        assert lines[0].split() == ["N", "per-stream", "aggregate", "p95", "batch"]
+        assert len(lines) == 3
+        assert "2.0x" in lines[2]
+        assert st.parallel_verdict(report).startswith("Recommended: 2 slots")
+
+    def test_a_level_with_no_numbers_renders_as_a_dash_not_a_crash(self) -> None:
+        from studioforge.gui import state as st
+
+        lines = st.parallel_level_lines({"levels": [{"n_streams": 4, "error": "boom"}]})
+        assert "-" in lines[1]
+
+    def test_the_measure_button_uses_the_shared_runner(self) -> None:
+        """A second ParallelBenchmarker would be a second lock, which is no lock."""
+        import inspect
+
+        from studioforge.gui.tabs import models as tab
+
+        source = inspect.getsource(tab._measure_parallel)
+        assert "parallel_bench.for_state(ctx.api_state)" in source
+
+    def test_the_exact_context_buttons_call_load_recommended(self) -> None:
+        import inspect
+
+        from studioforge.gui.tabs import models as tab
+
+        assert "load_recommended" in inspect.getsource(tab._load_at_ctx)
+        assert "_render_ctx_buttons" in inspect.getsource(tab._render_placements)

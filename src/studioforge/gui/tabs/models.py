@@ -957,12 +957,17 @@ def _render_placements(ctx: GuiContext, record: Any, card: Any, dialog: Any, tab
         if not lines:
             ui.label("No GPU on this box can hold this model.").classes("text-xs opacity-70")
             return
+        entries = profiles.get("modes") or profiles.get("profiles") or []
         for index, line in enumerate(lines):
+            entry = entries[index] if index < len(entries) else {}
             with ui.row().classes("w-full items-center gap-2 flex-nowrap"):
                 ui.badge(line.label, color="primary" if index == 0 else "secondary").classes(
                     "text-xs shrink-0"
                 )
                 ui.label(line.summary).classes("text-xs font-mono flex-1 min-w-0")
+                slots = st.parallel_summary(entry)
+                if slots:
+                    ui.label(slots).classes("text-xs opacity-70 shrink-0")
                 ui.label(line.availability).classes(f"text-xs text-{line.colour} shrink-0")
                 if line.load_args:
                     recipe = ", ".join(f"{k}={v}" for k, v in line.load_args.items())
@@ -970,6 +975,128 @@ def _render_placements(ctx: GuiContext, record: Any, card: Any, dialog: Any, tab
                         "Load here",
                         on_click=lambda ln=line: _load_placement(ctx, ln, dialog, table),
                     ).props("flat dense size=sm").tooltip(f"load_model({recipe})")
+                if line.load_args:
+                    ui.button(
+                        "Measure parallel",
+                        on_click=lambda ln=line, c=card: _measure_parallel(
+                            ctx, record, ln, c, dialog, table
+                        ),
+                    ).props("flat dense size=sm").tooltip(
+                        "Load once on these cards and sweep 1/2/4/8 concurrent "
+                        "requests, so the slot count stops being an estimate. "
+                        "Takes a few minutes and needs an idle server."
+                    )
+
+        _render_ctx_buttons(ctx, record, profiles, dialog, table)
+
+
+def _render_ctx_buttons(
+    ctx: GuiContext, record: Any, profiles: Mapping[str, Any], dialog: Any, table: Any
+) -> None:
+    """ "Load at exactly this context" -- 64k / 128k / 256k / 512k, plus a field.
+
+    The other half of the placements block, and the half a user reaches for
+    first: not "which cards" but "I need a 256k window". Unreachable sizes are
+    greyed with the reason rather than hidden, because "why can this model not
+    do 256k" is the question the button exists to answer.
+    """
+    ui.separator().classes("my-1")
+    with ui.row().classes("w-full items-center gap-2 flex-wrap"):
+        ui.label("Load at exactly:").classes("text-xs font-medium shrink-0")
+        for button in st.ctx_buttons(profiles):
+            widget = ui.button(
+                button.label,
+                on_click=lambda b=button: _load_at_ctx(ctx, record, b.ctx_size, dialog, table),
+            ).props("flat dense size=sm")
+            widget.tooltip(button.tooltip)
+            if not button.enabled:
+                widget.disable()
+        free_form = (
+            ui.number("tokens", precision=0)
+            .props("dense outlined clearable")
+            .classes("w-32")
+            .tooltip("any context up to this model's trained window")
+        )
+        ui.button(
+            "Load",
+            on_click=lambda: _load_at_ctx(ctx, record, _as_int(free_form.value), dialog, table),
+        ).props("flat dense size=sm")
+
+
+async def _load_at_ctx(
+    ctx: GuiContext, record: Any, ctx_size: int | None, dialog: Any, table: Any
+) -> None:
+    """Ask the server for exactly this window and let it pick the rest."""
+    if not ctx_size or ctx_size < 1:
+        ui.notify("Enter a context size in tokens first.", type="warning")
+        return
+    with busy(message=f"Loading {record.id} at {ctx_size} tokens…"):
+        try:
+            instance = await ctx.manager.load_recommended(record.id, int(ctx_size), source="gui")
+        except Exception as exc:  # noqa: BLE001 - the refusal is the useful part
+            notify_error(exc, what="load")
+            return
+    plan = instance.plan
+    where = ", ".join(str(d) for d in (plan.devices if plan else []))
+    kv = plan.kv_cache_type if plan else "?"
+    slots = plan.parallel if plan else 1
+    dialog.close()
+    ui.notify(
+        f"{record.id} ready at {ctx_size} ctx on GPU {where} — {kv} KV, {slots} slot"
+        f"{'' if slots == 1 else 's'}",
+        type="positive",
+    )
+    table.refresh()
+
+
+async def _measure_parallel(
+    ctx: GuiContext, record: Any, line: Any, card: Any, dialog: Any, table: Any
+) -> None:
+    """Run the concurrency sweep for one mode and show the curve.
+
+    Awaited inline rather than dispatched as a job: this dialog is the only
+    thing that wants the answer, the run refuses to start unless the server is
+    idle anyway, and a progress spinner the user can watch is a better story
+    than a job id they have to poll from a settings dialog.
+    """
+    from studioforge.core import parallel_bench
+
+    # The GUI shares the gateway's object graph by reference, so this is the
+    # SAME runner (and therefore the same one-at-a-time lock) the HTTP route and
+    # the MCP tool reach for -- not a second one that could race them.
+    if ctx.api_state is None or ctx.manager is None:
+        ui.notify("The parallel benchmark is not available in this session.", type="warning")
+        return
+    runner = parallel_bench.for_state(ctx.api_state)
+    with busy(message=f"Measuring {line.label} — 1/2/4/8 concurrent requests…"):
+        try:
+            report = await runner.run(record, mode=line.mode)
+        except Exception as exc:  # noqa: BLE001 - a refusal is the useful part
+            notify_error(exc, what="parallel benchmark")
+            return
+    _show_parallel_report(report.to_dict(), line.label)
+    # The placements are recomputed from the rows the run just wrote, so the
+    # basis flips from "estimated" to "measured" in front of the user.
+    _render_placements(ctx, record, card, dialog, table)
+
+
+def _show_parallel_report(report: Mapping[str, Any], label: str) -> None:
+    """The measured curve, as a dialog the user can read and dismiss."""
+    with ui.dialog() as dialog, ui.card().classes("min-w-[28rem]"):
+        ui.label(f"Parallel slots on {label}").classes("text-sm font-medium")
+        ui.label(
+            f"{report.get('ctx_per_slot')} ctx/slot · {report.get('kv_cache_type')} KV · "
+            f"launched with {report.get('parallel_launched')} slots"
+        ).classes("text-xs opacity-70")
+        ui.label("\n".join(st.parallel_level_lines(report))).classes(
+            "text-xs font-mono whitespace-pre"
+        )
+        ui.label(st.parallel_verdict(report)).classes("text-xs font-medium")
+        for note in report.get("notes") or []:
+            ui.label(note).classes("text-xs text-warning")
+        with ui.row().classes("w-full justify-end"):
+            ui.button("Close", on_click=dialog.close).props("flat")
+    dialog.open()
 
 
 async def _load_placement(ctx: GuiContext, line: Any, dialog: Any, table: Any) -> None:

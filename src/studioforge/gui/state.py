@@ -1481,6 +1481,137 @@ def placement_headline(profiles: Mapping[str, Any]) -> str:
     return f"Recommended: {best.text}"
 
 
+# ---------------------------------------------------------------------------
+# Slot counts and "load at exactly this context" (WP19 / D37)
+# ---------------------------------------------------------------------------
+
+
+def parallel_summary(entry: Mapping[str, Any]) -> str:
+    """ "4 of 7 slots (measured)" for one placement, or ``""`` when there is nothing to say.
+
+    Empty when the recommendation equals the ceiling, which is the case on a rig
+    that has never run a parallel benchmark -- D17's knee is already folded into
+    ``max_parallel``, so printing both would be printing one number twice. The
+    line appears exactly when the two diverge, which is exactly when the user
+    has learned something.
+    """
+    optimal = entry.get("optimal") or {}
+    ceiling = int(optimal.get("max_parallel") or 0)
+    recommended = optimal.get("recommended_parallel")
+    if not ceiling or recommended is None or int(recommended) == ceiling:
+        return ""
+    basis = str(optimal.get("recommended_parallel_basis") or "estimated")
+    return f"{int(recommended)} of {ceiling} slots ({basis})"
+
+
+@dataclass(frozen=True)
+class CtxButton:
+    """One "load at this exact context" button in the Models tab."""
+
+    label: str
+    ctx_size: int
+    enabled: bool
+    tooltip: str
+
+
+#: The four windows the Models tab offers as buttons. The same list the MCP
+#: ``load_recommended`` docstring names, so a user and an agent asking for "256k"
+#: mean the same load.
+CTX_BUTTONS: Final[tuple[tuple[str, int], ...]] = (
+    ("64k", 65536),
+    ("128k", 131072),
+    ("256k", 262144),
+    ("512k", 524288),
+)
+
+
+def ctx_buttons(profiles: Mapping[str, Any]) -> list[CtxButton]:
+    """The four context buttons, each enabled or greyed with the reason why.
+
+    Greyed rather than hidden: "why can this model not do 256k" is the question
+    the button is there to answer, and a control that vanishes answers nothing.
+    Two reasons it can be off, and they are different -- past the model's trained
+    window is permanent and about the model, while "no placement reaches it"
+    is about this box and may change when something unloads.
+    """
+    trained = int(profiles.get("n_ctx_train") or 0)
+    reachable = max(
+        (
+            int((entry.get("optimal") or {}).get("ctx_per_slot") or 0)
+            for entry in profiles.get("modes") or profiles.get("profiles") or []
+        ),
+        default=0,
+    )
+    out: list[CtxButton] = []
+    for label, ctx in CTX_BUTTONS:
+        if trained and ctx > trained:
+            out.append(
+                CtxButton(
+                    label,
+                    ctx,
+                    False,
+                    f"this model was trained to {trained} tokens; asking for more "
+                    f"needs RoPE scaling and degrades quality",
+                )
+            )
+        elif reachable and ctx > reachable:
+            out.append(
+                CtxButton(
+                    label,
+                    ctx,
+                    False,
+                    f"no set of cards on this box reaches {ctx} tokens for this "
+                    f"model even when idle (the best is {reachable})",
+                )
+            )
+        else:
+            out.append(
+                CtxButton(
+                    label,
+                    ctx,
+                    True,
+                    f"load at exactly {ctx} tokens per conversation; the server "
+                    f"picks the GPUs, the KV cache and the slot count",
+                )
+            )
+    return out
+
+
+def parallel_level_lines(report: Mapping[str, Any]) -> list[str]:
+    """The measured curve as one aligned line per concurrency level."""
+    lines = [f"{'N':>2}  {'per-stream':>10}  {'aggregate':>9}  {'p95':>7}  {'batch':>5}"]
+    for level in report.get("levels") or []:
+        lines.append(
+            f"{int(level.get('n_streams') or 0):>2}  "
+            f"{_tps(level.get('per_stream_tps')):>10}  "
+            f"{_tps(level.get('aggregate_tps')):>9}  "
+            f"{_secs(level.get('p95_latency_s')):>7}  "
+            f"{_batch(level.get('achieved_batch')):>5}"
+        )
+    return lines
+
+
+def parallel_verdict(report: Mapping[str, Any]) -> str:
+    """One sentence naming the recommendation and why it landed there."""
+    detail = str(report.get("recommended_parallel_detail") or "")
+    basis = str(report.get("recommended_parallel_basis") or "estimated")
+    return f"Recommended: {detail}" if detail else f"Recommended parallel basis: {basis}"
+
+
+def _secs(value: Any) -> str:
+    try:
+        return f"{float(value):.2f}s"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _batch(value: Any) -> str:
+    try:
+        return f"{float(value):.1f}x"
+    except (TypeError, ValueError):
+        return "-"
+
+
 def per_gpu_projection_lines(verdict: FitVerdict) -> list[str]:
     """``GPU0  12.34 GiB`` lines for the projected/free per-GPU map."""
     label = "projected" if verdict.fits else "free"
