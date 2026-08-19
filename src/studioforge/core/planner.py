@@ -1076,7 +1076,7 @@ class Planner:
         if isinstance(result, LoadPlan) and resident is not None:
             if reload_of not in result.evict_model_ids:
                 result.evict_model_ids.insert(0, reload_of)
-            credited = sum(self._instance_footprint(resident).values())
+            credited = sum(self.instance_footprint(resident).values())
             result.notes.append(
                 f"forced reload: planned as if the running instance of {reload_of} "
                 f"were already unloaded ({round(credited / MB)} MB credited back)"
@@ -1086,13 +1086,13 @@ class Planner:
     def _gpus_as_if_gone(self, resident: InstanceInfo) -> list[GpuInfo]:
         """The live GPU list with ``resident``'s planned footprint credited as free.
 
-        The footprint is the instance's own plan (:meth:`_instance_footprint`),
+        The footprint is the instance's own plan (:meth:`instance_footprint`),
         the same figure the eviction ladder credits for a victim; the truth is
         whatever the driver releases when the child exits, and a plan made on
         the estimate meets the same one-retry OOM path a post-eviction plan does.
         """
         gpus = list(self.probe.list_gpus())
-        footprint = self._instance_footprint(resident)
+        footprint = self.instance_footprint(resident)
         if not footprint:
             return gpus
         view: list[GpuInfo] = []
@@ -1330,7 +1330,7 @@ class Planner:
         """VRAM the planner is allowed to take back by evicting idle models."""
         total = 0
         for instance in self._evictable(loaded):
-            total += sum(self._instance_footprint(instance).values())
+            total += sum(self.instance_footprint(instance).values())
         return total
 
     def _terminal_rejection(
@@ -1693,7 +1693,7 @@ class Planner:
                 evicted: list[str] = []
                 for instance in evictable:
                     evicted.append(instance.model_id)
-                    for dev, amount in self._instance_footprint(instance).items():
+                    for dev, amount in self.instance_footprint(instance).items():
                         freed[dev] = freed.get(dev, 0) + amount
                     for pool, pool_note in pools:
                         for devices in (
@@ -2212,7 +2212,7 @@ class Planner:
             evicted: list[str] = []
             for instance in self._evictable(loaded):
                 evicted.append(instance.model_id)
-                for dev, amount in self._instance_footprint(instance).items():
+                for dev, amount in self.instance_footprint(instance).items():
                     freed[dev] = freed.get(dev, 0) + amount
                 result = self._try_devices(
                     record,
@@ -2513,8 +2513,17 @@ class Planner:
         return sorted(candidates, key=lambda i: i.last_activity_at or i.started_at or 0.0)
 
     @staticmethod
-    def _instance_footprint(instance: InstanceInfo) -> dict[int, int]:
-        """Per-GPU bytes an instance is believed to hold (from its own plan)."""
+    def instance_footprint(instance: InstanceInfo) -> dict[int, int]:
+        """Per-GPU bytes an instance is believed to hold (from its own plan).
+
+        Public because three surfaces need the same figure and a second
+        definition of "how much is this child holding" is how two of them start
+        disagreeing: the eviction ladder credits it for a victim, ``reload_of``
+        (D30) credits it for the child being replaced, and the catalog credits
+        it to a *loaded* model when computing that model's own rows (D36) --
+        otherwise every row of a resident model is judged against VRAM the row
+        itself would release.
+        """
         if instance.plan is None:
             return {}
         return dict(instance.plan.per_gpu_bytes)

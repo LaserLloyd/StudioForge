@@ -188,6 +188,38 @@ class _IdleProbe(_SnapshotProbe):
         return []
 
 
+class _CreditedProbe(_SnapshotProbe):
+    """The same GPUs, with one resident child's own VRAM handed back as free.
+
+    A loaded model's catalog rows describe *reloading it*, and a reload frees
+    the allocation it currently holds before the replacement takes any. Judging
+    those rows against a machine that still contains the model is judging them
+    against memory the row itself would release, and the answer is visibly
+    wrong: on 2026-08-19 the resident 17.4 GB Gemma-4 31B -- running at 262144
+    on three cards -- was told by its own catalog that it fitted only at 262144
+    with a **q4_0** KV cache spread over three GPUs, because its 17.4 GB of
+    weights and 20 GB of KV were counted as somebody else's.
+
+    The credit is :meth:`Planner.instance_footprint`, exactly what D30's
+    ``reload_of`` credits back for a forced reload, so the catalog's promise
+    and the load's own arithmetic cannot drift apart. Other models' rows are
+    computed against the uncredited probe, because *their* load does not free
+    anything.
+    """
+
+    def __init__(self, inner: Any, footprint: Mapping[int, int]) -> None:
+        super().__init__(inner)
+        self._gpus = [
+            g.model_copy(
+                update={
+                    "free_bytes": min(g.total_bytes, g.free_bytes + int(footprint.get(g.index, 0))),
+                    "used_bytes": max(0, g.used_bytes - int(footprint.get(g.index, 0))),
+                }
+            )
+            for g in self._gpus
+        ]
+
+
 # ---------------------------------------------------------------------------
 # Small projections
 # ---------------------------------------------------------------------------
@@ -718,6 +750,7 @@ def build_catalog(
                 record,
                 live=live,
                 idle=idle,
+                live_probe=live_probe,
                 loaded=loaded_list,
                 instance=loaded_map.get(record.id),
                 db=db,
@@ -759,6 +792,7 @@ def _model_entry(
     *,
     live: Planner,
     idle: Planner,
+    live_probe: Any,
     loaded: Sequence[Any],
     instance: Any,
     db: Any,
@@ -848,13 +882,19 @@ def _model_entry(
         )
         return entry
 
+    # A resident model's rows describe RELOADING it, so its own allocation is
+    # credited back and it is not one of the obstacles (D36 / see
+    # :class:`_CreditedProbe`). Every other model's rows see the machine as it
+    # is, because their load frees nothing.
+    entry_live, entry_loaded = _live_view_for(record, live, live_probe, loaded, instance)
+
     rows = [
         _option_row(
-            live,
+            entry_live,
             idle,
             record,
             ctx,
-            loaded=loaded,
+            loaded=entry_loaded,
             observations=observations,
             calibrate_for=calibrate_for,
         )
@@ -863,7 +903,7 @@ def _model_entry(
     basis = mark_recommended(
         rows,
         chat_class=record.kind == "chat",
-        floor=recommendation_floor(live.config, record),
+        floor=recommendation_floor(entry_live.config, record),
     )
     entry["recommended_basis"] = basis
     # The entry-level block describes the factor the recommended row was quoted
@@ -875,6 +915,36 @@ def _model_entry(
         entry["calibration"] = _calibration_block(calibrate_for(placed))
     entry["options"] = rows
     return compact_entry(entry) if compact else entry
+
+
+def _live_view_for(
+    record: ModelRecord,
+    live: Planner,
+    live_probe: Any,
+    loaded: Sequence[Any],
+    instance: Any,
+) -> tuple[Planner, list[Any]]:
+    """``(planner, other_loaded)`` this model's live rows should be judged against.
+
+    For a model that is **not** loaded this is the shared live planner and the
+    whole loaded list. For a model that **is** loaded it is a planner over a
+    :class:`_CreditedProbe` -- its own footprint handed back as free VRAM --
+    with itself removed from the obstacles, which is precisely the view D30's
+    ``reload_of`` takes when the same reload is actually performed. Both halves
+    matter: the credited probe is what ``fits`` is decided against, and it is
+    also what :func:`slots_for_plan` measures capacity against, so the slot
+    column is credited too rather than only the fit verdict.
+    """
+    if instance is None:
+        return live, list(loaded)
+    others = [i for i in loaded if i.model_id != record.id]
+    footprint = Planner.instance_footprint(instance)
+    if not footprint:
+        # A child with no plan (an adopted instance, a fake in a test): there is
+        # nothing to credit, and inventing a figure would be worse than none.
+        return live, others
+    credited = Planner(live.config, _CreditedProbe(live_probe, footprint), log_plans=False)
+    return credited, others
 
 
 def _calibration_block(calibration: Mapping[str, Any]) -> dict[str, Any]:

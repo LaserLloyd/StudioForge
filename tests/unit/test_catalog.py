@@ -878,6 +878,66 @@ def test_the_loaded_model_reports_its_running_plan() -> None:
     assert dense["loaded_plan"]["parallel_limited_by"] == "knee"
 
 
+def _resident(model_id: str, *, gpu: int = 0, gib: float = 25.0) -> InstanceInfo:
+    """A loaded child holding ``gib`` on one card, per its own plan."""
+    held = int(gib * GB)
+    return InstanceInfo(
+        model_id=model_id,
+        state="ready",
+        port=18100,
+        plan=LoadPlan(
+            model_id=model_id,
+            devices=[gpu],
+            ctx_size=32768,
+            parallel=1,
+            max_parallel=1,
+            ctx_per_slot=32768,
+            per_gpu_bytes={gpu: held},
+        ),
+    )
+
+
+def test_a_loaded_models_own_rows_see_its_own_vram_as_free() -> None:
+    """D36: a resident model's rows describe RELOADING it, and a reload frees
+    the allocation it holds. Judging them against a machine that still contains
+    the model told the live 31B it fitted only at 262k with a q4_0 cache spread
+    over three cards -- against memory the row itself would release."""
+    instance = _resident("pub/dense-8b", gpu=0, gib=25.0)
+    # 2 GiB free everywhere: nothing loads. 25 GiB of card 0 is this model.
+    crowded = catalog_for(free_gib=2.0, supervisor=FakeSupervisor([instance]))
+    dense = next(m for m in crowded["models"] if m["id"] == "pub/dense-8b")
+    row = next(r for r in dense["options"] if r["ctx_per_slot"] == 16384)
+    assert row["fits"] is True
+    assert row["devices"] == [0]
+
+
+def test_another_models_rows_do_not_get_that_credit() -> None:
+    """The credit is a statement about one reload, not about the machine."""
+    instance = _resident("pub/dense-8b", gpu=0, gib=25.0)
+    crowded = catalog_for(free_gib=2.0, supervisor=FakeSupervisor([instance]))
+    vlm = next(m for m in crowded["models"] if m["id"] == "pub/vlm-7b")
+    assert all(not r["fits"] for r in vlm["options"])
+
+
+def test_the_credit_reaches_the_slot_column_not_only_the_fit_verdict() -> None:
+    """``slots_for_plan`` measures capacity off the planner's own probe, so a
+    credited fit with an uncredited capacity would advertise one slot."""
+    instance = _resident("pub/dense-8b", gpu=0, gib=25.0)
+    crowded = catalog_for(free_gib=2.0, supervisor=FakeSupervisor([instance]))
+    dense = next(m for m in crowded["models"] if m["id"] == "pub/dense-8b")
+    row = next(r for r in dense["options"] if r["ctx_per_slot"] == 16384)
+    assert row["max_parallel"] > 1
+
+
+def test_a_resident_child_with_no_plan_is_credited_nothing() -> None:
+    """An adopted instance carries no per-GPU figures; inventing one is worse
+    than crediting none."""
+    instance = InstanceInfo(model_id="pub/dense-8b", state="ready", port=18100)
+    crowded = catalog_for(free_gib=2.0, supervisor=FakeSupervisor([instance]))
+    dense = next(m for m in crowded["models"] if m["id"] == "pub/dense-8b")
+    assert all(not r["fits"] for r in dense["options"])
+
+
 def test_an_unloaded_model_says_so_plainly() -> None:
     dense = next(m for m in catalog_for()["models"] if m["id"] == "pub/dense-8b")
     assert dense["state"] == "not-loaded"
