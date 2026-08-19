@@ -568,10 +568,10 @@ def _luid_pci_buses(luids: Iterable[LuidKey]) -> dict[LuidKey, int]:
     """PCI bus number for each adapter LUID, best effort.
 
     ``D3DKMTOpenAdapterFromLuid`` -> ``D3DKMTQueryAdapterInfo(ADAPTERADDRESS)``
-    -> ``D3DKMTCloseAdapter``. A LUID that does not open (the Microsoft Basic
-    Render adapter answers ``0xFFFFFFFF`` for its address on this box) is simply
-    absent from the result; the caller treats absence as "some other adapter"
-    rather than guessing.
+    -> ``D3DKMTCloseAdapter``. A LUID that fails any of the three, or that opens
+    and has no real PCI address (the Microsoft Basic Render adapter answers
+    ``0xFFFFFFFF`` on this box), is simply absent from the result; the caller
+    treats absence as "some other adapter" rather than guessing.
     """
     wanted = [key for key in luids if key != UNKNOWN_LUID]
     if not wanted:
