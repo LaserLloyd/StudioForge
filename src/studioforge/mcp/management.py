@@ -583,7 +583,9 @@ def build_management_mcp(state: Any) -> MCPServer:
             limit: Return only the first N models after the other filters.
                 Because the ordering is newest-download-first, ``limit=5`` is
                 "the five models the user most recently got", which is usually
-                what "my new model" means. Omit it to see the whole library.
+                what "my new model" means. The default is 25; pass ``null`` (or
+                ``0``) to see the whole library, and read ``truncated`` /
+                ``total_matching`` to know whether the default hid anything.
 
         Returns:
             ``{"ok": true, "catalog_hint": "...", "models": [...],
@@ -631,7 +633,9 @@ def build_management_mcp(state: Any) -> MCPServer:
             # Applied after the filters, not before: "the five newest chat
             # models" is the question, and truncating the catalog first would
             # answer "whichever of the five newest models happen to be chat".
-            if limit is not None and limit >= 0 and len(rows) >= limit:
+            # A limit of 0 (or below) means "no limit", like null: the check
+            # runs after the append, so 0 used to hand back exactly one row.
+            if limit is not None and limit > 0 and len(rows) >= limit:
                 limit_reached = True
         return {
             "ok": True,
@@ -772,12 +776,19 @@ def build_management_mcp(state: Any) -> MCPServer:
     ) -> dict[str, Any]:
         """Load a model into VRAM now, returning once it is serving.
 
-        **Pass a catalog row's ``load_args`` object straight in.** Its four
-        keys are exactly this tool's four arguments; that is the intended way
-        to call it and it needs nothing added::
+        **Pass a catalog ``load_args`` object straight in.** Every key in it
+        is an argument of this tool, nothing needs adding, and that is the
+        intended way to call it::
 
-            row = list_models()["models"][0]["options"][0]
-            load_model(**row["load_args"])
+            model = list_models()["models"][0]
+            load_model(**model["recommended"]["load_args"])      # names the devices
+            load_model(**model["options"][3]["load_args"])       # a context tier; the
+                                                                 # planner picks the cards
+
+        The ``recommended`` block and every ``placements[]`` recipe carry
+        ``devices``; the per-context ``options`` rows deliberately do not --
+        their placement is the planner's choice at load time, which the row's
+        ``devices`` column previews.
 
         You often do not need this tool at all: naming an unloaded model in an
         OpenAI API request loads it automatically with planner defaults. Reach
@@ -960,6 +971,29 @@ def build_management_mcp(state: Any) -> MCPServer:
             ``ctx_size_used``.
         """
         result = await state.manager.test_model(model_id, prompt, keep_loaded=keep_loaded)
+        if not result.get("ok", True):
+            # The call worked and the model did not: an empty reply, or no
+            # embedding vector. "Errors are results" (module docstring), so the
+            # agent gets an error object it can read rather than a bare
+            # ok:false with nothing to explain it.
+            detail = dict(result)
+            detail.pop("ok", None)
+            what = (
+                "no embedding vector came back"
+                if "embedding_dims" in result
+                else "the model answered with empty text"
+            )
+            return {
+                "ok": False,
+                "error": {
+                    "type": "test_failed",
+                    "code": "empty_reply",
+                    "message": f"the smoke test of '{result.get('model_id', model_id)}' ran "
+                    f"but {what}; the instance is up and the request succeeded, so read "
+                    f"the child's log (tail_logs / logs/models/) for what it generated",
+                },
+                **detail,
+            }
         return {"ok": True, **result}
 
     @_guard
@@ -1413,14 +1447,20 @@ def build_management_mcp(state: Any) -> MCPServer:
                 (e for group in ("tailscale", "lan", "loopback") for e in buckets[group]),
                 endpoints[0] if endpoints else {},
             )
-            if wanted not in {"auto", ""} and wanted in buckets:
-                # Asked for something we do not have; say so rather than
-                # silently handing back a different network.
+            if wanted not in {"auto", ""}:
+                # Asked for something we do not have -- a network this host has
+                # no address on, or a word that is not one of the three -- so
+                # say so rather than silently handing back a different network.
+                note = (
+                    f"no {wanted} address is available on this host"
+                    if wanted in buckets
+                    else f"unknown prefer {wanted!r}; use auto, tailscale, lan or loopback"
+                )
                 return {
                     "ok": True,
                     "recommended": chosen.get("url"),
                     "requested": wanted,
-                    "note": f"no {wanted} address is available on this host",
+                    "note": note,
                     "endpoints": endpoints,
                     "tailscale": buckets["tailscale"],
                     "lan": buckets["lan"],

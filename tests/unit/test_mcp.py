@@ -407,6 +407,49 @@ async def test_list_models_says_when_the_limit_hid_rows(state: State) -> None:
     assert "limit: int | None = 25" in inspect.getsource(mgmt)
 
 
+async def test_list_models_limit_zero_or_null_means_the_whole_library(state: State) -> None:
+    """``limit=0`` used to return exactly one row (the check ran after the append)."""
+    server = build_management_mcp(state)
+    for limit in (0, None, -1):
+        result = await call(server, "list_models", limit=limit)
+        assert result["count"] == 3, limit
+        assert result["truncated"] is False
+
+
+async def test_a_failed_smoke_test_is_an_error_result_not_a_bare_ok_false(
+    state: State, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Errors are results: an empty reply comes back with an error object."""
+
+    async def fake_test_model(name: str, prompt: Any = None, *, keep_loaded: bool = False) -> dict:
+        return {
+            "ok": False,
+            "model_id": name,
+            "latency_s": 0.5,
+            "completion_tokens": 0,
+            "text": "",
+            "loaded_for_test": True,
+            "unloaded_after": True,
+            "ctx_size_used": 4096,
+        }
+
+    monkeypatch.setattr(state.manager, "test_model", fake_test_model)
+    server = build_management_mcp(state)
+    result = await call(server, "test_model", model_id=TINY)
+    assert result["ok"] is False
+    assert result["error"]["type"] == "test_failed"
+    assert "empty text" in result["error"]["message"]
+    assert result["loaded_for_test"] is True  # the facts still travel
+
+
+async def test_connection_info_names_an_unknown_preference(state: State) -> None:
+    server = build_management_mcp(state)
+    result = await call(server, "connection_info", prefer="wifi")
+    assert result["ok"] is True
+    assert result["recommended"]
+    assert "unknown prefer" in result["note"]
+
+
 async def test_list_models_carries_the_catalog_columns(state: State) -> None:
     server = build_management_mcp(state)
     result = await call(server, "list_models")
