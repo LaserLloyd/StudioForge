@@ -2095,3 +2095,200 @@ Dashboard line.
 * **A holder measured only on unresolvable adapters shows no device at all.** It reports
   `gpu_indices: []` with source `nvml-context` and its bytes under `-1`; that is honest and it is
   also the least useful row in the payload.
+
+## D38 -- The engine's newer features, each one measured before it was switched on
+
+**Problem.** `b10425` shipped a pile of things StudioForge was not using: MTP and n-gram
+speculative decoding (`--spec-type` grew from two useful values to eleven), tensor parallelism
+(`-sm tensor`), a host-RAM prompt cache (`-cram`), GPU-side sampling (`-bs`), an explicit unified-KV
+switch. Two of them are large wins on this rig. One of them is a loss. Nothing in the codebase
+could tell them apart, and worse, nothing could tell whether a flag it passed was even *read* --
+D2 recorded `b10425` accepting the renamed `--draft*` family and silently ignoring it, which looks
+exactly like a feature that does not help.
+
+Everything below was measured on a **scratch** instance: the engine copied read-only out of the
+live data directory, port 1258, the 3090 pair (which `nvidia-smi` showed idle), and every child
+killed and verified gone afterwards. The live rig was never touched.
+
+### 1. A flag is passed only when the active engine advertises it
+
+`EngineFeatures` parses each build's own `--help` into `engines/<tag>/features.json`: the flag list
+**and the value lists** -- `--split-mode {none,layer,row,tensor}`, `--spec-type`'s eleven types,
+`--flash-attn [on|off|auto]` -- plus the defaults that decide what we must *not* re-emit
+(`--spec-draft-n-max 3`, `--cache-ram 8192`, `--ctx-checkpoints 32`). Warmed at boot by
+`ensure_engine`, readable synchronously next to the binary so the supervisor needs no dependency on
+the engine manager, and readable *without spawning anything* by the capabilities report.
+
+The important case is the one that is easy to get wrong: **"the help could not be read" is not "the
+engine has nothing".** An unknown build advertises nothing and the launch falls back to the flag
+surface that predates this gating -- a draft model still drafts, no new flag appears. Guessing
+either way is how a feature silently stops working.
+
+### 2. `spec_type: auto` -- MTP where it exists, n-grams where they pay, nothing otherwise
+
+Speculative decoding is distribution-preserving: the draft proposes, the full model verifies,
+rejected tokens are resampled from the true distribution. It is the rare feature that is pure speed
+with no quality cost, so `auto` is allowed to turn it on by itself. The ladder:
+
+1. `draft-mtp` when the GGUF carries `nextn_predict_layers >= 1` -- the model's own head, no second
+   model, no extra VRAM;
+2. `draft-simple` when a `draft_model_id` is attached (the previous behaviour);
+3. `ngram-mod` for thinking and MoE models -- draftless, ~16 MiB of host state;
+4. `none`.
+
+Measured on **Qwen3.8-27B Q5_K_S** (`qwen35`, `nextn_predict_layers=1`), one RTX 3090, 8k context,
+four *distinct* 256-token prose prompts, greedy, `cache_prompt: false`:
+
+| `--spec-type` | tok/s | vs none | acceptance (`draft_n_accepted/draft_n`) |
+| --- | --- | --- | --- |
+| `none` | 37.75 | -- | -- |
+| `draft-mtp`, n_max 3 | **50.70** | **+34.3%** | 0.528 |
+| `draft-mtp`, n_max 4 | 47.48 | +25.8% | 0.446 |
+| `ngram-mod` | 37.91 | +0.4% | no drafts emitted at all |
+| `draft-mtp,ngram-mod`, n_max 4 | 47.05 | +24.6% | 0.446 (draft counts identical to mtp alone) |
+
+On a code-rewrite turn the same model measured +95% with `draft-mtp` and +114% with `ngram-mod`.
+That inversion is the reason for a ladder rather than one answer: the strategies are good at
+different things, and `ngram-mod` is free when it is wrong. Combining them added nothing
+measurable, so `auto` picks exactly one.
+
+**`ngram-mod` clears the "does not slow a non-repetitive request by ~10%" bar with room to spare**
+(+0.4%, and `timings.draft_n` is null on unseen prose -- it does not even try), so it ships on for
+thinking/MoE models. On the 1.5B the same check gave parity on the first, cold request.
+
+**Benchmarking trap worth writing down.** `ngram-mod` learns from what it has already generated.
+Sending the *same* prompt three times measured **+751%** on the 27B and +20% on the 1.5B; four
+distinct prompts measured +0.4%. Every ngram number in this section is from distinct prompts.
+
+**`--spec-draft-n-max` is 3, not 16.** The constant here was 16 under a comment claiming that was
+the b10425 default; the help text says `(default: 3)`. Depth is not free: at n_max 4 acceptance
+fell from 0.528 to 0.446 and throughput with it, because every extra rejected token was verified
+for nothing. The flag is emitted only for `draft-*` types -- the n-gram types read
+`--spec-ngram-*-n-max` instead, and emitting it there would be a flag that looks like it does
+something.
+
+**Reading it.** `/props` is still not to be trusted (it reports `speculative.types: "none"` while
+drafting). `/slots[].speculative` came back `true` for `ngram-mod` too, so it means "configured",
+not "working"; only `timings.draft_n` / `draft_n_accepted` mean working. Both signals were read off
+the scratch loads above; `/props` was not relied on for any of them.
+
+### 3. Tensor split is opt-in, gated, and was *slower* here
+
+Qwen2.5-1.5B Q4_K_M, two RTX 3090s, 8k context, three runs each, median:
+
+| placement | generation | prompt |
+| --- | --- | --- |
+| one 3090 | 352.5 tok/s | 2803.6 tok/s |
+| two, `-sm layer` | 344.4 tok/s | 2722.5 tok/s |
+| two, `-sm tensor` | **294.3 tok/s** | **1182.0 tok/s** |
+| two, `-sm row` | fails to load | -- |
+
+A small model is tensor mode's worst case -- the per-layer all-reduce is fixed while the halved
+weight read shrinks with the model -- so a 31B may well win. That is precisely why this is a
+*benchmark dimension* (every multi-GPU mode now has a `-tensor` variant for an eligible model) and
+not a default. `layer` stays the default and `split_mode: auto` resolves to `layer` unless every
+gate passes.
+
+`throughput.estimate` grew a `split_mode`: layer sums the per-device times (a pipeline), tensor
+takes their `max` and adds `n_layer * T_TENSOR_SYNC_S` with `T_TENSOR_SYNC_S = 60e-6` -- two PCIe
+all-reduces per layer, an approximation calibrated to reproduce the crossover above, not a
+measurement of this bus. Prefill is deliberately modelled *identically* for both modes: a parallel
+roofline would advertise a prefill win and the rig measured a 57% prefill loss, so claiming either
+would be inventing a constant.
+
+**The gates**, all checked before the child is spawned, because llama.cpp enforces one of them by
+exiting -- `-fa off -sm tensor` dies with `SPLIT_MODE_TENSOR requires flash_attn to be enabled`:
+at least two devices; the engine lists `tensor`; flash attention on; an unquantized KV cache; a
+dense, non-hybrid model. An explicit `tensor` that fails a gate is **refused with the reasons**;
+`auto` downgrades to `layer` and records why on the plan. Someone who typed "tensor" and quietly
+got "layer" would go on to benchmark the wrong thing.
+
+Two findings the gates are *not* derived from a crash: `-sm tensor` with a `q8_0` KV cache
+**started and answered correctly** on b10425 (upstream documents quantized KV as unimplemented
+there, so declining it is StudioForge policy and is the gate most likely to be relaxed), and
+`--backend-sampling` under tensor mode logs `backend sampling not supported with
+SPLIT_MODE_TENSOR; using CPU` and carries on.
+
+`-sm row` is dead on CUDA: `error loading model: device CUDA2 does not support split buffers`. It
+stays in the `SplitMode` type only because the engine still lists it; it is documented in
+LIMITATIONS.
+
+### 4. Unified KV: verified, and deliberately turned *off* -- explicitly
+
+D17 left this "unverified, and not recommended anywhere until it is". Measured with the 0.5B,
+`--parallel 2 --ctx-size 16384`:
+
+| | engine log | `n_ctx` per slot | VRAM | one 12k-token request | two concurrent 12k requests |
+| --- | --- | --- | --- | --- | --- |
+| nothing passed | `kv_unified = 'false'` | 8192 | 997 MiB | **400** up front, naming the limit | **400** each, up front |
+| `--kv-unified` | `kv_unified = 'true'` | 16384 | 1005 MiB | **accepted** | **500 "Context size has been exceeded"**, mid-generation |
+| `--no-kv-unified` | `kv_unified = 'false'` | 8192 | -- | 400 | -- |
+
+So the working assumption going in was wrong in a useful way: StudioForge passing nothing does
+**not** leave unified on. The engine's help says "default: enabled if number of slots is auto", and
+StudioForge always passes an explicit `--parallel`, so the partitioned pool was already what
+happened -- by accident of another setting.
+
+**Decision: keep the partitioned pool, and say so.** Multi-slot launches now pass
+`--no-kv-unified` explicitly. That makes the catalog's `ctx_per_slot` literally true rather than
+true-by-coincidence, and it survives an engine release changing its default. The quality-first
+argument decides the tie between the two things worth wanting: unified buys a lone conversation the
+whole pool at the same VRAM, but it buys it by over-committing, and the way an over-commit surfaces
+is a **500 during generation** on an agent that had already spent a minute thinking. A 400 before
+any work starts is the better failure. `kv_unified: true` remains a per-model opt-in for a
+single-user long-context model, now documented with the number above instead of a shrug.
+
+Same VRAM either way is now measured, not assumed: 997 vs 1005 MiB.
+
+### 5. `--cache-ram` on by default; `-ub` measured and left alone
+
+`--cache-ram` keeps evicted prompt prefixes in *system* memory. It is the other half of
+`--cache-reuse` -- reuse recovers a prefix still in the slot, this recovers one that left it, which
+is exactly what happens to an OpenClaw agent's system prompt while another model borrows the slot.
+Measured VRAM at `-cram 8192` and `-cram 32768`: **identical, 1492 MiB**. No token can change. On
+by default at `min(32 GiB, 25% of system RAM)`.
+
+`-ub` was measured and deliberately **not** turned on (1.5B, one 3090, 5166-token prompt):
+
+| `-ub` | prompt processing | VRAM |
+| --- | --- | --- |
+| 512 (default) | 15232 tok/s | 1492 MiB |
+| 1024 | 17307 tok/s (+13.6%) | 1562 MiB (+70) |
+| 2048 (with `-b 2048`) | 18061 tok/s (+18.6%) | 1702 MiB (+210) |
+
+The compute buffer grows with `-ub` and `planner.compute_overhead_fraction` does not model it.
+Raising `-ub` globally would make every VRAM estimate optimistic by roughly that much, scaled to
+the model -- on a GPU-only server that turns a fit into an OOM. So `engine.ubatch_size` exists,
+defaults to unset, and the benchmark can measure it (`ubatch_sizes=(1024, 2048)`); making the
+planner ubatch-aware is left for whoever owns `planner.py` next.
+
+`--backend-sampling` stays off: b10425 labels it experimental, and under the quality-first rule
+"experimental with no measured quality claim" is itself the reason.
+
+`--sleep-idle-seconds` is never passed -- StudioForge owns model lifetime through TTL, and a second
+idle timer inside the child would unload state the supervisor believes is resident. `--fit off`
+stays (D11). `--flash-attn on` stays, and tensor mode now depends on it.
+
+**What pins it.** `tests/unit/test_engine_features.py` parses a *verbatim* trimmed excerpt of
+b10425's help (`tests/unit/data/b10425_help_excerpt.txt`) -- a parser tested only against a fixture
+its author invented would pass and then drop every flag in production.
+`tests/unit/test_supervisor_features.py` covers the whole spec-type matrix, the refusal for a type
+the engine lacks, the tensor gates one by one, refuse-vs-downgrade, and that no new flag reaches an
+engine that does not advertise it. `test_throughput.py` pins the tensor arithmetic including the
+crossover; `test_benchmark.py` pins that the default mode list did not change length.
+
+**What remains.**
+
+* **Calibration does not know about split mode.** Throughput observations key on model, device set
+  and GPU class. A model benchmarked in tensor mode teaches the layer-mode estimate a correction it
+  should not have. Rare enough that medians absorb it; a `split_mode` column would fix it.
+* **The planner's compute-buffer term is not ubatch-aware** (above).
+* **MTP was measured at one slot only.** `draft-mtp` with `--parallel > 1` is untested here; there
+  is no reason to expect trouble and no evidence either.
+* **`help.txt` is written with translated newlines on Windows**, so the cached copy is
+  double-spaced. Harmless -- `parse_help_entries` skips blank lines -- but it is why the fixture
+  generator had to filter them.
+* **The catalog, placements and the Setup tab do not show any of this yet.** `LoadPlan` and
+  `InstanceInfo` carry `speculative` and the resolved `split_mode`, and
+  `capabilities.engine_feature_rows` renders the Engine card, but the surfaces themselves belong to
+  work packages running alongside this one.
