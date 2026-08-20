@@ -410,6 +410,13 @@ class PlannerConfig(BaseModel):
     image_tokens_default: PositiveInt = 1024
     mmproj_compute_mb: NonNegativeInt = 512
     prefer_single_gpu: bool = True
+    #: Whether the sweep may relocate an idle resident whose placement went
+    #: stale (D42) -- e.g. still sharing a card with another model long after
+    #: the layout that forced it is gone. ``"auto"`` reloads it onto the
+    #: strictly better placement when the whole box is quiet; ``"suggest"``
+    #: only logs the opportunity; ``"off"`` never looks. A relocation drops
+    #: that model's prompt cache, which is why it waits for real idleness.
+    rebalance: Literal["auto", "suggest", "off"] = "auto"
     #: What the catalog optimises for when it names one load per model (D36).
     #:
     #: ``"quality"`` (the default): the best KV cache quality that reaches the

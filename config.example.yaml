@@ -107,6 +107,7 @@ planner:
   image_tokens_default: 1024
   mmproj_compute_mb: 512
   prefer_single_gpu: true
+  rebalance: auto
   quant_affinity:
     NVFP4:
       min_compute_capability: '12.0'

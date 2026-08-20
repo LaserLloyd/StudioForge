@@ -8,6 +8,7 @@ restart. They are pinned here because nothing else would catch a reintroduction.
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any
 
 import pytest
@@ -20,6 +21,7 @@ from studioforge.types import (
     GgufMeta,
     InstanceInfo,
     LoadPlan,
+    LoadRejected,
     ModelRecord,
     ModelSettings,
 )
@@ -448,6 +450,182 @@ def test_reconciler_is_off_when_auto_load_pinned_is_off() -> None:
     manager._maybe_reconcile_pinned()
 
     assert manager._reconcile_task is None, "the pin should mean only 'no TTL, no eviction'"
+
+
+# ---------------------------------------------------------------------------
+# The placement rebalancer (D42): a stale placement is revisited, carefully
+# ---------------------------------------------------------------------------
+
+
+class StubPlanner:
+    """Answers every plan_load with one canned result, recording the call."""
+
+    def __init__(self, result: Any) -> None:
+        self.result = result
+        self.calls: list[dict[str, Any]] = []
+
+    def plan_load(self, record: Any, **kwargs: Any) -> Any:
+        self.calls.append({"model_id": record.id, **kwargs})
+        return self.result
+
+
+def placed(model_id: str, devices: list[int], *, idle_s: float = 400.0) -> InstanceInfo:
+    now = time.time()
+    return InstanceInfo(
+        model_id=model_id,
+        state="ready",
+        ttl_s=1800,
+        started_at=now - 3600.0,
+        last_activity_at=now - idle_s,
+        plan=LoadPlan(
+            model_id=model_id,
+            devices=list(devices),
+            ctx_size=32768,
+            ctx_per_slot=32768,
+            parallel=1,
+            kv_cache_type="f16",
+        ),
+    )
+
+
+def rebalance_rig() -> tuple[Any, Any, Any]:
+    """A 27B on [1, 3] beside a 31B on [0, 1] -- the measured stale layout."""
+    mover = make_record("stale/mover")
+    anchor = make_record("busy/anchor")
+    manager, supervisor = make_manager([mover, anchor])
+    supervisor.instances[mover.id] = placed(mover.id, [1, 3])
+    supervisor.instances[anchor.id] = placed(anchor.id, [0, 1])
+    return manager, supervisor, mover
+
+
+def candidate_plan(model_id: str, devices: list[int]) -> LoadPlan:
+    return LoadPlan(
+        model_id=model_id,
+        devices=devices,
+        ctx_size=32768,
+        ctx_per_slot=32768,
+        parallel=1,
+        kv_cache_type="f16",
+        evict_model_ids=[model_id],  # reload_of lists itself first (D30)
+    )
+
+
+async def test_rebalance_moves_a_model_off_a_shared_card() -> None:
+    """The measured case: [1, 3] shares GPU1 with a resident; [2, 3] is free of it."""
+    manager, _supervisor, mover = rebalance_rig()
+    manager.planner = StubPlanner(candidate_plan(mover.id, [2, 3]))
+    calls: list[dict[str, Any]] = []
+
+    async def fake_load(model_id: str, **kwargs: Any) -> InstanceInfo:
+        calls.append({"model_id": model_id, **kwargs})
+        return placed(model_id, kwargs["devices"])
+
+    manager.load = fake_load  # type: ignore[method-assign]
+    manager._maybe_rebalance()
+
+    assert manager._rebalance_task is not None
+    await manager._rebalance_task
+    assert len(calls) == 1
+    assert calls[0]["model_id"] == mover.id
+    assert calls[0]["devices"] == [2, 3]
+    assert calls[0]["force"] is True
+    assert calls[0]["evict_busy"] is False
+    assert calls[0]["source"] == "rebalance"
+    # The preview asked for identical geometry, not a fresh ladder walk.
+    preview = manager.planner.calls[0]
+    assert preview["ctx_size"] == 32768
+    assert preview["parallel"] == 1
+    assert preview["allow_evict"] is False
+    assert preview["reload_of"] == mover.id
+
+
+def test_rebalance_suggest_mode_only_logs() -> None:
+    manager, _supervisor, mover = rebalance_rig()
+    manager.config.planner.rebalance = "suggest"
+    manager.planner = StubPlanner(candidate_plan(mover.id, [2, 3]))
+
+    manager._maybe_rebalance()
+
+    assert manager._rebalance_task is None
+    assert mover.id in manager._rebalance_last, "suggest still stamps the cooldown"
+
+
+def test_rebalance_off_never_looks() -> None:
+    manager, _supervisor, mover = rebalance_rig()
+    manager.config.planner.rebalance = "off"
+    planner = StubPlanner(candidate_plan(mover.id, [2, 3]))
+    manager.planner = planner
+
+    manager._maybe_rebalance()
+
+    assert manager._rebalance_task is None
+    assert planner.calls == []
+
+
+def test_rebalance_waits_for_real_idleness_and_cooldown() -> None:
+    manager, supervisor, mover = rebalance_rig()
+    manager.planner = StubPlanner(candidate_plan(mover.id, [2, 3]))
+
+    supervisor.instances[mover.id] = placed(mover.id, [1, 3], idle_s=10.0)
+    assert manager._rebalance_opportunity() is None, "10s idle is a conversation pause"
+
+    supervisor.instances[mover.id] = placed(mover.id, [1, 3])
+    manager._rebalance_last[mover.id] = time.time()
+    assert manager._rebalance_opportunity() is None, "one move per cooldown window"
+
+
+def test_rebalance_skips_a_busy_box() -> None:
+    manager, supervisor, mover = rebalance_rig()
+    manager.planner = StubPlanner(candidate_plan(mover.id, [2, 3]))
+    supervisor.instances["busy/anchor"].active_requests = 1
+
+    manager._maybe_rebalance()
+
+    assert manager._rebalance_task is None
+
+
+def test_rebalance_never_moves_a_forced_placement() -> None:
+    manager, _supervisor, mover = rebalance_rig()
+    mover.settings = ModelSettings(device_override=[1, 3])
+    manager.planner = StubPlanner(candidate_plan(mover.id, [2, 3]))
+
+    assert manager._rebalance_opportunity() is None
+
+
+def test_rebalance_prefers_fewer_cards_at_the_same_settings() -> None:
+    record = make_record("wide/model")
+    manager, supervisor = make_manager([record])
+    supervisor.instances[record.id] = placed(record.id, [0, 1, 2])
+    manager.planner = StubPlanner(candidate_plan(record.id, [0, 1]))
+
+    found = manager._rebalance_opportunity()
+
+    assert found is not None
+    model_id, plan, reason = found
+    assert model_id == record.id
+    assert plan.devices == [0, 1]
+    assert "cards" in reason
+
+
+def test_rebalance_ignores_a_refusal_or_an_evicting_candidate() -> None:
+    manager, _supervisor, mover = rebalance_rig()
+
+    manager.planner = StubPlanner(LoadRejected(model_id=mover.id, reason="no room", suggestions=[]))
+    assert manager._rebalance_opportunity() is None
+
+    evicting = candidate_plan(mover.id, [2, 3])
+    evicting.evict_model_ids = [mover.id, "busy/anchor"]
+    manager.planner = StubPlanner(evicting)
+    assert manager._rebalance_opportunity() is None
+
+
+def test_rebalance_leaves_a_well_placed_model_alone() -> None:
+    """No sharing, no narrower option: same devices back means no move."""
+    manager, _supervisor, mover = rebalance_rig()
+    manager.planner = StubPlanner(candidate_plan(mover.id, [1, 3]))
+    # Even though [1, 3] overlaps the anchor's [0, 1], the candidate is the
+    # same placement -- overlap removed is the trigger, not overlap existing.
+    assert manager._rebalance_opportunity() is None
 
 
 # ---------------------------------------------------------------------------

@@ -2667,3 +2667,49 @@ round-trip, ttl-override guard, `set_pinned`), `tests/unit/test_mcp.py` (`pin_mo
 surface pinned exactly), `tests/unit/test_api_hardening.py` (D32 gate moves),
 `tests/unit/test_catalog_routes.py` (`GET /v1/models/{id}` now carries the same runtime fields as
 the list -- the two shapes had diverged), `tests/unit/test_gui.py` (filtering on "pinned").
+
+## D42 -- A placement is a moment's answer, and the sweep re-asks the question
+
+**Problem.** Placements accrete. Measured on this rig, 2026-08-20: at 13:42 a 27B was planned onto
+`[1, 3]` -- a 5090/3090 cross-tier split sharing GPU1 -- because the 31B then held `[1, 0, 2]` and
+ClawForge held 7.5 GiB of GPU2, so that genuinely was the best fit at that instant. At 13:53 the
+31B was reloaded with a q8_0 cache and shrank to `[0, 1]`. From that moment `[2, 3]` sat free and
+strictly better -- no shared card, no cross-tier hop -- and the 27B stayed on `[1, 3]` anyway,
+contending with the 31B on GPU1 for every request either of them served. Every plan was optimal
+for the instant it was made; nothing ever revisited one after the world changed. (Prior art has
+the same shape: ollama's scheduler evicts and retries on pressure but never re-places a resident;
+the datacenter answer is live KV migration, whose home-rig equivalent is exactly "reload an idle
+model while nobody is watching".)
+
+**Decision.** A rebalance pass rides the TTL sweep, beside D41's pin reconciler and built the
+same way: single-flight task, so a multi-minute reload never stalls the sweeper.
+
+1. **Two triggers, both standing costs, neither a throughput guess.** An idle resident is moved
+   when a no-evict plan at its exact current settings (per-slot context, KV types, slot count --
+   a one-rung ladder, D14) lands it (a) off every card it shares with another resident, or
+   (b) on strictly fewer cards. Estimated tok/s never justifies a move: chasing estimates is
+   churn, removing a standing misplacement is not.
+2. **Quiet box only, and really idle.** The pass runs only when nothing is serving, loading,
+   testing or benchmarking (`_busy_reason`), and only for a model idle >= 300 s -- because a
+   relocation is a reload, and a reload drops the child's prompt cache. On this rig's RP
+   workload that cache was 93% of a 98k-token prompt; moving a model between turns would trade
+   a permanent contention win for a multi-minute reprocess loss. Five minutes idle means the
+   conversation has plausibly gone away.
+3. **The preview is the D30 machinery verbatim**: `plan_load(reload_of=self, allow_evict=False)`
+   credits the model's own footprint back and may evict nobody. The move itself is a forced
+   reload onto the previewed devices (`force=True, evict_busy=False` -- the reload licence
+   without the interrupt licence, D36), so a refusal at the gate leaves the resident serving.
+4. **Hysteresis**: one move (or one `suggest` log line) per model per 30 min, and a persisted
+   `device_override` -- the user said "run it here" -- is never second-guessed.
+5. **`planner.rebalance: auto | suggest | off`**, default `auto`. `suggest` logs the opportunity
+   and acts on nothing; the MCP instructions tell agents a quietly changed placement is
+   housekeeping, not something they did.
+
+**What this is not.** Not joint planning: two models loaded in sequence still each plan against
+the other's residency, and a globally-optimal *pair* placement (bin-packing both at once) remains
+future work -- the rebalancer converges the layout after the fact instead. Not an eviction
+change: nothing new may evict anything, in either pass.
+
+**Tests.** `tests/unit/test_gateway_lifecycle.py` (the measured `[1,3]`-beside-`[0,1]` layout
+moves to `[2,3]`; suggest/off modes; idle, cooldown, busy-box and device_override gates; a
+refusal or an evicting candidate is ignored; same-placement answer means no move).

@@ -171,6 +171,12 @@ interrupting), and test_model and benchmark_parallel refuse outright while
 anything is serving, loading or benchmarking -- all of them come back with
 retry_after_s, so waiting is usually cheaper than retrying.
 
+A model's GPUs can change while it sits idle: when the box is quiet, the
+server relocates an idle model whose placement went stale (still sharing a
+card with another model, or spread wider than it needs) onto strictly better
+cards at the same settings. That is normal housekeeping (planner.rebalance),
+not something you did -- read placements from server_status when they matter.
+
 WHEN VRAM IS MISSING: server_status reports free VRAM per GPU plus who is
 holding it. A row whose fits is false but whose if_gpus_idle.fits is true only
 needs an unload_model. vram_orphan_count above zero means leaked llama-server

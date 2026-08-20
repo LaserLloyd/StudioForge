@@ -279,6 +279,14 @@ class ModelManager:
         #: backoff for pinned reloads that keep failing, so a model that no
         #: longer fits is retried politely instead of every sweep.
         self._pin_retry: dict[str, tuple[float, float]] = {}
+        #: The placement-rebalance pass (D42): single-flight, like the pin
+        #: reconciler, and for the same reason -- a reload takes minutes and
+        #: the sweeper must keep sweeping underneath it.
+        self._rebalance_task: asyncio.Task[None] | None = None
+        #: model id -> when it was last rebalanced (or last suggested), so one
+        #: model is never shuffled -- or logged about -- more than once per
+        #: cooldown window.
+        self._rebalance_last: dict[str, float] = {}
         self._draining = False
         #: Set by the app to the boot's "done" event (D33): a JIT load that
         #: arrives while the library is still being scanned or the engine is
@@ -333,6 +341,11 @@ class ModelManager:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._reconcile_task
             self._reconcile_task = None
+        if self._rebalance_task is not None:
+            self._rebalance_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._rebalance_task
+            self._rebalance_task = None
 
         deadline = time.time() + (
             drain_timeout_s if drain_timeout_s is not None else self.config.server.drain_timeout_s
@@ -1428,6 +1441,7 @@ class ModelManager:
                 await asyncio.sleep(interval)
                 await self._sweep_ttl()
                 self._maybe_reconcile_pinned()
+                self._maybe_rebalance()
                 await self._sample_throughput()
             except asyncio.CancelledError:
                 raise
@@ -1549,6 +1563,165 @@ class ModelManager:
                     retry_in_s=round(delay),
                     error=str(exc),
                 )
+
+    # -- placement rebalancer (D42) ------------------------------------------
+
+    #: How long a model must have been idle before it may be relocated. A
+    #: relocation is a reload, and a reload drops the child's prompt cache --
+    #: on an agent/RP workload that cache is a ~100k-token reprocess, so a
+    #: model is only moved when its conversation has plausibly gone away.
+    REBALANCE_MIN_IDLE_S = 300.0
+    #: Per-model floor between relocations (and between "suggest" log lines).
+    #: The win is removing a *standing* misplacement; anything that needs to
+    #: move more often than this is churn, not optimisation.
+    REBALANCE_COOLDOWN_S = 1800.0
+
+    def _maybe_rebalance(self) -> None:
+        """Spawn one relocation when a resident model has a strictly better home.
+
+        Placements accrete: each plan was optimal for the instant it was made,
+        and nothing used to revisit it when the world changed. Measured on this
+        rig -- a 27B placed on [1, 3] because a 31B held [1, 0, 2], still
+        sharing GPU1 long after the 31B's reload shrank it to [0, 1], while
+        both 3090s sat free. This pass re-asks the planner's question for idle
+        residents, on a quiet box, and acts only on a strict improvement.
+        """
+        mode = getattr(self.config.planner, "rebalance", "off")
+        if mode not in ("suggest", "auto") or self._draining:
+            return
+        if self._rebalance_task is not None and not self._rebalance_task.done():
+            return
+        if self._reconcile_task is not None and not self._reconcile_task.done():
+            return
+        if self._busy_reason() is not None:
+            # Any in-flight request, load, test or benchmark: a relocation
+            # would compete with it for PCIe and CPU, and the layout it was
+            # computed against is about to change anyway.
+            return
+        found = self._rebalance_opportunity()
+        if found is None:
+            return
+        model_id, plan, reason = found
+        self._rebalance_last[model_id] = time.time()
+        if mode == "suggest":
+            log.info(
+                "rebalance available (planner.rebalance=suggest; not acting)",
+                model_id=model_id,
+                to_devices=list(plan.devices),
+                reason=reason,
+            )
+            return
+        self._rebalance_task = asyncio.create_task(
+            self._rebalance(model_id, plan, reason), name="studioforge-rebalance"
+        )
+
+    def _rebalance_opportunity(self) -> tuple[str, LoadPlan, str] | None:
+        """The first idle resident with a strictly better no-evict placement.
+
+        "Strictly better" is deliberately narrow -- two triggers, both about
+        standing costs, neither about chasing throughput estimates:
+
+        * the model shares a card with another resident and a placement with
+          no sharing exists at the same context, KV type and slot count;
+        * a placement on strictly fewer cards exists at the same settings
+          (every extra card in a layer split is a synchronisation hop).
+
+        The candidate plan must evict nothing (its own footprint is credited
+        back, D30), the model must have been idle for REBALANCE_MIN_IDLE_S,
+        and a persisted ``device_override`` -- the user said "run it here" --
+        is never second-guessed.
+        """
+        now = time.time()
+        loaded = self.supervisor.list()
+        for instance in loaded:
+            if instance.state != "ready" or instance.active_requests > 0:
+                continue
+            plan = instance.plan
+            if plan is None or not plan.devices:
+                continue
+            last = instance.last_activity_at or instance.started_at or now
+            if now - last < self.REBALANCE_MIN_IDLE_S:
+                continue
+            if now - self._rebalance_last.get(instance.model_id, 0.0) < self.REBALANCE_COOLDOWN_S:
+                continue
+            record = self.registry.get(instance.model_id)
+            if record is None or record.settings.device_override is not None:
+                continue
+            neighbours: set[int] = set()
+            for other in loaded:
+                if other.model_id != instance.model_id and other.plan is not None:
+                    neighbours.update(other.plan.devices)
+            overlap = set(plan.devices) & neighbours
+            candidate = self.planner.plan_load(
+                record,
+                ctx_size=plan.ctx_per_slot or plan.ctx_size,
+                kv_cache_type=plan.kv_cache_type,
+                kv_cache_type_v=plan.kv_cache_type_v,
+                parallel=plan.parallel,
+                loaded=loaded,
+                draft=self._draft_for(record),
+                adapters=[a for a, _ in self._adapters_for(record)],
+                reload_of=instance.model_id,
+                allow_evict=False,
+                evict_busy=False,
+                source="rebalance-preview",
+            )
+            if not isinstance(candidate, LoadPlan):
+                continue
+            if set(candidate.evict_model_ids) - {instance.model_id}:
+                continue  # defensive: a no-evict preview must not name victims
+            new_devices = set(candidate.devices)
+            new_overlap = new_devices & neighbours
+            if overlap and not new_overlap:
+                return (
+                    instance.model_id,
+                    candidate,
+                    f"shares GPU{sorted(overlap)} with another resident; "
+                    f"{sorted(new_devices)} is free of it",
+                )
+            if not (new_overlap - overlap) and len(candidate.devices) < len(plan.devices):
+                return (
+                    instance.model_id,
+                    candidate,
+                    f"spread over {len(plan.devices)} cards; "
+                    f"{len(candidate.devices)} suffice at the same settings",
+                )
+        return None
+
+    async def _rebalance(self, model_id: str, plan: LoadPlan, reason: str) -> None:
+        """Force-reload one model onto the previewed placement (D30/D36 rules).
+
+        ``force=True`` for the reload half only; ``evict_busy=False`` keeps the
+        no-interrupt rule. A refusal -- the world changed between preview and
+        gate -- leaves the resident child serving exactly as a refused forced
+        reload always has.
+        """
+        try:
+            instance = await self.load(
+                model_id,
+                ctx_size=plan.ctx_per_slot or plan.ctx_size,
+                kv_cache_type=plan.kv_cache_type,
+                kv_cache_type_v=plan.kv_cache_type_v,
+                parallel=plan.parallel,
+                devices=plan.devices,
+                force=True,
+                evict_busy=False,
+                source="rebalance",
+            )
+            log.info(
+                "rebalanced model",
+                model_id=model_id,
+                devices=list(instance.plan.devices) if instance.plan else list(plan.devices),
+                reason=reason,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the model keeps its old placement
+            log.warning(
+                "rebalance failed; the model keeps its placement",
+                model_id=model_id,
+                error=str(exc),
+            )
 
     def _model_was_removed(self, model_id: str) -> bool:
         """True only when the registry has scanned and no longer knows ``model_id``.

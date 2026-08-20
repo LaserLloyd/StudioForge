@@ -4325,6 +4325,10 @@ CONFIG_FIELD_HELP: Final[Mapping[str, str]] = {
     "engine.allow_source_build": "Fall back to building llama.cpp when no prebuilt asset fits.",
     "planner.headroom_fraction": "Fraction of EVERY GPU held back from the planner.",
     "planner.on_insufficient": "evict = unload LRU unpinned models; reject = refuse the load.",
+    "planner.rebalance": (
+        "auto = relocate an idle model whose placement went stale (quiet box only); "
+        "suggest = only log it; off = never look (D42)."
+    ),
     "planner.preference": (
         "quality = best KV cache that reaches the context floor, then the biggest window at "
         "that quality; throughput = the biggest window, preferring one that serves two slots."
