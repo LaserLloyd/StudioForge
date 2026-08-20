@@ -104,6 +104,11 @@ MANAGEMENT_FALLBACK_TOOLS: tuple[tuple[str, str], ...] = (
         "cache and the slot count and loads at exactly that context.",
     ),
     ("unload_model", "Unload a model, freeing its VRAM immediately."),
+    (
+        "pin_model",
+        "Keep a model loaded at all times: no idle TTL, never evicted, loaded at "
+        "startup and reloaded if it goes down. pinned=false removes the pin.",
+    ),
     ("search_models", "Find GGUF repos on HuggingFace. One compact row per repo."),
     (
         "repo_details",

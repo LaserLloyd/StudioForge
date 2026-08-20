@@ -628,7 +628,7 @@ def models_pin(
     off: bool = typer.Option(False, "--off", help="Unpin instead of pinning."),
     json_out: bool = JSON_OPTION,
 ) -> None:
-    """Pin a model so the idle TTL never unloads it."""
+    """Pin a model: kept loaded at all times, reloaded if it goes down."""
 
     async def work(client: StudioForgeClient) -> Any:
         return await client.pin(model, not off)

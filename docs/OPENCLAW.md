@@ -55,11 +55,11 @@ Then register it as a local stdio MCP server in OpenClaw's config:
 }
 ```
 
-`sfctl mcp` merges **two** upstream toolsets into one list of 26 tools:
+`sfctl mcp` merges **two** upstream toolsets into one list of 27 tools:
 
 | Tools | Source | Available when the main server is wedged? |
 | --- | --- | --- |
-| `list_models`, `model_options`, `model_info`, `load_model`, `load_recommended`, `unload_model`, `test_model`, `benchmark_parallel`, `search_models`, `repo_details`, `download_model`, `delete_model`, `server_status`, `connection_info`, `get_config`, `set_config` | main app | no |
+| `list_models`, `model_options`, `model_info`, `load_model`, `load_recommended`, `unload_model`, `pin_model`, `test_model`, `benchmark_parallel`, `search_models`, `repo_details`, `download_model`, `delete_model`, `server_status`, `connection_info`, `get_config`, `set_config` | main app | no |
 | `restart_server`, `kill_model`, `nuke_all_models`, `reclaim_orphan_engines`, `tail_logs`, `gpu_status`, `rollback_update`, `recovery_health`, `recovery_get_config`, `recovery_set_config` | watchdog sidecar | **yes** |
 
 That split is the point: when the main server locks up, OpenClaw still holds working tools to
@@ -192,7 +192,26 @@ narrow the query rather than trusting the tail. `trending_score` appears only wi
 `sort="trending"` — HF omits the field entirely under any other ordering, so its absence is not a
 zero.
 
-### 6. `server_status` and `connection_info`
+### 6. `pin_model` — the model that must always answer
+
+```
+pin_model(model_id="pub/agent-model")                 # keep loaded at all times
+pin_model(model_id="pub/agent-model", pinned=false)   # undo
+```
+
+A pinned model has no idle TTL, is never evicted to make room for another load, is loaded at
+server startup, and is brought back automatically (within ~15 s) if it goes down — so pinning an
+unloaded model also loads it; no separate `load_model` call is needed. This is the answer to the
+eviction ping-pong between an agent's workhorse and everything else: pin the workhorse once and
+stop re-warming it.
+
+Two things to know. `unload_model` on a pinned model is honoured and it **stays down** until
+loaded or pinned again — an explicit unload always wins, so don't unload-then-pin to "restart" a
+model (use `load_model(force=true)` for that). And every pin permanently occupies its VRAM, so
+each one shrinks what the planner can offer other loads; `server_status` shows the cost, and a
+refused load's suggestions will name the pinned models standing in the way.
+
+### 7. `server_status` and `connection_info`
 
 `server_status` is free VRAM per GPU, every loaded model with its port and remaining TTL, queue
 depth, the active engine tag — and who is holding the VRAM (next section).
