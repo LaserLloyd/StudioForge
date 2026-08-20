@@ -266,6 +266,19 @@ class ModelManager:
         self.benchmarker: Any = None
         self._ttl_task: asyncio.Task[None] | None = None
         self._autoload_task: asyncio.Task[None] | None = None
+        #: The reconcile pass keeping pinned models resident (D41). Spawned by
+        #: the TTL loop so a multi-minute cold load never stalls the sweeper,
+        #: and held by reference for the same reason as the autoload task.
+        self._reconcile_task: asyncio.Task[None] | None = None
+        #: Serving ids a caller *explicitly* unloaded. A pin means "keep this
+        #: loaded", but a deliberate unload outranks it until the model is
+        #: loaded or pinned again -- otherwise "Unload" on a pinned model is a
+        #: 15-second illusion and the panic button frees nothing (D41).
+        self._pin_suppressed: set[str] = set()
+        #: serving id -> (next_attempt_ts, current_delay_s): exponential
+        #: backoff for pinned reloads that keep failing, so a model that no
+        #: longer fits is retried politely instead of every sweep.
+        self._pin_retry: dict[str, tuple[float, float]] = {}
         self._draining = False
         #: Set by the app to the boot's "done" event (D33): a JIT load that
         #: arrives while the library is still being scanned or the engine is
@@ -314,6 +327,12 @@ class ModelManager:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._autoload_task
             self._autoload_task = None
+        if self._reconcile_task is not None:
+            # Same reason: a pinned reload in flight must not race the drain.
+            self._reconcile_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._reconcile_task
+            self._reconcile_task = None
 
         deadline = time.time() + (
             drain_timeout_s if drain_timeout_s is not None else self.config.server.drain_timeout_s
@@ -1112,6 +1131,11 @@ class ModelManager:
         # (nothing idle-unloaded) and a pinned model was not recognised as
         # pinned, so the planner would happily evict it.
         self.apply_effective_ttl(record, instance)
+        # Any successful load -- JIT, GUI, MCP, the reconciler itself -- means
+        # the model is wanted up again: an earlier explicit unload no longer
+        # holds the pin back, and a failing reload's backoff starts over (D41).
+        self._pin_suppressed.discard(record.id)
+        self._pin_retry.pop(record.id, None)
         self.registry.touch(record.id)
         # The instance carries the pid, and the pid is what makes the
         # observation about *this* child rather than about the whole card.
@@ -1268,6 +1292,31 @@ class ModelManager:
         self.apply_effective_ttl(record, instance)
         return instance.ttl_s
 
+    def set_pinned(self, model_id: str, pinned: bool) -> tuple[ModelRecord, int]:
+        """Persist the pin and make it bite now. One implementation for every surface.
+
+        The HTTP route, the GUI toggle and the MCP tool all used to compose
+        ``save_settings`` + ``refresh_ttl`` themselves, and the GUI forgot the
+        second half -- a pin that only applied on the next load. Returns the
+        updated record and the effective TTL (0 == pinned).
+
+        Pinning also re-arms the reconciler (D41): an explicit unload's
+        suppression and any retry backoff are cleared, so a freshly pinned
+        model is brought up by the next sweep rather than whenever the old
+        bookkeeping expires.
+        """
+        record = self.registry.resolve(model_id)
+        if record is None:
+            raise ModelNotFoundError(model_id, known=self.registry.known_ids())
+        settings = record.settings.model_copy(update={"pinned": pinned})
+        updated = self.registry.save_settings(record.id, settings)
+        effective = self.refresh_ttl(updated.id)
+        if pinned:
+            serving_id = self.serving_record(updated).id
+            self._pin_suppressed.discard(serving_id)
+            self._pin_retry.pop(serving_id, None)
+        return updated, effective if effective is not None else self.ttl_for(updated)
+
     #: Observations read at startup to tune the planner's overhead fraction.
     #: Newest-first, so a factor that drifted a year ago cannot outvote how the
     #: box behaves today.
@@ -1341,15 +1390,24 @@ class ModelManager:
     # -- unloading --------------------------------------------------------
 
     async def unload(self, name: str) -> bool:
+        """Stop the child serving ``name``; a deliberate unload sticks (D41).
+
+        The stopped id is marked so the pin reconciler leaves it down: whoever
+        called this could see the model was pinned and asked anyway. Loading
+        or re-pinning the model lifts the mark; the pin *setting* is untouched.
+        """
         record = self.registry.resolve(name)
         model_id = record.id if record is not None else name
         if self.supervisor.get(model_id) is None:
             return False
+        self._pin_suppressed.add(model_id)
         await self.supervisor.stop(model_id)
         return True
 
     async def unload_all(self) -> list[str]:
+        """Stop every child. Pinned ones stay down until loaded or re-pinned (D41)."""
         ids = [i.model_id for i in self.supervisor.list()]
+        self._pin_suppressed.update(ids)
         await self.supervisor.stop_all()
         return ids
 
@@ -1369,6 +1427,7 @@ class ModelManager:
             try:
                 await asyncio.sleep(interval)
                 await self._sweep_ttl()
+                self._maybe_reconcile_pinned()
                 await self._sample_throughput()
             except asyncio.CancelledError:
                 raise
@@ -1408,6 +1467,88 @@ class ModelManager:
                     ttl_s=ttl,
                 )
                 await self.supervisor.stop(instance.model_id)
+
+    # -- pinned-model reconciler (D41) --------------------------------------
+
+    #: First retry delay after a pinned reload fails, and its ceiling. The
+    #: sweep runs every ~15s; retrying a load that just failed on the very
+    #: next sweep would mostly re-measure the same full rig.
+    PIN_RETRY_BASE_S = 60.0
+    PIN_RETRY_CAP_S = 900.0
+
+    def _maybe_reconcile_pinned(self) -> None:
+        """Spawn one reconcile pass when a pinned model is down and wanted up.
+
+        A task rather than an await: a cold load takes minutes, and the TTL
+        sweeper must keep sweeping while it runs. At most one pass is in
+        flight; the pass itself serialises behind the load gate like any
+        other caller (D29).
+        """
+        if self._draining or not self.config.models.auto_load_pinned:
+            return
+        if self._autoload_task is not None and not self._autoload_task.done():
+            return  # boot warm-up still owns the job
+        if self._reconcile_task is not None and not self._reconcile_task.done():
+            return
+        wanted = self._pinned_needing_load()
+        if not wanted:
+            return
+        self._reconcile_task = asyncio.create_task(
+            self._reconcile_pinned(wanted), name="studioforge-pin-reconcile"
+        )
+
+    def _pinned_needing_load(self) -> list[str]:
+        """Serving ids of pinned models that should be resident but are not.
+
+        Skips a model that is already up or coming up, one a caller
+        deliberately unloaded (:meth:`unload` marks those), one whose load is
+        in flight, and one inside its failure backoff window.
+        """
+        now = time.time()
+        wanted: list[str] = []
+        for record in self.registry.all():
+            if not record.settings.pinned:
+                continue
+            serving_id = self.serving_record(record).id
+            if serving_id in wanted or serving_id in self._loading:
+                continue
+            instance = self.supervisor.get(serving_id)
+            if instance is not None and instance.state in ("ready", "loading"):
+                continue
+            if serving_id in self._pin_suppressed:
+                continue
+            next_at, _delay = self._pin_retry.get(serving_id, (0.0, 0.0))
+            if now < next_at:
+                continue
+            wanted.append(serving_id)
+        return wanted
+
+    async def _reconcile_pinned(self, wanted: list[str]) -> None:
+        """Reload each missing pinned model, backing off per model on failure.
+
+        Loads carry no special licence: the planner treats them like the boot
+        autoload (idle unpinned models may be evicted per policy, a busy model
+        never -- D36), and a refusal is a WARNING plus a longer wait, not a
+        crash of the sweep.
+        """
+        for serving_id in wanted:
+            if self._draining:
+                return
+            try:
+                await self.load(serving_id, source="pin-reconcile")
+                log.info("reloaded pinned model", model_id=serving_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - one model must not block the rest
+                _next, delay = self._pin_retry.get(serving_id, (0.0, 0.0))
+                delay = min(max(delay * 2, self.PIN_RETRY_BASE_S), self.PIN_RETRY_CAP_S)
+                self._pin_retry[serving_id] = (time.time() + delay, delay)
+                log.warning(
+                    "pinned model failed to reload; backing off",
+                    model_id=serving_id,
+                    retry_in_s=round(delay),
+                    error=str(exc),
+                )
 
     def _model_was_removed(self, model_id: str) -> bool:
         """True only when the registry has scanned and no longer knows ``model_id``.
@@ -1593,6 +1734,13 @@ class ModelManager:
                 await self.load(model_id, source="autoload")
                 log.info("preloaded model", model_id=model_id)
             except Exception as exc:
+                # Seed the reconciler's backoff (D41): the very next sweep
+                # re-attempting a load that failed seconds ago would only
+                # repeat the refusal.
+                self._pin_retry[model_id] = (
+                    time.time() + self.PIN_RETRY_BASE_S,
+                    self.PIN_RETRY_BASE_S,
+                )
                 log.warning("failed to preload model", model_id=model_id, error=str(exc))
 
     # -- helpers ----------------------------------------------------------

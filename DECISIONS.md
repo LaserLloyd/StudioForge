@@ -2612,3 +2612,58 @@ a model that lived on the 3090s: llama.cpp's per-device CUDA context is ~0.22 Gi
 `DEVICE_PLACEMENT_MIN_BYTES = 512 MiB` (the listing floor `HOLDER_MIN_BYTES` stays 256 MiB, a
 different question), which clears the Blackwell context and is still under the smallest real
 placement seen here (568 MiB, the lighter card of a 0.5B pair at 4k).
+
+## D41 -- A pin is a desired state, and a reconciler enforces it
+
+**Problem.** `pinned` promised "keep this model loaded" and delivered only half of it. What it
+did: effective TTL 0 (never idle-unloaded), excluded from every eviction ladder, warmed once at
+startup by `_autoload_pinned`. What it did not: nothing ever *re*-loaded a pinned model. A child
+that crash-looped past `gateway.max_restarts` sat at `state="failed"` holding nothing; a pin set
+while the model was unloaded did nothing until the next boot; an autoload that failed was one log
+line and gone. Worse, two paths silently *broke* an existing pin: LM Studio's request-level `ttl`
+was written straight onto `instance.ttl_s` -- and `ttl_s == 0` is the wire representation of
+pinned everywhere, so any client sending `{"ttl": 60}` unpinned the model the owner pinned. And
+the GUI toggle saved the setting without `refresh_ttl`, so a pin clicked on a resident model was
+not seen by the sweeper or the planner until the next load -- exactly when it was not needed.
+
+**Decision.** Pinned is a *desired state*: "resident at all times", reconciled, not just
+exempted.
+
+1. **A reconcile pass rides the TTL sweep** (every `gateway.ttl_sweep_interval_s`). A pinned
+   model with no `ready`/`loading` instance -- never loaded, crashed out, failed at boot -- is
+   reloaded, `source="pin-reconcile"`. The pass runs as its own task so a multi-minute cold load
+   never stalls the sweeper, at most one pass is in flight, and the loads carry no special
+   licence: idle unpinned models may be evicted per policy, a busy model never (D36).
+2. **A deliberate unload outranks the pin.** `manager.unload` / `unload_all` mark the stopped id
+   suppressed; the reconciler leaves it down. Anything else is a 15-second illusion of an unload
+   and a panic button that frees nothing. Any successful load of the model, or pinning it again,
+   lifts the mark. The pin *setting* is never silently changed -- suppression is in-memory and
+   dies with the process, so a restart restores "pinned means resident".
+3. **Failures back off per model**: 60 s doubling to a 900 s ceiling, seeded also by a failed
+   boot autoload. A pinned model that no longer fits is a WARNING per attempt and a longer wait,
+   not a sweep-rate retry storm; the backoff resets on success or re-pin.
+4. **A request-level `ttl` cannot unpin.** `_apply_ttl_override` leaves an instance whose
+   `ttl_s == 0` alone. The request itself still works; only its idle-timer wish is ignored.
+5. **One implementation of "set the pin"** (the D26 rule): `manager.set_pinned` does
+   save-settings + `refresh_ttl` + re-arm-reconciler, and the HTTP route, the GUI toggles (Models
+   row, Dashboard card) and the new MCP `pin_model` tool all call it. The GUI's own
+   save-without-refresh copy is gone.
+6. **Pin and saved settings join the D32 gate.** On an open install, `POST /api/models/{id}/pin`
+   and `PUT /api/models/{id}/settings` need a local caller or the PIN: both outlive the instance
+   -- a pin drives the boot autoload and the reconciler; saved settings shape every future load
+   -- so they are box changes, not residency. Load/unload stay open (LM Studio parity).
+
+`models.auto_load_pinned` now gates the whole promise: startup warm-up *and* the reconciler. Off,
+a pin degrades to what it used to be -- no idle TTL, never evicted.
+
+**Invariants kept.** The wire representation stays `ttl_s == 0`, nothing new travels on the
+instance. Reconcile loads serialise behind the load gate (D29) and plan like any other load (D14/
+D16); an explicit unload still frees VRAM immediately and stays freed (the GUI's unload-all
+dialog now says so). Several models may be pinned at once; the planner's refusal text already
+names pins as the obstacle when they crowd the cards.
+
+**Tests.** `tests/unit/test_gateway_lifecycle.py` (reconciler wants/skips/backs off, suppression
+round-trip, ttl-override guard, `set_pinned`), `tests/unit/test_mcp.py` (`pin_model` tool,
+surface pinned exactly), `tests/unit/test_api_hardening.py` (D32 gate moves),
+`tests/unit/test_catalog_routes.py` (`GET /v1/models/{id}` now carries the same runtime fields as
+the list -- the two shapes had diverged), `tests/unit/test_gui.py` (filtering on "pinned").

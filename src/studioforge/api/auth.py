@@ -88,6 +88,15 @@ _ADMIN_DELETE_PREFIXES: tuple[str, ...] = (
     "/api/adapters/",
     "/api/virtual-models/",
 )
+#: Per-model writes that persist across restarts: saved settings and the pin.
+#: Residency stays open (load/unload from the LAN is the product), but these
+#: two outlive the instance -- a pin drives the boot autoload and the
+#: reconciler (D41), and saved settings shape every future load -- so they are
+#: box changes under D32, matched as ``(verb, path suffix)`` under /api/models/.
+_ADMIN_SETTINGS_SUFFIXES: tuple[tuple[str, str], ...] = (
+    ("POST", "/pin"),
+    ("PUT", "/settings"),
+)
 _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
 
@@ -97,6 +106,10 @@ def is_admin_mutation(method: str, path: str) -> bool:
     if verb not in _MUTATING_METHODS:
         return False
     if any(path == p.rstrip("/") or path.startswith(p) for p in _ADMIN_MUTATION_PREFIXES):
+        return True
+    if path.startswith("/api/models/") and any(
+        verb == m and path.endswith(s) for m, s in _ADMIN_SETTINGS_SUFFIXES
+    ):
         return True
     return verb == "DELETE" and any(path.startswith(p) for p in _ADMIN_DELETE_PREFIXES)
 

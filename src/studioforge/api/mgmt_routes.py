@@ -540,18 +540,11 @@ async def pin_model(
     model_id: str, request: Request, pinned: bool = Body(True, embed=True)
 ) -> dict[str, Any]:
     state = _state(request)
-    record = state.registry.resolve(model_id)
-    if record is None:
-        raise ModelNotFoundError(model_id, known=state.registry.known_ids())
-    settings = record.settings.model_copy(update={"pinned": pinned})
-    updated = state.registry.save_settings(record.id, settings)
-    effective_ttl = state.manager.refresh_ttl(updated.id)
+    updated, effective_ttl = state.manager.set_pinned(model_id, pinned)
     return {
         "model_id": updated.id,
         "pinned": updated.settings.pinned,
-        "effective_ttl_s": (
-            effective_ttl if effective_ttl is not None else state.manager.ttl_for(updated)
-        ),
+        "effective_ttl_s": effective_ttl,
     }
 
 

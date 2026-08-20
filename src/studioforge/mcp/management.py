@@ -84,6 +84,27 @@ StudioForge management plane: control a GPU-only llama.cpp serving host.
 Use these tools to see what models exist, load/unload them, watch VRAM, find
 and download new ones, and change configuration.
 
+QUICK RECIPES -- copy these exact calls; every argument name is literal:
+  what models are there?        list_models()
+  is the server busy? VRAM?     server_status()
+  load a model                  load_recommended(model_id="<id>", ctx_size=32768)
+  free a model's VRAM           unload_model(model_id="<id>")
+  keep a model loaded forever   pin_model(model_id="<id>")
+  stop keeping it loaded        pin_model(model_id="<id>", pinned=false)
+  does it actually work?        test_model(model_id="<id>")
+Model ids come from list_models -- copy the `id` field exactly, slashes and
+all. The argument is always called model_id, never model or name.
+
+TO KEEP A MODEL LOADED AT ALL TIMES: pin_model(model_id). A pinned model has
+no idle timeout, is never evicted to make room for another model, is loaded
+when the server starts, and is brought back automatically within ~15 seconds
+if it goes down -- so pinning an unloaded model also loads it; you do not need
+a separate load call. pin_model(model_id, pinned=false) undoes it. One
+exception: unload_model on a pinned model is honoured and it STAYS down until
+someone loads or re-pins it -- an explicit unload always wins. Every pinned
+model permanently occupies VRAM, so pin only what must always answer
+instantly, and check the effect with server_status().
+
 TWO WAYS TO LOAD, and the first is usually the one you want.
 
 If what you know is the CONTEXT you need, say so and stop:
@@ -928,12 +949,61 @@ def build_management_mcp(state: Any) -> MCPServer:
         Args:
             model_id: Model id or alias.
 
+        Unloading a *pinned* model is honoured and sticks: the reconciler
+        leaves it down until it is loaded again or re-pinned. The pin setting
+        itself is not changed -- use ``pin_model`` with ``pinned=false`` to
+        remove it.
+
         Returns:
             ``{"ok": true, "unloaded": true}``, or ``unloaded: false`` when the
             model was not running (which is not an error).
         """
         unloaded = await state.manager.unload(model_id)
         return {"ok": True, "model_id": model_id, "unloaded": unloaded}
+
+    @_guard
+    async def pin_model(model_id: str, pinned: bool = True) -> dict[str, Any]:
+        """Pin a model so it stays loaded at all times, or unpin it.
+
+        The two calls you will make::
+
+            pin_model(model_id="vendor/Some-Model-GGUF/Some-Model-Q4_K_M")  # keep loaded
+            pin_model(model_id="vendor/Some-Model-GGUF/Some-Model-Q4_K_M", pinned=False)
+
+        A pinned model has no idle TTL, is never chosen as an eviction victim,
+        is loaded at server startup, and is brought back automatically (within
+        one sweep, ~15s) if it is not resident -- so pinning an *unloaded*
+        model also loads it shortly, no separate ``load_model`` call needed.
+        Do NOT call ``unload_model`` and then pin to "restart" it: an explicit
+        unload is honoured and holds the model down until it is loaded or
+        pinned again. Several models can be pinned at once; the only limit is
+        VRAM, and every pin permanently shrinks what the planner can offer
+        other loads, so pin only what must always answer instantly. In every
+        other tool's output, ``effective_ttl_s: 0`` / ``ttl_remaining_s: null``
+        on a model means "pinned".
+
+        Args:
+            model_id: The ``id`` field exactly as ``list_models`` returns it,
+                slashes and all (an alias also works).
+            pinned: ``false`` to remove the pin (the model becomes an ordinary
+                resident with the default idle TTL again). Omit it to pin.
+
+        Returns:
+            ``{"ok": true, "model_id", "pinned", "effective_ttl_s", "loaded"}``
+            -- ``effective_ttl_s`` is 0 while pinned, and ``loaded`` says
+            whether it is resident right now (the reconciler handles it if not:
+            no error, no follow-up call needed, just wait ~15s).
+        """
+        record, effective_ttl = state.manager.set_pinned(model_id, pinned)
+        serving = state.manager.serving_record(record)
+        instance = state.supervisor.get(serving.id)
+        return {
+            "ok": True,
+            "model_id": record.id,
+            "pinned": record.settings.pinned,
+            "effective_ttl_s": effective_ttl,
+            "loaded": instance is not None and instance.state == "ready",
+        }
 
     @_guard
     async def test_model(
@@ -1585,6 +1655,7 @@ def build_management_mcp(state: Any) -> MCPServer:
         load_model,
         load_recommended,
         unload_model,
+        pin_model,
         search_models,
         repo_details,
         download_model,

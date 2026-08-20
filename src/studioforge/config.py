@@ -255,6 +255,10 @@ class ModelsConfig(BaseModel):
     # (OpenClaw) carry long tool transcripts and run out of room at 8k, so the
     # aim is high and the step-down is what keeps big models loadable.
     target_ctx: PositiveInt = 1048576
+    # Pinned models are loaded at startup AND kept resident: the reconciler
+    # reloads one that goes down -- crash past max_restarts, a failure, a pin
+    # set while unloaded -- unless a caller explicitly unloaded it (D41).
+    # Turning this off reduces a pin to "no idle TTL, never evicted".
     auto_load_pinned: bool = True
     # Served when a request omits "model", or names one of DEFAULT_MODEL_ALIASES
     # ("local-model", "default", "auto"). LM Studio clients send "local-model"

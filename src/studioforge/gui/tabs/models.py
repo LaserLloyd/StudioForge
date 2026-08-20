@@ -458,8 +458,13 @@ def _model_row(ctx: GuiContext, record: Any, instance: Any, table: Any) -> None:
                     icon="play_arrow", on_click=lambda r=record: _settings_dialog(ctx, r, table)
                 ).props("flat dense color=positive").tooltip("Load")
             ui.button(icon="push_pin", on_click=lambda r=record: _toggle_pin(ctx, r, table)).props(
-                "flat dense"
-            ).tooltip("Pin / unpin")
+                "flat dense color=accent" if record.settings.pinned else "flat dense"
+            ).tooltip(
+                "Unpin: back to the normal idle TTL"
+                if record.settings.pinned
+                else "Pin: keep loaded at all times — no idle TTL, never evicted, "
+                "auto-loaded at startup and reloaded if it goes down"
+            )
             ui.button(icon="science", on_click=lambda r=record: _test(ctx, r)).props(
                 "flat dense"
             ).tooltip("Test: one short completion, with latency and tok/s")
@@ -510,9 +515,12 @@ async def _unload(ctx: GuiContext, record: Any, table: Any) -> None:
 
 
 async def _toggle_pin(ctx: GuiContext, record: Any, table: Any) -> None:
-    settings = record.settings.model_copy(update={"pinned": not record.settings.pinned})
+    # manager.set_pinned, not save_settings directly: the pin must bite on the
+    # resident instance immediately (refresh_ttl) and re-arm the reconciler.
     try:
-        updated = await run_blocking(ctx.registry.save_settings, record.id, settings)
+        updated, _ttl = await run_blocking(
+            ctx.manager.set_pinned, record.id, not record.settings.pinned
+        )
     except Exception as exc:  # noqa: BLE001
         notify_error(exc, what="pin")
         return

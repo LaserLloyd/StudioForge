@@ -57,6 +57,12 @@ class CountingSupervisor:
     def list(self) -> list[InstanceInfo]:
         return list(self.instances.values())
 
+    async def stop(self, model_id: str, **_kwargs: Any) -> None:
+        self.instances.pop(model_id, None)
+
+    async def stop_all(self, **_kwargs: Any) -> None:
+        self.instances.clear()
+
     def tail_log(self, model_id: str, n: int = 200) -> list[str]:
         return []
 
@@ -193,6 +199,17 @@ class StubRegistry:
     def resolve(self, name: str) -> ModelRecord | None:
         return self._records.get(name)
 
+    def get(self, model_id: str) -> ModelRecord | None:
+        return self._records.get(model_id)
+
+    def known_ids(self) -> list[str]:
+        return list(self._records)
+
+    def save_settings(self, model_id: str, settings: ModelSettings) -> ModelRecord:
+        record = self._records[model_id]
+        record.settings = settings
+        return record
+
     def touch(self, model_id: str) -> None:
         return None
 
@@ -293,6 +310,172 @@ def test_ttl_for_matrix(pinned: bool, ttl_s: int | None, default: int, expected:
     record = make_record(pinned=pinned, ttl_s=ttl_s)
     manager, _ = make_manager([record], default_ttl_s=default)
     assert manager.ttl_for(record) == expected
+
+
+# ---------------------------------------------------------------------------
+# set_pinned: the one implementation every surface shares
+# ---------------------------------------------------------------------------
+
+
+def test_set_pinned_persists_and_bites_the_resident_instance() -> None:
+    record = make_record()
+    manager, supervisor = make_manager([record], default_ttl_s=1800)
+    instance = loaded(record.id, 1800)
+    supervisor.instances[record.id] = instance
+
+    updated, effective = manager.set_pinned(record.id, True)
+
+    assert updated.settings.pinned is True
+    assert effective == 0
+    assert instance.ttl_s == 0, "the pin must bite immediately, not at the next load"
+
+    updated, effective = manager.set_pinned(record.id, False)
+    assert updated.settings.pinned is False
+    assert effective == 1800
+    assert instance.ttl_s == 1800
+
+
+def test_set_pinned_answers_the_effective_ttl_for_unloaded_models() -> None:
+    record = make_record()
+    manager, _ = make_manager([record], default_ttl_s=1800)
+    _, effective = manager.set_pinned(record.id, True)
+    assert effective == 0
+    _, effective = manager.set_pinned(record.id, False)
+    assert effective == 1800
+
+
+def test_set_pinned_rejects_an_unknown_model() -> None:
+    from studioforge.errors import ModelNotFoundError
+
+    manager, _ = make_manager([make_record()])
+    with pytest.raises(ModelNotFoundError):
+        manager.set_pinned("no/such-model", True)
+
+
+# ---------------------------------------------------------------------------
+# The pinned reconciler (D41): a pin means "keep loaded at all times"
+# ---------------------------------------------------------------------------
+
+
+def test_reconciler_wants_only_missing_pinned_models() -> None:
+    pinned_record = make_record("pinned/model", pinned=True)
+    plain = make_record("plain/model")
+    manager, supervisor = make_manager([pinned_record, plain])
+
+    assert manager._pinned_needing_load() == ["pinned/model"]
+
+    supervisor.instances["pinned/model"] = loaded("pinned/model", 0)
+    assert manager._pinned_needing_load() == []
+
+
+def test_reconciler_wants_a_pinned_model_whose_child_crashed_out() -> None:
+    """State 'failed' (restart limit reached) is down, not resident."""
+    record = make_record("pinned/model", pinned=True)
+    manager, supervisor = make_manager([record])
+    instance = loaded(record.id, 0)
+    instance.state = "failed"
+    supervisor.instances[record.id] = instance
+
+    assert manager._pinned_needing_load() == [record.id]
+
+
+async def test_explicit_unload_suppresses_the_reconciler_until_repin() -> None:
+    """A deliberate unload outranks the pin; pinning again re-arms it."""
+    record = make_record("pinned/model", pinned=True)
+    manager, supervisor = make_manager([record])
+    supervisor.instances[record.id] = loaded(record.id, 0)
+
+    assert await manager.unload(record.id) is True
+    assert manager._pinned_needing_load() == [], "unload must stick, not last 15 seconds"
+
+    manager.set_pinned(record.id, True)
+    assert manager._pinned_needing_load() == [record.id]
+
+
+async def test_unload_all_suppresses_every_pin() -> None:
+    records = [make_record("a/model", pinned=True), make_record("b/model", pinned=True)]
+    manager, supervisor = make_manager(records)
+    for r in records:
+        supervisor.instances[r.id] = loaded(r.id, 0)
+
+    await manager.unload_all()
+
+    assert manager._pinned_needing_load() == [], "the panic button must actually free VRAM"
+
+
+async def test_reconciler_loads_with_its_own_source() -> None:
+    record = make_record("pinned/model", pinned=True)
+    manager, supervisor = make_manager([record])
+    calls: list[tuple[str, str]] = []
+
+    async def fake_load(model_id: str, **kwargs: Any) -> InstanceInfo:
+        calls.append((model_id, kwargs.get("source", "")))
+        instance = loaded(model_id, 0)
+        supervisor.instances[model_id] = instance
+        return instance
+
+    manager.load = fake_load  # type: ignore[method-assign]
+    await manager._reconcile_pinned([record.id])
+
+    assert calls == [(record.id, "pin-reconcile")]
+
+
+async def test_reconciler_backs_off_after_a_failed_reload() -> None:
+    record = make_record("pinned/model", pinned=True)
+    manager, _ = make_manager([record])
+
+    async def failing_load(model_id: str, **kwargs: Any) -> InstanceInfo:
+        raise RuntimeError("no room")
+
+    manager.load = failing_load  # type: ignore[method-assign]
+    await manager._reconcile_pinned([record.id])
+
+    _next_at, delay = manager._pin_retry[record.id]
+    assert delay == manager.PIN_RETRY_BASE_S
+    assert manager._pinned_needing_load() == [], "inside the backoff window: not retried"
+
+    manager._pin_retry[record.id] = (0.0, delay)  # window elapsed
+    assert manager._pinned_needing_load() == [record.id]
+    await manager._reconcile_pinned([record.id])
+    _next_at, delay = manager._pin_retry[record.id]
+    assert delay == manager.PIN_RETRY_BASE_S * 2, "each failure doubles the wait"
+
+
+def test_reconciler_is_off_when_auto_load_pinned_is_off() -> None:
+    record = make_record("pinned/model", pinned=True)
+    manager, _ = make_manager([record], auto_load_pinned=False)
+
+    manager._maybe_reconcile_pinned()
+
+    assert manager._reconcile_task is None, "the pin should mean only 'no TTL, no eviction'"
+
+
+# ---------------------------------------------------------------------------
+# A request-level ttl must not unpin a pinned model
+# ---------------------------------------------------------------------------
+
+
+def test_request_ttl_override_is_ignored_on_a_pinned_instance() -> None:
+    """ttl_s == 0 is the wire form of pinned; a client ttl must not overwrite it."""
+    supervisor = CountingSupervisor()
+    state = FakeState(supervisor, chunks=[])
+    instance = loaded("pinned/model", 0)
+    supervisor.instances[instance.model_id] = instance
+
+    openai_routes._apply_ttl_override(state, instance.model_id, 60)
+
+    assert instance.ttl_s == 0
+
+
+def test_request_ttl_override_still_applies_to_unpinned_instances() -> None:
+    supervisor = CountingSupervisor()
+    state = FakeState(supervisor, chunks=[])
+    instance = loaded("plain/model", 1800)
+    supervisor.instances[instance.model_id] = instance
+
+    openai_routes._apply_ttl_override(state, instance.model_id, 60)
+
+    assert instance.ttl_s == 60
 
 
 # ---------------------------------------------------------------------------

@@ -313,6 +313,26 @@ def test_v1_models_stays_quiet_about_concurrency_when_nothing_is_loaded(app: Any
     assert "max_parallel" not in entry["studioforge"]
 
 
+def test_v1_single_model_carries_the_same_runtime_fields_as_the_list(app: Any) -> None:
+    """The same model must not read ``loaded`` from the list and nothing here."""
+    instance = InstanceInfo(model_id=MODEL_ID, state="ready", port=18100, plan=make_plan())
+    loaded(app, instance)
+
+    with TestClient(app) as http:
+        list_entry = http.get("/v1/models").json()["data"][0]
+        single = http.get(f"/v1/models/{MODEL_ID}").json()
+
+    assert single == list_entry
+
+
+def test_v1_single_model_reports_not_loaded_when_cold(app: Any) -> None:
+    with TestClient(app) as http:
+        single = http.get(f"/v1/models/{MODEL_ID}").json()
+
+    assert single["state"] == "not-loaded"
+    assert single["studioforge"]["state"] == "not-loaded"
+
+
 # ---------------------------------------------------------------------------
 # The WP19 routes
 # ---------------------------------------------------------------------------

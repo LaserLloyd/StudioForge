@@ -566,9 +566,10 @@ def stored_sort_descending(value: Any, key: str) -> bool:
 def filter_models(records: Sequence[ModelRecord], needle: str | None) -> list[ModelRecord]:
     """Substring filter over the fields a user actually scans for.
 
-    Matches the id, quant, architecture, kind and the capability badges, so
-    ``vision``, ``nvfp4`` or ``qwen`` all narrow a 30-model library usefully --
-    an id-only match would make "show me the vision models" impossible.
+    Matches the id, quant, architecture, kind, the capability badges and the
+    ``pinned`` badge, so ``vision``, ``nvfp4``, ``qwen`` or ``pinned`` all
+    narrow a 30-model library usefully -- an id-only match would make "show me
+    the vision models" impossible.
     """
     if not needle or not needle.strip():
         return list(records)
@@ -581,6 +582,7 @@ def filter_models(records: Sequence[ModelRecord], needle: str | None) -> list[Mo
             record.architecture,
             record.kind,
             *capability_badges(record),
+            *(("pinned",) if record.settings.pinned else ()),
         )
         return any(lowered in text.lower() for text in haystack)
 
@@ -914,7 +916,8 @@ def unload_all_prompt(model_ids: Sequence[str]) -> str:
     return (
         f"Unload {len(names)} resident model(s) and free their VRAM?\n{listed}\n\n"
         "Each will reload on its next request, which costs the load time again. "
-        "Pinned models are unloaded too."
+        "Pinned models are unloaded too, and stay down until they are loaded or "
+        "pinned again — an explicit unload outranks the pin."
     )
 
 
@@ -4305,7 +4308,10 @@ CONFIG_FIELD_HELP: Final[Mapping[str, str]] = {
         "'auto' keeps full-quality KV where it is affordable and quantizes only where it is not."
     ),
     "models.default_ttl_s": "Idle unload timer, in seconds. 0 means never idle-unload.",
-    "models.auto_load_pinned": "Load pinned models at startup so the first request is warm.",
+    "models.auto_load_pinned": (
+        "Load pinned models at startup and keep them resident: one that goes down "
+        "is reloaded automatically (D41)."
+    ),
     "models.default_model": "Served when a request omits 'model', or names local-model/default.",
     "models.preload_default_model": "Load that default at startup rather than on first use.",
     "models.default_flash_attn": "'on' everywhere from Ampere up; a large KV-bandwidth win.",

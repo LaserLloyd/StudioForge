@@ -75,6 +75,11 @@ def open_config(pin: str | None = "12345678") -> Config:
         ("DELETE", "/api/models/vendor/Some-Model-Q4_K_M"),
         ("DELETE", "/api/adapters/some-adapter"),
         ("DELETE", "/api/virtual-models/persona"),
+        # Persistent per-model writes (D41): a pin drives the boot autoload and
+        # the reconciler, and saved settings shape every future load. Both
+        # outlive the instance, so they are box changes, not residency.
+        ("POST", "/api/models/vendor/Some-Model-Q4_K_M/pin"),
+        ("PUT", "/api/models/vendor/Some-Model/settings"),
     ],
 )
 def test_admin_mutations_from_the_lan_need_a_credential_on_an_open_install(
@@ -101,7 +106,7 @@ def test_admin_mutations_from_the_lan_need_a_credential_on_an_open_install(
         ("POST", "/api/models/vendor/Some-Model/load"),
         ("POST", "/api/models/vendor/Some-Model/unload"),
         ("POST", "/api/models/unload-all"),
-        ("PUT", "/api/models/vendor/Some-Model/settings"),
+        ("GET", "/api/models/vendor/Some-Model/settings"),
         ("POST", "/api/models/scan"),
         ("POST", "/api/virtual-models"),
         # The WP18-21 surfaces. Residency stays open (LM Studio parity, D32):

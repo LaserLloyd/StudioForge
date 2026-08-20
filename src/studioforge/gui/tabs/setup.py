@@ -552,7 +552,9 @@ def _library_body(ctx: GuiContext, refresh: Any) -> None:
     ).classes("text-xs opacity-70")
     fields.row("models.default_kv_cache_type", label="KV cache type")
     fields.row("models.default_ttl_s", label="Idle unload after (s)")
-    fields.row("models.auto_load_pinned", label="Load pinned models at startup")
+    fields.row(
+        "models.auto_load_pinned", label="Load pinned models at startup and keep them loaded"
+    )
 
     model_ids = _safe(lambda: sorted(r.id for r in ctx.registry.all()), [])
     if model_ids:

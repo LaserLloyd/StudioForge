@@ -1772,6 +1772,16 @@ def test_filter_models_matches_more_than_the_id() -> None:
     assert st.filter_models(records, "no-such-model") == []
 
 
+def test_filter_models_finds_pinned_models() -> None:
+    """Typing what the badge says must find the models wearing it."""
+    records = [
+        make_record("kept-warm", settings=ModelSettings(pinned=True)),
+        make_record("ordinary"),
+    ]
+    assert [r.id for r in st.filter_models(records, "pinned")] == ["kept-warm"]
+    assert [r.id for r in st.filter_models(records, "PINNED")] == ["kept-warm"]
+
+
 # ---------------------------------------------------------------------------
 # Virtual models / presets (D13)
 # ---------------------------------------------------------------------------

@@ -80,34 +80,44 @@ async def list_models(request: Request) -> JSONResponse:
     # authoritative about what is resident, instead of forcing clients to a
     # second endpoint to answer "is anything loaded?".
     for entry in data:
-        instance = state.supervisor.get(_serving_id(state, entry["id"]))
-        loaded = instance is not None and instance.state == "ready"
-        # "loading" is neither: a client that reads not-loaded and issues a
-        # second load, or MCP list_models saying loading while this said
-        # not-loaded, was the confusion. LM Studio's own vocabulary is
-        # loaded/not-loaded; the third value is additive.
-        if loaded:
-            entry["state"] = "loaded"
-        elif instance is not None and instance.state == "loading":
-            entry["state"] = "loading"
-        else:
-            entry["state"] = "not-loaded"
-        if loaded and instance is not None and instance.plan is not None:
-            plan = instance.plan
-            entry["loaded_context_length"] = plan.ctx_size
-            # Concurrency, in the vendor block where a strict OpenAI client
-            # ignores it. `loaded_context_length` alone is ambiguous once a
-            # model runs multiple slots: --ctx-size is the TOTAL across slots
-            # (D4), so a client that reads it as "what one conversation gets"
-            # is right only at parallel 1. ctx_per_slot says which one it is,
-            # and max_parallel says how many streams the load was planned for
-            # -- the number a client should match its own concurrency to.
-            entry["studioforge"]["ctx_per_slot"] = plan.ctx_per_slot or plan.ctx_size
-            entry["studioforge"]["max_parallel"] = plan.max_parallel
-            entry["studioforge"]["parallel"] = plan.parallel
-            entry["studioforge"]["parallel_limited_by"] = plan.parallel_limited_by
-        entry["studioforge"]["state"] = entry["state"]
+        _decorate_openai_entry(state, entry)
     return JSONResponse({"object": "list", "data": data})
+
+
+def _decorate_openai_entry(state: Any, entry: dict[str, Any]) -> None:
+    """Overlay what is resident onto one ``openai_dict`` entry, in place.
+
+    One implementation for the list and the single-model endpoint: the same
+    model must not read ``loaded`` from ``GET /v1/models`` and have no
+    ``state`` at all from ``GET /v1/models/{id}``.
+    """
+    instance = state.supervisor.get(_serving_id(state, entry["id"]))
+    loaded = instance is not None and instance.state == "ready"
+    # "loading" is neither: a client that reads not-loaded and issues a
+    # second load, or MCP list_models saying loading while this said
+    # not-loaded, was the confusion. LM Studio's own vocabulary is
+    # loaded/not-loaded; the third value is additive.
+    if loaded:
+        entry["state"] = "loaded"
+    elif instance is not None and instance.state == "loading":
+        entry["state"] = "loading"
+    else:
+        entry["state"] = "not-loaded"
+    if loaded and instance is not None and instance.plan is not None:
+        plan = instance.plan
+        entry["loaded_context_length"] = plan.ctx_size
+        # Concurrency, in the vendor block where a strict OpenAI client
+        # ignores it. `loaded_context_length` alone is ambiguous once a
+        # model runs multiple slots: --ctx-size is the TOTAL across slots
+        # (D4), so a client that reads it as "what one conversation gets"
+        # is right only at parallel 1. ctx_per_slot says which one it is,
+        # and max_parallel says how many streams the load was planned for
+        # -- the number a client should match its own concurrency to.
+        entry["studioforge"]["ctx_per_slot"] = plan.ctx_per_slot or plan.ctx_size
+        entry["studioforge"]["max_parallel"] = plan.max_parallel
+        entry["studioforge"]["parallel"] = plan.parallel
+        entry["studioforge"]["parallel_limited_by"] = plan.parallel_limited_by
+    entry["studioforge"]["state"] = entry["state"]
 
 
 def _serving_id(state: Any, model_id: str) -> str:
@@ -129,7 +139,9 @@ async def retrieve_model(model_id: str, request: Request) -> JSONResponse:
     record = state.registry.resolve(model_id)
     if record is None:
         raise ModelNotFoundError(model_id, known=state.registry.known_ids())
-    return JSONResponse(record.openai_dict())
+    entry = record.openai_dict()
+    _decorate_openai_entry(state, entry)
+    return JSONResponse(entry)
 
 
 # ---------------------------------------------------------------------------
@@ -420,8 +432,16 @@ def _apply_ttl_override(state: Any, model_id: str, ttl_s: int | None) -> None:
     if ttl_s is None:
         return
     instance = state.supervisor.get(model_id)
-    if instance is not None:
-        instance.ttl_s = ttl_s
+    if instance is None:
+        return
+    if instance.ttl_s == 0:
+        # ttl_s == 0 is the wire representation of *pinned* everywhere (the
+        # sweeper and the eviction planner both read it off the instance), so
+        # honouring a request-level ttl here would let any client silently
+        # unpin a model the owner pinned. The request still works; only its
+        # idle-timer wish is ignored.
+        return
+    instance.ttl_s = ttl_s
 
 
 def _validate_tools(payload: dict[str, Any]) -> None:

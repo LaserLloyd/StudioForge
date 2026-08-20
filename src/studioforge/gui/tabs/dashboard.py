@@ -15,7 +15,7 @@ from typing import Any
 from nicegui import ui
 
 from studioforge.gui import state as st
-from studioforge.gui.tabs import GuiContext, api_request, busy, notify_error
+from studioforge.gui.tabs import GuiContext, api_request, busy, notify_error, run_blocking
 
 LOG_TAIL_LINES = 40
 
@@ -296,6 +296,17 @@ def _loaded_card(
                 color=st.activity_colour(introspection),
             ).classes("text-xs")
             ui.button(
+                icon="push_pin",
+                on_click=lambda model_id=instance.model_id, p=pinned: _toggle_pin(
+                    ctx, model_id, p, refresh
+                ),
+            ).props("flat dense color=accent" if pinned else "flat dense").tooltip(
+                "Unpin: back to the normal idle TTL"
+                if pinned
+                else "Pin: keep loaded at all times — no idle TTL, never evicted, "
+                "auto-loaded at startup and reloaded if it goes down"
+            )
+            ui.button(
                 icon="restart_alt",
                 on_click=lambda model_id=instance.model_id: _restart_model(ctx, model_id, refresh),
             ).props("flat dense").tooltip(
@@ -339,6 +350,18 @@ def _loaded_card(
 # for a child to exit and a reload waits for a 17 GiB model to come back, and
 # either would freeze the panel for every viewer if it blocked.
 # ---------------------------------------------------------------------------
+
+
+async def _toggle_pin(ctx: GuiContext, model_id: str, pinned: bool, refresh: Any) -> None:
+    try:
+        updated, _ttl = await run_blocking(ctx.manager.set_pinned, model_id, not pinned)
+    except Exception as exc:  # noqa: BLE001
+        notify_error(exc, what="pin")
+        return
+    ui.notify(
+        f"{updated.id} {'pinned' if updated.settings.pinned else 'unpinned'}", type="positive"
+    )
+    await refresh()
 
 
 async def _unload_one(ctx: GuiContext, model_id: str, refresh: Any) -> None:

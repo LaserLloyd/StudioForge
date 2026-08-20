@@ -59,6 +59,10 @@ EXPECTED_TOOLS = {
     # about the context it was asked for (WP19 / D37).
     "load_recommended",
     "unload_model",
+    # Pin = keep loaded at all times (D41). A tool of its own because an agent
+    # could *read* pinned off list_models but had no way to set it short of
+    # set_config, which is the wrong altitude for a per-model flag.
+    "pin_model",
     # The HuggingFace pair, split for the same reason list_models and
     # model_options are: browsing is cheap and knows nothing about sizes,
     # choosing costs a remote GGUF header read and answers exactly.
@@ -613,6 +617,31 @@ async def test_unload_of_unloaded_model_is_not_an_error(state: State) -> None:
     payload = await call(server, "unload_model", model_id=TINY)
     assert payload["ok"] is True
     assert payload["unloaded"] is False
+
+
+async def test_pin_model_round_trips_and_reports_the_effective_ttl(state: State) -> None:
+    """Pin persists to settings and answers 0; unpin restores the default TTL."""
+    server = build_management_mcp(state)
+    result = await call(server, "pin_model", model_id=TINY)
+    assert result["ok"] is True
+    assert result["pinned"] is True
+    assert result["effective_ttl_s"] == 0
+    assert result["loaded"] is False
+    record = state.registry.get(TINY)
+    assert record is not None and record.settings.pinned is True
+
+    result = await call(server, "pin_model", model_id=TINY, pinned=False)
+    assert result["pinned"] is False
+    assert result["effective_ttl_s"] == state.config.models.default_ttl_s
+    record = state.registry.get(TINY)
+    assert record is not None and record.settings.pinned is False
+
+
+async def test_pin_of_unknown_model_is_a_result_not_an_exception(state: State) -> None:
+    server = build_management_mcp(state)
+    result = await call(server, "pin_model", model_id="no-such-model")
+    assert result["ok"] is False
+    assert "no-such-model" in result["error"]["message"]
 
 
 # ---------------------------------------------------------------------------
