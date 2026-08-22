@@ -69,6 +69,10 @@ diagnose and restart it. Calling a management tool while the server is down retu
 There is deliberately **no inference tool**. Generation belongs on `POST /v1/chat/completions`,
 which streams; an MCP tool would buffer whole responses through a JSON-RPC envelope.
 
+Benchmarking has its own playbook, written for the agent: [BENCHMARKING.md](BENCHMARKING.md) —
+the two benchmarks, the exact calls, the three rules (quiet box, never mid-session, benchmark at
+the context you will run), and how a lease locks the result in. Hand it to OpenClaw as a skill.
+
 The server can print both snippets pre-filled for you:
 
 ```bash

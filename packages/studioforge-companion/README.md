@@ -147,8 +147,11 @@ Naming rule: management tools keep their bare names; watchdog tools whose names 
 get a `recovery_` prefix (so `get_config` is the server's config and `recovery_get_config` is the
 watchdog's). Watchdog-only tools keep their own names.
 
-Two flows worth knowing:
+Three flows worth knowing:
 
+* **Benchmarking a model:** placement benchmark (REST, a polled job) → `benchmark_parallel` on the
+  winner → `reserve_gpus` to lock it in. The agent-facing playbook is `docs/BENCHMARKING.md` in
+  the server repo; give it to OpenClaw as a skill.
 * **Getting a model:** `search_models` → `repo_details(repo_id)` → `download_model(repo_id, quant)`.
   Search knows nothing about size or fit; `repo_details` reads the model's GGUF header remotely
   (seconds, then cached) and answers exactly.
