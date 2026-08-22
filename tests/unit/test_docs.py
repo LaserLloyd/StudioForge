@@ -61,10 +61,26 @@ def test_docs_use_the_real_servers_add_signature() -> None:
             )
 
 
+#: The per-machine hook and its tracked template are not launchers (see
+#: test_bat_launchers.py); the README documents the template by its own row.
+_NOT_A_LAUNCHER = {"local-env.bat", "local-env.example.bat"}
+
+
 def test_every_bat_launcher_is_documented_in_the_readme() -> None:
+    """The launchers live in ``launchers/`` (not the repo root) since the
+    public-repo reshuffle; globbing the root here would pass vacuously, which
+    is exactly what happened once. Guard against an empty glob so a future
+    move cannot hollow the check out again."""
     readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
-    for bat in sorted(REPO_ROOT.glob("*.bat")):
+    launchers = sorted(
+        p for p in (REPO_ROOT / "launchers").glob("*.bat") if p.name.lower() not in _NOT_A_LAUNCHER
+    )
+    assert launchers, "no launchers found under launchers/ -- did they move again?"
+    for bat in launchers:
         assert bat.name in readme, f"{bat.name} exists but the README never mentions it"
+    assert "launchers\\local-env.example.bat" in readme, (
+        "the local-env template must stay documented with its launchers/ path"
+    )
 
 
 def test_every_sfctl_command_named_in_the_docs_exists() -> None:

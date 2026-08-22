@@ -824,7 +824,10 @@ class ParallelBenchmarker:
         if not report.loaded_for_benchmark:
             return
         if not was_loaded:
-            report.unloaded_after = await self.manager.unload(record.id)
+            # "As found" for a pinned model that happened to be down (a crash
+            # in reconcile backoff, a pin set a moment ago) is "wanted up", so
+            # this is not the deliberate unload that suppresses the pin (D41).
+            report.unloaded_after = await self.manager.unload(record.id, deliberate=False)
             return
         if previous is None:  # pragma: no cover - a ready instance always has a plan
             report.restored = False

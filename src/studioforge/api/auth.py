@@ -55,7 +55,16 @@ def extract_key(request: Request) -> str | None:
 
 
 def extract_pin(request: Request) -> str | None:
-    """The MCP pairing PIN, however the client chose to send it."""
+    """The MCP pairing PIN, however the client chose to send it.
+
+    The ``?pin=`` query form is still parsed -- some MCP connectors can only
+    be configured with a URL, and clients paired that way must keep working --
+    but it is deliberately not advertised anywhere (``/api/mcp/info``, the
+    banner, the 401 text name the header and the bearer form only): a URL is
+    recorded by reverse-proxy access logs, shell history and terminals, and
+    an eight-digit PIN with no lockout is not a credential to leave lying in
+    them.
+    """
     pin = request.headers.get("x-mcp-pin") or request.headers.get("x-studioforge-pin")
     if pin and pin.strip():
         return pin.strip()
@@ -130,10 +139,73 @@ def is_local_request(request: Any) -> bool:
     return _is_loopback(str(host))
 
 
+_DEFAULT_PORTS = {"http": 80, "https": 443, "ws": 80, "wss": 443}
+
+
+def _origin_key(value: str, scheme: str) -> tuple[str, int] | None:
+    """``(hostname, port)`` for an origin or a ``Host`` header, defaults filled in.
+
+    Both are parsed with ``urlsplit`` so IPv6 brackets, case and an implicit
+    port are handled one way. ``None`` means unparseable, which the caller
+    treats as foreign.
+    """
+    from urllib.parse import urlsplit
+
+    text = (value or "").strip()
+    if not text:
+        return None
+    try:
+        parts = urlsplit(text if "//" in text else "//" + text)
+        hostname = (parts.hostname or "").lower()
+        port = parts.port
+    except ValueError:
+        return None
+    if not hostname:
+        return None
+    if port is None:
+        port = _DEFAULT_PORTS.get((parts.scheme or scheme or "http").lower(), 80)
+    return hostname, port
+
+
+def cross_site_browser_request(request: Any) -> bool:
+    """True for a browser request whose ``Origin`` is not this server's own origin.
+
+    The D32 gate trusts a loopback peer -- and the operator's browser *is* a
+    loopback peer. With the shipped ``cors_origins: ["*"]`` any page the
+    operator visits can preflight and send ``PATCH /api/config`` to
+    ``http://127.0.0.1:1234`` and arrive looking local, so a peer-address
+    check alone leaves every box-changing route (and the PIN reveal) one
+    malicious tab away. The GUI's websocket gate already refuses a cross-site
+    upgrade for exactly this reason; this is the same rule for the API.
+
+    The comparison includes the port, unlike the websocket gate: a page served
+    by another local web app (a ComfyUI custom node, a dev server) is also a
+    loopback peer, and it is not this server. Non-browser clients send no
+    ``Origin`` and pass; so does an in-process call with no headers at all.
+    ``Origin: null`` (sandboxed frames, some redirects) is foreign.
+    """
+    headers = getattr(request, "headers", None)
+    if headers is None:
+        return False
+    origin = headers.get("origin")
+    host = headers.get("host")
+    if not origin or not host:
+        return False
+    if origin.strip().lower() == "null":
+        return True
+    scheme = str(getattr(getattr(request, "url", None), "scheme", "") or "http")
+    origin_key = _origin_key(origin, scheme)
+    host_key = _origin_key(host, scheme)
+    if origin_key is None or host_key is None:
+        return True
+    return origin_key != host_key
+
+
 REMOTE_ADMIN_NOTE = (
     "this management route changes the server itself and server.api_key is not set, so it "
     "is only accepted from this machine or with the MCP pairing PIN (header 'X-MCP-Pin', "
-    "or as the bearer token -- sfctl sends it that way). Set server.api_key on the Setup "
+    "or as the bearer token -- sfctl sends it that way). A browser request from another "
+    "origin is not 'this machine', even on loopback. Set server.api_key on the Setup "
     "tab to manage the server remotely with a real credential."
 )
 
@@ -190,14 +262,25 @@ def check_request(request: Request, config: Config) -> None:
         if pin_required:
             raise AuthError(
                 "This MCP endpoint needs the pairing PIN. Send it as "
-                "'X-MCP-Pin: <pin>', as a bearer token, or as ?pin=<pin>. The "
-                "PIN is printed in the server's startup banner and available "
-                "from GET /api/mcp/info.",
+                "'X-MCP-Pin: <pin>' or as a bearer token. The PIN is printed in "
+                "the server's startup banner and available from GET /api/mcp/info.",
                 code="invalid_mcp_pin",
             )
 
     if not expected:
-        if is_admin_mutation(request.method, path) and not is_local_request(request):
+        # D32 covers the MCP plane too. Every streamable-HTTP JSON-RPC call is
+        # a POST, and the tools behind it (set_config, delete_model,
+        # download_model, reserve_gpus) are the same box changes the HTTP
+        # routes gate -- so with no key, a remote caller needs the PIN here
+        # even when `mcp.pin_required` is off. That toggle used to be the one
+        # way to make the control plane the *least* protected surface: on an
+        # open install it opened set_config to the LAN with no credential at
+        # all. It now relaxes same-machine callers only. The GET side (the SSE
+        # stream) stays open, like every other read.
+        gated = is_admin_mutation(request.method, path) or (
+            on_mcp and (request.method or "").upper() in _MUTATING_METHODS
+        )
+        if gated and (not is_local_request(request) or cross_site_browser_request(request)):
             candidate = extract_pin(request) or provided
             if pin and candidate and _matches(candidate, str(pin)):
                 return
@@ -235,10 +318,16 @@ def may_reveal_pin(request: Any, config: Config) -> bool:
     So: reveal when a credential was actually required to get here, and
     otherwise only to a caller on this machine. A request with no peer at all is
     an in-process call (the GUI renders these panels by invoking the route
-    handler directly) and is trusted -- it never crossed a network.
+    handler directly) and is trusted -- it never crossed a network. A browser
+    request from another origin is refused even on loopback: with
+    ``Access-Control-Allow-Origin: *`` the response body is readable
+    cross-origin, so a page the operator visits could otherwise read the PIN
+    off ``http://127.0.0.1:1234/api/mcp/info`` and then use it.
     """
     if config.server.api_key:
         return True
+    if cross_site_browser_request(request):
+        return False
     client = getattr(request, "client", None)
     host = getattr(client, "host", None)
     if not host:

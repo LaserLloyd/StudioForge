@@ -355,9 +355,14 @@ That guarantees a non-empty reply, but it means:
   said `b10441` while every child ran `b10425`.
 * `--defrag-thold` is deprecated upstream and is no longer emitted. The per-model `defrag_thold`
   setting still loads and saves, but it does nothing.
-* The source-build fallback is implemented and its command construction is tested, but a full CUDA
-  compile has not been exercised end-to-end here — the official binary supports every GPU on the
-  reference machine, so the fallback has never been needed.
+* **Linux + NVIDIA has no prebuilt engine.** Upstream publishes no Linux CUDA archive at any tag
+  (the `ubuntu` assets are cpu/vulkan/rocm/sycl/openvino), so every Linux install — first run,
+  the Setup tab, `engine --update`, the MCP tool — compiles the tag from source, which needs
+  `git`, `cmake` and a CUDA toolkit with `nvcc` matching the driver and takes minutes. The build
+  is reused on a repeat install, smoke-tested like a download, and bakes `$ORIGIN` into the
+  binary's RUNPATH so `engines/<tag>-local/` is self-contained (D2/D3, amended). The command
+  construction is tested; a full CUDA compile has not been exercised end-to-end on the reference
+  rig, which runs Windows.
 
 ## Platform
 
@@ -365,12 +370,14 @@ That guarantees a non-empty reply, but it means:
   supported (no CUDA).
 * On Windows, `current` is a `current.txt` pointer file rather than a symlink, because symlinks
   need administrator rights or Developer Mode.
-* **"Children die with the server" is a Windows guarantee only.** Each `llama-server` child is put
-  in a job object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so the kernel kills it whatever
-  happens to us. On Linux a `kill -9` of the gateway leaves the children running (the `atexit`
-  handler does not run) until the next startup sweep reclaims them. If the job cannot be created or
-  a child cannot be assigned to it — no pywin32, or an existing job that refuses nesting — a WARNING
-  is logged once and loads continue *without* the net.
+* **"Children die with the server" is a kernel guarantee on Windows and a best effort on Linux.**
+  On Windows each `llama-server` child is put in a job object with
+  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so the kernel kills it whatever happens to us. On Linux
+  each child is launched through a `PR_SET_PDEATHSIG` shim (the POSIX half of D23), which
+  covers a `kill -9` of the gateway; the startup sweep and `reclaim_orphan_engines` pick up
+  anything that slips through. If the Windows job
+  cannot be created or a child cannot be assigned to it — no pywin32, or an existing job that
+  refuses nesting — a WARNING is logged once and loads continue *without* the net.
 * Registering the `lmstudio://` handler rebinds `HKCU\Software\Classes\lmstudio`. If LM Studio
   updates or re-registers itself it may silently take the scheme back. Nothing re-asserts it; the
   Server tab shows the true current state.

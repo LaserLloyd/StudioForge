@@ -26,7 +26,7 @@ from typing import Any
 from nicegui import ui
 
 from studioforge.gui import state as st
-from studioforge.gui.tabs import GuiContext, busy, notify_error
+from studioforge.gui.tabs import GuiContext, busy, notify_error, require_local_admin
 
 #: The only external link in the GUI: a repo page on HuggingFace, so a user can
 #: read the model card before committing to a download.
@@ -536,6 +536,9 @@ async def _enqueue(ctx: GuiContext, option: Any, on_picked: Any = None) -> None:
         ui.notify("downloads are not available in this build", type="warning")
         return
     try:
+        # Same rule as POST /api/downloads (D32): writing to the library is a
+        # box change.
+        require_local_admin(ctx, "enqueue download")
         group_id = await downloader.enqueue(option)
     except Exception as exc:  # noqa: BLE001
         notify_error(exc, what="enqueue download")
@@ -679,6 +682,7 @@ async def _control(ctx: GuiContext, action: str, group_id: str) -> None:
     if downloader is None:
         return
     try:
+        require_local_admin(ctx, action)
         await getattr(downloader, action)(group_id)
     except Exception as exc:  # noqa: BLE001
         notify_error(exc, what=action)

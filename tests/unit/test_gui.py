@@ -225,6 +225,138 @@ def test_no_gate_without_an_api_key(config: Config) -> None:
         assert client.get("/").status_code == 200
 
 
+def test_index_renders_every_tab_without_an_error_card(config: Config) -> None:
+    """A 200 is not enough: ``panel_guard`` turns a crashed tab into a 200 with
+    an error card, which is how the Dashboard shipped broken under this harness
+    (``manager is None``) for a while without any test noticing."""
+    app = create_gui_app(config, api_state=_FakeState(config))
+    with TestClient(app) as client:
+        text = client.get("/").text
+    assert "could not be rendered" not in text
+
+
+def test_a_failing_lease_book_is_a_stale_note_not_an_error_card(config: Config) -> None:
+    """Same discipline as the sibling Dashboard panels: a poll that fails
+    leaves a "live refresh failed" marker, never an error card for the tab."""
+    from types import SimpleNamespace
+
+    class _BrokenBook:
+        def all(self) -> list[Any]:
+            raise RuntimeError("book on fire")
+
+    state = _FakeState(config)
+    state.manager = SimpleNamespace(leases=_BrokenBook())
+    app = create_gui_app(config, api_state=state)
+    with TestClient(app) as client:
+        text = client.get("/").text
+    assert "The Dashboard tab could not be rendered" not in text
+    assert "live refresh failed" in text and "book on fire" in text
+
+
+# ---------------------------------------------------------------------------
+# D32 for the panel: a remote viewer on an open install cannot change the box
+# ---------------------------------------------------------------------------
+
+
+def test_viewer_host_is_empty_outside_a_client_context() -> None:
+    """A direct call (a test, an in-process caller) never crossed a network."""
+    from studioforge.gui import tabs
+
+    assert tabs.viewer_host() == ""
+
+
+async def test_a_remote_viewer_on_an_open_install_cannot_change_a_setting(
+    config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The D32 problem statement, on the panel: set server.api_key from the LAN
+    and lock the owner out. Refused with the API's own error code."""
+    from studioforge.errors import StudioForgeError
+    from studioforge.gui import tabs
+
+    config.server.api_key = None
+    monkeypatch.setattr(tabs, "viewer_host", lambda: "192.168.1.50")
+    ctx = tabs.GuiContext(config=config, api_state=_FakeState(config))
+    with pytest.raises(StudioForgeError) as info:
+        await tabs.apply_config_updates(ctx, {"server.api_key": "attacker-owned"})
+    assert info.value.code == "remote_admin_requires_credential"
+    assert info.value.status_code == 403
+    assert "server.api_key" in info.value.message
+    assert config.server.api_key is None
+    if config.config_path.exists():
+        assert "attacker-owned" not in config.config_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("peer", ["", "127.0.0.1", "::1"])
+async def test_a_local_viewer_on_an_open_install_may_change_a_setting(
+    config: Config, monkeypatch: pytest.MonkeyPatch, peer: str
+) -> None:
+    from studioforge.gui import tabs
+
+    config.server.api_key = None
+    monkeypatch.setattr(tabs, "viewer_host", lambda: peer)
+    ctx = tabs.GuiContext(config=config, api_state=_FakeState(config))
+    payload = await tabs.apply_config_updates(ctx, {"models.default_ctx": 16384})
+    assert payload["updated"] == ["models.default_ctx"]
+    assert config.models.default_ctx == 16384
+
+
+async def test_with_a_key_set_a_remote_viewer_may_change_a_setting(
+    config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With a key, reaching the panel took the key: it is the credential."""
+    from studioforge.gui import tabs
+
+    config.server.api_key = "sf-secret-key-1234"
+    monkeypatch.setattr(tabs, "viewer_host", lambda: "192.168.1.50")
+    ctx = tabs.GuiContext(config=config, api_state=_FakeState(config))
+    payload = await tabs.apply_config_updates(ctx, {"models.default_ctx": 16384})
+    assert payload["updated"] == ["models.default_ctx"]
+
+
+def test_require_local_admin_is_the_one_rule_every_box_changing_action_uses(
+    config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The guard is called by name from the tabs; this pins its decision table
+    and that every D32-class GUI action actually calls it."""
+    import re
+
+    from studioforge.errors import StudioForgeError
+    from studioforge.gui import tabs
+
+    config.server.api_key = None
+    ctx = tabs.GuiContext(config=config, api_state=_FakeState(config))
+    monkeypatch.setattr(tabs, "viewer_host", lambda: "10.0.0.7")
+    assert tabs.viewer_may_change_box(ctx) is False
+    with pytest.raises(StudioForgeError):
+        tabs.require_local_admin(ctx, "anything")
+    monkeypatch.setattr(tabs, "viewer_host", lambda: "127.0.0.1")
+    assert tabs.viewer_may_change_box(ctx) is True
+    tabs.require_local_admin(ctx, "anything")
+
+    root = Path(tabs.__file__).parent
+    guarded = {
+        "dashboard.py": [
+            "_reclaim_orphans",
+            "_release_lease",
+            "_toggle_pin",
+            "_restart_engines",
+            "_restart_server_dialog",
+        ],
+        "models.py": ["_toggle_pin", "_delete_dialog", "_settings_dialog"],
+        "server.py": ["install_engine", "activate_engine", "_register_protocol"],
+        "setup.py": ["_set_autostart", "_restart_dialog"],
+        "download.py": ["_enqueue", "_control"],
+    }
+    for filename, functions in guarded.items():
+        source = (root / filename).read_text(encoding="utf-8")
+        for name in functions:
+            match = re.search(
+                rf"^(async )?def {name}\(.*?(?=^(async )?def |\Z)", source, re.S | re.M
+            )
+            assert match is not None, f"{filename}:{name} not found"
+            assert "require_local_admin(" in match.group(0), f"{filename}:{name} is unguarded"
+
+
 # ---------------------------------------------------------------------------
 # Proxy safety: no internal absolute URLs
 # ---------------------------------------------------------------------------
@@ -309,6 +441,18 @@ def test_ttl_text_prefers_pinned_over_any_countdown() -> None:
     assert st.ttl_text(120, pinned=True) == "pinned"
     assert st.ttl_text(None) == "no TTL"
     assert st.ttl_text(90) == "1m 30s"
+
+
+def test_pin_tooltip_only_promises_a_reload_when_auto_load_pinned_is_on() -> None:
+    """D41: ``models.auto_load_pinned`` gates startup warm-up and the
+    reconciler, so the button must not promise either when it is off."""
+    assert st.pin_tooltip(True, auto_load_pinned=True).startswith("Unpin")
+    assert st.pin_tooltip(True, auto_load_pinned=False).startswith("Unpin")
+    on = st.pin_tooltip(False, auto_load_pinned=True)
+    off = st.pin_tooltip(False, auto_load_pinned=False)
+    assert "auto-loaded at startup" in on and "reloaded if it goes down" in on
+    assert "auto-loaded" not in off and "reloaded if" not in off
+    assert "never evicted" in off and "models.auto_load_pinned" in off
 
 
 def test_instance_ttl_countdown_is_live() -> None:
@@ -1579,6 +1723,21 @@ def test_config_fields_flag_restart_required_keys() -> None:
     assert set(st.SECRET_CONFIG_KEYS) == {"server.api_key", "hf.token"}
 
 
+def test_server_tab_help_is_the_setup_tab_help() -> None:
+    """One sentence per key (D26): the Server tab's tooltip is the Setup tab's
+    line, so the two forms cannot describe ``models.default_ctx`` differently
+    -- one of them used to carry the pre-D14 "used when a model says Auto"."""
+    known = {spec.key for spec in st.config_field_specs()}
+    by_key = {f.key: f for f in st.CONFIG_FIELDS}
+    for field in st.CONFIG_FIELDS:
+        assert field.key in known, field.key
+        assert field.key in st.CONFIG_FIELD_HELP, field.key
+        assert field.help == st.CONFIG_FIELD_HELP[field.key], field.key
+        assert field.help.strip()
+    assert "floor" in by_key["models.default_ctx"].help.lower()
+    assert by_key["models.default_ctx"].label == "Context floor"
+
+
 def test_restart_required_keys_filters() -> None:
     assert st.restart_required_keys(["models.default_ctx", "server.port"]) == ["server.port"]
 
@@ -2245,6 +2404,42 @@ def test_restart_server_note_says_how_it_restarts() -> None:
     assert "tray" in st.restart_server_note({"via": "tray"})  # D28
     assert "respawning itself" in st.restart_server_note({"via": "self-respawn"})
     assert st.restart_server_note(None) == "Restart requested."
+
+
+def test_leases_note_and_lease_line() -> None:
+    """The Dashboard's GPU leases panel (D43), on real ``GpuLease`` objects."""
+    from studioforge.types import GpuLease
+
+    now = time.time()
+    model_lease = GpuLease(
+        id="L1",
+        devices=[0, 1],
+        holder="bench",
+        model_ids=["qwen3-30b"],
+        reason="placement benchmark",
+        created_at=now,
+        last_activity_at=now,
+        idle_ttl_s=3600.0,
+    )
+    outside = GpuLease(
+        id="L2",
+        devices=[2],
+        holder="comfyui",
+        created_at=now,
+        last_activity_at=now,
+        idle_ttl_s=None,
+    )
+    assert st.leases_note([]).startswith("None.")
+    assert "2 standing lease(s)" in st.leases_note([model_lease, outside])
+
+    line = st.lease_line(model_lease)
+    for piece in ("CUDA [0, 1]", "qwen3-30b", "by bench", "placement benchmark", "L1"):
+        assert piece in line
+    assert "auto-release after 1 h 00 min" in line
+
+    line = st.lease_line(outside)
+    assert "held for something outside this server" in line
+    assert "until released" in line and "L2" in line
 
 
 def test_restart_labels_are_not_interchangeable() -> None:

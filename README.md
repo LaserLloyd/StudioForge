@@ -71,8 +71,10 @@ sfctl status
 | Python | 3.12+ |
 | Tooling | [`uv`](https://docs.astral.sh/uv/) |
 
-No CUDA toolkit install is needed: the prebuilt `llama-server` binaries ship the runtime, and
-StudioForge fetches and verifies the right one for your hardware on first run.
+On Windows no CUDA toolkit is needed: the prebuilt `llama-server` archive ships the runtime, and
+StudioForge fetches, verifies and smoke-tests the right one for your driver on first run. On
+Linux + NVIDIA the engine is **built from source** (upstream publishes no Linux CUDA archive), so
+`git`, `cmake` and a CUDA toolkit with `nvcc` matching the driver are needed once per engine tag.
 
 ## Quickstart
 
@@ -80,38 +82,24 @@ StudioForge fetches and verifies the right one for your hardware on first run.
 git clone <repo> studioforge && cd studioforge
 uv venv --python 3.12 .venv
 uv pip install --python .venv/Scripts/python.exe -e ".[dev]"     # Linux: .venv/bin/python
-```
-
-On Windows, double-clicking **launchers\Update StudioForge.bat** does the same thing (and keeps doing it on
-later updates). Then start it:
-
-```bash
 studioforge serve --open
 ```
 
-`--open` waits until the control panel actually answers before opening a browser, so you never land
-on a connection-refused page during a slow first start.
+On Windows, double-clicking **launchers\Update StudioForge.bat** does the install (and keeps doing
+it on later updates), and **launchers\Start StudioForge.bat** starts it. `--open` waits until the
+control panel actually answers before opening a browser.
 
-**First run** detects your GPUs, tunes a handful of defaults to them, fetches the pinned
-`llama-server` build, smoke-tests it before trusting it, and registers your existing model library
-**in place** — nothing is copied or moved. The panel opens on its **Setup** tab, which is where the
-whole first run happens: a live checklist of everything still standing between this box and serving
-a model, each unmet item with the button that fixes it, and every configuration key StudioForge has
-— grouped by the decision it makes, not by the file it lives in. You should never need to edit
-`config.yaml` by hand.
+**First run** detects your GPUs, tunes a handful of defaults to them, installs the pinned
+`llama-server` build and smoke-tests it before trusting it, and registers your existing model
+library **in place** — nothing is copied or moved. The panel opens on its **Setup** tab: a live
+checklist of everything still between this box and serving a model, each unmet item with the
+button that fixes it, and every configuration key grouped by the decision it makes. You should
+never need to edit `config.yaml` by hand. Three things to check there: the engine installed,
+`models.dir` points at your GGUF library (**Detect LM Studio library** finds one, including a
+relocated `downloadsFolder`), and the MCP pairing PIN you will need to connect an agent.
 
-Three things are worth checking there afterwards:
-
-1. **The engine installed.** If it did not, the checklist offers an Install button, and
-   `studioforge engine --update` says why from a terminal.
-2. **`models.dir` points at your GGUF library.** "Detect LM Studio library" probes for one
-   (including the relocated `downloadsFolder` recorded in `~/.lmstudio/settings.json`, which is
-   where most non-default installs actually live), but any directory of GGUFs works.
-3. **The MCP pairing PIN**, shown masked on the Setup tab, printed in the startup banner and served
-   at `GET /api/mcp/info`. You need it to connect an agent.
-
-**[`docs/SETUP.md`](docs/SETUP.md) is the full walkthrough**, tab section by tab section, and it
-gives the equivalent YAML and CLI for a box with no browser.
+**[`docs/SETUP.md`](docs/SETUP.md) is the full walkthrough**, tab section by tab section, with
+the equivalent YAML and CLI for a box with no browser.
 
 ## Ports
 
@@ -124,6 +112,11 @@ gives the equivalent YAML and CLI for a box with no browser.
 
 > LM Studio also uses port `1234`. They can share the same model library on disk, but not the same
 > port — quit LM Studio, or set `server.port` to something else.
+
+With no `server.api_key` (the default) anyone on the LAN can read, chat and load/unload; anything
+that changes the *box* — config, engines, files, restarts — needs a browser or client on the
+machine itself, or the MCP PIN, on the API, the MCP path and the control panel alike
+(DECISIONS.md D32). Set a key to manage it remotely.
 
 ## Data directory
 
@@ -162,22 +155,18 @@ systemd unit (see [`deploy/`](deploy/)).
 > reports `"instance": "secondary"` and names the pid holding it. So before pointing a new checkout
 > at an existing data directory, stop the old server and tray first.
 
-`config.example.yaml` is the generated default config with every important key annotated. The app
-does not need it — it writes its own `config.yaml` into the data dir on first run — it is there to
-read.
-
 ## Project layout
 
 | Path | What lives there |
 | --- | --- |
-| `src/studioforge/` | The application: `api/` (OpenAI-compatible gateway + management routes), `core/` (registry, VRAM planner, supervisor, leases, benchmarks), `gui/` (the control panel), `mcp/` (the agent control plane), `tray/` (Windows notification-area app), `watchdog/` (the recovery sidecar) |
+| `src/studioforge/` | The application: `api/` (OpenAI-compatible gateway + management routes), `core/` (registry, VRAM planner, supervisor, engine, leases, benchmarks, downloader), `gui/` (the control panel: dashboard, models, download, benchmark, chat, logs, server, setup), `mcp/` (the agent control plane, 19 tools), `tray/` (Windows notification-area app), `watchdog/` (the recovery sidecar, 10 tools), `migrations/` (SQL schema, applied at startup) |
 | `packages/studioforge-companion/` | `sfctl` — the thin remote-control CLI and the `sfctl mcp` stdio bridge for OpenClaw; installs anywhere, no CUDA dependencies |
 | `launchers/` | Windows double-click launchers (below) |
-| `deploy/` | Linux: systemd units for the server and the watchdog |
-| `docs/` | Setup, OpenClaw integration, the benchmarking playbook, the runbook, limitations |
-| `tests/unit/` | The suite CI runs (no GPU needed); `tests/contract/` needs real engines and weights and is opt-in |
+| `deploy/` | Linux: systemd user units for the server and the watchdog |
+| `docs/` | Setup, the catalog, OpenClaw integration, the benchmarking playbook, the runbook, engine features, limitations |
+| `tests/unit/` | The suite CI runs (no GPU, no network); `tests/contract/` needs real engines and weights and is opt-in |
 | `DECISIONS.md` | The running architectural decision log, D1 onward — the *why* behind every non-obvious rule |
-| `config.example.yaml` | Every config key with its shipped default, annotated; the app writes its own `config.yaml` into the data dir |
+| `config.example.yaml` | Every config key with its shipped default, annotated (a unit test keeps it so); the app writes its own `config.yaml` into the data dir |
 
 ## Windows: double-click launchers
 
@@ -206,7 +195,6 @@ studioforge config                # show the effective config, secrets redacted
 studioforge engine --check        # is there a newer llama.cpp release?
 studioforge engine --update       # install it, smoke-test it, then pin it
 studioforge autostart enable      # start at login (Startup folder / systemd --user)
-studioforge autostart disable
 ```
 
 `engine --update` only repins after the new build passes its smoke test, so a broken release can
@@ -217,210 +205,73 @@ move it onto the new one.
 
 ## Using it from OpenClaw (or any OpenAI client)
 
-### 1. Point inference at the gateway
+Inference is a base-URL change; management is one stdio MCP server on the agent's machine:
 
 ```bash
 OPENAI_BASE_URL=http://<studioforge-host>:1234/v1
 OPENAI_API_KEY=<server.api_key, or any non-empty string when auth is disabled>
 ```
 
-`GET /v1/models` lists every **downloaded** model (loaded or not), exactly like LM Studio, and
-naming an unloaded model in a chat request just-in-time loads it.
-
-### 2. Register the companion as a local stdio MCP server
-
-`sfctl` is a separate, dependency-light package in
-[`packages/studioforge-companion`](packages/studioforge-companion) that installs on the *agent's*
-machine. Build the wheel (`uv build --wheel -o dist`), copy it across, then:
-
 ```bash
-uv tool install ./studioforge_companion-<version>-py3-none-any.whl
+uv tool install ./studioforge_companion-<version>-py3-none-any.whl   # from `uv build --wheel`
 sfctl servers add rig http://<studioforge-host>:1234 --api-key <PIN or server.api_key>
 ```
 
 ```json
-{
-  "mcpServers": {
-    "studioforge": {
-      "command": "sfctl",
-      "args": ["mcp"]
-    }
-  }
-}
+{ "mcpServers": { "studioforge": { "command": "sfctl", "args": ["mcp"] } } }
 ```
 
-`sfctl mcp` speaks MCP over stdio locally and proxies to **both** the server's management-plane MCP
-(16 tools) and the watchdog's recovery MCP (10) as one merged toolset — so the agent keeps working
-recovery tools (`restart_server`, `kill_model`, `gpu_status`, `tail_logs`,
-`reclaim_orphan_engines`) even when the main server is wedged. There is no inference tool by
-design; generation goes over `/v1/chat/completions`, which streams.
+`GET /v1/models` lists every **downloaded** model (loaded or not), exactly like LM Studio, and
+naming an unloaded model in a chat request just-in-time loads it. `sfctl mcp` merges the server's
+19 management tools and the watchdog's 10 recovery tools into one list, so the agent keeps
+`restart_server`, `kill_model` and `tail_logs` even when the main server is wedged. There is no
+inference tool by design; generation goes over `/v1/chat/completions`, which streams.
 
-### 3. Let the agent pick its own model
-
-Two ways, and the first is usually the one an agent wants:
-
-```
-load_recommended(model_id, ctx_size=131072)   # name the model and the window; the server picks
-                                              # the GPUs, the KV cache and the slot count, and loads
-                                              # at EXACTLY that context -- or refuses with numbers
-```
-
-Or start from the catalog. `list_models` over MCP returns every model in the library, newest
-download first, each with a `recommended` load (its optimal settings on the rig's best pair of
-GPUs, chosen quality first), one `placements` entry per set of cards, and a per-context `options`
-table:
-
-```jsonc
-{
-  "id": "publisher/Some-122B-MoE-GGUF/...-Q5_K_M",
-  "summary": "qwen35moe | 122B-A9.5B MoE | Q5_K_M | hybrid | tools+thinking | 82.9 GB | 262144 ctx train",
-  "attention_kind": "hybrid",
-  "downloaded_at": "2026-08-16T09:14:02Z",
-  "recommended": {
-    "mode": "dual_5090", "label": "2x RTX 5090", "devices": [0, 1],
-    "ctx_per_slot": 65536, "kv_cache_type": "f16",
-    "max_parallel": 4, "recommended_parallel": 2,
-    "est_gen_tps": 37.0, "est_gen_tps_full_ctx": 31.2, "fits_now": true,
-    "load_args": { "model_id": "...", "ctx_size": 65536, "parallel": 2,
-                   "kv_cache_type": "f16", "devices": [0, 1] }
-  },
-  "placements": [ { "mode": "dual_5090", ... }, { "mode": "dual_3090", ... } ],
-  "options": [{
-    "ctx_per_slot": 65536, "fits": true, "devices": [0, 1, 2, 3],
-    "max_parallel": 4, "recommended_parallel": 4,
-    "est_gen_tps": 37.0, "est_gen_tps_full_ctx": 31.2,
-    "confidence": "calibrated", "best_now": true,
-    "load_args": { "model_id": "...", "ctx_size": 65536, "parallel": 4, "kv_cache_type": "f16" }
-  }]
-}
-```
-
-The agent passes `recommended.load_args` verbatim to `load_model` (it names the `devices`), or an
-`options` row's to load a different context tier. Whether it fits in the VRAM free *right now*,
-which GPUs it would use, how many conversations fit (`max_parallel`) and how many are worth running
-(`recommended_parallel`, measured or estimated), and roughly how fast at an ordinary turn
-(`est_gen_tps`) and with the window nearly full (`est_gen_tps_full_ctx`) — all already there, so
-there is nothing left to compute or guess. The recommendation never quantizes the KV cache to buy a
-bigger window, and never drops below the server's default context floor to buy a second slot. The
-same data is on `GET /api/catalog`; [`docs/CATALOG.md`](docs/CATALOG.md) explains every column.
-
-### 4. Let the agent find and fetch new models
-
-```
-search_models(query="qwen3")        # compact repo rows — HF publishes no file sizes here
-repo_details(repo_id)               # real per-quant sizes, fit, and the context each GPU set reaches
-download_model(repo_id, quant)      # queued; appears in list_models when it lands
-```
-
-`repo_details` reads the model's GGUF header remotely (seconds the first time, then cached), so the
-answer is the planner's own — the same arithmetic a real load runs, not a rule of thumb.
-
-### Optional: never name a model
-
-```yaml
-models:
-  default_model: <model-id>
-  preload_default_model: true
-```
-
-A request that omits `model` — or names `local-model`, `default`, `auto`, `current` — is served by
-the default, and `preload_default_model` loads it at startup so the first request is warm.
-
-The full sequence an agent runs is in
-[`docs/OPENCLAW.md`](docs/OPENCLAW.md#the-loop-an-agent-actually-runs), along with the reliability
-guarantees it can depend on and a troubleshooting section.
-
----
-
-## Download models from HuggingFace
-
-Click **Use this model → LM Studio** on any HuggingFace GGUF page and have it open StudioForge's
-quant picker instead:
-
-```bash
-studioforge protocol register --takeover-lmstudio
-```
-
-Opt-in and reversible — LM Studio's handler is backed up first and restored by `studioforge
-protocol unregister`. Without the flag only the `studioforge://` scheme is claimed and LM Studio is
-left alone. You can also search from the GUI's Download tab, or from the agent's machine:
-
-```bash
-sfctl download lmstudio-community/Qwen2.5-1.5B-Instruct-GGUF --quant Q4_K_M
-```
-
-Downloads are resumable, sha256-verified against what is actually on disk, survive a restart, and
-land in your existing library using LM Studio's `publisher/repo/` layout.
+The loop an agent runs — `list_models` (every model with a `recommended` load and a per-context
+`options` table, nothing left to compute), `load_recommended(model_id, ctx_size)` (loads at
+**exactly** that context or refuses with numbers), `search_models` → `repo_details` →
+`download_model`, `pin_model`, `reserve_gpus` — is in [`docs/OPENCLAW.md`](docs/OPENCLAW.md);
+every catalog column and its formula is in [`docs/CATALOG.md`](docs/CATALOG.md). Set
+`models.default_model` to serve requests that name no model at all.
 
 ---
 
 ## Tests
 
 ```bash
-.venv/Scripts/python.exe -m pytest tests/unit -q      # the whole fast suite, no GPU, no network
+.venv/Scripts/python.exe -m pytest tests/unit -q      # the fast suite: no GPU, no engine, no network
 ```
 
-`tests/unit` is the suite. It needs no GPU, no engine and no network, and it is what `just test`
-and `make test` run.
-
-`tests/contract` is different: it starts a **real** gateway with a **real** engine and loads
-**real** weights onto your GPUs. It is opt-in twice over — every item is marked `contract`,
-`addopts = -m 'not contract'` deselects the mark by default, and `SF_RUN_CONTRACT=1` must also be
-set. Both gates exist because an agent once ran `pytest tests` and left three `llama-server`
-children holding ~25 GiB after the run "finished" (DECISIONS.md D23).
-
-```bash
-SF_RUN_CONTRACT=1 SF_TEST_MODELS_DIR=/path/to/gguf/library \
-  .venv/Scripts/python.exe -m pytest -m contract tests/contract -q
-```
-
-A handful of unit tests exercise the *real* GGUF parser and the *real* engine binary when this
-machine happens to have them (`SF_TEST_MODELS_DIR`, or an auto-detected LM Studio library; the
-engine under `SF_DATA_DIR`). They skip cleanly when it does not, so a fresh checkout runs the whole
-file. See [`CONTRIBUTING.md`](CONTRIBUTING.md) and [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md).
-
-## Project layout
-
-```
-src/studioforge/
-  api/          FastAPI app: OpenAI routes, /api/* management, admin, auth
-  core/         registry, planner, supervisor, engine, downloader, gpu, updater
-  gui/          NiceGUI control panel (tabs/: dashboard, models, download, server, setup)
-  mcp/          management-plane MCP server (16 tools)
-  watchdog/     recovery sidecar: separate process, separate port, 10 MCP tools
-  tray/         Windows notification-area app
-  migrations/   SQL schema, applied at startup
-packages/
-  studioforge-companion/   sfctl: the client half, installed on the agent's machine
-tests/unit/     the suite (no GPU, no network)
-tests/contract/ real engine + real weights, opt-in
-docs/           catalog formulas, OpenClaw setup, limitations, comparison
-deploy/         systemd units
-```
+`tests/contract` starts a **real** gateway with a **real** engine and loads **real** weights onto
+your GPUs; it is deselected by default and additionally gated on `SF_RUN_CONTRACT=1`
+(DECISIONS.md D23). How to run it, which unit tests use real artefacts when the machine has them,
+lint and types: [`CONTRIBUTING.md`](CONTRIBUTING.md) and
+[`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md).
 
 ## Documentation
 
-- [`docs/SETUP.md`](docs/SETUP.md) — first run, tab by tab: the checklist, the model library, the
-  GPU policy knobs, the engine, ports and credentials — plus the equivalent YAML and CLI for a
-  headless box
-- [`docs/CATALOG.md`](docs/CATALOG.md) — the model catalog an agent picks from: how each column is
-  computed, the speed formulas, calibration, and the `list_models` → `load_model` sequence
+- [`docs/SETUP.md`](docs/SETUP.md) — first run, tab by tab; the GPU policy knobs; the engine
+  (Windows download, Linux source build); network, credentials and the D32 admin rule;
+  downloading models; the headless YAML and CLI
 - [`docs/OPENCLAW.md`](docs/OPENCLAW.md) — pointing OpenClaw at it, the tool list, the loop an agent
-  runs (catalog → load → inference → download → recover), default models, troubleshooting
-- [`docs/OPENCLAW-LONG-CONTEXT.md`](docs/OPENCLAW-LONG-CONTEXT.md) — what a long window really
-  costs, with three models' whole option tables and the measured numbers behind them
+  runs, pins and leases, default models, reliability guarantees, troubleshooting
 - [`docs/OPENCLAW-SETUP.md`](docs/OPENCLAW-SETUP.md) — a step-by-step two-machine install with a
   verification after each step (all hostnames and addresses are placeholders)
-- [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) — working on the code: environment, lint, types,
-  which tests touch real hardware, and how to run the GUI against a scratch data dir
-- [`DECISIONS.md`](DECISIONS.md) — architectural decisions, each with the measurement behind it
+- [`docs/CATALOG.md`](docs/CATALOG.md) — the model catalog an agent picks from: every column,
+  the speed formulas, calibration, `planner.preference`
+- [`docs/OPENCLAW-LONG-CONTEXT.md`](docs/OPENCLAW-LONG-CONTEXT.md) — what a long window really
+  costs, with three models' whole option tables and the measured numbers behind them
+- [`docs/BENCHMARKING.md`](docs/BENCHMARKING.md) — the benchmarking playbook for the agent: the
+  two benchmarks, the exact calls, the three rules, and locking a result in with a lease
+- [`docs/ENGINE-FEATURES.md`](docs/ENGINE-FEATURES.md) — the llama.cpp features StudioForge turns
+  on and the ones it deliberately does not, each with its default, quality cost and measurement
 - [`docs/RUNBOOK.md`](docs/RUNBOOK.md) — the operator's runbook: what `/health` is telling you, and
   what to do when it will not start, a model will not load, VRAM is held, or a download stalls
-- [`docs/ENGINE-FEATURES.md`](docs/ENGINE-FEATURES.md) — the llama.cpp features StudioForge turns
-  on and the ones it deliberately does not: speculative decoding, the host-RAM prompt cache, the
-  KV pool shape, tensor parallelism — each with its default, its quality cost and its measurement
+- [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) — working on the code: scratch data dir, the shape
+  of the code, adding a config key, headless Linux, the companion wheel
 - [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) — known limitations, honestly
 - [`docs/COMPARISON.md`](docs/COMPARISON.md) — what was borrowed from Ollama, oobabooga, KoboldCpp, vLLM
+- [`DECISIONS.md`](DECISIONS.md) — architectural decisions, each with the measurement behind it
 
 ## License
 

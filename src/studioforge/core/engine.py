@@ -36,6 +36,7 @@ import shutil
 import socket
 import stat
 import subprocess
+import tarfile
 import time
 import zipfile
 from collections import deque
@@ -155,9 +156,15 @@ _BUILD_RE = re.compile(r"build\s+(\d+)")
 _DEVICE_RE = re.compile(r"^\s*([A-Za-z][A-Za-z0-9_]*\d*)\s*:\s*(.+)$")
 _CUDA_VER_RE = re.compile(r"CUDA(?:\s+UMD)?\s+Version:\s*(\d+)\.(\d+)")
 
-#: ``llama-<tag>-bin-<os>[-<backend>[-<ver>]]-<arch>.zip``
+#: ``llama-<tag>-bin-<os>[-<backend>[-<ver>]]-<arch>.zip`` (Windows) or
+#: ``.tar.gz`` (every ubuntu/macos archive upstream publishes is a tarball;
+#: with ``.zip`` alone no Linux asset ever parsed and the prebuilt path was
+#: dead there). Note upstream ships **no** Linux CUDA archive at all: the
+#: ubuntu set is cpu/vulkan/rocm/sycl/openvino, so Linux+NVIDIA is always
+#: the source build (D2, amended) and the tarball path serves AMD/ROCm.
 _ASSET_RE = re.compile(
-    r"^llama-(?P<tag>[A-Za-z0-9._]+)-bin-(?P<os>win|ubuntu|linux|macos)-(?P<rest>.+)\.zip$"
+    r"^llama-(?P<tag>[A-Za-z0-9._]+)-bin-(?P<os>win|ubuntu|linux|macos)-(?P<rest>.+)"
+    r"\.(?:zip|tar\.gz)$"
 )
 _CUDART_RE = re.compile(
     r"^cudart-llama-bin-(?P<os>win|ubuntu|linux)-cuda-(?P<ver>[0-9.]+)-(?P<arch>x64|arm64)\.zip$"
@@ -742,6 +749,60 @@ def extract_engine_zip(zip_path: Path, dest: Path) -> Path | None:
     return binary
 
 
+def _is_tarball(path: Path) -> bool:
+    return path.name.endswith((".tar.gz", ".tgz"))
+
+
+def extract_engine_archive(archive: Path, dest: Path) -> Path | None:
+    """Extract a release archive: ``.zip`` (Windows) or ``.tar.gz`` (Linux, macOS)."""
+    if _is_tarball(archive):
+        return _extract_engine_tar(archive, dest)
+    return extract_engine_zip(archive, dest)
+
+
+def _extract_engine_tar(tar_path: Path, dest: Path) -> Path | None:
+    """The tarball twin of :func:`extract_engine_zip`: same flattening, same guards.
+
+    Upstream's ubuntu/macos archives nest everything under ``llama-bNNNN/``
+    (or ``build/bin/``); the shared prefix is stripped so ``engines/<tag>/``
+    holds the binary and its .so files directly, as the zip path does. Link
+    members are skipped along with unsafe paths: a symlink pointing outside
+    ``dest`` would be followed by a later member's write. The execute bit is
+    carried over, because a tarball is the one archive kind that has it and
+    ``llama-server`` is useless without it.
+    """
+    dest.mkdir(parents=True, exist_ok=True)
+    binary: Path | None = None
+    with tarfile.open(tar_path, "r:*") as archive:
+        members = archive.getmembers()
+        prefix = _common_prefix([m.name for m in members if m.isfile()])
+        for member in members:
+            if not member.isfile():
+                if member.issym() or member.islnk():
+                    log.warning("engine.tar.skip_link_member", member=member.name)
+                continue
+            name = member.name.replace("\\", "/")
+            if prefix and name.startswith(prefix):
+                name = name[len(prefix) :]
+            parts = [p for p in name.split("/") if p not in ("", ".")]
+            if not parts or any(p == ".." for p in parts) or Path(name).is_absolute():
+                log.warning("engine.tar.skip_unsafe_member", member=member.name)
+                continue
+            target = dest.joinpath(*parts)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            src = archive.extractfile(member)
+            if src is None:  # pragma: no cover - isfile() members always extract
+                continue
+            with src, target.open("wb") as out:
+                shutil.copyfileobj(src, out)
+            if member.mode & stat.S_IXUSR:
+                with contextlib.suppress(OSError):
+                    target.chmod(target.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+            if target.name == BIN_NAME:
+                binary = target
+    return binary
+
+
 def _make_executable(directory: Path) -> None:
     if os.name == "nt":
         return
@@ -1036,7 +1097,7 @@ class EngineManager:
                 skipped.append({"tag": tag, "reason": str(exc)})
                 continue
             if asset is None:
-                variants = sorted({a.variant for a in assets}) or ["<none>"]
+                variants = self._host_variants(assets)
                 skipped.append(
                     {
                         "tag": tag,
@@ -1150,6 +1211,21 @@ class EngineManager:
             )
 
         return None
+
+    def _host_variants(self, assets: Sequence[EngineAsset]) -> list[str]:
+        """The variants upstream ships for *this* os/arch, for a refusal message.
+
+        Listing every variant in the release made a Linux refusal read "no
+        build for ubuntu/x64 ... available variants: cuda-13.3" -- the
+        Windows builds -- which points the reader at a download that does
+        not exist for them. "<none>" is the honest answer there.
+        """
+        matching = {
+            a.variant
+            for a in assets
+            if _os_matches(a.os_token, self.os_token) and a.arch == self.arch_token
+        }
+        return sorted(matching) or ["<none>"]
 
     def _select_explicit(self, matching: Sequence[EngineAsset], requested: str) -> EngineAsset:
         want = requested if not requested[0].isdigit() else f"cuda-{requested}"
@@ -1414,28 +1490,59 @@ class EngineManager:
                 return self._finalize(dest, existing, "prebuilt", smoke, activate=True)
             log.warning("engine.install.reinstall_after_failed_smoke", tag=tag, detail=smoke.detail)
 
+        local = self.engine_dir(f"{tag}-local")
+        local_binary = find_server_binary(local)
+        if existing is None and local_binary is not None and not force:
+            # D27's reuse rule for the explicit path too. On Linux the only
+            # engine for a tag is the source build, so a repeat install(tag)
+            # -- `engine --update` run twice, the Setup tab clicked again --
+            # must find the binary it already has rather than recompile for
+            # twenty minutes to reach the same one.
+            smoke = await self._smoke(local.name, None)
+            if smoke.ok or smoke.no_model:
+                log.info("engine.install.local_build_present", tag=tag, smoke_ok=smoke.ok)
+                _emit(progress, "done", 1.0)
+                return self._finalize(local, local_binary, "source-local", smoke, activate=True)
+
         assets = await self.list_assets(tag)
         asset = self.select_asset(
             assets, gpus=self._gpus(), cuda_driver=self._cuda_driver_version()
         )
         if asset is None:
-            variants = sorted({a.variant for a in assets}) or ["<none>"]
+            variants = self._host_variants(assets)
+            if self.config.engine.allow_source_build:
+                # Upstream publishes no Linux CUDA archive at all, so on
+                # Linux+NVIDIA this is the ordinary path, not an edge case:
+                # the same fallback ensure_engine takes at boot, now also
+                # behind `engine --update`, the Setup tab and the MCP install
+                # (D2/D3). check_update already advertised "source" for it.
+                log.info(
+                    "engine.install.source_build",
+                    tag=tag,
+                    platform=f"{self.os_token}/{self.arch_token}",
+                    prebuilt_variants=variants,
+                )
+                return await self.build_from_source(
+                    tag, arches=self.cuda_arches(), progress=progress
+                )
             raise EngineError(
                 f"no GPU-capable llama-server build for {self.os_token}/{self.arch_token} at "
                 f"{tag} is compatible with this driver "
                 f"(CUDA {_fmt_version(self._cuda_driver_version())}); "
-                f"available variants: {', '.join(variants)}"
+                f"available variants: {', '.join(variants)}. Building from source needs "
+                f"git, cmake and a CUDA toolkit (nvcc) matching the driver; set "
+                f"engine.allow_source_build: true to enable it"
             )
 
         self.config.downloads_dir.mkdir(parents=True, exist_ok=True)
         archive = self.config.downloads_dir / asset.name
         await self._download(asset.url, archive, asset.size_bytes, "download", progress)
-        _verify_zip(archive)
+        _verify_archive(archive)
 
         if force and dest.exists():
             shutil.rmtree(dest, ignore_errors=True)
         _emit(progress, "extract", 0.0)
-        binary = extract_engine_zip(archive, dest)
+        binary = extract_engine_archive(archive, dest)
         _emit(progress, "extract", 1.0)
 
         if asset.needs_cudart and asset.cudart_url:
@@ -1586,6 +1693,21 @@ class EngineManager:
             f"-DCMAKE_CUDA_ARCHITECTURES={';'.join(arch_list)}",
             "-DCMAKE_BUILD_TYPE=Release",
             "-DLLAMA_BUILD_SERVER=ON",
+            # ggml builds shared libraries by default on Linux, so llama-server
+            # links libllama.so/libggml*.so, and ld.so never searches the
+            # binary's own directory (or the cwd). CMake's default embeds the
+            # BUILD-tree RPATH, so the copy in engines/<tag>-local/ only ran
+            # while engines/src-<tag>/build-studioforge survived -- and with
+            # the shared vendor checkout rebuilt for a newer tag it silently
+            # loaded that tag's libraries instead of its own. $ORIGIN is what
+            # upstream's own ubuntu release jobs bake in; USE_LINK_PATH keeps
+            # the CUDA toolkit's lib dir too, since BUILD_WITH_INSTALL_RPATH
+            # discards the build-tree entry that used to carry it and cudart/
+            # cublas are linked dynamically. Passed literally (no shell) and
+            # unconditionally: CMake ignores RPATH properties on Windows.
+            "-DCMAKE_INSTALL_RPATH=$ORIGIN",
+            "-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON",
+            "-DCMAKE_INSTALL_RPATH_USE_LINK_PATH=ON",
         ]
         code = await self._run_logged(
             configure, cwd=src, log_path=log_path, phase="configure", progress=progress
@@ -1811,7 +1933,7 @@ class EngineManager:
 
         gpus = self._gpus()
         detected = ", ".join(f"{g.name} (sm_{g.sm_arch or '?'})" for g in gpus) or "no GPUs"
-        variants = sorted({a.variant for a in assets}) or ["<none>"]
+        variants = self._host_variants(assets)
         raise EngineError(
             f"no usable llama-server engine for {tag}: detected {detected} with driver CUDA "
             f"{_fmt_version(self._cuda_driver_version())} on {self.os_token}/{self.arch_token}; "
@@ -2443,11 +2565,28 @@ def _reuse_completed_download(target: Path, expected_bytes: int) -> bool:
     if target.stat().st_size != expected_bytes:
         return False
     try:
-        _verify_zip(target)
+        _verify_archive(target)
     except EngineError:
         target.unlink(missing_ok=True)
         return False
     return True
+
+
+def _verify_archive(path: Path) -> None:
+    """Integrity check before extraction; which check depends on the suffix."""
+    if _is_tarball(path):
+        _verify_tar(path)
+    else:
+        _verify_zip(path)
+
+
+def _verify_tar(path: Path) -> None:
+    try:
+        with tarfile.open(path, "r:*") as archive:
+            for _member in archive:  # walks every header; a truncated gzip stream raises
+                pass
+    except (tarfile.TarError, OSError, EOFError) as exc:
+        raise EngineError(f"{path.name} is not a valid tar archive: {exc}") from exc
 
 
 def _verify_zip(path: Path) -> None:

@@ -1657,6 +1657,18 @@ whose `Origin` host differs from the `Host` header (a page on any site the opera
 otherwise drive the panel on `http://<lan-ip>:8080`), with a log line naming the fix for a proxy
 that rewrites `Host`.
 
+**Addendum (2026-08-22): the panel applies the same rule.** The GUI calls the box-changing code
+in-process (no route, no auth middleware), so on the default install every action above was one
+click away for any LAN host on `:8080`. Now each such GUI action -- config saves (every path goes
+through `apply_config_updates`), engine install/activate, restarts, VRAM reclaim, lease release,
+pin and saved settings (per the D41 addendum), deletes, download queueing, plus the GUI-only
+URL-handler and autostart registrations -- runs `require_local_admin`, which with no
+`server.api_key` accepts only a loopback viewer (from NiceGUI's client peer) and otherwise refuses
+with the same `remote_admin_requires_credential` text. The Setup tab withholds the PIN's reveal
+and copy from that viewer too, as `/api/mcp/info` already did. Reads, chat, load/unload stay open;
+with a key set, the key is the credential as before. Behind a reverse proxy the peer is the proxy
+-- the limit stated above, same answer: put the proxy behind `server.api_key`.
+
 **Also in the same commit.** Load arguments are validated once, in `ModelManager.load` (every
 caller): `ctx_size` and `parallel` must be positive and bounded, `kv_cache_type` must be one of
 the known types -- `0` used to mean "default" by accident and `-1` reached `--ctx-size -1`.
@@ -2783,3 +2795,53 @@ auto slots under an integer default; the grant's idle/busy/pinned/in-flight rule
 with owner activity; the performance profile incl. measured split mode on exactly those
 cards), `tests/unit/test_mcp.py` (`reserve_gpus`/`release_gpus` through `server_status`),
 `tests/unit/test_catalog_routes.py` (the routes), `tests/unit/test_api_hardening.py` (D32).
+
+### D32 and D41, amended 2026-08-22: the browser is a loopback peer, the MCP plane is a box, a request ttl cannot pin
+
+Corrections from review; none is a new rule. **D32, browser origin.** The operator's own
+browser is a loopback peer, and with `server.cors_origins: ["*"]` any page it shows can
+preflight and send `PATCH /api/config` to `http://127.0.0.1:1234` looking local. So on an open
+install the admin gate and the PIN reveal (`/api/mcp/info`, `/api/openclaw-setup`) apply the
+websocket gate's rule: a request whose `Origin` is not this server's own origin -- host *and*
+port, because another local web app is also a loopback peer and is not this server; `Origin:
+null` counts as foreign -- is not "this machine" and gets the same 403 / withheld PIN. CORS
+itself is unchanged: it governs what a page may *read*, never whom the server trusts.
+**D32, MCP plane.** With no key, a mutating request on the MCP path from off the box needs the
+PIN even when `mcp.pin_required` is off: every streamable-HTTP call is a POST and the tools
+behind it (`set_config`, `delete_model`, `download_model`, `reserve_gpus`) are the box changes
+the routes gate. The toggle relaxes same-machine callers only, and `/api/mcp/info` reports the
+`pin_required` a caller will actually be held to. **D41 item 4, mirrored.** A request-level
+`ttl` cannot pin either: `0` (and anything `int` rounds to it) is the wire form of pinned, so it
+is treated as no override rather than written onto the instance. **Also:** `/api/mcp/info` and
+the 401 text no longer advertise `?pin=` (still parsed, for URL-only connectors; a URL lands in
+proxy logs and shell history), and the vision SSRF guard refuses CGNAT space (`100.64.0.0/10`,
+the tailnet it names in its own reason for existing -- `is_private` never covered it).
+
+### 2026-08-22 review amendments (D2, D41, D42, D43) -- code brought in line with the decisions
+
+* **D2.** Upstream publishes no Linux CUDA archive at any tag (the ubuntu set is cpu/vulkan/rocm/
+  sycl/openvino, all `.tar.gz`), so "(Linux: the matching `ubuntu-cuda` asset)" never existed.
+  Linux+NVIDIA is the source build, and `install()` -- `engine --update`, the Setup tab, the MCP
+  install -- now takes the same `allow_source_build` fallback `ensure_engine` always took, reuses
+  an existing `<tag>-local` (D27), and names the prerequisites (git, cmake, a CUDA toolkit with
+  nvcc matching the driver) when building is off. The asset parser accepts `.tar.gz` so the ROCm
+  tarball serves AMD Linux. The source build bakes `$ORIGIN` into the RUNPATH (D3's
+  self-contained engine dir: the copied binary used to resolve its `.so` files through the
+  CMake build tree, and through a *newer* tag's once the shared vendor checkout was rebuilt).
+* **D41.** Housekeeping unloads -- the placement benchmark's fresh process per mode and its
+  teardown, the parallel benchmark's leave-as-found, `test_model` -- pass `deliberate=False` and
+  do not suppress the pin; a pinned model benchmarked or tested is brought back by the
+  reconciler within a sweep. The reconciler leaves a model under test or benchmark alone until
+  the run ends, so it cannot race the run's own unload -> lease -> load swap.
+* **D42.** Item 3 is now enforced rather than described: the busy check is repeated at the gate
+  (after the possibly minutes-long wait behind another load), the real move carries the
+  preview's `allow_evict=False`, and `require_resident` makes it a relocation only -- a resident
+  the TTL sweep unloaded meanwhile is not cold-loaded. A lease owner (D43) is never a candidate:
+  its placement is forced on a copy of the record, so the persisted-override gate could not see
+  it, and the cards are its alone. A one-shot `load(devices=...)` placement remains eligible,
+  per item 5.
+* **D43.** The grant writes the book entry *before* the awaited evictions (and releases it if one
+  fails): the planner reads the book, each `supervisor.stop` yields for a child teardown, and a
+  load planning in that window saw the cards free. Two overlapping grants now conflict at the
+  book before either unloads anything, and a victim that picked up a request between the scan
+  and its stop refuses the grant (D36) instead of being torn down.

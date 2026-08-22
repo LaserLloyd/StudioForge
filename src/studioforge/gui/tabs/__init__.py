@@ -106,6 +106,74 @@ def api_request(ctx: GuiContext) -> Any:
     return _InProcessRequest(ctx.api_state)
 
 
+# ---------------------------------------------------------------------------
+# D32 for the panel: on an open install, changing the box needs a local viewer
+# ---------------------------------------------------------------------------
+
+
+def viewer_host() -> str:
+    """Peer address of the browser driving the current page or event.
+
+    NiceGUI runs every page build, timer and event handler inside that page's
+    client context, so this is the socket peer of the viewer who clicked --
+    which behind a reverse proxy is the proxy, the same stated limit as the
+    API's peer check. ``""`` when there is no client context at all: a direct
+    in-process call (a test driving an action function), which never crossed
+    a network and is trusted the way :func:`is_local_request` trusts it.
+    """
+    try:
+        return str(ui.context.client.ip or "")
+    except (RuntimeError, AttributeError):
+        return ""
+
+
+def viewer_may_change_box(ctx: GuiContext) -> bool:
+    """Whether the current viewer passes the D32 rule.
+
+    With ``server.api_key`` set, reaching the panel at all took the key (the
+    gate exchanged it for the session cookie), so the key *is* the credential
+    and nothing more is asked -- exactly as the API behaves. Without one, only
+    a viewer on this machine may change the box.
+    """
+    if ctx.config.server.api_key:
+        return True
+    # The API's own loopback predicate, so the panel and ``check_request``
+    # cannot disagree on what "this machine" means.
+    from studioforge.api.auth import _is_loopback
+
+    host = viewer_host()
+    return not host or _is_loopback(host)
+
+
+#: What a remote viewer on an open install is told. Names the two ways in, in
+#: the same words the API uses for the same refusal.
+REMOTE_VIEWER_NOTE = (
+    "this changes the server itself and server.api_key is not set, so the panel only "
+    "accepts it from a browser on this machine. Open the panel on the box, or set "
+    "server.api_key (Setup tab, on the box) and sign in with it to manage the server "
+    "remotely with a real credential."
+)
+
+
+def require_local_admin(ctx: GuiContext, what: str) -> None:
+    """Refuse a box-changing action from a remote viewer on an open install.
+
+    The API closed this in D32: with no ``server.api_key``, editing config,
+    deleting files, restarting, installing engines, queueing downloads and
+    killing processes take a caller on this machine or the PIN. The panel
+    calls the same code in-process -- no route, no auth middleware -- so it
+    has to apply the rule itself, from the viewer's peer, or every one of those
+    actions is one click away for anyone on the LAN at ``:8080``. Reads, chat,
+    load and unload stay open, as D32 keeps them on the API.
+    """
+    if viewer_may_change_box(ctx):
+        return
+    log.warning("gui action refused: remote viewer on an open install", what=what)
+    raise StudioForgeError(
+        REMOTE_VIEWER_NOTE, code="remote_admin_requires_credential", status_code=403
+    )
+
+
 async def apply_config_updates(ctx: GuiContext, updates: dict[str, Any]) -> dict[str, Any]:
     """The GUI's one and only "change a setting".
 
@@ -120,6 +188,10 @@ async def apply_config_updates(ctx: GuiContext, updates: dict[str, Any]) -> dict
     """
     if not updates:
         return {"updated": [], "restart_required": []}
+    # Checked here, not only in the tabs: this is the single path every
+    # setting goes through, so a remote viewer on an open install cannot set
+    # server.api_key and lock the owner out whichever button they found.
+    require_local_admin(ctx, "change a setting")
     from studioforge.api.mgmt_routes import set_config
 
     payload = await set_config(api_request(ctx), updates)
@@ -196,6 +268,7 @@ def mono(text: str, *, classes: str = "") -> Any:
 
 
 __all__ = [
+    "REMOTE_VIEWER_NOTE",
     "GuiContext",
     "api_request",
     "apply_config_updates",
@@ -205,6 +278,9 @@ __all__ = [
     "mono",
     "notify_error",
     "panel_guard",
+    "require_local_admin",
     "run_blocking",
     "section",
+    "viewer_host",
+    "viewer_may_change_box",
 ]

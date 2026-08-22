@@ -706,7 +706,12 @@ class Benchmarker:
         # unload can be garbage-collected mid-flight -- leaving a llama-server
         # child holding VRAM, which is the exact failure this shield exists to
         # prevent. Same guard the restart and rescan paths already use.
-        task = asyncio.ensure_future(self.manager.unload(model_id))
+        #
+        # deliberate=False: this is housekeeping, not a choice to take the
+        # model down. A deliberate unload marks a pinned model so the D41
+        # reconciler leaves it down; a benchmark ending that way left every
+        # pinned model it measured unloaded until a restart.
+        task = asyncio.ensure_future(self.manager.unload(model_id, deliberate=False))
         _DETACHED_UNLOADS.add(task)
         task.add_done_callback(_DETACHED_UNLOADS.discard)
         try:
@@ -742,7 +747,10 @@ class Benchmarker:
         try:
             # A fresh process per mode: reusing a running instance would measure
             # a warm cache on whichever devices happened to be selected first.
-            await self.manager.unload(record.id)
+            # Not a deliberate unload (D41): if this mode's load then fails,
+            # a pinned model must not be left suppressed by its own benchmark.
+            # The reconciler leaves a model under benchmark alone meanwhile.
+            await self.manager.unload(record.id, deliberate=False)
             # The mode's cards are this benchmark's alone until the mode is
             # done (D43): an idle resident on them is unloaded, a busy one
             # fails the mode by name, and nothing else may load there meanwhile

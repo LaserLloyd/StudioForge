@@ -138,6 +138,68 @@ def test_one_private_answer_among_public_ones_fails_the_vet(
     assert vision._is_public_address("rebinder.example.com") is False
 
 
+@pytest.mark.parametrize(
+    "literal",
+    [
+        # CGNAT is the tailnet (netinfo._TAILSCALE_NET): `is_private` never
+        # covered it, so the guard's own stated purpose was not met.
+        "100.100.7.42",
+        "100.64.0.1",
+        "100.127.255.254",
+        "::ffff:100.100.7.42",
+        # The NAT64 well-known prefix is refused today via `is_reserved`; pin
+        # that the additive `is_global` check did not loosen it.
+        "64:ff9b::808:808",
+    ],
+)
+def test_cgnat_and_other_non_global_space_is_refused(
+    monkeypatch: pytest.MonkeyPatch, literal: str
+) -> None:
+    import socket
+
+    family = socket.AF_INET6 if ":" in literal else socket.AF_INET
+
+    def fake_getaddrinfo(host: str, port: Any) -> list[Any]:
+        return [(family, socket.SOCK_STREAM, 6, "", (literal, 0))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    assert vision._resolve_public("peer.example") is None
+    assert vision._is_public_address("peer.example") is False
+
+
+@pytest.mark.parametrize("literal", ["8.8.8.8", "2001:4860:4860::8888", "::ffff:8.8.8.8"])
+def test_genuinely_public_space_still_resolves(
+    monkeypatch: pytest.MonkeyPatch, literal: str
+) -> None:
+    import ipaddress
+    import socket
+
+    family = socket.AF_INET6 if ":" in literal else socket.AF_INET
+
+    def fake_getaddrinfo(host: str, port: Any) -> list[Any]:
+        return [(family, socket.SOCK_STREAM, 6, "", (literal, 0))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    assert vision._resolve_public("cdn.example") == str(ipaddress.ip_address(literal))
+
+
+async def test_a_tailnet_image_url_is_refused_before_any_request_is_made() -> None:
+    """End to end on the shipped default: no credential, no private hosts."""
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        return httpx.Response(403, content=b"secret")
+
+    config = Config(data_dir="/tmp/sf-vision")
+    config.gateway.allow_private_image_hosts = False
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(BadRequestError) as excinfo:
+            await vision._fetch("http://100.100.7.42:8080/x.png", config=config, client=client)
+    assert excinfo.value.code == "image_fetch_refused"
+    assert calls == [], "the target's status must not be observable"
+
+
 def test_a_malformed_content_length_is_not_a_500() -> None:
     import asyncio
 

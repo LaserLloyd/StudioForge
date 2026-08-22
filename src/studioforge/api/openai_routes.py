@@ -419,17 +419,30 @@ def _pop_ttl(payload: dict[str, Any]) -> int | None:
     LM Studio lets a client attach a TTL to a chat request so JIT-loaded models
     self-evict. llama-server does not know the field, so it is consumed here
     and applied to our own idle timer instead of being forwarded.
+
+    Anything that is not a positive number of seconds is *no override*. In
+    particular ``0`` -- and a negative or sub-second value, which ``int``
+    rounds to it -- is the wire form of **pinned** everywhere (the sweeper
+    never idle-unloads it, the planner excludes it from every eviction ladder,
+    a lease refuses it), and pinning is a box change behind the D32 gate. A
+    request may shorten or lengthen the idle timer; it may not pin, which is
+    the mirror of D41 item 4: it may not unpin either. Returning ``None``
+    rather than clamping keeps to what the docs promise ("the idle timer
+    resets to it") instead of inventing a remote "unload as soon as idle".
     """
     if "ttl" not in payload:
         return None
     raw = payload.pop("ttl")
     if isinstance(raw, bool) or not isinstance(raw, (int, float)):
         return None
-    return max(0, int(raw))
+    seconds = int(raw)
+    return seconds if seconds > 0 else None
 
 
 def _apply_ttl_override(state: Any, model_id: str, ttl_s: int | None) -> None:
-    if ttl_s is None:
+    # `ttl_s <= 0` is refused here as well as in `_pop_ttl`: a direct caller
+    # must not be able to write the pinned wire value onto an instance either.
+    if ttl_s is None or ttl_s <= 0:
         return
     instance = state.supervisor.get(model_id)
     if instance is None:

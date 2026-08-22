@@ -14,9 +14,11 @@ download -> extract -> launch -> ``/health`` path actually works end to end.
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import os
 import sys
+import tarfile
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -32,8 +34,10 @@ from studioforge.core.engine import (
     EngineError,
     EngineManager,
     _SmokeResult,  # internal: build tests stub the smoke step
+    _verify_archive,  # internal: the pre-extract integrity check
     build_assets,
     build_number,
+    extract_engine_archive,
     extract_engine_zip,
     find_server_binary,
     flags_from_help,
@@ -139,7 +143,11 @@ def _asset(name: str, size: int = 100) -> dict[str, Any]:
     }
 
 
-#: Mirrors the real GitHub asset list at b10425.
+#: Mirrors the real GitHub asset list at b10425 (read back from the release API
+#: on 2026-08-22). Two facts this fixture must keep honest, because the suite
+#: was green for months with names that never existed upstream: every Linux
+#: and macOS archive is a ``.tar.gz``, and there is NO ``ubuntu-cuda`` asset --
+#: Linux+NVIDIA is the source-build path.
 RAW_ASSETS: list[dict[str, Any]] = [
     _asset(f"llama-{TAG}-bin-win-cuda-12.4-x64.zip", 111),
     _asset(f"llama-{TAG}-bin-win-cuda-13.3-x64.zip", 222),
@@ -147,10 +155,10 @@ RAW_ASSETS: list[dict[str, Any]] = [
     _asset(f"llama-{TAG}-bin-win-vulkan-x64.zip", 444),
     _asset(f"llama-{TAG}-bin-win-rocm-7.14-x64.zip", 555),
     _asset(f"llama-{TAG}-bin-win-cpu-arm64.zip", 666),
-    _asset(f"llama-{TAG}-bin-ubuntu-x64.zip", 777),
-    _asset(f"llama-{TAG}-bin-ubuntu-cuda-x64.zip", 888),
-    _asset(f"llama-{TAG}-bin-ubuntu-cuda-arm64.zip", 999),
-    _asset(f"llama-{TAG}-bin-macos-arm64.zip", 1000),
+    _asset(f"llama-{TAG}-bin-ubuntu-x64.tar.gz", 777),
+    _asset(f"llama-{TAG}-bin-ubuntu-arm64.tar.gz", 888),
+    _asset(f"llama-{TAG}-bin-ubuntu-vulkan-x64.tar.gz", 999),
+    _asset(f"llama-{TAG}-bin-macos-arm64.tar.gz", 1000),
     _asset("cudart-llama-bin-win-cuda-12.4-x64.zip", 11),
     _asset("cudart-llama-bin-win-cuda-13.3-x64.zip", 22),
     _asset(f"llama-{TAG}-bin-win-cuda-13.3-x64.zip.sha256", 1),
@@ -194,11 +202,18 @@ def test_parse_asset_name_variants() -> None:
         "x64",
     )
     assert parse_asset_name(f"llama-{TAG}-bin-win-cpu-x64.zip") == (TAG, "win", "cpu", "x64")
-    assert parse_asset_name(f"llama-{TAG}-bin-ubuntu-x64.zip") == (TAG, "ubuntu", "cpu", "x64")
-    assert parse_asset_name(f"llama-{TAG}-bin-ubuntu-cuda-x64.zip") == (
+    # The Linux/macOS archives are tarballs; a zip-only parser dropped every one.
+    assert parse_asset_name(f"llama-{TAG}-bin-ubuntu-x64.tar.gz") == (TAG, "ubuntu", "cpu", "x64")
+    assert parse_asset_name(f"llama-{TAG}-bin-ubuntu-vulkan-x64.tar.gz") == (
         TAG,
         "ubuntu",
-        "cuda",
+        "vulkan",
+        "x64",
+    )
+    assert parse_asset_name(f"llama-{TAG}-bin-ubuntu-rocm-7.14-x64.tar.gz") == (
+        TAG,
+        "ubuntu",
+        "rocm-7.14",
         "x64",
     )
     assert parse_asset_name(f"llama-{TAG}-bin-win-rocm-7.14-x64.zip") == (
@@ -207,7 +222,12 @@ def test_parse_asset_name_variants() -> None:
         "rocm-7.14",
         "x64",
     )
-    assert parse_asset_name(f"llama-{TAG}-bin-macos-arm64.zip") == (TAG, "macos", "cpu", "arm64")
+    assert parse_asset_name(f"llama-{TAG}-bin-macos-arm64.tar.gz") == (
+        TAG,
+        "macos",
+        "cpu",
+        "arm64",
+    )
     assert parse_asset_name("cudart-llama-bin-win-cuda-13.3-x64.zip") is None
 
 
@@ -291,20 +311,28 @@ def test_select_asset_explicit_cpu_is_refused(tmp_config: Config) -> None:
         mgr.select_asset(ASSETS, gpus=MIXED_GPUS, cuda_driver=(13, 3))
 
 
-def test_select_asset_linux_x64(manager: EngineManager) -> None:
+def test_select_asset_linux_nvidia_has_no_prebuilt(manager: EngineManager) -> None:
+    """Upstream ships no Linux CUDA archive: None here is what routes a Linux+NVIDIA
+    box to the source build, and the cpu/vulkan tarballs must never be picked."""
     manager.os_token, manager.arch_token = "ubuntu", "x64"
-    chosen = manager.select_asset(ASSETS, gpus=MIXED_GPUS, cuda_driver=(13, 3))
-    assert chosen is not None
-    assert chosen.name == f"llama-{TAG}-bin-ubuntu-cuda-x64.zip"
-    # Unversioned linux CUDA asset: no version to compare, smoke test is the gate.
-    assert chosen.cuda_version is None
-
-
-def test_select_asset_linux_arm64(manager: EngineManager) -> None:
+    assert manager.select_asset(ASSETS, gpus=MIXED_GPUS, cuda_driver=(13, 3)) is None
     manager.os_token, manager.arch_token = "ubuntu", "arm64"
-    chosen = manager.select_asset(ASSETS, gpus=MIXED_GPUS, cuda_driver=(13, 3))
+    assert manager.select_asset(ASSETS, gpus=MIXED_GPUS, cuda_driver=(13, 3)) is None
+
+
+def test_select_asset_linux_amd_takes_the_rocm_tarball(manager: EngineManager) -> None:
+    """The one Linux box a prebuilt serves (ROCm is published as a tarball)."""
+    manager.os_token, manager.arch_token = "ubuntu", "x64"
+    amd = [_gpu(0, "AMD Radeon RX 7900 XTX", (0, 0))]
+    with_rocm = build_assets(
+        TAG, [*RAW_ASSETS, _asset(f"llama-{TAG}-bin-ubuntu-rocm-7.14-x64.tar.gz", 1234)]
+    )
+
+    chosen = manager.select_asset(with_rocm, gpus=amd, cuda_driver=None)
+
     assert chosen is not None
-    assert chosen.name == f"llama-{TAG}-bin-ubuntu-cuda-arm64.zip"
+    assert chosen.name == f"llama-{TAG}-bin-ubuntu-rocm-7.14-x64.tar.gz"
+    assert chosen.needs_cudart is False
 
 
 def test_select_asset_macos_arm64_has_no_cuda(manager: EngineManager) -> None:
@@ -579,6 +607,11 @@ async def test_build_from_source_command_construction(
     assert "-DCMAKE_CUDA_ARCHITECTURES=86;120" in configure
     assert "-DCMAKE_BUILD_TYPE=Release" in configure
     assert "-DLLAMA_BUILD_SERVER=ON" in configure
+    # The copied llama-server must find its own .so files (and the CUDA
+    # toolkit's) after the build tree is gone: $ORIGIN, literal, no shell.
+    assert "-DCMAKE_INSTALL_RPATH=$ORIGIN" in configure
+    assert "-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON" in configure
+    assert "-DCMAKE_INSTALL_RPATH_USE_LINK_PATH=ON" in configure
 
     build = next(c for c in calls if c[0] == "cmake" and "--build" in c)
     assert "--parallel" in build
@@ -679,6 +712,147 @@ async def test_ensure_engine_falls_back_to_source_build(
     assert built["tag"] == TAG
     assert built["arches"] == ["86", "120"]
     assert info.variant == "source-local"
+
+
+@pytest.mark.asyncio
+async def test_install_falls_back_to_source_build_on_linux(
+    tmp_config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`engine --update`, the Setup tab and the MCP install all go through
+    install(); on Linux+NVIDIA nothing prebuilt ever matches, and raising there
+    made the first-run step in deploy/README.md fail while boot quietly built."""
+    mgr = EngineManager(tmp_config, probe=StubProbe(MIXED_GPUS, (13, 3)))
+    mgr.os_token, mgr.arch_token = "ubuntu", "x64"
+    built: dict[str, Any] = {}
+
+    async def fake_assets(tag: str) -> list[EngineAsset]:
+        return list(ASSETS)
+
+    async def fake_build(tag: str, *, arches: Any, progress: Any = None) -> Any:
+        built["tag"] = tag
+        built["arches"] = list(arches)
+        directory = _fake_engine(tmp_config.engines_dir, f"{tag}-local", 1_000)
+        return mgr._finalize(
+            directory,
+            directory / BIN_NAME,
+            "source-local",
+            _SmokeResult(True, "ok"),
+            activate=True,
+        )
+
+    monkeypatch.setattr(mgr, "list_assets", fake_assets)
+    monkeypatch.setattr(mgr, "build_from_source", fake_build)
+
+    info = await mgr.install(TAG)
+
+    assert built == {"tag": TAG, "arches": ["86", "120"]}
+    assert info.tag == f"{TAG}-local" and info.variant == "source-local"
+
+
+@pytest.mark.asyncio
+async def test_install_names_the_source_prerequisites_when_building_is_off(
+    tmp_config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tmp_config.engine.allow_source_build = False
+    mgr = EngineManager(tmp_config, probe=StubProbe(MIXED_GPUS, (13, 3)))
+    mgr.os_token, mgr.arch_token = "ubuntu", "x64"
+
+    async def fake_assets(tag: str) -> list[EngineAsset]:
+        return list(ASSETS)
+
+    monkeypatch.setattr(mgr, "list_assets", fake_assets)
+    with pytest.raises(EngineError) as excinfo:
+        await mgr.install(TAG)
+
+    message = str(excinfo.value)
+    assert "cmake" in message and "allow_source_build" in message
+    # The variants named are this platform's, not the Windows downloads.
+    assert "cuda-13.3" not in message
+    assert "cpu, vulkan" in message
+
+
+@pytest.mark.asyncio
+async def test_install_reuses_an_existing_local_build(
+    tmp_config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D27's reuse rule on the explicit path: a second `engine --update` on Linux
+    must not recompile for twenty minutes to reach the binary it already has."""
+    mgr = EngineManager(tmp_config, probe=StubProbe(MIXED_GPUS, (13, 3)))
+    mgr.os_token, mgr.arch_token = "ubuntu", "x64"
+    _fake_engine(tmp_config.engines_dir, f"{TAG}-local", 1_000)
+
+    async def fake_smoke(tag: str, tiny_model: Any) -> _SmokeResult:
+        return _SmokeResult(True, "stubbed", version_ok=True)
+
+    async def boom(tag: str) -> list[EngineAsset]:  # pragma: no cover - must not run
+        raise AssertionError("install hit the network for an engine it already has")
+
+    monkeypatch.setattr(mgr, "_smoke", fake_smoke)
+    monkeypatch.setattr(mgr, "list_assets", boom)
+
+    info = await mgr.install(TAG)
+
+    assert info.tag == f"{TAG}-local"
+    assert info.active is True
+
+
+# ---------------------------------------------------------------------------
+# Tarball archives (every ubuntu/macos asset upstream publishes)
+# ---------------------------------------------------------------------------
+
+
+def _tarball(path: Path, members: dict[str, bytes], *, link: str | None = None) -> Path:
+    with tarfile.open(path, "w:gz") as archive:
+        for name, data in members.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            info.mode = 0o755 if name.endswith(BIN_NAME) else 0o644
+            archive.addfile(info, io.BytesIO(data))
+        if link is not None:
+            info = tarfile.TarInfo(link)
+            info.type = tarfile.SYMTYPE
+            info.linkname = "/etc/passwd"
+            archive.addfile(info)
+    return path
+
+
+def test_extract_engine_archive_flattens_a_tarball_and_skips_unsafe_members(
+    tmp_path: Path,
+) -> None:
+    archive = _tarball(
+        tmp_path / f"llama-{TAG}-bin-ubuntu-x64.tar.gz",
+        {
+            f"llama-{TAG}/{BIN_NAME}": b"ELF",
+            f"llama-{TAG}/libllama.so": b"so",
+            f"llama-{TAG}/../escape.txt": b"nope",
+        },
+        link=f"llama-{TAG}/evil-link",
+    )
+    dest = tmp_path / "engines" / TAG
+
+    binary = extract_engine_archive(archive, dest)
+
+    assert binary == dest / BIN_NAME, "the shared llama-bNNNN/ prefix is stripped"
+    assert (dest / "libllama.so").read_bytes() == b"so"
+    assert not (tmp_path / "engines" / "escape.txt").exists()
+    assert not (dest / "evil-link").exists()
+    if os.name != "nt":
+        assert os.access(binary, os.X_OK), "the tarball's execute bit is carried over"
+
+
+def test_verify_archive_dispatches_on_the_suffix(tmp_path: Path) -> None:
+    good = _tarball(tmp_path / "good.tar.gz", {f"llama-{TAG}/{BIN_NAME}": b"ELF"})
+    _verify_archive(good)  # does not raise
+
+    truncated = tmp_path / "truncated.tar.gz"
+    truncated.write_bytes(good.read_bytes()[:20])
+    with pytest.raises(EngineError, match="tar"):
+        _verify_archive(truncated)
+
+    not_a_zip = tmp_path / "bogus.zip"
+    not_a_zip.write_bytes(b"nope")
+    with pytest.raises(EngineError, match="zip"):
+        _verify_archive(not_a_zip)
 
 
 @needs_engine

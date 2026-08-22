@@ -15,7 +15,14 @@ from typing import Any
 from nicegui import ui
 
 from studioforge.gui import state as st
-from studioforge.gui.tabs import GuiContext, api_request, busy, notify_error, run_blocking
+from studioforge.gui.tabs import (
+    GuiContext,
+    api_request,
+    busy,
+    notify_error,
+    require_local_admin,
+    run_blocking,
+)
 
 LOG_TAIL_LINES = 40
 
@@ -156,6 +163,7 @@ def _vram_holders_panel(ctx: GuiContext) -> None:
 async def _reclaim_orphans(ctx: GuiContext, refresh: Any) -> None:
     with busy(message="Reclaiming leaked VRAM…"):
         try:
+            require_local_admin(ctx, "reclaim VRAM")
             from studioforge.api.mgmt_routes import vram_reclaim
 
             payload = await vram_reclaim(api_request(ctx), dry_run=False)
@@ -209,27 +217,44 @@ def _leases_panel(ctx: GuiContext) -> None:
     container = ui.column().classes("w-full gap-1")
 
     def refresh() -> None:
-        leases = list(ctx.manager.leases.all())
+        manager = ctx.manager
+        if manager is None:
+            # No manager wired (a degraded start, or the GUI test harness): an
+            # empty panel, never an error card -- the whole tab must still
+            # render, like every other panel here.
+            note.set_text(st.leases_note([]))
+            container.clear()
+            return
+        try:
+            leases = list(manager.leases.all())
+            container.clear()
+            with container:
+                for lease in leases:
+                    with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                        ui.label(st.lease_line(lease)).classes("text-xs font-mono grow truncate")
+                        ui.button(
+                            icon="lock_open",
+                            on_click=lambda lease_id=lease.id: _release_lease(
+                                ctx, lease_id, refresh
+                            ),
+                        ).props("flat dense").tooltip(
+                            "Release this lease now. The model stays loaded; the cards simply "
+                            "stop being reserved for it."
+                        )
+        except Exception as exc:  # noqa: BLE001 - a book that will not answer is a stale note
+            note.set_text(st.poll_failure_note(exc))
+            return
         note.set_text(st.leases_note(leases))
-        container.clear()
-        with container:
-            for lease in leases:
-                with ui.row().classes("w-full items-center gap-2 no-wrap"):
-                    ui.label(st.lease_line(lease)).classes("text-xs font-mono grow truncate")
-                    ui.button(
-                        icon="lock_open",
-                        on_click=lambda lease_id=lease.id: _release_lease(ctx, lease_id, refresh),
-                    ).props("flat dense").tooltip(
-                        "Release this lease now. The model stays loaded; the cards simply "
-                        "stop being reserved for it."
-                    )
 
     refresh()
     ui.timer(ctx.refresh_interval, refresh)
 
 
-async def _release_lease(ctx: GuiContext, lease_id: str, refresh: Any) -> None:
+def _release_lease(ctx: GuiContext, lease_id: str, refresh: Any) -> None:
+    # Plain def: the lease book is in-memory and ``release_lease`` is
+    # synchronous, so there is nothing to await.
     try:
+        require_local_admin(ctx, "release lease")
         ctx.manager.release_lease(lease_id)
     except Exception as exc:  # noqa: BLE001
         notify_error(exc, what="release lease")
@@ -343,10 +368,7 @@ def _loaded_card(
                     ctx, model_id, p, refresh
                 ),
             ).props("flat dense color=accent" if pinned else "flat dense").tooltip(
-                "Unpin: back to the normal idle TTL"
-                if pinned
-                else "Pin: keep loaded at all times — no idle TTL, never evicted, "
-                "auto-loaded at startup and reloaded if it goes down"
+                st.pin_tooltip(pinned, auto_load_pinned=ctx.config.models.auto_load_pinned)
             )
             ui.button(
                 icon="restart_alt",
@@ -396,6 +418,9 @@ def _loaded_card(
 
 async def _toggle_pin(ctx: GuiContext, model_id: str, pinned: bool, refresh: Any) -> None:
     try:
+        # A pin outlives the instance (boot autoload, reconciler), so it is a
+        # box change under D32/D41, not residency.
+        require_local_admin(ctx, "pin")
         updated, _ttl = await run_blocking(ctx.manager.set_pinned, model_id, not pinned)
     except Exception as exc:  # noqa: BLE001
         notify_error(exc, what="pin")
@@ -462,6 +487,7 @@ async def _restart_engines(ctx: GuiContext, refresh: Any) -> None:
     """
     with busy(message="Restarting the inference engines…"):
         try:
+            require_local_admin(ctx, "restart engines")
             from studioforge.api.admin_routes import restart_backend
 
             payload = await restart_backend(api_request(ctx))
@@ -487,6 +513,7 @@ def _restart_server_dialog(ctx: GuiContext, banner: Any) -> None:
             dialog.close()
             banner.set_text("Restarting the server… this page will reconnect by itself.")
             try:
+                require_local_admin(ctx, "restart server")
                 from studioforge.api.admin_routes import restart_server
 
                 # confirm=True is required by the endpoint; the dialog above is

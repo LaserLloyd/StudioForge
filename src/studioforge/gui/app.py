@@ -17,10 +17,14 @@ HTTPS front end.
 **Auth mirrors the gateway's.** When ``server.api_key`` is set, the panel is
 gated too: a browser gets a small login page that exchanges the key for a
 signed cookie, and an API client can present the same ``Authorization: Bearer``
-header the gateway accepts. When no key is configured there is no gate at all,
-which matches the gateway's own LAN/tailnet-trust default. The cookie carries a
-*derived* token, never the key, and ``secure`` is deliberately not set because
-the common deployment is plain HTTP on a tailnet.
+header the gateway accepts. When no key is configured the page itself is open,
+which matches the gateway's own LAN/tailnet-trust default -- reads, chat, load
+and unload work for anyone who can reach it -- but the buttons that change the
+*box* (config, files, engines, restarts, downloads) follow the API's D32 rule
+from the viewer's peer address: they work from a browser on this machine and
+refuse a remote one (:func:`studioforge.gui.tabs.require_local_admin`). The
+cookie carries a *derived* token, never the key, and ``secure`` is deliberately
+not set because the common deployment is plain HTTP on a tailnet.
 """
 
 from __future__ import annotations

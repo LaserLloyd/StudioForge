@@ -148,6 +148,7 @@ class StubManager:
         self.leased: list[dict[str, Any]] = []
         self.released: list[str] = []
         self.unloads: list[str] = []
+        self.unload_kwargs: list[dict[str, Any]] = []
         #: device tuples whose load should blow up
         self.fail_devices: set[tuple[int, ...]] = set()
         #: awaited inside load(), so a test can hold a run open
@@ -182,8 +183,9 @@ class StubManager:
     def release_lease(self, lease_id: str) -> None:
         self.released.append(lease_id)
 
-    async def unload(self, name: str) -> bool:
+    async def unload(self, name: str, **kwargs: Any) -> bool:
         self.unloads.append(name)
+        self.unload_kwargs.append(dict(kwargs))
         return self.supervisor.instances.pop(self.record.id, None) is not None
 
 
@@ -596,6 +598,23 @@ async def test_run_measures_every_applicable_mode_and_restores_state(
     assert "loading" in phases
     assert "generating" in phases
     assert progress[-1] == (None, "done", 1.0)
+
+
+async def test_benchmark_teardown_is_housekeeping_not_a_deliberate_unload(
+    engine: FakeEngine,
+) -> None:
+    """D41: a deliberate unload suppresses the pin reconciler. The per-mode fresh
+    process and the final teardown are neither, or a pinned model benchmarked
+    once stayed down until a restart."""
+    probe = StubProbe(reference_rig())
+    record = make_record(pinned=True)
+    manager = StubManager(record, probe)
+    bench = Benchmarker(manager, probe=probe)
+
+    await bench.run(record, modes=["rtx-5090-x1"], ctx_size=1024, max_tokens=32)
+
+    assert len(manager.unloads) >= 2, "one per mode plus the final teardown"
+    assert all(kwargs == {"deliberate": False} for kwargs in manager.unload_kwargs)
 
 
 async def test_run_defaults_to_a_long_deterministic_prompt(engine: FakeEngine) -> None:

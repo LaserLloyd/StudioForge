@@ -40,7 +40,7 @@ the one button that fixes them.
 | **GPUs** | NVML sees at least one card. StudioForge is GPU-only: no GPU, no inference | Check the driver, then **Re-probe** |
 | **llama.cpp engine** | A versioned engine is installed under `engines/<tag>/` and active | **Install engine b10425** |
 | **Gateway port** | Something is listening on `server.port`, and that something is us rather than LM Studio or a second copy of StudioForge | Quit the other one, or change the port |
-| **MCP pairing PIN** | Required only while `mcp.pin_required` is on | **Generate PIN** |
+| **MCP pairing PIN** | Required while `mcp.pin_required` is on — and, with no `server.api_key`, for every MCP caller that is not on this machine whatever the toggle says (D32) | **Generate PIN** |
 | *HuggingFace token* | Optional. Only gated or private repositories need one | Paste one into **Downloads & HuggingFace** |
 | *Start at login* | Optional | **Enable** in **Startup & service** |
 
@@ -81,6 +81,12 @@ Three fields, and they are the ones most worth understanding (DECISIONS.md D14):
 
 An explicit context — per model, or in the request — is always honoured verbatim.
 
+**`planner.preference`** decides what the catalog's one *recommended* load per model optimises
+for (D36): `quality` (the default) keeps the best KV cache type that reaches the floor and then
+takes the largest window at that quality; `throughput` takes the largest window at or above the
+floor, and a second slot if it fits, even with a quantized cache. [`CATALOG.md`](CATALOG.md) has
+the measurements behind the default.
+
 **`models.default_parallel`** is `auto` by default: the slot count is estimated per model and per
 placement (D17). `llama-server`'s `--ctx-size` is the *total* budget shared by the slots, so
 StudioForge multiplies the per-conversation window by the slot count when it launches the child.
@@ -120,6 +126,13 @@ a forced placement, because it describes the *neighbour's* memory.
 `planner.headroom_fraction` is different again: it is a percentage held back from **every** card,
 which is exactly why the two knobs above had to exist.
 
+**`planner.rebalance`** (`auto` | `suggest` | `off`, default `auto`) is the D42 housekeeping pass:
+once a minute, on a quiet box, a model idle for five minutes or more whose exact current settings
+would now fit on fewer cards — or off a card it shares with another model — is reloaded there. It
+evicts nothing, never touches a model that is serving, a persisted `device_override`, or a model
+holding a GPU lease (D43), and moves each model at most once per half hour. `suggest` only logs
+what it would do.
+
 ---
 
 ## 5. Engine
@@ -140,8 +153,14 @@ verified by reading the asset list, not by taking whatever tag sorts first — a
 downgrade an update. Installing a new engine does not disturb running models: each `llama-server`
 child keeps the build it was launched with until it is reloaded.
 
-`allow_source_build` is the documented fallback when nothing prebuilt fits. `keep_versions` is how
-many old engine directories survive a prune.
+**Linux + NVIDIA always builds from source.** Upstream publishes no Linux CUDA archive at any tag
+(the `ubuntu` assets are cpu, vulkan, rocm, sycl and openvino), so on Linux every install path —
+first run, **Install engine**, `engine --update`, the MCP tool — compiles the pinned tag with
+`allow_source_build` (default on) and needs `git`, `cmake` and a CUDA toolkit whose `nvcc` matches
+the driver. The build takes minutes, lands in `engines/<tag>-local/`, is reused on the next
+install of the same tag, and is smoke-tested like a download. With `allow_source_build: false` the
+refusal names those prerequisites. The ROCm tarball serves AMD cards the same way a Windows zip
+does. `keep_versions` is how many old engine directories survive a prune.
 
 ---
 
@@ -152,7 +171,7 @@ many old engine directories survive a prune.
 | `server.host` | A **bind** address. `0.0.0.0` listens on every interface, LAN and tailnet included; `127.0.0.1` is this machine only, which also means no agent on another box can reach it |
 | `server.port` | `1234` is LM Studio's default, which is the whole point — pointing an OpenAI client here is a host change, not a rewrite. They cannot share the port, though: quit LM Studio or move one of them |
 | `gui.port` / `watchdog.port` | This panel, and the recovery sidecar (a separate process) |
-| `server.api_key` | Guards inference **and** this panel. Blank means no auth at all, which is the LAN/tailnet-trust default |
+| `server.api_key` | Guards inference **and** this panel. Blank is the LAN/tailnet-trust default: reads, inference and load/unload are open, but changing the box (config, files, engines, restarts, downloads) needs a browser on the machine itself, the same rule the API applies (D32) |
 | `mcp.pin` | A short pairing code for the MCP path only — deliberately *not* the inference credential. **Generate new PIN** rotates it, which is the documented response to a leak; every already-paired agent then needs the new one |
 
 All three secrets render masked, with a reveal button. Leaving a masked field untouched keeps the
@@ -171,7 +190,14 @@ Even with no key, the routes that change the *box* — `PATCH /api/config`, rest
 app installs, deleting model files, queueing downloads, killing processes — are accepted only from
 this machine or with the MCP PIN (`X-MCP-Pin`, or as the bearer token, which is how `sfctl` sends
 it); anything else is `403 remote_admin_requires_credential` (D32). Reads, inference and
-load/unload stay open, as LM Studio's do.
+load/unload stay open, as LM Studio's do. "This machine" means the peer address *and* the browser
+origin: a page from any other site or port that your browser sends to `127.0.0.1:1234` is
+refused, and is not handed the PIN, even though it arrives from loopback. The MCP path follows
+the same rule — with no key, a caller off the box needs the PIN for every tool call even when
+`mcp.pin_required` is off (that toggle only relaxes same-machine callers), and `GET /api/mcp/info`
+reports the `pin_required` the caller will actually be held to. Send the PIN as `X-MCP-Pin` or as
+the bearer token; `?pin=` in the URL is still accepted for connectors that can only be configured
+with a URL, but a URL ends up in proxy logs and shell history, so it is no longer advertised.
 
 **Reachable at** lists the concrete addresses another machine can use — Tailscale first, because a
 tailnet address survives a network change where a LAN address silently stops resolving.
@@ -232,6 +258,26 @@ Three things are deliberately *not* in it, and each is a rule rather than a list
 A **↻** marker means the change is saved immediately but only takes effect after a restart
 (`RESTART_REQUIRED_KEYS`: the ports, the bind addresses, the data dir, the CORS origins and the MCP
 mount path).
+
+---
+
+## 9. Downloading models
+
+The **Download** tab searches HuggingFace and queues a quant; `sfctl download <repo> --quant
+<Q>` does the same from the agent's machine, and an agent uses `search_models` → `repo_details` →
+`download_model`. Downloads are resumable, verified (sha256 where the repository publishes one,
+byte count always) against what is actually on disk, survive a restart, and land in your library
+using LM Studio's `publisher/repo/` layout. Gated repositories need `hf.token`.
+
+HuggingFace's **Use this model → LM Studio** button can open StudioForge's quant picker instead:
+
+```bash
+studioforge protocol register --takeover-lmstudio
+```
+
+Opt-in and reversible — LM Studio's handler is backed up first and restored by `studioforge
+protocol unregister`. Without the flag only the `studioforge://` scheme is claimed and LM Studio is
+left alone. The Server tab shows the handler's true current state.
 
 ---
 

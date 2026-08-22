@@ -25,7 +25,14 @@ from typing import Any, Final
 from nicegui import ui
 
 from studioforge.gui import state as st
-from studioforge.gui.tabs import GuiContext, busy, notify_error, panel_guard, run_blocking
+from studioforge.gui.tabs import (
+    GuiContext,
+    busy,
+    notify_error,
+    panel_guard,
+    require_local_admin,
+    run_blocking,
+)
 
 _KV_TYPES = ("", "f32", "f16", "bf16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0")
 _FLASH_ATTN = ("", "on", "off", "auto")
@@ -460,10 +467,10 @@ def _model_row(ctx: GuiContext, record: Any, instance: Any, table: Any) -> None:
             ui.button(icon="push_pin", on_click=lambda r=record: _toggle_pin(ctx, r, table)).props(
                 "flat dense color=accent" if record.settings.pinned else "flat dense"
             ).tooltip(
-                "Unpin: back to the normal idle TTL"
-                if record.settings.pinned
-                else "Pin: keep loaded at all times — no idle TTL, never evicted, "
-                "auto-loaded at startup and reloaded if it goes down"
+                st.pin_tooltip(
+                    record.settings.pinned,
+                    auto_load_pinned=ctx.config.models.auto_load_pinned,
+                )
             )
             ui.button(icon="science", on_click=lambda r=record: _test(ctx, r)).props(
                 "flat dense"
@@ -518,6 +525,8 @@ async def _toggle_pin(ctx: GuiContext, record: Any, table: Any) -> None:
     # manager.set_pinned, not save_settings directly: the pin must bite on the
     # resident instance immediately (refresh_ttl) and re-arm the reconciler.
     try:
+        # A pin outlives the instance, so it is a box change under D32/D41.
+        require_local_admin(ctx, "pin")
         updated, _ttl = await run_blocking(
             ctx.manager.set_pinned, record.id, not record.settings.pinned
         )
@@ -630,6 +639,9 @@ def _delete_dialog(ctx: GuiContext, record: Any, table: Any) -> None:
         async def confirm() -> None:
             delete_files = bool(files.value) if files is not None else False
             try:
+                # Same rule as DELETE /api/models/ (D32): a deletion, files or
+                # registration, is a box change.
+                require_local_admin(ctx, "delete")
                 removed = await run_blocking(
                     ctx.registry.delete_model, record.id, delete_files=delete_files
                 )
@@ -901,6 +913,9 @@ def _settings_dialog(ctx: GuiContext, record: Any, table: Any) -> None:  # noqa:
                     )
                     return
             try:
+                # Saved settings shape every future load (PUT /settings is
+                # under the D32 gate since D41), unlike a one-off load.
+                require_local_admin(ctx, "save settings")
                 await run_blocking(ctx.registry.save_settings, record.id, settings)
             except Exception as exc:  # noqa: BLE001
                 notify_error(exc, what="save settings")

@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from studioforge.config import Config
+from studioforge.core import protocol
 from studioforge.core.protocol import (
     LMSTUDIO_SCHEME,
     OWN_SCHEME,
@@ -274,9 +275,28 @@ def test_register_without_takeover_leaves_lmstudio_alone(tmp_path: Path) -> None
 # ---------------------------------------------------------------------------
 
 
+def _stub_xdg_tools(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[list[str]]:
+    """Make the Linux branch hermetic: record the xdg tools, never run them.
+
+    ``xdg-mime default`` writes the developer's real ``~/.config/mimeapps.list``
+    and would leave ``lmstudio://`` bound to a desktop file in a pytest tmp dir
+    that ``_unregister_linux`` never unbinds. Pretend every tool exists so the
+    branch is exercised on every host, and capture argv instead of spawning.
+    ``XDG_CONFIG_HOME`` is redirected too, so a future code path that forgets
+    the stub still cannot reach the real config.
+    """
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "share"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    calls: list[list[str]] = []
+    monkeypatch.setattr(protocol.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(protocol.subprocess, "run", lambda argv, **_: calls.append(list(argv)))
+    return calls
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX desktop files only")
 def test_linux_desktop_file_written(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "share"))
+    """The desktop file is the contract; the xdg tools are recorded, not run."""
+    calls = _stub_xdg_tools(monkeypatch, tmp_path)
     config = make_config(tmp_path)
     result = register(config, takeover_lmstudio=True)
     desktop = Path(str(result["desktop_file"]))
@@ -285,8 +305,53 @@ def test_linux_desktop_file_written(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     assert f"x-scheme-handler/{OWN_SCHEME}" in text
     assert f"x-scheme-handler/{LMSTUDIO_SCHEME}" in text
     assert "%u" in text
+    assert any(argv[0].endswith("xdg-mime") for argv in calls), "the takeover must be applied"
     unregister(config)
     assert not desktop.exists()
+
+
+def test_linux_takeover_binds_both_schemes_through_xdg_mime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pin the exact ``xdg-mime`` calls, on every platform.
+
+    ``_register_linux``/``_unregister_linux`` are pure Python plus two
+    subprocess calls, so driving them directly lets the Windows rig (where the
+    author works) and CI both check the Linux contract instead of leaving it to
+    a test that only ever runs on a POSIX box.
+    """
+    calls = _stub_xdg_tools(monkeypatch, tmp_path)
+    config = make_config(tmp_path)
+    result = protocol._register_linux(config, takeover_lmstudio=True)
+    desktop = Path(str(result["desktop_file"]))
+    assert desktop.is_file()
+    assert calls[0][0].endswith("update-desktop-database")
+    xdg_mime = [argv[1:] for argv in calls if argv[0].endswith("xdg-mime")]
+    assert xdg_mime == [
+        ["default", desktop.name, f"x-scheme-handler/{OWN_SCHEME}"],
+        ["default", desktop.name, f"x-scheme-handler/{LMSTUDIO_SCHEME}"],
+    ]
+
+    calls.clear()
+    removed = protocol._unregister_linux(config)
+    assert removed["removed"] == str(desktop)
+    assert not desktop.exists()
+    assert [argv[0] for argv in calls] == ["/usr/bin/update-desktop-database"]
+
+
+def test_linux_register_without_tools_still_writes_the_desktop_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No xdg-utils on the box (minimal containers): the file is still the
+    contract, and nothing is spawned."""
+    calls = _stub_xdg_tools(monkeypatch, tmp_path)
+    monkeypatch.setattr(protocol.shutil, "which", lambda name: None)
+    config = make_config(tmp_path)
+    result = protocol._register_linux(config, takeover_lmstudio=False)
+    text = Path(str(result["desktop_file"])).read_text(encoding="utf-8")
+    assert f"x-scheme-handler/{OWN_SCHEME}" in text
+    assert f"x-scheme-handler/{LMSTUDIO_SCHEME}" not in text
+    assert calls == []
 
 
 @windows_only

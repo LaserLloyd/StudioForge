@@ -13,14 +13,33 @@ header) and no other -- not a URL, not a balloon, not the clipboard.
 
 from __future__ import annotations
 
+import os
 import socket
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-pystray = pytest.importorskip("pystray", reason="the tray needs pystray")
+# pystray picks its backend at import time. Off Windows the chain is
+# appindicator -> gtk -> xorg, and the xorg backend opens an X display at module
+# level; with no DISPLAY that raises Xlib.error.DisplayNameError, which is not an
+# ImportError, so importorskip would surface it as a collection error -- and one
+# collection error aborts the whole pytest run, not just this file. Nothing here
+# ever runs an icon (Menu/MenuItem come from pystray._base under every backend),
+# so the inert backend is the right one wherever there is no Win32 message pump.
+# setdefault so an explicit choice still wins.
+if sys.platform != "win32":
+    os.environ.setdefault("PYSTRAY_BACKEND", "dummy")
+
+try:
+    import pystray  # noqa: F401
+except Exception as exc:  # more than ImportError escapes when no backend fits
+    # Belt and braces for the setdefault above: an explicit PYSTRAY_BACKEND
+    # that cannot load here (xorg with no DISPLAY, a typo) must skip this
+    # file, not abort collection of the whole suite.
+    pytest.skip(f"the tray needs a usable pystray: {exc}", allow_module_level=True)
 
 from studioforge.config import Config  # noqa: E402
 from studioforge.core import autostart  # noqa: E402
@@ -911,3 +930,50 @@ def test_port_conflict_respawns_are_bounded_and_the_report_names_the_real_port(
     assert app.state == STATE_CRASHED
     assert "1235" in app.status_line() and "watchdog" in app.status_line()
     assert str(config.server.port) not in app.status_line() or config.server.port == 1235
+
+
+# ---------------------------------------------------------------------------
+# Headless hosts (2026-08-22): the ubuntu CI leg and any X-less Linux box
+# ---------------------------------------------------------------------------
+
+
+def test_headless_hosts_get_the_inert_pystray_backend() -> None:
+    """The module-level guard above is what lets this file collect off Windows.
+
+    Off Windows pystray's xorg backend opens an X display at import and raises
+    a non-ImportError when there is none, which pytest's importorskip does not
+    swallow; the guard parks pystray on its inert backend first. On Windows the
+    guard must stay out of the way so the suite keeps importing the real
+    ``_win32`` backend -- the reference platform, and the only place a pywin32
+    regression inside pystray would show up.
+    """
+    import importlib
+
+    chosen = os.environ.get("PYSTRAY_BACKEND")
+    if sys.platform == "win32":
+        backend = chosen or "win32"
+    else:
+        assert chosen, "the guard must have forced a backend before importing pystray"
+        backend = chosen
+    # Identity, not __module__: the dummy backend re-exports _base.Icon as-is.
+    assert pystray.Icon is importlib.import_module(f"pystray._{backend}").Icon
+    # Whatever the backend, the menu types the tests use come from _base.
+    assert pystray.Menu.__module__ == pystray.MenuItem.__module__ == "pystray._base"
+
+
+def test_ci_gives_the_linux_leg_the_inert_backend() -> None:
+    """The CI workflow sets PYSTRAY_BACKEND for Linux only -- belt and braces.
+
+    The in-file guard already covers the ubuntu runner, but the workflow is
+    where the next person looks when the job is red, so the choice lives there
+    too, scoped so the Windows leg keeps exercising the real backend.
+    """
+    import yaml
+
+    workflow = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml"
+    jobs = yaml.safe_load(workflow.read_text(encoding="utf-8"))["jobs"]
+    steps = [s for job in jobs.values() for s in job["steps"] if s.get("name") == "Unit tests"]
+    assert len(steps) == 1, "expected exactly one 'Unit tests' step across the jobs"
+    value = steps[0]["env"]["PYSTRAY_BACKEND"]
+    assert "dummy" in value
+    assert "runner.os == 'Linux'" in value, "must not replace the real backend on Windows"

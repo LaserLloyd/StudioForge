@@ -44,4 +44,12 @@ jobs:
       - name: Unit tests
         env:
           SF_GPU_PROBE: "null"
+          # pystray's Linux backends want an X display at import time (the
+          # xorg one opens it at module level, and the error it raises is not
+          # an ImportError, so importorskip cannot skip it). The tray tests
+          # never run an icon, so the headless runner gets the inert backend.
+          # Windows keeps the real _win32 backend: it is the reference
+          # platform and the only leg where a pywin32 regression would show.
+          # pystray treats an empty value as "platform default".
+          PYSTRAY_BACKEND: ${{ runner.os == 'Linux' && 'dummy' || '' }}
         run: uv run --python .venv pytest tests/unit -q --timeout=300

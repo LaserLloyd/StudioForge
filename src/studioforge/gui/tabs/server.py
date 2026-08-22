@@ -33,6 +33,7 @@ from studioforge.gui.tabs import (
     busy,
     notify_error,
     panel_guard,
+    require_local_admin,
     run_blocking,
 )
 
@@ -236,6 +237,10 @@ async def _register_protocol(ctx: GuiContext, refresh: Any, *, takeover: bool) -
 
     with busy(message="Registering the URL handler…"):
         try:
+            # A per-user URL-handler registration on the box, with no API
+            # route at all: the panel is its only surface, so the D32 rule
+            # has to be applied here.
+            require_local_admin(ctx, "register protocol handler")
             raw = await run_blocking(protocol.register, ctx.config, takeover_lmstudio=takeover)
             result: dict[str, Any] = dict(raw)
         except Exception as exc:  # noqa: BLE001
@@ -279,6 +284,7 @@ async def _restore_protocol(ctx: GuiContext, refresh: Any) -> None:
 
     with busy(message="Restoring LM Studio's handler…"):
         try:
+            require_local_admin(ctx, "restore LM Studio handler")
             result: dict[str, Any] = dict(await run_blocking(protocol.unregister, ctx.config))
         except Exception as exc:  # noqa: BLE001
             notify_error(exc, what="restore LM Studio handler")
@@ -545,16 +551,20 @@ def _config_widget(field: st.ConfigField, value: Any) -> Any:
         widget = ui.input(field.label, value=str(value or ""), password=True).props(
             "dense outlined"
         )
-        widget.tooltip(
-            "Shown masked. Leave it as-is to keep the current secret; type a new one to replace it."
-        )
     else:
         widget = ui.input(field.label, value="" if value is None else str(value)).props(
             "dense outlined"
         )
     widget.classes("grow")
-    if field.help:
-        widget.tooltip(field.help)
+    # One tooltip per widget: a secret's handling note is folded into the
+    # same string rather than nested as a second tooltip element.
+    parts = [field.help] if field.help else []
+    if field.kind == "secret":
+        parts.append(
+            "Shown masked. Leave it as-is to keep the current secret; type a new one to replace it."
+        )
+    if parts:
+        widget.tooltip(" ".join(parts))
     return widget
 
 
@@ -633,6 +643,7 @@ async def install_engine(ctx: GuiContext, tag: Any, refresh: Any) -> None:
         return
     with busy(message=f"Installing engine {tag} (this can take a while)…"):
         try:
+            require_local_admin(ctx, "engine install")
             info = await ctx.engine_manager.install(tag)
         except Exception as exc:  # noqa: BLE001
             notify_error(exc, what="engine install")
@@ -665,6 +676,7 @@ async def activate_engine(ctx: GuiContext, tag: str, refresh: Any) -> None:
     """
     with busy(message=f"Activating {tag} and reloading models…"):
         try:
+            require_local_admin(ctx, "activate engine")
             await run_blocking(ctx.engine_manager.set_active, tag)
             ctx.config.engine.pinned_tag = tag
             await run_blocking(ctx.config.save)

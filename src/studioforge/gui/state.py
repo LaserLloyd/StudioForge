@@ -170,6 +170,25 @@ def instance_ttl_text(instance: InstanceInfo | None, *, pinned: bool = False) ->
     return ttl_text(instance.ttl_remaining_s, pinned=pinned)
 
 
+def pin_tooltip(pinned: bool, *, auto_load_pinned: bool) -> str:
+    """What clicking the pin button commits the server to (D41).
+
+    The button is the one place an operator reads the pin contract, and
+    ``models.auto_load_pinned`` gates half of it: off, nothing reloads a pinned
+    model at boot or after a crash. Both tabs (Dashboard card, Models row) use
+    this so the two buttons and the Setup tab's help text cannot disagree.
+    """
+    if pinned:
+        return "Unpin: back to the normal idle TTL"
+    base = "Pin: keep loaded at all times — no idle TTL, never evicted"
+    if auto_load_pinned:
+        return f"{base}, auto-loaded at startup and reloaded if it goes down"
+    return (
+        f"{base}. Not reloaded at startup or after a crash: 'Load pinned models at "
+        "startup and keep them loaded' is off in Setup (models.auto_load_pinned)"
+    )
+
+
 def format_timestamp(epoch: float | int | None) -> str:
     if epoch is None:
         return UNKNOWN
@@ -2382,50 +2401,42 @@ class ConfigField:
     key: str
     label: str
     kind: str  # "text" | "int" | "float" | "bool" | "secret" | "select" | "list"
-    help: str = ""
     options: tuple[str, ...] = ()
 
     @property
     def restart_required(self) -> bool:
         return self.key in RESTART_REQUIRED_KEYS
 
+    @property
+    def help(self) -> str:
+        """The Setup tab's sentence for this key, so the two forms cannot disagree.
+
+        D26 keeps the Server tab's panels, but its rule is one control per
+        key; two forms with two explanations of ``models.default_ctx`` had one
+        of them still describing the pre-D14 meaning. Resolved lazily because
+        :data:`CONFIG_FIELD_HELP` is declared further down this module.
+        """
+        return CONFIG_FIELD_HELP.get(self.key, "")
+
 
 CONFIG_FIELDS: Final[tuple[ConfigField, ...]] = (
-    ConfigField("server.host", "Bind address", "text", "0.0.0.0 exposes it on the tailnet"),
-    ConfigField("server.port", "Gateway port", "int", "LM Studio's default is 1234"),
-    ConfigField("server.api_key", "API key", "secret", "Blank disables auth (LAN/tailnet trust)"),
-    ConfigField("server.cors_origins", "CORS origins", "list", "Comma separated; * allows all"),
-    ConfigField("models.dir", "Model directory", "text", "Primary GGUF library root"),
-    ConfigField("models.default_ctx", "Default context", "int", "Used when a model says Auto"),
-    ConfigField("models.default_ttl_s", "Default TTL (s)", "int", "0 means never idle-unload"),
+    ConfigField("server.host", "Bind address", "text"),
+    ConfigField("server.port", "Gateway port", "int"),
+    ConfigField("server.api_key", "API key", "secret"),
+    ConfigField("server.cors_origins", "CORS origins", "list"),
+    ConfigField("models.dir", "Model directory", "text"),
+    ConfigField("models.default_ctx", "Context floor", "int"),
+    ConfigField("models.default_ttl_s", "Default TTL (s)", "int"),
+    ConfigField("models.default_cache_reuse", "Default prompt-cache reuse", "int"),
+    ConfigField("planner.headroom_fraction", "VRAM headroom", "float"),
     ConfigField(
-        "models.default_cache_reuse",
-        "Default prompt-cache reuse",
-        "int",
-        "Biggest latency win for agent workloads; keep it above 0",
+        "planner.on_insufficient", "When VRAM is short", "select", options=("evict", "reject")
     ),
     ConfigField(
-        "planner.headroom_fraction",
-        "VRAM headroom",
-        "float",
-        "Fraction of each GPU held back from the planner",
+        "planner.preference", "Optimise loads for", "select", options=("quality", "throughput")
     ),
-    ConfigField(
-        "planner.on_insufficient",
-        "When VRAM is short",
-        "select",
-        "evict = unload LRU unpinned models; reject = refuse the load",
-        ("evict", "reject"),
-    ),
-    ConfigField(
-        "planner.preference",
-        "Optimise loads for",
-        "select",
-        "quality = best KV cache first; throughput = biggest window first",
-        ("quality", "throughput"),
-    ),
-    ConfigField("hf.token", "HuggingFace token", "secret", "Needed for gated repos"),
-    ConfigField("gui.port", "GUI port", "int", "This panel's own port"),
+    ConfigField("hf.token", "HuggingFace token", "secret"),
+    ConfigField("gui.port", "GUI port", "int"),
 )
 
 SECRET_CONFIG_KEYS: Final = frozenset(f.key for f in CONFIG_FIELDS if f.kind == "secret")
@@ -4321,17 +4332,27 @@ def save_result_text(payload: Mapping[str, Any] | None) -> str:
 
 #: Hand-written one-liners for the keys a first-run user has to think about.
 #: Anything without an entry falls back to "<kind>, default <x>", which is why
-#: a newly added key is never *missing* an explanation, only a good one.
+#: a newly added key is never *missing* an explanation, only a good one. Three
+#: classes of key must not ship on the fallback, and a test pins them: a
+#: security toggle ("bool, default False" says nothing about an SSRF guard),
+#: the sweep cadence that D41-D43 ride, and a D-numbered engine switch.
 CONFIG_FIELD_HELP: Final[Mapping[str, str]] = {
     "server.host": "Bind address. 0.0.0.0 exposes the gateway on the LAN and the tailnet.",
     "server.port": "Gateway port. 1234 is LM Studio's, so OpenAI clients need no change.",
-    "server.api_key": "Inference + panel credential. Blank disables auth (LAN/tailnet trust).",
+    "server.api_key": (
+        "Inference + panel credential. Blank leaves reads, inference and load/unload open "
+        "(LAN/tailnet trust); changing the box then needs a caller on this machine (D32)."
+    ),
     "server.cors_origins": "Comma separated; * allows every browser origin.",
     "gui.port": "This control panel's own port.",
     "watchdog.port": "The recovery sidecar's port. It is a separate process.",
+    "mcp.enabled": "The agent control plane (MCP) on this gateway.",
+    "mcp.path": "URL path the MCP endpoint is served on.",
     "mcp.pin": "Short pairing code for the MCP path. Rotate it if it leaks.",
     "mcp.pin_required": "Off falls back to the API key alone for MCP.",
+    "mcp.advertise": "Print the reachable MCP URLs (and the PIN) in the startup banner.",
     "models.dir": "Primary GGUF library root. Scanned in place; nothing is copied or moved.",
+    "models.extra_dirs": "Additional GGUF roots scanned alongside models.dir.",
     "models.default_ctx": "Context FLOOR. The planner never drops below this to buy a slot.",
     "models.target_ctx": (
         "Context every load AIMS for; the planner halves down from here to what fits (D14)."
@@ -4362,7 +4383,23 @@ CONFIG_FIELD_HELP: Final[Mapping[str, str]] = {
     "engine.cuda_variant": "'auto' picks the highest CUDA build this driver can run.",
     "engine.keep_versions": "How many old engine directories to keep when pruning.",
     "engine.allow_source_build": "Fall back to building llama.cpp when no prebuilt asset fits.",
+    "engine.cache_ram_mb": (
+        "Host-RAM prompt cache (--cache-ram), in MiB. 'auto' = 25% of RAM up to 32 GiB; "
+        "0 off; -1 no limit (D38)."
+    ),
+    "engine.ubatch_size": (
+        "Micro-batch (-ub). Blank keeps the engine's 512; raising it buys prefill speed for "
+        "compute-buffer VRAM (D38/D40)."
+    ),
+    "engine.backend_sampling": (
+        "GPU-side sampling (-bs). Experimental in b10425, so off under the quality-first "
+        "rule (D38)."
+    ),
     "planner.headroom_fraction": "Fraction of EVERY GPU held back from the planner.",
+    "planner.prefer_single_gpu": (
+        "Fit a model on one card when it can, before splitting it across several."
+    ),
+    "planner.cuda_context_mb": "Per-GPU allowance for the CUDA context and cuBLAS workspace.",
     "planner.on_insufficient": "evict = unload LRU unpinned models; reject = refuse the load.",
     "planner.rebalance": (
         "auto = relocate an idle model whose placement went stale (quiet box only); "
@@ -4373,9 +4410,22 @@ CONFIG_FIELD_HELP: Final[Mapping[str, str]] = {
         "that quality; throughput = the biggest window, preferring one that serves two slots."
     ),
     "planner.compute_overhead_fraction": "Calibrated allowance for compute and graph buffers.",
+    "gateway.allow_private_image_hosts": (
+        "Let a request's image_url fetch loopback/LAN/link-local hosts. Off is the SSRF "
+        "guard: the caller picks the URL, so on an open install it would be an "
+        "unauthenticated LAN probe. On only to serve images from your own network."
+    ),
+    "gateway.ttl_sweep_interval_s": (
+        "Seconds between housekeeping sweeps. Idle unloads, lease expiry (D43) and the pin "
+        "reconciler (D41) run each sweep; the rebalancer (D42) looks once a minute."
+    ),
+    "gateway.merge_reasoning_into_content": (
+        "Put a reasoning-only reply in message.content instead of returning an empty string."
+    ),
     "hf.token": "Needed only for gated or private HuggingFace repositories.",
     "hf.max_concurrent_downloads": "Parallel downloads. Raising it rarely helps a single link.",
     "hf.chunk_bytes": "Download chunk size, in bytes.",
     "logging.level": "DEBUG/INFO/WARNING/ERROR for the whole process.",
     "logging.json": "Structured JSON log lines instead of the human-readable renderer.",
+    "update.channel": "stable = tagged releases only; prerelease = pre-releases too.",
 }

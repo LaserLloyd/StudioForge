@@ -1351,8 +1351,12 @@ class Supervisor:
         else:
             kwargs["start_new_session"] = True
 
-        # Run from the engine directory: the CUDA/ggml DLLs (or .so files) ship
-        # alongside llama-server and are found relative to it.
+        # Run from the engine directory: that is the Windows DLL search rule,
+        # and the CUDA/ggml DLLs ship alongside llama-server. It does nothing
+        # for Linux -- ld.so never searches the working directory -- so there
+        # the .so files beside the binary are found through its $ORIGIN
+        # RUNPATH instead: upstream's ubuntu archives carry one, and the
+        # source build (engine.build_from_source) bakes the same one in.
         engine_dir = Path(argv[0]).parent
         log.info(
             "model_spawn",

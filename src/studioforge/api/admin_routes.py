@@ -24,7 +24,12 @@ from typing import Any
 import httpx
 from fastapi import APIRouter, Body, Request
 
-from studioforge.api.auth import PIN_WITHHELD_NOTE, may_reveal_pin
+from studioforge.api.auth import (
+    PIN_WITHHELD_NOTE,
+    cross_site_browser_request,
+    is_local_request,
+    may_reveal_pin,
+)
 from studioforge.core.ports import EXIT_RESTART_REQUESTED, supervised_by, supervising_tray_is_alive
 from studioforge.errors import BadRequestError, ModelNotFoundError
 from studioforge.logging import get_logger
@@ -544,15 +549,26 @@ async def mcp_info(request: Request) -> dict[str, Any]:
     # With server.api_key unset (the shipped default) it costs nothing, and the
     # PIN is then the only thing standing in front of the MCP control plane.
     reveal = may_reveal_pin(request, config)
+    # `pin_required` is what THIS caller will be held to, not the raw toggle:
+    # on an open install a caller off the box (or a cross-site browser page)
+    # needs the PIN on the MCP plane even with `mcp.pin_required` off (D32,
+    # amended). A paired agent told "no PIN needed" that then meets a 403 is
+    # worse than being told the truth here.
+    off_box = not config.server.api_key and (
+        not is_local_request(request) or cross_site_browser_request(request)
+    )
+    pin_needed = bool(mcp.pin) and (bool(mcp.pin_required) or off_box)
     payload: dict[str, Any] = {
         "enabled": mcp.enabled,
         "path": mcp.path,
         "transport": "streamable-http",
-        "pin": (mcp.pin if mcp.pin_required else None) if reveal else None,
-        "pin_required": bool(mcp.pin_required and mcp.pin),
+        "pin": (mcp.pin if pin_needed else None) if reveal else None,
+        "pin_required": pin_needed,
         "auth": {
             "header": "X-MCP-Pin",
-            "alternatives": ["Authorization: Bearer <pin>", "?pin=<pin>"],
+            # The ?pin= query form is still parsed but no longer advertised:
+            # a URL lands in proxy logs and shell history (see extract_pin).
+            "alternatives": ["Authorization: Bearer <pin>"],
             "api_key_also_accepted": bool(config.server.api_key),
         },
         "recommended": (tailscale or lan or loopback or [{}])[0].get("url"),
@@ -565,6 +581,6 @@ async def mcp_info(request: Request) -> dict[str, Any]:
             "endpoints": reachable_urls(config.watchdog.port, "/mcp", host=config.watchdog.host),
         },
     }
-    if not reveal and mcp.pin_required and mcp.pin:
+    if not reveal and pin_needed:
         payload["pin_note"] = PIN_WITHHELD_NOTE
     return payload

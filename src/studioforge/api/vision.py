@@ -229,8 +229,17 @@ def _resolve_public(host: str) -> str | None:
             address = ipaddress.ip_address(raw)
         except ValueError:
             return None
+        # CGNAT (100.64.0.0/10) is neither private nor global to `ipaddress`,
+        # and it is exactly the range Tailscale hands out (netinfo's
+        # _TAILSCALE_NET) -- so `is_private` alone left every tailnet peer
+        # fetchable, the one network this guard names in its own reason for
+        # existing. `is_global` follows the IANA special-purpose registries
+        # and is the superset; the explicit checks stay so nothing already
+        # refused loosens when those tables move (for IPv6, `is_global`
+        # ignores `is_reserved`, which covers the NAT64 prefix).
         if (
-            address.is_private
+            not address.is_global
+            or address.is_private
             or address.is_loopback
             or address.is_link_local
             or address.is_reserved
@@ -246,7 +255,7 @@ def _resolve_public(host: str) -> str | None:
 
 
 def _is_public_address(host: str) -> bool:
-    """False for loopback, link-local, private, ULA and other reserved space."""
+    """False for loopback, link-local, private, ULA, CGNAT/tailnet and other reserved space."""
     return _resolve_public(host) is not None
 
 

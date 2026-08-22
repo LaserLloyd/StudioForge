@@ -39,8 +39,12 @@ sfctl servers add rig http://<studioforge-host>:1234 --api-key <key>
 ```
 
 `--api-key` is not optional in practice: when `server.api_key` is unset the `/mcp` endpoint still
-enforces the MCP pairing PIN, so pass the PIN here or every management tool returns 401. The PIN is
-in the startup banner and at `GET /api/mcp/info`.
+enforces the MCP pairing PIN for any caller that is not on the rig itself — `mcp.pin_required:
+false` only relaxes same-machine callers (D32) — so pass the PIN here or every management tool
+returns 401. The PIN is in the startup banner and at `GET /api/mcp/info` (served to a remote
+caller only when a credential was needed to get there). `sfctl` sends it as the bearer token;
+`?pin=` in the URL works for connectors that can only take a URL, but is not advertised because a
+URL ends up in proxy logs and shell history.
 
 Then register it as a local stdio MCP server in OpenClaw's config:
 
@@ -203,17 +207,21 @@ pin_model(model_id="pub/agent-model")                 # keep loaded at all times
 pin_model(model_id="pub/agent-model", pinned=false)   # undo
 ```
 
-A pinned model has no idle TTL, is never evicted to make room for another load, is loaded at
-server startup, and is brought back automatically (within ~15 s) if it goes down — so pinning an
-unloaded model also loads it; no separate `load_model` call is needed. This is the answer to the
-eviction ping-pong between an agent's workhorse and everything else: pin the workhorse once and
-stop re-warming it.
+A pinned model has no idle TTL and is never evicted to make room for another load. With
+`models.auto_load_pinned` on (the default) it is also loaded at server startup and brought back
+automatically (within ~15 s) if it goes down — so pinning an unloaded model also loads it; no
+separate `load_model` call is needed. With it off, a pin is only "no TTL, never evicted". This is
+the answer to the eviction ping-pong between an agent's workhorse and everything else: pin the
+workhorse once and stop re-warming it.
 
 Two things to know. `unload_model` on a pinned model is honoured and it **stays down** until
 loaded or pinned again — an explicit unload always wins, so don't unload-then-pin to "restart" a
-model (use `load_model(force=true)` for that). And every pin permanently occupies its VRAM, so
+model (use `load_model(force=true)` for that). Housekeeping unloads are not explicit: `test_model`
+and both benchmarks unload and reload the models they measure, and a pinned one is put back by the
+reconciler within a sweep of the run ending (D41). And every pin permanently occupies its VRAM, so
 each one shrinks what the planner can offer other loads; `server_status` shows the cost, and a
-refused load's suggestions will name the pinned models standing in the way.
+refused load's suggestions will name the pinned models standing in the way. Pinning is a box
+change: `pin_model` (or `ttl_s: 0` in saved settings) does it, a request-level `ttl` cannot.
 
 **A card of its own.** When a model must run at full speed with nothing beside it -- or a
 card must stay empty for ComfyUI -- take a *lease*:
@@ -228,8 +236,13 @@ While it stands nobody else is planned onto those cards; the named model is load
 them, sized for as many slots as its context allows, in the split mode its own benchmark measured
 fastest there (tensor split is never assumed -- it measured *slower* than layer split on the
 reference rig, so benchmark first if you want it considered). Idle residents on the cards are
-unloaded; a model mid-request refuses the call; a pinned one needs `force=true`. Benchmarks take
-their own leases, which is what keeps a neighbour's load out of their numbers.
+unloaded; a model mid-request refuses the call, including one that picked up a request between
+the scan and its unload; a pinned one needs `force=true`. Two overlapping grants conflict before
+either unloads anything. Benchmarks take their own leases, which is what keeps a neighbour's load
+out of their numbers. A leased model stays exactly where the lease put it: the D42 rebalancer
+never moves it. Any *other* idle model may find itself quietly reloaded onto fewer or less
+contended cards once a minute on a quiet box — that is housekeeping (`planner.rebalance`), not
+something you did, and it never evicts or interrupts anything.
 
 ### 7. `server_status` and `connection_info`
 
@@ -404,7 +417,10 @@ for that model resets to it:
 {"model": "...", "messages": [...], "ttl": 1800}
 ```
 
-`ttl` is consumed by StudioForge and never forwarded to the engine.
+`ttl` is consumed by StudioForge and never forwarded to the engine. It can shorten or lengthen
+the idle timer only: `0` is the wire form of *pinned*, and pinning is a box change, so a request
+carrying `ttl: 0` (or a negative value) is served with no override rather than pinning the model
+— use `pin_model` for that.
 
 ---
 

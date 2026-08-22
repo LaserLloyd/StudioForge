@@ -175,6 +175,7 @@ class StubManager:
         self.leased: list[dict[str, Any]] = []
         self.released: list[str] = []
         self.unloads: list[str] = []
+        self.unload_kwargs: list[dict[str, Any]] = []
         self.busy: str | None = None
         self.benchmarker: Any = None
 
@@ -212,8 +213,9 @@ class StubManager:
     def release_lease(self, lease_id: str) -> None:
         self.released.append(lease_id)
 
-    async def unload(self, name: str) -> bool:
+    async def unload(self, name: str, **kwargs: Any) -> bool:
         self.unloads.append(name)
+        self.unload_kwargs.append(dict(kwargs))
         return self.supervisor.instances.pop(self.record.id, None) is not None
 
 
@@ -394,6 +396,9 @@ async def test_a_model_this_run_loaded_is_unloaded_again(monkeypatch: Any) -> No
     assert report.loaded_for_benchmark is True
     assert report.unloaded_after is True
     assert manager.unloads == [rec.id]
+    # Leave-as-found is housekeeping: a pinned model found down must stay
+    # wanted by the D41 reconciler, so this is not the deliberate unload.
+    assert manager.unload_kwargs == [{"deliberate": False}]
     assert manager.supervisor.instances == {}
 
 

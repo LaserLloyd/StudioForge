@@ -31,6 +31,9 @@ Notes
 - The watchdog is not `BindsTo=` the gateway: it exists to be up when the gateway is not (it can
   restart the gateway, reclaim orphaned `llama-server` processes and answer `/health` on its own port).
 - First run: `~/studioforge/.venv/bin/studioforge engine --update` installs the pinned llama.cpp build
-  into the data dir, or use the GUI's Setup tab. See `docs/SETUP.md`.
+  into the data dir, or use the GUI's Setup tab. On Linux + NVIDIA that is a **source build**
+  (upstream publishes no Linux CUDA archive): it needs `git`, `cmake` and a CUDA toolkit whose
+  `nvcc` matches the driver, takes minutes, and is reused on later installs of the same tag.
+  See `docs/SETUP.md`.
 - Windows uses the tray app / `StudioForge Autostart.bat` instead; `studioforge tray` refuses to run
   on Linux and points here.

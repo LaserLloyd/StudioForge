@@ -8,6 +8,7 @@ neighbours, never a serving one, and a pinned one only when forced.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any
 
@@ -22,7 +23,12 @@ from studioforge.errors import (
     ModelBusyError,
 )
 from studioforge.types import LoadPlan, LoadRejected, ModelSettings
-from tests.unit.test_gateway_lifecycle import make_manager, make_record, placed
+from tests.unit.test_gateway_lifecycle import (
+    CountingSupervisor,
+    make_manager,
+    make_record,
+    placed,
+)
 from tests.unit.test_planner import make_config, rig_5090x2_3090x2
 
 # ---------------------------------------------------------------------------
@@ -221,6 +227,94 @@ async def test_acquire_lease_waits_for_a_load_in_flight_and_names_conflicts() ->
     with pytest.raises(LeaseNotFoundError):
         manager.release_lease("nope")
     assert manager.release_lease(first.id).id == first.id
+
+
+class YieldingSupervisor(CountingSupervisor):
+    """A stop that takes a turn of the loop, as a real child teardown does."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.during_stop: list[Any] = []
+        self.on_stop: Any = None
+        self.fail_stop = False
+
+    async def stop(self, model_id: str, **_kwargs: Any) -> None:
+        await asyncio.sleep(0)
+        if self.on_stop is not None:
+            self.during_stop.append(self.on_stop())
+        if self.fail_stop:
+            raise RuntimeError("the child would not die")
+        self.instances.pop(model_id, None)
+
+
+def _lease_rig(*records: Any) -> tuple[Any, YieldingSupervisor]:
+    manager, _ = make_manager(list(records))
+    supervisor = YieldingSupervisor()
+    manager.supervisor = supervisor  # type: ignore[assignment]
+    return manager, supervisor
+
+
+async def test_a_load_mid_eviction_sees_the_cards_blocked() -> None:
+    """The book entry used to be written only after the awaited evictions, so a
+    load planning during a teardown saw the cards free and landed on them."""
+    owner = make_record("owner/model")
+    neighbour = make_record("idle/neighbour")
+    manager, supervisor = _lease_rig(owner, neighbour)
+    supervisor.instances[neighbour.id] = placed(neighbour.id, [0, 1])
+    supervisor.on_stop = lambda: manager.leases.blocked_for("jit/intruder")
+
+    lease = await manager.acquire_lease([0, 1], holder="api", model_ids=[owner.id])
+
+    assert supervisor.during_stop == [frozenset({0, 1})], "blocked from the first eviction on"
+    assert manager.leases.all() == [lease]
+
+
+async def test_two_overlapping_grants_the_loser_evicts_nothing() -> None:
+    victim_a = make_record("victim/a")
+    victim_b = make_record("victim/b")
+    manager, supervisor = _lease_rig(victim_a, victim_b)
+    supervisor.instances[victim_a.id] = placed(victim_a.id, [0])
+    supervisor.instances[victim_b.id] = placed(victim_b.id, [1])
+
+    results = await asyncio.gather(
+        manager.acquire_lease([0], holder="first"),
+        manager.acquire_lease([0, 1], holder="second"),
+        return_exceptions=True,
+    )
+
+    conflicts = [r for r in results if isinstance(r, LeaseConflictError)]
+    assert len(conflicts) == 1, results
+    assert victim_b.id in supervisor.instances, "the loser unloaded nothing for a lease it lost"
+    assert len(manager.leases) == 1
+
+
+async def test_a_failed_eviction_leaves_no_lease_behind() -> None:
+    victim = make_record("victim/model")
+    manager, supervisor = _lease_rig(victim)
+    supervisor.instances[victim.id] = placed(victim.id, [0])
+    supervisor.fail_stop = True
+
+    with pytest.raises(RuntimeError):
+        await manager.acquire_lease([0], holder="api")
+
+    assert len(manager.leases) == 0, "the caller was never handed a lease to release"
+
+
+async def test_a_victim_that_became_busy_during_the_grant_refuses_and_releases() -> None:
+    """Idle at the scan is not idle at the stop: a later victim can pick up a
+    request while an earlier one is torn down, and supervisor.stop has no guard."""
+    first = make_record("victim/first")
+    second = make_record("victim/second")
+    manager, supervisor = _lease_rig(first, second)
+    supervisor.instances[first.id] = placed(first.id, [0])
+    supervisor.instances[second.id] = placed(second.id, [1])
+    supervisor.on_stop = lambda: supervisor.mark_request_start(second.id)
+
+    with pytest.raises(ModelBusyError):
+        await manager.acquire_lease([0, 1], holder="api")
+
+    assert second.id in supervisor.instances, "a stream is never interrupted (D36)"
+    assert len(manager.leases) == 0
 
 
 def test_expire_leases_counts_owner_activity_and_releases_the_idle() -> None:

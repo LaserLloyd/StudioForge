@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -405,6 +406,83 @@ async def test_unload_all_suppresses_every_pin() -> None:
     assert manager._pinned_needing_load() == [], "the panic button must actually free VRAM"
 
 
+async def test_a_housekeeping_unload_leaves_the_pin_wanted() -> None:
+    """The benchmarks and test_model put the rig back with unload(); that is not a
+    caller choosing to take a pinned model down, so the reconciler must still want it."""
+    record = make_record("pinned/model", pinned=True)
+    manager, supervisor = make_manager([record])
+    supervisor.instances[record.id] = loaded(record.id, 0)
+
+    assert await manager.unload(record.id, deliberate=False) is True
+
+    assert record.id not in supervisor.instances
+    assert manager._pinned_needing_load() == [record.id]
+
+
+def test_reconciler_leaves_a_model_under_test_or_benchmark_alone() -> None:
+    """Those runs unload and reload the model themselves; a reconcile load in their
+    gap would race them and fail the next lease grant with 'a load is in flight'."""
+    record = make_record("pinned/model", pinned=True)
+    manager, _ = make_manager([record])
+    assert manager._pinned_needing_load() == [record.id]
+
+    manager._testing = record.id
+    assert manager._pinned_needing_load() == []
+    manager._testing = None
+
+    manager.benchmarker = SimpleNamespace(benchmarking=record.id)
+    assert manager._pinned_needing_load() == []
+    manager.benchmarker = SimpleNamespace(benchmarking=None)
+    assert manager._pinned_needing_load() == [record.id]
+
+
+async def test_test_model_teardown_keeps_a_pinned_model_wanted() -> None:
+    record = make_record("pinned/model", pinned=True)
+    manager, supervisor = make_manager([record])
+
+    async def fake_load(model_id: str, **kwargs: Any) -> InstanceInfo:
+        instance = loaded(model_id, 0)
+        supervisor.instances[model_id] = instance
+        return instance
+
+    manager.load = fake_load  # type: ignore[method-assign]
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, Any]:
+            return {
+                "choices": [{"message": {"content": "one short sentence"}}],
+                "usage": {"completion_tokens": 3},
+            }
+
+    class FakeClient:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> FakeClient:
+            return self
+
+        async def __aexit__(self, *_exc: object) -> None:
+            return None
+
+        async def post(self, url: str, json: Any = None) -> FakeResponse:
+            return FakeResponse()
+
+    result = await manager._run_test(
+        record,
+        record,
+        None,
+        was_loaded=False,
+        keep_loaded=False,
+        httpx=SimpleNamespace(AsyncClient=FakeClient),
+    )
+
+    assert result["ok"] is True and result["unloaded_after"] is True
+    assert manager._pinned_needing_load() == [record.id], "'as found' for a pin is 'wanted up'"
+
+
 async def test_reconciler_loads_with_its_own_source() -> None:
     record = make_record("pinned/model", pinned=True)
     manager, supervisor = make_manager([record])
@@ -530,6 +608,8 @@ async def test_rebalance_moves_a_model_off_a_shared_card() -> None:
     assert calls[0]["devices"] == [2, 3]
     assert calls[0]["force"] is True
     assert calls[0]["evict_busy"] is False
+    assert calls[0]["allow_evict"] is False, "the move carries the preview's no-evict rule"
+    assert calls[0]["require_resident"] is True, "a move never cold-loads a vanished model"
     assert calls[0]["source"] == "rebalance"
     # The preview asked for identical geometry, not a fresh ladder walk.
     preview = manager.planner.calls[0]
@@ -662,6 +742,184 @@ def test_rebalance_leaves_a_well_placed_model_alone() -> None:
     assert manager._rebalance_opportunity() is None
 
 
+def test_rebalance_never_moves_a_lease_owner_off_its_cards() -> None:
+    """D43: the lease forces the owner's placement on a COPY of the record, which the
+    persisted-override gate cannot see; the owner must not be previewed at all."""
+    record = make_record("leased/owner")
+    manager, supervisor = make_manager([record])
+    supervisor.instances[record.id] = placed(record.id, [2, 3])
+    manager.leases.acquire([2, 3], holder="api", model_ids=[record.id])
+    planner = StubPlanner(candidate_plan(record.id, [0]))
+    manager.planner = planner
+
+    assert manager._rebalance_opportunity() is None
+    assert planner.calls == [], "a leased owner is not even previewed"
+
+
+async def test_rebalance_skips_a_model_leased_after_the_preview() -> None:
+    manager, _supervisor, mover = rebalance_rig()
+    calls: list[str] = []
+
+    async def fake_load(model_id: str, **kwargs: Any) -> InstanceInfo:
+        calls.append(model_id)
+        return placed(model_id, kwargs["devices"])
+
+    manager.load = fake_load  # type: ignore[method-assign]
+    manager.leases.acquire([1, 3], holder="api", model_ids=[mover.id])
+
+    await manager._rebalance(mover.id, candidate_plan(mover.id, [2, 3]), "stale preview")
+
+    assert calls == [], "a grant between preview and move makes the cards its alone"
+
+
+# The real load() -> _load_locked() -> _load_gated() path, with only the child
+# launch stubbed: the D42 tests above stub load() entirely and so never reach
+# the gate, which is exactly where the rules below have to hold.
+
+
+def _real_load_rig() -> tuple[Any, Any, Any, list[str]]:
+    manager, supervisor, mover = rebalance_rig()
+    starts: list[str] = []
+
+    async def fake_start(record: Any, plan: LoadPlan, **kwargs: Any) -> InstanceInfo:
+        starts.append(record.id)
+        instance = placed(record.id, list(plan.devices))
+        supervisor.instances[record.id] = instance
+        return instance
+
+    manager._start_with_retry = fake_start  # type: ignore[method-assign]
+    manager._record_actual_vram = lambda *_a, **_k: None  # type: ignore[method-assign]
+    return manager, supervisor, mover, starts
+
+
+async def test_a_reload_without_the_interrupt_licence_refuses_a_busy_resident() -> None:
+    """evict_busy=False only ever reached the planner, which never sees the resident
+    it is replacing; the resident's own in-flight stream was stopped regardless."""
+    from studioforge.errors import ModelBusyError
+
+    manager, supervisor, mover, starts = _real_load_rig()
+    planner = StubPlanner(candidate_plan(mover.id, [2, 3]))
+    manager.planner = planner
+    supervisor.instances[mover.id].active_requests = 1
+
+    with pytest.raises(ModelBusyError) as excinfo:
+        await manager._load_gated(
+            mover,
+            ctx_size=None,
+            kv_cache_type=None,
+            parallel=None,
+            reload_of=mover.id,
+            force=True,
+            evict_busy=False,
+            source="rebalance",
+        )
+
+    assert excinfo.value.details["retry_after_s"] > 0
+    assert planner.calls == [], "refused before planning, like load_recommended's guard"
+    assert starts == []
+    assert supervisor.instances[mover.id].state == "ready", "the resident was never stopped"
+
+
+async def test_force_alone_still_interrupts_a_busy_resident() -> None:
+    """D36: force=true from a caller who can see what they interrupt is the one override."""
+    manager, supervisor, mover, starts = _real_load_rig()
+    manager.planner = StubPlanner(candidate_plan(mover.id, [2, 3]))
+    supervisor.instances[mover.id].active_requests = 1
+
+    instance = await manager._load_gated(
+        mover,
+        ctx_size=None,
+        kv_cache_type=None,
+        parallel=None,
+        reload_of=mover.id,
+        force=True,
+        evict_busy=None,
+        source="api",
+    )
+
+    assert starts == [mover.id]
+    assert instance.plan is not None and instance.plan.devices == [2, 3]
+
+
+async def test_rebalance_refuses_instead_of_stopping_a_resident_that_became_busy() -> None:
+    """The race: the sweep saw a quiet box, the move then waited at the gate behind
+    another load, and ensure_loaded handed the idle resident to a request meanwhile."""
+    manager, supervisor, mover, starts = _real_load_rig()
+    manager.planner = StubPlanner(candidate_plan(mover.id, [2, 3]))
+
+    await manager._load_gate.acquire()  # a JIT cold load won the gate first
+    manager._maybe_rebalance()
+    task = manager._rebalance_task
+    assert task is not None
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert not task.done(), "the move is parked at the gate"
+
+    _record, instance = await manager.ensure_loaded(mover.id)  # no lock on the fast path
+    supervisor.mark_request_start(instance.model_id)
+    manager._load_gate.release()
+    await task
+
+    assert starts == [], "the resident must not be reloaded under a live stream"
+    resident = supervisor.instances[mover.id]
+    assert resident.state == "ready" and resident.plan is not None
+    assert resident.plan.devices == [1, 3]
+    assert mover.id not in manager._rebalance_last, "a move that never happened burns no cooldown"
+
+
+class SequencePlanner(StubPlanner):
+    """Answers with each result in turn, then repeats the last one."""
+
+    def __init__(self, *results: Any) -> None:
+        super().__init__(results[-1])
+        self.results = list(results)
+
+    def plan_load(self, record: Any, **kwargs: Any) -> Any:
+        self.calls.append({"model_id": record.id, **kwargs})
+        return self.results.pop(0) if len(self.results) > 1 else self.results[0]
+
+
+async def test_rebalance_carries_its_no_evict_rule_to_the_gate() -> None:
+    """The preview said allow_evict=False; the real plan used to fall back to
+    planner.on_insufficient and could evict an idle bystander that landed in between."""
+    manager, supervisor, mover, starts = _real_load_rig()
+    planner = SequencePlanner(
+        candidate_plan(mover.id, [2, 3]),
+        LoadRejected(model_id=mover.id, reason="no room without evicting", suggestions=[]),
+    )
+    manager.planner = planner
+
+    manager._maybe_rebalance()
+    assert manager._rebalance_task is not None
+    await manager._rebalance_task
+
+    gate_call = planner.calls[1]
+    assert gate_call["source"] == "rebalance"
+    assert gate_call["reload_of"] == mover.id
+    assert gate_call["allow_evict"] is False
+    assert starts == [] and supervisor.instances[mover.id].plan.devices == [1, 3]
+
+
+async def test_rebalance_does_not_resurrect_a_model_the_ttl_sweep_unloaded() -> None:
+    manager, supervisor, mover, starts = _real_load_rig()
+    planner = StubPlanner(candidate_plan(mover.id, [2, 3]))
+    manager.planner = planner
+
+    await manager._load_gate.acquire()
+    manager._maybe_rebalance()
+    task = manager._rebalance_task
+    assert task is not None
+    for _ in range(10):
+        await asyncio.sleep(0)
+    supervisor.instances.pop(mover.id)  # what _sweep_ttl does to an idle model
+    manager._load_gate.release()
+    await task
+
+    assert starts == [], "a relocation of nothing must load nothing"
+    assert mover.id not in supervisor.instances
+    assert len(planner.calls) == 1, "only the preview; the gate never planned a cold load"
+
+
 # ---------------------------------------------------------------------------
 # A request-level ttl must not unpin a pinned model
 # ---------------------------------------------------------------------------
@@ -687,6 +945,40 @@ def test_request_ttl_override_still_applies_to_unpinned_instances() -> None:
 
     openai_routes._apply_ttl_override(state, instance.model_id, 60)
 
+    assert instance.ttl_s == 60
+
+
+def test_request_ttl_of_zero_is_no_override_and_cannot_pin() -> None:
+    """The mirror of D41 item 4: a request ttl cannot pin a model either.
+
+    ``ttl_s == 0`` is the wire form of pinned (sweeper, planner, leases all
+    read it), and pinning is a box change behind the D32 gate -- so ``0``, a
+    negative and a sub-second value (``int`` rounds it to 0) are all "no
+    override", never a write of 0 onto the instance.
+    """
+    assert openai_routes._pop_ttl({"ttl": 0}) is None
+    assert openai_routes._pop_ttl({"ttl": -5}) is None
+    assert openai_routes._pop_ttl({"ttl": 0.4}) is None
+    assert openai_routes._pop_ttl({"ttl": True}) is None
+    assert openai_routes._pop_ttl({"ttl": "60"}) is None
+    assert openai_routes._pop_ttl({"ttl": 60}) == 60
+    payload = {"ttl": 0, "messages": []}
+    openai_routes._pop_ttl(payload)
+    assert "ttl" not in payload, "the field is consumed either way, never forwarded"
+
+    supervisor = CountingSupervisor()
+    state = FakeState(supervisor, chunks=[])
+    instance = loaded("plain/model", 1800)
+    supervisor.instances[instance.model_id] = instance
+
+    # Belt and braces: a direct caller handing 0 through is refused too.
+    openai_routes._apply_ttl_override(state, instance.model_id, 0)
+    assert instance.ttl_s == 1800
+    openai_routes._apply_ttl_override(state, instance.model_id, -1)
+    assert instance.ttl_s == 1800
+    # ...and the instance has not been made pseudo-pinned: a later real
+    # override still lands (the D41 guard is not tripped).
+    openai_routes._apply_ttl_override(state, instance.model_id, 60)
     assert instance.ttl_s == 60
 
 

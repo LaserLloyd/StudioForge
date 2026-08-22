@@ -36,9 +36,12 @@ The watchdog has its own open `/health` on `:1235` that keeps answering when the
 * **Nothing at all under `pythonw` / the tray** — logs are in `<data dir>/logs/studioforge.log`
   and `logs/tray-server.log`; a dead console cannot kill the server any more (D33), so if the log
   ends abruptly, look for a port conflict or a config error at the top of the next start.
-* **Boot hangs at `installing engine`** on a fresh box: it is downloading ~600 MB from GitHub;
-  `/health` shows the percentage. Offline? `studioforge engine --list` says what it wants;
-  the Setup tab's engine row offers Install once the boot has given up.
+* **Boot hangs at `installing engine`** on a fresh box: on Windows it is downloading ~600 MB
+  from GitHub; on Linux + NVIDIA it is *compiling* the tag (upstream ships no Linux CUDA archive),
+  which takes minutes and needs `git`, `cmake` and a CUDA toolkit with `nvcc` — a refusal names
+  whichever is missing. `/health` shows the phase and percentage. Offline? `studioforge engine
+  --list` says what it wants; the Setup tab's engine row offers Install once the boot has given
+  up.
 
 ## A model will not load
 
@@ -67,7 +70,9 @@ GUI, the autoloader.
 
 `test_model` refuses on the same grounds and additionally refuses a second concurrent test; it
 loads cold models small (one slot, the default context) and unloads them again, so it never leaves
-the rig rearranged. Both benchmarks refuse a busy rig the same way. `load_recommended` on a model
+the rig rearranged — and a pinned model it unloaded comes back by itself, because a test's or a
+benchmark's unload is housekeeping, not the deliberate unload that suppresses a pin (D41). Both
+benchmarks refuse a busy rig the same way. `load_recommended` on a model
 that is itself serving is a **503** with `retry_after_s` rather than a reload under its clients;
 `load_model(force=true)` is the only thing that interrupts a stream.
 
@@ -129,9 +134,19 @@ process respawns (D28). `sfctl recover` also has `kill_model`, `gpu_status`, `ta
 * Anyone on the LAN can reach the gateway on the defaults. Set `server.api_key` on the Setup tab
   (the checklist's *Network exposure* row is red until you do or you bind to `127.0.0.1`).
 * Without a key, routes that change the box are only accepted from the machine itself or with the
-  MCP PIN (`403 remote_admin_requires_credential` otherwise) — D32.
+  MCP PIN (`403 remote_admin_requires_credential` otherwise) — D32. "The machine itself" means a
+  loopback peer whose browser `Origin`, if any, is this server's own host and port: a page from
+  another site or another local app is refused even from `127.0.0.1`, and so is the panel on
+  `:8080` for a LAN viewer. A `403` on a loopback request is therefore a cross-site page, or a
+  reverse proxy rewriting `Host` — the log line names which.
+* The MCP path is under the same rule: with no key, every tool call from off the box needs the PIN
+  even with `mcp.pin_required: false`; `GET /api/mcp/info` reports the `pin_required` a caller is
+  really held to.
 * The PIN is in the startup banner and `studioforge config` on the box; **Generate new PIN** on the
-  Setup tab rotates it after a leak.
+  Setup tab rotates it after a leak. Send it as `X-MCP-Pin` or the bearer token — `?pin=` still
+  works but lands in proxy logs and shell history, which is why nothing advertises it any more.
+* Vision requests never fetch an image from loopback, link-local, private, ULA or CGNAT space
+  (`100.64.0.0/10`, the tailnet) unless `gateway.allow_private_image_hosts` is on.
 
 ## Where the logs are
 

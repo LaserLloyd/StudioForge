@@ -23,7 +23,9 @@ Run them in that order: placement first, then the slot sweep on the winning plac
 2. **Never benchmark a model someone is mid-conversation with.** The benchmark unloads the model
    and reloads it fresh for every mode, which drops its prompt cache. On an RP session with a
    100k-token prompt that is minutes of reprocessing on the next turn. Benchmark when the session
-   is over, or benchmark a *different* copy/quant.
+   is over, or benchmark a *different* copy/quant. (A *pinned* model is safe to benchmark: the
+   run's unloads are housekeeping, not a deliberate unload, so the reconciler brings it back
+   within a sweep of the run ending — D41.)
 3. **Benchmark at the context you will actually run.** Speed and slot count both depend on
    `ctx_size`. Take it from the `list_models` row you intend to use (`ctx_per_slot`), or from the
    user. Do not accept the default silently.
@@ -124,7 +126,9 @@ pin_model(model_id="<id>")                         # optional: survive restarts 
 The lease loads the model onto exactly those cards, applies the **split mode and micro-batch
 its latest benchmark measured fastest on those very devices**, and sizes slots automatically
 (even when the server's `default_parallel` is 1). Nothing else will load there until you
-`release_gpus(lease_id=...)` or the model sits idle for `idle_ttl_s` (default 60 min).
+`release_gpus(lease_id=...)` or the model sits idle for `idle_ttl_s` (default 60 min), and the
+rebalancer (`planner.rebalance`, D42) never moves a leased model off its cards. A grant is
+refused, not forced, if a resident on those cards picks up a request before it is unloaded.
 
 If you only want the catalog updated — not a lock — stop after step 2: `list_models` now shows
 `confidence: "measured"` for that placement and the numbers are used in every recommendation.

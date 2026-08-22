@@ -56,7 +56,14 @@ when it does not:
 | `test_supervisor.py::test_live_real_llama_server` | engine **and** a tiny model — **this one loads onto a GPU** | as above, plus `SF_TEST_MODELS_DIR` |
 
 Never hard-code an absolute path into a test. It is right on exactly one machine, it leaks whose
-machine that was, and it turns "not installed here" into a failure instead of a skip.
+machine that was, and it turns "not installed here" into a failure instead of a skip. And never
+let a test reach the developer's real home directory: anything that writes under `~` (the
+`lmstudio://` handler's `mimeapps.list`, `~/.lmstudio`, the Startup folder) must be pointed at
+`tmp_path` — one test once took over the developer's real URL handler.
+
+CI (`.github/workflows/ci.yml`) runs `ruff check`, `ruff format --check` and `pytest tests/unit`
+on Windows and Ubuntu with `SF_GPU_PROBE=null` (no GPU) and, on the headless Ubuntu leg,
+`PYSTRAY_BACKEND=dummy` so the tray tests collect without an X display.
 
 ## Writing tests
 

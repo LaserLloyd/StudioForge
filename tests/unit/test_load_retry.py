@@ -256,6 +256,22 @@ async def test_the_retry_happens_exactly_once() -> None:
     assert supervisor.starts == 2
 
 
+async def test_a_no_evict_load_does_not_evict_to_retry() -> None:
+    """D42's relocation carries allow_evict=False: the retry's only lever is
+    evicting a bystander, which is the licence such a load does not have."""
+    supervisor = StubSupervisor(fail_times=1, stderr=OOM_STDERR)
+    supervisor.instances["victim/model"] = resident("victim/model")
+    planner = StubPlanner()
+    manager = make_manager(supervisor, planner)
+
+    with pytest.raises(ModelLoadError):
+        await manager.load("test/model", allow_evict=False)
+
+    assert supervisor.stopped == [], "the bystander is not evicted for a no-evict load"
+    assert supervisor.starts == 1, "no second attempt without changed conditions"
+    assert planner.kwargs[0]["allow_evict"] is False, "the planner is told the same rule"
+
+
 async def test_a_configuration_error_is_never_retried() -> None:
     """A bad flag fails identically the second time; retrying just hides it."""
     supervisor = StubSupervisor(fail_times=1, stderr=CONFIG_STDERR)

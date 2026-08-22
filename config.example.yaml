@@ -42,6 +42,9 @@
 #                           version of the same knob, applied even to a forced
 #                           placement, because it is the NEIGHBOUR's memory.
 #   planner.headroom_fraction  fraction of every card left free (0.10 = 10%).
+#   planner.preference      "quality" (default) or "throughput": whether the
+#                           catalog's recommended load keeps the best KV cache
+#                           or takes the biggest window / a second slot.
 #   hf.token                HuggingFace token for gated repos. A secret: it is
 #                           registered for log redaction, and it does not
 #                           belong in version control.
@@ -98,6 +101,18 @@ engine:
   allow_source_build: true
   repo: ggml-org/llama.cpp
   smoke_test_timeout_s: 180.0
+  # Host-RAM prompt cache (`--cache-ram`): evicted prompt prefixes are kept in
+  # system memory instead of recomputed. Costs no VRAM, changes no output, so
+  # it is on by default; "auto" = 25% of RAM capped at 32 GiB, 0 disables it.
+  cache_ram_mb: auto
+  # `--ubatch-size` for every model that does not set its own. Raising it
+  # buys prompt speed with compute-buffer VRAM the planner then charges per
+  # card (D40) -- a trade to make knowingly, so it ships unset (engine's 512).
+  ubatch_size: null
+  # `--backend-sampling`: GPU-side sampling. b10425 marks it EXPERIMENTAL, so
+  # it is off under the quality-first rule (only lossless, non-experimental
+  # features ship enabled).
+  backend_sampling: false
 planner:
   headroom_fraction: 0.1
   on_insufficient: evict
@@ -108,6 +123,11 @@ planner:
   mmproj_compute_mb: 512
   prefer_single_gpu: true
   rebalance: auto
+  # What the catalog's one recommended load per model optimises for (D36):
+  # "quality" = the best KV cache that reaches the context floor, then the
+  # largest window at that quality; "throughput" = the largest window, and a
+  # second slot if it fits, even with a quantized cache.
+  preference: quality
   quant_affinity:
     NVFP4:
       min_compute_capability: '12.0'

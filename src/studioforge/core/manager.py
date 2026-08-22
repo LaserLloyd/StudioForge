@@ -167,6 +167,15 @@ def classify_load_failure(stderr_tail: Sequence[str]) -> str:
     return "unknown"
 
 
+class ModelNotResidentError(ModelLoadError):
+    """A load that existed only to relocate a resident found none to move (D42).
+
+    Raised at the gate, not before it: the wait behind another load is the
+    window in which a TTL unload can take the model away, and a relocation
+    that proceeded anyway would cold-load a model nobody asked for.
+    """
+
+
 def _kv_rank(kv_k: str, kv_v: str) -> int:
     from studioforge.core.kv_sensitivity import kv_quality_rank
 
@@ -519,6 +528,8 @@ class ModelManager:
         force: bool = False,
         source: str = "api",
         evict_busy: bool | None = None,
+        allow_evict: bool | None = None,
+        require_resident: bool = False,
     ) -> InstanceInfo:
         """Explicit load (GUI/CLI/MCP). ``force`` reloads an already-running model.
 
@@ -546,9 +557,21 @@ class ModelManager:
         serving a request (D36). ``None`` (the default) follows ``force``: a
         caller who can see what they are interrupting and says ``force=true``
         means it. The two are separable because ``force`` also means "reload
-        the running instance", and three callers need the reload without the
+        the running instance", and four callers need the reload without the
         licence to interrupt a stream -- ``load_recommended``, the parallel
-        benchmark and the placement benchmark all pass ``evict_busy=False``.
+        benchmark, the placement benchmark and the D42 rebalancer all pass
+        ``evict_busy=False``. That licence is re-checked *at the gate*, not
+        only here: the wait behind another load can be minutes, and a resident
+        that picked up a request meanwhile is refused with ``retry_after_s``
+        rather than stopped mid-stream.
+
+        ``allow_evict`` is the planner's eviction policy for this one load;
+        ``None`` keeps ``planner.on_insufficient``. The rebalancer passes
+        ``False`` so the real move carries the same no-evict rule as its
+        preview (D42). ``require_resident`` makes the load a pure relocation:
+        if the instance it was meant to move is no longer ``ready`` when the
+        gate opens (a TTL unload, a crash), nothing is loaded -- a move must
+        never resurrect a model nobody asked for.
         """
         validate_load_args(
             ctx_size=ctx_size,
@@ -589,6 +612,8 @@ class ModelManager:
                 force=force,
                 source=source,
                 evict_busy=force if evict_busy is None else evict_busy,
+                allow_evict=allow_evict,
+                require_resident=require_resident,
             )
 
     #: Contexts the "Load recommended" buttons offer, and the ones the MCP
@@ -1010,6 +1035,8 @@ class ModelManager:
         force: bool = False,
         source: str = "api",
         evict_busy: bool | None = None,
+        allow_evict: bool | None = None,
+        require_resident: bool = False,
     ) -> InstanceInfo:
         """Plan, evict if needed, launch. Caller must hold the per-model lock.
 
@@ -1049,6 +1076,8 @@ class ModelManager:
                     force=force,
                     source=source,
                     evict_busy=force if evict_busy is None else evict_busy,
+                    allow_evict=allow_evict,
+                    require_resident=require_resident,
                 )
         finally:
             self._loading.discard(record.id)
@@ -1065,13 +1094,51 @@ class ModelManager:
         force: bool = False,
         source: str = "api",
         evict_busy: bool | None = None,
+        allow_evict: bool | None = None,
+        require_resident: bool = False,
     ) -> InstanceInfo:
         existing = self.supervisor.get(record.id)
+        if require_resident and (existing is None or existing.state != "ready"):
+            # A relocation of a model that is no longer resident is not a
+            # load: the rebalancer previewed a move for an idle child, and if
+            # the TTL sweep unloaded it while the move waited at the gate,
+            # the right outcome is "nothing" -- a cold load here would
+            # resurrect a model nobody asked for, onto cards it was never
+            # planned against (D42). Checked here rather than in the caller
+            # because the gate wait *is* the window.
+            raise ModelNotResidentError(
+                f"'{record.id}' is no longer resident; there is nothing to relocate"
+            )
         if reload_of is not None and (existing is None or existing.state != "ready"):
             # The resident child went away while we waited for the gate (a
             # crash, a TTL unload): there is nothing to replace, so this is an
             # ordinary load.
             reload_of = None
+        interrupt_ok = force if evict_busy is None else evict_busy
+        if (
+            reload_of is not None
+            and not interrupt_ok
+            and existing is not None
+            and existing.active_requests > 0
+        ):
+            # The box was idle when the caller looked, but that look was
+            # before the per-model lock and the D29 gate -- a wait behind
+            # another load is minutes, and ensure_loaded hands a ready
+            # resident to requests with no lock at all. The reload licence
+            # without the interrupt licence (D36/D42) has to be re-checked
+            # here, where nothing between this line and supervisor.stop()
+            # yields to the event loop; evict_busy alone cannot do it,
+            # because the planner never sees the resident it is replacing.
+            raise ModelBusyError(
+                f"'{record.id}' is serving {existing.active_requests} request(s); "
+                f"reloading it now would interrupt them. Wait for the stream(s) to "
+                f"finish, or pass force=true to load_model to do it anyway.",
+                details={
+                    "busy": self.busy_snapshot(),
+                    "retry_after_s": BUSY_RETRY_AFTER_S,
+                    "loaded_by": existing.loaded_by,
+                },
+            )
         if existing is not None and existing.state == "loading" and reload_of is None:
             # The supervisor is already bringing this child up -- its crash
             # watcher relaunching it after an exit. Planning again would launch
@@ -1105,7 +1172,11 @@ class ModelManager:
             # can see what they are interrupting overrides that, and a JIT load
             # can never set it. A caller that needs force's RELOAD half without
             # that licence passes evict_busy=False explicitly.
-            evict_busy=force if evict_busy is None else evict_busy,
+            evict_busy=interrupt_ok,
+            # None defers to planner.on_insufficient; the rebalancer's move
+            # carries its preview's allow_evict=False so that a world that
+            # changed between preview and gate is refused, not evicted (D42).
+            allow_evict=allow_evict,
             source=source,
         )
 
@@ -1147,6 +1218,7 @@ class ModelManager:
                 parallel=parallel,
                 source=source,
                 parallel_auto=parallel_auto,
+                allow_evict=allow_evict,
             )
         except StudioForgeError:
             raise
@@ -1233,6 +1305,7 @@ class ModelManager:
         parallel: int | None = None,
         source: str = "api",
         parallel_auto: bool = False,
+        allow_evict: bool | None = None,
     ) -> InstanceInfo:
         """Launch the child, retrying **once** after a transient OOM.
 
@@ -1249,6 +1322,15 @@ class ModelManager:
 
         A configuration error (bad flag, missing file, unsupported
         architecture) is never retried -- see :func:`classify_load_failure`.
+
+        A load planned with ``allow_evict=False`` (the D42 relocation) does
+        not evict to retry either: the retry's whole point is to change the
+        conditions by freeing a bystander, and that is exactly the licence
+        such a load does not have. The trade-off is honest -- the resident
+        was already stopped for the reload (D30 plans before it unloads, but
+        the launch itself failed), so the model stays down until the next JIT
+        request or the pin reconciler, which is what any forced reload that
+        dies at launch leaves behind today.
         """
         try:
             return await self.supervisor.start(
@@ -1259,6 +1341,12 @@ class ModelManager:
             tail = [str(line) for line in stderr] if isinstance(stderr, list) else []
             kind = classify_load_failure(tail)
             if kind != "transient":
+                raise
+            if allow_evict is False:
+                log.warning(
+                    "transient load failure; a no-evict load does not evict to retry",
+                    model_id=record.id,
+                )
                 raise
             victim = self._eviction_candidate(exclude=record.id)
             if victim is None:
@@ -1289,6 +1377,7 @@ class ModelManager:
             draft=draft,
             adapters=[a for a, _ in adapters],
             parallel_auto=parallel_auto,
+            allow_evict=allow_evict,
         )
         if isinstance(replanned, LoadRejected):
             raise self._vram_error(replanned)
@@ -1420,18 +1509,26 @@ class ModelManager:
 
     # -- unloading --------------------------------------------------------
 
-    async def unload(self, name: str) -> bool:
+    async def unload(self, name: str, *, deliberate: bool = True) -> bool:
         """Stop the child serving ``name``; a deliberate unload sticks (D41).
 
         The stopped id is marked so the pin reconciler leaves it down: whoever
         called this could see the model was pinned and asked anyway. Loading
         or re-pinning the model lifts the mark; the pin *setting* is untouched.
+
+        ``deliberate=False`` is for housekeeping teardown -- the benchmarks'
+        fresh-process-per-mode and leave-as-found unloads, ``test_model``
+        putting the rig back -- where nobody chose to take the model down.
+        Those stop without the mark, like the lease eviction and the TTL sweep
+        do, so a pinned model that was benchmarked or tested is brought back
+        by the reconciler instead of staying down until a restart.
         """
         record = self.registry.resolve(name)
         model_id = record.id if record is not None else name
         if self.supervisor.get(model_id) is None:
             return False
-        self._pin_suppressed.add(model_id)
+        if deliberate:
+            self._pin_suppressed.add(model_id)
         await self.supervisor.stop(model_id)
         return True
 
@@ -1526,18 +1623,54 @@ class ModelManager:
                 param="force",
                 details={"pinned": [i.model_id for i in pinned]},
             )
-        for victim in victims:
-            log.info(
-                "evicting for a gpu lease",
-                victim=victim.model_id,
-                devices=wanted,
-                holder=holder,
-                for_models=owners,
-            )
-            await self.supervisor.stop(victim.model_id)
+        # Book first, evict second. The planner reads the book, and every
+        # supervisor.stop() below yields to the event loop for the length of a
+        # child teardown: with the entry written afterwards, a JIT load (or
+        # the pin reconciler, or the rebalancer) planning during those awaits
+        # saw the cards unblocked and landed on the VRAM the victim had just
+        # freed, and two overlapping grants both passed conflicts() and both
+        # evicted before one of them lost at the book. Nothing between the
+        # checks above and this line awaits, so the scan and the entry are one
+        # atomic step; a failed eviction takes the entry back out because every
+        # caller only ever releases a lease it was handed.
         lease = self.leases.acquire(
             wanted, holder=holder, model_ids=owners, reason=reason, idle_ttl_s=idle_ttl_s
         )
+        try:
+            for victim in victims:
+                current = self.supervisor.get(victim.model_id)
+                if current is None:
+                    continue  # gone on its own while an earlier victim was torn down
+                if current.active_requests > 0:
+                    # Idle at the scan, busy now: the stop has no busy guard of
+                    # its own, and D36 holds across the whole grant.
+                    raise ModelBusyError(
+                        f"{current.model_id} picked up {current.active_requests} request(s) "
+                        f"on CUDA {wanted} while the lease was being granted; a lease never "
+                        f"interrupts a stream (D36). Retry when it is idle.",
+                        details={
+                            "retry_after_s": BUSY_RETRY_AFTER_S,
+                            "busy_models": [
+                                {
+                                    "model_id": current.model_id,
+                                    "active_requests": current.active_requests,
+                                }
+                            ],
+                        },
+                    )
+                log.info(
+                    "evicting for a gpu lease",
+                    victim=victim.model_id,
+                    devices=wanted,
+                    holder=holder,
+                    for_models=owners,
+                )
+                await self.supervisor.stop(victim.model_id)
+        except BaseException:
+            # CancelledError included: a cancelled benchmark must not leave a
+            # lease standing that nobody holds a handle to.
+            self.leases.release(lease.id)
+            raise
         log.info(
             "gpu lease acquired",
             lease_id=lease.id,
@@ -1746,15 +1879,20 @@ class ModelManager:
 
         Skips a model that is already up or coming up, one a caller
         deliberately unloaded (:meth:`unload` marks those), one whose load is
-        in flight, and one inside its failure backoff window.
+        in flight, one inside its failure backoff window, and one under a
+        smoke test or a benchmark -- those runs unload and reload the model
+        themselves (without the deliberate-unload mark, D41), and a reconcile
+        load spawned in their unload->lease->load gap would race the run and
+        fail its next grant with "a model load is in flight".
         """
         now = time.time()
+        under_test = {self._testing, getattr(self.benchmarker, "benchmarking", None)}
         wanted: list[str] = []
         for record in self.registry.all():
             if not record.settings.pinned:
                 continue
             serving_id = self.serving_record(record).id
-            if serving_id in wanted or serving_id in self._loading:
+            if serving_id in wanted or serving_id in self._loading or serving_id in under_test:
                 continue
             instance = self.supervisor.get(serving_id)
             if instance is not None and instance.state in ("ready", "loading"):
@@ -1869,7 +2007,9 @@ class ModelManager:
         The candidate plan must evict nothing (its own footprint is credited
         back, D30), the model must have been idle for REBALANCE_MIN_IDLE_S,
         and a persisted ``device_override`` -- the user said "run it here" --
-        is never second-guessed.
+        is never second-guessed. Neither is a lease owner (D43): it sits on
+        exactly its lease's cards by construction, so there is nothing to
+        re-ask.
         """
         now = time.time()
         loaded = self.supervisor.list()
@@ -1887,6 +2027,15 @@ class ModelManager:
                 continue
             record = self.registry.get(instance.model_id)
             if record is None or record.settings.device_override is not None:
+                continue
+            if self.leases.for_model(instance.model_id) is not None:
+                # A lease owner's placement is forced onto the lease's cards on
+                # a COPY of the record at load time (_apply_lease_profile), so
+                # the persisted-override gate above cannot see it. Previewing
+                # the raw record offers "[0] alone suffices" for a model leased
+                # onto [2, 3], and the reload's one-shot devices would then
+                # outrank the lease in _apply_lease_profile: the owner moved
+                # off the cards that were reserved for it. Never a candidate.
                 continue
             neighbours: set[int] = set()
             for other in loaded:
@@ -1947,10 +2096,20 @@ class ModelManager:
         """Force-reload one model onto the previewed placement (D30/D36 rules).
 
         ``force=True`` for the reload half only; ``evict_busy=False`` keeps the
-        no-interrupt rule. A refusal -- the world changed between preview and
-        gate -- leaves the resident child serving exactly as a refused forced
-        reload always has.
+        no-interrupt rule, and the gate re-checks it after the wait, so a
+        resident that picked up a request meanwhile is refused, not stopped.
+        ``allow_evict=False`` carries the preview's no-evict rule into the
+        real plan, and ``require_resident`` keeps the move a move: a refusal
+        -- the world changed between preview and gate -- leaves the resident
+        child serving exactly as a refused forced reload always has, and a
+        resident that vanished meanwhile is not reloaded cold.
         """
+        if self.leases.for_model(model_id) is not None:
+            # Granted between the preview and now: the cards are its alone.
+            log.info(
+                "rebalance skipped: the model was leased cards after the preview", model_id=model_id
+            )
+            return
         try:
             instance = await self.load(
                 model_id,
@@ -1961,6 +2120,8 @@ class ModelManager:
                 devices=plan.devices,
                 force=True,
                 evict_busy=False,
+                allow_evict=False,
+                require_resident=True,
                 source="rebalance",
             )
             log.info(
@@ -1971,6 +2132,21 @@ class ModelManager:
             )
         except asyncio.CancelledError:
             raise
+        except ModelBusyError as exc:
+            # A move that never happened should not burn the 30-minute
+            # cooldown: the next quiet look may find the model idle again.
+            self._rebalance_last.pop(model_id, None)
+            log.info(
+                "rebalance deferred; the model became busy while the move waited",
+                model_id=model_id,
+                error=str(exc),
+            )
+        except ModelNotResidentError as exc:
+            log.info(
+                "rebalance skipped; the model is no longer resident",
+                model_id=model_id,
+                error=str(exc),
+            )
         except Exception as exc:  # noqa: BLE001 - the model keeps its old placement
             log.warning(
                 "rebalance failed; the model keeps its placement",
@@ -2620,7 +2796,10 @@ class ModelManager:
         # only when the caller did not ask to keep it.
         unloaded = False
         if not was_loaded and not keep_loaded:
-            unloaded = await self.unload(serving.id)
+            # Housekeeping, not a choice to take the model down: a pinned
+            # model found unloaded (reconcile backoff, a fresh pin) must stay
+            # wanted by the reconciler after the test (D41).
+            unloaded = await self.unload(serving.id, deliberate=False)
 
         result: dict[str, Any] = {
             "model_id": record.id,

@@ -310,11 +310,53 @@ def test_restart_required_keys_are_flagged_on_the_spec() -> None:
 
 
 def test_a_field_without_hand_written_help_still_explains_itself() -> None:
-    specs = st.spec_by_key(st.config_field_specs())
+    # An empty help table rather than a key chosen for having no entry, so
+    # filling in the long tail later cannot trip this test.
+    specs = st.spec_by_key(st.config_field_specs(help_text={}))
     generic = specs["gateway.max_restarts"]
     assert generic.help == ""
     assert "default 3" in generic.summary
     assert "int" in generic.summary
+
+
+#: Keys that must never ship on the "<kind>, default <x>" fallback: a security
+#: toggle, the sweep cadence D41-D43 ride, the D38 engine switches, and the
+#: control plane's own knobs. A first-run user cannot infer any of these from a
+#: type and a default.
+MUST_HAVE_HELP = frozenset(
+    {
+        "gateway.allow_private_image_hosts",
+        "gateway.ttl_sweep_interval_s",
+        "gateway.merge_reasoning_into_content",
+        "engine.cache_ram_mb",
+        "engine.ubatch_size",
+        "engine.backend_sampling",
+        "planner.prefer_single_gpu",
+        "planner.cuda_context_mb",
+        "mcp.enabled",
+        "mcp.path",
+        "mcp.advertise",
+        "update.channel",
+    }
+)
+
+
+def test_consequential_keys_have_hand_written_help() -> None:
+    specs = st.spec_by_key(st.config_field_specs())
+    for key in sorted(MUST_HAVE_HELP):
+        assert key in specs, key
+        assert specs[key].help.strip(), f"{key} ships as '{specs[key].summary}'"
+    # The SSRF guard and the sweep cadence say what they gate, not just a type.
+    assert "SSRF" in specs["gateway.allow_private_image_hosts"].help
+    for d_number in ("D41", "D42", "D43"):
+        assert d_number in specs["gateway.ttl_sweep_interval_s"].help
+
+
+def test_every_help_entry_names_a_real_config_key() -> None:
+    """A renamed field must not leave a stale sentence behind."""
+    known = {spec.key for spec in st.config_field_specs()}
+    stale = set(st.CONFIG_FIELD_HELP) - known
+    assert not stale, stale
 
 
 def test_advanced_excludes_covered_keys_secrets_and_mappings() -> None:

@@ -18,18 +18,25 @@ from studioforge.core import netinfo
 from studioforge.errors import AuthError
 
 
-def make_request(path: str, headers: dict[str, str] | None = None, query: str = "") -> Request:
+def make_request(
+    path: str,
+    headers: dict[str, str] | None = None,
+    query: str = "",
+    *,
+    method: str = "GET",
+    client: tuple[str, int] | None = ("127.0.0.1", 5000),
+) -> Request:
     raw = [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()]
     scope: dict[str, Any] = {
         "type": "http",
-        "method": "GET",
+        "method": method,
         "path": path,
         "raw_path": path.encode(),
         "query_string": query.encode(),
         "headers": raw,
         "scheme": "http",
         "server": ("127.0.0.1", 1234),
-        "client": ("127.0.0.1", 5000),
+        "client": client,
         "root_path": "",
     }
     return Request(scope)
@@ -210,6 +217,53 @@ def test_pin_can_be_disabled() -> None:
     check_request(make_request("/mcp"), config)
 
 
+LAN = ("192.168.1.77", 5000)
+
+
+def test_pin_required_off_relaxes_same_machine_callers_only() -> None:
+    """D32 covers the MCP plane: every JSON-RPC call is a POST and the tools
+    behind it (set_config, delete_model, download_model, reserve_gpus) are the
+    box changes the HTTP routes gate. With no key, `pin_required: false` must
+    not open them to the LAN -- the control plane would again be the least
+    protected surface, the very thing the PIN exists to prevent."""
+    config = make_config(api_key=None, pin="12345678", pin_required=False)
+    with pytest.raises(AuthError) as excinfo:
+        check_request(make_request("/mcp", method="POST", client=LAN), config)
+    assert excinfo.value.status_code == 403
+    assert excinfo.value.code == "remote_admin_requires_credential"
+    # The PIN still admits the remote caller, either way it is sent.
+    check_request(
+        make_request("/mcp", {"X-MCP-Pin": "12345678"}, method="POST", client=LAN), config
+    )
+    check_request(
+        make_request("/mcp", {"Authorization": "Bearer 12345678"}, method="POST", client=LAN),
+        config,
+    )
+    # Same machine, and the in-process shim: relaxed as the toggle promises.
+    check_request(make_request("/mcp", method="POST"), config)
+    check_request(make_request("/mcp", method="POST", client=None), config)
+    # The SSE stream is a GET; reads stay open (D32).
+    check_request(make_request("/mcp", client=LAN), config)
+
+
+def test_no_pin_and_no_key_means_no_remote_mcp_at_all() -> None:
+    config = make_config(api_key=None, pin=None)
+    with pytest.raises(AuthError) as excinfo:
+        check_request(make_request("/mcp", method="POST", client=LAN), config)
+    assert excinfo.value.status_code == 403
+    check_request(make_request("/mcp", method="POST"), config)  # loopback: open
+
+
+def test_a_key_makes_the_mcp_plane_the_keys_business_as_before() -> None:
+    config = make_config(api_key="the-key", pin="12345678", pin_required=False)
+    with pytest.raises(AuthError) as excinfo:
+        check_request(make_request("/mcp", method="POST", client=LAN), config)
+    assert excinfo.value.status_code == 401
+    check_request(
+        make_request("/mcp", {"Authorization": "Bearer the-key"}, method="POST", client=LAN), config
+    )
+
+
 def test_health_needs_no_credential_even_with_a_pin() -> None:
     config = make_config(api_key="the-key", pin="12345678")
     check_request(make_request("/health"), config)
@@ -307,12 +361,12 @@ def test_pin_minted_into_a_preexisting_config_is_written_back(tmp_path: Any) -> 
 # ---------------------------------------------------------------------------
 
 
-def _request_from(host: str | None) -> Any:
+def _request_from(host: str | None, headers: dict[str, str] | None = None) -> Any:
     scope: dict[str, Any] = {
         "type": "http",
         "method": "GET",
         "path": "/api/mcp/info",
-        "headers": [],
+        "headers": [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()],
         "query_string": b"",
         "scheme": "http",
         "server": ("0.0.0.0", 1234),
@@ -332,6 +386,23 @@ def test_pin_withheld_from_remote_callers_when_no_api_key() -> None:
     assert may_reveal_pin(_request_from("127.0.0.1"), config) is True
     # An in-process call (the GUI invoking the handler) has no peer and is trusted.
     assert may_reveal_pin(_request_from(None), config) is True
+
+
+def test_pin_withheld_from_a_cross_site_page_even_on_loopback() -> None:
+    """The operator's browser is a loopback peer, and with CORS `*` the body of
+    /api/mcp/info is readable by any page it shows."""
+    from types import SimpleNamespace
+
+    from studioforge.api.auth import may_reveal_pin
+
+    config = make_config(api_key=None, pin="12345678")
+    host = {"Host": "127.0.0.1:1234"}
+    foreign = _request_from("127.0.0.1", {"Origin": "http://evil.example", **host})
+    assert may_reveal_pin(foreign, config) is False
+    same = _request_from("127.0.0.1", {"Origin": "http://127.0.0.1:1234", **host})
+    assert may_reveal_pin(same, config) is True
+    # The GUI's handler shim carries neither peer nor headers.
+    assert may_reveal_pin(SimpleNamespace(app=None), config) is True
 
 
 def test_pin_revealed_when_a_credential_was_required() -> None:

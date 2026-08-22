@@ -18,7 +18,14 @@ from typing import Any
 import pytest
 from fastapi import Request
 
-from studioforge.api.auth import REMOTE_ADMIN_NOTE, check_request, is_admin_mutation
+from studioforge.api.auth import (
+    PIN_WITHHELD_NOTE,
+    REMOTE_ADMIN_NOTE,
+    check_request,
+    cross_site_browser_request,
+    is_admin_mutation,
+    may_reveal_pin,
+)
 from studioforge.config import Config
 from studioforge.core.manager import validate_load_args
 from studioforge.errors import AuthError, BadRequestError
@@ -166,6 +173,106 @@ def test_without_a_pin_configured_remote_admin_is_refused_outright() -> None:
     assert excinfo.value.status_code == 403
 
 
+LOOPBACK = ("127.0.0.1", 40000)
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "http://evil.example",
+        "https://evil.example:443",
+        "null",
+        # Another local web app is also a loopback peer -- and is not this
+        # server, so the port is part of the comparison.
+        "http://127.0.0.1:8188",
+        "http://localhost:8080",
+    ],
+)
+def test_a_cross_site_browser_request_on_loopback_is_not_local(origin: str) -> None:
+    """The operator's browser is a loopback peer; any page it shows can drive it."""
+    config = open_config()
+    headers = {"Origin": origin, "Host": "127.0.0.1:1234"}
+    assert cross_site_browser_request(make_request("/api/config", headers=headers))
+    with pytest.raises(AuthError) as excinfo:
+        check_request(
+            make_request("/api/config", method="PATCH", headers=headers, client=LOOPBACK), config
+        )
+    assert excinfo.value.status_code == 403
+    assert excinfo.value.code == "remote_admin_requires_credential"
+    # ...and the PIN is withheld from such a page: with ACAO `*` the body is
+    # readable cross-origin, and the PIN is the only credential on the box.
+    assert not may_reveal_pin(
+        make_request("/api/mcp/info", headers=headers, client=LOOPBACK), config
+    )
+
+
+@pytest.mark.parametrize(
+    ("origin", "host"),
+    [
+        ("http://127.0.0.1:1234", "127.0.0.1:1234"),
+        ("http://localhost:1234", "LOCALHOST:1234"),
+        ("http://[::1]:1234", "[::1]:1234"),
+        # Implicit default ports on either side.
+        ("http://localhost", "localhost:80"),
+        ("http://localhost:80", "localhost"),
+    ],
+)
+def test_a_same_origin_browser_request_is_still_local(origin: str, host: str) -> None:
+    config = open_config()
+    headers = {"Origin": origin, "Host": host}
+    assert not cross_site_browser_request(make_request("/api/config", headers=headers))
+    check_request(
+        make_request("/api/config", method="PATCH", headers=headers, client=LOOPBACK), config
+    )
+    assert may_reveal_pin(make_request("/api/mcp/info", headers=headers, client=LOOPBACK), config)
+
+
+def test_a_cross_site_page_still_gets_in_with_a_real_credential() -> None:
+    """The Origin rule removes ambient trust; it is not a CSRF token scheme."""
+    evil = {"Origin": "http://evil.example", "Host": "127.0.0.1:1234"}
+    config = open_config()
+    check_request(
+        make_request(
+            "/api/config",
+            method="PATCH",
+            headers={**evil, "X-MCP-Pin": "12345678"},
+            client=LOOPBACK,
+        ),
+        config,
+    )
+    config.server.api_key = "the-real-key"
+    check_request(
+        make_request(
+            "/api/config",
+            method="PATCH",
+            headers={**evil, "Authorization": "Bearer the-real-key"},
+            client=LOOPBACK,
+        ),
+        config,
+    )
+    # With a key set there is no ambient credential to ride, so the reveal
+    # rule is the old one: a credential was required to get here.
+    assert may_reveal_pin(make_request("/api/mcp/info", headers=evil, client=LOOPBACK), config)
+
+
+def test_origin_is_only_consulted_when_a_browser_sent_one() -> None:
+    from types import SimpleNamespace
+
+    config = open_config()
+    # No Origin: sfctl, the watchdog, curl, every OpenAI client.
+    check_request(
+        make_request("/api/config", method="PATCH", headers={"Host": "x"}, client=LOOPBACK), config
+    )
+    # Origin without Host is not something a browser produces; pass.
+    assert not cross_site_browser_request(
+        make_request("/api/config", headers={"Origin": "http://evil.example"})
+    )
+    # The GUI's in-process shim has neither headers nor a peer.
+    shim = SimpleNamespace(app=None)
+    assert not cross_site_browser_request(shim)
+    assert may_reveal_pin(shim, config)
+
+
 def test_a_configured_api_key_is_the_credential_as_before() -> None:
     config = open_config()
     config.server.api_key = "the-real-key"
@@ -282,7 +389,7 @@ def test_engine_dir_refuses_a_tag_that_escapes_the_engines_tree(tmp_path: Any) -
 # ---------------------------------------------------------------------------
 
 
-def _open_app(tmp_path: Any, pin: str = "12345678") -> Any:
+def _open_app(tmp_path: Any, pin: str = "12345678", pin_required: bool = True) -> Any:
     from studioforge.api.app import build_state, create_app
 
     config = Config(
@@ -292,9 +399,65 @@ def _open_app(tmp_path: Any, pin: str = "12345678") -> Any:
         gui={"enabled": False},
         watchdog={"enabled": False},
         logging={"level": "ERROR"},
-        mcp={"pin": pin},
+        mcp={"pin": pin, "pin_required": pin_required},
     )
     return create_app(config, state=build_state(config), start_background=False)
+
+
+def test_a_cross_site_page_on_the_operators_browser_gets_403_and_no_pin(tmp_path: Any) -> None:
+    """Shipped default: CORS `*`, no key. The preflight succeeds for any origin,
+    the peer is loopback, and the response is readable cross-origin -- so the
+    auth gate, not CORS, has to be what says no."""
+    from fastapi.testclient import TestClient
+
+    evil = {"Origin": "http://evil.example"}
+    with TestClient(_open_app(tmp_path), client=("127.0.0.1", 50000)) as browser:
+        refused = browser.patch("/api/config", json={"models.default_ctx": 4096}, headers=evil)
+        assert refused.status_code == 403
+        assert refused.json()["error"]["code"] == "remote_admin_requires_credential"
+        info = browser.get("/api/mcp/info", headers=evil)
+        assert info.status_code == 200
+        assert info.json()["pin"] is None
+        assert info.json()["pin_note"] == PIN_WITHHELD_NOTE
+        # The query carrier is parsed but no longer advertised.
+        assert all("?pin=" not in a for a in info.json()["auth"]["alternatives"])
+        # Same origin (TestClient's Host is "testserver") is the operator's own tab.
+        same = {"Origin": "http://testserver"}
+        assert browser.get("/api/mcp/info", headers=same).json()["pin"] == "12345678"
+        ok = browser.patch("/api/config", json={"models.default_ctx": 4096}, headers=same)
+        assert ok.status_code == 200, ok.text
+
+
+def test_pin_required_off_does_not_open_the_mcp_plane_to_the_lan(tmp_path: Any) -> None:
+    from fastapi.testclient import TestClient
+
+    initialize = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "t", "version": "0"},
+        },
+    }
+    accept = {"Accept": "application/json, text/event-stream"}
+    with TestClient(_open_app(tmp_path, pin_required=False), client=("192.168.1.50", 50000)) as lan:
+        refused = lan.post("/mcp", json=initialize, headers=accept)
+        assert refused.status_code == 403
+        assert refused.json()["error"]["code"] == "remote_admin_requires_credential"
+        # /api/mcp/info tells that caller the truth about what it will be held to.
+        info = lan.get("/api/mcp/info").json()
+        assert info["pin_required"] is True
+        assert info["pin"] is None
+        assert info["pin_note"] == PIN_WITHHELD_NOTE
+        with_pin = lan.post("/mcp", json=initialize, headers={**accept, "X-MCP-Pin": "12345678"})
+        assert with_pin.status_code == 200, with_pin.text
+    with TestClient(
+        _open_app(tmp_path / "b", pin_required=False), client=("127.0.0.1", 50000)
+    ) as local:
+        assert local.post("/mcp", json=initialize, headers=accept).status_code == 200
+        assert local.get("/api/mcp/info").json()["pin_required"] is False
 
 
 def test_a_lan_caller_gets_403_on_an_admin_mutation_and_the_pin_admits_it(tmp_path: Any) -> None:
