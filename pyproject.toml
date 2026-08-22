@@ -6,6 +6,16 @@ readme = "README.md"
 requires-python = ">=3.12"
 # No licence chosen yet: all rights reserved. Do not add a licence
 # classifier or a LICENSE file until one is picked deliberately.
+keywords = ["llama.cpp", "llm", "openai-compatible", "gpu", "mcp", "lm-studio"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Web Environment",
+    "Framework :: FastAPI",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
@@ -28,6 +38,12 @@ dependencies = [
     # fresh install must get them without being told (WP17 F10).
     "pywin32>=306; sys_platform == 'win32'",
 ]
+
+[project.urls]
+Homepage = "https://github.com/LaserLloyd/StudioForge"
+Repository = "https://github.com/LaserLloyd/StudioForge"
+Issues = "https://github.com/LaserLloyd/StudioForge/issues"
+Changelog = "https://github.com/LaserLloyd/StudioForge/blob/main/DECISIONS.md"
 
 [project.optional-dependencies]
 dev = [

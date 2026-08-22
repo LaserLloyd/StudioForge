@@ -88,6 +88,14 @@ restating the reasoning in three places.
   addresses, no PINs or tokens — in code, tests, docs or fixtures. Machine-specific settings go in
   `local-env.bat` (gitignored) or `SF_DATA_DIR`.
 
+## Where things are
+
+`src/studioforge/` is the app (`api/`, `core/`, `gui/`, `mcp/`, `tray/`, `watchdog/`);
+`packages/studioforge-companion/` is `sfctl`, a separate package with its own `pyproject.toml`;
+`launchers/` holds the Windows `.bat` launchers; `deploy/` the Linux systemd units; `docs/` the
+user-facing documentation; `tests/unit/` the suite CI runs and `tests/contract/` the opt-in suite
+that needs real GPUs. Decisions with a *why* go in `DECISIONS.md`, numbered.
+
 ## Data directory
 
 Everything the app writes lives in the data dir: `SF_DATA_DIR`, else `<repo>/data`, else the

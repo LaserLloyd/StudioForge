@@ -26,7 +26,7 @@ The watchdog has its own open `/health` on `:1235` that keeps answering when the
 
 ## It will not start
 
-* **`startup port conflict`** in the console / `Start StudioForge.bat` names the port and the
+* **`startup port conflict`** in the console / `launchers\Start StudioForge.bat` names the port and the
   holder ("LM Studio", "another StudioForge (pid N)"). Quit that, or change `server.port` on the
   Setup tab. Exit code 3; the tray waits up to 120 s for whoever holds the port to answer as a
   StudioForge server before saying so (D28).
@@ -107,8 +107,8 @@ process respawns (D28). `sfctl recover` also has `kill_model`, `gpu_status`, `ta
 
 | You started it with | Restart from GUI/API/MCP does | Crash does |
 | --- | --- | --- |
-| the tray (`StudioForge Tray.bat`, autostart) | server exits 75, tray respawns, no crash counted | tray respawns (3 attempts within 60 s, then "Crashed — see the logs folder") |
-| `studioforge serve` / `Start StudioForge.bat` | watchdog kills and respawns | watchdog does **not** auto-respawn (by design); relaunch |
+| the tray (`launchers\StudioForge Tray.bat`, autostart) | server exits 75, tray respawns, no crash counted | tray respawns (3 attempts within 60 s, then "Crashed — see the logs folder") |
+| `studioforge serve` / `launchers\Start StudioForge.bat` | watchdog kills and respawns | watchdog does **not** auto-respawn (by design); relaunch |
 | systemd | watchdog kills and respawns | `Restart=on-failure` in the unit |
 
 ## Downloads

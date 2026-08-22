@@ -1062,7 +1062,7 @@ def apply_overrides(config: Config, updates: dict[str, Any]) -> Config:
         if dotted.split(".")[0] in Config.UNPERSISTED_KEYS:
             raise ConfigError(
                 f"{dotted} is not stored in config.yaml: the data directory is set by "
-                "SF_DATA_DIR (local-env.bat next to the launchers, or the shell/systemd "
+                "SF_DATA_DIR (local-env.bat in the repo root, or the shell/systemd "
                 "environment), see README 'Data directory'",
                 param=dotted,
             )

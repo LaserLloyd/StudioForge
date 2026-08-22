@@ -1,5 +1,7 @@
 # StudioForge
 
+[![CI](https://github.com/LaserLloyd/StudioForge/actions/workflows/ci.yml/badge.svg)](https://github.com/LaserLloyd/StudioForge/actions/workflows/ci.yml)
+
 A self-hosted, **GPU-only** LLM serving system: an OpenAI-compatible gateway over
 [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server`, with a model registry, a VRAM
 planner, a web control panel, and an MCP control plane for agents. It was built to replace LM
@@ -22,6 +24,44 @@ newer llama.cpp engine, and the image URLs a vision request names.
 
 ---
 
+## What it looks like
+
+The control panel at `http://<host>:8080` — every number is the *actual* one the engine
+reports (context, slots, VRAM per card), not the one that was asked for:
+
+![Dashboard: GPUs, who holds the VRAM, standing GPU leases, and each loaded model with its live slots](docs/images/dashboard.png)
+
+The Setup tab is a checklist, not a YAML file — it opens on a fresh install and stays green
+afterwards; the Models tab is the library, indexed in place, with load / pin / test / benchmark
+per row:
+
+| Setup | Models |
+| --- | --- |
+| ![Setup checklist](docs/images/setup.png) | ![Model library](docs/images/models.png) |
+
+On Windows, StudioForge also lives in the notification area. The tray starts the server, restarts
+it if it crashes, and puts the everyday actions one right-click away:
+
+<p align="center"><img src="docs/images/tray-menu.png" alt="The system tray menu: open the control panel, unload models, restart engines or the server, copy the MCP URL and PIN, start at login" width="420"></p>
+
+### The companion: `sfctl`
+
+StudioForge is built to be driven from *another* machine — the one running your agent. The
+[`studioforge-companion`](packages/studioforge-companion/) package installs anywhere (no CUDA, no
+server dependencies) and gives you:
+
+- **`sfctl`** — a remote control for the rig: status, load/unload/pin, benchmark, download,
+  logs, config, engine updates, and `sfctl recover` for when the server is wedged.
+- **`sfctl mcp`** — one stdio MCP server that merges the server's management tools *and* the
+  watchdog's recovery tools into a single toolset for [OpenClaw](docs/OPENCLAW.md) (or any MCP
+  client). When the main server locks up, the agent still holds `restart_server`.
+
+```bash
+uv tool install ./studioforge_companion-<version>-py3-none-any.whl
+sfctl servers add rig http://<studioforge-host>:1234 --api-key <pin-or-key> --use
+sfctl status
+```
+
 ## Requirements
 
 | | |
@@ -42,7 +82,7 @@ uv venv --python 3.12 .venv
 uv pip install --python .venv/Scripts/python.exe -e ".[dev]"     # Linux: .venv/bin/python
 ```
 
-On Windows, double-clicking **Update StudioForge.bat** does the same thing (and keeps doing it on
+On Windows, double-clicking **launchers\Update StudioForge.bat** does the same thing (and keeps doing it on
 later updates). Then start it:
 
 ```bash
@@ -106,7 +146,7 @@ The `.bat` launchers, the `justfile`/`Makefile` and the CLI all follow that rule
 double-click and a typed command reach the same install.
 
 **To point this checkout at a data directory that already exists** — an older install, or a second
-drive — create `local-env.bat` next to the launchers:
+drive — create `local-env.bat` in the repo root (template: `launchers\local-env.example.bat`):
 
 ```bat
 set "SF_DATA_DIR=D:\path\to\an\existing\data"
@@ -126,17 +166,35 @@ systemd unit (see [`deploy/`](deploy/)).
 does not need it — it writes its own `config.yaml` into the data dir on first run — it is there to
 read.
 
+## Project layout
+
+| Path | What lives there |
+| --- | --- |
+| `src/studioforge/` | The application: `api/` (OpenAI-compatible gateway + management routes), `core/` (registry, VRAM planner, supervisor, leases, benchmarks), `gui/` (the control panel), `mcp/` (the agent control plane), `tray/` (Windows notification-area app), `watchdog/` (the recovery sidecar) |
+| `packages/studioforge-companion/` | `sfctl` — the thin remote-control CLI and the `sfctl mcp` stdio bridge for OpenClaw; installs anywhere, no CUDA dependencies |
+| `launchers/` | Windows double-click launchers (below) |
+| `deploy/` | Linux: systemd units for the server and the watchdog |
+| `docs/` | Setup, OpenClaw integration, the benchmarking playbook, the runbook, limitations |
+| `tests/unit/` | The suite CI runs (no GPU needed); `tests/contract/` needs real engines and weights and is opt-in |
+| `DECISIONS.md` | The running architectural decision log, D1 onward — the *why* behind every non-obvious rule |
+| `config.example.yaml` | Every config key with its shipped default, annotated; the app writes its own `config.yaml` into the data dir |
+
 ## Windows: double-click launchers
 
-Five `.bat` files at the repo root, none of which need a terminal or admin rights:
+Everything a Windows user needs is in [`launchers/`](launchers/) — five `.bat` files, none of which
+need a terminal or admin rights:
 
 | File | What it does |
 | --- | --- |
 | **Start StudioForge.bat** | Starts the server and opens the control panel once it is actually up |
+| **StudioForge Tray.bat** | Puts StudioForge in the notification area: it starts the server, restarts it if it crashes, and offers start/stop, free VRAM and copy-the-MCP-URL from the icon |
 | **Open StudioForge GUI.bat** | Opens the control panel of an already-running server |
+| **StudioForge Autostart.bat** | Turns "start when I log in" on or off (tray, or server only) |
 | **Update StudioForge.bat** | Pulls code (if a git remote exists), syncs dependencies, updates the llama.cpp engine, then verifies |
-| **StudioForge Autostart.bat** | Turns "start when I log in" on or off |
-| **StudioForge Tray.bat** | Puts StudioForge in the notification area: start/stop the server, free VRAM, copy the MCP URL |
+
+They resolve the repo from their own location, so they work from a shortcut on the desktop too.
+`launchers\local-env.example.bat` is the template for keeping your data outside the checkout
+(copy it to the repo root as `local-env.bat`; see *Data directory* above).
 
 The same things from a terminal, on any platform:
 

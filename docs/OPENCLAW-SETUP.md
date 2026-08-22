@@ -46,7 +46,7 @@ curl -s http://127.0.0.1:1234/health
 ```
 
 You want `{"status":"ok",...,"instance":"primary"}`. If nothing answers, launch
-`Start StudioForge.bat` (or `StudioForge Autostart.bat` once, to have it start with Windows).
+`launchers\Start StudioForge.bat` (or `launchers\StudioForge Autostart.bat` once, to have it start with Windows).
 
 `instance` is worth a glance: `secondary` means another process already holds the data directory,
 and this one is serving reads while doing no background work at all — no download resume, no TTL
@@ -380,7 +380,7 @@ network change, since it reads the live Tailscale and LAN addresses rather than 
 
 ## Day to day
 
-- **Update the engine or the app** on the rig with `Update StudioForge.bat`, or `sfctl update`
+- **Update the engine or the app** on the rig with `launchers\Update StudioForge.bat`, or `sfctl update`
   remotely. App updates roll back automatically if the new version fails to come up; `rollback_update`
   is also exposed as an MCP tool.
 - **After updating the rig**, rebuild and reinstall the companion wheel on the OpenClaw box if the companion

@@ -18,7 +18,7 @@ uv pip install --python .venv/Scripts/python.exe -e ".[dev]"     # Linux: .venv/
 studioforge serve --open
 ```
 
-On Windows, **Start StudioForge.bat** does the same thing without a terminal.
+On Windows, **launchers\Start StudioForge.bat** does the same thing without a terminal.
 
 The panel opens on `http://localhost:8080`. On a fresh install it lands on **Setup** rather than the
 Dashboard, because a box with no engine and no model library has nothing to put on a dashboard.
