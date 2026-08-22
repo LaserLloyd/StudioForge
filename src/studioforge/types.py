@@ -861,6 +861,37 @@ class EngineInfo(BaseModel):
     build_log: Path | None = None
 
 
+class GpuLease(BaseModel):
+    """A claim on specific CUDA devices that the planner honours (D43).
+
+    Only the models in ``model_ids`` may be planned onto ``devices`` while the
+    lease stands; an empty ``model_ids`` means *nobody* may -- the cards are
+    held for something outside this server (a ComfyUI run, a training job).
+    ``idle_ttl_s`` is the safety net: a lease nobody has touched for that long
+    is released by the sweep, so a crashed benchmark or a forgotten reservation
+    cannot hold a card forever. ``None`` means held until released.
+    """
+
+    id: str
+    devices: list[int]
+    holder: str
+    model_ids: list[str] = Field(default_factory=list)
+    reason: str = ""
+    created_at: float
+    last_activity_at: float
+    idle_ttl_s: float | None = 3600.0
+
+    @property
+    def idle_s(self) -> float:
+        return max(0.0, time.time() - self.last_activity_at)
+
+    @property
+    def expires_at(self) -> float | None:
+        if self.idle_ttl_s is None:
+            return None
+        return self.last_activity_at + self.idle_ttl_s
+
+
 class ServerStatus(BaseModel):
     version: str
     uptime_s: float
@@ -877,6 +908,9 @@ class ServerStatus(BaseModel):
     queue_depth: int = 0
     active_downloads: int = 0
     draining: bool = False
+    #: Standing GPU leases (D43): which cards are held, by whom, for which
+    #: models, and when the sweep will release an idle one.
+    leases: list[GpuLease] = Field(default_factory=list)
 
 
 # Resolve forward references (ModelSettings <-> AdapterAttachment).

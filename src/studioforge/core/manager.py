@@ -17,6 +17,7 @@ from typing import Any
 
 from studioforge.config import Config, KvCacheType
 from studioforge.core.gpu import vram_processes
+from studioforge.core.leases import DEFAULT_IDLE_TTL_S, LeaseBook
 from studioforge.core.planner import BUSY_RETRY_AFTER_S, OBSERVATION_NOTE_PER_PID_DEVICE, Planner
 from studioforge.core.registry import Registry
 from studioforge.core.supervisor import Supervisor
@@ -24,6 +25,7 @@ from studioforge.db import Database
 from studioforge.errors import (
     BadRequestError,
     InsufficientVramError,
+    LeaseConflictError,
     ModelBusyError,
     ModelLoadError,
     ModelNotFoundError,
@@ -33,6 +35,7 @@ from studioforge.logging import get_logger
 from studioforge.types import (
     MB,
     AdapterRecord,
+    GpuLease,
     InstanceInfo,
     LoadPlan,
     LoadRejected,
@@ -234,6 +237,7 @@ class ModelManager:
         supervisor: Supervisor,
         db: Database,
         version: str = "0.1.0",
+        leases: LeaseBook | None = None,
     ) -> None:
         self.config = config
         self.registry = registry
@@ -241,6 +245,10 @@ class ModelManager:
         self.supervisor = supervisor
         self.db = db
         self.version = version
+        #: GPU leases (D43). Shared with the planner by the app so a lease
+        #: granted here is honoured there; a manager built without one (tests)
+        #: keeps a private, empty book.
+        self.leases = leases if leases is not None else LeaseBook()
         self._started_at = time.time()
         self._locks: dict[str, asyncio.Lock] = {}
         self._locks_guard = asyncio.Lock()
@@ -287,6 +295,11 @@ class ModelManager:
         #: model is never shuffled -- or logged about -- more than once per
         #: cooldown window.
         self._rebalance_last: dict[str, float] = {}
+        #: When the rebalancer last scanned, and per model the layout it
+        #: scanned against -- so the planner is asked once per changed world,
+        #: not once per sweep (D42, amended).
+        self._rebalance_checked_at = 0.0
+        self._rebalance_seen: dict[str, tuple[Any, float]] = {}
         self._draining = False
         #: Set by the app to the boot's "done" event (D33): a JIT load that
         #: arrives while the library is still being scanned or the engine is
@@ -1072,6 +1085,7 @@ class ModelManager:
             if settled is not None:
                 return settled
 
+        record, parallel_auto = self._apply_lease_profile(record)
         draft = self._draft_for(record)
         adapters = self._adapters_for(record)
 
@@ -1085,6 +1099,7 @@ class ModelManager:
             draft=draft,
             adapters=[a for a, _ in adapters],
             reload_of=reload_of,
+            parallel_auto=parallel_auto,
             # A model serving a request is never evicted to make room for
             # another one (D36); only an explicit force=true from a caller who
             # can see what they are interrupting overrides that, and a JIT load
@@ -1131,6 +1146,7 @@ class ModelManager:
                 kv_cache_type_v=kv_cache_type_v,
                 parallel=parallel,
                 source=source,
+                parallel_auto=parallel_auto,
             )
         except StudioForgeError:
             raise
@@ -1216,6 +1232,7 @@ class ModelManager:
         kv_cache_type_v: Any = None,
         parallel: int | None = None,
         source: str = "api",
+        parallel_auto: bool = False,
     ) -> InstanceInfo:
         """Launch the child, retrying **once** after a transient OOM.
 
@@ -1271,6 +1288,7 @@ class ModelManager:
             loaded=self.supervisor.list(),
             draft=draft,
             adapters=[a for a, _ in adapters],
+            parallel_auto=parallel_auto,
         )
         if isinstance(replanned, LoadRejected):
             raise self._vram_error(replanned)
@@ -1424,6 +1442,217 @@ class ModelManager:
         await self.supervisor.stop_all()
         return ids
 
+    # -- GPU leases (D43) --------------------------------------------------
+
+    async def acquire_lease(
+        self,
+        devices: Sequence[int],
+        *,
+        holder: str,
+        model_ids: Sequence[str] = (),
+        reason: str = "",
+        idle_ttl_s: float | None = DEFAULT_IDLE_TTL_S,
+        force: bool = False,
+    ) -> GpuLease:
+        """Give ``devices`` to ``model_ids`` (or to nobody) until released or idle.
+
+        Idle residents on those cards that are not the new owners are unloaded
+        -- that is what "the card is yours" means. A resident mid-request is
+        never interrupted: the call refuses with ``retry_after_s`` (D36). A
+        *pinned* idle resident refuses too unless ``force`` is set, because a
+        pin is a standing wish; with ``force`` it is evicted and the pin
+        reconciler brings it back on other cards if they fit, or on these once
+        the lease ends. A card already leased is a conflict, never a takeover.
+        """
+        wanted = sorted({int(d) for d in devices})
+        if not wanted:
+            raise BadRequestError("a lease must name at least one CUDA device", param="devices")
+        known = self._known_devices()
+        if known is not None:
+            unknown = [d for d in wanted if d not in known]
+            if unknown:
+                raise BadRequestError(
+                    f"unknown CUDA device(s) {unknown}; this box has {known}", param="devices"
+                )
+        owners: list[str] = []
+        for name in model_ids:
+            record = self.registry.resolve(name)
+            if record is None:
+                raise ModelNotFoundError(name, known=self.registry.known_ids())
+            serving_id = self.serving_record(record).id
+            if serving_id not in owners:
+                owners.append(serving_id)
+        if self.leases.conflicts(wanted):
+            # Let the book phrase the conflict: it names the lease in the way.
+            self.leases.acquire(wanted, holder=holder, model_ids=owners)
+        if self._loading:
+            raise ModelBusyError(
+                f"a model load is in flight ({', '.join(sorted(self._loading))}) and may "
+                f"land on these cards; retry once it settles",
+                details={"retry_after_s": BUSY_RETRY_AFTER_S, "loading": sorted(self._loading)},
+            )
+        busy: list[InstanceInfo] = []
+        pinned: list[InstanceInfo] = []
+        victims: list[InstanceInfo] = []
+        for instance in self.supervisor.list():
+            if instance.model_id in owners or instance.plan is None:
+                continue
+            if not (set(instance.plan.devices) & set(wanted)):
+                continue
+            if instance.state == "loading" or instance.active_requests > 0:
+                busy.append(instance)
+            elif instance.ttl_s == 0 and not force:
+                pinned.append(instance)
+            else:
+                victims.append(instance)
+        if busy:
+            names = ", ".join(f"{i.model_id} ({i.active_requests} in flight)" for i in busy)
+            raise ModelBusyError(
+                f"{names} is serving on CUDA {wanted}; a lease never interrupts a stream "
+                f"(D36). Retry when it is idle.",
+                details={
+                    "retry_after_s": BUSY_RETRY_AFTER_S,
+                    "busy_models": [
+                        {"model_id": i.model_id, "active_requests": i.active_requests} for i in busy
+                    ],
+                },
+            )
+        if pinned:
+            names = ", ".join(i.model_id for i in pinned)
+            raise LeaseConflictError(
+                f"pinned model(s) {names} are resident on CUDA {wanted}; pass force=true to "
+                f"evict them -- the pin reconciler brings them back on other cards if they "
+                f"fit, or on these once the lease ends",
+                param="force",
+                details={"pinned": [i.model_id for i in pinned]},
+            )
+        for victim in victims:
+            log.info(
+                "evicting for a gpu lease",
+                victim=victim.model_id,
+                devices=wanted,
+                holder=holder,
+                for_models=owners,
+            )
+            await self.supervisor.stop(victim.model_id)
+        lease = self.leases.acquire(
+            wanted, holder=holder, model_ids=owners, reason=reason, idle_ttl_s=idle_ttl_s
+        )
+        log.info(
+            "gpu lease acquired",
+            lease_id=lease.id,
+            devices=wanted,
+            holder=holder,
+            model_ids=owners,
+            idle_ttl_s=idle_ttl_s,
+            reason=reason or None,
+        )
+        return lease
+
+    def release_lease(self, lease_id: str) -> GpuLease:
+        lease = self.leases.release(lease_id)
+        log.info(
+            "gpu lease released",
+            lease_id=lease.id,
+            devices=list(lease.devices),
+            holder=lease.holder,
+        )
+        return lease
+
+    def touch_lease(self, lease_id: str) -> GpuLease:
+        return self.leases.touch(lease_id)
+
+    def _expire_leases(self) -> None:
+        """Release leases idle past their ttl; an owner's own activity counts as a touch.
+
+        In-memory only: a handful of dict lookups per sweep.
+        """
+        if not len(self.leases):
+            return
+        for lease in self.leases.all():
+            for model_id in lease.model_ids:
+                instance = self.supervisor.get(model_id)
+                if instance is None:
+                    continue
+                if instance.state == "loading":
+                    self.leases.touch(lease.id)
+                    continue
+                last = instance.last_activity_at or instance.started_at
+                if last:
+                    self.leases.touch(lease.id, at=last)
+        for lease in self.leases.expired():
+            self.leases.release(lease.id)
+            log.info(
+                "gpu lease released by the system: idle past its ttl",
+                lease_id=lease.id,
+                holder=lease.holder,
+                devices=list(lease.devices),
+                model_ids=list(lease.model_ids),
+                idle_ttl_s=lease.idle_ttl_s,
+            )
+
+    def _apply_lease_profile(self, record: ModelRecord) -> tuple[ModelRecord, bool]:
+        """Steer a leased model onto its cards in the measured-fastest shape (D43).
+
+        Returns ``(record, parallel_auto)``. A lease naming this model means
+        the cards are its alone, so: the placement is forced onto the lease's
+        devices; the split mode (and micro-batch) come from the model's latest
+        benchmark *on exactly those devices* when one exists -- tensor split
+        measured slower than layer on this rig for a small model and is
+        unmeasured for large ones (D38), so only a measurement may pick it;
+        and the slot count is sized by the estimator even when
+        ``models.default_parallel`` is an integer. An explicit per-model
+        ``device_override``, ``split_mode`` or ``parallel`` still wins.
+        """
+        lease = self.leases.for_model(record.id)
+        if lease is None:
+            return record, False
+        settings = record.settings
+        updates: dict[str, Any] = {}
+        basis = "default"
+        if settings.device_override is None:
+            updates["device_override"] = list(lease.devices)
+        if settings.split_mode is None:
+            best = self._measured_best_mode(record.id, lease.devices)
+            if best is not None:
+                updates["split_mode"] = best.get("split_mode") or "layer"
+                if best.get("ubatch") and settings.ubatch_size is None:
+                    updates["ubatch_size"] = int(best["ubatch"])
+                basis = f"measured: {best.get('mode')}"
+        parallel_auto = settings.parallel is None
+        if updates:
+            record = record.model_copy(update={"settings": settings.model_copy(update=updates)})
+        log.info(
+            "lease performance profile",
+            model_id=record.id,
+            lease_id=lease.id,
+            devices=list(lease.devices),
+            split_mode=record.settings.split_mode or "layer",
+            split_basis=basis,
+            parallel="auto" if parallel_auto else record.settings.parallel,
+        )
+        return record, parallel_auto
+
+    def _measured_best_mode(self, model_id: str, devices: Sequence[int]) -> dict[str, Any] | None:
+        """The winning generation mode of the latest benchmark on exactly ``devices``."""
+        reader = getattr(self.db, "latest_benchmark", None)
+        if reader is None:
+            return None
+        try:
+            row = reader(model_id)
+        except Exception:  # noqa: BLE001 - a missing table is not a load failure
+            return None
+        report = row.get("report") if isinstance(row, dict) else None
+        if not isinstance(report, dict):
+            return None
+        best = report.get("best_generation_mode")
+        for result in report.get("results") or []:
+            if not isinstance(result, dict) or result.get("mode") != best:
+                continue
+            if sorted(int(d) for d in result.get("devices") or []) == sorted(devices):
+                return result
+        return None
+
     # -- TTL --------------------------------------------------------------
 
     def ttl_for(self, record: ModelRecord) -> int:
@@ -1440,6 +1669,7 @@ class ModelManager:
             try:
                 await asyncio.sleep(interval)
                 await self._sweep_ttl()
+                self._expire_leases()
                 self._maybe_reconcile_pinned()
                 self._maybe_rebalance()
                 await self._sample_throughput()
@@ -1575,6 +1805,12 @@ class ModelManager:
     #: The win is removing a *standing* misplacement; anything that needs to
     #: move more often than this is churn, not optimisation.
     REBALANCE_COOLDOWN_S = 1800.0
+    #: How often the rebalancer *looks* at all, and how long an unchanged
+    #: layout's answer is trusted before the planner is asked again. The
+    #: sweep runs every 15 s; a planner preview is NVML plus estimate
+    #: arithmetic, and the steady state must cost nothing.
+    REBALANCE_CHECK_S = 60.0
+    REBALANCE_RECHECK_S = 600.0
 
     def _maybe_rebalance(self) -> None:
         """Spawn one relocation when a resident model has a strictly better home.
@@ -1598,6 +1834,10 @@ class ModelManager:
             # would compete with it for PCIe and CPU, and the layout it was
             # computed against is about to change anyway.
             return
+        now = time.time()
+        if now - self._rebalance_checked_at < self.REBALANCE_CHECK_S:
+            return
+        self._rebalance_checked_at = now
         found = self._rebalance_opportunity()
         if found is None:
             return
@@ -1633,6 +1873,7 @@ class ModelManager:
         """
         now = time.time()
         loaded = self.supervisor.list()
+        layout = self._layout_fingerprint(loaded)
         for instance in loaded:
             if instance.state != "ready" or instance.active_requests > 0:
                 continue
@@ -1652,6 +1893,12 @@ class ModelManager:
                 if other.model_id != instance.model_id and other.plan is not None:
                     neighbours.update(other.plan.devices)
             overlap = set(plan.devices) & neighbours
+            if not overlap and len(plan.devices) <= 1:
+                continue  # alone on one card: no move could improve it, no planner call
+            seen = self._rebalance_seen.get(instance.model_id)
+            if seen is not None and seen[0] == layout and now - seen[1] < self.REBALANCE_RECHECK_S:
+                continue  # the same world as last time; the answer has not changed
+            self._rebalance_seen[instance.model_id] = (layout, now)
             candidate = self.planner.plan_load(
                 record,
                 ctx_size=plan.ctx_per_slot or plan.ctx_size,
@@ -1687,6 +1934,14 @@ class ModelManager:
                     f"{len(candidate.devices)} suffice at the same settings",
                 )
         return None
+
+    def _layout_fingerprint(self, loaded: Sequence[InstanceInfo]) -> tuple[Any, ...]:
+        """What the rebalance answer depends on: who sits where, and what is leased."""
+        residents = tuple(
+            sorted((i.model_id, tuple(i.plan.devices)) for i in loaded if i.plan is not None)
+        )
+        leases = tuple(sorted((lease.id, tuple(lease.devices)) for lease in self.leases.all()))
+        return (residents, leases)
 
     async def _rebalance(self, model_id: str, plan: LoadPlan, reason: str) -> None:
         """Force-reload one model onto the previewed placement (D30/D36 rules).
@@ -1970,6 +2225,7 @@ class ModelManager:
             queue_depth=sum(self._load_waiters.values()),
             active_downloads=active_downloads,
             draining=self._draining,
+            leases=self.leases.all(),
         )
 
     def parallel_observations(self, model_id: str, *, limit: int = 64) -> list[dict[str, Any]]:

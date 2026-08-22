@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from studioforge.config import Config, FlashAttn, KvCacheType, QuantAffinity, SplitMode
 from studioforge.core.gpu import vram_processes
 from studioforge.core.kv_sensitivity import KV_QUALITY_LADDER
+from studioforge.core.leases import LeaseBook
 from studioforge.logging import get_logger
 from studioforge.types import (
     MB,
@@ -838,10 +839,15 @@ class Planner:
         *,
         observation_sink: Callable[[dict[str, object]], None] | None = None,
         log_plans: bool = True,
+        leases: LeaseBook | None = None,
     ) -> None:
         self.config = config
         self.probe = probe
         self._observation_sink = observation_sink
+        #: Standing GPU leases (D43). A card leased to someone other than the
+        #: model being planned is absent from every placement; ``None`` (tests,
+        #: the catalog's throwaway planners) means no leases exist.
+        self.leases = leases
         #: Whether an accepted or refused plan is worth an INFO line. False for
         #: a planner that exists only to *ask* questions -- the catalog runs one
         #: plan per model per context tier per hardware state, which at INFO
@@ -1102,6 +1108,7 @@ class Planner:
         reload_of: str | None = None,
         evict_busy: bool = False,
         source: str | None = None,
+        parallel_auto: bool = False,
     ) -> PlanResult:
         """Decide where (and whether) a model can be loaded.
 
@@ -1126,9 +1133,19 @@ class Planner:
         which means a refusal leaves the resident child running, instead of
         the old unload-then-plan order that left the model unloaded whenever
         the reload was refused.
+
+        Cards leased to someone other than this model (D43) are absent from
+        every placement, and a ``device_override`` naming one is refused with
+        the lease named. ``parallel_auto`` -- set for a leased model -- treats
+        an integer ``models.default_parallel`` as ``auto``: the cards are that
+        model's alone, so the estimator sizes its slots.
         """
+        blocked = self._leased_away(record)
+        forced = set(record.settings.device_override or ())
+        if forced & blocked:
+            return self._leased_rejection(record, sorted(forced & blocked))
         if reload_of is None:
-            return self._plan_load(
+            result = self._plan_load(
                 record,
                 ctx_size=ctx_size,
                 kv_cache_type=kv_cache_type,
@@ -1138,12 +1155,18 @@ class Planner:
                 draft=draft,
                 adapters=adapters,
                 allow_evict=allow_evict,
+                gpus=self._gpus_without(blocked),
                 evict_busy=evict_busy,
                 source=source,
+                parallel_auto=parallel_auto,
             )
+            return self._note_leases(result, blocked)
         resident = next((i for i in loaded if i.model_id == reload_of), None)
         others = [i for i in loaded if i.model_id != reload_of]
         gpus_view = self._gpus_as_if_gone(resident) if resident is not None else None
+        if blocked:
+            live = gpus_view if gpus_view is not None else list(self.probe.list_gpus())
+            gpus_view = [g for g in live if g.index not in blocked]
         own = [resident.pid] if resident is not None and resident.pid is not None else []
         result = self._plan_load(
             record,
@@ -1159,6 +1182,7 @@ class Planner:
             extra_own_pids=own,
             evict_busy=evict_busy,
             source=source,
+            parallel_auto=parallel_auto,
         )
         if isinstance(result, LoadPlan) and resident is not None:
             if reload_of not in result.evict_model_ids:
@@ -1168,7 +1192,77 @@ class Planner:
                 f"forced reload: planned as if the running instance of {reload_of} "
                 f"were already unloaded ({round(credited / MB)} MB credited back)"
             )
+        return self._note_leases(result, blocked)
+
+    # -- GPU leases (D43) --------------------------------------------------
+
+    def _leased_away(self, record: ModelRecord) -> frozenset[int]:
+        """Devices a standing lease holds for someone other than ``record``."""
+        if self.leases is None:
+            return frozenset()
+        return frozenset(self.leases.blocked_for(record.id))
+
+    def _gpus_without(self, blocked: frozenset[int]) -> list[GpuInfo] | None:
+        """The live GPU list minus leased-away cards; ``None`` (= live) when none are."""
+        if not blocked:
+            return None
+        return [g for g in self.probe.list_gpus() if g.index not in blocked]
+
+    def _lease_lines(self, blocked: frozenset[int]) -> list[str]:
+        """One actionable line per lease standing in the way."""
+        if self.leases is None or not blocked:
+            return []
+        lines: list[str] = []
+        for lease in self.leases.all():
+            held = sorted(set(lease.devices) & blocked)
+            if not held:
+                continue
+            who = lease.holder
+            if lease.model_ids:
+                who += f" for {', '.join(lease.model_ids)}"
+            if lease.reason:
+                who += f" ({lease.reason})"
+            ends = (
+                f"it is released automatically once idle for {int(lease.idle_ttl_s)} s"
+                if lease.idle_ttl_s is not None
+                else "it stands until released"
+            )
+            lines.append(
+                f"CUDA {held} is leased to {who} -- lease {lease.id}; {ends}, or now via "
+                f"DELETE /api/leases/{lease.id} (the release_gpus tool)"
+            )
+        return lines
+
+    def _note_leases(self, result: PlanResult, blocked: frozenset[int]) -> PlanResult:
+        """Say which cards a lease took away, on a plan and on a refusal alike."""
+        if not blocked:
+            return result
+        lines = self._lease_lines(blocked)
+        if isinstance(result, LoadRejected):
+            result.suggestions.extend(lines)
+        else:
+            result.notes.extend(lines)
         return result
+
+    def _leased_rejection(self, record: ModelRecord, clash: list[int]) -> LoadRejected:
+        """A forced placement onto someone else's leased card is refused, not honoured."""
+        rejection = LoadRejected(
+            model_id=record.id,
+            reason=(
+                f"the requested placement names CUDA {clash}, which is leased to someone "
+                f"else; a lease is not a default to override, it is a promise to its holder"
+            ),
+            suggestions=[
+                *self._lease_lines(frozenset(clash)),
+                "load without the device override and let the planner place it elsewhere",
+            ],
+        )
+        log.info(
+            "load rejected: device leased to another holder",
+            model_id=record.id,
+            devices=clash,
+        )
+        return rejection
 
     def _gpus_as_if_gone(self, resident: InstanceInfo) -> list[GpuInfo]:
         """The live GPU list with ``resident``'s planned footprint credited as free.
@@ -1214,13 +1308,14 @@ class Planner:
         extra_own_pids: Sequence[int] = (),
         evict_busy: bool = False,
         source: str | None = None,
+        parallel_auto: bool = False,
     ) -> PlanResult:
         """:meth:`plan_load` proper; ``gpus``/``extra_own_pids`` are the reload view."""
         settings = record.settings
         defaults = self.config.models
 
         requested_ctx = ctx_size or settings.ctx_size
-        slots, auto_parallel = self._resolve_parallel(record, parallel)
+        slots, auto_parallel = self._resolve_parallel(record, parallel, force_auto=parallel_auto)
         kv_k: KvCacheType = (
             kv_cache_type or settings.kv_cache_type or defaults.default_kv_cache_type
         )
@@ -1370,7 +1465,9 @@ class Planner:
 
     # -- plan_load helpers -------------------------------------------------
 
-    def _resolve_parallel(self, record: ModelRecord, parallel: int | None) -> tuple[int, bool]:
+    def _resolve_parallel(
+        self, record: ModelRecord, parallel: int | None, *, force_auto: bool = False
+    ) -> tuple[int, bool]:
         """``(slots, auto)`` for this load.
 
         An explicit slot count from anywhere -- the request, the per-model
@@ -1385,6 +1482,10 @@ class Planner:
         explicit = parallel or record.settings.parallel
         if explicit:
             return int(explicit), False
+        if force_auto:
+            # A leased model (D43): the cards are its alone, so an integer
+            # models.default_parallel -- a rig-wide caution -- does not apply.
+            return 1, True
         configured = self.config.models.default_parallel
         if isinstance(configured, str):  # "auto"
             return 1, True

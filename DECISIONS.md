@@ -2713,3 +2713,73 @@ change: nothing new may evict anything, in either pass.
 **Tests.** `tests/unit/test_gateway_lifecycle.py` (the measured `[1,3]`-beside-`[0,1]` layout
 moves to `[2,3]`; suggest/off modes; idle, cooldown, busy-box and device_override gates; a
 refusal or an evicting candidate is ignored; same-placement answer means no move).
+
+
+### D42, amended the same day: the rebalancer looks once a minute, and only when the world changed
+
+The first cut asked the planner every 15-second sweep for every idle resident -- an NVML read
+plus estimate arithmetic per model, for an answer that cannot change while nothing moves. Now:
+the pass runs at most once per `REBALANCE_CHECK_S` (60 s); a model alone on one card is never
+asked about (no move could improve it); and each model's answer is keyed to a *layout
+fingerprint* -- who sits where, plus the standing leases -- so the planner is consulted again
+only when that fingerprint changes, or after `REBALANCE_RECHECK_S` (600 s) for the slow drift
+that free VRAM from outside processes represents. Steady state: zero planner calls. Everything
+else on the sweep (idle TTL, lease expiry, the pin reconciler's wants-list) is in-memory
+bookkeeping over a handful of instances; the one network touch, the per-child `/metrics` scrape,
+predates this work and is one localhost GET per loaded model (D22).
+
+## D43 -- A card can belong to one model: GPU leases
+
+**Problem.** Two things on this rig wanted a card to themselves and had no way to say so.
+Benchmarks: every mode's number is supposed to be the *card's*, but a JIT load from another
+client could land beside the subject mid-measurement, and the only defence was "refuse to start
+while busy". And the agent's workhorse: "give this model the two 5090s and keep everything else
+off them" was expressible only as a persisted `device_override` -- which steers *that* model and
+says nothing to the others. `planner.excluded_devices` is the static cousin (D19): a config
+edit, for every model, forever.
+
+**Decision.** A **lease** is a runtime claim on specific CUDA devices, kept in an in-memory book
+shared by the planner and the manager.
+
+1. **Planner.** A card leased to someone other than the model being planned is *absent* from
+   its GPU view -- not ranked last, not an option (the D19 rule, per model and per moment). A
+   `device_override` naming such a card is refused with the lease named; a plan or a refusal
+   that lost cards to a lease says so in its notes / suggestions, with the lease id and how it
+   ends. A lease with no models holds its cards for something outside this server entirely.
+2. **The owner gets the measured-fastest shape.** A load of a leased model is forced onto the
+   lease's devices; its slot count is sized by the estimator even when
+   `models.default_parallel` is an integer (`parallel_auto` -- the cards are its alone, the
+   rig-wide caution does not apply); and its split mode and micro-batch come from the model's
+   latest benchmark **on exactly those devices** when one exists. Tensor split is never
+   assumed: it measured *slower* than layer split here (D38 S3) and is unmeasured for large
+   models, so only a measurement may choose it. Explicit per-model settings still win.
+3. **Granting one.** Idle residents on the cards that are not the new owner are unloaded --
+   that is what "the card is yours" means. A resident mid-request is never interrupted (D36):
+   the grant refuses with `retry_after_s`. A pinned idle resident refuses too unless
+   `force=true`, because a pin is a standing wish; forced, it is evicted and the D41 reconciler
+   brings it back elsewhere if it fits, or on these cards once the lease ends. A card already
+   leased is a conflict (409), never a takeover. A load in flight refuses the grant: it may be
+   about to land on those cards.
+4. **Ending one.** Explicitly (`DELETE /api/leases/{id}`, `release_gpus`, the Dashboard), or
+   by the sweep once idle for `idle_ttl_s` (default 3600 s; `null` = until released). The
+   owner model's own requests count as activity; an outside holder touches the lease
+   (`POST /api/leases/{id}/touch`). In-memory on purpose: a lease describes a live situation
+   and a restart is a clean slate; the idle TTL is what keeps a crashed benchmark or a
+   forgotten reservation from holding a card forever.
+5. **Benchmarks are the first client.** The placement benchmark takes a lease on each mode's
+   devices for that mode; the parallel benchmark takes one on its run's devices. A neighbour
+   that lands on the cards between modes is unloaded by the next grant; one that is busy fails
+   that mode by name instead of contaminating its number.
+6. **Surfaces.** `GET/POST /api/leases`, `DELETE /api/leases/{id}`, `POST .../touch` (the
+   mutations under the D32 gate); MCP `reserve_gpus` / `release_gpus`, `server_status.leases`;
+   `ServerStatus.leases`; a Dashboard panel with a release button.
+
+**What this is not.** Not an eviction licence: a grant unloads only *idle* residents, and the
+planner evicts nothing it could not evict before. Not persistence: pin the model too if it
+must also come back after a restart.
+
+**Tests.** `tests/unit/test_leases.py` (the book; the planner's refusal and the owner's right,
+auto slots under an integer default; the grant's idle/busy/pinned/in-flight rules; expiry
+with owner activity; the performance profile incl. measured split mode on exactly those
+cards), `tests/unit/test_mcp.py` (`reserve_gpus`/`release_gpus` through `server_status`),
+`tests/unit/test_catalog_routes.py` (the routes), `tests/unit/test_api_hardening.py` (D32).

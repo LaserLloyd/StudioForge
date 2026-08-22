@@ -113,9 +113,9 @@ Register the stdio bridge once:
 
 Add `"args": ["-s", "rig", "mcp"]` to pin a profile.
 
-`sfctl mcp` merges **two** upstream MCP servers into one list of **27 tools**.
+`sfctl mcp` merges **two** upstream MCP servers into one list of **29 tools**.
 
-**Management** (the main app, `<url>/mcp`) — 17 tools:
+**Management** (the main app, `<url>/mcp`) — 19 tools:
 
 | Tool | What it does |
 | --- | --- |
@@ -126,6 +126,8 @@ Add `"args": ["-s", "rig", "mcp"]` to pin a profile.
 | `load_recommended` | Name the model and the context; the server picks the GPUs, KV cache and slots and loads at exactly that window, or refuses with numbers |
 | `unload_model` | Free its VRAM immediately |
 | `pin_model` | Keep a model loaded at all times (no idle TTL, never evicted, auto-loaded and reloaded); `pinned=false` unpins |
+| `reserve_gpus` | Give specific GPUs to one model (loaded there at its measured-fastest settings, auto-sized slots) or hold them for an outside program; auto-releases after `idle_ttl_s` |
+| `release_gpus` | End a reservation early by its lease id |
 | `test_model` | Smoke-test end to end on an idle server and report tokens/second |
 | `benchmark_parallel` | Measure how many concurrent slots a model is worth running on a set of cards |
 | `search_models` | Browse HuggingFace. One thin row per repo — **no sizes**, HF publishes none at search time |

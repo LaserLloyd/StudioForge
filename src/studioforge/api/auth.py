@@ -81,6 +81,7 @@ _ADMIN_MUTATION_PREFIXES: tuple[str, ...] = (
     "/api/update/",
     "/api/vram/reclaim",
     "/api/downloads",
+    "/api/leases",
 )
 #: Deletions of things on disk / in the registry: same rule, DELETE only.
 _ADMIN_DELETE_PREFIXES: tuple[str, ...] = (

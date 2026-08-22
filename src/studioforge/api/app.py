@@ -30,6 +30,7 @@ from studioforge.core.downloader import Downloader
 from studioforge.core.engine import EngineManager
 from studioforge.core.gpu import get_probe
 from studioforge.core.health import PROBE_MAX_TOKENS, PROBE_TIMEOUT_S, deep_health
+from studioforge.core.leases import LeaseBook
 from studioforge.core.manager import ModelManager
 from studioforge.core.planner import Planner
 from studioforge.core.registry import Registry
@@ -410,10 +411,14 @@ def build_state(config: Config, *, version: str = __version__) -> Any:
     probe = get_probe()
     engine_manager = EngineManager(config, probe=probe)
     registry = Registry(config, db)
+    # One lease book shared by the planner (which honours leases) and the
+    # manager (which grants and expires them) -- D43.
+    leases = LeaseBook()
     planner = Planner(
         config,
         probe,
         observation_sink=lambda row: db.record_load_observation(**row),
+        leases=leases,
     )
     # The probe goes in so an unload can log the VRAM it actually reclaimed
     # rather than asserting that it did.
@@ -425,6 +430,7 @@ def build_state(config: Config, *, version: str = __version__) -> Any:
         supervisor=supervisor,
         db=db,
         version=version,
+        leases=leases,
     )
 
     state.config = config  # type: ignore[attr-defined]
@@ -435,6 +441,7 @@ def build_state(config: Config, *, version: str = __version__) -> Any:
     state.planner = planner  # type: ignore[attr-defined]
     state.supervisor = supervisor  # type: ignore[attr-defined]
     state.manager = manager  # type: ignore[attr-defined]
+    state.leases = leases  # type: ignore[attr-defined]
     downloader = Downloader(config, db)
     # A finished download must show up in /v1/models without a manual scan.
     downloader.subscribe(rescan_when_group_completes(downloader, registry))

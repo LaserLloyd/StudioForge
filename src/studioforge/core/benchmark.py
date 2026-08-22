@@ -738,10 +738,21 @@ class Benchmarker:
             split_mode=mode.split_mode,
             ubatch=mode.ubatch,
         )
+        lease = None
         try:
             # A fresh process per mode: reusing a running instance would measure
             # a warm cache on whichever devices happened to be selected first.
             await self.manager.unload(record.id)
+            # The mode's cards are this benchmark's alone until the mode is
+            # done (D43): an idle resident on them is unloaded, a busy one
+            # fails the mode by name, and nothing else may load there meanwhile
+            # -- so the number measured is the card's, not the neighbours'.
+            lease = await self.manager.acquire_lease(
+                mode.devices,
+                holder="benchmark",
+                model_ids=[record.id],
+                reason=f"benchmark {mode.key}",
+            )
             steered = record.model_copy(update={"settings": base_settings})
             record.settings = self._settings_for(steered, mode)
 
@@ -771,6 +782,10 @@ class Benchmarker:
             # One bad mode must not cost the user the other three.
             result.error = str(exc)
             log.warning("benchmark.mode_failed", model_id=record.id, mode=mode.key, error=str(exc))
+        finally:
+            if lease is not None:
+                with contextlib.suppress(Exception):
+                    self.manager.release_lease(lease.id)
         _emit(on_progress, mode.key, "done", position, total)
         return result
 

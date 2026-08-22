@@ -12,6 +12,7 @@ import asyncio
 import json
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -144,6 +145,8 @@ class StubManager:
         self.planner = StubPlanner(probe, verdict)
         self.supervisor = StubSupervisor()
         self.loads: list[tuple[int, ...]] = []
+        self.leased: list[dict[str, Any]] = []
+        self.released: list[str] = []
         self.unloads: list[str] = []
         #: device tuples whose load should blow up
         self.fail_devices: set[tuple[int, ...]] = set()
@@ -171,6 +174,13 @@ class StubManager:
         info = InstanceInfo(model_id=self.record.id, state="ready", port=18100)
         self.supervisor.instances[self.record.id] = info
         return info
+
+    async def acquire_lease(self, devices: Any, **kwargs: Any) -> Any:
+        self.leased.append({"devices": list(devices), **kwargs})
+        return SimpleNamespace(id=f"lease-{len(self.leased)}", devices=list(devices))
+
+    def release_lease(self, lease_id: str) -> None:
+        self.released.append(lease_id)
 
     async def unload(self, name: str) -> bool:
         self.unloads.append(name)
@@ -1055,3 +1065,27 @@ def test_save_benchmark_without_started_at_uses_now(db: Database) -> None:
     assert row is not None
     assert row["ts"] >= before
     assert row["ctx_size"] is None
+
+
+async def test_each_mode_runs_under_its_own_gpu_lease(engine: FakeEngine) -> None:
+    """D43: the mode's cards are the benchmark's alone while it measures them."""
+    probe = StubProbe(reference_rig())
+    record = make_record(device_override=[3], ctx_size=2048)
+    manager = StubManager(record, probe)
+    bench = Benchmarker(manager, probe=probe)
+    engine.scripts = [
+        sse(content_chunk(), timings_chunk(prompt_tps=2000.0, generation_tps=120.0)),
+        sse(content_chunk(), timings_chunk(prompt_tps=1500.0, generation_tps=90.0)),
+    ]
+
+    report = await bench.run(
+        record, modes=["rtx-5090-x1", "rtx-3090-x1"], ctx_size=1024, max_tokens=32
+    )
+
+    assert [r.mode for r in report.results] == ["rtx-5090-x1", "rtx-3090-x1"]
+    assert [lease["devices"] for lease in manager.leased] == [r.devices for r in report.results]
+    assert all(lease["model_ids"] == [record.id] for lease in manager.leased)
+    assert all(lease["holder"] == "benchmark" for lease in manager.leased)
+    assert manager.released == [f"lease-{n}" for n in range(1, len(manager.leased) + 1)], (
+        "every lease is released when its mode ends, success or not"
+    )

@@ -19,6 +19,7 @@ What these pin, beyond "it runs":
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -171,6 +172,8 @@ class StubManager:
         self.db = StubDb()
         self.record = rec
         self.loads: list[dict[str, Any]] = []
+        self.leased: list[dict[str, Any]] = []
+        self.released: list[str] = []
         self.unloads: list[str] = []
         self.busy: str | None = None
         self.benchmarker: Any = None
@@ -201,6 +204,13 @@ class StubManager:
         info = InstanceInfo(model_id=self.record.id, state="ready", port=18100, plan=plan)
         self.supervisor.instances[self.record.id] = info
         return info
+
+    async def acquire_lease(self, devices: Any, **kwargs: Any) -> Any:
+        self.leased.append({"devices": list(devices), **kwargs})
+        return SimpleNamespace(id=f"lease-{len(self.leased)}", devices=list(devices))
+
+    def release_lease(self, lease_id: str) -> None:
+        self.released.append(lease_id)
 
     async def unload(self, name: str) -> bool:
         self.unloads.append(name)

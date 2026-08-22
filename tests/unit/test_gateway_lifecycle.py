@@ -613,10 +613,44 @@ def test_rebalance_ignores_a_refusal_or_an_evicting_candidate() -> None:
     manager.planner = StubPlanner(LoadRejected(model_id=mover.id, reason="no room", suggestions=[]))
     assert manager._rebalance_opportunity() is None
 
+    manager._rebalance_seen.clear()  # a fresh look, not the cached "no" from above
     evicting = candidate_plan(mover.id, [2, 3])
     evicting.evict_model_ids = [mover.id, "busy/anchor"]
     manager.planner = StubPlanner(evicting)
     assert manager._rebalance_opportunity() is None
+
+
+def test_rebalancer_looks_once_a_minute_and_trusts_an_unchanged_layout() -> None:
+    """D42, amended: the planner is asked once per changed world, not once per sweep."""
+    manager, supervisor, mover = rebalance_rig()
+    planner = StubPlanner(candidate_plan(mover.id, [1, 3]))  # same placement: no move
+    manager.planner = planner
+
+    manager._maybe_rebalance()
+    first_look = len(planner.calls)
+    assert first_look == 2, "both residents overlap, so both are previewed once"
+    manager._maybe_rebalance()
+    assert len(planner.calls) == first_look, "the second look inside a minute is free"
+
+    manager._rebalance_checked_at = 0.0
+    manager._maybe_rebalance()
+    assert len(planner.calls) == first_look, "same layout inside the recheck window: still free"
+
+    supervisor.instances["new/comer"] = placed("new/comer", [2])
+    manager._rebalance_checked_at = 0.0
+    manager._maybe_rebalance()
+    assert len(planner.calls) > first_look, "a changed layout is a new question"
+
+
+def test_rebalancer_never_asks_about_a_model_alone_on_one_card() -> None:
+    record = make_record("alone/model")
+    manager, supervisor = make_manager([record])
+    supervisor.instances[record.id] = placed(record.id, [0])
+    planner = StubPlanner(candidate_plan(record.id, [0]))
+    manager.planner = planner
+
+    assert manager._rebalance_opportunity() is None
+    assert planner.calls == [], "nothing a move could improve: the planner is not consulted"
 
 
 def test_rebalance_leaves_a_well_placed_model_alone() -> None:

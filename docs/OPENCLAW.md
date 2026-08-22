@@ -55,11 +55,11 @@ Then register it as a local stdio MCP server in OpenClaw's config:
 }
 ```
 
-`sfctl mcp` merges **two** upstream toolsets into one list of 27 tools:
+`sfctl mcp` merges **two** upstream toolsets into one list of 29 tools:
 
 | Tools | Source | Available when the main server is wedged? |
 | --- | --- | --- |
-| `list_models`, `model_options`, `model_info`, `load_model`, `load_recommended`, `unload_model`, `pin_model`, `test_model`, `benchmark_parallel`, `search_models`, `repo_details`, `download_model`, `delete_model`, `server_status`, `connection_info`, `get_config`, `set_config` | main app | no |
+| `list_models`, `model_options`, `model_info`, `load_model`, `load_recommended`, `unload_model`, `pin_model`, `reserve_gpus`, `release_gpus`, `test_model`, `benchmark_parallel`, `search_models`, `repo_details`, `download_model`, `delete_model`, `server_status`, `connection_info`, `get_config`, `set_config` | main app | no |
 | `restart_server`, `kill_model`, `nuke_all_models`, `reclaim_orphan_engines`, `tail_logs`, `gpu_status`, `rollback_update`, `recovery_health`, `recovery_get_config`, `recovery_set_config` | watchdog sidecar | **yes** |
 
 That split is the point: when the main server locks up, OpenClaw still holds working tools to
@@ -210,6 +210,22 @@ loaded or pinned again — an explicit unload always wins, so don't unload-then-
 model (use `load_model(force=true)` for that). And every pin permanently occupies its VRAM, so
 each one shrinks what the planner can offer other loads; `server_status` shows the cost, and a
 refused load's suggestions will name the pinned models standing in the way.
+
+**A card of its own.** When a model must run at full speed with nothing beside it -- or a
+card must stay empty for ComfyUI -- take a *lease*:
+
+```
+reserve_gpus(devices=[0, 1], model_id="pub/agent-model")   # these two cards are its alone
+reserve_gpus(devices=[3], reason="ComfyUI render")           # nothing loads here until released
+release_gpus(lease_id="...")                                  # early exit; idle_ttl_s (60 min) is the default one
+```
+
+While it stands nobody else is planned onto those cards; the named model is loaded onto exactly
+them, sized for as many slots as its context allows, in the split mode its own benchmark measured
+fastest there (tensor split is never assumed -- it measured *slower* than layer split on the
+reference rig, so benchmark first if you want it considered). Idle residents on the cards are
+unloaded; a model mid-request refuses the call; a pinned one needs `force=true`. Benchmarks take
+their own leases, which is what keeps a neighbour's load out of their numbers.
 
 ### 7. `server_status` and `connection_info`
 

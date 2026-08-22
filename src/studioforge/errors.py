@@ -116,6 +116,20 @@ class ModelBusyError(StudioForgeError):
     code = "model_busy"
 
 
+class LeaseConflictError(StudioForgeError):
+    """The devices are held by an existing GPU lease, or by a pinned resident (D43)."""
+
+    status_code = 409
+    error_type = "invalid_request_error"
+    code = "lease_conflict"
+
+
+class LeaseNotFoundError(StudioForgeError):
+    status_code = 404
+    error_type = "invalid_request_error"
+    code = "lease_not_found"
+
+
 class UpstreamError(StudioForgeError):
     """llama-server returned an error or died mid-request."""
 

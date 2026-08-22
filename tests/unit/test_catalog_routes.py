@@ -334,6 +334,47 @@ def test_v1_single_model_reports_not_loaded_when_cold(app: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
+# GPU leases (D43)
+# ---------------------------------------------------------------------------
+
+
+def test_lease_routes_round_trip(app: Any) -> None:
+    with TestClient(app, client=("127.0.0.1", 50000)) as http:
+        created = http.post("/api/leases", json={"devices": [0], "reason": "test"})
+        assert created.status_code == 200, created.text
+        lease = created.json()
+        assert lease["devices"] == [0] and lease["holder"] == "api" and lease["model_ids"] == []
+
+        listed = http.get("/api/leases").json()
+        assert listed["count"] == 1 and listed["leases"][0]["id"] == lease["id"]
+
+        clash = http.post("/api/leases", json={"devices": [0]})
+        assert clash.status_code == 409
+        assert clash.json()["error"]["code"] == "lease_conflict"
+
+        touched = http.post(f"/api/leases/{lease['id']}/touch")
+        assert touched.status_code == 200
+
+        released = http.delete(f"/api/leases/{lease['id']}")
+        assert released.status_code == 200
+        assert released.json()["released"]["id"] == lease["id"]
+        assert http.get("/api/leases").json()["count"] == 0
+
+        missing = http.delete(f"/api/leases/{lease['id']}")
+        assert missing.status_code == 404
+        assert missing.json()["error"]["code"] == "lease_not_found"
+
+
+def test_lease_routes_validate_the_body(app: Any) -> None:
+    with TestClient(app, client=("127.0.0.1", 50000)) as http:
+        empty = http.post("/api/leases", json={"devices": []})
+        assert empty.status_code == 400
+        assert empty.json()["error"]["param"] == "devices"
+        bad_ttl = http.post("/api/leases", json={"devices": [0], "idle_ttl_s": 0})
+        assert bad_ttl.status_code == 400
+
+
+# ---------------------------------------------------------------------------
 # The WP19 routes
 # ---------------------------------------------------------------------------
 

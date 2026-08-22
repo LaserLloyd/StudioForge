@@ -67,6 +67,7 @@ from studioforge import __version__
 from studioforge.api.auth import redact_config_dict
 from studioforge.config import RESTART_REQUIRED_KEYS, Config, apply_overrides, load_config
 from studioforge.core import parallel_bench
+from studioforge.core.leases import lease_view
 from studioforge.errors import BadRequestError, ModelNotFoundError, StudioForgeError
 from studioforge.logging import get_logger
 from studioforge.types import GB
@@ -91,6 +92,8 @@ QUICK RECIPES -- copy these exact calls; every argument name is literal:
   free a model's VRAM           unload_model(model_id="<id>")
   keep a model loaded forever   pin_model(model_id="<id>")
   stop keeping it loaded        pin_model(model_id="<id>", pinned=false)
+  give a model its own GPU(s)   reserve_gpus(devices=[0], model_id="<id>")
+  release that reservation      release_gpus(lease_id="<lease id>")
   does it actually work?        test_model(model_id="<id>")
 Model ids come from list_models -- copy the `id` field exactly, slashes and
 all. The argument is always called model_id, never model or name.
@@ -104,6 +107,22 @@ exception: unload_model on a pinned model is honoured and it STAYS down until
 someone loads or re-pins it -- an explicit unload always wins. Every pinned
 model permanently occupies VRAM, so pin only what must always answer
 instantly, and check the effect with server_status().
+
+TO GIVE A MODEL CARDS OF ITS OWN (a resource lock): reserve_gpus(devices=[0],
+model_id="<id>"). While the lease stands nobody else may load onto those GPUs;
+the named model is loaded onto exactly them, sized for as many parallel slots
+as its context allows, and in the split mode its own benchmark measured
+fastest on those cards. Tensor split is NOT assumed: on this rig it measured
+slower than layer split, so only a measurement of that model on those cards
+can choose it -- benchmark first if you want it considered. Idle residents on
+the cards are unloaded to make room; a model mid-request is never interrupted
+(the call refuses; retry when idle); a pinned resident refuses unless
+force=true. The lease ends with release_gpus(lease_id), or by itself once
+the model has been idle for idle_ttl_s (default 3600 = 60 min).
+reserve_gpus(devices=[3]) with no model_id holds a card for something outside
+this server (ComfyUI, a training job): nothing is loaded there until it is
+released. Benchmarks take their own leases automatically, so a running
+benchmark's cards are off-limits. server_status lists every lease.
 
 TWO WAYS TO LOAD, and the first is usually the one you want.
 
@@ -1012,6 +1031,78 @@ def build_management_mcp(state: Any) -> MCPServer:
         }
 
     @_guard
+    async def reserve_gpus(
+        devices: list[int],
+        model_id: str | None = None,
+        reason: str = "",
+        idle_ttl_s: float | None = 3600.0,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        """Reserve specific GPUs for one model, or for something outside this server.
+
+        The two calls you will make::
+
+            reserve_gpus(devices=[0], model_id="vendor/Some-Model-GGUF/Some-Model-Q4_K_M")
+            reserve_gpus(devices=[3], reason="ComfyUI render")   # no model: held for an outsider
+
+        While the lease stands nothing else is planned onto those cards. A
+        named model is loaded onto exactly them (pin it too if it must also
+        survive restarts), sized for as many parallel slots as its context
+        allows, and in the split mode its own benchmark measured fastest on
+        those cards -- tensor split is never assumed, because it measured
+        slower than layer split on this rig; run a benchmark if you want it
+        considered. Idle residents on the cards are unloaded to make room; a
+        model mid-request refuses the call (retry when idle); a pinned idle
+        resident refuses unless ``force=true``.
+
+        Args:
+            devices: CUDA indices, e.g. ``[0]`` or ``[0, 1]`` -- exactly the
+                cards the model should run on. ``server_status`` lists them.
+            model_id: The ``id`` from ``list_models``. Omit to hold the cards
+                for something outside this server.
+            reason: Free text shown beside the lease (what it is for).
+            idle_ttl_s: Seconds of idleness after which the server releases
+                the lease by itself (default 3600). ``null`` = until released.
+            force: Evict a *pinned* idle resident from the cards.
+
+        Returns:
+            ``{"ok": true, "lease": {id, devices, holder, model_ids, reason,
+            created_at, last_activity_at, idle_ttl_s, idle_s, expires_at}}``.
+            Keep ``lease.id`` -- ``release_gpus`` needs it.
+        """
+        lease = await state.manager.acquire_lease(
+            devices,
+            holder="mcp",
+            model_ids=[model_id] if model_id else [],
+            reason=reason,
+            idle_ttl_s=idle_ttl_s,
+            force=force,
+        )
+        return {"ok": True, "lease": lease_view(lease)}
+
+    @_guard
+    async def release_gpus(lease_id: str) -> dict[str, Any]:
+        """Release a GPU lease now, so the cards go back to the general pool.
+
+        The id is the ``lease.id`` that ``reserve_gpus`` returned; ``server_status``
+        lists every standing lease with its id if you lost it. Releasing does
+        not unload the model that held the cards -- it simply stops being the
+        only model allowed there, and goes back to the ordinary idle TTL and
+        eviction rules (unless it is pinned). Leases also end by themselves
+        once idle for their ``idle_ttl_s``, so this is the early exit, not the
+        only one.
+
+        Args:
+            lease_id: The lease to release.
+
+        Returns:
+            ``{"ok": true, "released": {...the lease as it stood...}}``, or an
+            error result naming the id when no such lease exists.
+        """
+        lease = state.manager.release_lease(lease_id)
+        return {"ok": True, "released": lease_view(lease)}
+
+    @_guard
     async def test_model(
         model_id: str, prompt: str | None = None, keep_loaded: bool = False
     ) -> dict[str, Any]:
@@ -1477,6 +1568,7 @@ def build_management_mcp(state: Any) -> MCPServer:
             "busy": state.manager.busy_snapshot(),
             "active_downloads": status.active_downloads,
             "draining": status.draining,
+            "leases": [lease_view(lease) for lease in status.leases],
             "engine_tag": status.engine.tag if status.engine is not None else None,
             "engine_variant": status.engine.variant if status.engine is not None else None,
             "system_ram_total_gib": round(status.system_ram_total_bytes / GB, 2),
@@ -1662,6 +1754,8 @@ def build_management_mcp(state: Any) -> MCPServer:
         load_recommended,
         unload_model,
         pin_model,
+        reserve_gpus,
+        release_gpus,
         search_models,
         repo_details,
         download_model,

@@ -28,6 +28,7 @@ from studioforge.core.benchmark import (
     available_modes,
 )
 from studioforge.core.diskspace import disk_report
+from studioforge.core.leases import lease_view
 from studioforge.core.manager import validate_load_args
 from studioforge.core.parallel_bench import (
     DEFAULT_MAX_TOKENS as PARALLEL_MAX_TOKENS,
@@ -239,6 +240,65 @@ async def vram_reclaim(request: Request, dry_run: bool = Body(False, embed=True)
         "killed": sum(1 for action in actions if action.get("killed")),
         "actions": actions,
     }
+
+
+# ---------------------------------------------------------------------------
+# GPU leases (D43)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/leases")
+async def list_leases(request: Request) -> dict[str, Any]:
+    """Every standing GPU lease: which cards, held by whom, for which models."""
+    state = _state(request)
+    leases = [lease_view(lease) for lease in state.manager.leases.all()]
+    return {"leases": leases, "count": len(leases)}
+
+
+@router.post("/leases")
+async def create_lease(
+    request: Request,
+    devices: list[int] = Body(...),
+    model_ids: list[str] | None = Body(None),
+    holder: str = Body("api"),
+    reason: str = Body(""),
+    idle_ttl_s: float | None = Body(3600.0),
+    force: bool = Body(False),
+) -> dict[str, Any]:
+    """Give CUDA ``devices`` to ``model_ids`` -- or, with none, to something outside this server.
+
+    While the lease stands nothing else is planned onto those cards; the named
+    models are loaded onto exactly them, sized for as many slots as their
+    context allows, in the split mode their own benchmark measured fastest
+    there. Idle residents on the cards are unloaded; a model mid-request
+    refuses the call (503, ``retry_after_s``); a pinned idle resident refuses
+    unless ``force``. ``idle_ttl_s`` (default 3600) is how long the lease
+    survives without activity before the server releases it; ``null`` holds
+    it until ``DELETE``.
+    """
+    state = _state(request)
+    lease = await state.manager.acquire_lease(
+        devices,
+        holder=holder,
+        model_ids=model_ids or [],
+        reason=reason,
+        idle_ttl_s=idle_ttl_s,
+        force=force,
+    )
+    return lease_view(lease)
+
+
+@router.delete("/leases/{lease_id}")
+async def release_lease(lease_id: str, request: Request) -> dict[str, Any]:
+    state = _state(request)
+    return {"released": lease_view(state.manager.release_lease(lease_id))}
+
+
+@router.post("/leases/{lease_id}/touch")
+async def touch_lease(lease_id: str, request: Request) -> dict[str, Any]:
+    """Restart the idle clock -- for a holder outside this server that is still busy."""
+    state = _state(request)
+    return lease_view(state.manager.touch_lease(lease_id))
 
 
 # ---------------------------------------------------------------------------

@@ -38,6 +38,7 @@ thing it was measuring.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import re
 import statistics
 import time
@@ -521,41 +522,55 @@ class ParallelBenchmarker:
                 f"against fewer than N slots measure a queue rather than batching"
             )
 
-        reuse = was_loaded and _plan_serves(resident, report)
-        if reuse:
-            report.notes.append(
-                "the resident instance already had the placement and slot count "
-                "this run needs, so nothing was reloaded"
-            )
-        else:
-            await self.manager.load(
-                record.id,
-                ctx_size=report.ctx_per_slot,
-                kv_cache_type=report.kv_cache_type,
-                kv_cache_type_v=report.kv_cache_type_v,
-                parallel=report.parallel_launched,
-                devices=report.devices,
-                force=True,
-                # force here is the reload half only: the busy check above is
-                # what guards a serving model, and the load must not be able
-                # to evict one that started in the gap (D36).
-                evict_busy=False,
-                source="benchmark:parallel",
-            )
-            report.loaded_for_benchmark = True
-
+        # The run's cards are this benchmark's alone until it finishes (D43):
+        # a slot sweep that a neighbour's load lands on mid-way measures the
+        # neighbour. The lease also turns an intruder mid-request into a clear
+        # refusal here rather than a contaminated number later.
+        lease = await self.manager.acquire_lease(
+            report.devices,
+            holder="benchmark:parallel",
+            model_ids=[record.id],
+            reason="parallel benchmark",
+        )
         try:
-            await self._sweep(
-                record,
-                report,
-                levels=wanted_levels,
-                prompt_tokens=prompt_tokens,
-                max_tokens=max_tokens,
-                cancel_event=cancel_event,
-                on_progress=on_progress,
-            )
+            reuse = was_loaded and _plan_serves(resident, report)
+            if reuse:
+                report.notes.append(
+                    "the resident instance already had the placement and slot count "
+                    "this run needs, so nothing was reloaded"
+                )
+            else:
+                await self.manager.load(
+                    record.id,
+                    ctx_size=report.ctx_per_slot,
+                    kv_cache_type=report.kv_cache_type,
+                    kv_cache_type_v=report.kv_cache_type_v,
+                    parallel=report.parallel_launched,
+                    devices=report.devices,
+                    force=True,
+                    # force here is the reload half only: the busy check above is
+                    # what guards a serving model, and the load must not be able
+                    # to evict one that started in the gap (D36).
+                    evict_busy=False,
+                    source="benchmark:parallel",
+                )
+                report.loaded_for_benchmark = True
+
+            try:
+                await self._sweep(
+                    record,
+                    report,
+                    levels=wanted_levels,
+                    prompt_tokens=prompt_tokens,
+                    max_tokens=max_tokens,
+                    cancel_event=cancel_event,
+                    on_progress=on_progress,
+                )
+            finally:
+                await self._leave_as_found(record, report, was_loaded=was_loaded, previous=previous)
         finally:
-            await self._leave_as_found(record, report, was_loaded=was_loaded, previous=previous)
+            with contextlib.suppress(Exception):
+                self.manager.release_lease(lease.id)
 
         self._finish(record, report)
         return report

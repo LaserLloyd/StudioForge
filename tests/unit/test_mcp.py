@@ -63,6 +63,11 @@ EXPECTED_TOOLS = {
     # could *read* pinned off list_models but had no way to set it short of
     # set_config, which is the wrong altitude for a per-model flag.
     "pin_model",
+    # GPU leases (D43): a card that is one model's alone until released or
+    # idle. Two tools, because "hold" and "let go" are different decisions
+    # and an agent that only sees reserve_gpus does not know release exists.
+    "reserve_gpus",
+    "release_gpus",
     # The HuggingFace pair, split for the same reason list_models and
     # model_options are: browsing is cheap and knows nothing about sizes,
     # choosing costs a remote GGUF header read and answers exactly.
@@ -635,6 +640,35 @@ async def test_pin_model_round_trips_and_reports_the_effective_ttl(state: State)
     assert result["effective_ttl_s"] == state.config.models.default_ttl_s
     record = state.registry.get(TINY)
     assert record is not None and record.settings.pinned is False
+
+
+async def test_reserve_and_release_gpus_round_trip_through_server_status(state: State) -> None:
+    server = build_management_mcp(state)
+    reserved = await call(server, "reserve_gpus", devices=[0], model_id=TINY, reason="warm")
+    assert reserved["ok"] is True
+    lease = reserved["lease"]
+    assert lease["devices"] == [0] and lease["model_ids"] == [TINY]
+    assert lease["idle_ttl_s"] == 3600.0 and "expires_at" in lease
+
+    status = await call(server, "server_status")
+    assert [entry["id"] for entry in status["leases"]] == [lease["id"]]
+
+    conflict = await call(server, "reserve_gpus", devices=[0, 1])
+    assert conflict["ok"] is False
+    assert lease["id"] in conflict["error"]["message"]
+
+    released = await call(server, "release_gpus", lease_id=lease["id"])
+    assert released["ok"] is True and released["released"]["id"] == lease["id"]
+    again = await call(server, "release_gpus", lease_id=lease["id"])
+    assert again["ok"] is False
+    assert (await call(server, "server_status"))["leases"] == []
+
+
+async def test_reserve_gpus_rejects_a_card_this_box_does_not_have(state: State) -> None:
+    server = build_management_mcp(state)
+    result = await call(server, "reserve_gpus", devices=[7])
+    assert result["ok"] is False
+    assert result["error"]["param"] == "devices"
 
 
 async def test_pin_of_unknown_model_is_a_result_not_an_exception(state: State) -> None:

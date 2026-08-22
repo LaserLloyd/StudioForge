@@ -907,6 +907,45 @@ RESTART_SERVER_WARNING: Final = (
 )
 
 
+def _span_text(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    if seconds < 60:
+        return f"{int(seconds)} s"
+    if seconds < 3600:
+        return f"{int(seconds // 60)} min"
+    hours, rem = divmod(int(seconds), 3600)
+    return f"{hours} h {rem // 60:02d} min"
+
+
+def leases_note(leases: Sequence[Any]) -> str:
+    """The one-line summary above the GPU leases list (D43)."""
+    if not leases:
+        return (
+            "None. A lease gives a model -- or a program outside this server -- specific "
+            "GPUs of its own; benchmarks take one automatically while they run."
+        )
+    return (
+        f"{len(leases)} standing lease(s). Nothing else loads onto a leased card until the "
+        f"lease is released or idles out."
+    )
+
+
+def lease_line(lease: Any) -> str:
+    """One lease, compactly: cards, owner, holder, clock, id."""
+    who = (
+        ", ".join(lease.model_ids) if lease.model_ids else "held for something outside this server"
+    )
+    if lease.idle_ttl_s is None:
+        clock = "until released"
+    else:
+        clock = (
+            f"auto-release after {_span_text(lease.idle_ttl_s)} idle "
+            f"(idle {_span_text(lease.idle_s)})"
+        )
+    reason = f" · {lease.reason}" if lease.reason else ""
+    return f"CUDA {list(lease.devices)} → {who} · by {lease.holder}{reason} · {clock} · {lease.id}"
+
+
 def unload_all_prompt(model_ids: Sequence[str]) -> str:
     """Confirmation text for Unload all, naming what is about to be dropped."""
     names = [str(m) for m in model_ids]

@@ -109,6 +109,12 @@ MANAGEMENT_FALLBACK_TOOLS: tuple[tuple[str, str], ...] = (
         "Keep a model loaded at all times: no idle TTL, never evicted, loaded at "
         "startup and reloaded if it goes down. pinned=false removes the pin.",
     ),
+    (
+        "reserve_gpus",
+        "Give specific GPUs to one model (or hold them for an outside program) until "
+        "released or idle; nothing else loads there meanwhile.",
+    ),
+    ("release_gpus", "End a GPU reservation early by its lease id."),
     ("search_models", "Find GGUF repos on HuggingFace. One compact row per repo."),
     (
         "repo_details",

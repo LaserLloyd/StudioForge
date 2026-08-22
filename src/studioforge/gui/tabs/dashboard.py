@@ -40,6 +40,7 @@ def render(ctx: GuiContext) -> None:
     with ui.column().classes("w-full gap-4 p-2"):
         _gpu_panel(ctx)
         _vram_holders_panel(ctx)
+        _leases_panel(ctx)
         _loaded_panel(ctx)
         _log_panel(ctx)
 
@@ -194,6 +195,47 @@ async def _loaded_state(ctx: GuiContext) -> list[tuple[Any, dict[str, Any] | Non
             pinned = False
         out.append((instance, introspection, pinned))
     return out
+
+
+# ---------------------------------------------------------------------------
+# GPU leases (D43)
+# ---------------------------------------------------------------------------
+
+
+def _leases_panel(ctx: GuiContext) -> None:
+    """Standing GPU leases: which cards are held, by whom, and for how long."""
+    ui.label("GPU leases").classes("text-lg font-medium")
+    note = ui.label("").classes("text-xs opacity-70")
+    container = ui.column().classes("w-full gap-1")
+
+    def refresh() -> None:
+        leases = list(ctx.manager.leases.all())
+        note.set_text(st.leases_note(leases))
+        container.clear()
+        with container:
+            for lease in leases:
+                with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                    ui.label(st.lease_line(lease)).classes("text-xs font-mono grow truncate")
+                    ui.button(
+                        icon="lock_open",
+                        on_click=lambda lease_id=lease.id: _release_lease(ctx, lease_id, refresh),
+                    ).props("flat dense").tooltip(
+                        "Release this lease now. The model stays loaded; the cards simply "
+                        "stop being reserved for it."
+                    )
+
+    refresh()
+    ui.timer(ctx.refresh_interval, refresh)
+
+
+async def _release_lease(ctx: GuiContext, lease_id: str, refresh: Any) -> None:
+    try:
+        ctx.manager.release_lease(lease_id)
+    except Exception as exc:  # noqa: BLE001
+        notify_error(exc, what="release lease")
+        return
+    ui.notify(f"lease {lease_id} released", type="positive")
+    refresh()
 
 
 def _loaded_panel(ctx: GuiContext) -> None:

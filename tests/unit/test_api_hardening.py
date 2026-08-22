@@ -80,6 +80,10 @@ def open_config(pin: str | None = "12345678") -> Config:
         # outlive the instance, so they are box changes, not residency.
         ("POST", "/api/models/vendor/Some-Model-Q4_K_M/pin"),
         ("PUT", "/api/models/vendor/Some-Model/settings"),
+        # A GPU lease (D43) takes cards away from everyone else on the box.
+        ("POST", "/api/leases"),
+        ("DELETE", "/api/leases/abc123def456"),
+        ("POST", "/api/leases/abc123def456/touch"),
     ],
 )
 def test_admin_mutations_from_the_lan_need_a_credential_on_an_open_install(
@@ -107,6 +111,7 @@ def test_admin_mutations_from_the_lan_need_a_credential_on_an_open_install(
         ("POST", "/api/models/vendor/Some-Model/unload"),
         ("POST", "/api/models/unload-all"),
         ("GET", "/api/models/vendor/Some-Model/settings"),
+        ("GET", "/api/leases"),
         ("POST", "/api/models/scan"),
         ("POST", "/api/virtual-models"),
         # The WP18-21 surfaces. Residency stays open (LM Studio parity, D32):
