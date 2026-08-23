@@ -214,10 +214,14 @@ passing an unenforced hint through. Callers see the OpenAI-standard field on the
 `--fit-ctx` / `--n-gpu-layers` are all manager-owned flags that the expert "extra flags" box
 refuses.
 
-**Why:** `b10425` introduced `-fit, --fit [on|off]` — *"whether to adjust unset arguments to fit in
-device memory"* — **defaulting to on**, alongside `--n-gpu-layers` defaulting to `auto`. Because
-StudioForge always pins `--n-gpu-layers 999` and an explicit `--ctx-size`, there is nothing left
-for `--fit` to adjust today. But the combination `-ngl auto` + `--fit on` is precisely a silent
+**Why:** the pinned build ships `-fit, --fit [on|off]` — *"whether to adjust unset arguments to
+fit in device memory"* — **defaulting to on**, and the same upstream change makes unset arguments,
+`--n-gpu-layers` among them, subject to that fitting. It is not a `b10425` invention: it landed in
+[llama.cpp PR #16653](https://github.com/ggml-org/llama.cpp/pull/16653) ("automatically set
+parameters not set by the user in such a way that maximizes GPU utilization"), merged 2025-12-15;
+`b10425` is simply the build this project pinned and measured against. Because StudioForge always
+pins `--n-gpu-layers 999` and an explicit `--ctx-size`, there is nothing left for `--fit` to adjust
+today. But the combination `-ngl auto` + `--fit on` is precisely a silent
 partial-offload path, and this project's central promise is that a model either runs fully in VRAM
 or is rejected with numbers. Leaving an engine-side autofit enabled would mean a future flag change,
 or one stray entry in the extra-flags box, could quietly turn a rejection into a degraded load.

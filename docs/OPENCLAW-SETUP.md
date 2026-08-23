@@ -330,8 +330,10 @@ sfctl servers add rig http://<rig-ip>:1234 --api-key <the same string> --use
 export OPENAI_API_KEY=<the same string>
 ```
 
-The API key is valid everywhere — `/v1`, `/api`, `/mcp` and the watchdog — so it replaces the PIN
-rather than sitting alongside it. Two behaviours worth knowing:
+The API key is valid everywhere — `/v1`, `/api`, `/mcp` and the watchdog — so one credential
+covers every surface. It does **not** retire the PIN: with a key set, the two MCP endpoints (the
+app's `/mcp` and the watchdog) accept *either* credential, so an agent already paired with the PIN
+keeps working (`api/auth.py`, `watchdog/server.py`). Two more behaviours worth knowing:
 
 - `GET /health` stays open with no credential, so watchdogs and probes keep working.
 - `GET /health?deep=true` does **not** — it runs a real completion against every loaded model, so

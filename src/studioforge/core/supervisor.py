@@ -913,12 +913,15 @@ class Supervisor:
         # We proxy everything; the bundled web UI is dead weight, while the
         # introspection endpoints are what the Dashboard and planner feed on.
         argv += ["--no-webui", "--props", "--slots", "--metrics"]
-        # b10425 added `--fit` (default ON), which "adjusts unset arguments to fit
-        # in device memory". StudioForge's planner already decided placement and
-        # context against live free VRAM, so engine-side auto-adjustment is at
-        # best redundant and at worst a silent partial-offload path -- exactly the
-        # degradation the GPU-only policy exists to prevent. Turn it off and let a
-        # genuine over-commit fail loudly instead. Verified accepted by b10425.
+        # The pinned build ships `--fit` (default ON), which "adjusts unset
+        # arguments to fit in device memory". That is upstream llama.cpp
+        # PR #16653 (merged Dec 2025), not something b10425 introduced -- b10425
+        # is just the build we pinned. StudioForge's planner already decided
+        # placement and context against live free VRAM, so engine-side
+        # auto-adjustment is at best redundant and at worst a silent
+        # partial-offload path -- exactly the degradation the GPU-only policy
+        # exists to prevent. Turn it off and let a genuine over-commit fail
+        # loudly instead. Verified accepted by b10425.
         argv += ["--fit", "off"]
 
         argv += self._optional_args(record, plan, engine)

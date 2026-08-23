@@ -116,7 +116,9 @@ are the ones you ask for.
    ```
 
 3. Double-click **`launchers\Update StudioForge.bat`** — creates the virtualenv, installs the
-   dependencies, downloads and smoke-tests the pinned `llama-server` build for your driver.
+   dependencies, then installs the **newest** llama.cpp release that has a build your driver can
+   run, smoke-tests it, and pins to it. A build that fails its smoke test is never pinned. (`b10425`
+   is the build the numbers in these docs were measured on, not necessarily the one you will get.)
 4. Double-click **`launchers\Start StudioForge.bat`**. The control panel opens at
    <http://127.0.0.1:8080> on its **Setup** tab — a checklist with a button for each unmet item.
    (Prefer a notification-area icon that keeps the server alive and restarts it if it crashes?
@@ -267,7 +269,9 @@ server dependencies — and is the remote control for the host: `sfctl status`, 
 LM Studio also uses `1234`: quit it, or set `server.port`. With no `server.api_key` (the default)
 anyone on your LAN can read, chat and load/unload; anything that changes the *box* — config,
 engines, files, restarts — needs a browser or client on the machine itself, or the MCP PIN
-([DECISIONS.md](DECISIONS.md) D32). Set a key to manage it remotely.
+([DECISIONS.md](DECISIONS.md) D32). Set a key to manage it remotely: it is accepted on `/v1`,
+`/api`, `/mcp` and the watchdog, and it sits *beside* the PIN rather than replacing it — both MCP
+endpoints keep accepting either.
 
 ## Data directory
 
