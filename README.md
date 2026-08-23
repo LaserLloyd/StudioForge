@@ -13,7 +13,18 @@ runs both) and less battle-tested. Questions and bug reports: [Contact](#contact
 
 ---
 
-## Overview — technical brief
+## Overview
+
+### In plain English
+
+<p align="center"><img src="docs/images/how-it-works.svg" alt="StudioForge in plain English: your programs (chat apps, coding assistants, scripts — anything built for the OpenAI API) talk to StudioForge as if it were a cloud AI service; StudioForge finds your GPUs and model files, starts llama.cpp for the model asked for, fits it into GPU memory, stops idle models and restarts crashed ones; your AI agent can run the whole stack over MCP from another machine" width="1100"></p>
+
+Three ideas: your programs keep talking to the API they already know and just get a new address;
+StudioForge runs the engine behind local models for you — finding GPUs and model files, fitting
+models into memory, restarting what crashes — so you never write a config file; and your AI agent
+can operate all of it from another machine. The rest of this section is the technical version.
+
+### Technical brief
 
 **Why it exists.** Running Transformer models on your own GPUs leaves you without the operational
 layer a hosted API takes for granted: an endpoint every client already speaks, capacity planning
