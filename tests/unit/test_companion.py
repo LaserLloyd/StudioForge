@@ -1098,7 +1098,15 @@ def test_openclaw_setup_without_auth_renders_honestly(monkeypatch: Any) -> None:
             "OPENAI_BASE_URL": "http://rig:1234/v1",
             "OPENAI_API_KEY": "not-required",
         },
-        "mcp": {"mcpServers": {"studioforge": {"command": "sfctl", "args": ["mcp"]}}},
+        "mcp": {
+            "openclaw_cli": "openclaw mcp add studioforge --command sfctl --arg mcp",
+            "openclaw_config": {
+                "mcp": {"servers": {"studioforge": {"command": "sfctl", "args": ["mcp"]}}}
+            },
+            "generic_config": {
+                "mcpServers": {"studioforge": {"command": "sfctl", "args": ["mcp"]}}
+            },
+        },
         "companion_config": {
             "server.url": "http://rig:1234",
             "server.api_key": "not-required",

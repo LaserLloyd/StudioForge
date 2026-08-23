@@ -204,7 +204,30 @@ You should see every GPU the rig has — the reference rig reports 2× RTX 5090 
 
 ## Step 5 — Register the MCP server with OpenClaw
 
-Add this to OpenClaw's MCP configuration:
+Register the bridge with OpenClaw:
+
+```bash
+openclaw mcp add studioforge --command sfctl --arg mcp
+```
+
+or, editing OpenClaw's config file directly — its key is `mcp.servers`, a nested map, **not** the
+top-level `mcpServers` one:
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "studioforge": {
+        "command": "sfctl",
+        "args": ["mcp"]
+      }
+    }
+  }
+}
+```
+
+Clients that take the generic top-level map instead — Claude Code, Cline, LibreChat and most
+others — want this shape:
 
 ```json
 {
@@ -263,7 +286,7 @@ sfctl recover
 With no flags this prints the watchdog's own health diagnosis. It goes to the **watchdog** on 1235, deliberately bypassing the main server, so a success here
 proves the recovery path OpenClaw depends on is live.
 
-Finally, restart OpenClaw and confirm it lists the 24 `studioforge` tools.
+Finally, restart OpenClaw and confirm it lists the 29 `studioforge` tools.
 
 ---
 

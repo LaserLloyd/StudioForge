@@ -976,10 +976,25 @@ async def openclaw_setup(request: Request) -> JSONResponse:
                 "OPENAI_BASE_URL": f"http://{host}:{config.server.port}/v1",
                 "OPENAI_API_KEY": key,
             },
+            # Two spellings, because clients disagree. OpenClaw's key is
+            # `mcp.servers` (docs.openclaw.ai/cli/mcp); Claude Code, Cline,
+            # LibreChat and most others take a top-level `mcpServers` map.
+            # Handing back only one of them is how a paste-this-in snippet ends
+            # up silently registering nothing.
             "mcp": {
-                "mcpServers": {
-                    "studioforge": {"command": "sfctl", "args": ["mcp"]},
-                }
+                "openclaw_cli": "openclaw mcp add studioforge --command sfctl --arg mcp",
+                "openclaw_config": {
+                    "mcp": {
+                        "servers": {
+                            "studioforge": {"command": "sfctl", "args": ["mcp"]},
+                        }
+                    }
+                },
+                "generic_config": {
+                    "mcpServers": {
+                        "studioforge": {"command": "sfctl", "args": ["mcp"]},
+                    }
+                },
             },
             "companion_config": {
                 "server.url": f"http://{host}:{config.server.port}",
@@ -993,8 +1008,8 @@ async def openclaw_setup(request: Request) -> JSONResponse:
                 else PIN_WITHHELD_NOTE
             ),
             "next_steps": [
-                "`sfctl mcp` merges the app's 14 management tools with the "
-                "watchdog's 10 recovery tools into one stdio tool list.",
+                "`sfctl mcp` merges the app's 19 management tools with the "
+                "watchdog's 10 recovery tools into one stdio list of 29.",
                 "Start with list_models: it returns the catalog newest-download-first, "
                 "one options row per context size, exactly one marked recommended.",
                 "Pass that row's load_args verbatim to load_model, then send prompts "

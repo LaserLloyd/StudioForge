@@ -209,6 +209,18 @@ uv tool install ./studioforge_companion-<version>-py3-none-any.whl    # on the a
 sfctl servers add rig http://<studioforge-host>:1234 --api-key <PIN or server.api_key> --use
 ```
 
+OpenClaw's config key is `mcp.servers`, not the top-level `mcpServers` map:
+
+```bash
+openclaw mcp add studioforge --command sfctl --arg mcp
+```
+
+```json
+{ "mcp": { "servers": { "studioforge": { "command": "sfctl", "args": ["mcp"] } } } }
+```
+
+Claude Code, Cline, LibreChat and other clients that take the generic map want this instead:
+
 ```json
 { "mcpServers": { "studioforge": { "command": "sfctl", "args": ["mcp"] } } }
 ```
