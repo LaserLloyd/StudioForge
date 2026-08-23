@@ -2,275 +2,226 @@
 
 [![CI](https://github.com/LaserLloyd/StudioForge/actions/workflows/ci.yml/badge.svg)](https://github.com/LaserLloyd/StudioForge/actions/workflows/ci.yml)
 
-A self-hosted, **GPU-only** LLM serving system: an OpenAI-compatible gateway over
+A self-hosted, **GPU-only** LLM server: an OpenAI-compatible gateway over
 [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server`, with a model registry, a VRAM
-planner, a web control panel, and an MCP control plane for agents. It was built to replace LM
-Studio as the backend for [OpenClaw](docs/OPENCLAW.md), and it listens on LM Studio's port, so
-switching over is a host change rather than a rewrite.
+planner, a web control panel, a system tray, and an MCP control plane for agents. Built to replace
+LM Studio as the backend for [OpenClaw](docs/OPENCLAW.md) — it listens on LM Studio's port, so
+switching is a host change, not a rewrite.
 
-It is a *management* layer — it does not implement inference. Each loaded model is a supervised
-`llama-server` child on an internal port, and the gateway reverse-proxies OpenAI-shaped requests to
-the right one. That buys per-model crash isolation, per-model engine pinning, and `SIGKILL` as a
-guaranteed VRAM-reclaim path.
-
-**GPU-only policy:** models run fully in VRAM or they do not run. There is no CPU inference and no
-CPU layer offload anywhere in the codebase. A model that cannot fit entirely on GPU is rejected at
-load time with the numbers and an actionable suggestion — never silently degraded into something
-twenty times slower.
-
-**Nothing leaves the box.** No telemetry, no analytics, no phone-home. The only outbound requests
-are ones you ask for: HuggingFace when you search or download a model, GitHub when you check for a
-newer llama.cpp engine, and the image URLs a vision request names.
+- **GPU-only.** A model runs fully in VRAM or it does not run; a load that will not fit is refused
+  with the numbers and a suggestion, never silently slowed down.
+- **Nothing leaves the box.** No telemetry. The only outbound requests are the ones you ask for
+  (HuggingFace downloads, llama.cpp release checks, image URLs a vision request names).
 
 ---
 
-## What it looks like
+## Install
 
-The control panel at `http://<host>:8080` — every number is the *actual* one the engine
-reports (context, slots, VRAM per card), not the one that was asked for:
+### Windows
 
-![Dashboard: GPUs, who holds the VRAM, standing GPU leases, and each loaded model with its live slots](docs/images/dashboard.png)
+1. Install [Git](https://git-scm.com/download/win), [Python 3.12+](https://www.python.org/downloads/)
+   and [uv](https://docs.astral.sh/uv/getting-started/installation/). Have a current
+   [NVIDIA driver](https://www.nvidia.com/drivers/) (no CUDA toolkit needed — the prebuilt engine
+   ships its runtime).
+2. Clone:
 
-The Setup tab is a checklist, not a YAML file — it opens on a fresh install and stays green
-afterwards; the Models tab is the library, indexed in place, with load / pin / test / benchmark
-per row:
+   ```bash
+   git clone https://github.com/LaserLloyd/StudioForge.git
+   ```
 
-| Setup | Models |
-| --- | --- |
-| ![Setup checklist](docs/images/setup.png) | ![Model library](docs/images/models.png) |
+3. Double-click **`launchers\Update StudioForge.bat`** — creates the virtualenv, installs the
+   dependencies, downloads and smoke-tests the pinned `llama-server` build for your driver.
+4. Double-click **`launchers\Start StudioForge.bat`** (or **`launchers\StudioForge Tray.bat`** for
+   a notification-area icon that keeps the server alive). The control panel opens at
+   <http://127.0.0.1:8080> on its **Setup** tab — a checklist with a button for each unmet item.
 
-On Windows, StudioForge also lives in the notification area. The tray starts the server, restarts
-it if it crashes, and puts the everyday actions one right-click away:
+### Linux
 
-<p align="center"><img src="docs/images/tray-menu.png" alt="The system tray menu: open the control panel, unload models, restart engines or the server, copy the MCP URL and PIN, start at login" width="420"></p>
+1. Install [Git](https://git-scm.com/downloads), [Python 3.12+](https://www.python.org/downloads/),
+   [uv](https://docs.astral.sh/uv/getting-started/installation/), `cmake`, and the
+   [CUDA toolkit](https://developer.nvidia.com/cuda-downloads) whose `nvcc` matches your driver.
+   Upstream ships no Linux CUDA archive, so the engine is **built from source once per version**.
+2. Clone and install:
 
-### The companion: `sfctl`
+   ```bash
+   git clone https://github.com/LaserLloyd/StudioForge.git && cd StudioForge
+   uv venv --python 3.12 .venv
+   uv pip install --python .venv/bin/python -e ".[dev]"
+   ```
 
-StudioForge is built to be driven from *another* machine — the one running your agent. The
-[`studioforge-companion`](packages/studioforge-companion/) package installs anywhere (no CUDA, no
-server dependencies) and gives you:
+3. Start it (the first run builds the engine; watch the progress in the terminal):
 
-- **`sfctl`** — a remote control for the rig: status, load/unload/pin, benchmark, download,
-  logs, config, engine updates, and `sfctl recover` for when the server is wedged.
-- **`sfctl mcp`** — one stdio MCP server that merges the server's management tools *and* the
-  watchdog's recovery tools into a single toolset for [OpenClaw](docs/OPENCLAW.md) (or any MCP
-  client). When the main server locks up, the agent still holds `restart_server`.
+   ```bash
+   .venv/bin/studioforge serve --open
+   ```
 
-```bash
-uv tool install ./studioforge_companion-<version>-py3-none-any.whl
-sfctl servers add rig http://<studioforge-host>:1234 --api-key <pin-or-key> --use
-sfctl status
-```
+4. To run it as a service that survives logout, use the systemd user units in
+   [`deploy/`](deploy/README.md).
 
-## Requirements
+### First run, either platform
 
-| | |
-| --- | --- |
-| OS | Windows 10/11 or Linux |
-| GPU | NVIDIA, with a driver new enough for the CUDA build you install (CUDA 13.3 binaries need a 580-series driver or newer) |
-| Python | 3.12+ |
-| Tooling | [`uv`](https://docs.astral.sh/uv/) |
-
-On Windows no CUDA toolkit is needed: the prebuilt `llama-server` archive ships the runtime, and
-StudioForge fetches, verifies and smoke-tests the right one for your driver on first run. On
-Linux + NVIDIA the engine is **built from source** (upstream publishes no Linux CUDA archive), so
-`git`, `cmake` and a CUDA toolkit with `nvcc` matching the driver are needed once per engine tag.
-
-## Quickstart
-
-```bash
-git clone <repo> studioforge && cd studioforge
-uv venv --python 3.12 .venv
-uv pip install --python .venv/Scripts/python.exe -e ".[dev]"     # Linux: .venv/bin/python
-studioforge serve --open
-```
-
-On Windows, double-clicking **launchers\Update StudioForge.bat** does the install (and keeps doing
-it on later updates), and **launchers\Start StudioForge.bat** starts it. `--open` waits until the
-control panel actually answers before opening a browser.
-
-**First run** detects your GPUs, tunes a handful of defaults to them, installs the pinned
-`llama-server` build and smoke-tests it before trusting it, and registers your existing model
-library **in place** — nothing is copied or moved. The panel opens on its **Setup** tab: a live
-checklist of everything still between this box and serving a model, each unmet item with the
-button that fixes it, and every configuration key grouped by the decision it makes. You should
-never need to edit `config.yaml` by hand. Three things to check there: the engine installed,
-`models.dir` points at your GGUF library (**Detect LM Studio library** finds one, including a
-relocated `downloadsFolder`), and the MCP pairing PIN you will need to connect an agent.
-
-**[`docs/SETUP.md`](docs/SETUP.md) is the full walkthrough**, tab section by tab section, with
-the equivalent YAML and CLI for a box with no browser.
-
-## Ports
-
-| Service | Default | Purpose |
-| --- | --- | --- |
-| Gateway / management API | `1234` | OpenAI-compatible endpoints + `/api/*` + MCP |
-| Web GUI | `8080` | NiceGUI control panel |
-| Watchdog | `1235` | Recovery MCP sidecar (separate process) |
-| `llama-server` children | `18100–18200` | Internal, one port per loaded model |
-
-> LM Studio also uses port `1234`. They can share the same model library on disk, but not the same
-> port — quit LM Studio, or set `server.port` to something else.
-
-With no `server.api_key` (the default) anyone on the LAN can read, chat and load/unload; anything
-that changes the *box* — config, engines, files, restarts — needs a browser or client on the
-machine itself, or the MCP PIN, on the API, the MCP path and the control panel alike
-(DECISIONS.md D32). Set a key to manage it remotely.
-
-## Data directory
-
-Everything the app writes — `config.yaml`, `registry.sqlite3`, `engines/`, `logs/`, `downloads/` —
-lives in **one** place, resolved in one order:
-
-1. `SF_DATA_DIR` if it is set;
-2. the directory a `--config` (or `SF_CONFIG`) file lives in, when one was named — `config.yaml`
-   always sits in its data directory, and that is how the tray, the watchdog and autostart pass
-   the location to the processes they spawn;
-3. `<repo>/data` when you are running from a checkout (this is the normal case, and `.gitignore`
-   keeps it out of the repository);
-4. the platform data directory (`%LOCALAPPDATA%\studioforge`, `~/.local/share/studioforge`) for an
-   installed wheel.
-
-`config.yaml` itself never names the data directory (a `data_dir` key left by an older build is
-ignored with a warning), so copying a config between installs cannot silently move one.
-
-The `.bat` launchers, the `justfile`/`Makefile` and the CLI all follow that rule, so a
-double-click and a typed command reach the same install.
-
-**To point this checkout at a data directory that already exists** — an older install, or a second
-drive — create `local-env.bat` in the repo root (template: `launchers\local-env.example.bat`):
-
-```bat
-set "SF_DATA_DIR=D:\path\to\an\existing\data"
-```
-
-Every launcher calls it before doing anything else, and it is gitignored, so machine-specific paths
-can never be committed by accident. On Linux, export the same variable from your shell profile or a
-systemd unit (see [`deploy/`](deploy/)).
-
-> **One data directory serves one running instance.** Start a second server against the same data
-> dir and it comes up as a **secondary**: it answers reads, and it runs no downloader, no TTL
-> sweeper and no auto-load, because those want a single writer (DECISIONS.md D24). `GET /health`
-> reports `"instance": "secondary"` and names the pid holding it. So before pointing a new checkout
-> at an existing data directory, stop the old server and tray first.
-
-## Project layout
-
-| Path | What lives there |
-| --- | --- |
-| `src/studioforge/` | The application: `api/` (OpenAI-compatible gateway + management routes), `core/` (registry, VRAM planner, supervisor, engine, leases, benchmarks, downloader), `gui/` (the control panel: dashboard, models, download, benchmark, chat, logs, server, setup), `mcp/` (the agent control plane, 19 tools), `tray/` (Windows notification-area app), `watchdog/` (the recovery sidecar, 10 tools), `migrations/` (SQL schema, applied at startup) |
-| `packages/studioforge-companion/` | `sfctl` — the thin remote-control CLI and the `sfctl mcp` stdio bridge for OpenClaw; installs anywhere, no CUDA dependencies |
-| `launchers/` | Windows double-click launchers (below) |
-| `deploy/` | Linux: systemd user units for the server and the watchdog |
-| `docs/` | Setup, the catalog, OpenClaw integration, the benchmarking playbook, the runbook, engine features, limitations |
-| `tests/unit/` | The suite CI runs (no GPU, no network); `tests/contract/` needs real engines and weights and is opt-in |
-| `DECISIONS.md` | The running architectural decision log, D1 onward — the *why* behind every non-obvious rule |
-| `config.example.yaml` | Every config key with its shipped default, annotated (a unit test keeps it so); the app writes its own `config.yaml` into the data dir |
-
-## Windows: double-click launchers
-
-Everything a Windows user needs is in [`launchers/`](launchers/) — five `.bat` files, none of which
-need a terminal or admin rights:
-
-| File | What it does |
-| --- | --- |
-| **Start StudioForge.bat** | Starts the server and opens the control panel once it is actually up |
-| **StudioForge Tray.bat** | Puts StudioForge in the notification area: it starts the server, restarts it if it crashes, and offers start/stop, free VRAM and copy-the-MCP-URL from the icon |
-| **Open StudioForge GUI.bat** | Opens the control panel of an already-running server |
-| **StudioForge Autostart.bat** | Turns "start when I log in" on or off (tray, or server only) |
-| **Update StudioForge.bat** | Pulls code (if a git remote exists), syncs dependencies, updates the llama.cpp engine, then verifies |
-
-They resolve the repo from their own location, so they work from a shortcut on the desktop too.
-`launchers\local-env.example.bat` is the template for keeping your data outside the checkout
-(copy it to the repo root as `local-env.bat`; see *Data directory* above).
-
-The same things from a terminal, on any platform:
-
-```bash
-studioforge serve --open          # start, and open the GUI when it is ready
-studioforge gui                   # open the GUI of a running server
-studioforge scan                  # inventory the model library without starting a server
-studioforge config                # show the effective config, secrets redacted
-studioforge engine --check        # is there a newer llama.cpp release?
-studioforge engine --update       # install it, smoke-test it, then pin it
-studioforge autostart enable      # start at login (Startup folder / systemd --user)
-```
-
-`engine --update` only repins after the new build passes its smoke test, so a broken release can
-never become the default. Running instances keep the engine they started with; reload a model to
-move it onto the new one.
+The Setup tab asks you to confirm three things: the engine is installed, `models.dir` points at
+your GGUF library (**Detect LM Studio library** finds an existing one — models are indexed in
+place, never copied), and you have noted the MCP pairing PIN you will need for an agent. The full
+walkthrough, with the headless YAML/CLI equivalent, is [`docs/SETUP.md`](docs/SETUP.md).
 
 ---
 
-## Using it from OpenClaw (or any OpenAI client)
+## Three ways to set it up
 
-Inference is a base-URL change; management is one stdio MCP server on the agent's machine:
+### A. Let an AI coding agent do it
+
+Open [Claude Code](https://docs.anthropic.com/en/docs/claude-code), a DeepSeek-based harness, or
+any coding agent that can run shell commands **in the cloned folder**, and paste:
+
+> Install StudioForge on this machine by following `docs/SETUP.md`: create the virtualenv with uv,
+> install the llama.cpp engine with `studioforge engine --update`, point `models.dir` at my GGUF
+> library, start it with `studioforge serve --open`, and confirm `GET http://127.0.0.1:1234/health`
+> reports `"can_serve": true`. Only run `tests/unit`, never `tests/contract`.
+
+The repo is written for that: [`DECISIONS.md`](DECISIONS.md) explains every non-obvious rule,
+[`docs/RUNBOOK.md`](docs/RUNBOOK.md) says what each `/health` field means, and
+[`docs/BENCHMARKING.md`](docs/BENCHMARKING.md) is a playbook an agent can follow verbatim.
+
+### B. Manually, as an API (any OpenAI-compatible client)
+
+Once the server is up, it *is* a cloud-style API on your own hardware. Point any OpenAI client at it:
 
 ```bash
-OPENAI_BASE_URL=http://<studioforge-host>:1234/v1
-OPENAI_API_KEY=<server.api_key, or any non-empty string when auth is disabled>
+export OPENAI_BASE_URL=http://<studioforge-host>:1234/v1
+export OPENAI_API_KEY=not-required        # any non-empty string while server.api_key is unset
 ```
 
 ```bash
-uv tool install ./studioforge_companion-<version>-py3-none-any.whl   # from `uv build --wheel`
-sfctl servers add rig http://<studioforge-host>:1234 --api-key <PIN or server.api_key>
+curl http://<studioforge-host>:1234/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "<id from /v1/models>", "messages": [{"role": "user", "content": "hello"}]}'
+```
+
+```python
+from openai import OpenAI  # https://github.com/openai/openai-python
+client = OpenAI(base_url="http://<studioforge-host>:1234/v1", api_key="not-required")
+print(client.models.list())   # every downloaded model; naming an unloaded one loads it on demand
+```
+
+`GET /v1/models` lists every **downloaded** model, like LM Studio, and a request that names an
+unloaded model just-in-time loads it. To use it from outside your LAN, set `server.api_key` on the
+Setup tab and pass that key — see [`docs/SETUP.md` §6](docs/SETUP.md#6-network--access).
+
+### C. With OpenClaw (or any MCP agent)
+
+Inference is path B. Management — load, unload, pin, benchmark, download, recover — is one stdio
+MCP server on the agent's machine, provided by the companion package:
+
+```bash
+uv build --wheel -o dist                                              # in packages/studioforge-companion, on the rig
+uv tool install ./studioforge_companion-<version>-py3-none-any.whl    # on the agent's machine
+sfctl servers add rig http://<studioforge-host>:1234 --api-key <PIN or server.api_key> --use
 ```
 
 ```json
 { "mcpServers": { "studioforge": { "command": "sfctl", "args": ["mcp"] } } }
 ```
 
-`GET /v1/models` lists every **downloaded** model (loaded or not), exactly like LM Studio, and
-naming an unloaded model in a chat request just-in-time loads it. `sfctl mcp` merges the server's
-19 management tools and the watchdog's 10 recovery tools into one list, so the agent keeps
-`restart_server`, `kill_model` and `tail_logs` even when the main server is wedged. There is no
-inference tool by design; generation goes over `/v1/chat/completions`, which streams.
-
-The loop an agent runs — `list_models` (every model with a `recommended` load and a per-context
-`options` table, nothing left to compute), `load_recommended(model_id, ctx_size)` (loads at
-**exactly** that context or refuses with numbers), `search_models` → `repo_details` →
-`download_model`, `pin_model`, `reserve_gpus` — is in [`docs/OPENCLAW.md`](docs/OPENCLAW.md);
-every catalog column and its formula is in [`docs/CATALOG.md`](docs/CATALOG.md). Set
-`models.default_model` to serve requests that name no model at all.
+That gives the agent 29 tools: the server's 19 management tools plus the watchdog's 10 recovery
+tools, so it still holds `restart_server` when the main server is wedged. The step-by-step
+two-machine install with a check after each step is
+[`docs/OPENCLAW-SETUP.md`](docs/OPENCLAW-SETUP.md); the loop an agent actually runs is
+[`docs/OPENCLAW.md`](docs/OPENCLAW.md).
 
 ---
 
-## Tests
+## What it looks like
 
-```bash
-.venv/Scripts/python.exe -m pytest tests/unit -q      # the fast suite: no GPU, no engine, no network
-```
+Every number in the panel is the *actual* one the engine reports — context, slots, VRAM per card:
 
-`tests/contract` starts a **real** gateway with a **real** engine and loads **real** weights onto
-your GPUs; it is deselected by default and additionally gated on `SF_RUN_CONTRACT=1`
-(DECISIONS.md D23). How to run it, which unit tests use real artefacts when the machine has them,
-lint and types: [`CONTRIBUTING.md`](CONTRIBUTING.md) and
-[`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md).
+![Dashboard: GPUs, who holds the VRAM, standing GPU leases, and each loaded model with its live slots](docs/images/dashboard.png)
+
+| Setup — a checklist, not a YAML file | Models — the library, indexed in place |
+| --- | --- |
+| ![Setup checklist](docs/images/setup.png) | ![Model library](docs/images/models.png) |
+
+On Windows, the tray starts the server, restarts it if it crashes, and keeps the everyday actions
+one right-click away:
+
+<p align="center"><img src="docs/images/tray-menu.png" alt="The system tray menu: open the control panel, unload models, restart engines or the server, copy the MCP URL and PIN, start at login" width="420"></p>
+
+## The companion: `sfctl`
+
+[`packages/studioforge-companion`](packages/studioforge-companion/) installs anywhere — no CUDA, no
+server dependencies — and is the remote control for the rig: `sfctl status`, `models load/unload/pin`,
+`download`, `logs`, `config`, `update`, and `sfctl recover` for when the server is wedged.
+`sfctl mcp` is the stdio MCP bridge from path C.
+
+## Ports
+
+| Service | Default | Purpose |
+| --- | --- | --- |
+| Gateway / management API | `1234` | OpenAI-compatible endpoints, `/api/*`, `/mcp` |
+| Web GUI | `8080` | The control panel |
+| Watchdog | `1235` | Recovery MCP sidecar (separate process) |
+| `llama-server` children | `18100–18200` | Internal, one port per loaded model |
+
+LM Studio also uses `1234`: quit it, or set `server.port`. With no `server.api_key` (the default)
+anyone on your LAN can read, chat and load/unload; anything that changes the *box* — config,
+engines, files, restarts — needs a browser or client on the machine itself, or the MCP PIN
+([DECISIONS.md](DECISIONS.md) D32). Set a key to manage it remotely.
+
+## Data directory
+
+Everything the app writes — `config.yaml`, `registry.sqlite3`, `engines/`, `logs/`, `downloads/` —
+lives in one place: `SF_DATA_DIR` if set; else the folder a `--config` file lives in; else
+`<repo>/data` in a checkout (gitignored); else the platform data directory. To keep your data
+outside the checkout, copy [`launchers\local-env.example.bat`](launchers/local-env.example.bat) to
+the repo root as `local-env.bat` and set `SF_DATA_DIR` there (Linux: export it in your shell or the
+systemd unit). Every launcher reads it, and it is gitignored.
+
+One data directory serves one running instance; a second server on the same directory comes up
+read-only (`"instance": "secondary"` in `/health`). Stop the old server and tray before pointing a
+new checkout at an existing data directory.
+
+## Windows launchers
+
+All in [`launchers/`](launchers/); none need a terminal or admin rights, and they work from a
+desktop shortcut.
+
+| File | What it does |
+| --- | --- |
+| **Start StudioForge.bat** | Starts the server and opens the control panel once it is actually up |
+| **StudioForge Tray.bat** | Notification-area icon: starts the server, restarts it if it crashes, start/stop, free VRAM, copy the MCP URL |
+| **Open StudioForge GUI.bat** | Opens the control panel of an already-running server |
+| **StudioForge Autostart.bat** | Turns "start when I log in" on or off (tray, or server only) |
+| **Update StudioForge.bat** | Pulls code (if a git remote exists), syncs dependencies, updates the llama.cpp engine, verifies |
+
+The same from a terminal, on any platform: `studioforge serve --open`, `studioforge gui`,
+`studioforge scan`, `studioforge config`, `studioforge engine --check | --update`,
+`studioforge autostart enable`.
+
+## Project layout
+
+| Path | What lives there |
+| --- | --- |
+| `src/studioforge/` | The app: `api/` (gateway + management routes), `core/` (registry, VRAM planner, supervisor, engine, leases, benchmarks, downloader), `gui/`, `mcp/` (19 tools), `tray/`, `watchdog/` (10 tools), `migrations/` |
+| `packages/studioforge-companion/` | `sfctl` and the `sfctl mcp` bridge |
+| `launchers/` | Windows double-click launchers |
+| `deploy/` | Linux systemd user units |
+| `docs/` | Setup, OpenClaw, the catalog, benchmarking, the runbook, limitations |
+| `tests/unit/` | The suite CI runs (no GPU, no network); `tests/contract/` needs real engines and weights, opt-in |
+| `DECISIONS.md` | The architectural decision log, D1 onward — the *why* behind every rule |
+| `config.example.yaml` | Every config key with its shipped default, annotated |
 
 ## Documentation
 
-- [`docs/SETUP.md`](docs/SETUP.md) — first run, tab by tab; the GPU policy knobs; the engine
-  (Windows download, Linux source build); network, credentials and the D32 admin rule;
-  downloading models; the headless YAML and CLI
-- [`docs/OPENCLAW.md`](docs/OPENCLAW.md) — pointing OpenClaw at it, the tool list, the loop an agent
-  runs, pins and leases, default models, reliability guarantees, troubleshooting
-- [`docs/OPENCLAW-SETUP.md`](docs/OPENCLAW-SETUP.md) — a step-by-step two-machine install with a
-  verification after each step (all hostnames and addresses are placeholders)
-- [`docs/CATALOG.md`](docs/CATALOG.md) — the model catalog an agent picks from: every column,
-  the speed formulas, calibration, `planner.preference`
-- [`docs/OPENCLAW-LONG-CONTEXT.md`](docs/OPENCLAW-LONG-CONTEXT.md) — what a long window really
-  costs, with three models' whole option tables and the measured numbers behind them
-- [`docs/BENCHMARKING.md`](docs/BENCHMARKING.md) — the benchmarking playbook for the agent: the
-  two benchmarks, the exact calls, the three rules, and locking a result in with a lease
-- [`docs/ENGINE-FEATURES.md`](docs/ENGINE-FEATURES.md) — the llama.cpp features StudioForge turns
-  on and the ones it deliberately does not, each with its default, quality cost and measurement
-- [`docs/RUNBOOK.md`](docs/RUNBOOK.md) — the operator's runbook: what `/health` is telling you, and
-  what to do when it will not start, a model will not load, VRAM is held, or a download stalls
-- [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) — working on the code: scratch data dir, the shape
-  of the code, adding a config key, headless Linux, the companion wheel
-- [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) — known limitations, honestly
-- [`docs/COMPARISON.md`](docs/COMPARISON.md) — what was borrowed from Ollama, oobabooga, KoboldCpp, vLLM
+- [`docs/SETUP.md`](docs/SETUP.md) — first run, tab by tab; GPUs, engine, network, downloads; headless
+- [`docs/OPENCLAW-SETUP.md`](docs/OPENCLAW-SETUP.md) — two-machine install, verified step by step
+- [`docs/OPENCLAW.md`](docs/OPENCLAW.md) — the tool list and the loop an agent runs; pins and leases
+- [`docs/CATALOG.md`](docs/CATALOG.md) — the model catalog an agent picks from, every column explained
+- [`docs/BENCHMARKING.md`](docs/BENCHMARKING.md) — the benchmarking playbook
+- [`docs/OPENCLAW-LONG-CONTEXT.md`](docs/OPENCLAW-LONG-CONTEXT.md) — what a long window really costs
+- [`docs/ENGINE-FEATURES.md`](docs/ENGINE-FEATURES.md) — llama.cpp features on, off, and measured
+- [`docs/RUNBOOK.md`](docs/RUNBOOK.md) — what `/health` means and what to do when it is wrong
+- [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) · [`CONTRIBUTING.md`](CONTRIBUTING.md) — working on the code, running the tests
+- [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) · [`docs/COMPARISON.md`](docs/COMPARISON.md) — known limits; what was borrowed from Ollama, oobabooga, KoboldCpp, vLLM
 - [`DECISIONS.md`](DECISIONS.md) — architectural decisions, each with the measurement behind it
 
 ## License
