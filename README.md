@@ -15,6 +15,80 @@ switching is a host change, not a rewrite.
 
 ---
 
+## Overview
+
+StudioForge turns one machine with NVIDIA GPUs into a private LLM server that looks, to every
+client, exactly like a hosted API. You keep your models on disk as GGUF files; StudioForge loads
+them into VRAM on demand, serves them over the OpenAI API, and gives you — and your agents — the
+controls to manage them.
+
+```mermaid
+flowchart LR
+    subgraph clients["Client machine(s) — optional, e.g. a laptop on the LAN"]
+        A["Any OpenAI client<br/>(apps, SDKs, agent harnesses)"]
+        B["OpenClaw + sfctl<br/>(MCP tools)"]
+        C["Browser"]
+    end
+    subgraph host["Host machine — the GPUs and the model library"]
+        G["StudioForge gateway :1234<br/>OpenAI-compatible API · /api · /mcp"]
+        P["VRAM planner + registry"]
+        E1["llama-server child<br/>(model A, GPU 0)"]
+        E2["llama-server child<br/>(model B, GPUs 1+2)"]
+        W["Watchdog :1235"]
+        UI["Control panel :8080<br/>+ system tray"]
+    end
+    A -- "/v1/chat/completions" --> G
+    B -- "MCP" --> G
+    C --> UI
+    G --> P
+    P --> E1
+    P --> E2
+    W -. "recovers" .-> G
+```
+
+### The components
+
+| Component | Where it runs | What it does |
+| --- | --- | --- |
+| **Host machine** | The box with the NVIDIA GPUs and your GGUF library | Runs everything below. This is the only machine that needs a GPU, Python, or an install. |
+| Gateway (`:1234`) | Host | The OpenAI-compatible API (`/v1/*`), the management API (`/api/*`), and the agent control plane (`/mcp`). Naming an unloaded model in a request loads it just-in-time. |
+| **Backend: `llama-server`** | Host, one process per loaded model | [llama.cpp](https://github.com/ggml-org/llama.cpp)'s server, pinned to a tested build and fetched automatically. StudioForge never does inference itself — it supervises these children, so a crashed model never takes the gateway down and its VRAM is always reclaimable. |
+| VRAM planner + registry | Host | Indexes the library in place, estimates what fits where, walks context down a ladder until it fits, evicts idle models when it must, and keeps pinned models resident and leased cards exclusive. |
+| Control panel (`:8080`) + tray | Host (viewed from anywhere) | The web UI for setup, models, downloads, benchmarks, chat and logs; on Windows, a tray icon that keeps the server alive. |
+| Watchdog (`:1235`) | Host, separate process | Restarts the gateway, kills stuck models, tails logs — reachable even when the main server is wedged. |
+| **Client machine(s)** | Anything on the LAN or tailnet — a laptop, a NAS, the agent's box. Can also be the host itself. | Nothing to install for inference: any OpenAI client just points at the host. For agent management, install the small [`sfctl` companion](#the-companion-sfctl) (no GPU, no CUDA). |
+
+### Why it is worth running
+
+- **It tells the truth about VRAM.** A model runs entirely on GPU or it is refused with the
+  numbers and a fix — never silently spilled to CPU at a twentieth of the speed.
+- **Multi-GPU is planned, not guessed.** Placement across mixed cards, context sized to what
+  fits, measured slot counts, pins for models that must always be warm, and leases that give a
+  model a card of its own ([`DECISIONS.md`](DECISIONS.md) D14–D43, each with its measurement).
+- **Drop-in for LM Studio.** Same port, same `/v1/models` behaviour, same library on disk —
+  switching a client is a host change.
+- **Built for agents.** 29 MCP tools with a catalog that hands an agent the exact load
+  arguments, a benchmarking playbook it can follow, and recovery tools that survive a wedged server.
+- **Recovers on its own.** Tray, watchdog, crash restarts with backoff, and VRAM that cannot
+  outlive its owner process.
+- **Private by construction.** Nothing leaves the box unless you ask for it.
+
+### Where to go next
+
+| You want to… | Go to |
+| --- | --- |
+| Install it on the host | [Install](#install) — [Windows](#windows) · [Linux](#linux) |
+| Have an AI coding agent install it for you | [A. Let an AI coding agent do it](#a-let-an-ai-coding-agent-do-it) |
+| Call it from an app or SDK | [B. Manually, as an API](#b-manually-as-an-api-any-openai-compatible-client) |
+| Drive it from OpenClaw / an MCP agent | [C. With OpenClaw](#c-with-openclaw-or-any-mcp-agent) · [the companion](#the-companion-sfctl) |
+| See the control panel | [What it looks like](#what-it-looks-like) |
+| Know which ports to open | [Ports](#ports) |
+| Keep your data outside the checkout | [Data directory](#data-directory) |
+| Double-click instead of typing | [Windows launchers](#windows-launchers) |
+| Read more | [Documentation](#documentation) |
+
+---
+
 ## Install
 
 ### Windows
