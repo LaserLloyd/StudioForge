@@ -40,7 +40,7 @@ import re
 import struct
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Final
 
 from studioforge.types import GgufMeta
@@ -298,6 +298,7 @@ KNOWN_QUANT_LABELS: Final[frozenset[str]] = frozenset(
         "Q2_K",
         "Q2_K_S",
         "Q2_K_L",
+        "Q2_K_XL",
         "Q3_K",
         "Q3_K_S",
         "Q3_K_M",
@@ -319,9 +320,11 @@ KNOWN_QUANT_LABELS: Final[frozenset[str]] = frozenset(
         "Q5_K_XL",
         "Q6_K",
         "Q6_K_L",
+        "Q6_K_M",
         "Q6_K_XL",
         "Q8_0",
         "Q8_K",
+        "Q8_K_L",
         "Q8_K_XL",
         "IQ1_S",
         "IQ1_M",
@@ -816,6 +819,66 @@ def is_gguf(path: Path) -> bool:
 def looks_like_mmproj(path: Path) -> bool:
     """Filename-only heuristic for a vision projector file (no I/O)."""
     return "mmproj" in Path(path).name.lower()
+
+
+#: A speculative-decoding draft module is small by construction -- it is a few
+#: layers, not a model. Used only to break the ambiguous case in
+#: :func:`looks_like_auxiliary_gguf`; well above the ~0.8 GiB modules seen in
+#: the wild and far below any real quant of a model worth drafting for.
+DRAFT_MODULE_MAX_BYTES: Final = 1_610_612_736  # 1.5 GiB
+
+
+def _name_tokens(stem: str) -> list[str]:
+    """Filename stem split on the separators publishers actually use."""
+    return [tok for tok in re.split(r"[-_.\s]+", stem.lower()) if tok]
+
+
+def looks_like_auxiliary_gguf(path: Path | str, *, size_bytes: int | None = None) -> bool:
+    """True for a ``.gguf`` that is *not* a loadable model (no I/O).
+
+    Repos increasingly ship GGUFs that are not models: unsloth publishes MTP
+    speculative-decoding draft modules under ``MTP/`` and an ``imatrix_*.gguf``
+    calibration file beside the real quants. Both parse as quants by filename,
+    so without this they became their own rows in the Download tab -- rows that
+    could not be downloaded anyway, because a ``MTP/`` path separator is
+    refused by ``safe_filename``.
+
+    **Matching is on tokens and path segments, never substrings**, because
+    ``mtp`` is also a legitimate part of a *model* name: a model with an MTP
+    head is commonly published as ``Qwen3.8-27B-NVFP4-MTP-Q6_K.gguf``, and that
+    is a real 20 GiB model that must stay selectable. What separates the two is
+    *position*, not presence -- a draft module lives in an ``MTP/`` directory or
+    leads with an ``mtp-`` token, whereas a full model carries ``-MTP-`` in the
+    middle of its name. The middle case is genuinely ambiguous by name alone,
+    so it is only treated as auxiliary when a known size says it is too small
+    to be a model (:data:`DRAFT_MODULE_MAX_BYTES`); with no size, the file is
+    kept. Keeping a stray draft module is a cosmetic bug; dropping somebody's
+    model is a real one.
+    """
+    pure = PurePosixPath(str(path).replace("\\", "/"))
+    # An "MTP/" directory is unambiguous: that is where the draft modules go.
+    if any(part.lower() == "mtp" for part in pure.parts[:-1]):
+        return True
+
+    stem = pure.name
+    if stem.lower().endswith(".gguf"):
+        stem = stem[: -len(".gguf")]
+    tokens = _name_tokens(stem)
+    if not tokens:
+        return False
+
+    # A calibration matrix is never loadable, wherever it sits in the name.
+    if "imatrix" in tokens:
+        return True
+
+    if tokens[0] == "mtp":
+        return True
+
+    # Ambiguous position: "-MTP-" in the middle of a name is how a full model
+    # with an MTP head is published, so only a known, tiny size settles it.
+    return (
+        "mtp" in tokens[1:] and size_bytes is not None and 0 < size_bytes <= DRAFT_MODULE_MAX_BYTES
+    )
 
 
 def shard_paths_for(path: Path) -> list[Path]:

@@ -35,7 +35,11 @@ import httpx
 from huggingface_hub import hf_hub_url
 
 from studioforge.config import Config
-from studioforge.core.gguf import looks_like_mmproj, quant_label_from_filename
+from studioforge.core.gguf import (
+    looks_like_auxiliary_gguf,
+    looks_like_mmproj,
+    quant_label_from_filename,
+)
 from studioforge.errors import BadRequestError, UpstreamError
 from studioforge.logging import get_logger
 
@@ -315,6 +319,10 @@ class GgufFileInfo:
     shard_total: int | None
     sha256: str | None
     lfs_oid: str | None
+    #: A GGUF in the repo that is not a loadable model -- an MTP draft module
+    #: or an imatrix calibration file. Defaults False so every existing
+    #: construction site keeps its meaning.
+    is_auxiliary: bool = False
 
     @property
     def size_known(self) -> bool:
@@ -475,11 +483,16 @@ class GgufRepoInfo:
         * a projector is never a logical model of its own -- it cannot be
           loaded without a base model;
         * if the repo ships a projector at all it is a vision repo, so the best
-          matching projector is attached to every base entry.
+          matching projector is attached to every base entry;
+        * a GGUF that is not a model at all -- an MTP speculative-decoding
+          draft module, an imatrix calibration file -- is not a quant and is
+          never offered. It parses as one by filename, which is how a 26B repo
+          came to list "Q4_0 2.14 GiB" and "unknown 0.88 GiB" beside its one
+          real 13 GiB weight file, each badged as fitting on a single GPU.
         """
         buckets: dict[tuple[str, str], list[GgufFileInfo]] = {}
         for info in self.files:
-            if info.is_mmproj:
+            if info.is_mmproj or info.is_auxiliary:
                 continue
             buckets.setdefault((info.quant, shard_base(info.filename)), []).append(info)
 
@@ -641,7 +654,10 @@ def _file_from_sibling(entry: dict[str, Any]) -> GgufFileInfo | None:
     """Build a :class:`GgufFileInfo` from one ``siblings``/blob entry.
 
     Returns ``None`` for non-GGUF entries (READMEs, configs, ``.imatrix``
-    files) and for anything whose name is not a usable path component.
+    files) and for anything whose name is not a usable path component. A GGUF
+    that is not a *model* -- an MTP draft module, an ``imatrix_*.gguf`` -- is
+    still returned, flagged ``is_auxiliary``; the repo keeps the full picture
+    and :meth:`GgufRepoInfo.logical_models` is what refuses to offer it.
     """
     name = entry.get("rfilename") or entry.get("filename")
     if not isinstance(name, str) or not name.lower().endswith(".gguf"):
@@ -673,6 +689,7 @@ def _file_from_sibling(entry: dict[str, Any]) -> GgufFileInfo | None:
         shard_total=total,
         sha256=sha_str.lower() if sha_str else None,
         lfs_oid=oid_str,
+        is_auxiliary=looks_like_auxiliary_gguf(name, size_bytes=size),
     )
 
 

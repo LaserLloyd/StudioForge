@@ -1066,6 +1066,20 @@ no row says the same thing twice). A formula change that moves any anchor fails 
 
 ## D24 -- A download has one writer, and completion is proven on disk
 
+**Amended (2026-08-23): a repo's MTP draft modules and imatrix files are not quants.**
+`logical_models()` treated every non-projector `.gguf` in a repo as a base model, so
+unsloth's `MTP/mtp-*.gguf` speculative-decoding modules and `imatrix_*.gguf` became quant
+rows in the Download tab -- a 27B repo offering "Q4_0 2.14 GiB" beside its real 13 GiB
+weight file, each badged as fitting one GPU, and the MTP rows undownloadable anyway because
+`safe_filename` refuses the `MTP/` separator. `looks_like_auxiliary_gguf` now excludes them
+from `logical_models()` (and so from `header_file_for`, which reads the *smallest* logical
+download and could pick the imatrix). It matches on path segments and name **tokens**, never
+substrings: `MTP/` as a directory or a leading `mtp-` is a draft module, whereas `-MTP-` in
+the middle of a name is how a full model with an MTP head is published
+(`Qwen3.8-27B-NVFP4-MTP-Q6_K`, 20 GiB) and must stay selectable. The ambiguous middle case is
+settled by size only when a size is known -- keeping a stray row is cosmetic, hiding a model
+is not.
+
 **Incident (2026-08-18).** A 19.27 GB download of `unsloth/Qwen3.8-27B-GGUF` (Q5_K_S, main file
 19,270,036,448 B plus its mmproj) was enqueued by the live server at 22:01:48 and started
 transferring. At 22:04:45 and again at 22:07:09 `data/logs/studioforge.log` records
