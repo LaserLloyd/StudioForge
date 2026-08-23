@@ -321,6 +321,16 @@ class EngineConfig(BaseModel):
     #: VRAM-for-prefill trade the operator should make knowingly, not a default.
     #:
     ubatch_size: PositiveInt | None = None
+    #: The ``-ub`` a *many-slot* launch gets when nothing above is set. D38 §5
+    #: measured a bigger micro-batch as pure prefill speed (1024 was +13.6%),
+    #: and left it off only until the planner could charge its compute buffer;
+    #: D40 made the estimate ubatch-aware, so the automatic raise is now safe --
+    #: the error direction is a refused context, never an OOM. Applied above
+    #: four slots (the "many slots" line the batch size already uses), where a
+    #: large combined prefill is exactly what a bigger micro-batch helps; a
+    #: single-stream load stays byte-identical at the engine default. ``None``
+    #: turns the automatic raise off entirely.
+    ubatch_many_slots: PositiveInt | None = 1024
     #: ``-bs/--backend-sampling``: run sampling on the GPU. Faster, but marked
     #: EXPERIMENTAL by b10425 and silently downgraded to CPU sampling under
     #: ``--split-mode tensor``. Off by default under the quality-first rule --

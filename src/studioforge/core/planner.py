@@ -126,6 +126,42 @@ def kv_bytes_per_element(kv_type: str) -> float:
 SWA_CELL_ALIGN = 256
 DEFAULT_UBATCH = 512
 
+#: Slot count above which the automatic ``-ub`` raise applies. The same "many
+#: slots" line the batch size uses (supervisor.BATCH_SIZE_MANY_SLOTS): a
+#: single-stream or lightly-concurrent load keeps the engine's 512 and stays
+#: byte-identical, while a heavy concurrent prefill gets the larger micro-batch
+#: that D38 §5 measured as faster.
+UBATCH_MANY_SLOTS_THRESHOLD = 4
+
+
+def effective_ubatch(
+    *,
+    settings_ubatch: int | None,
+    engine_ubatch: int | None,
+    engine_ubatch_many_slots: int | None,
+    slots: int,
+) -> int | None:
+    """The ``-ub`` for a launch, or ``None`` to keep the engine default (512).
+
+    One precedence, shared by the planner (which charges its VRAM, D40) and the
+    supervisor (which emits it), so the micro-batch the estimate assumes is
+    always the one the child runs with:
+
+    1. an explicit per-model ``ubatch_size`` -- the operator chose it;
+    2. an explicit ``engine.ubatch_size`` -- the rig-wide choice;
+    3. ``engine.ubatch_many_slots`` when the launch runs more than
+       :data:`UBATCH_MANY_SLOTS_THRESHOLD` slots -- the automatic raise;
+    4. otherwise ``None`` (the flag is omitted; the engine keeps 512).
+    """
+    if settings_ubatch is not None:
+        return int(settings_ubatch)
+    if engine_ubatch is not None:
+        return int(engine_ubatch)
+    if engine_ubatch_many_slots is not None and slots > UBATCH_MANY_SLOTS_THRESHOLD:
+        return int(engine_ubatch_many_slots)
+    return None
+
+
 #: Compute-buffer growth per extra micro-batch token, per unit of ``n_embd``,
 #: per device. The activation scratch every device keeps for a forward pass
 #: scales with ``n_ubatch * n_embd``; measured on the scratch rig (D40, two
@@ -900,7 +936,9 @@ class Planner:
 
         planner_cfg = self.config.planner
         ctx_total = max(1, ctx_size) * max(1, parallel)
-        micro_batch = int(ubatch) if ubatch is not None else self.ubatch_for(record)
+        micro_batch = (
+            int(ubatch) if ubatch is not None else self.ubatch_for(record, max(1, parallel))
+        )
 
         weights = int(meta.tensor_bytes) or int(record.size_bytes)
         # One call for all four shapes: uniform, iSWA, hybrid, per-layer array.
@@ -2830,18 +2868,23 @@ class Planner:
     def _flash_attn_for(self, record: ModelRecord) -> FlashAttn:
         return record.settings.flash_attn or self.config.models.default_flash_attn
 
-    def ubatch_for(self, record: ModelRecord) -> int:
-        """The ``-ub`` a launch of ``record`` gets: per-model, else global, else 512.
+    def ubatch_for(self, record: ModelRecord, slots: int = 1) -> int:
+        """The ``-ub`` a launch of ``record`` at ``slots`` gets, as a real number.
 
-        The same precedence the supervisor applies when it builds the argv, so
-        the VRAM the planner charges for the micro-batch is the micro-batch the
-        child really runs with.
+        Shares :func:`effective_ubatch` with the supervisor, so the VRAM the
+        planner charges for the micro-batch is the micro-batch the child really
+        runs with -- including the automatic many-slots raise (D38 §5 / D40),
+        which is why ``slots`` matters: the estimate for an eight-slot rung must
+        include the bigger compute buffer that rung will actually allocate.
+        ``None`` from the shared policy means "engine default", i.e. 512.
         """
-        explicit = record.settings.ubatch_size
-        if explicit is not None:
-            return int(explicit)
-        configured = getattr(self.config.engine, "ubatch_size", None)
-        return int(configured) if configured is not None else DEFAULT_UBATCH
+        ub = effective_ubatch(
+            settings_ubatch=record.settings.ubatch_size,
+            engine_ubatch=getattr(self.config.engine, "ubatch_size", None),
+            engine_ubatch_many_slots=getattr(self.config.engine, "ubatch_many_slots", None),
+            slots=slots,
+        )
+        return ub if ub is not None else DEFAULT_UBATCH
 
     def _split_mode_for(self, record: ModelRecord) -> SplitMode:
         return record.settings.split_mode or "layer"

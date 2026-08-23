@@ -187,6 +187,29 @@ def test_an_explicit_spec_type_survives_high_concurrency(tmp_path: Path) -> None
     assert resolve_spec_type(record, B10425, has_draft=False, slots=8)[0] == "draft-mtp"
 
 
+def test_effective_ubatch_precedence() -> None:
+    """The one policy the planner and supervisor share. Per-model wins, then the
+    rig-wide setting, then the many-slots raise, then None (engine default)."""
+    from studioforge.core.planner import effective_ubatch
+
+    def ub(**kw: object) -> int | None:
+        base = {
+            "settings_ubatch": None,
+            "engine_ubatch": None,
+            "engine_ubatch_many_slots": 1024,
+            "slots": 8,
+        }
+        base.update(kw)
+        return effective_ubatch(**base)  # type: ignore[arg-type]
+
+    assert ub(settings_ubatch=4096) == 4096, "per-model wins over everything"
+    assert ub(engine_ubatch=768) == 768, "rig-wide setting wins over the raise"
+    assert ub() == 1024, "the many-slots raise applies above the threshold"
+    assert ub(slots=4) is None, "at the threshold the engine keeps 512"
+    assert ub(slots=1) is None, "a single stream keeps 512"
+    assert ub(engine_ubatch_many_slots=None) is None, "raise off => None even at 8 slots"
+
+
 def test_auto_prefers_mtp_over_an_attached_draft_model(tmp_path: Path) -> None:
     """MTP needs no second model in VRAM, so it wins where both are possible."""
     record = make_record(tmp_path, meta=dense_meta(extra={"nextn_predict_layers": 2}))

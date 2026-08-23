@@ -109,6 +109,13 @@ engine:
   # buys prompt speed with compute-buffer VRAM the planner then charges per
   # card (D40) -- a trade to make knowingly, so it ships unset (engine's 512).
   ubatch_size: null
+  # `--ubatch-size` for a MANY-SLOT launch (>4 slots) when nothing above is
+  # set. D38 measured a larger micro-batch as pure prefill speed and D40 made
+  # the estimate charge its VRAM, so the automatic raise is safe (error
+  # direction: a refused context, never an OOM). Helps exactly the heavy
+  # concurrent prefill; a single-stream load stays at the engine's 512. null
+  # turns the automatic raise off.
+  ubatch_many_slots: 1024
   # `--backend-sampling`: GPU-side sampling. b10425 marks it EXPERIMENTAL, so
   # it is off under the quality-first rule (only lossless, non-experimental
   # features ship enabled).

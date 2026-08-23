@@ -413,7 +413,29 @@ def test_many_slots_raise_the_batch_size(config: Config, tmp_path: Path) -> None
         make_record(tmp_path), make_plan(parallel=8), port=18100
     )
     assert value_after(argv, "--batch-size") == "4096"
-    # --ubatch-size is a VRAM term the planner models; it must stay untouched.
+    # Above four slots the automatic -ub raise applies (D38 §5 default 1024);
+    # the planner charges its VRAM (D40), and --batch-size still covers it.
+    assert value_after(argv, "--ubatch-size") == "1024"
+
+
+def test_many_slots_ubatch_raise_is_off_when_unset(config: Config, tmp_path: Path) -> None:
+    """`engine.ubatch_many_slots = None` keeps the engine's 512: the flag is
+    omitted even at eight slots, the pre-D38-§5 behaviour."""
+    config.engine.ubatch_many_slots = None
+    binary = make_binary(tmp_path)
+    argv = sup(config, binary).build_command(
+        make_record(tmp_path), make_plan(parallel=8), port=18100
+    )
+    assert "--ubatch-size" not in argv
+
+
+def test_a_single_stream_launch_keeps_the_engine_ubatch(config: Config, tmp_path: Path) -> None:
+    """At or below the threshold the argv is byte-identical to before: no
+    --ubatch-size, so the engine keeps 512."""
+    binary = make_binary(tmp_path)
+    argv = sup(config, binary).build_command(
+        make_record(tmp_path), make_plan(parallel=1), port=18100
+    )
     assert "--ubatch-size" not in argv
 
 

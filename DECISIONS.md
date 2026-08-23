@@ -2400,6 +2400,21 @@ the model -- on a GPU-only server that turns a fit into an OOM. So `engine.ubatc
 defaults to unset, and the benchmark can measure it (`ubatch_sizes=(1024, 2048)`); making the
 planner ubatch-aware is left for whoever owns `planner.py` next.
 
+**Amendment (2026-08-23): the automatic many-slots raise, now that the planner is aware.** D40
+made `Planner.estimate` charge `ubatch_scratch_bytes` for the micro-batch, which removed the OOM
+objection above ("the error direction is now a refused context, not an OOM"). The one piece still
+missing was an *automatic* raise -- `engine.ubatch_size` had to be set by hand. A gauntlet run at
+`--parallel 8` made the case: eight cold slots re-prefilling a shared prompt is exactly the large
+combined prefill a bigger micro-batch speeds up, and it was running at the engine's 512. So
+`engine.ubatch_many_slots` (default **1024**, the measured +13.6% rung) now applies above
+`UBATCH_MANY_SLOTS_THRESHOLD = 4` slots, through one policy (`planner.effective_ubatch`) that both
+`Planner.ubatch_for(record, slots)` and `Supervisor.ubatch_for(record, slots)` call -- so the
+micro-batch the estimate charges is the one the child launches with, at the slot count it commits
+to (`max_slots_by_vram` re-estimates per candidate, so the raise cannot under-charge). A
+single-stream load is byte-identical; an explicit per-model or `engine.ubatch_size` still wins;
+`null` turns it off. 2048 (+18.6%) is available and worth a per-rig measurement before adopting as
+the default -- 1024 is the conservative starting point, not a measured knee for this hardware.
+
 `--backend-sampling` stays off: b10425 labels it experimental, and under the quality-first rule
 "experimental with no measured quality claim" is itself the reason.
 

@@ -56,7 +56,7 @@ import psutil
 
 from studioforge.config import Config, resolve_cache_ram_mb
 from studioforge.core.engine import EngineFeatures, probe_engine_features
-from studioforge.core.planner import attention_kind, is_moe
+from studioforge.core.planner import attention_kind, effective_ubatch, is_moe
 from studioforge.errors import ModelLoadError, ModelUnloadError
 from studioforge.logging import get_logger
 from studioforge.types import AdapterRecord, InstanceInfo, LoadPlan, ModelRecord
@@ -921,7 +921,7 @@ class Supervisor:
         # genuine over-commit fail loudly instead. Verified accepted by b10425.
         argv += ["--fit", "off"]
 
-        argv += self._optional_args(record, engine)
+        argv += self._optional_args(record, plan, engine)
         argv += self._concurrency_args(record, plan, engine)
 
         if record.kind == "embedding":
@@ -982,13 +982,15 @@ class Supervisor:
         args += ["--main-gpu", str(main)]
         return args
 
-    def _optional_args(self, record: ModelRecord, features: EngineFeatures) -> list[str]:
+    def _optional_args(
+        self, record: ModelRecord, plan: LoadPlan, features: EngineFeatures
+    ) -> list[str]:
         settings = record.settings
         args: list[str] = []
 
         if settings.batch_size is not None:
             args += ["--batch-size", str(settings.batch_size)]
-        ubatch = self.ubatch_for(record)
+        ubatch = self.ubatch_for(record, max(1, plan.parallel))
         if ubatch is not None:
             args += ["--ubatch-size", str(ubatch)]
         if settings.threads is not None:
@@ -1087,18 +1089,20 @@ class Supervisor:
 
         return args
 
-    def ubatch_for(self, record: ModelRecord) -> int | None:
-        """The ``-ub`` this launch passes: per-model, else ``engine.ubatch_size``, else none.
+    def ubatch_for(self, record: ModelRecord, slots: int = 1) -> int | None:
+        """The ``-ub`` this launch passes, or ``None`` to keep the engine's 512.
 
-        ``None`` means the flag is not emitted and the engine keeps its 512. The
-        planner resolves the same precedence (``Planner.ubatch_for``) so the
-        VRAM it charges for the micro-batch is the micro-batch the child runs.
+        Shares :func:`effective_ubatch` with ``Planner.ubatch_for`` so the VRAM
+        the planner charged for the micro-batch is the micro-batch the child
+        runs -- including the automatic many-slots raise (D38 §5), which is why
+        ``slots`` is threaded in from ``plan.parallel``.
         """
-        settings = record.settings
-        if settings.ubatch_size is not None:
-            return int(settings.ubatch_size)
-        configured = self._config.engine.ubatch_size
-        return int(configured) if configured is not None else None
+        return effective_ubatch(
+            settings_ubatch=record.settings.ubatch_size,
+            engine_ubatch=self._config.engine.ubatch_size,
+            engine_ubatch_many_slots=self._config.engine.ubatch_many_slots,
+            slots=slots,
+        )
 
     def _concurrency_args(
         self, record: ModelRecord, plan: LoadPlan, features: EngineFeatures
@@ -1129,7 +1133,7 @@ class Supervisor:
         # verbatim (the user chose both numbers); the automatic one is raised
         # to cover the micro-batch.
         auto_batch = BATCH_SIZE_MANY_SLOTS if slots > 4 else ENGINE_DEFAULT_BATCH_SIZE
-        ubatch = self.ubatch_for(record) or 0
+        ubatch = self.ubatch_for(record, slots) or 0
         if settings.batch_size is None and (slots > 4 or ubatch > auto_batch):
             args += ["--batch-size", str(max(auto_batch, ubatch))]
 
