@@ -1,7 +1,9 @@
 # Development
 
 Working notes for changing the code. For the rules of the road — lint, types, the test policy, the
-`DECISIONS.md` convention — see [`../CONTRIBUTING.md`](../CONTRIBUTING.md).
+`DECISIONS.md` convention — see [`../CONTRIBUTING.md`](../CONTRIBUTING.md). For cutting a release —
+the four version strings, the tag, and the workflow that builds the zip and the wheels — see
+[`RELEASING.md`](RELEASING.md).
 
 ## Running it against a scratch data directory
 

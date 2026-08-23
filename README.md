@@ -8,7 +8,7 @@ planner, a web control panel, a system tray, and an MCP control plane for agents
 LM Studio as the backend for [OpenClaw](docs/OPENCLAW.md) — it listens on LM Studio's port, so
 switching is a host change, not a rewrite.
 
-**Status:** v0.2.0. Windows is the reference platform and runs it daily; Linux is supported (CI
+**Status:** v1.26-08-23. Windows is the reference platform and runs it daily; Linux is supported (CI
 runs both) and less battle-tested. Questions and bug reports: [Contact](#contact).
 
 ---
@@ -311,6 +311,7 @@ The same from a terminal, on any platform: `studioforge serve --open`, `studiofo
 - [`docs/ENGINE-FEATURES.md`](docs/ENGINE-FEATURES.md) — llama.cpp features on, off, and measured
 - [`docs/RUNBOOK.md`](docs/RUNBOOK.md) — what `/health` means and what to do when it is wrong
 - [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) · [`CONTRIBUTING.md`](CONTRIBUTING.md) — working on the code, running the tests
+- [`docs/RELEASING.md`](docs/RELEASING.md) — the version scheme, cutting a tag, what the updater expects
 - [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) · [`docs/COMPARISON.md`](docs/COMPARISON.md) — known limits; what was borrowed from Ollama, oobabooga, KoboldCpp, vLLM
 - [`DECISIONS.md`](DECISIONS.md) — architectural decisions, each with the measurement behind it
 

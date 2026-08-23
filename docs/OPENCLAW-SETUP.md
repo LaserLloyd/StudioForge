@@ -74,7 +74,7 @@ Do this first. Every later step assumes it, and it is the single most common thi
 curl -s -m 8 http://<rig-ip>:1234/health
 ```
 
-Expected: `{"status":"ok","version":"0.2.0",...}`.
+Expected: `{"status":"ok","version":"1.26-08-23",...}`.
 
 If it hangs or refuses:
 

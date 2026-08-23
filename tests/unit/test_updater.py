@@ -66,6 +66,26 @@ def test_version_key_tolerates_junk() -> None:
     assert _version_key("1.0.0+build7") == (1, 0, 0)
 
 
+def test_version_key_reads_the_hyphenated_calendar_date() -> None:
+    """``1.26-08-23`` and the PEP 440 ``1.26.8.23`` must be the same version.
+
+    The display string, the tag and the wheel metadata all say the same date in
+    three spellings; if they did not sort equal the updater would offer the
+    running build to itself as an update, or refuse a genuinely newer one.
+    """
+    assert _version_key("1.26-08-23") == _version_key("1.26.8.23") == (1, 26, 8, 23)
+    assert _version_key("v1.26-08-23") == _version_key("1.26-08-23")
+    assert _version_key("1.26-08-23") > _version_key("0.2.0")
+    assert _version_key("1.26-08-24") > _version_key("1.26-08-23")
+    assert _version_key("1.27-01-04") > _version_key("1.26-12-31")
+
+
+def test_version_key_still_drops_a_prerelease_suffix() -> None:
+    """A non-numeric hyphen chunk must not sort the candidate above the release."""
+    assert _version_key("1.26-08-23-rc1") == _version_key("1.26-08-23")
+    assert _version_key("1.0.0-beta") < _version_key("1.0.1")
+
+
 def test_release_newer_than_current() -> None:
     old = ReleaseInfo(
         tag="v0.0.1",
