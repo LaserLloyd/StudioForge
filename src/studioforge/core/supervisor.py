@@ -107,6 +107,19 @@ SPLIT_MODE_LAYER = "layer"
 #: at once queue behind each other. ``--ubatch-size`` stays at its 512 default
 #: -- that one is a VRAM term the planner models (planner.DEFAULT_UBATCH).
 BATCH_SIZE_MANY_SLOTS = 4096
+
+#: Above this many slots, ``auto`` speculative decoding turns itself off.
+#: Speculation spends spare GPU compute to shorten a single stream: it drafts
+#: tokens and verifies them in one pass, a big win at one slot because decode
+#: is memory-bound there (the weights are read regardless, so the extra tokens
+#: are nearly free). Every added slot fills that spare compute with real work,
+#: and once the batch saturates the GPU the drafted-then-rejected tokens are
+#: pure waste that slows *every* concurrent request. The crossover is model-
+#: and hardware-specific, but it is well below the point of a heavy agent or
+#: benchmark load; four is the same "many slots" line the batch size uses, and
+#: a model that genuinely wants speculation at high concurrency can still set
+#: ``spec_type`` explicitly. This gates ``auto`` only.
+SPEC_AUTO_MAX_SLOTS = 4
 #: llama.cpp's own default logical batch. A micro-batch is clamped to the
 #: logical batch (``n_ubatch = min(n_batch, n_ubatch)``), so an ``-ub`` above
 #: this needs ``-b`` raised with it or it is silently not what was asked for.
@@ -481,14 +494,19 @@ def _nextn_heads(record: ModelRecord) -> int:
 
 
 def resolve_spec_type(
-    record: ModelRecord, features: EngineFeatures, *, has_draft: bool
+    record: ModelRecord, features: EngineFeatures, *, has_draft: bool, slots: int = 1
 ) -> tuple[str, str]:
     """Pick the ``--spec-type`` for this model. Returns ``(type, reason)``.
 
     Speculative decoding is *distribution-preserving*: the draft proposes, the
     full model verifies, and rejected tokens are resampled from the true
     distribution. It is therefore the rare feature that is pure speed with no
-    quality cost, which is why ``auto`` is allowed to turn it on by itself.
+    quality cost, which is why ``auto`` is allowed to turn it on by itself --
+    but only *at low concurrency*. ``slots`` is the launch's parallel slot count
+    (D17); above :data:`SPEC_AUTO_MAX_SLOTS`, ``auto`` returns ``none``, because
+    speculation trades spare compute for latency and a saturated multi-slot
+    batch has none to spare (see the constant). An explicit ``spec_type`` is
+    still honoured at any slot count -- the caller chose it.
 
     Raises :class:`ModelLoadError` when an explicitly configured type is not one
     the active engine offers -- b10425 accepts unknown values on some flags and
@@ -522,6 +540,15 @@ def resolve_spec_type(
         return requested, "set on this model"
 
     # --- auto ---------------------------------------------------------
+    if slots > SPEC_AUTO_MAX_SLOTS:
+        # A saturated multi-slot batch has no spare compute for drafting to
+        # spend, so speculation there slows every concurrent request down
+        # rather than speeding one up. Off before any of the what-to-draft-from
+        # checks below, since none of them changes this.
+        return (
+            SPEC_TYPE_NONE,
+            f"{slots} slots: speculation is a single-stream win and hurts a saturated batch",
+        )
     if not features.known:
         # Unknown engine: keep exactly the pre-gating behaviour, no guesses.
         if has_draft:
@@ -652,7 +679,9 @@ def resolve_launch_features(
     has_draft: bool,
 ) -> ResolvedFeatures:
     """Resolve every ``auto``/gated knob for one launch. Pure; may raise."""
-    spec_type, spec_reason = resolve_spec_type(record, features, has_draft=has_draft)
+    spec_type, spec_reason = resolve_spec_type(
+        record, features, has_draft=has_draft, slots=max(1, plan.parallel)
+    )
     split_mode, split_reason = resolve_split_mode(record, plan, features)
     return ResolvedFeatures(
         spec_type=spec_type,

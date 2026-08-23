@@ -160,6 +160,33 @@ def test_auto_picks_mtp_when_the_model_has_its_own_heads(tmp_path: Path) -> None
     assert "multi-token-prediction head" in reason
 
 
+def test_auto_disables_speculation_above_the_slot_threshold(tmp_path: Path) -> None:
+    """Speculation is a single-stream win; a saturated multi-slot batch has no
+    spare compute for it, so auto turns it off past SPEC_AUTO_MAX_SLOTS -- even
+    for an MTP model that would otherwise draft (the observed 8-slot case)."""
+    record = make_record(tmp_path, meta=dense_meta(extra={"nextn_predict_layers": 1}))
+    assert resolve_spec_type(record, B10425, has_draft=False, slots=4)[0] == "draft-mtp"
+    spec, reason = resolve_spec_type(record, B10425, has_draft=False, slots=8)
+    assert spec == "none"
+    assert "8 slots" in reason
+
+
+def test_auto_slot_gate_also_silences_ngram_and_draft(tmp_path: Path) -> None:
+    """The gate is before every what-to-draft-from check, so a thinking model
+    (ngram) and an attached draft model both go quiet at high concurrency too."""
+    thinking = make_record(tmp_path, thinking=True)
+    assert resolve_spec_type(thinking, B10425, has_draft=False, slots=8)[0] == "none"
+    plain = make_record(tmp_path)
+    assert resolve_spec_type(plain, B10425, has_draft=True, slots=8)[0] == "none"
+
+
+def test_an_explicit_spec_type_survives_high_concurrency(tmp_path: Path) -> None:
+    """The slot gate is an auto-only default; a caller who set spec_type meant
+    it (a benchmark measuring speculation at 8 slots, say)."""
+    record = make_record(tmp_path, settings=ModelSettings(spec_type="draft-mtp"))
+    assert resolve_spec_type(record, B10425, has_draft=False, slots=8)[0] == "draft-mtp"
+
+
 def test_auto_prefers_mtp_over_an_attached_draft_model(tmp_path: Path) -> None:
     """MTP needs no second model in VRAM, so it wins where both are possible."""
     record = make_record(tmp_path, meta=dense_meta(extra={"nextn_predict_layers": 2}))

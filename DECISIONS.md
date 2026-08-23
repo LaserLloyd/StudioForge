@@ -2297,6 +2297,19 @@ drafting). `/slots[].speculative` came back `true` for `ngram-mod` too, so it me
 not "working"; only `timings.draft_n` / `draft_n_accepted` mean working. Both signals were read off
 the scratch loads above; `/props` was not relied on for any of them.
 
+**Amendment (2026-08-23): `auto` is off above four slots.** Every measurement above is a *single
+stream* (`--parallel 1`), where decode is memory-bound: the weights are read to produce one token
+regardless, so the drafted tokens are verified almost for free and the win is real. That reasoning
+inverts under concurrency. A gauntlet run loaded Dark-Scarlett-27B at `--parallel 8` and `auto`
+still chose `draft-mtp` (it saw the MTP head, not the slot count) -- but eight concurrent streams
+already saturate the GPU, so the drafted-then-rejected tokens are pure extra compute that slows
+*every* request. `resolve_spec_type` now takes the launch's slot count and returns `none` from
+`auto` above `SPEC_AUTO_MAX_SLOTS = 4` (the same "many slots" line the batch size uses). An
+explicit `spec_type` is still honoured at any concurrency -- a benchmark that wants to measure
+speculation at eight slots sets it and means it. The crossover is model- and hardware-specific;
+four is a deliberately conservative default, not a measured knee, and is the natural thing to
+calibrate per model later.
+
 ### 3. Tensor split is opt-in, gated, and was *slower* here
 
 Qwen2.5-1.5B Q4_K_M, two RTX 3090s, 8k context, three runs each, median:
