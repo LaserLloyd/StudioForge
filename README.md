@@ -20,29 +20,7 @@ client, exactly like a hosted API. You keep your models on disk as GGUF files; S
 them into VRAM on demand, serves them over the OpenAI API, and gives you — and your agents — the
 controls to manage them.
 
-```mermaid
-flowchart LR
-    subgraph clients["Client machine(s) — optional, e.g. a laptop on the LAN"]
-        A["Any OpenAI client<br/>(apps, SDKs, agent harnesses)"]
-        B["OpenClaw + sfctl<br/>(MCP tools)"]
-        C["Browser"]
-    end
-    subgraph host["Host machine — the GPUs and the model library"]
-        G["StudioForge gateway :1234<br/>OpenAI-compatible API · /api · /mcp"]
-        P["VRAM planner + registry"]
-        E1["llama-server child<br/>(model A, GPU 0)"]
-        E2["llama-server child<br/>(model B, GPUs 1+2)"]
-        W["Watchdog :1235"]
-        UI["Control panel :8080<br/>+ system tray"]
-    end
-    A -- "/v1/chat/completions" --> G
-    B -- "MCP" --> G
-    C --> UI
-    G --> P
-    P --> E1
-    P --> E2
-    W -. "recovers" .-> G
-```
+<p align="center"><img src="docs/images/architecture.svg" alt="How a request flows: client machines (any OpenAI client, OpenClaw with sfctl, a browser) reach the StudioForge gateway on the host machine; the VRAM planner places each model on GPUs and supervises one llama-server process per loaded model; a watchdog recovers the gateway" width="1100"></p>
 
 ### The components
 
