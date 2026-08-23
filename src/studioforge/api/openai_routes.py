@@ -629,6 +629,10 @@ async def _stream_upstream(
     completion_tokens = 0
     sent_done = False
     closing = False
+    #: The pending read of the first upstream chunk while keep-alives run. Held
+    #: at function scope so the finally can cancel it if the client disconnects
+    #: mid-prefill -- an orphaned read task would hold the httpx stream open.
+    first: asyncio.Task[bytes] | None = None
     state.supervisor.mark_request_start(record.id)
     try:
         async with state.client.stream(
@@ -641,13 +645,45 @@ async def _stream_upstream(
                 yield b"data: [DONE]\n\n"
                 sent_done = True
                 return
-            async for chunk in response.aiter_raw():
-                if not chunk:
-                    continue
-                if b"[DONE]" in chunk:
+            stream = response.aiter_raw()
+            # Keep the socket warm until the FIRST byte. On a busy server that
+            # first byte is the end of prefill, and prefill grows with
+            # concurrency (eight cold slots re-processing a shared prompt can be
+            # tens of seconds); a silent socket that whole time trips a client's
+            # read timeout, and a retrying client piles more prefill onto an
+            # already-saturated batch -- the self-amplifying failure behind
+            # "trouble with 8 concurrent". A ``:`` comment is valid SSE every
+            # parser ignores. Only until the first chunk: after that the stream
+            # is flowing, so there is no per-chunk timer overhead.
+            interval = state.config.gateway.stream_keepalive_interval_s
+            first = asyncio.ensure_future(stream.__anext__())  # type: ignore[arg-type]
+            waited = 0.0
+            while True:
+                done, _ = await asyncio.wait({first}, timeout=interval)
+                if done:
+                    break
+                # ``wait`` did NOT cancel the read; the same task is still
+                # pending and we re-wait on it. Cancelling it here would abort
+                # the httpx read mid-flight and corrupt the stream.
+                waited += interval
+                yield f": prefilling {record.id} ({waited:.0f}s)\n\n".encode()
+            try:
+                first_chunk = first.result()
+            except StopAsyncIteration:
+                first_chunk = None
+            if first_chunk:
+                if b"[DONE]" in first_chunk:
                     sent_done = True
-                completion_tokens += chunk.count(b'"delta"')
-                yield chunk
+                completion_tokens += first_chunk.count(b'"delta"')
+                yield first_chunk
+            if not sent_done:
+                async for chunk in stream:
+                    if not chunk:
+                        continue
+                    if b"[DONE]" in chunk:
+                        sent_done = True
+                    completion_tokens += chunk.count(b'"delta"')
+                    yield chunk
     except GeneratorExit:
         # The client went away. Nothing may be yielded during this unwind --
         # doing so raises RuntimeError("async generator ignored GeneratorExit")
@@ -663,6 +699,10 @@ async def _stream_upstream(
             code="upstream_error",
         )
     finally:
+        # Cancel a first-chunk read still pending when the client vanished
+        # mid-prefill, so it does not hold the httpx stream open after us.
+        if first is not None and not first.done():
+            first.cancel()
         # Release the request slot FIRST. When a client disconnects, this
         # generator is closed with GeneratorExit, and yielding during that
         # unwind raises RuntimeError("async generator ignored GeneratorExit") --

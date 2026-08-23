@@ -138,6 +138,46 @@ async def test_request_slot_released_on_normal_completion() -> None:
     assert supervisor.active == 0
 
 
+async def test_keepalive_is_emitted_while_the_first_chunk_is_slow() -> None:
+    """A busy prefill can leave the socket silent for tens of seconds before the
+    first token. A ``:`` keep-alive fills that gap so a client read timeout does
+    not fire (and retry, piling onto the prefill) on a stream that is working."""
+
+    class SlowFirst:
+        status_code = 200
+
+        async def __aenter__(self) -> SlowFirst:
+            return self
+
+        async def __aexit__(self, *_exc: object) -> None:
+            return None
+
+        async def aiter_raw(self) -> Any:
+            await asyncio.sleep(0.03)  # prefill: silent, longer than the interval
+            yield b'data: {"delta":1}\n\n'
+            yield b"data: [DONE]\n\n"
+
+        async def aread(self) -> bytes:
+            return b""
+
+    supervisor = CountingSupervisor()
+    state = FakeState(supervisor, [])
+    state.client = type("C", (), {"stream": lambda self, *a, **k: SlowFirst()})()
+    state.config.gateway.stream_keepalive_interval_s = 0.01
+    record = make_record()
+
+    chunks = [
+        chunk
+        async for chunk in openai_routes._stream_upstream(
+            state, record, "http://x/v1/chat/completions", {}, 0.0
+        )
+    ]
+    joined = b"".join(chunks)
+    assert b": prefilling" in joined, "no keep-alive during the silent prefill window"
+    assert b'"delta":1' in joined and b"[DONE]" in joined, "the real stream must still pass through"
+    assert supervisor.active == 0, "the request slot must still be released"
+
+
 async def test_request_slot_released_when_client_disconnects_midstream() -> None:
     """The bug: yielding [DONE] before the decrement swallowed the decrement.
 
