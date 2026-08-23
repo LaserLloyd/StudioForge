@@ -13,26 +13,50 @@ runs both) and less battle-tested. Questions and bug reports: [Contact](#contact
 
 ---
 
-## Overview
+## Overview — technical brief
 
-StudioForge turns one machine with NVIDIA GPUs into a private LLM server that looks, to every
-client, exactly like a hosted API. You keep your models on disk as GGUF files; StudioForge loads
-them into VRAM on demand, serves them over the OpenAI API, and gives you — and your agents — the
-controls to manage them.
+**Why it exists.** Running Transformer models on your own GPUs leaves you without the operational
+layer a hosted API takes for granted: an endpoint every client already speaks, capacity planning
+across the cards, recovery when a process wedges, and — above all — *remote* management, so the
+machine running your agent is not the machine running your models. StudioForge is that layer. It
+puts llama.cpp backends (one `llama-server` process per loaded GGUF model) behind the OpenAI API,
+and puts their **management** — load, unload, pin, benchmark, lease GPUs, recover — behind
+[MCP](https://modelcontextprotocol.io), so an agent such as OpenClaw can operate the GPU host from
+another machine with no shell on it.
 
-<p align="center"><img src="docs/images/architecture.svg" alt="How a request flows: client machines (any OpenAI client, OpenClaw with sfctl, a browser) reach the StudioForge gateway on the host machine; the VRAM planner places each model on GPUs and supervises one llama-server process per loaded model; a watchdog recovers the gateway" width="1100"></p>
+**What it is not.** It does no inference of its own, it never offloads to CPU, and it never phones
+home: a model runs entirely in VRAM or is refused with the numbers, and the only outbound requests
+are the ones you ask for.
 
-### The components
+<p align="center"><img src="docs/images/architecture.svg" alt="StudioForge — what runs where: client machines reach the gateway's four surfaces (/v1 OpenAI API, /mcp MCP server, /api REST, :8080 control panel); on the host the gateway indexes the GGUF model library, plans VRAM and supervises one llama-server backend per loaded model; a separate watchdog sidecar with its own MCP server restarts the gateway and kills stuck backends" width="1100"></p>
 
-| Component | Where it runs | What it does |
+### Components
+
+| Component | Runs on | Role |
 | --- | --- | --- |
-| **Host machine** | The box with the NVIDIA GPUs and your GGUF library | Runs everything below. This is the only machine that needs a GPU, Python, or an install. |
-| Gateway (`:1234`) | Host | The OpenAI-compatible API (`/v1/*`), the management API (`/api/*`), and the agent control plane (`/mcp`). Naming an unloaded model in a request loads it just-in-time. |
-| **Backend: `llama-server`** | Host, one process per loaded model | [llama.cpp](https://github.com/ggml-org/llama.cpp)'s server, pinned to a tested build and fetched automatically. StudioForge never does inference itself — it supervises these children, so a crashed model never takes the gateway down and its VRAM is always reclaimable. |
-| VRAM planner + registry | Host | Indexes the library in place, estimates what fits where, walks context down a ladder until it fits, evicts idle models when it must, and keeps pinned models resident and leased cards exclusive. |
-| Control panel (`:8080`) + tray | Host (viewed from anywhere) | The web UI for setup, models, downloads, benchmarks, chat and logs; on Windows, a tray icon that keeps the server alive. |
-| Watchdog (`:1235`) | Host, separate process | Restarts the gateway, kills stuck models, tails logs — reachable even when the main server is wedged. |
-| **Client machine(s)** | Anything on the LAN or tailnet — a laptop, a NAS, the agent's box. Can also be the host itself. | Nothing to install for inference: any OpenAI client just points at the host. For agent management, install the small [`sfctl` companion](#the-companion-sfctl) (no GPU, no CUDA). |
+| **Host machine** | The box with the NVIDIA GPUs and the GGUF library | Runs everything below. The only machine that installs anything. |
+| **Gateway** (`:1234`, one process) | Host | Four surfaces: `/v1` the OpenAI-compatible API; `/mcp` an MCP server with 19 management tools; `/api` the management REST; `:8080` the control panel (plus a system tray on Windows). Inside: the registry, the VRAM planner and the supervisor. |
+| **Backends** — `llama-server` | Host, one process per loaded model, each on its own internal port | [llama.cpp](https://github.com/ggml-org/llama.cpp)'s server, pinned to a tested build and fetched automatically. Spawned on demand, placed by the planner, idled out on a TTL, kept resident when pinned, given a card of their own when leased. A crash takes down one model, never the gateway. |
+| **Model library** | Host, on disk (`models.dir`) | Your GGUF Transformer models, indexed in place — the same folder LM Studio uses; nothing is copied or moved. |
+| **Watchdog sidecar** (`:1235`) | Host, a separate process | Its **own MCP server** with 10 recovery tools — restart the gateway, kill a stuck backend, reclaim VRAM, tail logs — reachable when the gateway is wedged, because it is not the gateway. |
+| **VRAM policy** | Host, inside the planner | The context ladder, eviction of idle models, pins, leases and measured slot counts — every rule with its measurement in [`DECISIONS.md`](DECISIONS.md) D14–D43. |
+| **Client machine(s)** | Anything on the LAN or tailnet — a laptop, a NAS, the agent's box; or the host itself | Nothing to install for inference: any OpenAI client points at `:1234/v1`. For management, the [`sfctl` companion](#the-companion-sfctl) (no GPU, no CUDA) bridges both MCP servers into one toolset. |
+
+### How a request flows
+
+1. A client `POST`s to `/v1/chat/completions` naming a model — or `local-model`, which resolves to
+   `models.default_model`.
+2. The gateway looks the model up in the registry. If a backend is already serving it, the request
+   is proxied straight through, streaming intact.
+3. Otherwise the VRAM planner chooses a placement: which GPUs, what context (walking a ladder down
+   from `models.target_ctx` until it fits), which KV cache type, how many parallel slots. It may
+   evict *idle* models when policy allows; it never touches a pinned model, a leased card, or a
+   model mid-request.
+4. The supervisor spawns a `llama-server` on an internal port, waits for it to pass health, and the
+   request proceeds. The backend idles out after its TTL unless pinned.
+5. Everything else — loading ahead of time, pinning, leasing a card, benchmarking, downloading —
+   happens over `/mcp` or `/api`; if the gateway itself stops answering, the sidecar's tools on
+   `:1235` restart it.
 
 ### Why it is worth running
 
