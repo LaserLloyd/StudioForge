@@ -8,10 +8,8 @@ planner, a web control panel, a system tray, and an MCP control plane for agents
 LM Studio as the backend for [OpenClaw](docs/OPENCLAW.md) — it listens on LM Studio's port, so
 switching is a host change, not a rewrite.
 
-- **GPU-only.** A model runs fully in VRAM or it does not run; a load that will not fit is refused
-  with the numbers and a suggestion, never silently slowed down.
-- **Nothing leaves the box.** No telemetry. The only outbound requests are the ones you ask for
-  (HuggingFace downloads, llama.cpp release checks, image URLs a vision request names).
+**Status:** v0.2.0. Windows is the reference platform and runs it daily; Linux is supported (CI
+runs both) and less battle-tested. Questions and bug reports: [Contact](#contact).
 
 ---
 
@@ -86,6 +84,7 @@ flowchart LR
 | Keep your data outside the checkout | [Data directory](#data-directory) |
 | Double-click instead of typing | [Windows launchers](#windows-launchers) |
 | Read more | [Documentation](#documentation) |
+| Ask a question or report a bug | [Contact](#contact) |
 
 ---
 
@@ -95,8 +94,8 @@ flowchart LR
 
 1. Install [Git](https://git-scm.com/download/win), [Python 3.12+](https://www.python.org/downloads/)
    and [uv](https://docs.astral.sh/uv/getting-started/installation/). Have a current
-   [NVIDIA driver](https://www.nvidia.com/drivers/) (no CUDA toolkit needed — the prebuilt engine
-   ships its runtime).
+   [NVIDIA driver](https://www.nvidia.com/drivers/) — the CUDA 13 engine builds need a 580-series
+   driver or newer (no CUDA toolkit needed: the prebuilt engine ships its runtime).
 2. Clone:
 
    ```bash
@@ -105,9 +104,10 @@ flowchart LR
 
 3. Double-click **`launchers\Update StudioForge.bat`** — creates the virtualenv, installs the
    dependencies, downloads and smoke-tests the pinned `llama-server` build for your driver.
-4. Double-click **`launchers\Start StudioForge.bat`** (or **`launchers\StudioForge Tray.bat`** for
-   a notification-area icon that keeps the server alive). The control panel opens at
+4. Double-click **`launchers\Start StudioForge.bat`**. The control panel opens at
    <http://127.0.0.1:8080> on its **Setup** tab — a checklist with a button for each unmet item.
+   (Prefer a notification-area icon that keeps the server alive and restarts it if it crashes?
+   Use **`launchers\StudioForge Tray.bat`** instead, and open the panel from the icon's menu.)
 
 ### Linux
 
@@ -142,6 +142,9 @@ walkthrough, with the headless YAML/CLI equivalent, is [`docs/SETUP.md`](docs/SE
 ---
 
 ## Three ways to set it up
+
+Install once (above), then pick whichever of these matches how you will use it — or let an agent
+do the install for you.
 
 ### A. Let an AI coding agent do it
 
@@ -188,7 +191,7 @@ Inference is path B. Management — load, unload, pin, benchmark, download, reco
 MCP server on the agent's machine, provided by the companion package:
 
 ```bash
-uv build --wheel -o dist                                              # in packages/studioforge-companion, on the rig
+uv build --wheel -o dist                                              # in packages/studioforge-companion, on the host
 uv tool install ./studioforge_companion-<version>-py3-none-any.whl    # on the agent's machine
 sfctl servers add rig http://<studioforge-host>:1234 --api-key <PIN or server.api_key> --use
 ```
@@ -223,7 +226,7 @@ one right-click away:
 ## The companion: `sfctl`
 
 [`packages/studioforge-companion`](packages/studioforge-companion/) installs anywhere — no CUDA, no
-server dependencies — and is the remote control for the rig: `sfctl status`, `models load/unload/pin`,
+server dependencies — and is the remote control for the host: `sfctl status`, `models load/unload/pin`,
 `download`, `logs`, `config`, `update`, and `sfctl recover` for when the server is wedged.
 `sfctl mcp` is the stdio MCP bridge from path C.
 
@@ -297,6 +300,15 @@ The same from a terminal, on any platform: `studioforge serve --open`, `studiofo
 - [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) · [`CONTRIBUTING.md`](CONTRIBUTING.md) — working on the code, running the tests
 - [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) · [`docs/COMPARISON.md`](docs/COMPARISON.md) — known limits; what was borrowed from Ollama, oobabooga, KoboldCpp, vLLM
 - [`DECISIONS.md`](DECISIONS.md) — architectural decisions, each with the measurement behind it
+
+## Contact
+
+StudioForge is built and maintained by **Lloyd** — [LaserLloyd.com](https://laserlloyd.com),
+*"Laser and other technology projects. Free for your use."*
+
+- Bugs, questions and ideas: [open an issue](https://github.com/LaserLloyd/StudioForge/issues)
+- Email: [Lloyd@LaserLloyd.com](mailto:Lloyd@LaserLloyd.com)
+- More projects: [github.com/LaserLloyd](https://github.com/LaserLloyd)
 
 ## License
 
