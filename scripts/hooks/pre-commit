@@ -1,0 +1,8 @@
+#!/bin/sh
+# Blocks a commit that would publish private data. See scripts/scrub_check.py
+#
+# --staged reads the INDEX, not the working tree. Those are different files and
+# the difference is exploitable: stage a secret, tidy the working copy, commit.
+set -e
+cd "$(git rev-parse --show-toplevel)"
+exec python3 scripts/scrub_check.py --staged

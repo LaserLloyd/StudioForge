@@ -95,6 +95,28 @@ restating the reasoning in three places.
   addresses, no PINs or tokens — in code, tests, docs or fixtures. Machine-specific settings go in
   `local-env.bat` (gitignored) or `SF_DATA_DIR`.
 
+  This one is enforced, not trusted. `scripts/scrub_check.py` scans the tree, the index, a commit
+  and commit messages; `sh scripts/install-hooks.sh` wires it into pre-commit, commit-msg and
+  pre-push, and CI runs it on every push and pull request. Run it once after cloning — nothing
+  installs a hook for you.
+
+  It reads the **index**, not the working tree, because those differ: stage a secret, tidy the
+  working copy, commit, and a working-tree scan sees nothing. The pre-push scan reads the
+  **commits being pushed** for the same reason — a clean checkout says nothing about what is
+  already committed behind it.
+
+  Some things it flags are legitimate: this is a LAN server, so private addresses appear
+  throughout the docs and the SSRF tests, and a redaction test needs a credential-shaped string.
+  Those are exempt under `tests/`. A genuine false positive elsewhere gets an inline
+  `scrub-ok: <why>` comment — the marker must be the first thing in the comment, so prose can
+  never trigger it by accident. Vendor-prefixed keys (`sk-ant-`, `ghp_`, `AKIA…`), private-key
+  blocks and JWTs are never exempt anywhere, including tests.
+
+  Personal identifiers — a name, a machine, a tailnet — live in `scripts/scrub-rules.local.txt`,
+  which is git-ignored: publishing the list of words that must never be published is its own leak.
+  CI therefore runs with the generic patterns only, and says so in its output. Your clone is where
+  the identifier rules actually fire.
+
 ## Where things are
 
 `src/studioforge/` is the app (`api/`, `core/`, `gui/`, `mcp/`, `tray/`, `watchdog/`);

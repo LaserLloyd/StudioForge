@@ -10,6 +10,32 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  privacy:
+    # Keeps CONTRIBUTING's "no personal data in the repository" rule from being
+    # an honour system. Runs FIRST and on its own runner: it is seconds long,
+    # needs no toolchain, and a leak should fail the build before anything else
+    # spends time.
+    #
+    # Read the note this prints. scripts/scrub-rules.local.txt is git-ignored on
+    # purpose -- publishing the list of words that must never be published is
+    # its own leak -- so in CI the personal-identifier rules are NOT loaded and
+    # this job verifies the generic patterns only (keys, tokens, private keys,
+    # home paths, Windows user profiles, emails). The maintainer's clone is
+    # where the name and hostname rules actually run, via the git hooks.
+    name: no private data
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan the tree
+        run: python3 scripts/scrub_check.py
+      - name: Scan the commits being pushed
+        if: github.event_name == 'pull_request'
+        run: |
+          python3 scripts/scrub_check.py --commit-range \
+            "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+      - name: Prove the scanner still works
+        run: python3 scripts/scrub_check.py --selftest
+
   unit:
     # Windows first: it is the reference platform (the tray, the Job Object
     # VRAM guard, the PDH counters). The unit suite never touches a GPU -- the

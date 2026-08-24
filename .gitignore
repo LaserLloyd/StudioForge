@@ -55,3 +55,6 @@ desktop.ini
 
 # --- agent scratch -------------------------------------------------------
 .claude/worktrees/
+
+# Per-fork private identifiers for scripts/scrub_check.py — never published.
+scripts/scrub-rules.local.txt

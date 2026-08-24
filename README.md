@@ -190,7 +190,7 @@ curl http://<studioforge-host>:1234/v1/chat/completions \
 
 ```python
 from openai import OpenAI  # https://github.com/openai/openai-python
-client = OpenAI(base_url="http://<studioforge-host>:1234/v1", api_key="not-required")
+client = OpenAI(base_url="http://<studioforge-host>:1234/v1", api_key="not-required")  # scrub-ok: the literal string clients send when auth is off
 print(client.models.list())   # every downloaded model; naming an unloaded one loads it on demand
 ```
 
@@ -320,7 +320,7 @@ StudioForge is built and maintained by **Lloyd** — [LaserLloyd.com](https://la
 *"Laser and other technology projects. Free for your use."*
 
 - Bugs, questions and ideas: [open an issue](https://github.com/LaserLloyd/StudioForge/issues)
-- Email: [Lloyd@LaserLloyd.com](mailto:Lloyd@LaserLloyd.com)
+- Email: [Lloyd@LaserLloyd.com](mailto:Lloyd@LaserLloyd.com) <!-- scrub-ok: the maintainer's published contact address, deliberate -->
 - More projects: [github.com/LaserLloyd](https://github.com/LaserLloyd)
 
 ## License
