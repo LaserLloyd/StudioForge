@@ -19,6 +19,7 @@ import os
 import sys
 import time
 from collections.abc import Awaitable, Callable, Iterable, Sequence
+from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -65,7 +66,21 @@ Exit codes (scriptable):
 {_EXIT_HELP}
 """
 
-JSON_OPTION = typer.Option(False, "--json", help="Machine-readable JSON output.")
+def _json_flag(value: bool) -> bool:
+    """Record `--json` at PARSE time, not when the command body reads it.
+
+    A per-command `--json` used to reach STATE only via want_json(), which runs
+    inside the command body -- after the network call. So `sfctl status --json`
+    against an unreachable server failed before the flag was ever recorded, and
+    the error came out as Rich prose. A parse-time callback fires first.
+    """
+    if value:
+        STATE.json_out = True
+    return value
+
+
+JSON_OPTION = typer.Option(False, "--json", callback=_json_flag,
+                           help="Machine-readable JSON output.")
 
 app = typer.Typer(
     name="sfctl",
@@ -86,6 +101,10 @@ app.add_typer(servers_app, name="servers")
 # Global state
 # ---------------------------------------------------------------------------
 
+
+# Registry kinds the server filters on. Module scope because a default
+# argument is evaluated at import, not at call time.
+_MODEL_KINDS = ("chat", "embedding", "rerank", "vision", "draft")
 
 @dataclass
 class CliState:
@@ -144,7 +163,26 @@ def _report(exc: CompanionError | CompanionConfigError) -> None:
     Suggestions from a VRAM rejection live in the error's ``studioforge``
     diagnostics block; losing them here would turn actionable advice ("try
     --ctx 8192") into a dead end.
+
+    Under ``--json`` the same failure is emitted as one JSON object instead.
+    The flag is documented as "machine-readable output"; printing Rich prose
+    on the error path -- hard-wrapped at terminal width, so not even reliably
+    greppable -- broke that contract exactly when a script needed structure.
     """
+    if STATE.json_out:
+        payload: dict[str, Any] = {
+            "ok": False,
+            "error": str(exc),
+            "exit_code": getattr(exc, "exit_code", 1),
+        }
+        for attr in ("code", "status", "details", "suggestions"):
+            value = getattr(exc, attr, None)
+            if value:
+                payload[attr] = list(value) if attr == "suggestions" else value
+        # stdout, like every other --json payload: a caller redirecting stdout
+        # into a parser must not have to merge two streams to see a failure.
+        print(json.dumps(payload, indent=2, default=str))
+        return
     STATE.err.print(f"[red]error:[/red] {exc}" if not STATE.no_color else f"error: {exc}")
     suggestions: Sequence[str] = getattr(exc, "suggestions", ()) or ()
     for suggestion in suggestions:
@@ -193,6 +231,16 @@ def emit(data: Any) -> None:
 
 
 def want_json(local: bool) -> bool:
+    """Did the caller ask for JSON, globally or on this command?
+
+    Records the answer on STATE so the ERROR path can honour it too. `--json`
+    is accepted both before the subcommand (global) and after it (per-command),
+    but only the global form reached STATE -- so `sfctl status --json` failing
+    printed Rich prose, which is the one moment a caller piping to a parser
+    cannot cope with.
+    """
+    if local:
+        STATE.json_out = True
     return local or STATE.json_out
 
 
@@ -378,10 +426,17 @@ def _badges(record: dict[str, Any]) -> str:
 def models_list(
     loaded: bool = typer.Option(False, "--loaded", help="Only currently loaded models."),
     vision: bool = typer.Option(False, "--vision", help="Only vision-capable models."),
-    kind: str | None = typer.Option(None, "--kind", help="Filter by kind: chat, embedding, ..."),
+    kind: str | None = typer.Option(
+        None, "--kind", help=f"Filter by kind: {', '.join(_MODEL_KINDS)}."),
     json_out: bool = JSON_OPTION,
 ) -> None:
     """List registry models with capability badges."""
+    if kind is not None and kind.lower() not in _MODEL_KINDS:
+        # An unknown kind silently returned zero rows and exit 0, so a typo was
+        # indistinguishable from "the registry has none of those".
+        raise typer.BadParameter(
+            f"unknown kind {kind!r}; expected one of {', '.join(_MODEL_KINDS)}",
+            param_hint="--kind")
 
     async def work(client: StudioForgeClient) -> Any:
         return await client.models()
@@ -572,6 +627,22 @@ def models_load(
         except CompanionError as exc:
             if isinstance(exc, ApiError) and exc.status_code == 404:
                 raise
+            # A 500 from /plan used to leave plan=None, which skipped the
+            # "will not fit, pass --force" guard entirely -- turning this into
+            # an implicit --force without saying so. Say so, and make the
+            # operator opt in.
+            if not force:
+                raise ApiError(
+                    f"could not check whether {model} fits ({exc}); "
+                    f"pass --force to load without the check",
+                    code="plan_unavailable",
+                    status_code=getattr(exc, "status_code", None),
+                ) from None
+            STATE.err.print(
+                f"[yellow]warning:[/yellow] fit check unavailable ({exc}); "
+                f"loading anyway because --force was given"
+                if not STATE.no_color else
+                f"warning: fit check unavailable ({exc}); loading anyway (--force)")
             plan = None
         if plan is not None and not use_json:
             _print_plan(plan)
@@ -976,6 +1047,32 @@ def _new_lines(previous: Sequence[str], current: Sequence[str]) -> list[str]:
     return list(current)
 
 
+def _format_log_line(line: Any) -> str:
+    """Render one log entry for a human.
+
+    The server sends structured entries for its own logs and plain strings for
+    a model's llama-server passthrough. ``str()`` on the former printed a
+    Python dict repr -- single quotes, a raw float timestamp, and a `message`
+    field that already carries its own ISO timestamp and level, so every line
+    double-printed its metadata. The pre-formatted message IS the line; the
+    composed fallback only runs for an entry that lacks one.
+    """
+    if isinstance(line, str):
+        return line
+    if isinstance(line, dict):
+        message = line.get("message")
+        if message:
+            return str(message)
+        ts = line.get("ts")
+        stamp = ""
+        if isinstance(ts, (int, float)):
+            stamp = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S") + " "
+        level = str(line.get("level") or "").upper()
+        logger = str(line.get("logger") or "")
+        return f"{stamp}{level:<8}{logger} {line.get('msg') or ''}".rstrip()
+    return str(line)
+
+
 @app.command()
 def logs(
     model: str | None = typer.Argument(None, help="Model id for per-model llama-server logs."),
@@ -991,7 +1088,15 @@ def logs(
             payload = await client.model_logs(model, n)
         else:
             payload = await client.logs(n, level)
-        return [str(line) for line in payload.get("lines") or []]
+        lines = payload.get("lines") or []
+        if model and not lines and not payload.get("path"):
+            # The server answers 200 with an empty list for a model id it does
+            # not know, so rendering it verbatim printed nothing and exited 0 --
+            # a typo'd id looked like a quiet success. `models info` on the same
+            # id exits 1; match that.
+            raise CompanionError(
+                f"no logs for {model!r} -- the server does not know that model id")
+        return [_format_log_line(line) for line in lines]
 
     async def work(client: StudioForgeClient) -> Any:
         lines = await fetch(client)
@@ -1111,9 +1216,15 @@ def _flatten(value: Any, prefix: str = "") -> list[tuple[str, Any]]:
 @config_app.command("set")
 def config_set(
     pairs: list[str] = typer.Argument(..., help="key=value pairs, e.g. models.default_ctx=8192"),
+    yes: bool = typer.Option(False, "--yes", help="Skip the confirmation."),
     json_out: bool = JSON_OPTION,
 ) -> None:
     """Change server configuration keys."""
+    # This writes config.yaml on the rig and can disable auth or repoint the
+    # model directory. Every other server-mutating command here is gated; this
+    # one was not, so an agent or a typo could reconfigure the server with no
+    # prompt and no tty check.
+    _confirm(f"change server config on the rig ({len(pairs)} key(s))?", yes=yes)
 
     async def work(client: StudioForgeClient) -> Any:
         current = await client.get_config()
@@ -1430,7 +1541,7 @@ def openclaw_setup(
     ),
     json_out: bool = JSON_OPTION,
 ) -> None:
-    """Print the two snippets that point OpenClaw at this server.
+    """Print the snippets that point OpenClaw at this server.
 
     The key is redacted unless ``--reveal-key`` is passed: the default has to be
     safe to paste into a chat or an issue.

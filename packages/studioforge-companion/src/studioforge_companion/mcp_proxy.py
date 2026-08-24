@@ -352,7 +352,10 @@ class McpProxy:
                 renamed = _annotate(
                     renamed, "(watchdog tool: works even when the main server is down.)"
                 )
-            table[exposed] = UpstreamTool(exposed, tool.name, self.watchdog, renamed)
+            # setdefault, not assignment: management is built first and wins.
+            # A watchdog tool whose exposed name already exists would
+            # otherwise shadow it, which is what the prefixing exists to stop.
+            table.setdefault(exposed, UpstreamTool(exposed, tool.name, self.watchdog, renamed))
         return table
 
     # -- MCP handlers ------------------------------------------------------

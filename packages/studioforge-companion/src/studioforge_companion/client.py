@@ -32,6 +32,7 @@ rather than flattened into the message.
 from __future__ import annotations
 
 import json
+from urllib.parse import quote
 from collections.abc import AsyncIterator, Mapping
 from types import TracebackType
 from typing import Any
@@ -56,6 +57,18 @@ EXIT_CODE_TABLE: tuple[tuple[int, str], ...] = (
     (EXIT_UNREACHABLE, "server unreachable (refused / timed out / DNS)"),
     (EXIT_AUTH, "auth failed (missing or wrong API key)"),
 )
+
+
+
+def _path_segment(model: str) -> str:
+    """URL-encode a model id for a path.
+
+    StudioForge ids are ``publisher/repo/file-stem``, so the slashes are real
+    path structure and must survive -- but a ``?`` or ``#`` in an id silently
+    truncated the request into a different endpoint, and ``..`` resolved
+    somewhere else entirely once httpx normalised dot-segments.
+    """
+    return quote(model, safe="/")
 
 
 class CompanionError(Exception):
@@ -219,11 +232,29 @@ class StudioForgeClient:
         raw_suggestions = details.get("suggestions") if details else None
         suggestions = [str(s) for s in raw_suggestions] if isinstance(raw_suggestions, list) else []
 
+        # A 503 carries a wait, in the header and again in the diagnostics
+        # block. Both were dropped, so "busy, try again in 10 minutes" reached
+        # the caller as an unexplained failure -- the shape most likely to be
+        # hit while a GPU lease is held.
+        retry_after = details.get("retry_after_s") if details else None
+        if retry_after is None:
+            header = response.headers.get("Retry-After")
+            if header:
+                try:
+                    retry_after = float(header)
+                except ValueError:          # HTTP-date form; a wait we cannot use
+                    retry_after = None
+        if retry_after is not None:
+            details = {**details, "retry_after_s": retry_after}
+            wait = int(float(retry_after))
+            message = f"{message} (the server asked for {wait}s before retrying)"
+            suggestions = [*suggestions, f"wait {wait}s and run the same command again"]
+
         if response.status_code in (401, 403):
             return AuthFailed(
                 f"{message}\n  (server: {response.request.url.host}; "
-                f"set the key with 'sfctl config' on the server or "
-                f"'sfctl servers add <name> <url> --api-key <key>' locally)"
+                f"set the key locally with 'sfctl servers add <name> <url> --api-key <key>' "
+                f"or 'sfctl config-local set', or set SF_API_KEY in the environment)"
             )
         return ApiError(
             message,
@@ -268,7 +299,15 @@ class StudioForgeClient:
         try:
             return response.json()
         except (json.JSONDecodeError, ValueError):
-            return response.text
+            # Returning the raw text let callers do .get() on a str, which
+            # escaped as an AttributeError traceback -- and "a traceback here
+            # is a bug" is this module's own contract. A 200 of HTML is a
+            # captive portal or a proxy, not this server.
+            snippet = (response.text or "").strip()[:200]
+            raise CompanionError(
+                f"expected JSON from {response.request.url} but got "
+                f"{response.headers.get('content-type') or 'an unparseable body'}"
+                + (f": {snippet}" if snippet else "")) from None
 
     async def get(self, path: str, **params: Any) -> Any:
         return await self.request("GET", path, params=params)
@@ -347,7 +386,7 @@ class StudioForgeClient:
         force: bool = False,
     ) -> Any:
         return await self.post(
-            f"models/{model}/load",
+            f"models/{_path_segment(model)}/load",
             {
                 "ctx_size": ctx_size,
                 "kv_cache_type": kv_cache_type,
@@ -357,22 +396,22 @@ class StudioForgeClient:
         )
 
     async def unload(self, model: str) -> Any:
-        return await self.post(f"models/{model}/unload")
+        return await self.post(f"models/{_path_segment(model)}/unload")
 
     async def test(self, model: str, prompt: str | None = None) -> Any:
-        return await self.post(f"models/{model}/test", {"prompt": prompt})
+        return await self.post(f"models/{_path_segment(model)}/test", {"prompt": prompt})
 
     async def pin(self, model: str, pinned: bool) -> Any:
-        return await self.post(f"models/{model}/pin", {"pinned": pinned})
+        return await self.post(f"models/{_path_segment(model)}/pin", {"pinned": pinned})
 
     async def delete_model(self, model: str, *, delete_files: bool, confirm: bool) -> Any:
-        return await self.delete(f"models/{model}", delete_files=delete_files, confirm=confirm)
+        return await self.delete(f"models/{_path_segment(model)}", delete_files=delete_files, confirm=confirm)
 
     async def settings(self, model: str) -> Any:
-        return await self.get(f"models/{model}/settings")
+        return await self.get(f"models/{_path_segment(model)}/settings")
 
     async def put_settings(self, model: str, settings: dict[str, Any]) -> Any:
-        return await self.put(f"models/{model}/settings", settings)
+        return await self.put(f"models/{_path_segment(model)}/settings", settings)
 
     async def plan(
         self,
@@ -383,14 +422,14 @@ class StudioForgeClient:
         parallel: int | None = None,
     ) -> Any:
         return await self.get(
-            f"models/{model}/plan",
+            f"models/{_path_segment(model)}/plan",
             ctx_size=ctx_size,
             kv_cache_type=kv_cache_type,
             parallel=parallel,
         )
 
     async def introspect(self, model: str) -> Any:
-        return await self.get(f"models/{model}/introspect")
+        return await self.get(f"models/{_path_segment(model)}/introspect")
 
     async def logs(self, n: int = 200, level: str | None = None) -> Any:
         return await self.get("logs", n=n, level=level)

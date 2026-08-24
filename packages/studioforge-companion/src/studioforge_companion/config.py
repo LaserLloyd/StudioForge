@@ -24,6 +24,7 @@ Layout::
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
 import tomllib
 from pathlib import Path
@@ -244,6 +245,24 @@ def config_path() -> Path:
     return config_dir() / CONFIG_FILENAME
 
 
+
+def _warn_if_world_readable(target: Path) -> None:
+    """Complain (once, on stderr) if the config is readable by anyone else.
+
+    We write it 0600, but a file restored from a backup, copied with ``cp -r``
+    or hand-edited comes back with the umask default -- and it holds an API
+    key. ssh and gpg refuse outright; refusing here would lock someone out of
+    their own rig over a permission bit, so this warns and continues.
+    """
+    try:
+        mode = target.stat().st_mode & 0o777
+    except OSError:
+        return
+    if mode & 0o077:
+        print(f"warning: {target} is mode {mode:04o}; it holds an API key. "
+              f"Fix with: chmod 600 {target}", file=sys.stderr)
+
+
 def load_companion_config(path: Path | None = None) -> CompanionConfig:
     """Read the config, returning an empty one when the file does not exist.
 
@@ -253,6 +272,7 @@ def load_companion_config(path: Path | None = None) -> CompanionConfig:
     target = path or config_path()
     if not target.is_file():
         return CompanionConfig()
+    _warn_if_world_readable(target)
     try:
         raw = tomllib.loads(target.read_text(encoding="utf-8"))
     except tomllib.TOMLDecodeError as exc:
@@ -320,7 +340,7 @@ def save_companion_config(cfg: CompanionConfig, path: Path | None = None) -> Pat
     a shared box does not.
     """
     target = path or config_path()
-    target.parent.mkdir(parents=True, exist_ok=True)
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     payload = tomli_w.dumps(_to_table(cfg))
 
     fd, tmp_name = tempfile.mkstemp(
