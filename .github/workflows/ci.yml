@@ -25,7 +25,12 @@ jobs:
     name: no private data
     runs-on: ubuntu-latest
     steps:
+      # fetch-depth: 0 because the commit-range step below needs the PR's base
+      # commit, and the default shallow clone does not contain it -- the scan
+      # then fails with "unknown revision" on every pull request.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Scan the tree
         run: python3 scripts/scrub_check.py
       - name: Scan the commits being pushed
