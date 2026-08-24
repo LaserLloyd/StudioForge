@@ -41,6 +41,7 @@ from studioforge.core.gguf import (
     GgufError,
     TensorInfo,
     is_gguf,
+    looks_like_auxiliary_gguf,
     looks_like_mmproj,
     missing_shard_names,
     quant_label_from,
@@ -865,6 +866,57 @@ def test_quant_label_from_tensors_when_file_type_unknown() -> None:
     assert quant_label_from({}, tensors, None) == "Q4_K"
 
 
+# ===========================================================================
+# Auxiliary GGUFs: files in a repo that are not models
+# ===========================================================================
+
+
+@pytest.mark.parametrize(
+    ("name", "size", "want"),
+    [
+        # unsloth ships the draft modules in their own directory.
+        ("MTP/mtp-Qwen3.8-27B-Q4_0.gguf", 2_297_478_020, True),
+        ("MTP/mtp-Qwen3.8-27B-Q8_0.gguf", None, True),
+        # ...and the same module flat, leading with the mtp token.
+        ("mtp-Qwen3.8-27B-Q4_0.gguf", 2_297_478_020, True),
+        ("mtp_Qwen3.8-27B-Q4_0.gguf", None, True),
+        # A calibration matrix is never loadable, wherever it sits.
+        ("imatrix_unsloth.gguf", 944_892_805, True),
+        ("Qwen3.8-27B-imatrix.gguf", None, True),
+        # THE FALSE-POSITIVE GUARD: a full model with an MTP head is published
+        # with -MTP- in the middle of its name, at model size. Dropping it
+        # would hide a real 20 GiB model from the picker.
+        ("Qwen3.8-27B-NVFP4-MTP-Q6_K.gguf", 21_000_000_000, False),
+        ("Qwen3.8-27B-NVFP4-MTP-Q6_K.gguf", None, False),
+        ("Gemma4-31B-QAT-Uncensored-Balanced-MTP-Q4_K_M.gguf", 18_000_000_000, False),
+        # A middle mtp token IS auxiliary once a size says it cannot be a model.
+        ("Qwen3.8-27B-mtp-draft.gguf", 300_000_000, True),
+        # ...but with no size at all, keep it: a stray row is cosmetic, a
+        # missing model is not.
+        ("Qwen3.8-27B-mtp-draft.gguf", None, False),
+        # "mtp" inside a longer word is not a token and must never match.
+        ("Qwen3.8-27B-mtpx-Q4_K_M.gguf", 100_000, False),
+        ("Promtpheus-7B-Q4_K_M.gguf", 100_000, False),
+        # Ordinary quants and projectors are untouched.
+        ("gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf", 14_250_000_000, False),
+        ("mmproj-F32.gguf", 1_000_000, False),
+    ],
+)
+def test_looks_like_auxiliary_gguf(name: str, size: int | None, want: bool) -> None:
+    assert looks_like_auxiliary_gguf(name, size_bytes=size) is want
+
+
+def test_auxiliary_matching_is_case_and_separator_insensitive() -> None:
+    assert looks_like_auxiliary_gguf("mtp/MTP-Model-Q4_0.gguf")
+    assert looks_like_auxiliary_gguf("IMATRIX_unsloth.GGUF")
+    assert looks_like_auxiliary_gguf(Path("MTP") / "mtp-x-Q4_0.gguf")
+
+
+def test_a_windows_style_mtp_path_is_still_auxiliary() -> None:
+    """HF hands back POSIX paths, but a Path on Windows renders backslashes."""
+    assert looks_like_auxiliary_gguf(r"MTP\mtp-Qwen3.8-27B-Q4_0.gguf")
+
+
 def test_quant_label_reads_file_type_from_kv() -> None:
     assert quant_label_from({"general.file_type": 18}, [], None) == "Q6_K"
 
@@ -876,6 +928,12 @@ def test_quant_label_reads_file_type_from_kv() -> None:
         ("thing.i1-IQ3_XXS.gguf", "IQ3_XXS"),
         ("gemma-4-31B-heretic-NVFP4.gguf", "NVFP4"),
         ("gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf", "Q4_K_XL"),
+        # unsloth's dynamic mixes: the UD- prefix is deliberately not part of
+        # the label (the download picker matches on the bare quant), but the
+        # label itself must resolve instead of falling through to "unknown".
+        ("Qwen3.8-27B-UD-Q2_K_XL.gguf", "Q2_K_XL"),
+        ("Qwen3.8-27B-UD-Q6_K_M.gguf", "Q6_K_M"),
+        ("Qwen3.8-27B-UD-Q8_K_L.gguf", "Q8_K_L"),
         ("24_10_Mistrial_Celeste-12B-V1.6.Q8_0NSFW.gguf", "Q8_0"),
         ("mmproj-model-BF16.gguf", "BF16"),
         ("Behemoth-123B-IQ3_M-00001-of-00002.gguf", "IQ3_M"),

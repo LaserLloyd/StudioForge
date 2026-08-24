@@ -2,8 +2,8 @@
 
 Layout (all inside ``data_dir``, which by design survives every update)::
 
-    <data_dir>/releases/v0.2.0/       unpacked release
-    <data_dir>/releases/v0.1.0/       previous release, kept for rollback
+    <data_dir>/releases/1.26-08-23/   unpacked release
+    <data_dir>/releases/0.2.0/        previous release, kept for rollback
     <data_dir>/current.txt            the ACTIVE release directory name
     <data_dir>/current                POSIX-only convenience symlink
 
@@ -119,9 +119,25 @@ def _version_key(version: str) -> tuple[int, ...]:
     Comparison is numeric per component so ``v0.10.0`` correctly beats
     ``v0.9.0`` -- a plain string compare gets that backwards, which would make
     the updater refuse real updates.
+
+    A hyphen means two different things here, so it is read two different ways.
+    This project's releases are calendar-versioned and spell the date with
+    hyphens (``1.26-08-23``, tagged ``v1.26-08-23``), while the package metadata
+    has to say the same thing in PEP 440 (``1.26.8.23``); an all-digit chunk
+    after a hyphen is therefore just another numeric component, and the two
+    spellings must produce the same key or the updater would think a release is
+    newer or older than the build already running. A non-numeric chunk
+    (``2.1.3-rc1``) is a pre-release suffix and is dropped along with everything
+    after it -- keeping it would sort the release candidate *above* the release.
     """
-    cleaned = version.strip().lstrip("vV")
-    cleaned = cleaned.split("+", 1)[0].split("-", 1)[0]
+    cleaned = version.strip().lstrip("vV").split("+", 1)[0]
+    head, *suffixes = cleaned.split("-")
+    date_parts: list[str] = []
+    for chunk in suffixes:
+        if not chunk.isdigit():
+            break
+        date_parts.append(chunk)
+    cleaned = ".".join([head, *date_parts])
     parts: list[int] = []
     for chunk in cleaned.split("."):
         digits = "".join(ch for ch in chunk if ch.isdigit())

@@ -74,7 +74,7 @@ Do this first. Every later step assumes it, and it is the single most common thi
 curl -s -m 8 http://<rig-ip>:1234/health
 ```
 
-Expected: `{"status":"ok","version":"0.2.0",...}`.
+Expected: `{"status":"ok","version":"1.26-08-23",...}`.
 
 If it hangs or refuses:
 
@@ -204,7 +204,30 @@ You should see every GPU the rig has — the reference rig reports 2× RTX 5090 
 
 ## Step 5 — Register the MCP server with OpenClaw
 
-Add this to OpenClaw's MCP configuration:
+Register the bridge with OpenClaw:
+
+```bash
+openclaw mcp add studioforge --command sfctl --arg mcp
+```
+
+or, editing OpenClaw's config file directly — its key is `mcp.servers`, a nested map, **not** the
+top-level `mcpServers` one:
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "studioforge": {
+        "command": "sfctl",
+        "args": ["mcp"]
+      }
+    }
+  }
+}
+```
+
+Clients that take the generic top-level map instead — Claude Code, Cline, LibreChat and most
+others — want this shape:
 
 ```json
 {
@@ -263,7 +286,7 @@ sfctl recover
 With no flags this prints the watchdog's own health diagnosis. It goes to the **watchdog** on 1235, deliberately bypassing the main server, so a success here
 proves the recovery path OpenClaw depends on is live.
 
-Finally, restart OpenClaw and confirm it lists the 24 `studioforge` tools.
+Finally, restart OpenClaw and confirm it lists the 29 `studioforge` tools.
 
 ---
 
@@ -307,8 +330,10 @@ sfctl servers add rig http://<rig-ip>:1234 --api-key <the same string> --use
 export OPENAI_API_KEY=<the same string>
 ```
 
-The API key is valid everywhere — `/v1`, `/api`, `/mcp` and the watchdog — so it replaces the PIN
-rather than sitting alongside it. Two behaviours worth knowing:
+The API key is valid everywhere — `/v1`, `/api`, `/mcp` and the watchdog — so one credential
+covers every surface. It does **not** retire the PIN: with a key set, the two MCP endpoints (the
+app's `/mcp` and the watchdog) accept *either* credential, so an agent already paired with the PIN
+keeps working (`api/auth.py`, `watchdog/server.py`). Two more behaviours worth knowing:
 
 - `GET /health` stays open with no credential, so watchdogs and probes keep working.
 - `GET /health?deep=true` does **not** — it runs a real completion against every loaded model, so

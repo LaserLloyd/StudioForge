@@ -172,7 +172,7 @@ does. `keep_versions` is how many old engine directories survive a prune.
 | `server.port` | `1234` is LM Studio's default, which is the whole point — pointing an OpenAI client here is a host change, not a rewrite. They cannot share the port, though: quit LM Studio or move one of them |
 | `gui.port` / `watchdog.port` | This panel, and the recovery sidecar (a separate process) |
 | `server.api_key` | Guards inference **and** this panel. Blank is the LAN/tailnet-trust default: reads, inference and load/unload are open, but changing the box (config, files, engines, restarts, downloads) needs a browser on the machine itself, the same rule the API applies (D32) |
-| `mcp.pin` | A short pairing code for the MCP path only — deliberately *not* the inference credential. **Generate new PIN** rotates it, which is the documented response to a leak; every already-paired agent then needs the new one |
+| `mcp.pin` | A short pairing code for the MCP path only — deliberately *not* the inference credential. Setting `server.api_key` does not retire it: the app's `/mcp` and the watchdog accept **either** credential, so a paired agent keeps working. **Generate new PIN** rotates it, which is the documented response to a leak; every already-paired agent then needs the new one |
 
 All three secrets render masked, with a reveal button. Leaving a masked field untouched keeps the
 current value: the panel never posts the placeholder back over a working credential.

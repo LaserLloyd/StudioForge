@@ -214,10 +214,14 @@ passing an unenforced hint through. Callers see the OpenAI-standard field on the
 `--fit-ctx` / `--n-gpu-layers` are all manager-owned flags that the expert "extra flags" box
 refuses.
 
-**Why:** `b10425` introduced `-fit, --fit [on|off]` — *"whether to adjust unset arguments to fit in
-device memory"* — **defaulting to on**, alongside `--n-gpu-layers` defaulting to `auto`. Because
-StudioForge always pins `--n-gpu-layers 999` and an explicit `--ctx-size`, there is nothing left
-for `--fit` to adjust today. But the combination `-ngl auto` + `--fit on` is precisely a silent
+**Why:** the pinned build ships `-fit, --fit [on|off]` — *"whether to adjust unset arguments to
+fit in device memory"* — **defaulting to on**, and the same upstream change makes unset arguments,
+`--n-gpu-layers` among them, subject to that fitting. It is not a `b10425` invention: it landed in
+[llama.cpp PR #16653](https://github.com/ggml-org/llama.cpp/pull/16653) ("automatically set
+parameters not set by the user in such a way that maximizes GPU utilization"), merged 2025-12-15;
+`b10425` is simply the build this project pinned and measured against. Because StudioForge always
+pins `--n-gpu-layers 999` and an explicit `--ctx-size`, there is nothing left for `--fit` to adjust
+today. But the combination `-ngl auto` + `--fit on` is precisely a silent
 partial-offload path, and this project's central promise is that a model either runs fully in VRAM
 or is rejected with numbers. Leaving an engine-side autofit enabled would mean a future flag change,
 or one stray entry in the extra-flags box, could quietly turn a rejection into a degraded load.
@@ -1061,6 +1065,20 @@ no row says the same thing twice). A formula change that moves any anchor fails 
 ---
 
 ## D24 -- A download has one writer, and completion is proven on disk
+
+**Amended (2026-08-23): a repo's MTP draft modules and imatrix files are not quants.**
+`logical_models()` treated every non-projector `.gguf` in a repo as a base model, so
+unsloth's `MTP/mtp-*.gguf` speculative-decoding modules and `imatrix_*.gguf` became quant
+rows in the Download tab -- a 27B repo offering "Q4_0 2.14 GiB" beside its real 13 GiB
+weight file, each badged as fitting one GPU, and the MTP rows undownloadable anyway because
+`safe_filename` refuses the `MTP/` separator. `looks_like_auxiliary_gguf` now excludes them
+from `logical_models()` (and so from `header_file_for`, which reads the *smallest* logical
+download and could pick the imatrix). It matches on path segments and name **tokens**, never
+substrings: `MTP/` as a directory or a leading `mtp-` is a draft module, whereas `-MTP-` in
+the middle of a name is how a full model with an MTP head is published
+(`Qwen3.8-27B-NVFP4-MTP-Q6_K`, 20 GiB) and must stay selectable. The ambiguous middle case is
+settled by size only when a size is known -- keeping a stray row is cosmetic, hiding a model
+is not.
 
 **Incident (2026-08-18).** A 19.27 GB download of `unsloth/Qwen3.8-27B-GGUF` (Q5_K_S, main file
 19,270,036,448 B plus its mmproj) was enqueued by the live server at 22:01:48 and started

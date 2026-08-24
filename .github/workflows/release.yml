@@ -1,0 +1,108 @@
+name: Release
+
+# Cutting a release is pushing a tag. Everything below is reproducible from a
+# clean checkout of that tag -- see docs/RELEASING.md for the same commands run
+# by hand.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # creating the release and uploading its assets
+
+jobs:
+  build:
+    name: build and publish the release assets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # git archive below reads the tag object, and a shallow clone of a
+          # tag push does not necessarily have it.
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Work out the version strings
+        id: version
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          # The display version: the tag without its leading v ("1.26-08-23").
+          # The wheels carry the PEP 440 spelling of the same date instead,
+          # because PEP 440 cannot express a hyphenated one -- see the comment
+          # above `version` in pyproject.toml.
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build the wheels and the sdist
+        run: |
+          set -euo pipefail
+          uv build --wheel --sdist -o dist
+          (cd packages/studioforge-companion && uv build --wheel -o dist)
+          mv packages/studioforge-companion/dist/*.whl dist/
+          ls -l dist
+
+      - name: Build the source zip
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # One top-level directory inside the archive, which is exactly what
+          # the in-app updater expects: core/updater.py::_extract flattens a
+          # single top-level directory and would otherwise install the tree one
+          # level too deep.
+          git archive --format=zip --prefix="StudioForge-${VERSION}/" \
+            -o "dist/StudioForge-${VERSION}.zip" "${TAG}"
+
+      - name: Add the built wheels and sdist to the source zip
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import zipfile
+          from pathlib import Path
+
+          version = os.environ["VERSION"]
+          dist = Path("dist")
+          archive = dist / f"StudioForge-{version}.zip"
+          payload = sorted(
+              p for p in dist.iterdir() if p.suffix == ".whl" or p.name.endswith(".tar.gz")
+          )
+          with zipfile.ZipFile(archive, "a", zipfile.ZIP_DEFLATED) as zf:
+              for item in payload:
+                  zf.write(item, f"StudioForge-{version}/dist/{item.name}")
+          print("\n".join(f"added {p.name}" for p in payload))
+          PY
+
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum *.zip *.whl *.tar.gz > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create the GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: StudioForge ${{ steps.version.outputs.version }}
+          # The zip is the app release payload and the ONLY archive attached:
+          # core/updater.py::_parse_release takes the first asset whose name
+          # ends in .zip/.tar.gz as the thing to install, so attaching the
+          # sdist beside it could hand the updater a Python source
+          # distribution instead of a release tree. The sdist ships inside the
+          # zip's dist/ directory, with its hash in SHA256SUMS.txt.
+          files: |
+            dist/StudioForge-${{ steps.version.outputs.version }}.zip
+            dist/*.whl
+            dist/SHA256SUMS.txt
+          fail_on_unmatched_files: true
+          generate_release_notes: true

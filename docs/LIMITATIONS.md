@@ -226,6 +226,14 @@ top when HuggingFace published one.
   and a locked `.part` fail immediately. The queue shows `retrying in Ns (attempt k/5)` while it
   waits, and on failure says whether Resume continues from the partial or starts over.
 
+* **A repo's non-model GGUFs are not offered as quants.** Some publishers ship an MTP
+  speculative-decoding draft module (`MTP/mtp-*.gguf`) and an imatrix calibration file
+  (`imatrix_*.gguf`) beside the real weights. Both parse as quants by filename and neither is
+  loadable, so they are filtered out of the picker. The filter matches path segments and name
+  tokens, not substrings, so a full model that carries an MTP head (`...-NVFP4-MTP-Q6_K.gguf`)
+  is still offered; a mid-name `mtp` token is only treated as a draft module when the repo also
+  reports a size too small to be a model.
+
 ## Pre-download fit estimates are cruder still
 
 Before a file is on disk there is no GGUF metadata, so the KV portion of a fit verdict is a bounded
@@ -366,8 +374,8 @@ That guarantees a non-empty reply, but it means:
 
 ## Platform
 
-* Linux is primary, Windows is fully supported and is what the reference rig runs. macOS is not
-  supported (no CUDA).
+* Windows is the reference platform and runs it daily; Linux is supported (CI runs both) and
+  less battle-tested. macOS is not supported (no CUDA).
 * On Windows, `current` is a `current.txt` pointer file rather than a symlink, because symlinks
   need administrator rights or Developer Mode.
 * **"Children die with the server" is a kernel guarantee on Windows and a best effort on Linux.**

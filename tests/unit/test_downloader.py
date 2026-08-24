@@ -309,6 +309,7 @@ def finfo(
     sha256: str | None = None,
     is_mmproj: bool | None = None,
 ) -> GgufFileInfo:
+    from studioforge.core.gguf import looks_like_auxiliary_gguf
     from studioforge.core.hf_search import shard_parts
 
     index, total = shard_parts(filename)
@@ -321,6 +322,10 @@ def finfo(
         shard_total=total,
         sha256=sha256,
         lfs_oid=sha256,
+        # Derived, not passed: this helper has to classify a filename the same
+        # way the real sibling parser does, or these tests would prove nothing
+        # about production.
+        is_auxiliary=looks_like_auxiliary_gguf(filename, size_bytes=size),
     )
 
 
@@ -417,6 +422,7 @@ async def wait_group(
         ("TheDrummer_Behemoth-X-123B-v2.1-IQ3_M-00001-of-00002.gguf", "IQ3_M"),
         ("TheDrummer_Behemoth-X-123B-v2.1-IQ3_M-00002-of-00002.gguf", "IQ3_M"),
         ("gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf", "Q4_K_XL"),
+        ("Qwen3.8-27B-UD-Q2_K_XL.gguf", "Q2_K_XL"),
         ("gemma-4-Ortenzya-31B-it-uncensored-heretic-NVFP4.gguf", "NVFP4"),
         ("G4-MeroMero-31B-uncensored-heretic-mmproj-BF16.gguf", "BF16"),
         ("Qwen2.5-VL-7B-Abliterated-Caption-it.mmproj-f16.gguf", "F16"),
@@ -459,6 +465,75 @@ def repo_with(files: list[GgufFileInfo], repo_id: str = REPO) -> GgufRepoInfo:
         last_modified=None,
         files=files,
     )
+
+
+def test_a_repos_mtp_modules_and_imatrix_are_not_quants() -> None:
+    """The Download tab listed unsloth's scaffolding as if it were weights.
+
+    Shape taken from a real unsloth GGUF repo: the one 13 GiB weight file was
+    outnumbered by an ``MTP/`` speculative-decoding draft module and an imatrix
+    calibration file, each of which parses as a quant by filename and each of
+    which was badged "fits one GPU". Neither is loadable, and the MTP row could
+    not even be downloaded -- ``safe_filename`` refuses the ``MTP/`` separator.
+    """
+    repo = repo_with(
+        [
+            finfo("Qwen3.8-27B-UD-Q2_K_XL.gguf", 9_000_000_000),
+            finfo("MTP/mtp-Qwen3.8-27B-Q4_0.gguf", 2_297_478_020),
+            finfo("MTP/mtp-Qwen3.8-27B-Q8_0.gguf", 858_993_459),
+            finfo("imatrix_unsloth.gguf", 944_892_805),
+        ]
+    )
+    options = repo.logical_models()
+    assert [o.quant for o in options] == ["Q2_K_XL"]
+    assert [f.filename for f in options[0].files] == ["Qwen3.8-27B-UD-Q2_K_XL.gguf"]
+    # And the label resolves rather than reading "unknown".
+    assert "unknown" not in {o.quant for o in options}
+
+
+def test_a_model_with_an_mtp_head_is_still_offered() -> None:
+    """The guard against over-matching: -MTP- mid-name is a real model.
+
+    ``Qwen3.8-27B-NVFP4-MTP-Q6_K`` is a full 20 GiB model that happens to carry
+    an MTP head. Filtering on the substring "mtp" would have hidden it, which
+    is a worse bug than the one being fixed.
+    """
+    repo = repo_with(
+        [
+            finfo("Qwen3.8-27B-NVFP4-MTP-Q6_K.gguf", 21_000_000_000),
+            finfo("MTP/mtp-Qwen3.8-27B-Q4_0.gguf", 2_297_478_020),
+        ]
+    )
+    options = repo.logical_models()
+    # Asserted on the file, not the label: which of two whitelisted tokens wins
+    # ("NVFP4" here, being the longer) is a separate, pre-existing rule in
+    # parse_quant. What matters is that the model survives the filter at all.
+    assert [f.filename for o in options for f in o.files] == ["Qwen3.8-27B-NVFP4-MTP-Q6_K.gguf"]
+
+
+def test_a_repo_of_nothing_but_auxiliaries_offers_nothing() -> None:
+    """Better an empty picker than a list of undownloadable rows."""
+    repo = repo_with([finfo("imatrix_unsloth.gguf", 944_892_805)])
+    assert repo.logical_models() == []
+
+
+def test_header_file_for_skips_the_imatrix() -> None:
+    """It reads the SMALLEST logical download, which used to be the imatrix.
+
+    A remote header read aimed at a calibration file returns geometry for the
+    wrong thing (or nothing), and it only stayed invisible because a locally
+    registered sibling usually answered first.
+    """
+    from studioforge.core.hf_meta import header_file_for
+
+    repo = repo_with(
+        [
+            finfo("Qwen3.8-27B-UD-Q2_K_XL.gguf", 9_000_000_000),
+            finfo("imatrix_unsloth.gguf", 944_892_805),
+            finfo("MTP/mtp-Qwen3.8-27B-Q8_0.gguf", 858_993_459),
+        ]
+    )
+    assert header_file_for(repo) == "Qwen3.8-27B-UD-Q2_K_XL.gguf"
 
 
 def test_logical_models_collapses_shards_and_sums_bytes() -> None:

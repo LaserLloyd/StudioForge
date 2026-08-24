@@ -656,7 +656,7 @@ async def _stream_upstream(
             # parser ignores. Only until the first chunk: after that the stream
             # is flowing, so there is no per-chunk timer overhead.
             interval = state.config.gateway.stream_keepalive_interval_s
-            first = asyncio.ensure_future(stream.__anext__())  # type: ignore[arg-type]
+            first = asyncio.ensure_future(stream.__anext__())
             waited = 0.0
             while True:
                 done, _ = await asyncio.wait({first}, timeout=interval)

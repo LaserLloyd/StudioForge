@@ -46,7 +46,30 @@ caller only when a credential was needed to get there). `sfctl` sends it as the 
 `?pin=` in the URL works for connectors that can only take a URL, but is not advertised because a
 URL ends up in proxy logs and shell history.
 
-Then register it as a local stdio MCP server in OpenClaw's config:
+Then register it as a local stdio MCP server:
+
+```bash
+openclaw mcp add studioforge --command sfctl --arg mcp
+```
+
+or, editing OpenClaw's config file directly — its key is `mcp.servers`, a nested map, **not** the
+top-level `mcpServers` one:
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "studioforge": {
+        "command": "sfctl",
+        "args": ["mcp"]
+      }
+    }
+  }
+}
+```
+
+Clients that take the generic top-level map instead — Claude Code, Cline, LibreChat and most
+others — want this shape:
 
 ```json
 {
