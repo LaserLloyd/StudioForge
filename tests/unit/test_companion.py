@@ -646,6 +646,26 @@ def test_cli_openclaw_setup_hides_key_by_default(live_server: ServerHandle) -> N
     assert API_KEY in revealed.output  # opt-in only
 
 
+def test_redactor_masks_an_mcp_pin() -> None:
+    """The PIN is a credential, and it is NOT called `api_key`.
+
+    `GET /api/openclaw-setup` returns the MCP pairing PIN as `mcp_pin`, a name
+    that matched none of the redactor's hints -- so the default output carried
+    it in clear while the human-mode path printed "(API key redacted...)".
+
+    Asserted against the redactor directly, not through the live server: the
+    server only fills `mcp_pin` in when `server.api_key` is set, so an
+    end-to-end check passes vacuously on a fixture with auth off and proves
+    nothing. (Written after exactly that mistake.)
+    """
+    masked = cli_module._redact_tree({"mcp_pin": "12345678", "nested": {"pin": "87654321"}})
+    assert masked["mcp_pin"] != "12345678", "the MCP pin was rendered unredacted"
+    assert masked["nested"]["pin"] != "87654321"
+    # The sentinel for "auth is disabled" must survive: redacting it once
+    # produced the nonsense value `not-...ed` in the printed snippets.
+    assert cli_module._redact_tree({"api_key": "not-required"})["api_key"] == "not-required"
+
+
 def test_cli_help_documents_exit_codes() -> None:
     result = runner.invoke(cli_module.app, ["--help"], catch_exceptions=False)
     assert result.exit_code == 0

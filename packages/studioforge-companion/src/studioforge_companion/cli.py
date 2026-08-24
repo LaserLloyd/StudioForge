@@ -1018,7 +1018,13 @@ def logs(
 # config
 # ---------------------------------------------------------------------------
 
-_SECRET_HINTS = ("api_key", "token", "secret", "password")
+# "pin" is here because GET /api/openclaw-setup returns the MCP pairing PIN
+# as `mcp_pin`, and that name contains none of the other hints. The server
+# only fills it in when `server.api_key` is set, so the leak stayed latent
+# on a rig with auth off -- and would have armed itself the moment someone
+# hardened the server by setting a key. This command's whole contract is
+# that its default output is safe to paste into a chat or an issue.
+_SECRET_HINTS = ("api_key", "token", "secret", "password", "pin")
 
 #: The server's sentinel for "auth is disabled" (see ``GET /api/openclaw-setup``).
 #: It is not a secret, and redacting it once produced the nonsense value
@@ -1341,6 +1347,11 @@ def recover(
         _confirm("restart the StudioForge server (drops in-flight requests)?", yes=yes)
     if nuke:
         _confirm("kill every loaded model?", yes=yes)
+    if kill:
+        # The watchdog resolves this alias exact -> case-insensitive -> substring,
+        # so "gemma" can match more than one loaded model. Name what was asked
+        # for; the operator is the only one who knows which they meant.
+        _confirm(f"SIGKILL the model child matching {kill!r}?", yes=yes)
 
     profile = _resolve_profile()
     # The user already confirmed above (or passed --yes), so the watchdog's own

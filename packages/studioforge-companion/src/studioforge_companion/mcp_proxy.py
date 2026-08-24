@@ -38,6 +38,11 @@ session, which is exactly the outcome this design exists to prevent.
 from __future__ import annotations
 
 import contextlib
+
+try:  # the MCP SDK builds its client with httpx2; match it exactly
+    from httpx2 import Timeout as _Timeout
+except ImportError:  # pragma: no cover - older SDKs are on httpx
+    from httpx import Timeout as _Timeout
 import time
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack
@@ -62,7 +67,14 @@ from mcp.server.lowlevel import Server
 from studioforge_companion.config import ServerProfile
 
 PROXY_NAME = "studioforge"
-PROXY_VERSION = "0.1.0"
+# Derived, not hardcoded: this read 0.1.0 out of a 0.2.0 package, and the
+# value is what `initialize` advertises in serverInfo.
+try:  # pragma: no cover - trivial, and the fallback is exercised below
+    from importlib.metadata import version as _pkg_version
+
+    PROXY_VERSION = _pkg_version("studioforge-companion")
+except Exception:  # not installed as a distribution (a source checkout)
+    PROXY_VERSION = "0+unknown"
 
 #: Prefix applied to watchdog tools whose names would otherwise collide.
 RECOVERY_PREFIX = "recovery_"
@@ -210,7 +222,18 @@ class Upstream:
     async def _session(self) -> AsyncIterator[Client]:
         headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
         async with AsyncExitStack() as stack:
-            http = await stack.enter_async_context(create_mcp_http_client(headers=headers))
+            # timeout_s was declared and never passed, so calls fell back to the
+            # SDK default read timeout (300s). A cold load of a large model runs
+            # longer than that, and the failure was reported as "the server is
+            # not answering, try restart_server" while the load was progressing.
+            #
+            # Only READ is stretched. Connect/write/pool stay at the SDK's 30s:
+            # a flat timeout_s would make an unreachable host hang for the full
+            # ten minutes instead of failing fast, which is a worse bug than the
+            # one being fixed.
+            http = await stack.enter_async_context(create_mcp_http_client(
+                headers=headers,
+                timeout=_Timeout(30.0, read=self.timeout_s)))
             transport = streamable_http_client(self.url, http_client=http)
             client = await stack.enter_async_context(Client(transport))
             yield client
