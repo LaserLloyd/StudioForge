@@ -32,10 +32,10 @@ rather than flattened into the message.
 from __future__ import annotations
 
 import json
-from urllib.parse import quote
 from collections.abc import AsyncIterator, Mapping
 from types import TracebackType
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -57,7 +57,6 @@ EXIT_CODE_TABLE: tuple[tuple[int, str], ...] = (
     (EXIT_UNREACHABLE, "server unreachable (refused / timed out / DNS)"),
     (EXIT_AUTH, "auth failed (missing or wrong API key)"),
 )
-
 
 
 def _path_segment(model: str) -> str:
@@ -242,7 +241,7 @@ class StudioForgeClient:
             if header:
                 try:
                     retry_after = float(header)
-                except ValueError:          # HTTP-date form; a wait we cannot use
+                except ValueError:  # HTTP-date form; a wait we cannot use
                     retry_after = None
         if retry_after is not None:
             details = {**details, "retry_after_s": retry_after}
@@ -307,7 +306,8 @@ class StudioForgeClient:
             raise CompanionError(
                 f"expected JSON from {response.request.url} but got "
                 f"{response.headers.get('content-type') or 'an unparseable body'}"
-                + (f": {snippet}" if snippet else "")) from None
+                + (f": {snippet}" if snippet else "")
+            ) from None
 
     async def get(self, path: str, **params: Any) -> Any:
         return await self.request("GET", path, params=params)
@@ -405,7 +405,9 @@ class StudioForgeClient:
         return await self.post(f"models/{_path_segment(model)}/pin", {"pinned": pinned})
 
     async def delete_model(self, model: str, *, delete_files: bool, confirm: bool) -> Any:
-        return await self.delete(f"models/{_path_segment(model)}", delete_files=delete_files, confirm=confirm)
+        return await self.delete(
+            f"models/{_path_segment(model)}", delete_files=delete_files, confirm=confirm
+        )
 
     async def settings(self, model: str) -> Any:
         return await self.get(f"models/{_path_segment(model)}/settings")

@@ -19,8 +19,8 @@ import os
 import sys
 import time
 from collections.abc import Awaitable, Callable, Iterable, Sequence
-from datetime import datetime
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 import typer
@@ -66,6 +66,7 @@ Exit codes (scriptable):
 {_EXIT_HELP}
 """
 
+
 def _json_flag(value: bool) -> bool:
     """Record `--json` at PARSE time, not when the command body reads it.
 
@@ -79,8 +80,9 @@ def _json_flag(value: bool) -> bool:
     return value
 
 
-JSON_OPTION = typer.Option(False, "--json", callback=_json_flag,
-                           help="Machine-readable JSON output.")
+JSON_OPTION = typer.Option(
+    False, "--json", callback=_json_flag, help="Machine-readable JSON output."
+)
 
 app = typer.Typer(
     name="sfctl",
@@ -105,6 +107,7 @@ app.add_typer(servers_app, name="servers")
 # Registry kinds the server filters on. Module scope because a default
 # argument is evaluated at import, not at call time.
 _MODEL_KINDS = ("chat", "embedding", "rerank", "vision", "draft")
+
 
 @dataclass
 class CliState:
@@ -427,7 +430,8 @@ def models_list(
     loaded: bool = typer.Option(False, "--loaded", help="Only currently loaded models."),
     vision: bool = typer.Option(False, "--vision", help="Only vision-capable models."),
     kind: str | None = typer.Option(
-        None, "--kind", help=f"Filter by kind: {', '.join(_MODEL_KINDS)}."),
+        None, "--kind", help=f"Filter by kind: {', '.join(_MODEL_KINDS)}."
+    ),
     json_out: bool = JSON_OPTION,
 ) -> None:
     """List registry models with capability badges."""
@@ -435,8 +439,8 @@ def models_list(
         # An unknown kind silently returned zero rows and exit 0, so a typo was
         # indistinguishable from "the registry has none of those".
         raise typer.BadParameter(
-            f"unknown kind {kind!r}; expected one of {', '.join(_MODEL_KINDS)}",
-            param_hint="--kind")
+            f"unknown kind {kind!r}; expected one of {', '.join(_MODEL_KINDS)}", param_hint="--kind"
+        )
 
     async def work(client: StudioForgeClient) -> Any:
         return await client.models()
@@ -641,8 +645,9 @@ def models_load(
             STATE.err.print(
                 f"[yellow]warning:[/yellow] fit check unavailable ({exc}); "
                 f"loading anyway because --force was given"
-                if not STATE.no_color else
-                f"warning: fit check unavailable ({exc}); loading anyway (--force)")
+                if not STATE.no_color
+                else f"warning: fit check unavailable ({exc}); loading anyway (--force)"
+            )
             plan = None
         if plan is not None and not use_json:
             _print_plan(plan)
@@ -1094,8 +1099,7 @@ def logs(
             # not know, so rendering it verbatim printed nothing and exited 0 --
             # a typo'd id looked like a quiet success. `models info` on the same
             # id exits 1; match that.
-            raise CompanionError(
-                f"no logs for {model!r} -- the server does not know that model id")
+            raise CompanionError(f"no logs for {model!r} -- the server does not know that model id")
         return [_format_log_line(line) for line in lines]
 
     async def work(client: StudioForgeClient) -> Any:

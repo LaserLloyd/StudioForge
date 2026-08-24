@@ -3070,8 +3070,8 @@ def test_log_line_text_does_not_double_prefix_a_rendered_structlog_line() -> Non
     ("origin", "host", "same"),
     [
         ("http://192.168.1.50:8080", "192.168.1.50:8080", True),
-        ("http://rig.tailnet.ts.net:8080", "rig.tailnet.ts.net:8080", True),  # scrub-ok: invented tailnet host, Origin/Host fixture
-        ("https://rig.tailnet.ts.net", "rig.tailnet.ts.net:8080", True),  # scrub-ok: invented tailnet host; port ignored
+        ("http://rig.tailnet.ts.net:8080", "rig.tailnet.ts.net:8080", True),  # scrub-ok: fake host
+        ("https://rig.tailnet.ts.net", "rig.tailnet.ts.net:8080", True),  # scrub-ok: fake host
         ("http://[::1]:8080", "[::1]:8080", True),
         ("http://evil.example.com", "192.168.1.50:8080", False),
         ("http://192.168.1.51:8080", "192.168.1.50:8080", False),

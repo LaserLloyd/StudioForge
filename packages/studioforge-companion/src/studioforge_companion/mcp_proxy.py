@@ -231,9 +231,9 @@ class Upstream:
             # a flat timeout_s would make an unreachable host hang for the full
             # ten minutes instead of failing fast, which is a worse bug than the
             # one being fixed.
-            http = await stack.enter_async_context(create_mcp_http_client(
-                headers=headers,
-                timeout=_Timeout(30.0, read=self.timeout_s)))
+            http = await stack.enter_async_context(
+                create_mcp_http_client(headers=headers, timeout=_Timeout(30.0, read=self.timeout_s))
+            )
             transport = streamable_http_client(self.url, http_client=http)
             client = await stack.enter_async_context(Client(transport))
             yield client

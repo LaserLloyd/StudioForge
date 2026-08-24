@@ -245,7 +245,6 @@ def config_path() -> Path:
     return config_dir() / CONFIG_FILENAME
 
 
-
 def _warn_if_world_readable(target: Path) -> None:
     """Complain (once, on stderr) if the config is readable by anyone else.
 
@@ -259,8 +258,11 @@ def _warn_if_world_readable(target: Path) -> None:
     except OSError:
         return
     if mode & 0o077:
-        print(f"warning: {target} is mode {mode:04o}; it holds an API key. "
-              f"Fix with: chmod 600 {target}", file=sys.stderr)
+        print(
+            f"warning: {target} is mode {mode:04o}; it holds an API key. "
+            f"Fix with: chmod 600 {target}",
+            file=sys.stderr,
+        )
 
 
 def load_companion_config(path: Path | None = None) -> CompanionConfig:
