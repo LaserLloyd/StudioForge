@@ -419,12 +419,27 @@ def _port_is_bindable(port: int, host: str = CHILD_HOST) -> bool:
     ``SO_REUSEADDR`` (llama-server and most servers do) otherwise lets a second
     plain bind succeed, so the probe would report a busy port as free and we
     would end up talking to the wrong process.
+
+    On POSIX the probe must set ``SO_REUSEADDR`` for the mirror-image reason.
+    A child that has just been unloaded leaves its served connections in
+    ``TIME_WAIT`` for around a minute, and a *plain* bind to that port fails
+    for as long as they last -- so the probe called a port busy that the next
+    llama-server, which sets ``SO_REUSEADDR`` itself, would have taken
+    happily. The port was skipped for a minute after every unload, and on a
+    narrow ``child_port_start..end`` range that is how "No free port in the
+    llama-server child range" arrives on a box with free ports. The two
+    options are opposites by design: on Windows the danger is a false *free*,
+    on Linux a false *busy*, and the probe has to model what the child will
+    actually do on each.
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         if os.name == "nt":
             with contextlib.suppress(OSError, AttributeError):
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            with contextlib.suppress(OSError, AttributeError):
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind((host, port))
     except OSError:
         return False
@@ -765,10 +780,26 @@ class _Instance:
 #: pools, the asyncio child watcher) and is documented unsafe there; the shim
 #: is single-threaded, does two syscalls and execs. ``prctl`` is Linux-only,
 #: so on other POSIX systems the prefix is empty and behaviour is unchanged.
+#: Printed by the shim when the exec fails, and matched on the way back out.
+#: Without it a missing or unlaunchable engine binary is reported as a Python
+#: traceback with exit code 1: the shim turns what used to be an ``OSError``
+#: out of ``Popen`` in *this* process into a child that starts fine and then
+#: dies, so the "Could not launch llama-server" path was unreachable on Linux
+#: and the operator got `FileNotFoundError` from a stack they do not own.
+PDEATHSIG_EXEC_FAILED = "studioforge-pdeathsig: exec failed: "
+
+#: Exit code the shim uses for that case. 127 is the shell's convention for
+#: "command not found", which is what this is.
+PDEATHSIG_EXEC_FAILED_CODE = 127
+
 _PDEATHSIG_SHIM = (
     "import ctypes, os, signal, sys; "
     "ctypes.CDLL(None, use_errno=True).prctl(1, int(signal.SIGKILL), 0, 0, 0); "
-    "os.execv(sys.argv[1], sys.argv[1:])"
+    "\ntry:\n"
+    "    os.execv(sys.argv[1], sys.argv[1:])\n"
+    "except OSError as exc:\n"
+    f"    sys.stderr.write({PDEATHSIG_EXEC_FAILED!r} + str(exc) + chr(10))\n"
+    f"    raise SystemExit({PDEATHSIG_EXEC_FAILED_CODE})\n"
 )
 
 
@@ -1361,7 +1392,18 @@ class Supervisor:
             resolved=decided,
         )
         inst.argv = argv
-        full_argv = [*self._launch_prefix, *_pdeathsig_prefix(), *argv]
+        # The shim must be the OUTERMOST element, ahead of the launch prefix
+        # as well as the engine argv: its body is
+        # `os.execv(sys.argv[1], sys.argv[1:])`, so whatever follows it is
+        # taken as a complete command line to exec. With the prefix first, a
+        # prefix of `[python, -u]` swallowed `-c <shim>` as its own script
+        # argument and then tried to compile the interpreter binary --
+        # "SyntaxError: source code cannot contain null bytes" out of an ELF
+        # header. PDEATHSIG survives execve, so wrapping the prefix too keeps
+        # the guarantee for every layer. Production never noticed because
+        # `_launch_prefix` is empty there; every launch-prefix test on Linux
+        # did (26 of them).
+        full_argv = [*_pdeathsig_prefix(), *self._launch_prefix, *argv]
         inst.open_log()
         inst.write_log(f"=== studioforge launch: {' '.join(full_argv)}")
 
@@ -1499,6 +1541,18 @@ class Supervisor:
                 # Fail fast: waiting out a 10 minute timeout for a process that
                 # already exited buries the actual error.
                 await self._drain_pumps(inst)
+                # The shim could not exec the engine at all. That is a launch
+                # failure, not a crashed engine, and it must read like the
+                # `OSError` from `create_subprocess_exec` it replaced --
+                # otherwise a mistyped engine path surfaces as somebody else's
+                # Python traceback.
+                for line in inst.stderr_tail():
+                    if PDEATHSIG_EXEC_FAILED in line:
+                        reason = line.split(PDEATHSIG_EXEC_FAILED, 1)[1].strip()
+                        raise ModelLoadError(
+                            f"Could not launch llama-server for '{inst.record.id}': {reason}",
+                            details={"argv": inst.argv},
+                        )
                 raise ModelLoadError(
                     self._failure_message(inst, f"exited with code {code} during startup"),
                     details={
