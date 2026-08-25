@@ -749,33 +749,49 @@ def models_options(model: str, json_out: bool = JSON_OPTION) -> None:
     if want_json(json_out):
         emit(payload)
         return
-    profiles = payload.get("profiles") or payload.get("modes") or []
+    profiles = payload.get("profiles") or []
     if not profiles:
         STATE.console.print("no placement profiles reported for this model")
         return
+    recommended = payload.get("recommended_mode")
     table = _table(
         "Mode",
         "GPUs",
-        "Ctx",
+        "Ctx/slot",
         "Slots",
         "KV",
         "tok/s",
-        "tok/s (full ctx)",
-        "Confidence",
+        "at full ctx",
+        "Fits now",
         title=f"placement options: {model}",
     )
     for entry in profiles:
+        # Every number lives under `optimal` -- the mode entry itself carries
+        # only the label, the devices and the fits-now verdict.
+        best = entry.get("optimal") or {}
+        mode = str(entry.get("mode") or "-")
+        if mode == recommended:
+            mode = f"{mode} *"
+        would_evict = entry.get("would_evict") or []
+        if entry.get("fits_now"):
+            # The most operational column: it can fit AND be loaded right now,
+            # or it can fit only by throwing a resident model off the cards.
+            fits = "yes" if not would_evict else f"evicts {len(would_evict)}"
+        else:
+            fits = "no"
         table.add_row(
-            str(entry.get("mode") or entry.get("key") or "-"),
+            mode,
             ",".join(str(d) for d in entry.get("devices") or []) or "-",
-            str(entry.get("ctx_size") or entry.get("max_ctx") or "-"),
-            str(entry.get("max_parallel") or entry.get("recommended_parallel") or "-"),
-            str(entry.get("kv_cache_type") or "-"),
-            _short(entry.get("est_gen_tps")),
-            _short(entry.get("est_gen_tps_full_ctx")),
-            str(entry.get("confidence") or "-"),
+            str(best.get("ctx_per_slot") or "-"),
+            str(best.get("recommended_parallel") or best.get("max_parallel") or "-"),
+            str(best.get("kv_cache_type") or "-"),
+            _short(best.get("est_gen_tps")),
+            _short(best.get("est_gen_tps_full_ctx")),
+            fits,
         )
     STATE.console.print(table)
+    if recommended:
+        STATE.console.print(f"* recommended; load it with: sfctl models load {model}")
 
 
 @models_app.command("load-recommended")
@@ -825,20 +841,27 @@ def models_repo(repo_id: str, json_out: bool = JSON_OPTION) -> None:
     if want_json(json_out):
         emit(payload)
         return
-    quants = payload.get("quants") or payload.get("files") or []
+    quants = payload.get("quants") or []
     if not quants:
         STATE.console.print(f"no GGUF quants found in {repo_id}")
         return
-    table = _table("Quant", "Size", "Fits", "Max ctx", "Note", title=repo_id)
+    table = _table("Quant", "Size", "Files", "Verdict", "Why", title=repo_id)
     for entry in quants:
+        fit = entry.get("fit") or {}
+        files = entry.get("files") or []
+        # A size of 0 means HuggingFace reported none, which is also why the
+        # verdict is "unknown" -- rendering it as "0 B" would look like an
+        # empty file rather than a missing measurement.
+        total = entry.get("total_bytes")
         table.add_row(
-            str(entry.get("quant") or entry.get("filename") or "-"),
-            fmt_bytes(entry.get("size_bytes")),
-            fmt_bool(entry.get("fits")),
-            str(entry.get("max_ctx") or "-"),
-            str(entry.get("verdict") or entry.get("reason") or ""),
+            str(entry.get("quant") or "-"),
+            fmt_bytes(total) if total else "unknown",
+            str(len(files)) if files else "-",
+            str(fit.get("verdict") or "-"),
+            str(fit.get("message") or ""),
         )
     STATE.console.print(table)
+    STATE.console.print(f"download one with: sfctl download {repo_id} --quant <QUANT>")
 
 
 @models_app.command("unload")
@@ -1654,22 +1677,29 @@ def search(
     if want_json(json_out):
         emit(payload)
         return
-    repos = payload.get("results") or payload.get("repos") or []
+    repos = payload.get("repos") or []
     if not repos:
         STATE.console.print(f"nothing found for {query!r}")
         return
+    # Deliberately NO fit column. The search API reports no file sizes, so
+    # every verdict here comes back "unknown" -- a column that is always the
+    # same word is noise, and pretending otherwise would be worse. The fit
+    # question is answered by `models repo`, which reads the GGUF headers.
     table = _table("Repo", "Downloads", "Likes", "Updated", "Quants", title=f"search: {query}")
     for entry in repos:
         quants = entry.get("quants") or []
+        days = entry.get("updated_days_ago")
         table.add_row(
-            str(entry.get("repo_id") or entry.get("id") or "-"),
-            str(entry.get("downloads") or "-"),
-            str(entry.get("likes") or "-"),
-            str(entry.get("last_modified") or entry.get("updated_at") or "-"),
+            str(entry.get("repo_id") or "-"),
+            f"{entry['downloads']:,}" if isinstance(entry.get("downloads"), int) else "-",
+            str(entry.get("likes") if entry.get("likes") is not None else "-"),
+            f"{days:.0f}d ago" if isinstance(days, (int, float)) else "-",
             str(len(quants)) if quants else "-",
         )
     STATE.console.print(table)
-    STATE.console.print("sizes and fit verdicts: sfctl models repo <repo-id>")
+    if payload.get("truncated"):
+        STATE.console.print("(truncated -- raise --limit for more)")
+    STATE.console.print("per-quant sizes and fit detail: sfctl models repo <repo-id>")
 
 
 # ---------------------------------------------------------------------------
