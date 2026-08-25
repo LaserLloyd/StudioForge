@@ -208,11 +208,27 @@ def port_has_listener(port: int, host: str = "127.0.0.1", timeout_s: float = 1.0
 def port_is_bindable(port: int, host: str = "0.0.0.0") -> bool:
     """Whether ``host:port`` can be bound right now.
 
-    ``SO_EXCLUSIVEADDRUSE`` on Windows is essential: without it a second bind
-    against a listener that set ``SO_REUSEADDR`` (which most servers do)
-    succeeds, so the probe would call a busy port free -- the exact way two
-    servers end up sharing a port and one of them silently never gets a
-    request. Deliberately does *not* set ``SO_REUSEADDR``.
+    This is the startup preflight (see :func:`check_startup_ports`), and what
+    it must answer is not "can a bare socket bind here" but "can the server we
+    are about to start bind here". Those differ, in opposite directions on the
+    two platforms, so the probe models the real thing on each:
+
+    * **Windows** -- set ``SO_EXCLUSIVEADDRUSE``. Without it a second bind
+      against a listener that set ``SO_REUSEADDR`` (most servers do) succeeds,
+      so the probe calls a busy port free: the exact way two servers end up
+      sharing a port and one of them silently never gets a request. The danger
+      here is a false *free*.
+    * **POSIX** -- set ``SO_REUSEADDR``, because uvicorn does. asyncio's
+      ``create_server`` sets it by default on POSIX, so a port whose previous
+      listener left connections in ``TIME_WAIT`` is one uvicorn will take
+      happily -- while a *plain* bind fails for as long as those last, up to
+      about a minute. Without this the preflight refused to start over a port
+      the server would have bound, and exited ``EXIT_PORT_CONFLICT`` blaming a
+      conflict that did not exist. The danger here is a false *busy*.
+
+    ``supervisor._port_is_bindable`` makes the same split for llama-server
+    children; the two are deliberately identical in behaviour and differ only
+    in which process they are predicting.
     """
     family = socket.AF_INET6 if ":" in host else socket.AF_INET
     sock = socket.socket(family, socket.SOCK_STREAM)
@@ -220,6 +236,9 @@ def port_is_bindable(port: int, host: str = "0.0.0.0") -> bool:
         if os.name == "nt":
             with contextlib.suppress(OSError, AttributeError):
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            with contextlib.suppress(OSError, AttributeError):
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind((host, port))
     except OSError:
         return False

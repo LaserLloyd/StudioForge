@@ -226,3 +226,70 @@ def test_inspect_running_watchdog_does_not_call_a_wildcard_listener_free(tmp_pat
         presence = inspect_running_watchdog(config, timeout_s=1.0)
     assert "nothing is listening" not in presence.reason, presence.reason
     assert presence.adoptable is False  # a bare socket is not our watchdog
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows probes with SO_EXCLUSIVEADDRUSE instead")
+def test_the_preflight_sees_past_a_previous_listeners_time_wait() -> None:
+    """The preflight must model uvicorn, not a bare socket.
+
+    asyncio's ``create_server`` sets ``SO_REUSEADDR`` on POSIX, so uvicorn
+    binds happily over a port whose previous listener left connections in
+    TIME_WAIT. A *plain* bind fails for as long as those last -- about a
+    minute -- so the preflight refused to start, exited EXIT_PORT_CONFLICT,
+    and named a conflict that did not exist. ``supervisor._port_is_bindable``
+    already made this split for llama-server children; this is the same fix on
+    the path that actually gates startup.
+    """
+    with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = int(probe.getsockname()[1])
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", port))
+    listener.listen(1)
+    client = socket.create_connection(("127.0.0.1", port))
+    served, _ = listener.accept()
+    # The server side closes first, so the SERVER's socket is what lingers.
+    served.close()
+    listener.close()
+    client.close()
+
+    plain = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        plain.bind(("127.0.0.1", port))
+    except OSError:
+        pass  # TIME_WAIT is present: the precondition for this test holds.
+    else:
+        plain.close()
+        pytest.skip("no TIME_WAIT lingered; nothing to prove on this kernel")
+    finally:
+        plain.close()
+
+    assert ports_module.port_is_bindable(port, "127.0.0.1") is True
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows probes with SO_EXCLUSIVEADDRUSE instead")
+def test_a_live_listener_is_still_reported_busy() -> None:
+    """SO_REUSEADDR must not turn the probe into a rubber stamp: an actual
+    listener still has to read as occupied, or the preflight stops catching
+    the double-start it exists for."""
+    with wildcard_listener() as port:
+        assert ports_module.port_is_bindable(port, "0.0.0.0") is False
+
+
+def test_the_two_probes_agree_on_this_platform() -> None:
+    """Two probes with opposite policies is one wrong probe. They predict
+    different processes (uvicorn vs llama-server) but both processes set
+    SO_REUSEADDR, so the answers must match."""
+    from studioforge.core.supervisor import _port_is_bindable as child_probe
+
+    with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as probe:
+        probe.bind(("127.0.0.1", 0))
+        free_port = int(probe.getsockname()[1])
+    assert ports_module.port_is_bindable(free_port, "127.0.0.1") == child_probe(
+        free_port, "127.0.0.1"
+    )
+
+    with wildcard_listener() as busy:
+        assert ports_module.port_is_bindable(busy, "127.0.0.1") == child_probe(busy, "127.0.0.1")

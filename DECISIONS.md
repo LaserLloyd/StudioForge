@@ -2918,3 +2918,44 @@ configuration field. Both the main app and the watchdog now take the PIN from
 a header or the bearer slot only, and both detect the retired form so the 401
 can say *why* a URL that used to work no longer does, rather than looking like
 a wrong PIN.
+
+---
+
+## D45 -- The 92 assistant trailers in published history stay
+
+Ninety-two of the commits already on the public remote carry a
+`Co-Authored-By:` trailer naming the assistant that helped write them. The
+repository's own `commit-msg` hook rejects that trailer, and the house style is
+that finished work does not announce its tooling. So every audit of this
+repository finds them and proposes the same remedy: rewrite the history and
+force-push.
+
+The remedy is worse than the finding, and the finding is smaller than it looks.
+
+**What is actually there.** All ninety-two are the same trailer form. There are
+no `claude.ai/code/session` URLs and no `Claude-Session:` lines anywhere in the
+published log -- those are the entries that would link a private transcript of
+the machine this was built on, and that is the class this rule exists to catch.
+A trailer naming a co-author leaks nothing: no path, no host, no credential, no
+person. It is a style violation in a log, not a disclosure.
+
+**What removing them costs.** Rewriting them means rewriting every commit from
+the first one that carries a trailer, which invalidates every sha in the
+published history. Every clone, fork, issue reference, release tag, bisect
+result and permalink into this repository breaks at once, and anyone who
+already fetched keeps the old objects anyway -- so the trailers remain
+reachable from every existing copy regardless. A force-push over a public
+history is also the operation with no undo: a mistake in it is unrecoverable
+from the remote side.
+
+Trading a permanent break in a public history for the cosmetic removal of a
+line that discloses nothing is not a good trade. **The published trailers
+stay.**
+
+**This is not a relaxation.** The `commit-msg` hook still rejects the trailer,
+so no *new* commit can carry one, and the session-URL and transcript rules are
+untouched and remain hard failures. The decision is narrow: do not rewrite
+history that is already public for this.
+
+Recorded here so the next sweep reads a decision instead of re-filing the
+finding.

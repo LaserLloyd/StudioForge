@@ -190,13 +190,18 @@ OK_MARKER = re.compile(r"(?:#|//|--)\s*scrub-ok\b"
                        r"|(?:/\*|<!--)\s*scrub-ok\b")
 
 
-def load_local_rules() -> list[tuple[re.Pattern, str]]:
+def load_local_rules(path: Path | None = None) -> list[tuple[re.Pattern, str]]:
     """Per-fork identifiers: the maintainer's name, hostnames, handles.
 
     Kept out of the repo on purpose — publishing the list of words that must
     never be published is its own small leak.
+
+    ``path`` overrides the location, which the selftest uses to drive these
+    rules with an INVENTED identifier: proving the LICENCE exception needs a
+    name the local rules actually match, and writing the real one into a
+    fixture is the leak this whole file exists to prevent.
     """
-    path = REPO / "scripts" / "scrub-rules.local.txt"
+    path = path or REPO / "scripts" / "scrub-rules.local.txt"
     rules = []
     if not path.exists():
         if getattr(load_local_rules, "_noted", False):
@@ -220,7 +225,7 @@ def load_local_rules() -> list[tuple[re.Pattern, str]]:
         if not line or line.startswith("#"):
             continue
         try:
-            rules.append((re.compile(line, re.IGNORECASE), "a local private identifier"))
+            rules.append((re.compile(line, re.IGNORECASE), LOCAL_RULE_WHY))
         except re.error as e:
             print(f"scrub_check: bad regex in scrub-rules.local.txt: {line!r} ({e})",
                   file=sys.stderr)
@@ -304,6 +309,31 @@ def rev_text(repo_root: Path, rev: str, rel: str) -> str | None:
         return r.stdout.decode("utf-8")
     except UnicodeDecodeError:
         return None
+
+
+#: The one place a personal name is published ON PURPOSE.
+#:
+#: MIT requires the copyright notice to survive verbatim, and naming a
+#: copyright holder is a deliberate public authorship statement — the opposite
+#: of a leak. The maintainer's legal name is nevertheless a local private
+#: identifier everywhere else in the tree, and must stay one: a home path, a
+#: hostname or a commit message that names him is still a finding.
+#:
+#: So the exception is as narrow as it can be made:
+#:   * only in a file actually named LICENSE / LICENCE / COPYING,
+#:   * only on the line that IS the copyright notice, and
+#:   * only against the LOCAL private-identifier rules.
+#: Every generic rule — credentials, hosts, IPs, emails, paths — still applies
+#: to that line and to the rest of the file.
+LICENCE_FILENAMES = {"LICENSE", "LICENSE.md", "LICENSE.txt", "LICENCE", "COPYING"}
+COPYRIGHT_NOTICE = re.compile(
+    r"^\s*Copyright\s*(?:\(c\)|©)?\s*\d{4}(?:\s*[-–]\s*\d{4})?\s+\S", re.IGNORECASE)
+#: The `why` string load_local_rules attaches to every local rule.
+LOCAL_RULE_WHY = "a local private identifier"
+
+
+def _is_copyright_notice(rel: str, line: str) -> bool:
+    return Path(rel).name in LICENCE_FILENAMES and bool(COPYRIGHT_NOTICE.match(line))
 
 
 HEURISTIC_IN_FIXTURES = {
@@ -460,9 +490,12 @@ def scan(root: Path, staged: bool = False, rev: str | None = None) -> list[str]:
         for lineno, line in enumerate(text.splitlines(), 1):
             if OK_MARKER.search(line):
                 continue
+            licence_notice = _is_copyright_notice(rel, line)
             for pattern, why in rules:
                 if in_fixtures and why in HEURISTIC_IN_FIXTURES:
                     continue
+                if licence_notice and why == LOCAL_RULE_WHY:
+                    continue  # a copyright holder is published on purpose
                 m = pattern.search(line)
                 if m:
                     snippet = m.group(0)
@@ -538,6 +571,57 @@ def selftest() -> int:
         if not any("backend/hist.py" in p for p in scan(root, rev=sha)):
             failures.append("--rev missed a credential that is in the commit "
                             "but not in the working tree")
+
+        # --- the LICENCE copyright-line exception ---------------------------
+        # A copyright holder is named on purpose; a hostname or a credential is
+        # not. Driven with an INVENTED private identifier (the real one must
+        # never appear in a fixture) by pointing load_local_rules at a
+        # throwaway rules file for the duration.
+        rules_probe = root / "invented-rules.txt"
+        rules_probe.write_text(r"\bwintermute\b" + "\n", encoding="utf-8")
+        real_loader = load_local_rules
+        globals()["load_local_rules"] = lambda path=None: real_loader(rules_probe)
+        try:
+            (root / "LICENSE").write_text(
+                "MIT License\n\nCopyright (c) 2026 Wintermute\n", encoding="utf-8")
+            _git(root, "add", "LICENSE")
+            if any("LICENSE" in p for p in scan(root, staged=True)):
+                failures.append("the LICENCE copyright notice was rejected — MIT "
+                                "requires it verbatim, so this makes attribution "
+                                "impossible")
+
+            # ...but the same name anywhere else in the same file is a finding.
+            (root / "LICENSE").write_text(
+                "MIT License\n\nCopyright (c) 2026 Someone\n\nContact Wintermute.\n",
+                encoding="utf-8")
+            _git(root, "add", "LICENSE")
+            if not any("LICENSE" in p for p in scan(root, staged=True)):
+                failures.append("the copyright exception leaked past the notice "
+                                "line: anything in LICENSE would be waved through")
+
+            # ...and in any other file.
+            (root / "docs").mkdir(exist_ok=True)   # git rm prunes empty dirs
+            (root / "docs" / "credits.md").write_text(
+                "Copyright (c) 2026 Wintermute\n", encoding="utf-8")
+            _git(root, "add", "docs/credits.md")
+            if not any("credits.md" in p for p in scan(root, staged=True)):
+                failures.append("the copyright exception leaked outside LICENSE: "
+                                "a name in any file would be waved through")
+            _git(root, "rm", "-q", "-f", "docs/credits.md")
+
+            # A credential ON the notice line is still a finding: only the
+            # LOCAL identifier rules are relaxed there, never the generic ones.
+            (root / "LICENSE").write_text(
+                f"MIT License\n\nCopyright (c) 2026 Wintermute, {secret}\n",
+                encoding="utf-8")
+            _git(root, "add", "LICENSE")
+            if not any("LICENSE" in p for p in scan(root, staged=True)):
+                failures.append("a credential on the LICENCE copyright line was "
+                                "not flagged — the exception must only relax the "
+                                "local identifier rules")
+        finally:
+            globals()["load_local_rules"] = real_loader
+            _git(root, "rm", "-q", "-f", "LICENSE")
 
         # --- content rule fixtures ------------------------------------------
         # Every rule gets a POSITIVE (must fire) and a NEGATIVE (must not).
