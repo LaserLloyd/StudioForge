@@ -327,8 +327,12 @@ def check_request(request: Request, config: Config) -> None:
             note = " " + PIN_IN_QUERY_NOTE if pin_in_query(request) else ""
             raise AuthError(
                 "This MCP endpoint needs the pairing PIN. Send it as "
-                "'X-MCP-Pin: <pin>' or as a bearer token. The PIN is printed in "
-                "the server's startup banner and available from GET /api/mcp/info." + note,
+                "'X-MCP-Pin: <pin>' or as a bearer token. Read it ON THE SERVER: "
+                "the startup banner, `studioforge config`, or the control panel "
+                "(Setup -> Network & access). GET /api/mcp/info returns 'pin': null "
+                "to a caller in your position -- it only reveals the PIN to someone "
+                "who is already on the box or already authenticated, which is the "
+                "point of it being a credential." + note,
                 code="invalid_mcp_pin",
             )
 

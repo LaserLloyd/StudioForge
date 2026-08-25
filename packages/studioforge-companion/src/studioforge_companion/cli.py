@@ -2009,10 +2009,16 @@ def openclaw_setup(
 def mcp() -> None:
     """Run the stdio MCP server OpenClaw registers.
 
-    Merges the main app's management tools with the watchdog's recovery tools
-    into one tool list. Watchdog tools stay available when the main server is
-    down, which is the entire reason the two planes are separate; colliding
-    names are exposed with a 'recovery_' prefix.
+    Merges the main app's 19 management tools with the watchdog's 10 recovery
+    tools into one 29-tool list. Watchdog tools stay available when the main
+    server is down, which is the entire reason the two planes are separate.
+
+    Watchdog tools are exposed with a 'recovery_' prefix unless they are on the
+    proxy's allowlist of watchdog-only names -- an allowlist, not collision
+    detection, so 'health' becomes 'recovery_health' even though nothing on the
+    management plane is called that. Prefixing a name needlessly costs nothing;
+    failing to prefix one that collides would let a recovery tool shadow a
+    management tool.
     """
     from studioforge_companion.mcp_proxy import McpProxy
 

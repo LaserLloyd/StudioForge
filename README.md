@@ -12,6 +12,12 @@ switching is a host change, not a rewrite.
 **Status:** v0.2.0. Windows is the reference platform and runs it daily; Linux is supported (CI
 runs both) and less battle-tested. Questions and bug reports: [Contact](#contact).
 
+**On versions.** There is one number here and it is the one in `pyproject.toml`: `GET /api/version`,
+`GET /health` and the `sfctl` package all report `0.2.0`. If a server you are talking to reports
+something else — a dated string such as `1.26-08-23` — you are talking to a private build from a
+different release line, not to this repository, and its tools and payloads may not match these
+docs. Check with `curl -s <host>/api/version`.
+
 ---
 
 ## Overview

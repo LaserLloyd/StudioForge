@@ -949,7 +949,11 @@ async def version() -> dict[str, Any]:
 
 @router.get("/openclaw-setup")
 async def openclaw_setup(request: Request) -> JSONResponse:
-    """The exact two snippets needed to point OpenClaw at this server.
+    """Everything needed to point OpenClaw at this server.
+
+    Three blocks, not two: ``inference`` (the OpenAI-compatible env), ``mcp``
+    (the stdio server registration) and ``companion_config`` (what ``sfctl``
+    needs locally).
 
     ``next_steps`` rides along because the reader is often the agent itself:
     knowing the URL is not the same as knowing which of the merged tools to call
@@ -993,8 +997,8 @@ async def openclaw_setup(request: Request) -> JSONResponse:
                 else PIN_WITHHELD_NOTE
             ),
             "next_steps": [
-                "`sfctl mcp` merges the app's 14 management tools with the "
-                "watchdog's 10 recovery tools into one stdio tool list.",
+                "`sfctl mcp` merges the app's 19 management tools with the "
+                "watchdog's 10 recovery tools into one stdio tool list (29).",
                 "Start with list_models: it returns the catalog newest-download-first, "
                 "one options row per context size, exactly one marked recommended.",
                 "Pass that row's load_args verbatim to load_model, then send prompts "

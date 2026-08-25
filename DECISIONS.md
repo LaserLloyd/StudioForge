@@ -2300,7 +2300,7 @@ the scratch loads above; `/props` was not relied on for any of them.
 **Amendment (2026-08-23): `auto` is off above four slots.** Every measurement above is a *single
 stream* (`--parallel 1`), where decode is memory-bound: the weights are read to produce one token
 regardless, so the drafted tokens are verified almost for free and the win is real. That reasoning
-inverts under concurrency. A gauntlet run loaded Dark-Scarlett-27B at `--parallel 8` and `auto`
+inverts under concurrency. A CrucibleForge run loaded Dark-Scarlett-27B at `--parallel 8` and `auto`
 still chose `draft-mtp` (it saw the MTP head, not the slot count) -- but eight concurrent streams
 already saturate the GPU, so the drafted-then-rejected tokens are pure extra compute that slows
 *every* request. `resolve_spec_type` now takes the launch's slot count and returns `none` from
@@ -2403,7 +2403,7 @@ planner ubatch-aware is left for whoever owns `planner.py` next.
 **Amendment (2026-08-23): the automatic many-slots raise, now that the planner is aware.** D40
 made `Planner.estimate` charge `ubatch_scratch_bytes` for the micro-batch, which removed the OOM
 objection above ("the error direction is now a refused context, not an OOM"). The one piece still
-missing was an *automatic* raise -- `engine.ubatch_size` had to be set by hand. A gauntlet run at
+missing was an *automatic* raise -- `engine.ubatch_size` had to be set by hand. A CrucibleForge run at
 `--parallel 8` made the case: eight cold slots re-prefilling a shared prompt is exactly the large
 combined prefill a bigger micro-batch speeds up, and it was running at the engine's 512. So
 `engine.ubatch_many_slots` (default **1024**, the measured +13.6% rung) now applies above
