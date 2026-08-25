@@ -1,6 +1,7 @@
 # StudioForge
 
 [![CI](https://github.com/LaserLloyd/StudioForge/actions/workflows/ci.yml/badge.svg)](https://github.com/LaserLloyd/StudioForge/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 A self-hosted, **GPU-only** LLM server: an OpenAI-compatible gateway over
 [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server`, with a model registry, a VRAM
@@ -325,5 +326,10 @@ StudioForge is built and maintained by **Lloyd** — [LaserLloyd.com](https://la
 
 ## License
 
-**Not yet chosen — all rights reserved for now.** There is deliberately no `LICENSE` file: until
-one is picked, no permission to copy, modify or redistribute is granted.
+**MIT** — see [`LICENSE`](LICENSE). Use it, fork it, ship it; keep the copyright notice.
+
+The dependencies are permissive too (MIT, BSD, Apache-2.0) with one exception worth naming:
+`pystray`, which draws the Windows system-tray icon, is **LGPL-3.0**. It is an unmodified
+dependency installed by pip and imported at runtime — that is the arrangement the LGPL is written
+for, and it does not reach into this project's own terms. If you redistribute a bundled or frozen
+build that embeds it, the LGPL's relinking obligation is yours to satisfy.

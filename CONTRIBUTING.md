@@ -130,3 +130,9 @@ that needs real GPUs. Decisions with a *why* go in `DECISIONS.md`, numbered.
 Everything the app writes lives in the data dir: `SF_DATA_DIR`, else `<repo>/data`, else the
 platform directory (DECISIONS.md D25). `data/` is gitignored. Two servers cannot share one data
 dir — the second becomes a read-only *secondary* (D24) — so stop one before starting the other.
+
+## Licensing of contributions
+
+The project is **MIT** ([`LICENSE`](LICENSE)). Contributions are accepted under the same terms:
+opening a pull request means you agree your work is licensed MIT and that you have the right to
+licence it. There is no separate CLA.

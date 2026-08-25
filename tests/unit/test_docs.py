@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 import sys
+import tomllib
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -105,3 +106,39 @@ def test_every_studioforge_command_named_in_the_docs_exists() -> None:
     prose = {"is", "and", "the", "a", "an", "can", "does", "exists", "listens", "never"}
     unknown = used - known - prose
     assert not unknown, f"docs name studioforge commands that do not exist: {sorted(unknown)}"
+
+
+def test_the_repository_carries_a_licence_and_both_packages_declare_it() -> None:
+    """A public repo with no LICENSE is 'all rights reserved'.
+
+    That contradicted CONTRIBUTING inviting contributions, and left every fork
+    and every published wheel legally unusable. The three artefacts have to
+    agree: the file, the server's metadata, and the companion's -- the
+    companion is built as its own wheel, so a root-only LICENSE would ship a
+    licence-less package.
+    """
+    licence = REPO_ROOT / "LICENSE"
+    assert licence.is_file(), "no LICENSE file at the repository root"
+    text = licence.read_text(encoding="utf-8")
+    assert "MIT License" in text
+    assert "Copyright (c)" in text
+
+    for pyproject in (
+        REPO_ROOT / "pyproject.toml",
+        REPO_ROOT / "packages" / "studioforge-companion" / "pyproject.toml",
+    ):
+        project = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]
+        assert project.get("license") == "MIT", f"{pyproject} declares no licence"
+        assert project.get("license-files"), f"{pyproject} ships no licence file"
+        # PEP 639: an SPDX expression and a trove classifier together is a
+        # build error, so the classifier must stay out.
+        assert not [c for c in project.get("classifiers", []) if c.startswith("License ::")], (
+            f"{pyproject} mixes a licence classifier with the SPDX expression"
+        )
+
+    companion_licence = REPO_ROOT / "packages" / "studioforge-companion" / "LICENSE"
+    assert companion_licence.is_file(), "the companion wheel would ship without a LICENSE"
+    assert companion_licence.read_text(encoding="utf-8") == text
+
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    assert "all rights reserved" not in readme.lower()

@@ -7,8 +7,12 @@ readme = "README.md"
 # (an OpenClaw host, a laptop, a NAS), which frequently lags the server rig.
 # tomllib is stdlib from 3.11, so reading config needs no extra dependency.
 requires-python = ">=3.11"
-# No licence chosen yet: all rights reserved. Do not add a licence
-# classifier or a LICENSE file until one is picked deliberately.
+# Same MIT terms as the server it talks to. The LICENSE here is a copy of the
+# repository root one, not a symlink and not a `../../` path: this package is
+# built as its own wheel, and a license-files entry that escapes the project
+# root lands in the wheel as `dist-info/licenses/../../LICENSE`.
+license = "MIT"
+license-files = ["LICENSE"]
 keywords = ["llm", "llama.cpp", "mcp", "cli", "studioforge"]
 
 # Deliberately does NOT depend on `studioforge`. The companion is a pure
