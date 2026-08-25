@@ -106,7 +106,10 @@ classified `other-instance` is a `llama-server` from a different install; its `d
 The watchdog on `:1235` answers when the server does not: `sfctl recover --restart` (or `POST
 http://127.0.0.1:1235/restart` with the API key or PIN) kills the process tree and — unless a live
 tray launched the server, in which case the tray does it — spawns the replacement. Exactly one
-process respawns (D28). `sfctl recover` also has `kill_model`, `gpu_status`, `tail_logs`.
+process respawns (D28). The watchdog's read-only diagnostics are on the same command and
+are the right first move: `sfctl recover --gpus`, `--logs <n>` (add `--log-model <id>` for
+one model's log) and `--config`. Then `--kill <model>` or `--nuke` to free VRAM without a
+full restart.
 
 ## Restarts and who brings it back
 

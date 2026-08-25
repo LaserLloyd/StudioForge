@@ -47,6 +47,10 @@ EXIT_USAGE = 2
 EXIT_CONFIRM = 3
 EXIT_UNREACHABLE = 4
 EXIT_AUTH = 5
+#: A human was asked and said no. Distinct from EXIT_CONFIRM on purpose: one is
+#: "you did not pass --yes and there is no terminal to ask", which a wrapper
+#: can fix by passing the flag, and the other is a refusal, which it must not.
+EXIT_DECLINED = 6
 
 #: Rendered into ``sfctl --help`` so the contract is discoverable from the shell.
 EXIT_CODE_TABLE: tuple[tuple[int, str], ...] = (
@@ -56,6 +60,7 @@ EXIT_CODE_TABLE: tuple[tuple[int, str], ...] = (
     (EXIT_CONFIRM, "confirmation required (destructive command, no --yes, no tty)"),
     (EXIT_UNREACHABLE, "server unreachable (refused / timed out / DNS)"),
     (EXIT_AUTH, "auth failed (missing or wrong API key)"),
+    (EXIT_DECLINED, "declined at the confirmation prompt"),
 )
 
 
@@ -432,6 +437,94 @@ class StudioForgeClient:
 
     async def introspect(self, model: str) -> Any:
         return await self.get(f"models/{_path_segment(model)}/introspect")
+
+    async def placement_profiles(self, model: str) -> Any:
+        """Best achievable load per hardware mode -- the ``model_options`` table."""
+        return await self.get(f"models/{_path_segment(model)}/profiles")
+
+    async def load_recommended(
+        self,
+        model: str,
+        *,
+        ctx_size: int,
+        prefer_mode: str | None = None,
+        kv_min: str | None = None,
+    ) -> Any:
+        """Load at exactly ``ctx_size`` per slot, or refuse with a 507.
+
+        The distinction from :meth:`load` is the whole point: this one either
+        gives the window that was asked for or says it cannot, instead of
+        quietly shrinking it.
+        """
+        body: dict[str, Any] = {"ctx_size": ctx_size}
+        if prefer_mode is not None:
+            body["prefer_mode"] = prefer_mode
+        if kv_min is not None:
+            body["kv_min"] = kv_min
+        return await self.post(f"models/{_path_segment(model)}/load-recommended", body)
+
+    # -- GPU leases (D43) --------------------------------------------------
+    #
+    # A co-tenant that cannot SEE a standing lease will keep trying to plan
+    # onto held cards and read the refusals as a broken rig, so the read side
+    # matters at least as much as the write side.
+
+    async def leases(self) -> Any:
+        return await self.get("leases")
+
+    async def create_lease(
+        self,
+        *,
+        devices: list[int],
+        model_ids: list[str] | None = None,
+        holder: str = "sfctl",
+        reason: str = "",
+        idle_ttl_s: float | None = 3600.0,
+        force: bool = False,
+    ) -> Any:
+        return await self.post(
+            "leases",
+            {
+                "devices": devices,
+                "model_ids": model_ids,
+                "holder": holder,
+                "reason": reason,
+                "idle_ttl_s": idle_ttl_s,
+                "force": force,
+            },
+        )
+
+    async def release_lease(self, lease_id: str) -> Any:
+        return await self.delete(f"leases/{_path_segment(lease_id)}")
+
+    async def touch_lease(self, lease_id: str) -> Any:
+        return await self.post(f"leases/{_path_segment(lease_id)}/touch")
+
+    # -- Hugging Face -------------------------------------------------------
+
+    async def hf_search(
+        self,
+        query: str,
+        *,
+        limit: int = 20,
+        author: str | None = None,
+        sort: str = "downloads",
+        newer_than_days: int | None = None,
+        with_context: bool = False,
+    ) -> Any:
+        return await self.get(
+            "hf/search",
+            q=query,
+            limit=limit,
+            author=author,
+            sort=sort,
+            newer_than_days=newer_than_days,
+            with_context=with_context,
+        )
+
+    async def hf_repo(self, repo_id: str) -> Any:
+        """One repo's quants with a fit verdict and a per-GPU-set context matrix."""
+        return await self.get(f"hf/repo/{_path_segment(repo_id)}")
 
     async def logs(self, n: int = 200, level: str | None = None) -> Any:
         return await self.get("logs", n=n, level=level)

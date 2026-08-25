@@ -240,8 +240,12 @@ one right-click away:
 ## The companion: `sfctl`
 
 [`packages/studioforge-companion`](packages/studioforge-companion/) installs anywhere — no CUDA, no
-server dependencies — and is the remote control for the host: `sfctl status`, `models load/unload/pin`,
-`download`, `logs`, `config`, `update`, and `sfctl recover` for when the server is wedged.
+server dependencies — and is the remote control for the host: `sfctl status` (GPUs, loaded models and
+any standing GPU lease), `models load/unload/pin`, `models options` and `models load-recommended` (the
+planner's per-mode table, and a load that refuses rather than silently shrinking your context),
+`search` and `models repo` (find a GGUF on Hugging Face, then read its headers for a real fit verdict),
+`leases` (claim cards so nothing else is planned onto them), `download`, `logs`, `config`, `update`,
+and `sfctl recover` for when the server is wedged.
 `sfctl mcp` is the stdio MCP bridge from path C.
 
 ## Ports

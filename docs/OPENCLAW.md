@@ -507,9 +507,16 @@ the holder's pid in `instance_holder_pid`. That is one process per data director
 
 ```bash
 sfctl recover                 # diagnose: up / degraded / wedged / down
+sfctl recover --gpus          # GPU state, read THROUGH the watchdog
+sfctl recover --logs 200      # tail the server log through the watchdog
+sfctl recover --config        # the server config, secrets redacted
 sfctl recover --kill <model>  # free VRAM without a full restart
 sfctl recover --restart       # restart the wedged server
 ```
+
+The first four read; they change nothing. They go through the watchdog on purpose: the
+same diagnostics on the main server are served by the process that is not answering, so
+looking before choosing which hammer to reach for needs the sidecar too.
 
 **Something loaded but behaves oddly.** `sfctl models info <model>` shows what the engine *actually*
 reports (real context, slot count, whether speculative decoding is armed) next to what was

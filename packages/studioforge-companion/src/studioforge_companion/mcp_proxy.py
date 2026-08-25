@@ -37,12 +37,11 @@ session, which is exactly the outcome this design exists to prevent.
 
 from __future__ import annotations
 
-import contextlib
-
 try:  # the MCP SDK builds its client with httpx2; match it exactly
     from httpx2 import Timeout as _Timeout
 except ImportError:  # pragma: no cover - older SDKs are on httpx
     from httpx import Timeout as _Timeout
+import contextlib
 import time
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack
@@ -502,6 +501,22 @@ async def probe_watchdog_auth(profile: ServerProfile, *, timeout_s: float = 5.0)
     try:
         async with httpx.AsyncClient(timeout=timeout_s) as client:
             response = await client.post(profile.watchdog_mcp_url, json=body, headers=headers)
+            # A successful `initialize` ALLOCATES a session on the watchdog,
+            # and this probe never sent `notifications/initialized` and never
+            # tore one down -- so every failed `recover` left a half-open
+            # session behind on the one process whose job is to still be
+            # working when everything else is not. Streamable-HTTP's own
+            # teardown is DELETE with the session id. Best-effort: the answer
+            # to the question being asked is already in `status_code`, and a
+            # watchdog that will not close a session must not turn a
+            # diagnostic into an error.
+            session_id = response.headers.get("mcp-session-id")
+            if session_id and response.status_code < 400:
+                with contextlib.suppress(Exception):
+                    await client.delete(
+                        profile.watchdog_mcp_url,
+                        headers={**headers, "mcp-session-id": session_id},
+                    )
     except Exception:  # noqa: BLE001 - any transport failure is "unreachable"
         return "unreachable"
     if response.status_code in (401, 403):

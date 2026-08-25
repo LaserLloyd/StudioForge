@@ -33,6 +33,7 @@ from typing import Any
 
 import httpx
 import pytest
+import typer
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 COMPANION_SRC = REPO_ROOT / "packages" / "studioforge-companion" / "src"
@@ -543,6 +544,14 @@ def _invoke(server: ServerHandle, *args: str, env: dict[str, str] | None = None)
         (["--nuke"], "nuke_all_models", {"confirm": True}),
         (["--kill", "qwen"], "kill_model", {"model_name": "qwen"}),
         ([], "health", {}),
+        # The READ side. `recover` reached 4 of the watchdog's 10 tools -- a
+        # health check and three ways to kill things -- so when the main
+        # server was wedged (the situation the watchdog exists for) the CLI
+        # offered no way to LOOK at the box before choosing which.
+        (["--gpus"], "gpu_status", {}),
+        (["--logs", "50"], "tail_logs", {"n": 50}),
+        (["--logs", "50", "--log-model", "qwen"], "tail_logs", {"n": 50, "model_id": "qwen"}),
+        (["--config"], "get_config", {}),
     ],
 )
 def test_recover_sends_arguments_the_watchdog_actually_accepts(
@@ -587,6 +596,7 @@ def test_recover_sends_arguments_the_watchdog_actually_accepts(
         ["models", "list"],
         ["config", "get"],
         ["openclaw-setup"],
+        ["leases", "list"],
     ],
 )
 def test_cli_commands_render(live_server: ServerHandle, command: list[str]) -> None:
@@ -603,6 +613,7 @@ def test_cli_commands_render(live_server: ServerHandle, command: list[str]) -> N
         ["models", "list"],
         ["config", "get"],
         ["openclaw-setup"],
+        ["leases", "list"],
     ],
 )
 def test_cli_commands_json(live_server: ServerHandle, command: list[str]) -> None:
@@ -1204,3 +1215,145 @@ def test_recover_still_says_unreachable_when_the_watchdog_is_down(monkeypatch: A
     out = _all_output(result)
     assert "cannot reach the StudioForge watchdog" in out
     assert "needs a credential" not in out
+
+
+# ---------------------------------------------------------------------------
+# GPU leases: the read side is what a co-tenant needs
+# ---------------------------------------------------------------------------
+
+
+def test_status_renders_a_standing_lease(monkeypatch: Any, live_server: ServerHandle) -> None:
+    """`/api/status` has carried the lease book since D43 and `sfctl status`
+    threw it away, so nothing in the CLI could tell you the rig was LEASED --
+    and a harness holding all four cards makes every load fail with a refusal
+    that reads like a broken rig.
+
+    Injected at the client, because a real lease needs a real CUDA device and
+    CI has none. What is under test is the rendering, not the server.
+    """
+    real_status = cli_module.StudioForgeClient.status
+
+    async def status_with_a_lease(self: Any) -> Any:
+        payload = await real_status(self)
+        payload["leases"] = [
+            {
+                "id": "lease-abc",
+                "devices": [0, 1],
+                "holder": "crucibleforge",
+                "model_ids": [],
+                "reason": "benchmark run",
+                "idle_s": 12,
+                "expires_at": time.time() + 600,
+            }
+        ]
+        return payload
+
+    monkeypatch.setattr(cli_module.StudioForgeClient, "status", status_with_a_lease)
+    result = _invoke(live_server, "status")
+    assert result.exit_code == 0, _all_output(result)
+    output = _all_output(result)
+    assert "lease-abc" in output
+    assert "crucibleforge" in output
+    # An EMPTY model list is the STRONGEST claim -- nobody may plan onto those
+    # cards -- so it must never render as "-", which reads like no restriction.
+    assert "nothing may load" in output
+
+
+def test_the_lease_plane_is_reachable_from_the_cli(live_server: ServerHandle) -> None:
+    """`/api/leases` has been live with no CLI in front of it: create, list,
+    touch and release all had to go through `sfctl mcp`."""
+    from studioforge_companion import cli as cli_mod
+
+    for name in ("list", "add", "release", "touch"):
+        assert name in {c.name for c in cli_mod.leases_app.registered_commands}, name
+
+    created = _invoke(
+        live_server, "leases", "add", "--devices", "0", "--holder", "pytest", "--json"
+    )
+    if created.exit_code != 0:
+        # CI has no NVIDIA driver, so the probe reports zero cards and the
+        # server refuses device 0. That refusal still proves the request
+        # reached `/api/leases` with the right body -- which is the wiring
+        # under test -- so assert on it rather than skipping silently.
+        refusal = json.loads(created.output)
+        assert "CUDA device" in str(refusal.get("error", "")), refusal
+        pytest.skip("no CUDA devices on this machine; lease round-trip needs one")
+    lease_id = json.loads(created.output)["id"]
+    try:
+        listed = json.loads(_invoke(live_server, "leases", "list", "--json").output)
+        assert any(entry["id"] == lease_id for entry in listed["leases"])
+        # And status sees it, which is the whole point.
+        status = json.loads(_invoke(live_server, "status", "--json").output)
+        assert any(entry["id"] == lease_id for entry in status["leases"])
+        touched = _invoke(live_server, "leases", "touch", lease_id, "--json")
+        assert touched.exit_code == 0, _all_output(touched)
+    finally:
+        released = _invoke(live_server, "leases", "release", lease_id, "--json")
+        assert released.exit_code == 0, _all_output(released)
+    after = json.loads(_invoke(live_server, "leases", "list", "--json").output)
+    assert not any(entry["id"] == lease_id for entry in after["leases"])
+
+
+def test_the_headline_read_commands_exist(live_server: ServerHandle) -> None:
+    """0.2.0's own features were reachable only through `sfctl mcp`."""
+    from studioforge_companion import cli as cli_mod
+
+    top = {c.name or c.callback.__name__.replace("_", "-") for c in cli_mod.app.registered_commands}
+    assert "search" in top
+    model_commands = {
+        c.name or c.callback.__name__.replace("_", "-")
+        for c in cli_mod.models_app.registered_commands
+    }
+    assert {"options", "repo", "load-recommended"} <= model_commands
+
+
+# ---------------------------------------------------------------------------
+# Minor contract fixes
+# ---------------------------------------------------------------------------
+
+
+def test_declining_a_prompt_is_a_different_exit_code_from_needing_one(monkeypatch: Any) -> None:
+    """Both used to be 3, so a wrapper could not tell "pass --yes" (retryable)
+    from "a human said no" (must not be retried)."""
+    from studioforge_companion.client import EXIT_CONFIRM, EXIT_DECLINED
+
+    assert EXIT_CONFIRM != EXIT_DECLINED
+
+    monkeypatch.setattr(cli_module.sys.stdin, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr(cli_module.typer, "confirm", lambda *a, **k: False)
+    with pytest.raises(typer.Exit) as declined:
+        cli_module._confirm("do the thing?", yes=False)
+    assert declined.value.exit_code == EXIT_DECLINED
+
+    monkeypatch.setattr(cli_module.sys.stdin, "isatty", lambda: False, raising=False)
+    with pytest.raises(typer.Exit) as needed:
+        cli_module._confirm("do the thing?", yes=False)
+    assert needed.value.exit_code == EXIT_CONFIRM
+
+
+async def test_a_download_that_vanishes_is_not_reported_as_finished() -> None:
+    """The follower returned its STARTING payload when the group stopped being
+    listed, so a never-observed download printed the same success line as a
+    verified one -- carrying status="queued"."""
+
+    class _Client:
+        async def downloads(self) -> dict[str, Any]:
+            return {"downloads": []}
+
+    result = await cli_module._follow_download(
+        _Client(),  # type: ignore[arg-type]
+        "group-1",
+        {"repo_id": "someone/model-GGUF", "quant": "Q4_K_M", "status": "queued"},
+    )
+    assert result["vanished"] is True
+    assert result["status"] != "queued"
+
+
+def test_an_id_column_is_not_squeezed_to_nothing() -> None:
+    """Model ids are `publisher/repo/file-stem`. Rich divides a narrow terminal
+    proportionally, so the id folded to a few characters a line while
+    single-digit numeric columns kept their width."""
+    table = cli_module._table("Model", "State", "Ctx", "Port", "PID")
+    by_header = {str(column.header): column for column in table.columns}
+    assert by_header["Model"].min_width == cli_module._ID_COLUMN_MIN_WIDTH
+    assert by_header["Ctx"].min_width is None
