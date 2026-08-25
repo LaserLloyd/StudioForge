@@ -419,7 +419,7 @@ def test_a_cross_site_page_on_the_operators_browser_gets_403_and_no_pin(tmp_path
         assert info.status_code == 200
         assert info.json()["pin"] is None
         assert info.json()["pin_note"] == PIN_WITHHELD_NOTE
-        # The query carrier is parsed but no longer advertised.
+        # The query carrier is refused outright (D44), and never advertised.
         assert all("?pin=" not in a for a in info.json()["auth"]["alternatives"])
         # Same origin (TestClient's Host is "testserver") is the operator's own tab.
         same = {"Origin": "http://testserver"}
@@ -508,3 +508,121 @@ def test_mcp_disabled_leaves_the_endpoint_unmounted(tmp_path: Any) -> None:
     with TestClient(app, client=("127.0.0.1", 50000)) as local:
         assert local.post("/mcp", json={}, headers={"X-MCP-Pin": "12345678"}).status_code == 404
     assert getattr(app.state, "management_mcp", None) is None
+
+
+# ---------------------------------------------------------------------------
+# D44: an eight-digit PIN is only a secret while guessing is slow
+# ---------------------------------------------------------------------------
+
+
+def _reset_guard() -> None:
+    from studioforge.api.auth import GUARD
+
+    GUARD.reset()
+
+
+def test_a_pin_in_the_query_string_is_refused(tmp_path: Any) -> None:
+    """It used to be parsed and accepted. A URL is written to reverse-proxy
+    access logs, browser history and shell history, none of which expire --
+    and neither does the PIN. Header or bearer only."""
+    from fastapi.testclient import TestClient
+
+    _reset_guard()
+    body = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
+    accept = {"accept": "application/json, text/event-stream"}
+    with TestClient(_open_app(tmp_path), client=("192.168.1.50", 5000)) as lan:
+        refused = lan.post("/mcp?pin=12345678", json=body, headers=accept)
+        assert refused.status_code == 401, refused.text
+        message = refused.json()["error"]["message"]
+        # And it explains itself, so a URL that used to work does not merely
+        # look like a wrong PIN.
+        assert "?pin=" in message and "X-MCP-Pin" in message
+    _reset_guard()
+    with TestClient(_open_app(tmp_path), client=("192.168.1.50", 5000)) as lan:
+        ok = lan.post("/mcp", json=body, headers={**accept, "X-MCP-Pin": "12345678"})
+        assert ok.status_code != 401, ok.text
+
+
+def test_the_watchdog_also_refuses_a_pin_in_the_query_string() -> None:
+    """The recovery surface carries the destructive tools; it took ?pin= too."""
+    from studioforge.watchdog.server import _pin_from_request
+
+    scope = {"headers": [], "query_string": b"pin=12345678"}
+    assert _pin_from_request(scope) is None
+
+
+def test_wrong_pins_are_locked_out_with_a_doubling_backoff() -> None:
+    """Measured on the rig: eight wrong PINs, ~13ms each, no counter, no
+    lockout -- 10^8 walked by one machine in hours."""
+    _reset_guard()
+    from studioforge.api.auth import GUARD, check_request
+
+    config = open_config()
+    config.mcp.pin_required = True
+
+    def attempt(pin: str) -> int:
+        request = make_request("/mcp", method="POST", headers={"X-MCP-Pin": pin})
+        try:
+            check_request(request, config)
+        except AuthError as exc:
+            return exc.status_code
+        return 200
+
+    # Three free tries, all plain 401s -- an operator mistyping is not punished.
+    assert [attempt("00000000") for _ in range(3)] == [401, 401, 401]
+    # The fourth arms the lockout, and the fifth attempt is refused before any
+    # comparison happens.
+    assert attempt("00000000") == 401
+    assert attempt("00000000") == 429
+    # Even a CORRECT PIN loses while the lockout stands: refused before the
+    # compare, so guessing buys nothing.
+    assert attempt("12345678") == 429
+
+    # The 429 tells the caller how long, in the shape sfctl parses.
+    request = make_request("/mcp", method="POST", headers={"X-MCP-Pin": "00000000"})
+    with pytest.raises(AuthError) as caught:
+        check_request(request, config)
+    assert caught.value.code == "too_many_credential_attempts"
+    assert caught.value.details["retry_after_s"] >= 1
+
+    # A success clears the record.
+    GUARD.reset()
+    assert attempt("12345678") == 200
+    _reset_guard()
+
+
+def test_the_lockout_only_counts_callers_that_offered_a_credential() -> None:
+    """An open install serves plenty of credential-free traffic (that is the
+    LM Studio parity the product depends on). Counting those would let a
+    chatty poller lock the operator's own address out."""
+    _reset_guard()
+    from studioforge.api.auth import GUARD, check_request
+
+    config = open_config()
+    for _ in range(20):
+        check_request(make_request("/v1/models"), config)
+    assert GUARD.retry_after("192.168.1.50") == 0.0
+    _reset_guard()
+
+
+def test_a_lockout_is_per_client_address() -> None:
+    """One sprayer must not lock the operator out of their own rig."""
+    _reset_guard()
+    from studioforge.api.auth import GUARD, check_request
+
+    config = open_config()
+    config.mcp.pin_required = True
+    for _ in range(6):
+        with pytest.raises(AuthError):
+            check_request(
+                make_request(
+                    "/mcp",
+                    method="POST",
+                    headers={"X-MCP-Pin": "00000000"},
+                    client=("192.168.1.99", 5000),
+                ),
+                config,
+            )
+    assert GUARD.retry_after("192.168.1.99") > 0
+    assert GUARD.retry_after("192.168.1.50") == 0.0
+    _reset_guard()

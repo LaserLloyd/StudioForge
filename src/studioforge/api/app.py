@@ -67,7 +67,13 @@ class AuthMiddleware(BaseHTTPMiddleware):
         try:
             check_request(request, self.config)
         except StudioForgeError as exc:
-            return JSONResponse(exc.to_payload(), status_code=exc.status_code)
+            headers: dict[str, str] = {}
+            if exc.status_code == 429 and exc.details.get("retry_after_s"):
+                # The middleware short-circuits before the exception handler
+                # below ever runs, so the header has to be set here too or a
+                # locked-out client gets the wait only in the JSON body.
+                headers["Retry-After"] = str(exc.details["retry_after_s"])
+            return JSONResponse(exc.to_payload(), status_code=exc.status_code, headers=headers)
         if request.url.path not in _NO_BOOT_WAIT_PATHS:
             await wait_for_boot(request.app.state, timeout_s=SCAN_WAIT_S, scan_only=True)
         return await call_next(request)
@@ -800,6 +806,11 @@ def _install_error_handlers(app: FastAPI) -> None:
         # wait instead of leaving it to guess a backoff (and hammer us).
         if exc.status_code == 503:
             headers["Retry-After"] = str(exc.details.get("retry_after_s", 5))
+        # 429 is the credential lockout. Same reasoning: the wait is a fact the
+        # server knows, so it goes in the header every HTTP client already
+        # understands, not only in the JSON body.
+        elif exc.status_code == 429 and exc.details.get("retry_after_s"):
+            headers["Retry-After"] = str(exc.details["retry_after_s"])
         return JSONResponse(exc.to_payload(), status_code=exc.status_code, headers=headers)
 
     from fastapi.exceptions import RequestValidationError

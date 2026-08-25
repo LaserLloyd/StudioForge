@@ -566,8 +566,9 @@ async def mcp_info(request: Request) -> dict[str, Any]:
         "pin_required": pin_needed,
         "auth": {
             "header": "X-MCP-Pin",
-            # The ?pin= query form is still parsed but no longer advertised:
-            # a URL lands in proxy logs and shell history (see extract_pin).
+            # The ?pin= query form is refused outright, not merely
+            # unadvertised: a URL lands in proxy logs, browser history and
+            # shell history (see auth.PIN_IN_QUERY_NOTE).
             "alternatives": ["Authorization: Bearer <pin>"],
             "api_key_also_accepted": bool(config.server.api_key),
         },

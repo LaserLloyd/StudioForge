@@ -143,8 +143,12 @@ process respawns (D28). `sfctl recover` also has `kill_model`, `gpu_status`, `ta
   even with `mcp.pin_required: false`; `GET /api/mcp/info` reports the `pin_required` a caller is
   really held to.
 * The PIN is in the startup banner and `studioforge config` on the box; **Generate new PIN** on the
-  Setup tab rotates it after a leak. Send it as `X-MCP-Pin` or the bearer token — `?pin=` still
-  works but lands in proxy logs and shell history, which is why nothing advertises it any more.
+  Setup tab rotates it after a leak. Send it as `X-MCP-Pin` or the bearer token. `?pin=` in the URL
+  is refused: a URL lands in proxy logs, browser history and shell history.
+* Wrong credentials are rate-limited. Three free attempts per client address, then a doubling
+  lockout (1s, 2s, 4s … capped at 5 minutes) that clears after 15 quiet minutes or on any
+  success. A locked-out caller gets `429` with `Retry-After`. The main server and the watchdog
+  count separately, so neither door can lock the other.
 * Vision requests never fetch an image from loopback, link-local, private, ULA or CGNAT space
   (`100.64.0.0/10`, the tailnet) unless `gateway.allow_private_image_hosts` is on.
 

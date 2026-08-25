@@ -2873,3 +2873,48 @@ the tailnet it names in its own reason for existing -- `is_private` never covere
   load planning in that window saw the cards free. Two overlapping grants now conflict at the
   book before either unloads anything, and a victim that picked up a request between the scan
   and its stop refuses the grant (D36) instead of being torn down.
+
+## D44 -- An eight-digit PIN is only a secret while guessing is slow
+
+The MCP pairing PIN is eight digits by design: its whole job is to be read off
+the startup banner and typed into a connector, the way a TV shows a code. A
+10^8 keyspace is a fair trade for that -- but only if an attacker gets a few
+attempts, not a few million.
+
+Measured on the live rig on 2026-08-24: eight wrong PINs in a row, every one
+answered in about 13 ms, no counter, no lockout, and the correct PIN still
+worked immediately afterwards. One machine walks the whole keyspace in hours.
+That PIN is the only thing in front of `restart_server`, `nuke_all_models`,
+`rollback_update`, `reclaim_orphan_engines` and `set_config` on an install
+with no `server.api_key` -- which is the shipped default.
+
+Two changes.
+
+**A doubling lockout, per client address** (`studioforge.credential_guard`).
+Three wrong answers are free -- a mistyped PIN and a retry -- and every failure
+after that locks that address out for 1s, 2s, 4s … capped at five minutes. The
+record is dropped after fifteen quiet minutes, or immediately on any success,
+so an operator who fat-fingers it is barely inconvenienced. A locked-out client
+is refused *before* the comparison runs, so a correct guess arriving mid-lockout
+wins nothing. At the cap that is under 300 guesses a day from one address:
+hours becomes geological time. The refusal is a `429` carrying both
+`Retry-After` and `retry_after_s`, the shape `sfctl` already parses.
+
+The main server and the watchdog get **separate** counters. They are separate
+processes and separate doors; a spray at one must not lock the operator out of
+the other, and the watchdog exists precisely for when the main server is not
+answering. It is a rate limiter keyed on a client-supplied address, so a caller
+with many source addresses degrades it -- `server.api_key` remains the answer
+for anything reachable off the box. This makes the default install defensible,
+not perfect.
+
+**`?pin=` is refused, not merely unadvertised.** The previous decision (D32,
+amended 2026-08-22) stopped advertising the query form but kept parsing it for
+connectors configurable only by URL. That was the wrong side of the trade: a
+URL is written to reverse-proxy access logs, browser history, shell history,
+referrer headers and crash reports -- none of which expire -- for a credential
+that does not expire either. The `X-MCP-Pin` header costs a connector one
+configuration field. Both the main app and the watchdog now take the PIN from
+a header or the bearer slot only, and both detect the retired form so the 401
+can say *why* a URL that used to work no longer does, rather than looking like
+a wrong PIN.
