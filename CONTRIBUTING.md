@@ -115,7 +115,10 @@ restating the reasoning in three places.
   Personal identifiers — a name, a machine, a tailnet — live in `scripts/scrub-rules.local.txt`,
   which is git-ignored: publishing the list of words that must never be published is its own leak.
   CI therefore runs with the generic patterns only, and says so in its output. Your clone is where
-  the identifier rules actually fire.
+  the identifier rules actually fire. Every verdict — the clean line and `--selftest`'s `OK` — ends
+  with how many identifier rules were loaded, so a "clean" can never be read as more than it was;
+  `--require-local-rules` turns that caption into a gate (exit 2 on zero) for a release check on a
+  machine that is supposed to have the file. Do not add it to CI, where the file never exists.
 
 ## Where things are
 

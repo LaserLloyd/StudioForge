@@ -233,6 +233,24 @@ def load_local_rules(path: Path | None = None) -> list[tuple[re.Pattern, str]]:
     return rules
 
 
+def local_rule_summary() -> tuple[int, str]:
+    """How many private-identifier rules this run actually loaded, in words.
+
+    A "clean" verdict is worth exactly what the rule set behind it was, and
+    `scripts/scrub-rules.local.txt` is git-ignored on purpose — so a fresh
+    clone, or CI, scans with the GENERIC rules only and still prints clean.
+    Every verdict now states the count, so a clean line can never be read as
+    more than it is. `--require-local-rules` turns that from a caption into a
+    gate.
+    """
+    n = len(load_local_rules())
+    if n:
+        return n, (f"{n} private identifier rule(s) loaded from "
+                   f"scripts/scrub-rules.local.txt")
+    return 0, ("0 private identifier rules — scripts/scrub-rules.local.txt is "
+               "absent, so GENERIC rules only")
+
+
 def _skipped(rel: str) -> bool:
     return any(part in SKIP_DIRS for part in Path(rel).parts)
 
@@ -721,7 +739,9 @@ def selftest() -> int:
         for f in failures:
             print(f"  {f}", file=sys.stderr)
         return 1
-    print("OK")
+    # State the rule set the OK stands on: the local file is git-ignored, so
+    # "OK" on a fresh clone means the GENERIC rules passed and nothing more.
+    print(f"OK ({local_rule_summary()[1]})")
     return 0
 
 
@@ -737,7 +757,7 @@ def _report(problems: list[str], scanned: str) -> int:
               "\n(A commit message cannot carry a marker \u2014 reword it instead.)\n",
               file=sys.stderr)
         return 1
-    print(f"\u2713 scrub_check: clean ({scanned})")
+    print(f"\u2713 scrub_check: clean ({scanned}; {local_rule_summary()[1]})")
     return 0
 
 
@@ -762,7 +782,25 @@ def main() -> int:
                          "'<sha> --not --remotes=origin' (pre-push)")
     ap.add_argument("--selftest", action="store_true",
                     help="verify --staged really reads the index, then exit")
+    # siftforge's copy spells it --self-test; accept both so a runbook written
+    # against either repo works here rather than dying on an unknown flag.
+    ap.add_argument("--self-test", dest="selftest", action="store_true",
+                    help=argparse.SUPPRESS)
+    ap.add_argument("--require-local-rules", action="store_true",
+                    help="fail (exit 2) unless scripts/scrub-rules.local.txt "
+                         "loaded at least one private-identifier rule — for CI "
+                         "or a release gate, where a generic-rules-only 'clean' "
+                         "must not pass as a privacy check")
     args = ap.parse_args()
+
+    if args.require_local_rules and not local_rule_summary()[0]:
+        print("scrub_check: --require-local-rules was given, but "
+              "scripts/scrub-rules.local.txt loaded 0 rules.\n"
+              "            This run would have checked GENERIC patterns only "
+              "and still printed 'clean'.\n"
+              "            Refusing: a verdict that overstates what it checked "
+              "is worse than no verdict.", file=sys.stderr)
+        return 2
 
     if args.selftest:
         return selftest()
