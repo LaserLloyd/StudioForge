@@ -3071,3 +3071,67 @@ these is a new rule, each is the decision above actually enforced.
   reclaims idle residents of every tier), and the gate trades FIFO progress
   for tier order -- a sustained stream of tier-1/2 loads can park a
   background waiter, accepted and documented rather than papered over.
+
+## D47 -- The 2026-08-26 ops review: close the failures that report success
+
+An OpenClaw-side agent reviewed the running rig read-only and filed a grounded
+list (client-kept document, 2026-08-26). The thread through its server-side
+items is one defect class: **operations that "work" and are quietly wrong** --
+a settings write that silently nulls forty fields, a fallback window a session
+cannot live in, an eviction whose "why" scrolls away, a benchmark only its
+starter can find, a placement at half speed with nothing saying so, and an
+open inference port whose abusers cannot be named. Landed together:
+
+1. **`PATCH /api/models/{id}/settings`** (RFC 7386 merge: present keys set,
+   ``null`` clears, absent untouched; an unknown key is a 400 naming it, not
+   an ignored no-op). PUT stays the full replace and now says so loudly.
+   Same D32 gate as PUT; `sfctl models settings --set` writes through PATCH
+   now, so only the named fields travel.
+2. **`settings.min_ctx`**: refuse a load whose planned window per slot would
+   land below it -- for the JIT path especially, where a 61k window that
+   "works" per turn shreds a 51k-prompt session through compaction. Applied
+   only when the request names no ctx_size (D14: an explicit ask is honoured);
+   the refusal names the setting.
+3. **`settings.allowed_devices`**: the soft cousin of ``device_override`` --
+   a set the planner may choose within, so a model with otherwise-null
+   settings cannot sprawl onto cards its owner never meant for it. An
+   explicit override outranks it, like it outranks ``excluded_devices``.
+4. **`LoadPlan.placement_tier`** (``optimal``/``degraded``) and a plan note
+   whenever a split mixes compute generations -- measured ~half generation
+   speed on this rig's 5090+3090 splits, previously surfacing as a different
+   complaint. A thinking-arch model loading with no ``reasoning_format`` also
+   warns at load time, since that failure lands on the client.
+5. **`GET /api/evictions`**: a ring of ``{ts, evicted, evicted_by, reason,
+   freed_bytes, priority}`` with ``reason`` in {plan, oom-retry, ttl, lease,
+   removed}. In-memory on purpose: the question is asked about the running
+   server.
+6. **`GET /api/benchmark/jobs`** plus a ``benchmark`` block in `/api/status`
+   while one runs: the job table stops being job_id-or-nothing.
+7. **Request attribution**: every inference request is counted against its
+   peer IP or self-declared ``X-SF-Client`` label, rolled up in
+   `/api/status.clients` over the trailing hour. On 2026-08-24 naming one
+   abuser took rig-side netstat and four hours; the ring is the whole
+   defence until ``server.api_key`` is set.
+8. **`GET /api/models/{id}/options`**: the MCP ``model_options`` capacity
+   table over plain REST -- read-only math a planning agent without MCP
+   credentials previously had to estimate.
+
+Also verified against the review rather than changed: the Windows CI red was
+the unresolvable ``setup-uv@v10`` ref (fixed separately -- both legs died at
+"Set up job", before any product code ran), and the watchdog already enforces
+PIN/key with the D44 lockout on its whole mutation surface -- the review
+predates that landing; the runbook now records it.
+
+**Deliberately not taken here**: lease priority classes and calendars (D46's
+tiers already govern lease grants; a second priority axis wants its own
+decision), slot save/restore across reloads, observed-tps catalog
+calibration, and everything client-side (OpenClaw catalog entries, fallback
+chains, the layout decision, ``server.api_key`` rollout) -- those are the
+operator's calls, made against the live rig.
+
+**Tests.** `tests/unit/test_catalog_routes.py` (PATCH round-trip, null-clears,
+unknown-field 400; evictions endpoint incl. ``since``; jobs list + status
+block; options over GET; the clients rollup), `tests/unit/
+test_placement_policy.py` (min_ctx floor/refusal/explicit-ask, allowed_devices
+bound and empty-set refusal, mixed-generation grading),
+`tests/unit/test_api_hardening.py` (PATCH joins the D32 gate).

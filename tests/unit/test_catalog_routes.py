@@ -94,6 +94,13 @@ class FakeRegistry:
     def scan(self, *, force: bool = False) -> Any:  # pragma: no cover - lifespan only
         raise RuntimeError("not used")
 
+    def save_settings(self, model_id: str, settings: Any) -> ModelRecord:
+        record = self.get(model_id)
+        assert record is not None
+        updated = record.model_copy(update={"settings": settings})
+        self._records = [updated if r.id == model_id else r for r in self._records]
+        return updated
+
 
 class FakeSupervisor:
     def __init__(self, instances: list[InstanceInfo]) -> None:
@@ -482,3 +489,114 @@ def test_catalog_rows_say_how_many_slots_are_worth_running(app: Any) -> None:
     assert 1 <= row["recommended_parallel"] <= row["max_parallel"]
     assert row["recommended_parallel_basis"] == "estimated"
     assert row["load_args"]["parallel"] == row["recommended_parallel"]
+
+
+# ---------------------------------------------------------------------------
+# The 2026-08-26 ops surfaces: PATCH settings, evictions, jobs list, options,
+# client attribution
+# ---------------------------------------------------------------------------
+
+#: PATCH settings is D32-gated; TestClient's default peer is "testclient",
+#: which is not loopback, so these speak as the operator's own machine.
+LOOPBACK = ("127.0.0.1", 50000)
+
+
+def test_patch_settings_changes_only_the_named_field(app: Any) -> None:
+    """RFC 7386: a present key is set, everything else stays byte-identical."""
+    with TestClient(app, client=LOOPBACK) as http:
+        before = http.get(f"/api/models/{MODEL_ID}/settings").json()
+        patched = http.patch(f"/api/models/{MODEL_ID}/settings", json={"ctx_size": 131072})
+        assert patched.status_code == 200
+        after = http.get(f"/api/models/{MODEL_ID}/settings").json()
+
+    assert after["ctx_size"] == 131072
+    assert {**after, "ctx_size": before["ctx_size"]} == before
+
+
+def test_patch_settings_null_clears_exactly_that_field(app: Any) -> None:
+    with TestClient(app, client=LOOPBACK) as http:
+        http.patch(
+            f"/api/models/{MODEL_ID}/settings",
+            json={"ctx_size": 131072, "reasoning_format": "deepseek"},
+        )
+        cleared = http.patch(
+            f"/api/models/{MODEL_ID}/settings", json={"reasoning_format": None}
+        ).json()
+
+    assert cleared["reasoning_format"] is None
+    assert cleared["ctx_size"] == 131072  # untouched by the second patch
+
+
+def test_patch_settings_rejects_an_unknown_field(app: Any) -> None:
+    """A typoed key that 'worked' is the failure class PATCH exists to close."""
+    with TestClient(app, client=LOOPBACK) as http:
+        response = http.patch(f"/api/models/{MODEL_ID}/settings", json={"ctxsize": 1})
+    assert response.status_code == 400
+    assert "ctxsize" in response.json()["error"]["message"]
+
+
+def test_evictions_endpoint_names_who_evicted_what_and_why(app: Any) -> None:
+    manager = app.state.manager
+    manager._record_eviction("vendor/old-model", reason="plan", evicted_by=MODEL_ID)
+    manager._record_eviction("vendor/idle-model", reason="ttl")
+    # Windows' clock is coarse enough that both events can share a timestamp;
+    # the since-filter assertion needs them a real interval apart.
+    manager._evictions[0]["ts"] -= 60.0
+    with TestClient(app) as http:
+        body = http.get("/api/evictions").json()
+        since = http.get("/api/evictions", params={"since": body["evictions"][0]["ts"]}).json()
+
+    assert body["count"] == 2
+    newest = body["evictions"][0]
+    assert newest["evicted"] == "vendor/idle-model"
+    assert newest["reason"] == "ttl"
+    oldest = body["evictions"][-1]
+    assert oldest["evicted_by"] == MODEL_ID
+    assert oldest["reason"] == "plan"
+    assert since["count"] == 1
+
+
+def test_benchmark_jobs_are_listable_and_status_carries_the_running_one(app: Any) -> None:
+    """The job table used to be job_id-or-nothing: a client that lost the id
+    could only rediscover a run by colliding with it."""
+    from studioforge.api.mgmt_routes import _benchmark_jobs
+
+    job = _benchmark_jobs(app.state).create(MODEL_ID, ["single_gpu"])
+    with TestClient(app) as http:
+        listed = http.get("/api/benchmark/jobs").json()
+        status = http.get("/api/status").json()
+        job.state = "completed"
+        done = http.get("/api/status").json()
+
+    assert listed["count"] == 1
+    assert listed["jobs"][0]["job_id"] == job.job_id
+    assert status["benchmark"] == {
+        "job_id": job.job_id,
+        "model_id": MODEL_ID,
+        "mode": None,
+        "phase": "planning",
+        "fraction": 0.0,
+    }
+    assert done["benchmark"] is None
+
+
+def test_model_options_is_a_plain_get(app: Any) -> None:
+    """Read-only capacity math must not need the MCP plane (wish W5)."""
+    with TestClient(app) as http:
+        body = http.get(f"/api/models/{MODEL_ID}/options").json()
+    assert body["model"]["id"] == MODEL_ID
+    assert body["model"]["options"]
+
+
+def test_status_attributes_inference_to_clients(app: Any) -> None:
+    manager = app.state.manager
+    manager.note_client(host="100.66.1.2", label=None, model_id=MODEL_ID)
+    manager.note_client(host="100.66.1.2", label=None, model_id=MODEL_ID)
+    manager.note_client(host="100.66.1.3", label="sift-forge", model_id=MODEL_ID)
+    with TestClient(app) as http:
+        clients = http.get("/api/status").json()["clients"]
+
+    assert clients[0]["client"] == "100.66.1.2"
+    assert clients[0]["requests"] == 2
+    assert clients[0]["models"] == {MODEL_ID: 2}
+    assert {c["client"] for c in clients} == {"100.66.1.2", "sift-forge"}

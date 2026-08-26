@@ -87,6 +87,7 @@ def open_config(pin: str | None = "12345678") -> Config:
         # outlive the instance, so they are box changes, not residency.
         ("POST", "/api/models/vendor/Some-Model-Q4_K_M/pin"),
         ("PUT", "/api/models/vendor/Some-Model/settings"),
+        ("PATCH", "/api/models/vendor/Some-Model/settings"),
         # A GPU lease (D43) takes cards away from everyone else on the box.
         ("POST", "/api/leases"),
         ("DELETE", "/api/leases/abc123def456"),

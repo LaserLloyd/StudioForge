@@ -153,6 +153,7 @@ _ADMIN_DELETE_PREFIXES: tuple[str, ...] = (
 _ADMIN_SETTINGS_SUFFIXES: tuple[tuple[str, str], ...] = (
     ("POST", "/pin"),
     ("PUT", "/settings"),
+    ("PATCH", "/settings"),
 )
 _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 

@@ -127,12 +127,24 @@ class ModelSettings(BaseModel):
 
     # --- Tier 1: basic -------------------------------------------------
     ctx_size: int | None = None
+    #: Refuse any load whose planned window per slot would land BELOW this,
+    #: instead of quietly serving a smaller one. For a model that is a
+    #: fallback link in someone's chain: a 61k window that "works" per turn
+    #: and then shreds a 51k-prompt session through compaction is worse than
+    #: a structured 507 the client can route around. Only applied when the
+    #: request itself names no ctx_size -- an explicit ask is honoured (D14).
+    min_ctx: int | None = None
     kv_cache_type: KvCacheType | None = None
     kv_cache_type_v: KvCacheType | None = None
     ttl_s: int | None = None
     pinned: bool = False
     draft_model_id: str | None = None
     device_override: list[int] | None = None
+    #: The set of CUDA devices the planner MAY choose among for this model --
+    #: softer than ``device_override``, which forces an exact placement. A
+    #: big dense model with null settings otherwise sprawls across whatever
+    #: cards are free, mixed generations included. ``None`` = any card.
+    allowed_devices: list[int] | None = None
     engine_tag: str | None = None  # per-model engine pin
 
     # --- Tier 2: advanced ----------------------------------------------
@@ -732,6 +744,13 @@ class LoadPlan(BaseModel):
     #: the supervisor when ``auto`` (or an ineligible ``tensor``) is downgraded
     #: to ``layer``; also appended to :attr:`notes`.
     split_mode_reason: str | None = None
+    #: How good this placement is, judged structurally at plan time:
+    #: ``"optimal"`` (one card, or a same-generation split) or ``"degraded"``
+    #: (a split across mixed compute generations -- measured ~half generation
+    #: speed on this rig's 5090+3090 splits). ``None`` on plans from before
+    #: the field existed. A ranking, not a promise: the benchmark history is
+    #: the measured truth.
+    placement_tier: Literal["optimal", "degraded"] | None = None
 
     @property
     def fits_single_gpu(self) -> bool:

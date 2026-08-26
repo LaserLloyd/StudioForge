@@ -53,6 +53,21 @@ def _app_state(request: Request) -> Any:
     return request.app.state
 
 
+def _note_client(state: Any, request: Request, model_id: str) -> None:
+    """Attribute this inference request to its source (IP or X-SF-Client).
+
+    Counted at admission, refusals included: an unattributed client hammering
+    a held endpoint is exactly the caller the rollup exists to name. On
+    2026-08-24 identifying one took rig-side netstat and four hours.
+    """
+    client = getattr(request, "client", None)
+    state.manager.note_client(
+        host=getattr(client, "host", None),
+        label=request.headers.get("x-sf-client"),
+        model_id=model_id,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Models
 # ---------------------------------------------------------------------------
@@ -195,6 +210,7 @@ async def chat_completions(request: Request) -> Any:
     # A preset-only virtual model is served by its base's instance; everything
     # from here down (load, URL, request accounting) keys off `serving`.
     serving = state.manager.serving_record(record)
+    _note_client(state, request, serving.id)
 
     if payload.get("stream"):
         # The D46 hold check runs BEFORE the 200 and the SSE stream begin: a
@@ -303,6 +319,7 @@ async def completions(request: Request) -> Any:
         # Sampler defaults only: there are no messages to carry a system prompt.
         record.preset.apply_to_payload(payload, chat=False)
     serving = state.manager.serving_record(record)
+    _note_client(state, request, serving.id)
     await state.manager.ensure_loaded(serving.id, source="jit:/v1/completions")
     _apply_ttl_override(state, serving.id, ttl_override)
     return await _forward(state, serving, "/v1/completions", payload)
@@ -331,6 +348,7 @@ async def embeddings(request: Request) -> Any:
     if "input" not in payload:
         raise BadRequestError("'input' is required", param="input")
     serving = state.manager.serving_record(record)
+    _note_client(state, request, serving.id)
     await state.manager.ensure_loaded(serving.id, source="jit:/v1/embeddings")
     return await _forward(state, serving, "/v1/embeddings", payload)
 
@@ -343,6 +361,7 @@ async def rerank(request: Request) -> Any:
     payload = dict(body)
     payload["model"] = record.id
     serving = state.manager.serving_record(record)
+    _note_client(state, request, serving.id)
     await state.manager.ensure_loaded(serving.id, source="jit:/v1/rerank")
     return await _forward(state, serving, "/v1/rerank", payload)
 
@@ -353,6 +372,7 @@ async def tokenize(request: Request) -> Any:
     body = await _json_body(request)
     record = _resolve_or_404(state, _require_model(body, state.config))
     serving = state.manager.serving_record(record)
+    _note_client(state, request, serving.id)
     await state.manager.ensure_loaded(serving.id, source="jit:/v1/tokenize")
     return await _forward(state, serving, "/tokenize", dict(body))
 

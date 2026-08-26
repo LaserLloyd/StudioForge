@@ -1226,6 +1226,32 @@ class Planner:
         if blocked:
             live = gpus_view if gpus_view is not None else list(self.probe.list_gpus())
             gpus_view = [g for g in live if g.index not in blocked]
+        allowed = record.settings.allowed_devices
+        if allowed is not None and not forced:
+            # The soft cousin of device_override: a SET the planner may choose
+            # within, so a big model with otherwise-null settings cannot
+            # sprawl onto cards its owner never meant for it. An explicit
+            # device_override outranks it, the same way it outranks
+            # planner.excluded_devices (explicit beats policy).
+            allowed_set = {int(d) for d in allowed}
+            live = gpus_view if gpus_view is not None else list(self.probe.list_gpus())
+            gpus_view = [g for g in live if g.index in allowed_set]
+            if not gpus_view:
+                return self._note_leases(
+                    LoadRejected(
+                        model_id=record.id,
+                        reason=(
+                            f"the model's allowed_devices {sorted(allowed_set)} matches no "
+                            f"usable GPU right now (leases or planner.excluded_devices may "
+                            f"have taken them)"
+                        ),
+                        suggestions=[
+                            "widen or clear the model's allowed_devices setting, or free "
+                            "one of the cards it names"
+                        ],
+                    ),
+                    blocked,
+                )
         own = [i.pid for i in credited if i.pid is not None]
         result = self._plan_load(
             record,
@@ -1273,7 +1299,37 @@ class Planner:
                         + f" from CUDA {sorted(chosen)} for the fastest placement; "
                         f"recently active ones are reloaded afterwards where they fit"
                     )
+            if allowed is not None and not forced:
+                result.notes.append(
+                    f"placement restricted to CUDA {sorted({int(d) for d in allowed})} "
+                    f"by the model's allowed_devices setting"
+                )
+            self._grade_placement(result, gpus_view)
         return self._note_leases(result, blocked)
+
+    def _grade_placement(self, plan: LoadPlan, gpus_view: Sequence[GpuInfo] | None) -> None:
+        """Stamp ``placement_tier`` and say so when a split mixes generations.
+
+        Measured on this rig: a 5090+3090 split generates at roughly half the
+        pace of a same-generation placement, and nothing used to warn -- the
+        load "worked" and the slowness surfaced as a different complaint.
+        """
+        gpus = list(gpus_view) if gpus_view is not None else list(self.probe.list_gpus())
+        caps: dict[int, tuple[int, int]] = {
+            g.index: g.compute_capability for g in gpus if g.compute_capability is not None
+        }
+        majors = {caps[d][0] for d in plan.devices if d in caps}
+        if len(plan.devices) > 1 and len(majors) > 1:
+            plan.placement_tier = "degraded"
+            named = ", ".join(
+                f"CUDA{d} sm_{caps[d][0]}{caps[d][1]}" for d in plan.devices if d in caps
+            )
+            plan.notes.append(
+                f"mixed-generation split ({named}): expect roughly the slower "
+                f"card's generation speed -- about half, measured on this rig"
+            )
+        else:
+            plan.placement_tier = "optimal"
 
     # -- GPU leases (D43) --------------------------------------------------
 
@@ -1413,6 +1469,14 @@ class Planner:
         evict_allowed = allow_evict
 
         ladder = self._context_ladder(record, requested_ctx)
+        min_ctx = settings.min_ctx if ctx_size is None else None
+        if min_ctx:
+            # The floor a fallback model must not serve below: a window that
+            # "works" per turn and then shreds a long session through
+            # compaction is worse than a refusal the client can route around.
+            # Only when the request named no ctx_size -- an explicit ask is
+            # honoured verbatim (D14).
+            ladder = [c for c in ladder if c >= int(min_ctx)] or [int(min_ctx)]
         aim = ladder[0]
         floor = ladder[-1]
         thinking = bool(record.capabilities.thinking)
@@ -1455,25 +1519,28 @@ class Planner:
                     return attempt
 
         if not evict_allowed:
-            return self._terminal_rejection(
-                record,
-                ctx=floor,
-                slots=slots,
-                kv_k=kv_options[0][0],
-                kv_v=kv_options[0][1],
-                loaded=loaded,
-                draft=draft,
-                adapters=adapters,
-                evict_allowed=False,
-                auto_parallel=auto_parallel,
-                aim=aim,
-                floor=floor,
-                tried=tried,
-                gpus=gpus,
-                extra_own_pids=extra_own_pids,
-                evict_busy=evict_busy,
-                source=source,
-                priority=priority,
+            return self._min_ctx_noted(
+                min_ctx,
+                self._terminal_rejection(
+                    record,
+                    ctx=floor,
+                    slots=slots,
+                    kv_k=kv_options[0][0],
+                    kv_v=kv_options[0][1],
+                    loaded=loaded,
+                    draft=draft,
+                    adapters=adapters,
+                    evict_allowed=False,
+                    auto_parallel=auto_parallel,
+                    aim=aim,
+                    floor=floor,
+                    tried=tried,
+                    gpus=gpus,
+                    extra_own_pids=extra_own_pids,
+                    evict_busy=evict_busy,
+                    source=source,
+                    priority=priority,
+                ),
             )
 
         # Pass 2 (DECISIONS.md D16): even the floor does not fit, so eviction is
@@ -1532,26 +1599,44 @@ class Planner:
                     self._log_plan(record, attempt, tried, source=source)
                     return attempt
 
-        return self._terminal_rejection(
-            record,
-            ctx=floor,
-            slots=slots,
-            kv_k=kv_options[0][0],
-            kv_v=kv_options[0][1],
-            loaded=loaded,
-            draft=draft,
-            adapters=adapters,
-            evict_allowed=True,
-            auto_parallel=auto_parallel,
-            aim=aim,
-            floor=floor,
-            tried=tried,
-            gpus=gpus,
-            extra_own_pids=extra_own_pids,
-            evict_busy=evict_busy,
-            source=source,
-            priority=priority,
+        return self._min_ctx_noted(
+            min_ctx,
+            self._terminal_rejection(
+                record,
+                ctx=floor,
+                slots=slots,
+                kv_k=kv_options[0][0],
+                kv_v=kv_options[0][1],
+                loaded=loaded,
+                draft=draft,
+                adapters=adapters,
+                evict_allowed=True,
+                auto_parallel=auto_parallel,
+                aim=aim,
+                floor=floor,
+                tried=tried,
+                gpus=gpus,
+                extra_own_pids=extra_own_pids,
+                evict_busy=evict_busy,
+                source=source,
+                priority=priority,
+            ),
         )
+
+    @staticmethod
+    def _min_ctx_noted(min_ctx: int | None, result: PlanResult) -> PlanResult:
+        """Name ``settings.min_ctx`` in a refusal it caused.
+
+        Without the line, "not even the floor fits" reads as a VRAM problem
+        when the actual obstacle is the model's own configured floor.
+        """
+        if min_ctx and isinstance(result, LoadRejected):
+            result.suggestions.append(
+                f"the model's settings.min_ctx = {int(min_ctx)} refuses any smaller "
+                f"window; lower or clear it to let the context ladder step down, or "
+                f"free VRAM until {int(min_ctx)} fits"
+            )
+        return result
 
     # -- plan_load helpers -------------------------------------------------
 

@@ -111,6 +111,12 @@ are the right first move: `sfctl recover --gpus`, `--logs <n>` (add `--log-model
 one model's log) and `--config`. Then `--kill <model>` or `--nuke` to free VRAM without a
 full restart.
 
+The watchdog's `/mcp` and `POST /restart` demand a credential whenever **either** the API key
+or the MCP PIN is set — the shipped default (PIN only, no key) included — with the same
+wrong-credential lockout as the main app (D44) and `?pin=` refused. Only `GET /health` is open.
+Verified 2026-08-26: an unauthenticated call to a destructive watchdog tool from off the box is
+a 401, and `tests/unit/test_watchdog.py` pins it.
+
 ## Restarts and who brings it back
 
 | You started it with | Restart from GUI/API/MCP does | Crash does |

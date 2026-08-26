@@ -87,6 +87,24 @@ async def status(request: Request) -> dict[str, Any]:
         downloads = len(state.downloader.active())
     payload = state.manager.status(engine=engine, active_downloads=downloads)
     data = payload.model_dump(mode="json")
+    # A running benchmark was invisible here -- REST clients had to learn of
+    # it from a 503 on their next POST. Present while one runs, null after.
+    running = _benchmark_jobs(state).running()
+    data["benchmark"] = (
+        None
+        if running is None
+        else {
+            "job_id": running.job_id,
+            "model_id": running.model_id,
+            "mode": running.mode,
+            "phase": running.phase,
+            "fraction": running.fraction,
+        }
+    )
+    # Who used inference in the trailing hour, busiest first (X-SF-Client
+    # label or peer IP). The open :1234 trade makes this the whole defence
+    # until a key is set: the next mystery client names itself here.
+    data["clients"] = state.manager.clients_snapshot()
     _attach_child_metrics(state, data)
     # Names every VRAM holder, says which GPU each one's memory is actually on
     # (``device_bytes``/``per_gpu_bytes``), and collapses desktop noise. Off the
@@ -401,6 +419,28 @@ async def plan(
     )
 
 
+@router.get("/models/{model_id:path}/options")
+async def model_options(
+    model_id: str, request: Request, refresh: bool = Query(False)
+) -> dict[str, Any]:
+    """Every loading option for one model -- the MCP ``model_options`` table, over REST.
+
+    Read-only capacity math (context/KV matrices, per-placement fit, the
+    ``load_args`` recipes), previously reachable only through the MCP plane --
+    so a planning agent without MCP credentials had to *estimate* the very
+    numbers this server computes exactly. GET, ungated, like every other
+    read surface.
+    """
+    state = _state(request)
+    catalog = await run_in_threadpool(
+        state.manager.catalog, model=model_id, compact=False, refresh=refresh
+    )
+    entries = catalog["models"]
+    if not entries:
+        raise ModelNotFoundError(model_id, known=state.registry.known_ids())
+    return {"catalog_hint": catalog["catalog_hint"], "model": entries[0]}
+
+
 @router.get("/models/{model_id:path}/profiles")
 async def placement_profiles(model_id: str, request: Request) -> dict[str, Any]:
     """Best achievable load per hardware mode, so an agent can pick one.
@@ -530,12 +570,58 @@ async def put_settings(
 
     Validation happens here rather than at load time so an unknown flag is a
     save-time error the user sees immediately, not a mystery crash later.
+
+    **This is a full-object REPLACE**: a field the payload omits is reset to
+    its default, silently. That has already cost a deliberate
+    ``reasoning_format`` once -- a client that means "change one field" wants
+    ``PATCH`` below, and should only PUT a payload it first GETs and merges.
     """
     state = _state(request)
     record = state.registry.resolve(model_id)
     if record is None:
         raise ModelNotFoundError(model_id, known=state.registry.known_ids())
+    try:
+        settings = ModelSettings.model_validate(payload)
+    except Exception as exc:
+        raise BadRequestError(f"invalid settings: {exc}") from exc
+    return await _validated_settings_save(state, record, settings)
 
+
+@router.patch("/models/{model_id:path}/settings")
+async def patch_settings(
+    model_id: str, request: Request, payload: dict[str, Any] = Body(...)
+) -> dict[str, Any]:
+    """Merge-patch per-model settings (RFC 7386): change ONLY the named fields.
+
+    A present key is set, an explicit ``null`` clears that field, and an
+    absent key is left byte-identical -- so ``{"ctx_size": 131072}`` touches
+    nothing else. This exists because the full-object PUT punishes the natural
+    call shape: sending only the field you mean to change silently nulls every
+    other field, and the loss surfaces later as a different symptom (thinking
+    leaking into ``content``, a model sprawling across cards). A key that is
+    not a settings field is a 400 naming it, not an ignored no-op -- a typoed
+    field that "worked" is the same failure class this verb exists to close.
+    """
+    state = _state(request)
+    record = state.registry.resolve(model_id)
+    if record is None:
+        raise ModelNotFoundError(model_id, known=state.registry.known_ids())
+    current = record.settings.model_dump(mode="json")
+    unknown = sorted(set(payload) - set(current))
+    if unknown:
+        raise BadRequestError(
+            f"unknown settings field(s): {', '.join(unknown)}",
+            param=unknown[0],
+        )
+    try:
+        settings = ModelSettings.model_validate({**current, **payload})
+    except Exception as exc:
+        raise BadRequestError(f"invalid settings: {exc}") from exc
+    return await _validated_settings_save(state, record, settings)
+
+
+async def _validated_settings_save(state: Any, record: Any, settings: Any) -> dict[str, Any]:
+    """The shared tail of PUT and PATCH: guards, expert-flag checks, save."""
     # A benchmark rewrites this record's settings per mode and restores them at
     # the end, so a save landing mid-run reaches SQLite and is then silently
     # reverted in memory -- the change appears to have worked and has not.
@@ -548,11 +634,6 @@ async def put_settings(
             code="model_benchmarking",
             param="model",
         )
-
-    try:
-        settings = ModelSettings.model_validate(payload)
-    except Exception as exc:
-        raise BadRequestError(f"invalid settings: {exc}") from exc
 
     if settings.extra_flags.strip():
         tag = settings.engine_tag or state.config.engine.pinned_tag
@@ -1469,6 +1550,21 @@ def _benchmark_jobs(state: Any) -> BenchmarkJobs:
     return jobs
 
 
+@router.get("/evictions")
+async def evictions(request: Request, since: float | None = Query(None)) -> dict[str, Any]:
+    """Recent eviction events, newest first: who was unloaded, by what, and why.
+
+    "Why did that model disappear?" used to need log archaeology once the
+    evicting plan scrolled out of /api/status -- and it is the first question
+    asked whenever a companion's model goes missing mid-conversation. Each
+    event carries ``{ts, evicted, evicted_by, reason, freed_bytes, priority}``
+    with ``reason`` in {plan, oom-retry, ttl, lease, removed}. In-memory ring:
+    survives as long as the process, which is when the question is asked.
+    """
+    events = _state(request).manager.evictions(since)
+    return {"evictions": list(reversed(events)), "count": len(events)}
+
+
 def _require_job(state: Any, job_id: str) -> BenchmarkJob:
     job = _benchmark_jobs(state).get(job_id)
     if job is None:
@@ -1656,6 +1752,19 @@ async def _run_benchmark_job(
                 log.warning(
                     "could not persist benchmark report", model_id=record.id, error=str(exc)
                 )
+
+
+@router.get("/benchmark/jobs")
+async def benchmark_jobs(request: Request) -> dict[str, Any]:
+    """Every known benchmark job, newest first.
+
+    Without this the job table was write-only -- ``job_id`` or nothing. A
+    second client, or the same client after a crash, could not discover a
+    running benchmark except by getting ``503 benchmark_busy`` on its next
+    POST; the playbook literally said "poll the job_id you started".
+    """
+    jobs = _benchmark_jobs(_state(request)).all()
+    return {"jobs": [job.to_dict() for job in reversed(jobs)], "count": len(jobs)}
 
 
 @router.get("/benchmark/jobs/{job_id}")

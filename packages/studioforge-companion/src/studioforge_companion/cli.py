@@ -1088,13 +1088,15 @@ def models_settings(
     """
 
     async def work(client: StudioForgeClient) -> Any:
-        current = await client.settings(model)
         if not set_:
-            return current
-        updates = dict(current)
+            return await client.settings(model)
+        # PATCH, not GET-merge-PUT: only the named fields travel, so a
+        # concurrent change to some other field is not silently overwritten
+        # with the stale copy this process fetched a moment earlier.
+        changes: dict[str, Any] = {}
         for key, value in _split_pairs(set_):
-            _assign(updates, key, value)
-        return await client.put_settings(model, updates)
+            _assign(changes, key, value)
+        return await client.patch_settings(model, changes)
 
     settings = with_client(work)
     if want_json(json_out):

@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
+from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -82,6 +83,17 @@ CONFIG_ERROR_MARKERS: tuple[str, ...] = (
     "does not exist",
 )
 
+
+#: How many per-request attribution events the ring keeps. On 2026-08-24 an
+#: unidentified tailnet client starved a lease for four hours and naming it
+#: took rig-side netstat; this ring is what makes the next one name itself.
+CLIENT_EVENT_HISTORY = 5000
+
+#: How many eviction events the in-memory ring keeps. In-memory on purpose:
+#: the question it answers -- "why did that model disappear?" -- is asked about
+#: the running server, and completed benchmark/settings history is what SQLite
+#: is for. At this rig's eviction rate, 500 events is weeks.
+EVICTION_HISTORY = 500
 
 #: How recently a displaced model must have served to count as *active* and be
 #: reloaded after a priority load lands (D46). The figure is D42's idleness
@@ -372,6 +384,14 @@ class ModelManager:
         #: restore task right after the displacing load settles.
         self._restore_entries: dict[str, _RestoreEntry] = {}
         self._restore_task: asyncio.Task[None] | None = None
+        #: Ring of eviction events, newest last: "why did that model
+        #: disappear?" used to need log archaeology once the evicting plan
+        #: scrolled out of /api/status. Served by GET /api/evictions.
+        self._evictions: deque[dict[str, Any]] = deque(maxlen=EVICTION_HISTORY)
+        #: ``(ts, client, model_id)`` per inference request, for the
+        #: who-used-this rollup in /api/status. The open :1234 trade means
+        #: attribution is the whole defence until a key is set.
+        self._client_events: deque[tuple[float, str, str]] = deque(maxlen=CLIENT_EVENT_HISTORY)
         self._draining = False
         #: Set by the app to the boot's "done" event (D33): a JIT load that
         #: arrives while the library is still being scanned or the engine is
@@ -1410,6 +1430,23 @@ class ModelManager:
                 return settled
 
         record, parallel_auto = self._apply_lease_profile(record)
+        if record.capabilities.thinking and not (
+            record.settings.reasoning_format
+            or self.config.models.default_reasoning_format != "none"
+        ):
+            # The failure mode lands on the CLIENT: channel markers arrive
+            # inline in message.content and look like model damage there, so
+            # the one place that knows both facts -- thinking arch, no format
+            # -- says so at load time (D12 keeps "none" as the default).
+            log.warning(
+                "thinking model loads with no reasoning_format",
+                model_id=record.id,
+                detail=(
+                    "thoughts will arrive inline in content; set the model's "
+                    "reasoning_format (usually 'deepseek') to move them to "
+                    "reasoning_content"
+                ),
+            )
         draft = self._draft_for(record)
         adapters = self._adapters_for(record)
 
@@ -1478,6 +1515,7 @@ class ModelManager:
                         },
                     )
                 self._note_displaced(record, victim, priority=priority)
+                self._record_eviction(victim, reason="plan", evicted_by=record.id)
                 log.info(
                     "evicting to make room", victim=victim, for_model=record.id, priority=priority
                 )
@@ -1562,6 +1600,58 @@ class ModelManager:
             model_id=victim,
             for_model=for_record.id,
         )
+
+    def _record_eviction(self, victim: str, *, reason: str, evicted_by: str | None = None) -> None:
+        """Append one event to the eviction ring. Call BEFORE the stop.
+
+        ``reason`` is a small closed set -- ``plan`` (a load's eviction/
+        preemption), ``oom-retry``, ``ttl``, ``lease``, ``removed`` -- so a
+        client can filter without parsing prose.
+        """
+        instance = self.supervisor.get(victim)
+        self._evictions.append(
+            {
+                "ts": time.time(),
+                "evicted": victim,
+                "evicted_by": evicted_by,
+                "reason": reason,
+                "freed_bytes": (
+                    sum(Planner.instance_footprint(instance).values())
+                    if instance is not None
+                    else 0
+                ),
+                "priority": instance.priority if instance is not None else None,
+            }
+        )
+
+    def evictions(self, since: float | None = None) -> list[dict[str, Any]]:
+        """Eviction events, oldest first; ``since`` filters by timestamp."""
+        return [dict(e) for e in self._evictions if since is None or e["ts"] >= since]
+
+    def note_client(self, *, host: str | None, label: str | None, model_id: str) -> None:
+        """Count one inference request against its source.
+
+        ``label`` is the optional ``X-SF-Client`` header -- self-declared, so
+        it names cooperating clients nicely and falls back to the peer address
+        for the ones the attribution exists to catch.
+        """
+        who = (label or "").strip() or (host or "").strip() or "in-process"
+        self._client_events.append((time.time(), who, model_id))
+
+    def clients_snapshot(self, *, window_s: float = 3600.0) -> list[dict[str, Any]]:
+        """Requests by source over the trailing window, busiest first."""
+        cutoff = time.time() - window_s
+        rollup: dict[str, dict[str, Any]] = {}
+        for ts, who, model_id in self._client_events:
+            if ts < cutoff:
+                continue
+            entry = rollup.setdefault(
+                who, {"client": who, "requests": 0, "last_seen": 0.0, "models": {}}
+            )
+            entry["requests"] += 1
+            entry["last_seen"] = max(entry["last_seen"], ts)
+            entry["models"][model_id] = entry["models"].get(model_id, 0) + 1
+        return sorted(rollup.values(), key=lambda e: -int(e["requests"]))
 
     def _kick_restore(self) -> None:
         """Start the single-flight restore pass when displaced models wait on it."""
@@ -1765,6 +1855,7 @@ class ModelManager:
             # Same restore promise as a planner-chosen victim (D46): a
             # recently-active model displaced by the retry comes back too.
             self._note_displaced(record, victim, priority=priority)
+            self._record_eviction(victim, reason="oom-retry", evicted_by=record.id)
             await self.supervisor.stop(victim)
 
         # Re-plan: free VRAM has changed, so placement and context may too.
@@ -1794,6 +1885,7 @@ class ModelManager:
             if self.supervisor.get(victim) is None:
                 continue
             self._note_displaced(record, victim, priority=priority)
+            self._record_eviction(victim, reason="oom-retry", evicted_by=record.id)
             log.info("evicting to make room on the retry", victim=victim, for_model=record.id)
             await self.supervisor.stop(victim)
         instance = await self.supervisor.start(
@@ -2113,6 +2205,7 @@ class ModelManager:
                     holder=holder,
                     for_models=owners,
                 )
+                self._record_eviction(victim.model_id, reason="lease", evicted_by=holder)
                 await self.supervisor.stop(victim.model_id)
         except BaseException:
             # CancelledError included: a cancelled benchmark must not leave a
@@ -2277,6 +2370,7 @@ class ModelManager:
                     pid=instance.pid,
                     port=instance.port,
                 )
+                self._record_eviction(instance.model_id, reason="removed")
                 await self.supervisor.stop(instance.model_id)
                 continue
             ttl = instance.ttl_s
@@ -2291,6 +2385,7 @@ class ModelManager:
                     idle_s=round(idle),
                     ttl_s=ttl,
                 )
+                self._record_eviction(instance.model_id, reason="ttl")
                 await self.supervisor.stop(instance.model_id)
 
     # -- pinned-model reconciler (D41) --------------------------------------

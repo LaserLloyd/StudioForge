@@ -421,6 +421,14 @@ class StudioForgeClient:
     async def put_settings(self, model: str, settings: dict[str, Any]) -> Any:
         return await self.put(f"models/{_path_segment(model)}/settings", settings)
 
+    async def patch_settings(self, model: str, changes: dict[str, Any]) -> Any:
+        """Merge-patch: only the named fields change (RFC 7386 semantics).
+
+        Prefer this over :meth:`put_settings` for "change one field" -- PUT is
+        a full replace, and a payload that omits a field silently resets it.
+        """
+        return await self.patch(f"models/{_path_segment(model)}/settings", changes)
+
     async def plan(
         self,
         model: str,

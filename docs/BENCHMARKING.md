@@ -73,6 +73,10 @@ GET /api/benchmark/jobs/{job_id}
 "report": {...}, "error": null}`. Poll every 10–15 s until `state` is no longer `running`.
 `DELETE /api/benchmark/jobs/{job_id}` cancels between modes and restores the model's settings.
 
+Lost the id? `GET /api/benchmark/jobs` lists every known job newest first, and `/api/status`
+carries a `benchmark: {job_id, model_id, mode, phase, fraction}` block while one runs — a
+second client (or the same one after a crash) recovers a run without colliding with it.
+
 **Read the report.** `report.results[]` has one row per mode:
 
 | Field | Meaning |
