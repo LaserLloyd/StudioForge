@@ -110,7 +110,7 @@ class CredentialGuard:
             record = self._records.get(client)
             if record is None:
                 return 0.0
-            if now - record.last_seen > self.window_s:
+            if now - record.last_seen >= self.window_s:
                 del self._records[client]
                 return 0.0
             remaining = record.locked_until - now
@@ -127,7 +127,7 @@ class CredentialGuard:
         now = time.monotonic()
         with self._lock:
             record = self._records.get(client)
-            if record is None or now - record.last_seen > self.window_s:
+            if record is None or now - record.last_seen >= self.window_s:
                 record = _Record()
                 self._records[client] = record
             record.failures += 1

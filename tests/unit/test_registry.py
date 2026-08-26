@@ -1378,8 +1378,10 @@ def test_live_real_library(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -
     paired = [r for r in records if r.mmproj_path is not None]
     assert all(r.capabilities.vision for r in paired)
 
-    for embedding in (r for r in records if r.kind == "embedding"):
-        assert embedding.mmproj_path is None
+    # An embedding model MAY carry a projector: VL embedding models (e.g.
+    # Qwen3-VL-Embedding) embed images as well as text. The invariant is not
+    # "embeddings have no mmproj" but the `paired` check above: any record
+    # holding a projector must be vision-capable.
 
     for record in records:
         assert "mmproj" not in record.path.name.lower(), record.id

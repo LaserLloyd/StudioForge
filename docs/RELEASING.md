@@ -114,8 +114,6 @@ tool, or the watchdog's own rollback when the server is too wedged to answer.
 
 ## Licence
 
-**No licence has been chosen yet: all rights reserved.** There is no `LICENSE` file and no licence
-classifier in either `pyproject.toml`, and that is deliberate — do not add one until a licence is
-picked on purpose. Practically, that makes a release zip *a download*, not an open-source release:
-people may fetch it and run it, and packaging or redistributing it is not yet granted. Say so
-wherever the zip is offered.
+**MIT** — see [`LICENSE`](../LICENSE) at the repository root; `pyproject.toml` carries the SPDX
+`license = "MIT"` expression. A release zip must include the `LICENSE` file, and the copyright
+notice must stay intact in anything packaged or redistributed.
