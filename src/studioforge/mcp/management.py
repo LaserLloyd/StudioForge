@@ -819,6 +819,7 @@ def build_management_mcp(state: Any) -> MCPServer:
         parallel: int | None = None,
         devices: list[int] | None = None,
         force: bool = False,
+        priority: int | None = None,
     ) -> dict[str, Any]:
         """Load a model into VRAM now, returning once it is serving.
 
@@ -884,6 +885,15 @@ def build_management_mcp(state: Any) -> MCPServer:
                 does not have is rejected immediately.
             force: Reload even if the model is already running (use after
                 changing its settings).
+            priority: The load's tier: 1 for the model a person is actively
+                chatting with, 2 for a model dispatched to work on a task, 3
+                (or omitted) for background work. A tier-1/2 load takes the
+                fastest placement -- idle worse-tier models are displaced from
+                the cards it picks and the recently active ones reloaded
+                afterwards where they fit -- jumps the load queue, and holds
+                new worse-tier traffic off (503 + Retry-After) while it loads.
+                The tier is remembered per model, so later loads of the same
+                model keep it. A tier-3 load never displaces tier 1 or 2.
 
         Returns:
             The running instance: port, pid, devices, planned VRAM breakdown,
@@ -898,6 +908,7 @@ def build_management_mcp(state: Any) -> MCPServer:
             devices=devices,
             force=force,
             source="mcp:load_model",
+            priority=priority,
         )
         return {
             "ok": True,
@@ -910,6 +921,7 @@ def build_management_mcp(state: Any) -> MCPServer:
         model_id: str,
         ctx_size: int,
         prefer_mode: str | None = None,
+        priority: int | None = None,
     ) -> dict[str, Any]:
         """**The easy way to load.** Say the model and the context you need.
 
@@ -945,6 +957,11 @@ def build_management_mcp(state: Any) -> MCPServer:
             prefer_mode: A hardware-mode key from a ``placements[]`` row
                 (``dual_5090``, ``dual_3090``, ``all_gpus``, ``single_5090`` on
                 this rig) to try that placement instead of the default order.
+            priority: The load's tier: 1 for the model a person is actively
+                chatting with, 2 for a dispatched agent, 3 (or omitted) for
+                background work. A tier-1/2 load takes the best placement even
+                when idle worse-tier models must be displaced for it; the
+                recently active ones are reloaded afterwards where they fit.
 
         Returns:
             The running instance: port, pid, devices, the KV cache type chosen,
@@ -955,6 +972,7 @@ def build_management_mcp(state: Any) -> MCPServer:
             int(ctx_size),
             prefer_modes=[prefer_mode] if prefer_mode else None,
             source="mcp:load_recommended",
+            priority=priority,
         )
         return {
             "ok": True,

@@ -605,7 +605,16 @@ async def test_load_model_accepts_a_placements_row_load_args_shape(state: State)
         "kv_cache_type",
         "kv_cache_type_v",
         "devices",
+        "priority",
     } <= set(schema["properties"])
+
+
+async def test_load_model_rejects_a_priority_outside_the_three_tiers(state: State) -> None:
+    """D46: 1, 2 and 3 are the tiers; anything else is a 400 naming the parameter."""
+    server = build_management_mcp(state)
+    payload = await call(server, "load_model", model_id=TINY, priority=5)
+    assert payload["ok"] is False
+    assert payload["error"]["param"] == "priority"
 
 
 async def test_load_model_rejects_a_cuda_index_this_box_does_not_have(state: State) -> None:

@@ -423,6 +423,7 @@ async def load_model(
     parallel: int | None = Body(None),
     devices: list[int] | None = Body(None),
     force: bool = Body(False),
+    priority: int | None = Body(None),
 ) -> dict[str, Any]:
     """Load one model, optionally onto named GPUs.
 
@@ -430,6 +431,14 @@ async def load_model(
     catalog's per-hardware-mode ``load_args`` carry one -- and never touches the
     model's saved settings. A CUDA index this box does not have is a 400 naming
     the parameter, not a planner refusal that reads like a VRAM problem.
+
+    ``priority`` is the load's tier (D46): 1 the active chat model, 2 a
+    dispatched agent, 3 (or omitted) background. A tier-1/2 load takes the
+    fastest placement -- displacing idle worse-tier models from the cards it
+    picks and reloading the recently active ones afterwards where they fit --
+    jumps the load queue, and holds new worse-tier traffic off (503 +
+    Retry-After) while it loads. The tier is remembered per model, so a JIT
+    reload keeps it.
     """
     state = _state(request)
     instance = await state.manager.load(
@@ -441,6 +450,7 @@ async def load_model(
         devices=devices,
         force=force,
         source="api:/api/models/{id}/load",
+        priority=priority,
     )
     return instance.model_dump(mode="json")
 
@@ -452,6 +462,7 @@ async def load_recommended(
     ctx_size: int = Body(..., embed=True),
     prefer_mode: str | None = Body(None),
     kv_min: str | None = Body(None),
+    priority: int | None = Body(None),
 ) -> dict[str, Any]:
     """Load at exactly ``ctx_size`` per slot; the server picks everything else.
 
@@ -473,6 +484,7 @@ async def load_recommended(
         prefer_modes=[prefer_mode] if prefer_mode else None,
         kv_min=kv_min,
         source="api:/api/models/{id}/load-recommended",
+        priority=priority,
     )
     return instance.model_dump(mode="json")
 

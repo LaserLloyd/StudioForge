@@ -24,6 +24,7 @@ from studioforge.config import Config, FlashAttn, KvCacheType, QuantAffinity, Sp
 from studioforge.core.gpu import vram_processes
 from studioforge.core.kv_sensitivity import KV_QUALITY_LADDER
 from studioforge.core.leases import LeaseBook
+from studioforge.core.priority import PRIORITY_BACKGROUND
 from studioforge.logging import get_logger
 from studioforge.types import (
     MB,
@@ -1147,6 +1148,7 @@ class Planner:
         evict_busy: bool = False,
         source: str | None = None,
         parallel_auto: bool = False,
+        priority: int = PRIORITY_BACKGROUND,
     ) -> PlanResult:
         """Decide where (and whether) a model can be loaded.
 
@@ -1177,59 +1179,100 @@ class Planner:
         the lease named. ``parallel_auto`` -- set for a leased model -- treats
         an integer ``models.default_parallel`` as ``auto``: the cards are that
         model's alone, so the estimator sizes its slots.
+
+        ``priority`` is the load's tier (D46). A chat or agent load (1 or 2)
+        plans *as if every idle lower-tier resident were already gone* -- the
+        same credit ``reload_of`` gets -- so it takes the placement an idle
+        box would have given it instead of squeezing in beside background
+        models; the lower-tier residents actually sitting on the chosen cards
+        land in ``evict_model_ids``, and the ones elsewhere stay loaded. It
+        also makes eviction first-class for this load regardless of
+        ``planner.on_insufficient`` (an explicit ``allow_evict`` still wins),
+        and restricts every eviction ladder to equal-or-lower tiers.
         """
         blocked = self._leased_away(record)
         forced = set(record.settings.device_override or ())
         if forced & blocked:
             return self._leased_rejection(record, sorted(forced & blocked))
-        if reload_of is None:
-            result = self._plan_load(
-                record,
-                ctx_size=ctx_size,
-                kv_cache_type=kv_cache_type,
-                kv_cache_type_v=kv_cache_type_v,
-                parallel=parallel,
-                loaded=loaded,
-                draft=draft,
-                adapters=adapters,
-                allow_evict=allow_evict,
-                gpus=self._gpus_without(blocked),
-                evict_busy=evict_busy,
-                source=source,
-                parallel_auto=parallel_auto,
-            )
-            return self._note_leases(result, blocked)
-        resident = next((i for i in loaded if i.model_id == reload_of), None)
-        others = [i for i in loaded if i.model_id != reload_of]
-        gpus_view = self._gpus_as_if_gone(resident) if resident is not None else None
+
+        evict_allowed = (
+            allow_evict
+            if allow_evict is not None
+            else (priority < PRIORITY_BACKGROUND or self.config.planner.on_insufficient == "evict")
+        )
+
+        resident = (
+            next((i for i in loaded if i.model_id == reload_of), None)
+            if reload_of is not None
+            else None
+        )
+        others = [i for i in loaded if resident is None or i.model_id != reload_of]
+
+        # D46 preemption: the lower-tier idle residents this load may displace
+        # for the fastest placement. Strictly lower tiers only -- an equal-tier
+        # resident is displaced by the ordinary ladder when the fit demands it,
+        # never just for a nicer split.
+        preempt: list[InstanceInfo] = []
+        if priority < PRIORITY_BACKGROUND and evict_allowed:
+            # Idle-only, always -- even under force. Preemption displaces for a
+            # *nicer placement*; D36 allows interrupting a stream only when the
+            # fit genuinely demands it, and that path is the eviction ladder
+            # below, which still honours ``evict_busy``.
+            preempt = self._evictable(others, include_busy=False, for_priority=priority + 1)
+        preempt_ids = {i.model_id for i in preempt}
+
+        credited = ([resident] if resident is not None else []) + preempt
+        gpus_view = self._gpus_as_if_gone(credited) if credited else None
         if blocked:
             live = gpus_view if gpus_view is not None else list(self.probe.list_gpus())
             gpus_view = [g for g in live if g.index not in blocked]
-        own = [resident.pid] if resident is not None and resident.pid is not None else []
+        own = [i.pid for i in credited if i.pid is not None]
         result = self._plan_load(
             record,
             ctx_size=ctx_size,
             kv_cache_type=kv_cache_type,
             kv_cache_type_v=kv_cache_type_v,
             parallel=parallel,
-            loaded=others,
+            loaded=[i for i in others if i.model_id not in preempt_ids],
             draft=draft,
             adapters=adapters,
-            allow_evict=allow_evict,
+            allow_evict=evict_allowed,
             gpus=gpus_view,
             extra_own_pids=own,
             evict_busy=evict_busy,
             source=source,
             parallel_auto=parallel_auto,
+            priority=priority,
         )
-        if isinstance(result, LoadPlan) and resident is not None:
-            if reload_of not in result.evict_model_ids:
-                result.evict_model_ids.insert(0, reload_of)
-            credited = sum(self.instance_footprint(resident).values())
-            result.notes.append(
-                f"forced reload: planned as if the running instance of {reload_of} "
-                f"were already unloaded ({round(credited / MB)} MB credited back)"
-            )
+        if isinstance(result, LoadPlan):
+            if reload_of is not None and resident is not None:
+                if reload_of not in result.evict_model_ids:
+                    result.evict_model_ids.insert(0, reload_of)
+                credit = sum(self.instance_footprint(resident).values())
+                result.notes.append(
+                    f"forced reload: planned as if the running instance of {reload_of} "
+                    f"were already unloaded ({round(credit / MB)} MB credited back)"
+                )
+            if preempt:
+                chosen = set(result.devices)
+                displaced = [
+                    i
+                    for i in preempt
+                    if any(
+                        dev in chosen and amount > 0
+                        for dev, amount in self.instance_footprint(i).items()
+                    )
+                ]
+                for victim in displaced:
+                    if victim.model_id not in result.evict_model_ids:
+                        result.evict_model_ids.append(victim.model_id)
+                if displaced:
+                    result.notes.append(
+                        f"priority {priority} load: displacing lower-priority "
+                        + ", ".join(i.model_id for i in displaced)
+                        + f" from CUDA {sorted(chosen)} for the fastest placement; "
+                        f"recently active ones are reloaded afterwards where they fit"
+                    )
         return self._note_leases(result, blocked)
 
     # -- GPU leases (D43) --------------------------------------------------
@@ -1302,16 +1345,21 @@ class Planner:
         )
         return rejection
 
-    def _gpus_as_if_gone(self, resident: InstanceInfo) -> list[GpuInfo]:
-        """The live GPU list with ``resident``'s planned footprint credited as free.
+    def _gpus_as_if_gone(self, residents: Sequence[InstanceInfo]) -> list[GpuInfo]:
+        """The live GPU list with the planned footprints credited as free.
 
-        The footprint is the instance's own plan (:meth:`instance_footprint`),
+        The footprint is each instance's own plan (:meth:`instance_footprint`),
         the same figure the eviction ladder credits for a victim; the truth is
         whatever the driver releases when the child exits, and a plan made on
-        the estimate meets the same one-retry OOM path a post-eviction plan does.
+        the estimate meets the same one-retry OOM path a post-eviction plan
+        does. One instance for a forced reload (D30); the reload target plus
+        every preemptable lower-tier resident for a priority load (D46).
         """
         gpus = list(self.probe.list_gpus())
-        footprint = self.instance_footprint(resident)
+        footprint: dict[int, int] = {}
+        for resident in residents:
+            for dev, amount in self.instance_footprint(resident).items():
+                footprint[dev] = footprint.get(dev, 0) + amount
         if not footprint:
             return gpus
         view: list[GpuInfo] = []
@@ -1341,12 +1389,13 @@ class Planner:
         loaded: Sequence[InstanceInfo],
         draft: ModelRecord | None,
         adapters: Sequence[AdapterRecord],
-        allow_evict: bool | None,
+        allow_evict: bool,
         gpus: Sequence[GpuInfo] | None = None,
         extra_own_pids: Sequence[int] = (),
         evict_busy: bool = False,
         source: str | None = None,
         parallel_auto: bool = False,
+        priority: int = PRIORITY_BACKGROUND,
     ) -> PlanResult:
         """:meth:`plan_load` proper; ``gpus``/``extra_own_pids`` are the reload view."""
         settings = record.settings
@@ -1358,11 +1407,10 @@ class Planner:
             kv_cache_type or settings.kv_cache_type or defaults.default_kv_cache_type
         )
         kv_v: KvCacheType = kv_cache_type_v or settings.kv_cache_type_v or kv_k
-        evict_allowed = (
-            allow_evict
-            if allow_evict is not None
-            else self.config.planner.on_insufficient == "evict"
-        )
+        # Resolved by plan_load -- the ONE place the default (config policy,
+        # plus D46's tier clause) lives; a second lookalike resolution here
+        # would silently diverge on the priority rule.
+        evict_allowed = allow_evict
 
         ladder = self._context_ladder(record, requested_ctx)
         aim = ladder[0]
@@ -1397,6 +1445,7 @@ class Planner:
                     gpus=gpus,
                     extra_own_pids=extra_own_pids,
                     evict_busy=evict_busy,
+                    priority=priority,
                     extra_notes=self._rung_notes(
                         ctx, aim, floor, thinking=thinking, kv_k=cand_k, kv_options=kv_options
                     ),
@@ -1424,6 +1473,7 @@ class Planner:
                 extra_own_pids=extra_own_pids,
                 evict_busy=evict_busy,
                 source=source,
+                priority=priority,
             )
 
         # Pass 2 (DECISIONS.md D16): even the floor does not fit, so eviction is
@@ -1432,7 +1482,7 @@ class Planner:
         # available + reclaimable and take the highest rung that fits. Loading
         # at the 8192 floor after freeing 19 GB, when 65536 would have fitted
         # for the identical cost, is the defect this pass exists to fix.
-        reclaimable = self._reclaimable_bytes(loaded, evict_busy=evict_busy)
+        reclaimable = self._reclaimable_bytes(loaded, evict_busy=evict_busy, for_priority=priority)
         for ctx in ladder:
             for cand_k, cand_v in kv_options:
                 tried.append(f"{ctx}/{cand_k}+evict")
@@ -1451,6 +1501,7 @@ class Planner:
                     gpus=gpus,
                     extra_own_pids=extra_own_pids,
                     evict_busy=evict_busy,
+                    priority=priority,
                     extra_notes=self._rung_notes(
                         ctx, aim, floor, thinking=thinking, kv_k=cand_k, kv_options=kv_options
                     ),
@@ -1499,6 +1550,7 @@ class Planner:
             extra_own_pids=extra_own_pids,
             evict_busy=evict_busy,
             source=source,
+            priority=priority,
         )
 
     # -- plan_load helpers -------------------------------------------------
@@ -1561,11 +1613,15 @@ class Planner:
         return notes
 
     def _reclaimable_bytes(
-        self, loaded: Sequence[InstanceInfo], *, evict_busy: bool = False
+        self,
+        loaded: Sequence[InstanceInfo],
+        *,
+        evict_busy: bool = False,
+        for_priority: int | None = None,
     ) -> int:
         """VRAM the planner is allowed to take back by evicting idle models."""
         total = 0
-        for instance in self._evictable(loaded, include_busy=evict_busy):
+        for instance in self._evictable(loaded, include_busy=evict_busy, for_priority=for_priority):
             total += sum(self.instance_footprint(instance).values())
         return total
 
@@ -1589,6 +1645,7 @@ class Planner:
         extra_own_pids: Sequence[int] = (),
         evict_busy: bool = False,
         source: str | None = None,
+        priority: int = PRIORITY_BACKGROUND,
     ) -> PlanResult:
         """Recompute the floor rung as the *terminal* refusal, and log it.
 
@@ -1613,6 +1670,7 @@ class Planner:
             terminal=True,
             gpus=gpus,
             extra_own_pids=extra_own_pids,
+            priority=priority,
             extra_notes=(
                 [
                     f"wanted up to {aim} tokens of context but not even the {floor} "
@@ -1789,6 +1847,7 @@ class Planner:
         gpus: Sequence[GpuInfo] | None = None,
         extra_own_pids: Sequence[int] = (),
         evict_busy: bool = False,
+        priority: int = PRIORITY_BACKGROUND,
     ) -> PlanResult:
         """Plan a load at one specific context size.
 
@@ -1867,6 +1926,7 @@ class Planner:
                 terminal=terminal,
                 extra_own_pids=extra_own_pids,
                 evict_busy=evict_busy,
+                priority=priority,
             )
 
         order = self._candidate_order(gpus)
@@ -1946,9 +2006,11 @@ class Planner:
                             result.notes.append(pool_note)
                         return result
 
-        # Nothing fits as-is. Try again with LRU unpinned models evicted.
+        # Nothing fits as-is. Try again with unpinned models evicted, worst
+        # tier first (D46) and least-recently-used within one; a tier the
+        # asking load does not outrank or match is never a candidate.
         if evict_allowed:
-            evictable = self._evictable(loaded, include_busy=evict_busy)
+            evictable = self._evictable(loaded, include_busy=evict_busy, for_priority=priority)
             if evictable:
                 freed: dict[int, int] = {}
                 evicted: list[str] = []
@@ -1983,7 +2045,8 @@ class Planner:
                                 result.evict_model_ids = list(evicted)
                                 result.notes.extend(notes)
                                 result.notes.append(
-                                    "evicting least-recently-used unpinned models: "
+                                    "evicting unpinned models, lowest priority tier "
+                                    "first and least-recently-used within one: "
                                     + ", ".join(evicted)
                                 )
                                 if pool_note:
@@ -2006,6 +2069,7 @@ class Planner:
             terminal=terminal,
             extra_own_pids=extra_own_pids,
             evict_busy=evict_busy,
+            priority=priority,
         )
 
     def _wider_split_for_parallel(
@@ -2450,6 +2514,7 @@ class Planner:
         auto_parallel: bool = False,
         terminal: bool = True,
         extra_own_pids: Sequence[int] = (),
+        priority: int = PRIORITY_BACKGROUND,
     ) -> PlanResult:
         gpu_map = {gpu.index: gpu for gpu in gpus}
         unknown = [d for d in devices if d not in gpu_map]
@@ -2491,7 +2556,7 @@ class Planner:
         if evict_allowed:
             freed: dict[int, int] = {}
             evicted: list[str] = []
-            for instance in self._evictable(loaded, include_busy=evict_busy):
+            for instance in self._evictable(loaded, include_busy=evict_busy, for_priority=priority):
                 evicted.append(instance.model_id)
                 for dev, amount in self.instance_footprint(instance).items():
                     freed[dev] = freed.get(dev, 0) + amount
@@ -2531,6 +2596,7 @@ class Planner:
             forced=forced,
             extra_own_pids=extra_own_pids,
             evict_busy=evict_busy,
+            priority=priority,
         )
         if forced:
             rejection.suggestions.append(
@@ -2557,6 +2623,7 @@ class Planner:
         forced: bool = False,
         extra_own_pids: Sequence[int] = (),
         evict_busy: bool = False,
+        priority: int = PRIORITY_BACKGROUND,
     ) -> LoadRejected:
         estimate = self._safe_estimate(
             record,
@@ -2673,6 +2740,16 @@ class Planner:
         elif not evict_allowed and loaded:
             suggestions.append(
                 "planner.on_insufficient is 'reject'; set it to 'evict' to auto-unload idle models"
+            )
+        # 5b. Higher-tier models this load may not displace (D46). Without the
+        # line, an empty eviction list beside "does not fit" reads as "pinned
+        # or busy", which would be the wrong diagnosis here.
+        outranked = [i for i in loaded if not self._is_pinned(i) and i.priority < priority]
+        if outranked:
+            held = ", ".join(f"{i.model_id} (priority {i.priority})" for i in outranked)
+            suggestions.append(
+                f"VRAM is held by higher-priority models this load does not outrank: "
+                f"{held}; load with a better priority tier, or unload them"
             )
 
         reason_parts = [
@@ -2817,9 +2894,13 @@ class Planner:
         return instance.ttl_s == 0
 
     def _evictable(
-        self, loaded: Sequence[InstanceInfo], *, include_busy: bool = False
+        self,
+        loaded: Sequence[InstanceInfo],
+        *,
+        include_busy: bool = False,
+        for_priority: int | None = None,
     ) -> list[InstanceInfo]:
-        """Unpinned, idle instances, least-recently-used first.
+        """Unpinned, idle instances, worst tier first, least-recently-used within one.
 
         Instances with in-flight requests are never evicted -- killing a child
         mid-stream fails a live request to save a future one, which is the
@@ -2832,6 +2913,12 @@ class Planner:
         ``force=True`` from a human-driven caller (D36). A JIT load never sets
         it: an inference request that arrives mid-stream for somebody else must
         queue or be refused, never win by killing the stream.
+
+        ``for_priority`` is the asking load's tier (D46): only instances at the
+        same or a lower tier (an equal or higher number) are candidates, so a
+        background load can never displace the chat model to make room for
+        itself. ``None`` applies no tier rule -- the informational surfaces
+        that predate tiers.
         """
         candidates = [
             i
@@ -2839,8 +2926,12 @@ class Planner:
             if not self._is_pinned(i)
             and i.state == "ready"
             and (include_busy or i.active_requests == 0)
+            and (for_priority is None or i.priority >= for_priority)
         ]
-        return sorted(candidates, key=lambda i: i.last_activity_at or i.started_at or 0.0)
+        return sorted(
+            candidates,
+            key=lambda i: (-i.priority, i.last_activity_at or i.started_at or 0.0),
+        )
 
     @staticmethod
     def busy_instances(loaded: Sequence[InstanceInfo]) -> list[InstanceInfo]:

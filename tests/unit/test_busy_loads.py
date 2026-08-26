@@ -25,6 +25,7 @@ import pytest
 
 from studioforge.core.manager import ModelManager
 from studioforge.core.planner import BUSY_RETRY_AFTER_S, Planner
+from studioforge.core.priority import PriorityLock
 from studioforge.errors import InsufficientVramError, ModelBusyError
 from studioforge.types import GB, InstanceInfo, LoadPlan
 from tests.unit.test_load_retry import (
@@ -204,6 +205,7 @@ def test_an_idle_server_is_reported_as_idle() -> None:
         "busy_models": [],
         "loading": [],
         "testing": None,
+        "priority_hold": None,
     }
 
 
@@ -404,4 +406,6 @@ async def test_the_load_gate_is_held_for_the_whole_test_load() -> None:
     """D29's gate plus its own lock: a test cannot race a concurrent load."""
     manager, _supervisor = smoke_manager()
     assert isinstance(manager._test_gate, asyncio.Lock)
-    assert isinstance(manager._load_gate, asyncio.Lock)
+    # The load gate is D46's priority-aware lock: same one-at-a-time
+    # guarantee, best tier first in the queue.
+    assert isinstance(manager._load_gate, PriorityLock)

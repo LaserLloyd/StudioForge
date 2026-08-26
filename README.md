@@ -83,6 +83,11 @@ are the ones you ask for.
 - **Multi-GPU is planned, not guessed.** Placement across mixed cards, context sized to what
   fits, measured slot counts, pins for models that must always be warm, and leases that give a
   model a card of its own ([`DECISIONS.md`](DECISIONS.md) D14–D43, each with its measurement).
+- **The chat model comes first.** A load can say what it is — `priority: 1` the model a person
+  is chatting with, `2` a dispatched agent, `3` (or nothing) background. A chat load takes the
+  fastest placement (idle background models are moved off its cards and reloaded afterwards
+  where they fit), jumps the load queue, and holds background traffic off while it loads;
+  background can never displace it ([`DECISIONS.md`](DECISIONS.md) D46).
 - **Drop-in for LM Studio.** Same port, same `/v1/models` behaviour, same library on disk —
   switching a client is a host change.
 - **Built for agents.** 29 MCP tools with a catalog that hands an agent the exact load

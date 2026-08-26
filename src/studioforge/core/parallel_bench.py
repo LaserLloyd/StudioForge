@@ -553,6 +553,7 @@ class ParallelBenchmarker:
                     # to evict one that started in the gap (D36).
                     evict_busy=False,
                     source="benchmark:parallel",
+                    hold_traffic=False,
                 )
                 report.loaded_for_benchmark = True
 
@@ -839,6 +840,7 @@ class ParallelBenchmarker:
                 force=True,
                 evict_busy=False,
                 source="benchmark:parallel-restore",
+                hold_traffic=False,
             )
             report.restored = True
         except Exception as exc:  # noqa: BLE001 - a failed restore must be reported, not raised

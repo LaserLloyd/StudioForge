@@ -113,9 +113,21 @@ class StubPlanner:
             return self.result
         return LoadPlan(model_id=record.id, devices=[0], ctx_size=8192)
 
-    def _evictable(self, loaded: list[InstanceInfo]) -> list[InstanceInfo]:
-        candidates = [i for i in loaded if i.ttl_s != 0 and i.active_requests == 0]
-        return sorted(candidates, key=lambda i: i.last_activity_at or 0.0)
+    def _evictable(
+        self,
+        loaded: list[InstanceInfo],
+        *,
+        include_busy: bool = False,
+        for_priority: int | None = None,
+    ) -> list[InstanceInfo]:
+        candidates = [
+            i
+            for i in loaded
+            if i.ttl_s != 0
+            and (include_busy or i.active_requests == 0)
+            and (for_priority is None or i.priority >= for_priority)
+        ]
+        return sorted(candidates, key=lambda i: (-i.priority, i.last_activity_at or 0.0))
 
     @property
     def probe(self) -> Any:
@@ -147,6 +159,7 @@ class StubSupervisor:
             port=18100,
             plan=plan,
             loaded_by=kwargs.get("source"),
+            priority=kwargs.get("priority", 3),
         )
         self.instances[record.id] = info
         return info

@@ -1313,13 +1313,16 @@ class Supervisor:
         draft: ModelRecord | None = None,
         adapters: Sequence[tuple[AdapterRecord, float]] = (),
         source: str | None = None,
+        priority: int = 3,
     ) -> InstanceInfo:
         """Launch (or return) the child for ``record``; returns once /health is ok.
 
         ``source`` names the caller ("mcp:load_model", "jit:/v1/chat/completions",
         "gui"...). It is stamped on the instance and carried into the spawn and
         ready log lines so a model appearing on the GPUs can be traced back to
-        whoever asked for it (D36).
+        whoever asked for it (D36). ``priority`` is the load's tier (D46),
+        stamped the same way; the crash-relaunch loop reuses this instance's
+        info, so the tier survives a restart.
         """
         async with self._lock(record.id):
             existing = self._instances.get(record.id)
@@ -1337,6 +1340,7 @@ class Supervisor:
                 plan=plan,
                 ttl_s=record.settings.ttl_s,
                 loaded_by=source,
+                priority=priority,
                 log_path=self._log_path_for(record.id),
             )
             inst = _Instance(

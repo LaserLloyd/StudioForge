@@ -197,6 +197,11 @@ async def chat_completions(request: Request) -> Any:
     serving = state.manager.serving_record(record)
 
     if payload.get("stream"):
+        # The D46 hold check runs BEFORE the 200 and the SSE stream begin: a
+        # held request must be a real HTTP 503 with Retry-After, not an
+        # in-band error frame most clients treat as fatal. ensure_loaded
+        # repeats the check inside the stream as the backstop.
+        state.manager.admission_check(serving.id)
         # Load inside the stream so a multi-minute cold start is covered by
         # keep-alive comments rather than silence.
         return StreamingResponse(

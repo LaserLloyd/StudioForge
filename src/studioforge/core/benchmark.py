@@ -58,6 +58,7 @@ import httpx
 
 from studioforge.core.gpu import fastest_gpu_order
 from studioforge.core.planner import BUSY_RETRY_AFTER_S
+from studioforge.core.priority import PRIORITY_CHAT
 from studioforge.core.supervisor import SPLIT_MODE_TENSOR, tensor_split_model_blockers
 from studioforge.errors import BadRequestError, ModelBusyError, ModelLoadError
 from studioforge.logging import get_logger
@@ -540,6 +541,13 @@ class Benchmarker:
                 # currently holds is genuinely available; without allowing the
                 # eviction the planner would reject a mode that will in fact fit.
                 allow_evict=True,
+                # Chat-tier candidacy on purpose: the run takes a D43 lease per
+                # mode, and a lease grant unloads idle residents of every tier
+                # (force covers the rest) -- so the applicability check must
+                # count them reclaimable too, whatever tier this model or its
+                # neighbours carry. Without it, benchmarking a tiered model on
+                # a full box reports "does not fit" for modes that fit fine.
+                priority=PRIORITY_CHAT,
             )
         except Exception as exc:  # pragma: no cover - planner errors are rare
             log.warning("benchmark.plan_failed", model_id=record.id, mode=mode.key, error=str(exc))
@@ -770,7 +778,12 @@ class Benchmarker:
             # force reloads (a fresh child per mode); evict_busy=False keeps
             # D36's rule that a load never interrupts a stream.
             instance = await self.manager.load(
-                record.id, ctx_size=ctx_size, force=True, evict_busy=False, source="benchmark"
+                record.id,
+                ctx_size=ctx_size,
+                force=True,
+                evict_busy=False,
+                source="benchmark",
+                hold_traffic=False,
             )
             result.load_time_s = round(time.perf_counter() - started, 3)
             result.vram_used_bytes = self._vram_delta(free_before, mode.devices)

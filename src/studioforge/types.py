@@ -821,6 +821,11 @@ class InstanceInfo(BaseModel):
     #: event without a requester, and the 2026-08-19 log review could not tell
     #: an OpenClaw load from the GUI's (D36).
     loaded_by: str | None = None
+    #: Load-priority tier (D46): 1 = the active chat model, 2 = a dispatched
+    #: agent, 3 = background. Lower outranks higher when models compete for
+    #: VRAM; a load that never said is background, so every pre-D46 instance
+    #: behaves exactly as it always did.
+    priority: int = 3
     restarts: int = 0
     last_error: str | None = None
     log_path: Path | None = None

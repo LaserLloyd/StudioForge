@@ -51,6 +51,16 @@ import subprocess
 import sys
 from pathlib import Path
 
+# The verdicts use ✓/✗ and em-dashes. Under a git hook on Windows,
+# stdout is a cp1252 pipe and printing them raises UnicodeEncodeError -- the
+# hook then fails the COMMIT with a codec traceback on a perfectly clean tree.
+# The gate must never be the thing that breaks; degrade the glyphs, not the run.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):  # pragma: no cover - exotic streams
+        pass
+
 REPO = Path(__file__).resolve().parent.parent
 
 # Files we never scan (binary or vendored) — but see FORBIDDEN_PATHS below,

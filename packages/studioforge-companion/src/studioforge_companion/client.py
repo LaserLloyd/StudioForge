@@ -389,16 +389,17 @@ class StudioForgeClient:
         kv_cache_type: str | None = None,
         parallel: int | None = None,
         force: bool = False,
+        priority: int | None = None,
     ) -> Any:
-        return await self.post(
-            f"models/{_path_segment(model)}/load",
-            {
-                "ctx_size": ctx_size,
-                "kv_cache_type": kv_cache_type,
-                "parallel": parallel,
-                "force": force,
-            },
-        )
+        body: dict[str, Any] = {
+            "ctx_size": ctx_size,
+            "kv_cache_type": kv_cache_type,
+            "parallel": parallel,
+            "force": force,
+        }
+        if priority is not None:
+            body["priority"] = priority
+        return await self.post(f"models/{_path_segment(model)}/load", body)
 
     async def unload(self, model: str) -> Any:
         return await self.post(f"models/{_path_segment(model)}/unload")
@@ -449,6 +450,7 @@ class StudioForgeClient:
         ctx_size: int,
         prefer_mode: str | None = None,
         kv_min: str | None = None,
+        priority: int | None = None,
     ) -> Any:
         """Load at exactly ``ctx_size`` per slot, or refuse with a 507.
 
@@ -461,6 +463,8 @@ class StudioForgeClient:
             body["prefer_mode"] = prefer_mode
         if kv_min is not None:
             body["kv_min"] = kv_min
+        if priority is not None:
+            body["priority"] = priority
         return await self.post(f"models/{_path_segment(model)}/load-recommended", body)
 
     # -- GPU leases (D43) --------------------------------------------------

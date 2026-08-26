@@ -2977,3 +2977,97 @@ history that is already public for this.
 
 Recorded here so the next sweep reads a decision instead of re-filing the
 finding.
+
+## D46 -- Three tiers of model loads: the chat model outranks the agent's, which outranks background
+
+**Problem.** Every load was equal. The model the user is mid-conversation with, a model an agent
+was dispatched with, and a background batch job all queued FIFO at the D29 gate, all evicted by
+the same LRU rule, and all competed for cards and PCIe bandwidth while a cold chat model was
+uploading weights. On this rig that meant the reply the user was literally waiting on could sit
+behind a background load, or land in a placement squeezed beside one because eviction was a
+last resort (D14: pass 1 never evicts) rather than a right.
+
+**Decision.** A load carries a **priority tier**: 1 the active chat model, 2 a dispatched agent,
+3 -- or unspecified -- background. Unspecified means background, so the minimal request (model +
+context size) and every pre-D46 client behave exactly as before. An explicit tier is remembered
+per model in memory, so a TTL unload and the JIT reload that follows keep the chat model at the
+chat tier; a restart is a clean slate.
+
+1. **Candidacy.** A load may displace only equal-or-worse tiers: the eviction ladders
+   (`_evictable`, everywhere) drop candidates the asking tier does not outrank or match, and
+   order the rest worst tier first, LRU within one. A background load can therefore never touch
+   the chat model -- "priority 3 takes a backseat to anything else" -- while pinned (D41) and
+   busy (D36) stay untouchable for everyone.
+2. **The fastest placement.** A tier-1/2 load plans *as if every idle worse-tier resident were
+   already gone* -- the same footprint credit `reload_of` gets (D30) -- so it takes the
+   placement an idle box would have given it instead of squeezing in beside background models.
+   Only the residents actually sitting on the chosen cards are displaced; the rest stay loaded.
+   Eviction is first-class for these loads regardless of `planner.on_insufficient` (an explicit
+   `allow_evict` still wins), and `load_recommended` walks its modes with eviction allowed from
+   the first round for the same reason.
+3. **The hold.** From the moment a tier-1/2 load is asked for -- its gate wait included -- until
+   it settles either way, new inference for worse-tier models and new worse-tier loads are
+   refused 503 + `Retry-After` (`priority_hold` in `busy` says who and why): they must drain
+   off the cards, not compete with the upload. Traffic for the loading model itself queues as
+   always (LM Studio parity), equal-or-better tiers pass, and internal loads (pin reconciler,
+   rebalancer, benchmarks, the restore below) hold nothing.
+4. **The gate queue is priority-aware.** D29's one-load-at-a-time stands; the lock now wakes
+   the best tier first, FIFO within one. A place in line, not an interrupt licence: a load
+   already holding the gate is never cancelled.
+5. **The restore.** Victims a tier-1/2 load displaced that were *recently active* (a request
+   within 300 s -- D42's idleness figure, same reasoning) are reloaded right after it settles,
+   best tier first, each with its exact previous settings tuple (the D42 five-field reload) on
+   whatever cards the planner now picks -- with `allow_evict=False`, so a restore can never
+   displace anything in turn. One attempt each: fits or stays down. Idle victims stay unloaded.
+   An explicit unload in the window cancels the restore (the D41 rule: a deliberate unload
+   outranks the machinery), and pinned models never enter it -- they are the reconciler's job.
+
+**Surfaces.** `priority` on `POST /api/models/{id}/load` and `/load-recommended`, on the MCP
+`load_model` / `load_recommended` tools, and `sfctl models load --priority`; the tier rides
+`InstanceInfo.priority`; `busy.priority_hold` on `/health` and `/api/health`.
+
+**Tests.** `tests/unit/test_priority.py` (the lock's ordering and cancellation, candidacy and
+tier-then-LRU order, the fast-card displacement and its per-card limit, the no-evict restore
+licence, the hold's refusals and its release, the gate jump, active-restored vs idle-stays-down,
+a restore that no longer fits, unload-cancels-restore), `tests/unit/test_mcp.py` (the tool
+schema carries `priority`; a tier outside 1-3 is a 400 naming the parameter).
+
+### D46, amended the same day: what the review pass corrected
+
+Eight independent review angles over the diff, before it ever ran; none of
+these is a new rule, each is the decision above actually enforced.
+
+* **Preemption is idle-only, always.** The preempt set inherited
+  ``include_busy`` from ``force``, so a forced tier load could kill a busy
+  background stream *for a nicer placement*. D36's licence belongs to the
+  eviction ladder alone -- preemption now never lists a busy instance, and
+  the victim-stop loop re-checks each victim at stop time (the plan chose it
+  idle; a teardown-length await later it may not be).
+* **Re-tiering a running model reaches the instance.** ``load(priority=1)``
+  on a ready model updated the memo and returned -- and every candidacy
+  check reads the *instance*, so the promotion was a silent no-op until the
+  next reload. The early-return path now stamps the live instance.
+* **The transient-OOM retry keeps every promise.** Its replan -- routinely
+  carrying preemption victims for a tier load -- launched without stopping
+  them (a spawn into VRAM the plan only imagined free), and its own LRU
+  victim skipped the restore book. Both paths now stop and note victims
+  exactly like the plan loop.
+* **A refused load does not re-tier.** The memo wrote before the admission
+  gate, so a 503-refused background load could demote the chat model on the
+  way out.
+* **The hold spans load_recommended's walk**, not only its final load, and
+  a held *streaming* request is refused before the 200 -- a real 503 with
+  ``Retry-After`` -- rather than as an in-band SSE error frame.
+* **The lease plane honours the tiers.** ``reserve_gpus`` unloaded idle
+  residents regardless of tier -- an end-run around "background can never
+  displace it". A chat/agent-tier idle resident now refuses a grant the way
+  a pinned one does; ``force`` overrides both.
+* **The preview answers for the real load.** ``plan_preview``, the slot
+  re-check inside ``load_recommended``, and the benchmark's applicability
+  check all planned tier-blind and could contradict the load they preview.
+  All three now plan at the tier the actual load will use.
+* Deliberately unchanged: the in-memory tier memo has no decay (a restart
+  or an explicit re-tier is the demotion path, and the TTL sweep still
+  reclaims idle residents of every tier), and the gate trades FIFO progress
+  for tier order -- a sustained stream of tier-1/2 loads can park a
+  background waiter, accepted and documented rather than papered over.

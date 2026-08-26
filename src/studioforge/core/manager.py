@@ -13,12 +13,14 @@ import asyncio
 import contextlib
 import time
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from studioforge.config import Config, KvCacheType
 from studioforge.core.gpu import vram_processes
 from studioforge.core.leases import DEFAULT_IDLE_TTL_S, LeaseBook
 from studioforge.core.planner import BUSY_RETRY_AFTER_S, OBSERVATION_NOTE_PER_PID_DEVICE, Planner
+from studioforge.core.priority import PRIORITY_BACKGROUND, PriorityLock, normalise_priority
 from studioforge.core.registry import Registry
 from studioforge.core.supervisor import Supervisor
 from studioforge.db import Database
@@ -79,6 +81,50 @@ CONFIG_ERROR_MARKERS: tuple[str, ...] = (
     "no such file or directory",
     "does not exist",
 )
+
+
+#: How recently a displaced model must have served to count as *active* and be
+#: reloaded after a priority load lands (D46). The figure is D42's idleness
+#: threshold for the same reason it is D42's: five minutes without a request
+#: means the conversation has plausibly gone away, so the VRAM is better left
+#: to whoever the priority load was for.
+RESTORE_ACTIVE_WINDOW_S = 300.0
+
+
+def reload_settings(plan: LoadPlan) -> dict[str, Any]:
+    """The settings tuple a faithful reload of ``plan``'s instance needs.
+
+    ``ctx_per_slot or ctx_size`` is the load-bearing subtlety: ``ctx_size`` on
+    a plan is already per slot, but older plans carried only the total, and
+    reloading a 4-slot model at its *total* context quadruples the ask. One
+    implementation, because the D42 rebalancer and the D46 restore must never
+    drift on it.
+    """
+    return {
+        "ctx_size": int(plan.ctx_per_slot or plan.ctx_size),
+        "kv_cache_type": plan.kv_cache_type,
+        "kv_cache_type_v": plan.kv_cache_type_v,
+        "parallel": int(plan.parallel),
+    }
+
+
+@dataclass
+class _RestoreEntry:
+    """What it takes to bring a displaced model back exactly as it was (D46).
+
+    The five-field settings tuple is the D42 rebalancer's: everything else a
+    faithful reload needs, the planner re-derives. ``devices`` is deliberately
+    absent -- the old cards now belong to the priority model, so the restore
+    lets the planner place it fresh, with no eviction licence at all.
+    """
+
+    model_id: str
+    priority: int
+    ctx_size: int
+    kv_cache_type: Any
+    kv_cache_type_v: Any
+    parallel: int
+    evicted_at: float
 
 
 #: Sanity ceilings for per-request load arguments. Not policy -- the planner
@@ -265,7 +311,9 @@ class ModelManager:
         #: two cold loads planned side by side each see the VRAM the other has
         #: not allocated yet, both launch, one OOMs, the retry evicts the
         #: other, and the first client's request lands on a dead child.
-        self._load_gate = asyncio.Lock()
+        #: Priority-aware since D46: waiters are served best tier first, FIFO
+        #: within a tier, so a chat load never queues behind background ones.
+        self._load_gate = PriorityLock()
         #: model ids whose load is in flight behind the gate, for /health.busy.
         #: The supervisor's "loading" state only appears once a child exists;
         #: this covers the planning window too, which is where two callers used
@@ -309,6 +357,21 @@ class ModelManager:
         #: not once per sweep (D42, amended).
         self._rebalance_checked_at = 0.0
         self._rebalance_seen: dict[str, tuple[Any, float]] = {}
+        #: model id -> the tier its last explicit load asked for (D46), so a
+        #: JIT reload of the chat model keeps being the chat model. In-memory
+        #: on purpose: tiers describe what the clients are doing right now,
+        #: and a restart is a clean slate the next explicit load repopulates.
+        self._model_priority: dict[str, int] = {}
+        #: model id -> tier, for chat/agent loads currently in flight (gate
+        #: wait included). While any hold stands, new inference and new loads
+        #: for models of a *worse* tier are refused with a 503 + Retry-After,
+        #: so they drain off the cards instead of competing with the load.
+        self._priority_holds: dict[str, int] = {}
+        #: model id -> what it takes to bring back a recently-active model a
+        #: priority load displaced (D46); consumed by the single-flight
+        #: restore task right after the displacing load settles.
+        self._restore_entries: dict[str, _RestoreEntry] = {}
+        self._restore_task: asyncio.Task[None] | None = None
         self._draining = False
         #: Set by the app to the boot's "done" event (D33): a JIT load that
         #: arrives while the library is still being scanned or the engine is
@@ -368,6 +431,13 @@ class ModelManager:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._rebalance_task
             self._rebalance_task = None
+        if self._restore_task is not None:
+            # A restore reload in flight must not spawn children into the drain.
+            self._restore_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._restore_task
+            self._restore_task = None
+        self._restore_entries.clear()
 
         deadline = time.time() + (
             drain_timeout_s if drain_timeout_s is not None else self.config.server.drain_timeout_s
@@ -470,6 +540,76 @@ class ModelManager:
         if lock is not None and not lock.locked():
             self._locks.pop(model_id, None)
 
+    def _effective_priority(self, model_id: str) -> int:
+        """The tier a model is serving (or would load) at (D46).
+
+        A running instance carries the truth; an unloaded model falls back to
+        the tier its last explicit load asked for, so the chat model stays the
+        chat model across a TTL unload and its JIT reload; a model nobody ever
+        tiered is background.
+        """
+        instance = self.supervisor.get(model_id)
+        if instance is not None:
+            return instance.priority
+        return self._model_priority.get(model_id, PRIORITY_BACKGROUND)
+
+    def _resolve_tier(self, model_id: str, priority: int | None) -> int:
+        """The tier this load runs at: the validated explicit ask, else memory."""
+        tier = normalise_priority(priority)
+        if tier is None:
+            return self._model_priority.get(model_id, PRIORITY_BACKGROUND)
+        return tier
+
+    def _current_hold(self) -> tuple[str, int] | None:
+        """The winning hold -- best tier, model id as the tiebreak -- or None.
+
+        One implementation on purpose: the 503's named holder and
+        ``busy.priority_hold`` must be the same answer.
+        """
+        holds = self._priority_holds
+        if not holds:
+            return None
+        holder = min(holds, key=lambda mid: (holds[mid], mid))
+        return holder, holds[holder]
+
+    def admission_check(self, model_id: str) -> None:
+        """Raise the D46 hold refusal this model's traffic would get right now.
+
+        For the API layer: the streaming endpoints call this *before* the 200
+        and the SSE stream begin, so a held request is a real HTTP 503 with
+        ``Retry-After`` instead of an in-band error frame most clients treat
+        as fatal. ``ensure_loaded`` runs the same check as the backstop.
+        """
+        self._refuse_if_held(model_id, priority=self._effective_priority(model_id))
+
+    def _refuse_if_held(self, model_id: str, *, priority: int) -> None:
+        """503 anything a standing chat/agent load outranks (D46).
+
+        While a tier-1 or tier-2 load is in flight -- gate wait included --
+        new inference for worse-tier models and new worse-tier loads are
+        refused so those models drain, become evictable, and stop competing
+        with the load for bandwidth. Traffic for the loading model itself
+        queues as always (LM Studio parity), and equal-or-better tiers pass.
+        """
+        if model_id in self._priority_holds:
+            return
+        hold = self._current_hold()
+        if hold is None:
+            return
+        holder, hold_p = hold
+        if priority <= hold_p:
+            return
+        raise ModelBusyError(
+            f"a priority {hold_p} model ('{holder}') is loading; requests and "
+            f"loads for lower-priority models are held off until it is serving "
+            f"so it gets the cards and the bandwidth. Retry shortly.",
+            details={
+                "busy": self.busy_snapshot(),
+                "retry_after_s": BUSY_RETRY_AFTER_S,
+                "priority_hold": {"model_id": holder, "priority": hold_p},
+            },
+        )
+
     async def ensure_loaded(
         self, name: str, *, source: str = "jit"
     ) -> tuple[ModelRecord, InstanceInfo]:
@@ -484,12 +624,20 @@ class ModelManager:
         The returned record is the one the caller *named* (a virtual model
         keeps its identity); the returned instance may belong to its base --
         use ``instance.model_id`` for anything that talks to the supervisor.
+
+        A JIT load inherits the tier of the model's last explicit load (D46),
+        so the chat model reloading mid-conversation gets the chat tier's
+        rights; and while a better-tier load is in flight, requests for
+        worse-tier models are refused here with a 503 + Retry-After rather
+        than served -- they must drain, not compete.
         """
         await self._await_boot()
         record = self.registry.resolve(name)
         if record is None:
             raise ModelNotFoundError(name, known=self.registry.known_ids())
         serving = self.serving_record(record)
+        priority = self._effective_priority(serving.id)
+        self._refuse_if_held(serving.id, priority=priority)
 
         instance = self.supervisor.get(serving.id)
         if instance is not None and instance.state == "ready":
@@ -505,7 +653,16 @@ class ModelManager:
                 if instance is not None and instance.state == "ready":
                     self.registry.touch(record.id)
                     return record, instance
-                instance = await self._load_locked(serving, source=source)
+                # Re-resolve the tier under the lock: an explicit load that
+                # tiered this model while we queued must not be undone by a
+                # JIT reload cold-loading it at the stale background tier.
+                priority = self._effective_priority(serving.id)
+                instance = await self._load_locked(
+                    serving,
+                    source=source,
+                    priority=priority,
+                    hold=priority < PRIORITY_BACKGROUND,
+                )
                 self.registry.touch(record.id)
                 return record, instance
         finally:
@@ -530,6 +687,8 @@ class ModelManager:
         evict_busy: bool | None = None,
         allow_evict: bool | None = None,
         require_resident: bool = False,
+        priority: int | None = None,
+        hold_traffic: bool = True,
     ) -> InstanceInfo:
         """Explicit load (GUI/CLI/MCP). ``force`` reloads an already-running model.
 
@@ -572,6 +731,16 @@ class ModelManager:
         if the instance it was meant to move is no longer ``ready`` when the
         gate opens (a TTL unload, a crash), nothing is loaded -- a move must
         never resurrect a model nobody asked for.
+
+        ``priority`` is the load's tier (D46): 1 the active chat model, 2 a
+        dispatched agent, 3 (or ``None``) background. An explicit tier is
+        remembered per model, so the next load of the same model -- a JIT
+        reload included -- keeps it. A tier-1 or tier-2 load plans as if idle
+        lower-tier residents were gone (they are displaced from the cards it
+        picks, and the recently-active ones reloaded afterwards where they
+        fit), jumps the load queue, and -- unless ``hold_traffic`` is
+        ``False``, the internal callers' setting -- holds new worse-tier
+        traffic off with a 503 while it is in flight.
         """
         validate_load_args(
             ctx_size=ctx_size,
@@ -594,27 +763,58 @@ class ModelManager:
                     )
                 }
             )
+        tier = self._resolve_tier(record.id, priority)
+        if hold_traffic:
+            self._refuse_if_held(record.id, priority=tier)
+        if normalise_priority(priority) is not None:
+            # An explicit tier is the caller saying what this model *is*;
+            # remember it so a TTL unload and JIT reload keep it (D46).
+            # Written only past the admission gate: a load the hold just
+            # refused must not re-tier the model as a side effect.
+            self._model_priority[record.id] = tier
+        hold = tier < PRIORITY_BACKGROUND and hold_traffic
         lock = await self._lock_for(record.id)
-        async with lock:
-            existing = self.supervisor.get(record.id)
-            reload_of: str | None = None
-            if existing is not None and existing.state == "ready":
-                if not force:
-                    return existing
-                reload_of = record.id
-            return await self._load_locked(
-                record,
-                ctx_size=ctx_size,
-                kv_cache_type=kv_cache_type,
-                kv_cache_type_v=kv_cache_type_v,
-                parallel=parallel,
-                reload_of=reload_of,
-                force=force,
-                source=source,
-                evict_busy=force if evict_busy is None else evict_busy,
-                allow_evict=allow_evict,
-                require_resident=require_resident,
-            )
+        self._load_waiters[record.id] = self._load_waiters.get(record.id, 0) + 1
+        try:
+            async with lock:
+                existing = self.supervisor.get(record.id)
+                reload_of: str | None = None
+                if existing is not None and existing.state == "ready":
+                    if not force:
+                        if normalise_priority(priority) is not None:
+                            # Re-tiering a running model must reach the live
+                            # instance -- the planner's candidacy and
+                            # _effective_priority read it there, and a memo
+                            # the instance contradicts is a silent no-op.
+                            existing.priority = tier
+                        return existing
+                    reload_of = record.id
+                return await self._load_locked(
+                    record,
+                    ctx_size=ctx_size,
+                    kv_cache_type=kv_cache_type,
+                    kv_cache_type_v=kv_cache_type_v,
+                    parallel=parallel,
+                    reload_of=reload_of,
+                    force=force,
+                    source=source,
+                    evict_busy=force if evict_busy is None else evict_busy,
+                    allow_evict=allow_evict,
+                    require_resident=require_resident,
+                    priority=tier,
+                    hold=hold,
+                )
+        finally:
+            # The same waiter bookkeeping ensure_loaded keeps: without it,
+            # _prune_lock can discard a lock this call is queued on, and two
+            # tasks end up inside _load_locked for one model -- the first
+            # finisher then pops the second's hold mid-load.
+            remaining = self._load_waiters.get(record.id, 1) - 1
+            if remaining <= 0:
+                self._load_waiters.pop(record.id, None)
+                self._prune_lock(record.id)
+            else:
+                self._load_waiters[record.id] = remaining
 
     #: Contexts the "Load recommended" buttons offer, and the ones the MCP
     #: docstring names. Not a limit -- any integer up to the trained window is
@@ -630,6 +830,7 @@ class ModelManager:
         prefer_modes: Sequence[str] | None = None,
         kv_min: str | None = None,
         source: str = "api",
+        priority: int | None = None,
     ) -> InstanceInfo:
         """Load at **exactly** ``ctx_size`` per slot, letting the server pick the rest.
 
@@ -667,6 +868,12 @@ class ModelManager:
                 not quantize the cache to reach this window at all". Omitted,
                 the full quality-first ladder is available.
             source: who asked, stamped on the instance and the log lines (D36).
+            priority: the load's tier (D46): 1 the active chat model, 2 a
+                dispatched agent, 3 (or omitted) background. A tier-1/2 load
+                walks the modes with eviction of worse-tier idle models allowed
+                from the first round, so the best mode wins even when
+                background models must be displaced for it; the recently
+                active ones are reloaded afterwards where they fit.
         """
         from studioforge.core import catalog as catalog_mod
         from studioforge.core import placements as placements_mod
@@ -677,6 +884,12 @@ class ModelManager:
         if record is None:
             raise ModelNotFoundError(name, known=self.registry.known_ids())
         record = self.serving_record(record)
+        tier = self._resolve_tier(record.id, priority)
+        self._refuse_if_held(record.id, priority=tier)
+        if normalise_priority(priority) is not None:
+            # Same rule as load(): an explicit tier is remembered, but only
+            # past the admission gate (D46).
+            self._model_priority[record.id] = tier
         if record.meta is None:
             raise ModelLoadError(
                 f"'{record.id}' has no readable GGUF metadata, so its trained context "
@@ -753,54 +966,74 @@ class ModelManager:
         planner = Planner(self.config, probe, log_plans=False)
         loaded = [i for i in self.supervisor.list() if i.model_id != record.id]
 
+        # A chat/agent load (D46) walks with eviction of worse-tier idle
+        # models allowed from the FIRST round: the headline mode that fits by
+        # displacing background models beats a lesser mode that fits beside
+        # them, which is the whole point of the tier. Background keeps the
+        # gentler two-round walk -- fit beside everyone first.
+        rounds: tuple[bool, ...] = (True,) if tier < PRIORITY_BACKGROUND else (False, True)
         attempts: list[dict[str, Any]] = []
-        for allow_evict in (False, True):
-            attempts = [
-                self._mode_attempt(
-                    record,
-                    mode,
+        hold = tier < PRIORITY_BACKGROUND
+        if hold:
+            # D46: the hold must span the mode walk too, not only the final
+            # load -- otherwise a worse-tier load can take the D29 gate while
+            # this one is still choosing its placement. The inner self.load()
+            # re-registers the same key and pops it; the outer pop is the
+            # backstop for every refusal path out of the walk.
+            self._priority_holds[record.id] = tier
+        try:
+            for allow_evict in rounds:
+                attempts = [
+                    self._mode_attempt(
+                        record,
+                        mode,
+                        ctx_size=int(ctx_size),
+                        kv_min=kv_min,
+                        planner=planner,
+                        loaded=loaded,
+                        observations=observations,
+                        allow_evict=allow_evict,
+                        catalog_mod=catalog_mod,
+                        placements_mod=placements_mod,
+                        priority=tier,
+                    )
+                    for mode in modes
+                ]
+                winner = next((a for a in attempts if a["fits"]), None)
+                if winner is None:
+                    continue
+                log.info(
+                    "loading at the requested context",
+                    model_id=record.id,
                     ctx_size=int(ctx_size),
-                    kv_min=kv_min,
-                    planner=planner,
-                    loaded=loaded,
-                    observations=observations,
-                    allow_evict=allow_evict,
-                    catalog_mod=catalog_mod,
-                    placements_mod=placements_mod,
+                    mode=winner["mode"],
+                    devices=winner["devices"],
+                    kv_cache_type=winner["kv_cache_type"],
+                    parallel=winner["parallel"],
+                    evicting=winner["would_evict"],
+                    source=source,
                 )
-                for mode in modes
-            ]
-            winner = next((a for a in attempts if a["fits"]), None)
-            if winner is None:
-                continue
-            log.info(
-                "loading at the requested context",
-                model_id=record.id,
-                ctx_size=int(ctx_size),
-                mode=winner["mode"],
-                devices=winner["devices"],
-                kv_cache_type=winner["kv_cache_type"],
-                parallel=winner["parallel"],
-                evicting=winner["would_evict"],
-                source=source,
-            )
-            # force=True is the RELOAD half of force (the model may be resident
-            # at another context); evict_busy=False keeps D36's rule -- a model
-            # that is serving is never a candidate, and this path has no
-            # override for that by design.
-            return await self.load(
-                record.id,
-                ctx_size=int(ctx_size),
-                kv_cache_type=winner["kv_cache_type"],
-                kv_cache_type_v=winner["kv_cache_type_v"],
-                parallel=winner["parallel"],
-                devices=winner["devices"],
-                force=True,
-                source=source,
-                evict_busy=False,
-            )
+                # force=True is the RELOAD half of force (the model may be
+                # resident at another context); evict_busy=False keeps D36's
+                # rule -- a model that is serving is never a candidate, and
+                # this path has no override for that by design.
+                return await self.load(
+                    record.id,
+                    ctx_size=int(ctx_size),
+                    kv_cache_type=winner["kv_cache_type"],
+                    kv_cache_type_v=winner["kv_cache_type_v"],
+                    parallel=winner["parallel"],
+                    devices=winner["devices"],
+                    force=True,
+                    source=source,
+                    evict_busy=False,
+                    priority=tier,
+                )
 
-        raise self._recommendation_refused(record, int(ctx_size), attempts, trained=trained)
+            raise self._recommendation_refused(record, int(ctx_size), attempts, trained=trained)
+        finally:
+            if hold:
+                self._priority_holds.pop(record.id, None)
 
     def _modes_for_recommendation(self, prefer_modes: Sequence[str] | None) -> list[Any]:
         """The hardware modes to walk, in the order to walk them."""
@@ -844,6 +1077,7 @@ class ModelManager:
         allow_evict: bool,
         catalog_mod: Any,
         placements_mod: Any,
+        priority: int = PRIORITY_BACKGROUND,
     ) -> dict[str, Any]:
         """Can this mode hold ``ctx_size`` per slot, and if not, what is in the way?
 
@@ -872,6 +1106,7 @@ class ModelManager:
             draft=self._draft_for(record),
             adapters=[a for a, _ in self._adapters_for(record)],
             allow_evict=allow_evict,
+            priority=priority,
         )
         if not isinstance(result, LoadPlan):
             attempt["reason"] = result.reason
@@ -909,6 +1144,10 @@ class ModelManager:
                 draft=self._draft_for(record),
                 adapters=[a for a, _ in self._adapters_for(record)],
                 allow_evict=allow_evict,
+                # Same tier as the fit decision above: the slot count must be
+                # judged in the same world (preemption credit included), or a
+                # tier load's re-check silently walks down to one slot (D46).
+                priority=priority,
             )
             if isinstance(candidate, LoadPlan):
                 plan = candidate
@@ -1037,6 +1276,8 @@ class ModelManager:
         evict_busy: bool | None = None,
         allow_evict: bool | None = None,
         require_resident: bool = False,
+        priority: int = PRIORITY_BACKGROUND,
+        hold: bool = False,
     ) -> InstanceInfo:
         """Plan, evict if needed, launch. Caller must hold the per-model lock.
 
@@ -1058,14 +1299,21 @@ class ModelManager:
                 "waiting for another model load to finish before planning",
                 model_id=record.id,
                 queued=sum(self._load_waiters.values()),
+                priority=priority,
             )
         # Visible in /health.busy.loading from the moment the load is asked
         # for, gate wait included: a load queued behind another one is still a
         # load in flight, and "the box was idle when we looked" must not be
         # true only between the gate and the spawn.
         self._loading.add(record.id)
+        # The hold spans the same window (D46): from the moment a chat/agent
+        # load is asked for -- its gate wait very much included -- until it
+        # settles either way, worse-tier traffic is refused at admission.
+        if hold:
+            self._priority_holds[record.id] = priority
         try:
-            async with self._load_gate:
+            await self._load_gate.acquire(priority)
+            try:
                 return await self._load_gated(
                     record,
                     ctx_size=ctx_size,
@@ -1078,9 +1326,17 @@ class ModelManager:
                     evict_busy=force if evict_busy is None else evict_busy,
                     allow_evict=allow_evict,
                     require_resident=require_resident,
+                    priority=priority,
                 )
+            finally:
+                self._load_gate.release()
         finally:
             self._loading.discard(record.id)
+            if hold:
+                self._priority_holds.pop(record.id, None)
+            # Bring back what this load displaced, where it still fits --
+            # also on failure: the victims are already gone either way (D46).
+            self._kick_restore()
 
     async def _load_gated(
         self,
@@ -1096,6 +1352,7 @@ class ModelManager:
         evict_busy: bool | None = None,
         allow_evict: bool | None = None,
         require_resident: bool = False,
+        priority: int = PRIORITY_BACKGROUND,
     ) -> InstanceInfo:
         existing = self.supervisor.get(record.id)
         if require_resident and (existing is None or existing.state != "ready"):
@@ -1178,6 +1435,7 @@ class ModelManager:
             # changed between preview and gate is refused, not evicted (D42).
             allow_evict=allow_evict,
             source=source,
+            priority=priority,
         )
 
         if isinstance(plan_result, LoadRejected):
@@ -1201,7 +1459,28 @@ class ModelManager:
             if victim == reload_of:
                 log.info("stopping the running instance for a forced reload", model_id=victim)
             else:
-                log.info("evicting to make room", victim=victim, for_model=record.id)
+                # The plan chose this victim while it was idle, but each stop
+                # above yields for a child teardown -- it may be serving by
+                # now, and D36 says a stream is never killed to make room
+                # without the explicit licence. Refusing here leaves earlier
+                # victims stopped; their restore entries stand, and the
+                # _kick_restore in _load_locked's finally brings the active
+                # ones back.
+                inst = self.supervisor.get(victim)
+                if inst is not None and inst.active_requests > 0 and not interrupt_ok:
+                    raise ModelBusyError(
+                        f"'{victim}' picked up {inst.active_requests} request(s) after "
+                        f"the plan chose it for eviction; loading '{record.id}' now "
+                        f"would interrupt them. Retry shortly.",
+                        details={
+                            "busy": self.busy_snapshot(),
+                            "retry_after_s": BUSY_RETRY_AFTER_S,
+                        },
+                    )
+                self._note_displaced(record, victim, priority=priority)
+                log.info(
+                    "evicting to make room", victim=victim, for_model=record.id, priority=priority
+                )
             await self.supervisor.stop(victim)
 
         engine_tag = record.settings.engine_tag
@@ -1219,6 +1498,7 @@ class ModelManager:
                 source=source,
                 parallel_auto=parallel_auto,
                 allow_evict=allow_evict,
+                priority=priority,
             )
         except StudioForgeError:
             raise
@@ -1237,11 +1517,125 @@ class ModelManager:
         # holds the pin back, and a failing reload's backoff starts over (D41).
         self._pin_suppressed.discard(record.id)
         self._pin_retry.pop(record.id, None)
+        # A fresh load of this model supersedes any pending restore of it.
+        self._restore_entries.pop(record.id, None)
         self.registry.touch(record.id)
         # The instance carries the pid, and the pid is what makes the
         # observation about *this* child rather than about the whole card.
         self._record_actual_vram(record, instance.plan or plan, instance)
         return instance
+
+    def _note_displaced(self, for_record: ModelRecord, victim: str, *, priority: int) -> None:
+        """Remember a recently-active victim of a chat/agent load, to bring back (D46).
+
+        Only tier-1/2 loads restore their victims: background-vs-background
+        eviction is the pre-D46 LRU world, where a reload would be churn. A
+        victim that was not recently active stays unloaded -- that is the
+        deal: the user's chat takes the cards, the idle background model has
+        no standing claim on coming back.
+        """
+        if priority >= PRIORITY_BACKGROUND:
+            return
+        instance = self.supervisor.get(victim)
+        if instance is None or instance.plan is None:
+            return
+        now = time.time()
+        last = instance.last_activity_at or instance.started_at or 0.0
+        active = instance.active_requests > 0 or (now - last) <= RESTORE_ACTIVE_WINDOW_S
+        if not active:
+            log.info(
+                "displaced model was idle and stays unloaded",
+                model_id=victim,
+                idle_s=round(now - last),
+                for_model=for_record.id,
+            )
+            return
+        self._restore_entries[victim] = _RestoreEntry(
+            model_id=victim,
+            priority=instance.priority,
+            evicted_at=now,
+            **reload_settings(instance.plan),
+        )
+        log.info(
+            "displaced model was recently active; it is reloaded after the "
+            "priority load where it fits",
+            model_id=victim,
+            for_model=for_record.id,
+        )
+
+    def _kick_restore(self) -> None:
+        """Start the single-flight restore pass when displaced models wait on it."""
+        if not self._restore_entries or self._draining:
+            # A load that was parked at the gate when stop() ran can finish
+            # during the drain; its kick must not spawn a task into shutdown.
+            return
+        if self._restore_task is not None and not self._restore_task.done():
+            return
+        self._restore_task = asyncio.create_task(
+            self._restore_evicted(), name="sf-priority-restore"
+        )
+
+    async def _restore_evicted(self) -> None:
+        """Reload the recently-active models a priority load displaced (D46).
+
+        One attempt per entry, best tier first and earliest eviction within a
+        tier, each with the exact settings tuple it ran with before (the D42
+        five-field reload) on whatever cards the planner now picks -- with no
+        eviction licence at all, so a restore can never displace anything in
+        turn. An entry that no longer fits is dropped, not retried: "if it
+        fits, reload it" was the promise, and a wants-list that lingers is the
+        pin reconciler's job, not this pass's.
+        """
+        while self._restore_entries:
+            if self._draining:
+                # A shutdown mid-window: do not spawn children into the drain.
+                self._restore_entries.clear()
+                return
+            model_id = min(
+                self._restore_entries,
+                key=lambda mid: (
+                    self._restore_entries[mid].priority,
+                    self._restore_entries[mid].evicted_at,
+                ),
+            )
+            entry = self._restore_entries.pop(model_id)
+            if self.supervisor.get(model_id) is not None:
+                continue  # already back -- a JIT request beat this pass to it
+            if model_id in self._pin_suppressed:
+                continue  # explicitly unloaded meanwhile; down stays down (D41)
+            try:
+                await self.load(
+                    model_id,
+                    ctx_size=entry.ctx_size,
+                    kv_cache_type=entry.kv_cache_type,
+                    kv_cache_type_v=entry.kv_cache_type_v,
+                    parallel=entry.parallel,
+                    source="priority-restore",
+                    evict_busy=False,
+                    allow_evict=False,
+                    priority=entry.priority,
+                    hold_traffic=False,
+                )
+                log.info(
+                    "restored after a priority eviction",
+                    model_id=model_id,
+                    priority=entry.priority,
+                    ctx_size=entry.ctx_size,
+                )
+            except (InsufficientVramError, ModelBusyError) as exc:
+                log.info(
+                    "displaced model stays unloaded: no room left after the priority load",
+                    model_id=model_id,
+                    reason=getattr(exc, "message", str(exc)),
+                )
+            except StudioForgeError as exc:
+                log.warning(
+                    "restore after a priority eviction failed",
+                    model_id=model_id,
+                    error=getattr(exc, "message", str(exc)),
+                )
+            except Exception:  # pragma: no cover - defensive
+                log.exception("restore after a priority eviction crashed", model_id=model_id)
 
     #: How often a caller waiting on an in-flight start re-checks it.
     SETTLE_POLL_S = 0.25
@@ -1306,6 +1700,7 @@ class ModelManager:
         source: str = "api",
         parallel_auto: bool = False,
         allow_evict: bool | None = None,
+        priority: int = PRIORITY_BACKGROUND,
     ) -> InstanceInfo:
         """Launch the child, retrying **once** after a transient OOM.
 
@@ -1334,7 +1729,13 @@ class ModelManager:
         """
         try:
             return await self.supervisor.start(
-                record, plan, engine_tag=engine_tag, draft=draft, adapters=adapters, source=source
+                record,
+                plan,
+                engine_tag=engine_tag,
+                draft=draft,
+                adapters=adapters,
+                source=source,
+                priority=priority,
             )
         except ModelLoadError as exc:
             stderr = exc.details.get("stderr")
@@ -1348,7 +1749,7 @@ class ModelManager:
                     model_id=record.id,
                 )
                 raise
-            victim = self._eviction_candidate(exclude=record.id)
+            victim = self._eviction_candidate(exclude=record.id, for_priority=priority)
             if victim is None:
                 log.warning(
                     "load failed transiently but nothing can be evicted; not retrying",
@@ -1361,6 +1762,9 @@ class ModelManager:
                 model_id=record.id,
                 victim=victim,
             )
+            # Same restore promise as a planner-chosen victim (D46): a
+            # recently-active model displaced by the retry comes back too.
+            self._note_displaced(record, victim, priority=priority)
             await self.supervisor.stop(victim)
 
         # Re-plan: free VRAM has changed, so placement and context may too.
@@ -1378,18 +1782,39 @@ class ModelManager:
             adapters=[a for a, _ in adapters],
             parallel_auto=parallel_auto,
             allow_evict=allow_evict,
+            priority=priority,
         )
         if isinstance(replanned, LoadRejected):
             raise self._vram_error(replanned)
+        # The replan may carry victims of its own -- routinely so for a
+        # tier-1/2 load, whose preemption credit lists the lower-tier
+        # residents on its chosen cards (D46). Launching without stopping
+        # them spawns the child into VRAM the plan only imagined free.
+        for victim in replanned.evict_model_ids:
+            if self.supervisor.get(victim) is None:
+                continue
+            self._note_displaced(record, victim, priority=priority)
+            log.info("evicting to make room on the retry", victim=victim, for_model=record.id)
+            await self.supervisor.stop(victim)
         instance = await self.supervisor.start(
-            record, replanned, engine_tag=engine_tag, draft=draft, adapters=adapters, source=source
+            record,
+            replanned,
+            engine_tag=engine_tag,
+            draft=draft,
+            adapters=adapters,
+            source=source,
+            priority=priority,
         )
         log.info("load succeeded on retry", model_id=record.id)
         return instance
 
-    def _eviction_candidate(self, *, exclude: str) -> str | None:
-        """LRU unpinned idle instance to evict, or None if there is nothing."""
-        for instance in self.planner._evictable(self.supervisor.list()):
+    def _eviction_candidate(self, *, exclude: str, for_priority: int | None = None) -> str | None:
+        """Best eviction victim -- worst tier, LRU within it -- or None.
+
+        ``for_priority`` keeps the D46 rule on the transient-OOM retry path
+        too: a background load's retry may not free the chat model.
+        """
+        for instance in self.planner._evictable(self.supervisor.list(), for_priority=for_priority):
             if instance.model_id != exclude:
                 return instance.model_id
         return None
@@ -1525,6 +1950,10 @@ class ModelManager:
         """
         record = self.registry.resolve(name)
         model_id = record.id if record is not None else name
+        if deliberate:
+            # An explicit unload also cancels a pending priority restore:
+            # whoever called this wants the model DOWN, not down-for-a-moment.
+            self._restore_entries.pop(model_id, None)
         if self.supervisor.get(model_id) is None:
             return False
         if deliberate:
@@ -1536,6 +1965,7 @@ class ModelManager:
         """Stop every child. Pinned ones stay down until loaded or re-pinned (D41)."""
         ids = [i.model_id for i in self.supervisor.list()]
         self._pin_suppressed.update(ids)
+        self._restore_entries.clear()
         await self.supervisor.stop_all()
         return ids
 
@@ -1559,7 +1989,9 @@ class ModelManager:
         *pinned* idle resident refuses too unless ``force`` is set, because a
         pin is a standing wish; with ``force`` it is evicted and the pin
         reconciler brings it back on other cards if they fit, or on these once
-        the lease ends. A card already leased is a conflict, never a takeover.
+        the lease ends. A chat- or agent-tier idle resident (D46) refuses the
+        same way: a lease grant does not outrank the tiers without ``force``.
+        A card already leased is a conflict, never a takeover.
         """
         wanted = sorted({int(d) for d in devices})
         if not wanted:
@@ -1590,6 +2022,7 @@ class ModelManager:
             )
         busy: list[InstanceInfo] = []
         pinned: list[InstanceInfo] = []
+        tiered: list[InstanceInfo] = []
         victims: list[InstanceInfo] = []
         for instance in self.supervisor.list():
             if instance.model_id in owners or instance.plan is None:
@@ -1600,6 +2033,12 @@ class ModelManager:
                 busy.append(instance)
             elif instance.ttl_s == 0 and not force:
                 pinned.append(instance)
+            elif instance.priority < PRIORITY_BACKGROUND and not force:
+                # A chat/agent-tier resident is a standing claim the way a pin
+                # is (D46): "background can never displace it" must hold for
+                # the lease plane too, or reserve_gpus is an end-run around
+                # the tier rule. force works exactly as it does for a pin.
+                tiered.append(instance)
             else:
                 victims.append(instance)
         if busy:
@@ -1622,6 +2061,15 @@ class ModelManager:
                 f"fit, or on these once the lease ends",
                 param="force",
                 details={"pinned": [i.model_id for i in pinned]},
+            )
+        if tiered:
+            names = ", ".join(f"{i.model_id} (priority {i.priority})" for i in tiered)
+            raise LeaseConflictError(
+                f"higher-priority model(s) {names} are resident on CUDA {wanted}; a lease "
+                f"grant does not outrank the chat or agent tier (D46). Pass force=true to "
+                f"evict them anyway, or lease other cards",
+                param="force",
+                details={"priority_models": [i.model_id for i in tiered]},
             )
         # Book first, evict second. The planner reads the book, and every
         # supervisor.stop() below yields to the event loop for the length of a
@@ -1917,7 +2365,7 @@ class ModelManager:
             if self._draining:
                 return
             try:
-                await self.load(serving_id, source="pin-reconcile")
+                await self.load(serving_id, source="pin-reconcile", hold_traffic=False)
                 log.info("reloaded pinned model", model_id=serving_id)
             except asyncio.CancelledError:
                 raise
@@ -2050,10 +2498,7 @@ class ModelManager:
             self._rebalance_seen[instance.model_id] = (layout, now)
             candidate = self.planner.plan_load(
                 record,
-                ctx_size=plan.ctx_per_slot or plan.ctx_size,
-                kv_cache_type=plan.kv_cache_type,
-                kv_cache_type_v=plan.kv_cache_type_v,
-                parallel=plan.parallel,
+                **reload_settings(plan),
                 loaded=loaded,
                 draft=self._draft_for(record),
                 adapters=[a for a, _ in self._adapters_for(record)],
@@ -2113,16 +2558,14 @@ class ModelManager:
         try:
             instance = await self.load(
                 model_id,
-                ctx_size=plan.ctx_per_slot or plan.ctx_size,
-                kv_cache_type=plan.kv_cache_type,
-                kv_cache_type_v=plan.kv_cache_type_v,
-                parallel=plan.parallel,
+                **reload_settings(plan),
                 devices=plan.devices,
                 force=True,
                 evict_busy=False,
                 allow_evict=False,
                 require_resident=True,
                 source="rebalance",
+                hold_traffic=False,
             )
             log.info(
                 "rebalanced model",
@@ -2335,7 +2778,7 @@ class ModelManager:
 
         for model_id in wanted:
             try:
-                await self.load(model_id, source="autoload")
+                await self.load(model_id, source="autoload", hold_traffic=False)
                 log.info("preloaded model", model_id=model_id)
             except Exception as exc:
                 # Seed the reconciler's backoff (D41): the very next sweep
@@ -2573,6 +3016,11 @@ class ModelManager:
             loaded=self.supervisor.list(),
             draft=self._draft_for(record),
             adapters=[a for a, _ in self._adapters_for(record)],
+            # The preview must answer for the load the Load button would run,
+            # and that load runs at the model's remembered tier (D46) -- a
+            # tier-blind preview says "does not fit" for a chat model whose
+            # real load would displace background residents and land fine.
+            priority=self._effective_priority(record.id),
         )
         if isinstance(result, LoadRejected):
             return {
@@ -2625,6 +3073,8 @@ class ModelManager:
         the one-at-a-time smoke-test slot.
         """
         loaded = self.supervisor.list()
+        current = self._current_hold()
+        hold = None if current is None else {"model_id": current[0], "priority": current[1]}
         return {
             "active_requests": sum(i.active_requests for i in loaded),
             "busy_models": [
@@ -2634,6 +3084,9 @@ class ModelManager:
             ],
             "loading": sorted(self._loading | {i.model_id for i in loaded if i.state == "loading"}),
             "testing": self._testing,
+            # The chat/agent load currently holding worse-tier traffic off
+            # (D46), or None -- the reason behind any 503 a client just got.
+            "priority_hold": hold,
         }
 
     def _busy_reason(self) -> str | None:
@@ -2754,6 +3207,7 @@ class ModelManager:
                 ctx_size=ctx_used,
                 parallel=1,
                 source="mcp:test_model",
+                hold_traffic=False,
             )
         instance = self.supervisor.get(serving.id)
         if instance is None or instance.state != "ready":

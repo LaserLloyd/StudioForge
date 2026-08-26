@@ -665,7 +665,7 @@ def test_evicts_lru_unpinned_model_to_make_room() -> None:
     plan = planner.plan_load(record, ctx_size=4096, loaded=loaded)
     assert isinstance(plan, LoadPlan)
     assert plan.evict_model_ids == ["old/model"]  # LRU only, not both
-    assert any("evicting least-recently-used" in n for n in plan.notes)
+    assert any("least-recently-used within one" in n for n in plan.notes)
 
 
 def test_never_evicts_pinned_models() -> None:

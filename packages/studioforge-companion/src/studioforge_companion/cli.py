@@ -669,6 +669,11 @@ def models_load(
     force: bool = typer.Option(
         False, "--force", help="Load even if the plan says it will not fit."
     ),
+    priority: int | None = typer.Option(
+        None,
+        "--priority",
+        help="Load tier: 1 active chat, 2 dispatched agent, 3 (default) background.",
+    ),
     json_out: bool = JSON_OPTION,
 ) -> None:
     """Show the fit plan, then load."""
@@ -711,11 +716,21 @@ def models_load(
             )
         if use_json:
             return await client.load(
-                model, ctx_size=ctx, kv_cache_type=kv_type, parallel=parallel, force=force
+                model,
+                ctx_size=ctx,
+                kv_cache_type=kv_type,
+                parallel=parallel,
+                force=force,
+                priority=priority,
             )
         with STATE.console.status(f"loading {model}...", spinner="dots"):
             return await client.load(
-                model, ctx_size=ctx, kv_cache_type=kv_type, parallel=parallel, force=force
+                model,
+                ctx_size=ctx,
+                kv_cache_type=kv_type,
+                parallel=parallel,
+                force=force,
+                priority=priority,
             )
 
     instance = with_client(work)
@@ -804,6 +819,11 @@ def models_load_recommended(
     kv_min: str | None = typer.Option(
         None, "--kv-min", help="Refuse to quantise the KV cache below this, e.g. q8_0."
     ),
+    priority: int | None = typer.Option(
+        None,
+        "--priority",
+        help="Load tier: 1 active chat, 2 dispatched agent, 3 (default) background.",
+    ),
     json_out: bool = JSON_OPTION,
 ) -> None:
     """Load at EXACTLY this context, or refuse and say why.
@@ -816,7 +836,7 @@ def models_load_recommended(
 
     async def work(client: StudioForgeClient) -> Any:
         return await client.load_recommended(
-            model, ctx_size=ctx_size, prefer_mode=prefer_mode, kv_min=kv_min
+            model, ctx_size=ctx_size, prefer_mode=prefer_mode, kv_min=kv_min, priority=priority
         )
 
     payload = with_client(work)
