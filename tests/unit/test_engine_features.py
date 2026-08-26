@@ -191,7 +191,11 @@ def test_the_help_cache_is_written_without_doubling_the_engines_crlf(
 
     from studioforge.core import engine as engine_module
 
-    binary = tmp_path / "llama-server.exe"
+    # The name matters: `probe_engine_features` refuses to execute anything not
+    # called exactly `BIN_NAME`, so a hard-coded "llama-server.exe" was refused
+    # on Linux and the monkeypatched `run` never fired -- the CRLF behaviour
+    # under test went unexercised on every non-Windows leg.
+    binary = tmp_path / engine_module.BIN_NAME
     binary.write_bytes(b"stub")
     crlf_help = HELP_EXCERPT.replace("\n", "\r\n").encode("utf-8")
 

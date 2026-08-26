@@ -115,7 +115,10 @@ restating the reasoning in three places.
   Personal identifiers — a name, a machine, a tailnet — live in `scripts/scrub-rules.local.txt`,
   which is git-ignored: publishing the list of words that must never be published is its own leak.
   CI therefore runs with the generic patterns only, and says so in its output. Your clone is where
-  the identifier rules actually fire.
+  the identifier rules actually fire. Every verdict — the clean line and `--selftest`'s `OK` — ends
+  with how many identifier rules were loaded, so a "clean" can never be read as more than it was;
+  `--require-local-rules` turns that caption into a gate (exit 2 on zero) for a release check on a
+  machine that is supposed to have the file. Do not add it to CI, where the file never exists.
 
 ## Where things are
 
@@ -130,3 +133,9 @@ that needs real GPUs. Decisions with a *why* go in `DECISIONS.md`, numbered.
 Everything the app writes lives in the data dir: `SF_DATA_DIR`, else `<repo>/data`, else the
 platform directory (DECISIONS.md D25). `data/` is gitignored. Two servers cannot share one data
 dir — the second becomes a read-only *secondary* (D24) — so stop one before starting the other.
+
+## Licensing of contributions
+
+The project is **MIT** ([`LICENSE`](LICENSE)). Contributions are accepted under the same terms:
+opening a pull request means you agree your work is licensed MIT and that you have the right to
+licence it. There is no separate CLA.

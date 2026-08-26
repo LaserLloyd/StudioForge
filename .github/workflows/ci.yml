@@ -28,12 +28,21 @@ jobs:
       # fetch-depth: 0 because the commit-range step below needs the PR's base
       # commit, and the default shallow clone does not contain it -- the scan
       # then fails with "unknown revision" on every pull request.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
       - name: Scan the tree
         run: python3 scripts/scrub_check.py
-      - name: Scan the commits being pushed
+      - name: Scan the TREE of every commit in the pull request
+        if: github.event_name == 'pull_request'
+        # Not just the head: a secret added in one commit and removed in the
+        # next still publishes, and a head-only scan calls that clean.
+        run: |
+          for sha in $(git rev-list --reverse \
+              "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"); do
+            python3 scripts/scrub_check.py --rev "$sha"
+          done
+      - name: Scan the commit messages being pushed
         if: github.event_name == 'pull_request'
         run: |
           python3 scripts/scrub_check.py --commit-range \
@@ -53,10 +62,10 @@ jobs:
       matrix:
         os: [windows-latest, ubuntu-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v10
 
       - name: Set up Python
         run: uv python install 3.12

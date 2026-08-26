@@ -196,8 +196,10 @@ refused, and is not handed the PIN, even though it arrives from loopback. The MC
 the same rule — with no key, a caller off the box needs the PIN for every tool call even when
 `mcp.pin_required` is off (that toggle only relaxes same-machine callers), and `GET /api/mcp/info`
 reports the `pin_required` the caller will actually be held to. Send the PIN as `X-MCP-Pin` or as
-the bearer token; `?pin=` in the URL is still accepted for connectors that can only be configured
-with a URL, but a URL ends up in proxy logs and shell history, so it is no longer advertised.
+the bearer token; `?pin=` in the URL is refused, because a URL ends up in proxy logs, browser
+history and shell history. Repeated wrong credentials are locked out with a doubling backoff —
+three free tries per client address, then 1s, 2s, 4s … up to five minutes — since eight digits
+only stay a secret if guessing is slow.
 
 **Reachable at** lists the concrete addresses another machine can use — Tailscale first, because a
 tailnet address survives a network change where a LAN address silently stops resolving.

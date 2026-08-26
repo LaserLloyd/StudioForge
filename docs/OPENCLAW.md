@@ -42,9 +42,10 @@ sfctl servers add rig http://<studioforge-host>:1234 --api-key <key>
 enforces the MCP pairing PIN for any caller that is not on the rig itself — `mcp.pin_required:
 false` only relaxes same-machine callers (D32) — so pass the PIN here or every management tool
 returns 401. The PIN is in the startup banner and at `GET /api/mcp/info` (served to a remote
-caller only when a credential was needed to get there). `sfctl` sends it as the bearer token;
-`?pin=` in the URL works for connectors that can only take a URL, but is not advertised because a
-URL ends up in proxy logs and shell history.
+caller only when a credential was needed to get there). `sfctl` sends it as the bearer token.
+`?pin=` in the URL is **refused**: a URL ends up in proxy logs, browser history and shell history,
+and an eight-digit PIN is not a credential to leave lying in them. A connector that can only be
+given a URL needs a header field, or `server.api_key` instead.
 
 Then register it as a local stdio MCP server:
 
@@ -529,9 +530,16 @@ the holder's pid in `instance_holder_pid`. That is one process per data director
 
 ```bash
 sfctl recover                 # diagnose: up / degraded / wedged / down
+sfctl recover --gpus          # GPU state, read THROUGH the watchdog
+sfctl recover --logs 200      # tail the server log through the watchdog
+sfctl recover --config        # the server config, secrets redacted
 sfctl recover --kill <model>  # free VRAM without a full restart
 sfctl recover --restart       # restart the wedged server
 ```
+
+The first four read; they change nothing. They go through the watchdog on purpose: the
+same diagnostics on the main server are served by the process that is not answering, so
+looking before choosing which hammer to reach for needs the sidecar too.
 
 **Something loaded but behaves oddly.** `sfctl models info <model>` shows what the engine *actually*
 reports (real context, slot count, whether speculative decoding is armed) next to what was

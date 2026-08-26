@@ -1,6 +1,7 @@
 # StudioForge
 
 [![CI](https://github.com/LaserLloyd/StudioForge/actions/workflows/ci.yml/badge.svg)](https://github.com/LaserLloyd/StudioForge/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 A self-hosted, **GPU-only** LLM server: an OpenAI-compatible gateway over
 [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server`, with a model registry, a VRAM
@@ -10,6 +11,12 @@ switching is a host change, not a rewrite.
 
 **Status:** v1.26-08-23. Windows is the reference platform and runs it daily; Linux is supported (CI
 runs both) and less battle-tested. Questions and bug reports: [Contact](#contact).
+
+**On versions.** There is one number here and it is the one in `pyproject.toml`: `GET /api/version`,
+`GET /health` and the `sfctl` package all report `0.2.0`. If a server you are talking to reports
+something else — a dated string such as `1.26-08-23` — you are talking to a private build from a
+different release line, not to this repository, and its tools and payloads may not match these
+docs. Check with `curl -s <host>/api/version`.
 
 ---
 
@@ -253,8 +260,12 @@ one right-click away:
 ## The companion: `sfctl`
 
 [`packages/studioforge-companion`](packages/studioforge-companion/) installs anywhere — no CUDA, no
-server dependencies — and is the remote control for the host: `sfctl status`, `models load/unload/pin`,
-`download`, `logs`, `config`, `update`, and `sfctl recover` for when the server is wedged.
+server dependencies — and is the remote control for the host: `sfctl status` (GPUs, loaded models and
+any standing GPU lease), `models load/unload/pin`, `models options` and `models load-recommended` (the
+planner's per-mode table, and a load that refuses rather than silently shrinking your context),
+`search` and `models repo` (find a GGUF on Hugging Face, then read its headers for a real fit verdict),
+`leases` (claim cards so nothing else is planned onto them), `download`, `logs`, `config`, `update`,
+and `sfctl recover` for when the server is wedged.
 `sfctl mcp` is the stdio MCP bridge from path C.
 
 ## Ports
@@ -342,5 +353,10 @@ StudioForge is built and maintained by **Lloyd** — [LaserLloyd.com](https://la
 
 ## License
 
-**Not yet chosen — all rights reserved for now.** There is deliberately no `LICENSE` file: until
-one is picked, no permission to copy, modify or redistribute is granted.
+**MIT** — see [`LICENSE`](LICENSE). Use it, fork it, ship it; keep the copyright notice.
+
+The dependencies are permissive too (MIT, BSD, Apache-2.0) with one exception worth naming:
+`pystray`, which draws the Windows system-tray icon, is **LGPL-3.0**. It is an unmodified
+dependency installed by pip and imported at runtime — that is the arrangement the LGPL is written
+for, and it does not reach into this project's own terms. If you redistribute a bundled or frozen
+build that embeds it, the LGPL's relinking obligation is yours to satisfy.

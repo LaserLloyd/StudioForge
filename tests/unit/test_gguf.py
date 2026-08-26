@@ -1122,9 +1122,11 @@ def test_real_library_tensor_bytes_are_consistent_with_file_size() -> None:
     right: if a size were wrong, the sum would drift far from the real file.
     """
     checked = 0
+    candidates = 0
     for path in sorted(MODELS_ROOT.rglob("*.gguf")):
         if not _first_shard_only(path) or len(shard_paths_for(path)) > 1:
             continue
+        candidates += 1
         gguf = read_gguf(path)
         size = path.stat().st_size
         assert gguf.data_offset < size
@@ -1132,7 +1134,12 @@ def test_real_library_tensor_bytes_are_consistent_with_file_size() -> None:
         assert gguf.total_tensor_bytes <= payload
         assert gguf.total_tensor_bytes > payload * 0.98, path.name
         checked += 1
-    assert checked > 10
+    # `> 10` encoded the size of one developer's library: on a box with seven
+    # single-shard models every per-file invariant above passed and the test
+    # still failed. The real invariant is that every eligible file was
+    # checked, and that there was something to check at all.
+    assert checked == candidates
+    assert checked > 0, f"no single-shard GGUF files under {MODELS_ROOT}"
 
 
 @needs_library

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import hmac
+import math
 from typing import Any
 
 from fastapi import Request
 
 from studioforge.config import SECRET_CONFIG_PATHS, Config, redact, redact_config_dict
+from studioforge.credential_guard import CredentialGuard, client_key
 
 # Re-exported: these live in ``studioforge.config`` (a leaf the watchdog may import)
 # but every API/MCP surface has always taken them from here.
@@ -23,6 +25,33 @@ PUBLIC_PATHS = frozenset({"/health", "/healthz", "/api/health", "/favicon.ico"})
 #: (including junk) fails closed: ``/health?deep=true`` runs a real completion
 #: against every loaded model, which must never be reachable without the key.
 _FALSY = frozenset({"", "0", "false", "no", "off"})
+
+#: Process-wide lockout for repeated wrong credentials. One instance for the
+#: whole API: the thing being protected is a single eight-digit PIN, so a
+#: per-router or per-request counter would count nothing.
+GUARD = CredentialGuard()
+
+
+def _client_of(request: Any) -> str | None:
+    client = getattr(request, "client", None)
+    return client_key(getattr(client, "host", None) if client else None)
+
+
+def _throttled(client: str | None) -> AuthError | None:
+    """The 429 to raise if this client is locked out, else ``None``."""
+    wait = GUARD.retry_after(client)
+    if wait <= 0:
+        return None
+    seconds = max(1, math.ceil(wait))
+    return AuthError(
+        f"Too many incorrect credentials from this address. Wait {seconds}s and try again. "
+        "This lockout exists because the MCP pairing PIN is only eight digits: without it the "
+        "whole keyspace is reachable by one machine in hours. Set server.api_key for a real "
+        "credential, or run from the server's own machine.",
+        code="too_many_credential_attempts",
+        status_code=429,
+        details={"retry_after_s": seconds},
+    )
 
 
 def _matches(provided: str, expected: str) -> bool:
@@ -54,22 +83,40 @@ def extract_key(request: Request) -> str | None:
     return None
 
 
-def extract_pin(request: Request) -> str | None:
-    """The MCP pairing PIN, however the client chose to send it.
+#: Rejected, not merely unadvertised. ``?pin=`` used to be accepted so that an
+#: MCP connector configurable only by URL could pair; the cost was that the
+#: credential then sat in reverse-proxy access logs, browser history, shell
+#: history, referrer headers and any crash report -- places nothing ever
+#: expires from, for a secret with no expiry either. A header costs a
+#: connector one configuration field. This constant exists so the 401 can say
+#: *why* a URL that used to work now does not, instead of looking like a wrong
+#: PIN.
+PIN_IN_QUERY_NOTE = (
+    "The MCP pairing PIN is no longer accepted as a '?pin=' query parameter: a URL is "
+    "written to access logs, shell history and browser history, which is no place for a "
+    "credential. Send it as the 'X-MCP-Pin' header or as 'Authorization: Bearer <pin>'."
+)
 
-    The ``?pin=`` query form is still parsed -- some MCP connectors can only
-    be configured with a URL, and clients paired that way must keep working --
-    but it is deliberately not advertised anywhere (``/api/mcp/info``, the
-    banner, the 401 text name the header and the bearer form only): a URL is
-    recorded by reverse-proxy access logs, shell history and terminals, and
-    an eight-digit PIN with no lockout is not a credential to leave lying in
-    them.
+
+def pin_in_query(request: Any) -> bool:
+    """Whether the caller tried the retired ``?pin=`` form."""
+    params = getattr(request, "query_params", None)
+    if params is None:
+        return False
+    value = params.get("pin")
+    return bool(value and value.strip())
+
+
+def extract_pin(request: Request) -> str | None:
+    """The MCP pairing PIN, from a header or the bearer slot -- never a URL.
+
+    See :data:`PIN_IN_QUERY_NOTE` for why the query form is refused rather
+    than quietly deprecated.
     """
     pin = request.headers.get("x-mcp-pin") or request.headers.get("x-studioforge-pin")
     if pin and pin.strip():
         return pin.strip()
-    query = request.query_params.get("pin")
-    return query.strip() if query and query.strip() else None
+    return None
 
 
 def is_mcp_path(path: str, config: Config) -> bool:
@@ -251,19 +298,41 @@ def check_request(request: Request, config: Config) -> None:
 
     expected = config.server.api_key
     provided = extract_key(request)
+    header_pin = extract_pin(request)
+
+    # Only credentialed traffic is throttled. An open install serves plenty of
+    # requests that carry nothing at all (that is the LM Studio parity the
+    # product depends on), and counting those would let a chatty poller lock
+    # the operator's own address out of a server neither of them was attacking.
+    client = _client_of(request) if (provided or header_pin) else None
+    if client is not None:
+        throttled = _throttled(client)
+        if throttled is not None:
+            # Refused before any comparison, so a correct guess that lands
+            # during a lockout still buys nothing.
+            raise throttled
 
     if expected and provided and _matches(provided, expected):
+        GUARD.record_success(client)
         return
 
     if on_mcp and pin:
-        candidate = extract_pin(request) or provided
+        candidate = header_pin or provided
         if candidate and _matches(candidate, str(pin)):
+            GUARD.record_success(client)
             return
         if pin_required:
+            if candidate:
+                GUARD.record_failure(client)
+            note = " " + PIN_IN_QUERY_NOTE if pin_in_query(request) else ""
             raise AuthError(
                 "This MCP endpoint needs the pairing PIN. Send it as "
-                "'X-MCP-Pin: <pin>' or as a bearer token. The PIN is printed in "
-                "the server's startup banner and available from GET /api/mcp/info.",
+                "'X-MCP-Pin: <pin>' or as a bearer token. Read it ON THE SERVER: "
+                "the startup banner, `studioforge config`, or the control panel "
+                "(Setup -> Network & access). GET /api/mcp/info returns 'pin': null "
+                "to a caller in your position -- it only reveals the PIN to someone "
+                "who is already on the box or already authenticated, which is the "
+                "point of it being a credential." + note,
                 code="invalid_mcp_pin",
             )
 
@@ -281,13 +350,21 @@ def check_request(request: Request, config: Config) -> None:
             on_mcp and (request.method or "").upper() in _MUTATING_METHODS
         )
         if gated and (not is_local_request(request) or cross_site_browser_request(request)):
-            candidate = extract_pin(request) or provided
+            candidate = header_pin or provided
             if pin and candidate and _matches(candidate, str(pin)):
+                GUARD.record_success(client)
                 return
+            if candidate:
+                GUARD.record_failure(client)
+            note = " " + PIN_IN_QUERY_NOTE if pin_in_query(request) else ""
             raise AuthError(
-                REMOTE_ADMIN_NOTE, code="remote_admin_requires_credential", status_code=403
+                REMOTE_ADMIN_NOTE + note,
+                code="remote_admin_requires_credential",
+                status_code=403,
             )
         return
+    if provided:
+        GUARD.record_failure(client)
     raise AuthError(
         "Incorrect API key provided. Set the same key the server has in "
         "server.api_key, or send it as 'Authorization: Bearer <key>'."

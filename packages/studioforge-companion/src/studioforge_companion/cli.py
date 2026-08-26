@@ -40,6 +40,7 @@ from rich.table import Table
 from studioforge_companion.client import (
     EXIT_CODE_TABLE,
     EXIT_CONFIRM,
+    EXIT_DECLINED,
     EXIT_USAGE,
     ApiError,
     CompanionError,
@@ -94,9 +95,11 @@ app = typer.Typer(
 models_app = typer.Typer(help="Inspect and control models.", no_args_is_help=True)
 config_app = typer.Typer(help="Read and change server-side configuration.", no_args_is_help=True)
 servers_app = typer.Typer(help="Manage local server profiles.", no_args_is_help=True)
+leases_app = typer.Typer(help="Claim and release GPUs (D43).", no_args_is_help=True)
 app.add_typer(models_app, name="models")
 app.add_typer(config_app, name="config")
 app.add_typer(servers_app, name="servers")
+app.add_typer(leases_app, name="leases")
 
 
 # ---------------------------------------------------------------------------
@@ -280,10 +283,27 @@ def fmt_bool(value: Any) -> str:
     return "yes" if value else "-"
 
 
+#: Columns that hold an IDENTIFIER rather than a measurement. StudioForge
+#: model ids are `publisher/repo/file-stem` -- routinely 50+ characters -- and
+#: Rich divides a narrow terminal proportionally across columns, so an id
+#: column ended up folded to a few characters a line while single-digit numeric
+#: columns kept their full width. The row then took six display lines and the
+#: one value you were looking for was the least readable thing in it. A minimum
+#: width makes Rich take the space from the columns that do not need it.
+_ID_COLUMNS = frozenset({"Model", "Repo", "Lease", "Quant", "Id", "ID", "Name", "Adapter"})
+
+#: Not the full length of an id -- a hard minimum wider than the terminal makes
+#: Rich overflow the whole table. Enough for `publisher/repo` on one line.
+_ID_COLUMN_MIN_WIDTH = 24
+
+
 def _table(*columns: str, title: str | None = None) -> Table:
     table = Table(title=title, header_style="bold", expand=False)
     for column in columns:
-        table.add_column(column, overflow="fold")
+        if column in _ID_COLUMNS:
+            table.add_column(column, overflow="fold", min_width=_ID_COLUMN_MIN_WIDTH)
+        else:
+            table.add_column(column, overflow="fold")
     return table
 
 
@@ -310,8 +330,11 @@ def _confirm(question: str, *, yes: bool) -> None:
         STATE.err.print(f"error: {question} requires confirmation. Re-run with --yes.")
         raise typer.Exit(EXIT_CONFIRM) from None
     if not answered:
+        # A DIFFERENT code from the non-tty case above. Both used to be 3, so
+        # a script could not tell "this needs --yes" (retryable: add the flag)
+        # from "a human looked at it and said no" (not retryable: stop).
         STATE.console.print("aborted")
-        raise typer.Exit(EXIT_CONFIRM)
+        raise typer.Exit(EXIT_DECLINED)
 
 
 # ---------------------------------------------------------------------------
@@ -335,6 +358,13 @@ def status(json_out: bool = JSON_OPTION) -> None:
         return payload, models
 
     payload, models = with_client(work)
+    # The server has carried the lease book in `/api/status` since D43 and
+    # this command threw it away, so `sfctl status` could not tell you the rig
+    # was LEASED -- the single most important thing a co-tenant needs to know,
+    # because a harness holding all four cards makes every load fail with a
+    # refusal that reads like a broken rig. Rendered from the payload already
+    # in hand; no second request.
+    standing = payload.get("leases") or []
     if want_json(json_out):
         emit(payload)
         return
@@ -384,6 +414,26 @@ def status(json_out: bool = JSON_OPTION) -> None:
         console.print(table)
     else:
         console.print("no models loaded")
+
+    if standing:
+        lease_table = _table(
+            "Lease", "GPUs", "Holder", "For", "Idle", "Expires in", title="GPU leases"
+        )
+        for lease in standing:
+            model_ids = lease.get("model_ids") or []
+            expires = lease.get("expires_at")
+            lease_table.add_row(
+                str(lease.get("id")),
+                ",".join(str(d) for d in lease.get("devices") or []),
+                str(lease.get("holder") or "?"),
+                # An EMPTY model list is the strongest form: nobody may plan
+                # onto these cards at all. Rendering it as "-" would read like
+                # "no restriction", which is the opposite.
+                ", ".join(model_ids) if model_ids else "nothing may load",
+                fmt_duration(lease.get("idle_s")),
+                fmt_duration(expires - time.time()) if isinstance(expires, (int, float)) else "-",
+            )
+        console.print(lease_table)
 
     engine = payload.get("engine") or {}
     summary = _table("Field", "Value", title="Server")
@@ -681,6 +731,139 @@ def models_load(
     )
 
 
+@models_app.command("options")
+def models_options(model: str, json_out: bool = JSON_OPTION) -> None:
+    """What this model can actually do on each hardware mode.
+
+    The planner's own table: per GPU set, the best context and slot count it
+    can achieve, the estimated generation speed at that shape, and how
+    confident the estimate is. This is the question "how should I load it?"
+    answered before you load it -- previously reachable only through
+    ``sfctl mcp``'s ``model_options`` tool.
+    """
+
+    async def work(client: StudioForgeClient) -> Any:
+        return await client.placement_profiles(model)
+
+    payload = with_client(work)
+    if want_json(json_out):
+        emit(payload)
+        return
+    profiles = payload.get("profiles") or []
+    if not profiles:
+        STATE.console.print("no placement profiles reported for this model")
+        return
+    recommended = payload.get("recommended_mode")
+    table = _table(
+        "Mode",
+        "GPUs",
+        "Ctx/slot",
+        "Slots",
+        "KV",
+        "tok/s",
+        "at full ctx",
+        "Fits now",
+        title=f"placement options: {model}",
+    )
+    for entry in profiles:
+        # Every number lives under `optimal` -- the mode entry itself carries
+        # only the label, the devices and the fits-now verdict.
+        best = entry.get("optimal") or {}
+        mode = str(entry.get("mode") or "-")
+        if mode == recommended:
+            mode = f"{mode} *"
+        would_evict = entry.get("would_evict") or []
+        if entry.get("fits_now"):
+            # The most operational column: it can fit AND be loaded right now,
+            # or it can fit only by throwing a resident model off the cards.
+            fits = "yes" if not would_evict else f"evicts {len(would_evict)}"
+        else:
+            fits = "no"
+        table.add_row(
+            mode,
+            ",".join(str(d) for d in entry.get("devices") or []) or "-",
+            str(best.get("ctx_per_slot") or "-"),
+            str(best.get("recommended_parallel") or best.get("max_parallel") or "-"),
+            str(best.get("kv_cache_type") or "-"),
+            _short(best.get("est_gen_tps")),
+            _short(best.get("est_gen_tps_full_ctx")),
+            fits,
+        )
+    STATE.console.print(table)
+    if recommended:
+        STATE.console.print(f"* recommended; load it with: sfctl models load {model}")
+
+
+@models_app.command("load-recommended")
+def models_load_recommended(
+    model: str,
+    ctx_size: int = typer.Option(..., "--ctx", help="Context window per slot, exactly."),
+    prefer_mode: str | None = typer.Option(
+        None, "--mode", help="Hardware mode key to prefer, e.g. dual_5090."
+    ),
+    kv_min: str | None = typer.Option(
+        None, "--kv-min", help="Refuse to quantise the KV cache below this, e.g. q8_0."
+    ),
+    json_out: bool = JSON_OPTION,
+) -> None:
+    """Load at EXACTLY this context, or refuse and say why.
+
+    The difference from ``models load`` is the refusal. A plain load may fit
+    the model by shrinking the window; this one either gives the window asked
+    for or answers 507 with what it would take, which is what an agent needs
+    in order to ask for something else instead of silently getting less.
+    """
+
+    async def work(client: StudioForgeClient) -> Any:
+        return await client.load_recommended(
+            model, ctx_size=ctx_size, prefer_mode=prefer_mode, kv_min=kv_min
+        )
+
+    payload = with_client(work)
+    if want_json(json_out):
+        emit(payload)
+        return
+    _print_plan(payload.get("plan") or payload)
+
+
+@models_app.command("repo")
+def models_repo(repo_id: str, json_out: bool = JSON_OPTION) -> None:
+    """Every quant in a Hugging Face repo, with a fit verdict for THIS rig.
+
+    The sizes come from the GGUF headers read remotely, so this answers "will
+    it fit, and at what context" before anything is downloaded.
+    """
+
+    async def work(client: StudioForgeClient) -> Any:
+        return await client.hf_repo(repo_id)
+
+    payload = with_client(work)
+    if want_json(json_out):
+        emit(payload)
+        return
+    quants = payload.get("quants") or []
+    if not quants:
+        STATE.console.print(f"no GGUF quants found in {repo_id}")
+        return
+    table = _table("Quant", "Size", "Files", "Verdict", "Why", title=repo_id)
+    for entry in quants:
+        fit = entry.get("fit") or {}
+        files = entry.get("files") or []
+        # A size of 0 means HuggingFace reported none, which is also why the
+        # verdict is "unknown" -- rendering it as "0 B" would look like an
+        # empty file rather than a missing measurement.
+        total = entry.get("total_bytes")
+        table.add_row(
+            str(entry.get("quant") or "-"),
+            fmt_bytes(total) if total else "unknown",
+            str(len(files)) if files else "-",
+            str(fit.get("verdict") or "-"),
+            str(fit.get("message") or ""),
+        )
+    STATE.console.print(table)
+    STATE.console.print(f"download one with: sfctl download {repo_id} --quant <QUANT>")
+
+
 @models_app.command("unload")
 def models_unload(model: str, json_out: bool = JSON_OPTION) -> None:
     """Unload a model and free its VRAM."""
@@ -968,9 +1151,26 @@ def download(
                 f"error: {entry.get('filename')}: {entry.get('error') or 'download failed'}"
             )
         raise typer.Exit(1)
-    STATE.console.print(
-        f"download {result.get('status', 'finished')}: {result.get('repo_id') or repo_id}"
-    )
+
+    status = str(result.get("status") or "")
+    if result.get("vanished"):
+        # The group stopped being listed before it reached a terminal status.
+        # That is usually a completed download the server has already retired,
+        # but it is not something this command WATCHED happen -- and it used to
+        # print the same cheerful line as a verified success, carrying the
+        # status the download had when it STARTED ("queued").
+        STATE.err.print(
+            f"warning: the server stopped listing this download before it finished "
+            f"({repo_id}). It has probably completed and been retired from the "
+            f"list, but this command did not see it finish."
+        )
+        STATE.console.print("check with: sfctl models scan && sfctl models list")
+        raise typer.Exit(1)
+    if status and status != "completed":
+        # canceled / paused: not a failure, but not a download either.
+        STATE.err.print(f"download {status}: {result.get('repo_id') or repo_id}")
+        raise typer.Exit(1)
+    STATE.console.print(f"download completed: {result.get('repo_id') or repo_id}")
     STATE.console.print("run 'sfctl models scan' if the new model is not listed yet")
 
 
@@ -978,7 +1178,18 @@ async def _follow_download(
     client: StudioForgeClient, group_id: str, started: dict[str, Any]
 ) -> dict[str, Any]:
     """Poll the server's download state, one progress row per file."""
-    latest: dict[str, Any] = dict(started)
+    # Deliberately NOT `dict(started)`: the starting payload carries
+    # status="queued", and if the group vanished from the listing before any
+    # poll saw it, returning that made a never-observed download print as a
+    # finished one.
+    latest: dict[str, Any] = {
+        "group_id": group_id,
+        "repo_id": started.get("repo_id"),
+        "quant": started.get("quant"),
+        "status": None,
+        "downloads": [],
+        "vanished": True,
+    }
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -1018,6 +1229,7 @@ async def _follow_download(
                 "quant": started.get("quant"),
                 "status": _group_status(statuses),
                 "downloads": entries,
+                "vanished": False,
             }
             if statuses <= _TERMINAL_DOWNLOAD:
                 break
@@ -1438,10 +1650,207 @@ def chat(
 
 
 @app.command()
+def search(
+    query: str = typer.Argument(..., help="What to look for on Hugging Face."),
+    limit: int = typer.Option(20, "--limit", help="How many repos to return (max 100)."),
+    author: str | None = typer.Option(None, "--author", help="Restrict to one publisher."),
+    sort: str = typer.Option("downloads", "--sort", help="downloads | likes | updated."),
+    newer_than_days: int | None = typer.Option(
+        None, "--newer-than", help="Only repos touched within this many days."
+    ),
+    json_out: bool = JSON_OPTION,
+) -> None:
+    """Search Hugging Face for GGUF repos.
+
+    The listing carries no file sizes -- that is a limit of the search API, not
+    of this command -- so it is the first half of a pair: `sfctl search` to find
+    the repo, then `sfctl models repo <id>` to read the GGUF headers and get a
+    real fit verdict per quant.
+    """
+
+    async def work(client: StudioForgeClient) -> Any:
+        return await client.hf_search(
+            query, limit=limit, author=author, sort=sort, newer_than_days=newer_than_days
+        )
+
+    payload = with_client(work)
+    if want_json(json_out):
+        emit(payload)
+        return
+    repos = payload.get("repos") or []
+    if not repos:
+        STATE.console.print(f"nothing found for {query!r}")
+        return
+    # Deliberately NO fit column. The search API reports no file sizes, so
+    # every verdict here comes back "unknown" -- a column that is always the
+    # same word is noise, and pretending otherwise would be worse. The fit
+    # question is answered by `models repo`, which reads the GGUF headers.
+    table = _table("Repo", "Downloads", "Likes", "Updated", "Quants", title=f"search: {query}")
+    for entry in repos:
+        quants = entry.get("quants") or []
+        days = entry.get("updated_days_ago")
+        table.add_row(
+            str(entry.get("repo_id") or "-"),
+            f"{entry['downloads']:,}" if isinstance(entry.get("downloads"), int) else "-",
+            str(entry.get("likes") if entry.get("likes") is not None else "-"),
+            f"{days:.0f}d ago" if isinstance(days, (int, float)) else "-",
+            str(len(quants)) if quants else "-",
+        )
+    STATE.console.print(table)
+    if payload.get("truncated"):
+        STATE.console.print("(truncated -- raise --limit for more)")
+    STATE.console.print("per-quant sizes and fit detail: sfctl models repo <repo-id>")
+
+
+# ---------------------------------------------------------------------------
+# leases (D43)
+# ---------------------------------------------------------------------------
+
+
+@leases_app.command("list")
+def leases_list(json_out: bool = JSON_OPTION) -> None:
+    """Every standing GPU lease: which cards, held by whom, for what."""
+
+    async def work(client: StudioForgeClient) -> Any:
+        return await client.leases()
+
+    payload = with_client(work)
+    if want_json(json_out):
+        emit(payload)
+        return
+    standing = payload.get("leases") or []
+    if not standing:
+        STATE.console.print("no GPU leases standing")
+        return
+    table = _table("Lease", "GPUs", "Holder", "For", "Reason", "Idle", "Expires in")
+    for lease in standing:
+        model_ids = lease.get("model_ids") or []
+        expires = lease.get("expires_at")
+        table.add_row(
+            str(lease.get("id")),
+            ",".join(str(d) for d in lease.get("devices") or []),
+            str(lease.get("holder") or "?"),
+            ", ".join(model_ids) if model_ids else "nothing may load",
+            str(lease.get("reason") or ""),
+            fmt_duration(lease.get("idle_s")),
+            fmt_duration(expires - time.time()) if isinstance(expires, (int, float)) else "never",
+        )
+    STATE.console.print(table)
+
+
+@leases_app.command("add")
+def leases_add(
+    devices: str = typer.Option(..., "--devices", help="CUDA indices, comma separated: 0,1"),
+    models: str | None = typer.Option(
+        None, "--models", help="Comma-separated model ids allowed on these cards. Omit for none."
+    ),
+    holder: str = typer.Option("sfctl", "--holder", help="Who is holding them."),
+    reason: str = typer.Option("", "--reason", help="Why, for whoever reads the lease book."),
+    ttl: float | None = typer.Option(
+        3600.0, "--ttl", help="Release after this many idle seconds. 0 means never."
+    ),
+    force: bool = typer.Option(
+        False, "--force", help="Take the cards even if a resident must be evicted."
+    ),
+    json_out: bool = JSON_OPTION,
+) -> None:
+    """Claim GPUs so nothing else is planned onto them.
+
+    With no ``--models`` the cards are held for something OUTSIDE this server
+    (an image-generation run, a training job) and nothing at all may load on
+    them -- which is the stronger claim, not the weaker one.
+
+    The idle TTL is the safety net: a crashed benchmark cannot hold a card
+    forever. ``--ttl 0`` disables it, so use it only for a holder that
+    something is watching.
+    """
+    try:
+        device_list = [int(part) for part in devices.split(",") if part.strip()]
+    except ValueError:
+        STATE.err.print(f"error: --devices must be CUDA indices like '0,1', got {devices!r}")
+        raise typer.Exit(EXIT_USAGE) from None
+    if not device_list:
+        STATE.err.print("error: --devices needs at least one CUDA index")
+        raise typer.Exit(EXIT_USAGE)
+    model_ids = [m.strip() for m in models.split(",") if m.strip()] if models else None
+
+    async def work(client: StudioForgeClient) -> Any:
+        return await client.create_lease(
+            devices=device_list,
+            model_ids=model_ids,
+            holder=holder,
+            reason=reason,
+            # `--ttl 0` is the wire form of "no expiry"; the API wants null.
+            idle_ttl_s=ttl or None,
+            force=force,
+        )
+
+    payload = with_client(work)
+    if want_json(json_out):
+        emit(payload)
+        return
+    STATE.console.print(
+        f"lease {payload.get('id')} holds GPU "
+        f"{','.join(str(d) for d in payload.get('devices') or [])} for "
+        f"{payload.get('holder')}"
+    )
+    STATE.console.print(f"release it with: sfctl leases release {payload.get('id')}")
+
+
+@leases_app.command("release")
+def leases_release(lease_id: str, json_out: bool = JSON_OPTION) -> None:
+    """Give the cards back."""
+
+    async def work(client: StudioForgeClient) -> Any:
+        return await client.release_lease(lease_id)
+
+    payload = with_client(work)
+    if want_json(json_out):
+        emit(payload)
+        return
+    released = payload.get("released") or {}
+    STATE.console.print(
+        f"released {released.get('id', lease_id)}: GPU "
+        f"{','.join(str(d) for d in released.get('devices') or [])} free"
+    )
+
+
+@leases_app.command("touch")
+def leases_touch(lease_id: str, json_out: bool = JSON_OPTION) -> None:
+    """Restart the idle clock on a lease that is still in use.
+
+    For a holder outside this server: the server cannot see that an image job
+    is still running, so a long one has to say so or the sweep reclaims its
+    cards mid-run.
+    """
+
+    async def work(client: StudioForgeClient) -> Any:
+        return await client.touch_lease(lease_id)
+
+    payload = with_client(work)
+    if want_json(json_out):
+        emit(payload)
+        return
+    expires = payload.get("expires_at")
+    when = fmt_duration(expires - time.time()) if isinstance(expires, (int, float)) else "never"
+    STATE.console.print(f"lease {payload.get('id', lease_id)} touched; expires in {when}")
+
+
+@app.command()
 def recover(
     restart: bool = typer.Option(False, "--restart", help="Restart the main server process."),
     kill: str | None = typer.Option(None, "--kill", help="Kill one model's llama-server child."),
     nuke: bool = typer.Option(False, "--nuke", help="Kill every model child."),
+    gpus: bool = typer.Option(False, "--gpus", help="Read GPU state THROUGH the watchdog."),
+    show_logs: int | None = typer.Option(
+        None, "--logs", help="Tail this many server log lines through the watchdog."
+    ),
+    log_model: str | None = typer.Option(
+        None, "--log-model", help="With --logs: one model's log instead of the server's."
+    ),
+    show_config: bool = typer.Option(
+        False, "--config", help="Read the server config through the watchdog."
+    ),
     yes: bool = typer.Option(False, "--yes", help="Skip the confirmation prompt."),
     json_out: bool = JSON_OPTION,
 ) -> None:
@@ -1450,7 +1859,24 @@ def recover(
     With no flags this prints the watchdog's own health diagnosis. The watchdog
     is a separate process on a separate port (default 1235) precisely so this
     command still works when nothing else does.
+
+    ``--gpus``, ``--logs`` and ``--config`` are the READ side of that. They
+    exist because the diagnostics with the same names on the main server are
+    served by the process that is not answering: without them this command
+    offered a health check and three ways to kill things, and no way to LOOK
+    at the box before deciding which. Nothing here changes anything.
     """
+    diagnostics = [gpus, show_logs is not None, show_config]
+    actions = [restart, kill is not None, nuke]
+    if sum(bool(f) for f in diagnostics + actions) > 1:
+        STATE.err.print(
+            "error: pick one thing at a time -- each of --restart/--kill/--nuke/--gpus/"
+            "--logs/--config is a single watchdog tool call."
+        )
+        raise typer.Exit(EXIT_USAGE)
+    if log_model is not None and show_logs is None:
+        STATE.err.print("error: --log-model needs --logs <n>")
+        raise typer.Exit(EXIT_USAGE)
     from studioforge_companion.mcp_proxy import (
         call_watchdog_tool,
         describe_exception,
@@ -1482,6 +1908,14 @@ def recover(
         tool, arguments = "kill_model", {"model_name": kill}
     elif nuke:
         tool, arguments = "nuke_all_models", {"confirm": True}
+    elif gpus:
+        tool, arguments = "gpu_status", {}
+    elif show_logs is not None:
+        tool, arguments = "tail_logs", {"n": show_logs}
+        if log_model:
+            arguments["model_id"] = log_model
+    elif show_config:
+        tool, arguments = "get_config", {}
 
     async def work() -> Any:
         try:
@@ -1605,10 +2039,16 @@ def openclaw_setup(
 def mcp() -> None:
     """Run the stdio MCP server OpenClaw registers.
 
-    Merges the main app's management tools with the watchdog's recovery tools
-    into one tool list. Watchdog tools stay available when the main server is
-    down, which is the entire reason the two planes are separate; colliding
-    names are exposed with a 'recovery_' prefix.
+    Merges the main app's 19 management tools with the watchdog's 10 recovery
+    tools into one 29-tool list. Watchdog tools stay available when the main
+    server is down, which is the entire reason the two planes are separate.
+
+    Watchdog tools are exposed with a 'recovery_' prefix unless they are on the
+    proxy's allowlist of watchdog-only names -- an allowlist, not collision
+    detection, so 'health' becomes 'recovery_health' even though nothing on the
+    management plane is called that. Prefixing a name needlessly costs nothing;
+    failing to prefix one that collides would let a recovery tool shadow a
+    management tool.
     """
     from studioforge_companion.mcp_proxy import McpProxy
 

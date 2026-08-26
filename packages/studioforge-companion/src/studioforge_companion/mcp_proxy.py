@@ -22,13 +22,21 @@ Why the ``recovery_`` prefix
 ----------------------------
 Both upstreams expose ``get_config``/``set_config``, and the watchdog has its own
 ``health``. Merging them into one namespace needs a deterministic rule, and the
-rule is: **management keeps the bare name; the watchdog's colliding names get a
-``recovery_`` prefix.** Management is the everyday surface, so it stays
-unadorned; the watchdog's uniquely-named tools (``restart_server``,
-``kill_model``, ``nuke_all_models``, ``tail_logs``, ``gpu_status``,
-``rollback_update``) collide with nothing and keep their names. Anything else
-new that appears on the watchdog is prefixed too -- prefixing an unknown name is
-safe, shadowing a management tool is not.
+rule is: **management keeps the bare name; every watchdog tool is prefixed
+``recovery_`` unless it is on an explicit allowlist.** Management is the
+everyday surface, so it stays unadorned. The allowlist
+(:data:`WATCHDOG_UNPREFIXED`) is the watchdog's own vocabulary --
+``restart_server``, ``kill_model``, ``nuke_all_models``, ``tail_logs``,
+``gpu_status``, ``rollback_update``, ``reclaim_orphan_engines`` -- and those
+keep their names.
+
+Note that this is an ALLOWLIST, not collision detection, and the difference is
+visible: the watchdog's ``health`` collides with nothing on the management
+plane and is still exposed as ``recovery_health``, because it is not on the
+list. That is deliberate. Prefixing a name that did not need it costs an agent
+nothing; failing to prefix one that turns out to collide silently shadows a
+management tool with a recovery tool, which is the one outcome this design
+must never produce -- so an unknown watchdog name is prefixed by default.
 
 Transport failures become tool-result *errors* (``is_error=True``), never
 protocol errors: an MCP client that gets a protocol error may drop the whole
@@ -37,12 +45,11 @@ session, which is exactly the outcome this design exists to prevent.
 
 from __future__ import annotations
 
-import contextlib
-
 try:  # the MCP SDK builds its client with httpx2; match it exactly
     from httpx2 import Timeout as _Timeout
 except ImportError:  # pragma: no cover - older SDKs are on httpx
     from httpx import Timeout as _Timeout
+import contextlib
 import time
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack
@@ -502,6 +509,22 @@ async def probe_watchdog_auth(profile: ServerProfile, *, timeout_s: float = 5.0)
     try:
         async with httpx.AsyncClient(timeout=timeout_s) as client:
             response = await client.post(profile.watchdog_mcp_url, json=body, headers=headers)
+            # A successful `initialize` ALLOCATES a session on the watchdog,
+            # and this probe never sent `notifications/initialized` and never
+            # tore one down -- so every failed `recover` left a half-open
+            # session behind on the one process whose job is to still be
+            # working when everything else is not. Streamable-HTTP's own
+            # teardown is DELETE with the session id. Best-effort: the answer
+            # to the question being asked is already in `status_code`, and a
+            # watchdog that will not close a session must not turn a
+            # diagnostic into an error.
+            session_id = response.headers.get("mcp-session-id")
+            if session_id and response.status_code < 400:
+                with contextlib.suppress(Exception):
+                    await client.delete(
+                        profile.watchdog_mcp_url,
+                        headers={**headers, "mcp-session-id": session_id},
+                    )
     except Exception:  # noqa: BLE001 - any transport failure is "unreachable"
         return "unreachable"
     if response.status_code in (401, 403):

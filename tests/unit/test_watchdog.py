@@ -1467,7 +1467,16 @@ WATCHDOG_MODULES = ("studioforge.watchdog.server", "studioforge.watchdog.__main_
 FORBIDDEN_PREFIXES = ("studioforge.core", "studioforge.api", "studioforge.db")
 
 #: The only StudioForge modules the watchdog may touch.
-ALLOWED_STUDIOFORGE = ("studioforge.config", "studioforge.watchdog")
+# `credential_guard` joins `config` on the allowlist for the same reason config
+# is on it: a stdlib-only leaf that imports nothing from the rest of the
+# package, so it drags none of the app machinery into the recovery process.
+# The watchdog needs it because the destructive tools live behind the same
+# eight-digit PIN, and a lockout on only one of the two doors is no lockout.
+ALLOWED_STUDIOFORGE = (
+    "studioforge.config",
+    "studioforge.credential_guard",
+    "studioforge.watchdog",
+)
 
 
 def _module_path(dotted: str) -> Path:
@@ -1642,9 +1651,9 @@ async def test_poll_loop_survives_a_failing_health_check(harness: Harness) -> No
 async def test_watchdog_accepts_the_pin_through_the_main_servers_carriers(
     harness: Harness,
 ) -> None:
-    """A client that paired with the main /mcp via ``X-MCP-Pin`` (or ``?pin=``)
-    must not get a 401 from the recovery surface -- and a wrong PIN in those
-    carriers is still a 401 (2026-08-19)."""
+    """A client that paired with the main /mcp via ``X-MCP-Pin`` must not get a
+    401 from the recovery surface -- and a wrong PIN in those carriers is still
+    a 401 (2026-08-19). ``?pin=`` is refused on both surfaces since D44."""
     raw = yaml.safe_load(harness.config_path.read_text(encoding="utf-8"))
     raw["server"]["api_key"] = None
     raw.setdefault("mcp", {})["pin"] = "87654321"
@@ -1661,7 +1670,8 @@ async def test_watchdog_accepts_the_pin_through_the_main_servers_carriers(
     ):
         assert post(client, http.url, {"X-MCP-Pin": "87654321"}).status_code != 401
         assert post(client, http.url, {"X-StudioForge-Pin": "87654321"}).status_code != 401
-        assert post(client, http.url + "?pin=87654321", {}).status_code != 401
+        # D44: the query carrier is refused, not merely unadvertised.
+        assert post(client, http.url + "?pin=87654321", {}).status_code == 401
         wrong = post(client, http.url, {"X-MCP-Pin": "00000000"})
         assert wrong.status_code == 401
         message = wrong.json()["error"]["message"]

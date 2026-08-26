@@ -61,6 +61,7 @@ import functools
 import hmac
 import json
 import logging
+import math
 import os
 import shlex
 import subprocess
@@ -84,6 +85,7 @@ from studioforge.config import (
     find_config_path,
     resolve_data_dir,
 )
+from studioforge.credential_guard import CredentialGuard, client_key
 
 log = logging.getLogger("studioforge.watchdog")
 
@@ -2236,7 +2238,13 @@ def _json_response_bytes(payload: dict[str, Any]) -> bytes:
     return json.dumps(payload, default=str).encode("utf-8")
 
 
-async def _send_json(send: Any, status: int, payload: dict[str, Any]) -> None:
+async def _send_json(
+    send: Any,
+    status: int,
+    payload: dict[str, Any],
+    *,
+    extra_headers: Sequence[tuple[bytes, bytes]] = (),
+) -> None:
     body = _json_response_bytes(payload)
     await send(
         {
@@ -2245,6 +2253,7 @@ async def _send_json(send: Any, status: int, payload: dict[str, Any]) -> None:
             "headers": [
                 (b"content-type", b"application/json"),
                 (b"content-length", str(len(body)).encode("ascii")),
+                *extra_headers,
             ],
         }
     )
@@ -2300,6 +2309,32 @@ def wrap_asgi(
         if expected_key or expected_pin:
             provided = _bearer_from_headers(scope.get("headers") or [])
             pin_carrier = _pin_from_request(scope)
+            peer = _peer_key(scope) if (provided or pin_carrier) else None
+            # Same lockout as the main app, and for a sharper reason: this is
+            # the surface with nuke_all_models, kill_model, restart_server and
+            # rollback_update on it, and on the default install the only thing
+            # in front of them is an eight-digit PIN. Separate process, so
+            # separate counter -- neither door can lock the other.
+            wait = _CREDENTIAL_GUARD.retry_after(peer)
+            if wait > 0:
+                seconds = max(1, math.ceil(wait))
+                await _send_json(
+                    send,
+                    429,
+                    {
+                        "error": {
+                            "message": (
+                                "Too many incorrect credentials from this address. Wait "
+                                f"{seconds}s and try again."
+                            ),
+                            "type": "invalid_request_error",
+                            "code": "too_many_credential_attempts",
+                            "studioforge": {"retry_after_s": seconds},
+                        }
+                    },
+                    extra_headers=((b"retry-after", str(seconds).encode("ascii")),),
+                )
+                return
             key_ok = (
                 expected_key is not None
                 and provided is not None
@@ -2309,7 +2344,17 @@ def wrap_asgi(
                 candidate is not None and _constant_time_eq(candidate, expected_pin)
                 for candidate in (provided, pin_carrier)
             )
+            if key_ok or pin_ok:
+                _CREDENTIAL_GUARD.record_success(peer)
             if not key_ok and not pin_ok:
+                if provided or pin_carrier:
+                    _CREDENTIAL_GUARD.record_failure(peer)
+                query_note = (
+                    " The PIN is no longer accepted as '?pin=': a URL is written to access "
+                    "logs and shell history, which is no place for a credential."
+                    if _pin_in_query(scope)
+                    else ""
+                )
                 await _send_json(
                     send,
                     401,
@@ -2320,12 +2365,12 @@ def wrap_asgi(
                                 "accepts the same server.api_key as the main server, "
                                 "or the MCP pairing PIN when no key is set -- as "
                                 "'Authorization: Bearer <credential>', as the "
-                                "'X-MCP-Pin' header, or as ?pin=<pin>. The PIN is "
+                                "'X-MCP-Pin' header. The PIN is "
                                 "on the control panel (Setup -> Network & access -> "
                                 "the eye button next to 'MCP pairing PIN'), in "
                                 "`studioforge config` on the host, and at GET "
                                 "/api/mcp/info from the host itself. For sfctl: "
-                                "`sfctl servers add rig <url> --api-key <PIN> --use`."
+                                "`sfctl servers add rig <url> --api-key <PIN> --use`." + query_note
                             ),
                             "type": "invalid_request_error",
                             "code": "invalid_api_key",
@@ -2373,6 +2418,10 @@ def _bearer_from_headers(headers: Iterable[tuple[bytes, bytes]]) -> str | None:
     return None
 
 
+#: One lockout counter for the whole watchdog process; see
+#: :mod:`studioforge.credential_guard`.
+_CREDENTIAL_GUARD = CredentialGuard()
+
 #: Header names the MAIN server accepts the MCP pairing PIN under (see
 #: ``studioforge.api.auth.extract_pin``). The watchdog must accept the same
 #: ones: a client that paired with the main ``/mcp`` using ``X-MCP-Pin`` got a
@@ -2383,18 +2432,36 @@ _PIN_HEADERS: tuple[bytes, ...] = (b"x-mcp-pin", b"x-studioforge-pin")
 
 
 def _pin_from_request(scope: dict[str, Any]) -> str | None:
-    """The PIN sent as ``X-MCP-Pin``/``X-StudioForge-Pin`` or ``?pin=``."""
+    """The PIN sent as ``X-MCP-Pin``/``X-StudioForge-Pin``. Headers only.
+
+    ``?pin=`` is refused here for the same reason the main app refuses it
+    (``studioforge.api.auth.PIN_IN_QUERY_NOTE``): a URL ends up in access logs
+    and shell history, and this surface carries the destructive tools.
+    """
     for name, value in scope.get("headers") or []:
         if name.lower() in _PIN_HEADERS:
             text = value.decode("latin-1").strip()
             if text:
                 return text
+    return None
+
+
+def _pin_in_query(scope: dict[str, Any]) -> bool:
+    """Whether the caller tried the retired ``?pin=`` form."""
     query = (scope.get("query_string") or b"").decode("latin-1")
     for part in query.split("&"):
         key, _, val = part.partition("=")
-        if key == "pin" and val:
-            return val.strip()
-    return None
+        if key == "pin" and val.strip():
+            return True
+    return False
+
+
+def _peer_key(scope: dict[str, Any]) -> str | None:
+    client = scope.get("client")
+    if not client:
+        return None
+    host = client[0] if isinstance(client, list | tuple) else client
+    return client_key(str(host) if host is not None else None)
 
 
 def _constant_time_eq(left: str, right: str) -> bool:

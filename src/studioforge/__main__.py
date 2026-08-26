@@ -371,7 +371,7 @@ def _log_mcp_banner(config: Config) -> None:
         marker = "->" if entry is endpoints[0] else "  "
         lines.append(f"  {marker} {entry['url']}  ({entry['label']})")
     if mcp.pin_required and mcp.pin:
-        lines.append(f"     PIN: {mcp.pin}    (header 'X-MCP-Pin', or ?pin=)")
+        lines.append(f"     PIN: {mcp.pin}    (header 'X-MCP-Pin', or bearer)")
     else:
         lines.append("     PIN: not required")
     lines.append("     ask the 'connection_info' tool for a direct LAN address")

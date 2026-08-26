@@ -2,9 +2,12 @@
 # Last gate before anything leaves the machine.
 #
 # Three checks, because a push publishes three different things:
-#   (a) the TREE of every commit being pushed  — scanned via `git ls-tree`, not
-#       the working tree: the working copy can be clean while the commit that
-#       is actually travelling still carries the secret.
+#   (a) the TREE of EVERY commit being pushed — each one, scanned via
+#       `git ls-tree`, not the working tree: the working copy can be clean
+#       while the commit that is actually travelling still carries the secret.
+#       Not just the tip, either — a secret added in commit N and tidied away
+#       in N+1 is still published by N, and a tip-only scan calls that clean
+#       while `git log -p` and every clone still carry it.
 #   (b) the MESSAGE of every outgoing commit.
 #   (c) runtime data files that must never be tracked at all — covered by
 #       scrub_check's FORBIDDEN_PATHS / FORBIDDEN_IF_COMMITTED, which (a)
@@ -44,8 +47,6 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     if is_zero "$local_sha"; then continue; fi
     saw_ref=1
 
-    python3 scripts/scrub_check.py --rev "$local_sha" || status=1
-
     if is_zero "$remote_sha"; then
         range="$local_sha $not_remotes"
     elif ! git cat-file -e "${remote_sha}^{commit}" 2>/dev/null \
@@ -61,6 +62,21 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     else
         range="$remote_sha..$local_sha"
     fi
+
+    # Every outgoing commit's TREE, oldest first — not only the tip. A scan of
+    # the tip alone cannot see a secret that a later commit removed, and that
+    # secret publishes anyway. A tree scan is a fraction of a second, so the
+    # cost of being right here is a rounding error on a push.
+    scanned=0
+    for sha in $(git rev-list --reverse $range); do
+        scanned=$((scanned + 1))
+        python3 scripts/scrub_check.py --rev "$sha" || {
+            status=1
+            echo "pre-push: the tree of commit $sha is not publishable" >&2
+        }
+    done
+    echo "pre-push: scanned $scanned commit tree(s) on $local_ref"
+
     python3 scripts/scrub_check.py --commit-range "$range" || status=1
 done
 

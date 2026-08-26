@@ -2318,7 +2318,7 @@ the scratch loads above; `/props` was not relied on for any of them.
 **Amendment (2026-08-23): `auto` is off above four slots.** Every measurement above is a *single
 stream* (`--parallel 1`), where decode is memory-bound: the weights are read to produce one token
 regardless, so the drafted tokens are verified almost for free and the win is real. That reasoning
-inverts under concurrency. A gauntlet run loaded Dark-Scarlett-27B at `--parallel 8` and `auto`
+inverts under concurrency. A CrucibleForge run loaded Dark-Scarlett-27B at `--parallel 8` and `auto`
 still chose `draft-mtp` (it saw the MTP head, not the slot count) -- but eight concurrent streams
 already saturate the GPU, so the drafted-then-rejected tokens are pure extra compute that slows
 *every* request. `resolve_spec_type` now takes the launch's slot count and returns `none` from
@@ -2421,7 +2421,7 @@ planner ubatch-aware is left for whoever owns `planner.py` next.
 **Amendment (2026-08-23): the automatic many-slots raise, now that the planner is aware.** D40
 made `Planner.estimate` charge `ubatch_scratch_bytes` for the micro-batch, which removed the OOM
 objection above ("the error direction is now a refused context, not an OOM"). The one piece still
-missing was an *automatic* raise -- `engine.ubatch_size` had to be set by hand. A gauntlet run at
+missing was an *automatic* raise -- `engine.ubatch_size` had to be set by hand. A CrucibleForge run at
 `--parallel 8` made the case: eight cold slots re-prefilling a shared prompt is exactly the large
 combined prefill a bigger micro-batch speeds up, and it was running at the engine's 512. So
 `engine.ubatch_many_slots` (default **1024**, the measured +13.6% rung) now applies above
@@ -2891,3 +2891,89 @@ the tailnet it names in its own reason for existing -- `is_private` never covere
   load planning in that window saw the cards free. Two overlapping grants now conflict at the
   book before either unloads anything, and a victim that picked up a request between the scan
   and its stop refuses the grant (D36) instead of being torn down.
+
+## D44 -- An eight-digit PIN is only a secret while guessing is slow
+
+The MCP pairing PIN is eight digits by design: its whole job is to be read off
+the startup banner and typed into a connector, the way a TV shows a code. A
+10^8 keyspace is a fair trade for that -- but only if an attacker gets a few
+attempts, not a few million.
+
+Measured on the live rig on 2026-08-24: eight wrong PINs in a row, every one
+answered in about 13 ms, no counter, no lockout, and the correct PIN still
+worked immediately afterwards. One machine walks the whole keyspace in hours.
+That PIN is the only thing in front of `restart_server`, `nuke_all_models`,
+`rollback_update`, `reclaim_orphan_engines` and `set_config` on an install
+with no `server.api_key` -- which is the shipped default.
+
+Two changes.
+
+**A doubling lockout, per client address** (`studioforge.credential_guard`).
+Three wrong answers are free -- a mistyped PIN and a retry -- and every failure
+after that locks that address out for 1s, 2s, 4s … capped at five minutes. The
+record is dropped after fifteen quiet minutes, or immediately on any success,
+so an operator who fat-fingers it is barely inconvenienced. A locked-out client
+is refused *before* the comparison runs, so a correct guess arriving mid-lockout
+wins nothing. At the cap that is under 300 guesses a day from one address:
+hours becomes geological time. The refusal is a `429` carrying both
+`Retry-After` and `retry_after_s`, the shape `sfctl` already parses.
+
+The main server and the watchdog get **separate** counters. They are separate
+processes and separate doors; a spray at one must not lock the operator out of
+the other, and the watchdog exists precisely for when the main server is not
+answering. It is a rate limiter keyed on a client-supplied address, so a caller
+with many source addresses degrades it -- `server.api_key` remains the answer
+for anything reachable off the box. This makes the default install defensible,
+not perfect.
+
+**`?pin=` is refused, not merely unadvertised.** The previous decision (D32,
+amended 2026-08-22) stopped advertising the query form but kept parsing it for
+connectors configurable only by URL. That was the wrong side of the trade: a
+URL is written to reverse-proxy access logs, browser history, shell history,
+referrer headers and crash reports -- none of which expire -- for a credential
+that does not expire either. The `X-MCP-Pin` header costs a connector one
+configuration field. Both the main app and the watchdog now take the PIN from
+a header or the bearer slot only, and both detect the retired form so the 401
+can say *why* a URL that used to work no longer does, rather than looking like
+a wrong PIN.
+
+---
+
+## D45 -- The 92 assistant trailers in published history stay
+
+Ninety-two of the commits already on the public remote carry a
+`Co-Authored-By:` trailer naming the assistant that helped write them. The
+repository's own `commit-msg` hook rejects that trailer, and the house style is
+that finished work does not announce its tooling. So every audit of this
+repository finds them and proposes the same remedy: rewrite the history and
+force-push.
+
+The remedy is worse than the finding, and the finding is smaller than it looks.
+
+**What is actually there.** All ninety-two are the same trailer form. There are
+no `claude.ai/code/session` URLs and no `Claude-Session:` lines anywhere in the
+published log -- those are the entries that would link a private transcript of
+the machine this was built on, and that is the class this rule exists to catch.
+A trailer naming a co-author leaks nothing: no path, no host, no credential, no
+person. It is a style violation in a log, not a disclosure.
+
+**What removing them costs.** Rewriting them means rewriting every commit from
+the first one that carries a trailer, which invalidates every sha in the
+published history. Every clone, fork, issue reference, release tag, bisect
+result and permalink into this repository breaks at once, and anyone who
+already fetched keeps the old objects anyway -- so the trailers remain
+reachable from every existing copy regardless. A force-push over a public
+history is also the operation with no undo: a mistake in it is unrecoverable
+from the remote side.
+
+Trading a permanent break in a public history for the cosmetic removal of a
+line that discloses nothing is not a good trade. **The published trailers
+stay.**
+
+**This is not a relaxation.** The `commit-msg` hook still rejects the trailer,
+so no *new* commit can carry one, and the session-URL and transcript rules are
+untouched and remain hard failures. The decision is narrow: do not rewrite
+history that is already public for this.
+
+Recorded here so the next sweep reads a decision instead of re-filing the
+finding.

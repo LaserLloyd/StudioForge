@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 from fastapi import Request
 
-from studioforge.api.auth import check_request, extract_pin, is_mcp_path
+from studioforge.api.auth import check_request, extract_pin, is_mcp_path, pin_in_query
 from studioforge.config import Config, generate_pin
 from studioforge.core import netinfo
 from studioforge.errors import AuthError
@@ -160,8 +160,19 @@ def test_short_pins_are_rejected() -> None:
 def test_pin_extracted_from_every_accepted_carrier() -> None:
     assert extract_pin(make_request("/mcp", {"X-MCP-Pin": " 1234 "})) == "1234"
     assert extract_pin(make_request("/mcp", {"X-StudioForge-Pin": "5678"})) == "5678"
-    assert extract_pin(make_request("/mcp", query="pin=9012")) == "9012"
     assert extract_pin(make_request("/mcp")) is None
+
+
+def test_the_query_carrier_is_refused() -> None:
+    """D44: ``?pin=`` used to be accepted. A URL is written to reverse-proxy
+    access logs, browser history and shell history -- none of which expire,
+    and neither does an eight-digit PIN."""
+    request = make_request("/mcp", query="pin=9012")
+    assert extract_pin(request) is None
+    # Detected, though, so the 401 can explain itself instead of looking like
+    # a wrong PIN to someone whose URL worked yesterday.
+    assert pin_in_query(request)
+    assert not pin_in_query(make_request("/mcp"))
 
 
 def test_is_mcp_path_matches_the_endpoint_and_children() -> None:

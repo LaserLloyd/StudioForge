@@ -796,9 +796,15 @@ if NO_LISTEN:
 
 class Server(ThreadingHTTPServer):
     daemon_threads = True
-    # No SO_REUSEADDR: a port clash must fail loudly instead of silently
-    # sharing the port with another listener (which Windows allows).
-    allow_reuse_address = False
+    # Mirror the real llama-server, which sets SO_REUSEADDR -- on POSIX only.
+    # The flag decides whether this child's TIME_WAIT connections leave the
+    # port bindable after it exits (the kernel copies the ORIGINAL socket's
+    # reuse flag onto its TIME_WAIT, so a fake without it makes the port
+    # un-rebindable for a minute in a way the real engine never does). On
+    # Windows SO_REUSEADDR lets a second bind silently share a LIVE listener,
+    # which would hide a genuine port clash -- and that is the platform whose
+    # probe uses SO_EXCLUSIVEADDRUSE for exactly that reason.
+    allow_reuse_address = os.name != "nt"
 
 
 server = Server(("127.0.0.1", PORT), Handler)
@@ -1071,6 +1077,8 @@ async def test_port_allocation_skips_a_bound_port(
     config: Config, tmp_path: Path, fake_binary: Path
 ) -> None:
     blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    # Like any real server on the box, and like the probe under test.
+    blocker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     blocker.bind(("127.0.0.1", TEST_PORT_START))
     blocker.listen(1)
     supervisor = fake_sup(config, fake_binary)
@@ -1259,3 +1267,97 @@ async def test_stop_prunes_the_per_model_lock(config: Config, tmp_path: Path) ->
 
     assert await supervisor.kill("other/model") is False  # not running
     assert "other/model" not in supervisor._locks
+
+
+# ---------------------------------------------------------------------------
+# Cross-platform launch mechanics
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="the PDEATHSIG shim is Linux-only")
+async def test_the_pdeathsig_shim_wraps_a_launch_prefix_rather_than_hiding_inside_it(
+    config: Config, tmp_path: Path, fake_binary: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Its body is ``os.execv(sys.argv[1], sys.argv[1:])``, so it has to be the
+    OUTERMOST element of the command line the supervisor builds. Composed the
+    other way round, the launch prefix ``[python, -u]`` took ``-c <shim>`` as
+    its own script argument and tried to compile the interpreter binary:
+    "SyntaxError: source code cannot contain null bytes"."""
+    from studioforge.core import supervisor as supervisor_module
+
+    seen: list[list[str]] = []
+    real = supervisor_module.asyncio.create_subprocess_exec
+
+    async def spy(*argv: str, **kwargs: object) -> object:
+        seen.append(list(argv))
+        return await real(*argv, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(supervisor_module.asyncio, "create_subprocess_exec", spy)
+    supervisor = fake_sup(config, fake_binary)
+    try:
+        await supervisor.start(make_record(tmp_path), make_plan())
+    finally:
+        await supervisor.aclose()
+
+    assert seen, "the supervisor never spawned a child"
+    shim = supervisor_module._pdeathsig_prefix()
+    assert seen[0][: len(shim)] == shim, f"shim is not outermost: {seen[0][:6]}"
+    # ... and the launch prefix sits inside it, not in front of it.
+    assert seen[0][len(shim) : len(shim) + 2] == [sys.executable, "-u"]
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="the PDEATHSIG shim is Linux-only")
+def test_the_shim_reports_an_unlaunchable_binary_instead_of_a_traceback() -> None:
+    """The shim moves the exec into the child, so a missing engine no longer
+    raises OSError out of Popen. Without a marker the operator gets somebody
+    else's FileNotFoundError traceback and exit code 1."""
+    import subprocess
+
+    from studioforge.core.supervisor import (
+        PDEATHSIG_EXEC_FAILED,
+        PDEATHSIG_EXEC_FAILED_CODE,
+        _pdeathsig_prefix,
+    )
+
+    failed = subprocess.run(
+        [*_pdeathsig_prefix(), "/nonexistent/llama-server"],
+        capture_output=True,
+        text=True,
+    )
+    assert failed.returncode == PDEATHSIG_EXEC_FAILED_CODE
+    assert PDEATHSIG_EXEC_FAILED in failed.stderr
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows probes with SO_EXCLUSIVEADDRUSE instead")
+def test_the_port_probe_sees_past_a_previous_childs_time_wait() -> None:
+    """llama-server sets SO_REUSEADDR, so the kernel marks its TIME_WAIT
+    sockets reusable -- but only a probe that also sets SO_REUSEADDR is allowed
+    to see that. Without it the port read busy for a minute after every
+    unload, which on a narrow child_port range is how "No free port" arrives on
+    a box with free ports."""
+    from studioforge.core.supervisor import _port_is_bindable
+
+    port = TEST_PORT_START + 90
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", port))
+    listener.listen(1)
+    client = socket.create_connection(("127.0.0.1", port))
+    served, _ = listener.accept()
+    # Server closes first, so the SERVER side is what lingers in TIME_WAIT.
+    served.close()
+    listener.close()
+    client.close()
+
+    plain = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        plain.bind(("127.0.0.1", port))
+    except OSError:
+        pass  # The TIME_WAIT is there, which is the precondition for the test.
+    else:
+        plain.close()
+        pytest.skip("no TIME_WAIT lingered; nothing to prove on this kernel")
+    finally:
+        plain.close()
+
+    assert _port_is_bindable(port) is True

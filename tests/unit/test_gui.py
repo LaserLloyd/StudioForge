@@ -121,6 +121,7 @@ def make_record(
     preset: VirtualPreset | None = None,
     settings: ModelSettings | None = None,
     last_used_at: float | None = None,
+    added_at: float | None = None,
 ) -> ModelRecord:
     meta = GgufMeta(architecture=arch, n_vocab=vocab or 0, tokenizer_model="gpt2")
     return ModelRecord(
@@ -145,6 +146,12 @@ def make_record(
         preset=preset,
         last_used_at=last_used_at,
         mtime=mtime,
+        # `ModelRecord.added_at` defaults to `time.time()`, so records built
+        # microseconds apart are NOT tied on the date key -- which quietly
+        # turned the tie-break assertions below into construction-order
+        # assertions everywhere the clock is fine-grained enough to tell them
+        # apart (i.e. everywhere but Windows).
+        **({"added_at": added_at} if added_at is not None else {}),
     )
 
 
@@ -458,12 +465,16 @@ def test_pin_tooltip_only_promises_a_reload_when_auto_load_pinned_is_on() -> Non
 def test_instance_ttl_countdown_is_live() -> None:
     import time
 
+    # 59, not 60. The remaining time is computed from a SECOND `time.time()`
+    # call, so a 60s offset lands a hair under 540.0 and the (correct) floor in
+    # `format_duration` renders "8m 59s". Only Windows' ~15.6ms clock
+    # granularity made the two calls agree often enough for a 60 to pass.
     instance = InstanceInfo(
         model_id="m",
         state="ready",
         ttl_s=600,
-        started_at=time.time() - 60,
-        last_activity_at=time.time() - 60,
+        started_at=time.time() - 59,
+        last_activity_at=time.time() - 59,
     )
     text = st.instance_ttl_text(instance)
     assert text.startswith("9m")
@@ -2328,7 +2339,9 @@ def test_sort_models_direction_flag_flips_the_order() -> None:
 
 def test_sort_models_ties_break_on_id_in_both_directions() -> None:
     """The table repaints on a timer; equal rows must never swap under the cursor."""
-    records = [make_record("c", size=GIB), make_record("a", size=GIB), make_record("b", size=GIB)]
+    # Every key must actually TIE, or this asserts nothing about tie-breaking.
+    tied = {"size": GIB, "added_at": 1_700_000_000.0}
+    records = [make_record("c", **tied), make_record("a", **tied), make_record("b", **tied)]
     assert [r.id for r in st.sort_models(records, "size", True)] == ["a", "b", "c"]
     assert [r.id for r in st.sort_models(records, "size", False)] == ["a", "b", "c"]
     assert [r.id for r in st.sort_models(records, "date", True)] == ["a", "b", "c"]
