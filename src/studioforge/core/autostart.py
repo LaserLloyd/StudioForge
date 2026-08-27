@@ -98,8 +98,16 @@ def launch_command(config: Config, *, open_gui: bool = False, tray: bool = False
     menu is how you reach the control panel.
     """
     if tray:
-        script = shutil.which("studioforge")
-        base = [script] if script else [_tray_interpreter(), "-m", "studioforge"]
+        # NEVER the console script for the tray. `studioforge.exe` is a
+        # console-subsystem launcher ([project.scripts]); from an activated
+        # venv shutil.which() finds it -- possibly a DIFFERENT checkout's
+        # copy, whichever venv is on PATH -- and a shim baked with it runs
+        # the tray attached to a hidden console: the "stream exists but is
+        # dead" environment __main__ documents as the fatal case, and one
+        # default-terminal Settings toggle away from a visible window at
+        # every login. pythonw next to sys.executable is pinned to THIS
+        # install and owns no console at all.
+        base = [_tray_interpreter(), "-m", "studioforge"]
         return [*base, "tray", "--config", str(config.config_path)]
     script = shutil.which("studioforge")
     base = [script] if script else [sys.executable, "-m", "studioforge"]
@@ -150,7 +158,7 @@ def status(config: Config) -> AutostartStatus:
         # a UTF-8(-BOM) one, and a UTF-8 decode of UTF-16 bytes interleaves
         # NULs that would hide the "tray" substring below.
         if raw.startswith(codecs.BOM_UTF16_LE):
-            body = raw.decode("utf-16-le", errors="replace")
+            body = raw[len(codecs.BOM_UTF16_LE) :].decode("utf-16-le", errors="replace")
         else:
             body = raw.decode("utf-8-sig", errors="replace")
         launches_tray = " tray " in f" {body} " or '"tray"' in body
@@ -220,7 +228,10 @@ def _enable_windows(config: Config, *, open_gui: bool, tray: bool = False) -> Au
         # write_bytes does no newline translation on any platform.
         payload = codecs.BOM_UTF16_LE + script.replace("\n", "\r\n").encode("utf-16-le")
         path.write_bytes(payload)
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
+        # ValueError covers UnicodeEncodeError: an NTFS path may carry a lone
+        # surrogate, and that failure should read as "could not write the
+        # shim", not a raw codec traceback.
         raise AutostartError(f"could not write {path}: {exc}") from exc
     log.info("autostart enabled", path=str(path), tray=tray)
     return AutostartStatus(

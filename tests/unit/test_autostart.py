@@ -193,6 +193,21 @@ class TestTrayAutostart:
         # SF_DATA_DIR.
         assert str(config.config_path) in argv
 
+    def test_tray_launch_never_uses_the_console_script(
+        self, config: Config, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """studioforge.exe is a console-subsystem launcher, and which() finds
+        whichever venv's copy is on PATH -- possibly a different checkout's.
+        A shim baked with it runs the tray against a hidden (or, one Settings
+        toggle later, visible) console. The tray shim is always
+        pythonw -m studioforge, pinned to this install."""
+        monkeypatch.setattr(
+            autostart.shutil, "which", lambda name: r"C:\other\venv\Scripts\studioforge.exe"
+        )
+        argv = autostart.launch_command(config, tray=True)
+        assert "studioforge.exe" not in argv[0].lower()
+        assert argv[1:3] == ["-m", "studioforge"]
+
     def test_open_gui_is_ignored_for_the_tray(self, config: Config) -> None:
         # The tray's own menu opens the panel; --open belongs to `serve`.
         argv = autostart.launch_command(config, open_gui=True, tray=True)
