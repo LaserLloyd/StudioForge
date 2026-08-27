@@ -18,6 +18,7 @@ what is actually on disk rather than what we believe we wrote.
 
 from __future__ import annotations
 
+import codecs
 import os
 import shlex
 import shutil
@@ -142,9 +143,16 @@ def status(config: Config) -> AutostartStatus:
         # is not enough to answer "why is there no tray icon?", which is the
         # question this status is usually being asked to settle.
         try:
-            body = path.read_text(encoding="utf-8", errors="replace")
+            raw = path.read_bytes()
         except OSError:
-            body = ""
+            raw = b""
+        # BOM-aware: the shim is UTF-16 LE now; older installs may still hold
+        # a UTF-8(-BOM) one, and a UTF-8 decode of UTF-16 bytes interleaves
+        # NULs that would hide the "tray" substring below.
+        if raw.startswith(codecs.BOM_UTF16_LE):
+            body = raw.decode("utf-16-le", errors="replace")
+        else:
+            body = raw.decode("utf-8-sig", errors="replace")
         launches_tray = " tray " in f" {body} " or '"tray"' in body
         mode = (
             "tray (which starts the server too)"
@@ -202,10 +210,16 @@ def _enable_windows(config: Config, *, open_gui: bool, tray: bool = False) -> Au
     )
     path = target / WINDOWS_SHIM
     try:
-        # BOM on purpose: wscript.exe reads a .vbs as ANSI unless it is
-        # BOM-prefixed, so a non-ASCII data dir (a user name with an accent)
-        # became mojibake at login and autostart silently did nothing.
-        path.write_text(script, encoding="utf-8-sig")
+        # UTF-16 LE with BOM -- the ONLY Unicode encoding the VBScript engine
+        # accepts. An earlier version wrote UTF-8 with a BOM to survive a
+        # non-ASCII data dir, but wscript.exe parses a .vbs as ANSI or as
+        # BOM-marked UTF-16 and nothing else: the UTF-8 BOM arrived as three
+        # garbage characters and every login died on a "Windows Script Host /
+        # Invalid character / 800A0408 / Line 1 Char 1" dialog. UTF-16 keeps
+        # the accented-path case working AND compiles. CRLF explicitly:
+        # write_bytes does no newline translation on any platform.
+        payload = codecs.BOM_UTF16_LE + script.replace("\n", "\r\n").encode("utf-16-le")
+        path.write_bytes(payload)
     except OSError as exc:
         raise AutostartError(f"could not write {path}: {exc}") from exc
     log.info("autostart enabled", path=str(path), tray=tray)

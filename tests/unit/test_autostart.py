@@ -7,6 +7,7 @@ a shim that runs at every login and does nothing visible.
 
 from __future__ import annotations
 
+import codecs
 import os
 from pathlib import Path
 
@@ -17,6 +18,13 @@ from studioforge.core import autostart
 
 windows_only = pytest.mark.skipif(os.name != "nt", reason="Windows Startup folder")
 posix_only = pytest.mark.skipif(os.name == "nt", reason="systemd user units")
+
+
+def read_shim(path: Path) -> str:
+    """Decode the shim the way wscript.exe will: UTF-16 LE behind its BOM."""
+    raw = path.read_bytes()
+    assert raw.startswith(codecs.BOM_UTF16_LE)
+    return raw[len(codecs.BOM_UTF16_LE) :].decode("utf-16-le")
 
 
 @pytest.fixture
@@ -55,7 +63,7 @@ def test_enable_writes_a_hidden_launch_shim(config: Config, fake_startup: Path) 
     shim = fake_startup / "StudioForge.vbs"
     assert shim.is_file()
 
-    text = shim.read_text(encoding="utf-8")
+    text = read_shim(shim)
     # 0 = hidden window, False = do not wait: a login shim must not flash a
     # console or block the logon sequence.
     assert ", 0, False" in text
@@ -82,7 +90,7 @@ def test_shim_quotes_paths_containing_spaces(tmp_path: Path, fake_startup: Path)
     assert " " in str(cfg.config_path)
 
     autostart.enable(cfg)
-    text = (fake_startup / "StudioForge.vbs").read_text(encoding="utf-8")
+    text = read_shim(fake_startup / "StudioForge.vbs")
     run_line = next(line for line in text.splitlines() if line.startswith("shell.Run"))
     # Inside a VBScript string literal a quote is escaped by doubling it.
     assert '""' in run_line, run_line
@@ -117,6 +125,35 @@ def test_status_reports_the_real_file_not_our_belief(config: Config, fake_startu
     autostart.enable(config)
     (fake_startup / "StudioForge.vbs").unlink()  # user deleted it by hand
     assert autostart.status(config).enabled is False
+
+
+@windows_only
+def test_shim_is_utf16le_with_bom_never_utf8(config: Config, fake_startup: Path) -> None:
+    """The VBScript engine parses ANSI or BOM-marked UTF-16 and nothing else.
+
+    A UTF-8 BOM -- written 'on purpose' once, to survive an accented data
+    dir -- arrived as three garbage characters and every login died on
+    'Invalid character / 800A0408 / Line 1 Char 1'. Lived on this rig from
+    2026-08-22 to 2026-08-26.
+    """
+    autostart.enable(config, tray=True)
+    raw = (fake_startup / autostart.WINDOWS_SHIM).read_bytes()
+    assert raw.startswith(codecs.BOM_UTF16_LE)
+    assert not raw.startswith(codecs.BOM_UTF8)
+    body = raw[len(codecs.BOM_UTF16_LE) :].decode("utf-16-le")
+    assert "\r\n" in body  # explicit CRLF: write_bytes translates nothing
+    assert body.startswith("'")  # the first parsed character is a comment
+
+
+@windows_only
+def test_status_still_reads_an_old_utf8_bom_shim(config: Config, fake_startup: Path) -> None:
+    """Installs that pre-date the fix hold a UTF-8-BOM shim; status() must
+    still classify it (as broken-at-login as it is) instead of mis-reading."""
+    autostart.enable(config, tray=True)
+    shim = fake_startup / autostart.WINDOWS_SHIM
+    text = read_shim(shim)
+    shim.write_text(text, encoding="utf-8-sig")
+    assert "tray" in autostart.status(config).detail
 
 
 @posix_only
@@ -173,7 +210,7 @@ class TestTrayAutostart:
     ) -> None:
         result = autostart.enable(config, tray=True)
         assert result.enabled
-        body = (fake_startup / autostart.WINDOWS_SHIM).read_text(encoding="utf-8")
+        body = read_shim(fake_startup / autostart.WINDOWS_SHIM)
         assert "tray" in body
         assert " serve " not in body
 
