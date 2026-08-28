@@ -20,6 +20,7 @@ from pydantic import ValidationError
 
 from studioforge.config import Config
 from studioforge.core.engine import EngineManager
+from studioforge.core.manager import ModelManager
 from studioforge.core.planner import (
     CALIBRATION_MIN_ROWS,
     MAX_PARALLEL_CAP,
@@ -36,7 +37,10 @@ from studioforge.core.planner import (
     max_parallel_for,
     parallel_options,
 )
+from studioforge.errors import BadRequestError
 from studioforge.types import GgufMeta, LoadPlan, LoadRejected, ModelSettings
+from tests.unit.test_load_retry import StubPlanner, StubRegistry, StubSupervisor
+from tests.unit.test_load_retry import make_record as make_manager_record
 from tests.unit.test_planner import (
     StubProbe,
     gpu,
@@ -421,6 +425,97 @@ def test_a_per_model_cap_limits_the_automatic_slot_count() -> None:
     plan = planner.plan_load(record, ctx_size=8192)
     assert isinstance(plan, LoadPlan)
     assert plan.parallel == 1
+
+
+# ---------------------------------------------------------------------------
+# The per-model cap became a hard ceiling (D48)
+# ---------------------------------------------------------------------------
+
+
+def capped_manager(cap: int | None) -> ModelManager:
+    """A manager over one model whose settings state ``max_parallel_cap``."""
+    record = make_manager_record()
+    record.settings = ModelSettings(max_parallel_cap=cap)
+    return ModelManager(
+        Config(data_dir="/tmp/sf-parallel-cap"),
+        registry=StubRegistry({record.id: record}),  # type: ignore[arg-type]
+        planner=StubPlanner(),  # type: ignore[arg-type]
+        supervisor=StubSupervisor(),  # type: ignore[arg-type]
+        db=None,  # type: ignore[arg-type]
+    )
+
+
+async def test_a_request_above_the_cap_is_refused_naming_both_numbers() -> None:
+    """D14 promises an explicit ``parallel`` is honoured verbatim, and a stated
+    per-model ceiling promises the opposite. The two cannot both be kept, so
+    the conflict is refused loudly rather than resolved silently in either
+    direction -- honouring a *smaller* number than the caller asked for is the
+    one outcome that must never happen quietly."""
+    manager = capped_manager(2)
+    supervisor = manager.supervisor
+
+    with pytest.raises(BadRequestError) as excinfo:
+        await manager.load("test/model", parallel=4)
+
+    assert excinfo.value.param == "parallel"
+    assert excinfo.value.details == {"max_parallel_cap": 2, "requested": 4}
+    assert "2" in excinfo.value.message and "4" in excinfo.value.message
+    assert supervisor.starts == 0  # type: ignore[attr-defined]
+
+
+async def test_a_request_at_or_below_the_cap_is_honoured_verbatim() -> None:
+    manager = capped_manager(2)
+    await manager.load("test/model", parallel=2)
+    assert manager.planner.kwargs[-1]["parallel"] == 2  # type: ignore[attr-defined]
+
+
+async def test_a_model_with_no_cap_is_unaffected() -> None:
+    manager = capped_manager(None)
+    await manager.load("test/model", parallel=8)
+    assert manager.planner.kwargs[-1]["parallel"] == 8  # type: ignore[attr-defined]
+
+
+async def test_an_internal_replay_of_an_existing_shape_is_not_capped() -> None:
+    """Three internal callers hand ``load`` an instance's own ``plan.parallel``
+    back: the D46 priority restore, the D42 rebalancer, and the parallel
+    benchmark's teardown. That is the server reproducing a shape it already
+    launched, not a user stating a count -- so a cap lowered under a running
+    eight-slot model must not turn "put it back where it was" into a 400 and
+    leave the box in the shape the run happened to end on.
+
+    The same tolerance the legacy settings-row hole above already grants.
+    """
+    manager = capped_manager(2)
+
+    instance = await manager.load("test/model", parallel=4, enforce_parallel_cap=False)
+
+    assert instance.state == "ready"
+    assert manager.planner.kwargs[-1]["parallel"] == 4  # type: ignore[attr-defined]
+
+
+async def test_the_user_shaped_load_is_still_refused_at_the_same_cap() -> None:
+    """The escape hatch is keyword-only and defaults to enforcing, so every
+    request path -- HTTP, MCP, GUI, CLI -- still meets the D48 refusal."""
+    manager = capped_manager(2)
+    with pytest.raises(BadRequestError) as excinfo:
+        await manager.load("test/model", parallel=4)
+    assert excinfo.value.param == "parallel"
+    assert manager.supervisor.starts == 0  # type: ignore[attr-defined]
+
+
+async def test_a_legacy_settings_row_above_the_cap_still_loads() -> None:
+    """Only the REQUEST argument is checked. A model whose own saved
+    ``parallel`` sits above a cap added later must not have its JIT loads
+    bricked -- the settings save path refuses new ones, and this hole is
+    documented in D48 rather than closed by taking a working model offline."""
+    manager = capped_manager(2)
+    record = manager.registry.get("test/model")  # type: ignore[union-attr]
+    assert record is not None
+    record.settings = ModelSettings(parallel=8, max_parallel_cap=2)
+
+    instance = await manager.load("test/model")
+
+    assert instance.state == "ready"
 
 
 def test_auto_never_turns_a_working_load_into_a_rejection() -> None:

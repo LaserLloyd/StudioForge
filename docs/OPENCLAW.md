@@ -160,6 +160,55 @@ evicted.
 You often do not need this call at all — see the next step — so reach for it to pre-warm a model,
 or to load one at a specific context size and slot count.
 
+**Say what the load is for.** `priority` tiers it: `1` the model a person is actively chatting
+with, `2` a model a dispatched agent will use, `3` — or omitted — background work. A tier-1/2 load
+is planned as if the idle worse-tier residents were already gone, so it gets the placement an idle
+box would have given it; it jumps the one-at-a-time load queue; and while it runs, loads and
+inference for worse-tier models are refused with `503` + `Retry-After` (the `priority_hold` row in
+[the error table](#what-makes-this-reliable-for-an-agent-workload)). Background can never displace a
+chat or agent model. The tier is remembered per model, and a model whose saved settings carry
+`priority` keeps its tier across a **restart** of the server as well — so a bot that tiers its
+model once keeps it through an engine update or a crash (D46, D48). Nothing else needs to change:
+omitting `priority` is background, exactly as before it existed.
+
+A single *request* can state a tier too, in the chat-completions body:
+
+```json
+{"model": "...", "messages": [...], "priority": 1}
+```
+
+That gates this request's own admission — a tier-1 turn passes a hold that would 503 a background
+turn for the same model — and tiers the just-in-time load it triggers, **only upwards**: the load
+runs at the better of the tier you asked for and the model's standing one, so a background-tagged
+turn against the model a person is chatting with cannot cold-load it at tier 3 and leave it there.
+It deliberately does **not** re-tier a model that is already running either: one client cannot
+promote the instance everybody else is sharing. `1`, `2`, `3` or absent; anything else is a `400`
+naming the parameter, so a typo cannot quietly demote a chat turn.
+
+**Break for old clients (D48).** Before this field existed, an unrecognised `priority` in a
+chat/completions body was forwarded to `llama-server` and ignored. It is now validated and consumed,
+so anything outside `1`, `2` and `3` — `true`, `"high"`, and vLLM's `priority: 0` among them — is a
+`400` naming the parameter rather than a silent no-op. That break is deliberate: a mistyped tier
+that was quietly accepted would demote a chat turn to background and then have it refused during
+the next load, which is the failure this field exists to prevent.
+
+**If your client will not send unknown body fields.** Some strict OpenAI SDKs strip or reject
+anything outside the documented schema. There is deliberately **no header form** of this field — a
+tier is a property of the workload, not of the transport, and a second spelling of it is a second
+thing to keep in step. Use the standing setting instead; it survives restarts, and every load of
+that model (just-in-time ones included) inherits it:
+
+```bash
+sfctl models settings pub/chat-model --set priority=1
+```
+
+The same write is `PATCH /api/models/{id}/settings` with `{"priority": 1}`, or the *Load priority*
+select in the GUI's model settings dialog. The full resolution ladder is: the explicit `priority` on
+this call, else the tier of this model's last **explicit load** (remembered until the server
+restarts), else `settings.priority`, else background. So the setting is the floor — a per-request
+tier decides how that one turn is admitted and can lift the load it triggers above the floor, never
+below it — and nothing about a request is remembered afterwards.
+
 ### 3. Inference over HTTP, not MCP
 
 ```bash
@@ -273,6 +322,18 @@ something you did, and it never evicts or interrupts anything.
 `server_status` is free VRAM per GPU, every loaded model with its port and remaining TTL, queue
 depth, the active engine tag — and who is holding the VRAM (next section).
 
+Each loaded row also carries `priority`, the tier that load was made at (`1` chat, `2` agent, `3`
+background) — read it beside `loaded_by` to see who would win the cards — and `speculative`, what
+drafting actually resolved to for that launch. `null` and `{"type": "none", "reason": ...}` are
+different answers: the first means the launch has not decided yet, the second that drafting was
+considered and declined, with `reason` saying why (above four slots it always declines itself —
+speculation trades spare compute for latency and a saturated batch has none to spare).
+
+`busy` carries one more key beside `active_requests`, `busy_models`, `loading` and `testing`:
+`priority_hold` is `{model_id, priority}` while a chat- or agent-tier load is holding worse-tier
+traffic off, and `null` otherwise. It is the reason behind any `priority_hold` 503 you have just
+been given.
+
 `connection_info` is what to call when the network moves: it returns every address this server
 answers on, tailnet first (those survive network changes), with the OpenAI base URL alongside.
 
@@ -297,6 +358,50 @@ serving (with `retry_after_s`, so waiting is the right move), memory held by som
 us, or the model's own trained window. Ask again with the number it names and it will load. Above
 `n_ctx_train` it is a `400` carrying that number, because serving past the trained window needs RoPE
 scaling and degrades quality.
+
+Everything else about the call is optional:
+
+| Argument | What it does |
+| --- | --- |
+| `prefer_mode` | Try this hardware mode first (`"dual_3090"`), instead of the headline order. |
+| `kv_min` | The lowest KV cache quality this load may accept — `"f16"`, `"q8_0"` or `"q4_0"`. A floor on the quality-first ladder, not a choice: `"f16"` means "do not quantize the cache to reach this window at all", and a window that would need a worse cache is refused rather than reached quietly at lower quality. |
+| `max_slots` | Ceiling on the slot count this load may choose (>= 1). The server's own number is what the placement *could* sustain; if you know only three bots will ever talk to it, cap it here and the KV cache for the slots you will not use is never priced into the fit — which often buys a larger window instead. Below 1 is a `400` naming the parameter. |
+| `persist` | Write the profile this call resolved into the model's saved settings (below). |
+| `priority` | The load's tier, exactly as on `load_model`: `1` chat, `2` agent, `3` or omitted background. |
+
+**`persist` — keeping the answer.** The walk costs minutes, and its result used to evaporate with
+the instance. `persist: true` writes what *actually launched* — context per slot, both KV cache
+types and the slot count — into the model's saved settings, so the next plain load, including the
+automatic one an inference request triggers, reproduces it without asking again. The tier is
+written too, but **only when this call named a `priority`**: a `persist` that says nothing about
+priority leaves the saved tier exactly as it was, rather than freezing whatever tier the model
+happened to be running at into a standing setting nobody chose.
+
+The trade is real and worth stating: it **freezes** the KV ladder and the slot estimator for that
+model, which then stop adapting to what else is resident or to a changed machine. Hand the decision
+back by nulling the fields — `PATCH /api/models/{id}/settings` with
+`{"ctx_size": null, "kv_cache_type": null, "kv_cache_type_v": null, "parallel": null}`; a PATCH
+sets the keys present, clears the ones sent as `null` and leaves absent keys untouched (D47), and
+the settings dialog's Auto/blank fields do the same thing from the control panel. From a shell it
+is `sfctl models settings <model> --set ctx_size=null` (repeat `--set` per field); a literal `null`
+clears the field whatever it currently holds. Devices are
+deliberately **not** persisted: a placement is a one-shot load argument, so the cards are still
+chosen fresh on every load.
+
+Two calls are refused outright, before anything loads: `persist` on a preset-only virtual model
+(the write would land on the base model and every persona sharing it — call it on the base id), and
+`persist` while that model is being benchmarked (the run rewrites those very fields). Afterwards
+the write is best-effort: if a benchmark starts *during* the load, or the settings validation
+rejects the resolved row, the load stands and only the write is skipped, with a warning in the
+server log. So a success means the model is loaded; it does not by itself prove the profile was
+saved — read the settings back if it matters.
+
+**`persist` needs a credential when you are remote.** The route itself is ungated, because
+residency is open (LM Studio parity) — but a flag that writes settings is a change to the box, so
+it needs `server.api_key`, a caller on the rig itself, or the MCP pairing PIN, exactly like
+`PUT /settings` does (D32). Otherwise it is a `403 remote_admin_requires_credential`, and the same
+request without `persist` still loads. The MCP tool needs nothing extra: `sfctl mcp` reaches `/mcp`
+with the key or the PIN it was registered with, which is the same D32 gate this flag asks for.
 
 Use `list_models` -> a `placements[]` row -> `load_model` when you want to choose the hardware
 yourself. Use `load_recommended` the rest of the time.
@@ -345,8 +450,52 @@ only thing that does; a just-in-time load from an inference request can never se
 one-at-a-time, refuses outright while anything is serving, loading or benchmarking, loads at the
 server's default context with one slot when the model is cold, and unloads it again afterwards.
 Read `server_status.busy` (`active_requests`, `loading`, `testing`) before either call and you will
-not meet these refusals. Every loaded model also reports `loaded_by`, so on a shared box you can
-see which client asked for what.
+avoid the busy refusals; a priority hold can still appear whenever a better-tier load starts —
+honour `Retry-After`. `busy.priority_hold` names the model whose load is holding you off, and it
+can become true between your read and your call, which is the case the header exists for. Every
+loaded model also reports `loaded_by` and `priority`, so on a shared box you can see which client
+asked for what, and at which tier.
+
+## Sharing one model between bots
+
+One `llama-server` serves several conversations at once, one per **slot**, so two bots on the same
+model do not need two loads — they need enough slots. Either set `parallel` in the model's saved
+settings, so every load of it (just-in-time ones included) comes up with them:
+
+```bash
+sfctl models settings pub/agent-model --set parallel=3
+```
+
+or resolve and remember the whole shape in one call:
+
+```
+load_recommended(model_id="pub/agent-model", ctx_size=32768, max_slots=3, persist=true)
+```
+
+The second is usually the better trade: the plan is sized for the concurrency you actually have,
+the window is not paying for slots nobody will use, and `persist` means the next load repeats it.
+Past the slot count llama.cpp queues rather than refusing, so guessing low costs latency, not
+errors. `max_parallel` and `recommended_parallel` on the catalog row say what the placement will
+really sustain — and a model whose settings carry `max_parallel_cap` now **refuses** a `parallel`
+above it with a `400` naming both numbers rather than quietly clamping it (D48).
+
+**Mixed tiers on one instance.** The saved `settings.priority` is the model's standing tier; each
+request may then say what *it* is. Three bots sharing one model whose settings say `priority: 2`:
+
+* the companion a person is talking to sends `priority: 1` on its turns — it passes every hold
+  below tier 1, and a reload it triggers takes the fast placement and jumps the load queue;
+* a beta bot sends nothing, so it inherits the model's tier 2 — while some *other* model is loading
+  at tier 2 it still passes (equal tiers pass), but a tier-1 load holds it off;
+* a nightly email-summarising bot sends `priority: 3` and waits (`503 priority_hold` +
+  `Retry-After`) whenever a better-tier load is in flight — which is what you want from a job
+  nobody is watching.
+
+A `priority: 3` on a request makes that bot's own turns yield; it cannot pull the shared model down
+to tier 3 if its turn is the one that happens to trigger a reload. The load takes the better of the
+requested tier and the standing one, so the model comes back at tier 2 either way.
+
+Traffic for the model that is *itself* loading always queues rather than being refused, so bots
+sharing an instance never hold each other off during its own reload.
 
 ## When the VRAM is gone
 
@@ -475,6 +624,7 @@ hiding a failure, and never a `200` for a route that does not exist.
 | Model too big for VRAM | 507 | `insufficient_vram` | no — read `suggestions` |
 | Engine failed to start | 502 | `model_load_failed` | no — message carries the stderr tail |
 | Busy / transient | 503 | varies | **yes**, honour `Retry-After` |
+| Held by a higher-tier load | 503 | `priority_hold` | yes — honour `Retry-After` |
 
 A `507` carries the numbers *and* what to do about it under `error.studioforge.suggestions` —
 fewer slots at the same window (`max_parallel_that_fits`, when an explicit `parallel` was the

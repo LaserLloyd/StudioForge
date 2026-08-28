@@ -296,7 +296,13 @@ async def _stream(
     the child we started -- there is no configured or guessed URL anywhere, which
     is what keeps this working behind any proxy.
     """
-    record, _instance = await ctx.manager.ensure_loaded(model_id)
+    # Tier 1, literally: a person typing in this tab *is* the active chat, which
+    # is D46's own definition of the tier. Claiming nothing left the server's own
+    # UI as background work -- an agent's tier-2 load could 503 the human sitting
+    # in front of it. The number is spelled out rather than imported because this
+    # package imports nothing from ``core``; the tiers live in
+    # ``studioforge/core/priority.py`` (PRIORITY_CHAT).
+    record, _instance = await ctx.manager.ensure_loaded(model_id, priority=1)
     base = ctx.supervisor.base_url(record.id)
     if base is None:
         raise RuntimeError(f"model '{record.id}' is not serving")

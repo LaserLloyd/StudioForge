@@ -283,6 +283,20 @@ def fmt_bool(value: Any) -> str:
     return "yes" if value else "-"
 
 
+def fmt_priority(value: Any) -> str:
+    """Load tier as the bare digit (1 chat / 2 agent / 3 background), D46.
+
+    The digit rather than the word keeps the column one character wide on a
+    narrow terminal, where the model id already needs every column Rich can
+    take from its neighbours. A missing value means the server predates D48
+    and does not report tiers at all, so the cell is left EMPTY -- "-" reads
+    as "no tier", which is a different and wrong statement.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return ""
+    return str(value)
+
+
 #: Columns that hold an IDENTIFIER rather than a measurement. StudioForge
 #: model ids are `publisher/repo/file-stem` -- routinely 50+ characters -- and
 #: Rich divides a narrow terminal proportionally across columns, so an id
@@ -395,7 +409,12 @@ def status(json_out: bool = JSON_OPTION) -> None:
 
     loaded = payload.get("loaded") or []
     if loaded:
-        table = _table("Model", "State", "Ctx", "Port", "PID", "TTL left", "Active", "tok/s")
+        # `Prio` sits beside `TTL left` because they are one policy: the tier
+        # is what `models.ttl_by_priority` looks the countdown up by (D48), and
+        # it is also what decides whose load holds off whose.
+        table = _table(
+            "Model", "State", "Ctx", "Port", "PID", "Prio", "TTL left", "Active", "tok/s"
+        )
         for instance in loaded:
             plan = instance.get("plan") or {}
             model_id = str(instance.get("model_id"))
@@ -407,6 +426,7 @@ def status(json_out: bool = JSON_OPTION) -> None:
                 str(plan.get("ctx_size") or "-"),
                 str(instance.get("port") or "-"),
                 str(instance.get("pid") or "-"),
+                fmt_priority(instance.get("priority")),
                 "pinned" if not instance.get("ttl_s") else fmt_duration(ttl),
                 str(instance.get("active_requests") or 0),
                 f"{tps:.1f}" if isinstance(tps, (int, float)) else "-",
@@ -819,6 +839,16 @@ def models_load_recommended(
     kv_min: str | None = typer.Option(
         None, "--kv-min", help="Refuse to quantise the KV cache below this, e.g. q8_0."
     ),
+    max_slots: int | None = typer.Option(
+        None,
+        "--max-slots",
+        help="Cap the slot count the planner is allowed to pick (>= 1).",
+    ),
+    persist: bool = typer.Option(
+        False,
+        "--persist",
+        help="Save the winning ctx/KV/slots/tier to this model's settings.",
+    ),
     priority: int | None = typer.Option(
         None,
         "--priority",
@@ -832,18 +862,132 @@ def models_load_recommended(
     the model by shrinking the window; this one either gives the window asked
     for or answers 507 with what it would take, which is what an agent needs
     in order to ask for something else instead of silently getting less.
+
+    ``--max-slots`` caps the concurrency the planner may choose; omitting it
+    leaves the estimator free, which is what you want unless the slots are
+    costing context you would rather spend on the window. ``--persist`` writes
+    the shape that actually launched back into the model's settings, so the
+    next load -- JIT, autoload, restart -- repeats it without asking; the
+    trade is that it FREEZES the KV ladder and the slot estimator for this
+    model until those fields are cleared again
+    (``sfctl models settings <model> --set ctx_size=null``, and likewise for
+    kv_cache_type / kv_cache_type_v / parallel; ``null`` clears a field
+    whatever it currently holds). Devices are deliberately not persisted, so
+    the placement is still chosen fresh on every load.
+
+    With ``--persist`` the saved settings are read back and compared against
+    what actually launched, because a server that predates the flag answers
+    200 and drops it silently. A disagreement is a warning on stderr, not a
+    failure: the load itself succeeded.
     """
+    readback: dict[str, Any] = {}
 
     async def work(client: StudioForgeClient) -> Any:
-        return await client.load_recommended(
-            model, ctx_size=ctx_size, prefer_mode=prefer_mode, kv_min=kv_min, priority=priority
+        result = await client.load_recommended(
+            model,
+            ctx_size=ctx_size,
+            prefer_mode=prefer_mode,
+            kv_min=kv_min,
+            max_slots=max_slots,
+            persist=persist,
+            priority=priority,
         )
+        if persist:
+            try:
+                readback["settings"] = await client.settings(model)
+            except Exception:
+                # Verification is never allowed to turn a successful load into
+                # a failure; an unreadable settings row is reported as "could
+                # not verify" below and nothing else.
+                readback["settings"] = None
+        return result
 
     payload = with_client(work)
     if want_json(json_out):
         emit(payload)
+    else:
+        _print_plan(payload.get("plan") or payload)
+    if persist:
+        _warn_if_not_persisted(model, payload, readback.get("settings"))
+
+
+#: What ``--persist`` writes, as ``settings field -> plan field``. ``ctx_size``
+#: is the one that cannot be compared name-to-name: ``settings.ctx_size`` is
+#: PER SLOT while a plan's ``ctx_size`` may be the total across slots, so the
+#: per-slot number is read from ``ctx_per_slot`` first -- the same correction
+#: the server makes when it writes the row.
+_PERSISTED_FIELDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("ctx_size", ("ctx_per_slot", "ctx_size")),
+    ("kv_cache_type", ("kv_cache_type",)),
+    ("kv_cache_type_v", ("kv_cache_type_v",)),
+    ("parallel", ("parallel",)),
+)
+
+
+def _plan_value(plan: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        value = plan.get(key)
+        if value:
+            return value
+    return None
+
+
+def _same_persisted(saved: Any, launched: Any) -> bool:
+    """Does the saved settings field agree with what the load actually used?"""
+    if saved is None:
+        return False
+    if isinstance(launched, int) and not isinstance(launched, bool):
+        try:
+            return int(saved) == launched
+        except (TypeError, ValueError):
+            return False
+    return str(saved).strip().lower() == str(launched).strip().lower()
+
+
+def _warn_if_not_persisted(model: str, payload: Any, settings: Any) -> None:
+    """Warn when ``--persist`` asked for a write that did not happen.
+
+    ``persist`` is a body field a pre-D48 server has never heard of, and
+    FastAPI drops an unknown field rather than rejecting it -- so that server
+    loads the model, answers 200, and the operator's explicit "freeze this
+    profile" simply evaporates. The current server can also skip the write
+    best-effort *after* the load succeeded (a benchmark that started during a
+    multi-minute load, or the settings validation refusing the resolved row),
+    which is equally invisible from here. So the profile is read back and
+    compared rather than assumed.
+
+    Deliberately does NOT change the exit code: the load -- the thing that was
+    asked for -- succeeded, and only the bookkeeping half is in doubt. The
+    warning goes to stderr, so a ``--json`` caller's stdout stays parseable.
+    """
+    plan = payload.get("plan") if isinstance(payload, dict) else None
+    if not isinstance(plan, dict):
+        plan = payload if isinstance(payload, dict) else None
+    if not isinstance(plan, dict):
         return
-    _print_plan(payload.get("plan") or payload)
+    if not isinstance(settings, dict):
+        _persist_warning(model, ["the model's settings could not be read back"])
+        return
+    differences: list[str] = []
+    for name, keys in _PERSISTED_FIELDS:
+        launched = _plan_value(plan, keys)
+        if launched is None:
+            continue
+        saved = settings.get(name)
+        if not _same_persisted(saved, launched):
+            differences.append(f"{name}: settings say {_short(saved)}, the load used {launched}")
+    if differences:
+        _persist_warning(model, differences)
+
+
+def _persist_warning(model: str, details: Sequence[str]) -> None:
+    STATE.err.print(
+        "warning: the server did not persist the profile -- it may predate "
+        "--persist, or the write was skipped; see the server log, and check "
+        f"'sfctl models settings {model}'"
+    )
+    for line in details:
+        STATE.err.print(f"  - {line}")
 
 
 @models_app.command("repo")
@@ -1013,7 +1157,17 @@ def _coerce_like(current: Any, raw: str) -> Any:
     Typing ``--set ctx_size=8192`` should not save the string ``"8192"``; the
     current value is the most reliable type hint available client-side, and the
     server validates whatever survives.
+
+    A literal ``null``/``none`` CLEARS the field whatever type it holds, and
+    that test has to come BEFORE the type branches. It used to live inside the
+    ``current is None`` branch, which meant clearing only worked on a field
+    that was already empty -- so the documented escape hatch out of a
+    ``load-recommended --persist`` freeze
+    (``--set ctx_size=null``) answered "expected an integer, got 'null'"
+    precisely when there was something to clear.
     """
+    if raw.strip().lower() in ("null", "none"):
+        return None
     if isinstance(current, bool):
         lowered = raw.strip().lower()
         if lowered in ("true", "yes", "on", "1"):
@@ -1037,7 +1191,10 @@ def _coerce_like(current: Any, raw: str) -> Any:
         except json.JSONDecodeError as exc:
             raise CompanionConfigError(f"expected JSON for this key, got {raw!r}") from exc
     if current is None:
-        if raw.lower() in ("null", "none", ""):
+        # An EMPTY value stays where it was: on an already-empty field it is
+        # still "leave it empty", but on a string field it is a legitimate
+        # empty string, which is why it is not hoisted above with null/none.
+        if raw == "":
             return None
         for caster in (int, float):
             try:
@@ -1442,8 +1599,18 @@ def config_get(
 
 
 def _flatten(value: Any, prefix: str = "") -> list[tuple[str, Any]]:
+    """Dotted key/value pairs, one row per leaf -- an EMPTY dict included.
+
+    An empty dict is a leaf, not an absence: ``models.ttl_by_priority`` and
+    ``planner.reserved_mb`` both default to ``{}``, and recursing into them
+    produced no rows at all, so ``sfctl config get`` listed neither and the
+    only way to learn the keys exist was to read the server source. The root
+    is the one dict with no name to print, so an empty config stays empty.
+    """
     out: list[tuple[str, Any]] = []
     if isinstance(value, dict):
+        if not value:
+            return [(prefix, value)] if prefix else []
         for key, item in value.items():
             out.extend(_flatten(item, f"{prefix}.{key}" if prefix else str(key)))
     else:

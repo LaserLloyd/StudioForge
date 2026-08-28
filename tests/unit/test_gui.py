@@ -1603,6 +1603,22 @@ def test_form_round_trip_keeps_concrete_values() -> None:
     assert restored.extra_flags == "--verbose"
 
 
+def test_form_round_trip_keeps_the_fields_the_settings_dialog_gained() -> None:
+    """``prefer_single_gpu`` is the one worth naming: it is a ``bool | None``
+    tri-state, so ``False`` ("never split this model") has to survive the trip
+    as False rather than collapsing into None ("inherit the global") -- the
+    failure mode of listing it among the non-optional bools (D48)."""
+    settings = ModelSettings(priority=2, prefer_single_gpu=False, max_parallel_cap=4)
+    restored = st.settings_from_form(st.form_from_settings(settings))
+    assert restored == settings
+    assert restored.prefer_single_gpu is False
+
+    auto = st.settings_from_form(st.form_from_settings(ModelSettings()))
+    assert auto.priority is None
+    assert auto.prefer_single_gpu is None
+    assert auto.max_parallel_cap is None
+
+
 def test_settings_from_form_treats_blank_text_as_auto() -> None:
     form = st.form_from_settings(ModelSettings(ctx_size=4096, rope_scaling="linear"))
     form["ctx_size"] = ""
@@ -2008,6 +2024,87 @@ def test_has_launch_overrides_ignores_adapters() -> None:
     assert st.has_launch_overrides(with_adapters) is False
     with_ctx = ModelSettings(ctx_size=8192)
     assert st.has_launch_overrides(with_ctx) is True
+
+
+def test_a_load_tier_is_not_a_launch_override_and_does_not_split_the_instance() -> None:
+    """``priority`` never reaches llama-server's argv, so it cannot be a reason
+    to spawn a second child. Left in the comparison, giving a persona a
+    standing tier would silently cost a second full copy of the base weights in
+    VRAM -- and this panel is where the operator reads that cost (D48).
+
+    The manager's ``serving_record`` carries the same exclusion; the two
+    disagreeing is the failure mode.
+    """
+    assert st.has_launch_overrides(ModelSettings(priority=1)) is False
+
+    tiered = make_record(
+        "persona",
+        virtual=True,
+        base_model_id="base",
+        preset=VirtualPreset(temperature=0.4),
+        settings=ModelSettings(priority=1),
+    )
+    assert st.shares_base_instance(tiered) is True
+
+    # A real launch-time delta beside the tier still splits it off.
+    also_ctx = make_record(
+        "persona-ctx",
+        virtual=True,
+        base_model_id="base",
+        settings=ModelSettings(priority=1, ctx_size=8192),
+    )
+    assert st.shares_base_instance(also_ctx) is False
+
+
+def test_the_priority_select_is_locked_exactly_when_the_persona_shares() -> None:
+    """The registry refuses a standing tier on a preset-only persona, so the
+    settings dialog must not offer the write: an enabled control whose Save
+    always fails is worse than a disabled one that says why.
+
+    The note names the base, because "set it there" is useless without it.
+    """
+    persona = make_record(
+        "persona", virtual=True, base_model_id="base-30b", preset=VirtualPreset(temperature=0.4)
+    )
+    note = st.priority_lock_note(persona)
+    assert note is not None
+    assert "base-30b" in note
+    assert "shares" in note
+
+    # A persona with a launch override gets its own child, and keeps the select.
+    with_override = make_record(
+        "persona-ctx", virtual=True, base_model_id="base-30b", settings=ModelSettings(ctx_size=8192)
+    )
+    assert st.priority_lock_note(with_override) is None
+    with_adapter = make_record(
+        "persona-lora",
+        virtual=True,
+        base_model_id="base-30b",
+        settings=ModelSettings(adapters=[AdapterAttachment(adapter_id="a", scale=1.0)]),
+    )
+    assert st.priority_lock_note(with_adapter) is None
+    # ...and a real model always keeps it.
+    assert st.priority_lock_note(make_record("real")) is None
+
+    # One rule, not two: the lock is the sharing rule, inverted.
+    for record in (persona, with_override, with_adapter, make_record("real")):
+        assert (st.priority_lock_note(record) is not None) == st.shares_base_instance(record)
+
+
+def test_the_settings_dialog_disables_the_locked_priority_select() -> None:
+    """Static guard on the wiring: the helper exists to be *used* here.
+
+    The disable is read once at open -- editing a context override in the same
+    dialog can stop the record sharing without re-enabling the select -- which
+    is why the registry's refusal stays the backstop.
+    """
+    import inspect
+
+    from studioforge.gui.tabs import models as models_tab
+
+    source = inspect.getsource(models_tab._settings_dialog)
+    assert "priority_lock_note(record)" in source
+    assert "priority.disable()" in source
 
 
 def test_virtual_instance_note_names_the_vram_cost() -> None:
@@ -2998,6 +3095,23 @@ def test_chat_tab_does_not_default_samplers_with_boolean_or() -> None:
     assert "number_value(temperature.value" in source
     assert "number_value(top_p.value" in source
     assert "number_value(max_tokens.value" in source
+
+
+def test_the_gui_chat_tab_loads_at_the_chat_tier() -> None:
+    """A person typing in this tab is D46's tier 1 by definition.
+
+    Claiming no tier left the product's own chat as background work, so an
+    agent's tier-2 load could 503 the human sitting in front of the server.
+    The literal 1 (this package imports nothing from ``core``) is pinned to the
+    core constant here.
+    """
+    import inspect
+
+    from studioforge.core.priority import PRIORITY_CHAT
+    from studioforge.gui.tabs import chat
+
+    source = inspect.getsource(chat)
+    assert f"ensure_loaded(model_id, priority={PRIORITY_CHAT})" in source
 
 
 # ---------------------------------------------------------------------------

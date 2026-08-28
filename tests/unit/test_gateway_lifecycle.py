@@ -355,6 +355,109 @@ def test_ttl_for_matrix(pinned: bool, ttl_s: int | None, default: int, expected:
     assert manager.ttl_for(record) == expected
 
 
+@pytest.mark.parametrize(
+    ("pinned", "ttl_s", "tier", "expected"),
+    [
+        # A pin still wins outright, and a per-model ttl_s still beats the map:
+        # the tier map is a default for models that state no opinion.
+        (True, None, 1, 0),
+        (True, 900, 1, 0),
+        (False, 900, 1, 900),
+        # Only then is the tier priced...
+        (False, None, 1, 3600),
+        (False, None, 2, 1800),
+        # ...and a tier the map does not mention falls through to the default.
+        (False, None, 3, 60),
+    ],
+)
+def test_ttl_by_priority_sits_between_the_per_model_ttl_and_the_default(
+    pinned: bool, ttl_s: int | None, tier: int, expected: int
+) -> None:
+    """D48's four steps, in order: pin, ``settings.ttl_s``, the tier map, the
+    global default. Getting the order wrong would let a per-tier default quietly
+    overrule a number an operator typed for one model."""
+    record = make_record(pinned=pinned, ttl_s=ttl_s)
+    manager, _ = make_manager([record], default_ttl_s=60, ttl_by_priority={1: 3600, 2: 1800})
+    assert manager.ttl_for(record, priority=tier) == expected
+
+
+@pytest.mark.parametrize("tier", [1, 2, 3])
+def test_an_empty_ttl_by_priority_answers_exactly_as_it_did_before(tier: int) -> None:
+    """The shipped default is empty precisely so an upgrade changes nothing:
+    a populated default would have silently dropped background residency on a
+    live rig the first time the server restarted."""
+    record = make_record()
+    manager, _ = make_manager([record], default_ttl_s=1800)
+    assert manager.config.models.ttl_by_priority == {}
+    assert manager.ttl_for(record, priority=tier) == 1800
+    assert manager.ttl_for(record) == 1800
+
+
+def test_a_tier_ttl_of_zero_keeps_that_tier_resident() -> None:
+    """0 is the wire form of "never idle-unload" everywhere else, and the map
+    spells it the same way -- so "the chat model stays" is sayable without
+    pinning every chat model by hand."""
+    record = make_record()
+    manager, _ = make_manager([record], default_ttl_s=1800, ttl_by_priority={1: 0})
+    assert manager.ttl_for(record, priority=1) == 0
+    assert manager.ttl_for(record, priority=3) == 1800
+
+
+def test_an_omitted_priority_prices_the_models_own_tier() -> None:
+    """The five pre-D48 call sites pass nothing, so the fallback walk has to
+    give an unloaded model a coherent ``effective_ttl_s`` too -- that number is
+    what /api/models reports for a model nobody has loaded yet."""
+    record = make_record()
+    manager, supervisor = make_manager([record], default_ttl_s=60, ttl_by_priority={1: 3600})
+
+    assert manager.ttl_for(record) == 60, "background until something says otherwise"
+
+    record.settings = ModelSettings(priority=1)
+    assert manager.ttl_for(record) == 3600, "the standing setting, with nothing loaded"
+
+    instance = loaded(record.id, None)
+    instance.priority = 3
+    supervisor.instances[record.id] = instance
+    assert manager.ttl_for(record) == 60, "a live child is the truth about the tier"
+
+
+async def test_re_tiering_a_ready_instance_restamps_its_effective_ttl() -> None:
+    """``models.ttl_by_priority`` prices the countdown by tier, so a promotion
+    that left the old countdown standing would reap the chat model on the
+    background clock. This deliberately discards any per-request ttl override:
+    a re-tier is a statement about what the model *is*."""
+    record = make_record()
+    manager, supervisor = make_manager(
+        [record], default_ttl_s=900, ttl_by_priority={1: 3600, 3: 900}
+    )
+    instance = loaded(record.id, 60)  # a request-level ttl override standing
+    supervisor.instances[record.id] = instance
+
+    promoted = await manager.load(record.id, priority=1)
+
+    assert promoted is instance
+    assert instance.priority == 1
+    assert instance.ttl_s == 3600
+
+
+async def test_a_re_tier_leaves_a_ttl_override_alone_when_no_tier_map_is_set() -> None:
+    """The restamp exists to price the tier from ``models.ttl_by_priority``.
+    With the map empty -- the shipped default -- it cannot change the answer,
+    so firing it anyway only threw away a per-request ttl override for nothing.
+    The tier itself still lands on the instance."""
+    record = make_record()
+    manager, supervisor = make_manager([record], default_ttl_s=900)
+    assert manager.config.models.ttl_by_priority == {}
+    instance = loaded(record.id, 60)  # a request-level ttl override standing
+    supervisor.instances[record.id] = instance
+
+    promoted = await manager.load(record.id, priority=1)
+
+    assert promoted is instance
+    assert instance.priority == 1
+    assert instance.ttl_s == 60, "nothing to reprice, so the override survives"
+
+
 # ---------------------------------------------------------------------------
 # set_pinned: the one implementation every surface shares
 # ---------------------------------------------------------------------------
@@ -1020,6 +1123,35 @@ def test_request_ttl_of_zero_is_no_override_and_cannot_pin() -> None:
     # override still lands (the D41 guard is not tripped).
     openai_routes._apply_ttl_override(state, instance.model_id, 60)
     assert instance.ttl_s == 60
+
+
+# ---------------------------------------------------------------------------
+# A request-level priority is consumed here, never forwarded (D48)
+# ---------------------------------------------------------------------------
+
+
+def test_a_request_priority_is_taken_out_of_the_upstream_payload() -> None:
+    """llama-server does not know the field: forwarding it is an
+    unknown-parameter error on some builds and silently ignored on others."""
+    assert openai_routes._pop_priority({}) is None
+    payload: dict[str, Any] = {"priority": 2, "messages": []}
+    assert openai_routes._pop_priority(payload) == 2
+    assert "priority" not in payload
+    # An explicit JSON null is "no opinion", not junk -- a client that always
+    # sends the key must not have to omit it to mean nothing.
+    assert openai_routes._pop_priority({"priority": None}) is None
+
+
+@pytest.mark.parametrize("bad", [0, 4, -1, "1", 1.5, True, False])
+def test_a_junk_request_priority_is_a_400_rather_than_ignored(bad: Any) -> None:
+    """The deliberate asymmetry with ``ttl``: a mistyped TTL costs a wrong idle
+    timer, a mistyped tier silently demotes a chat turn to background and it
+    starts meeting 503s nothing can attribute back to the typo."""
+    from studioforge.errors import BadRequestError
+
+    with pytest.raises(BadRequestError) as excinfo:
+        openai_routes._pop_priority({"priority": bad})
+    assert excinfo.value.param == "priority"
 
 
 # ---------------------------------------------------------------------------

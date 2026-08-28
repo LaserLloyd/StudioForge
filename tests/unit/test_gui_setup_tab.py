@@ -270,10 +270,14 @@ def test_field_specs_cover_every_scalar_key_of_every_section() -> None:
             key = f"{section_name}.{info.alias or name}"
             if key not in generated:
                 missing.append(key)
-    # Both are mappings keyed by CUDA index / quant family: they get row
-    # widgets on the GPU card, not a text box, and rendering them as one would
-    # silently destroy the other entries.
-    assert sorted(missing) == ["planner.quant_affinity", "planner.reserved_mb"]
+    # All three are mappings -- keyed by CUDA index, quant family and load
+    # tier. They get row widgets of their own, not a text box, and rendering
+    # one as a text box would silently destroy the other entries.
+    assert sorted(missing) == [
+        "models.ttl_by_priority",
+        "planner.quant_affinity",
+        "planner.reserved_mb",
+    ]
     assert set(missing) <= st.CUSTOM_WIDGET_KEYS
 
 
@@ -353,10 +357,30 @@ def test_consequential_keys_have_hand_written_help() -> None:
 
 
 def test_every_help_entry_names_a_real_config_key() -> None:
-    """A renamed field must not leave a stale sentence behind."""
-    known = {spec.key for spec in st.config_field_specs()}
+    """A renamed field must not leave a stale sentence behind.
+
+    Read off the config model rather than the generated specs: a dict-typed key
+    (``models.ttl_by_priority``, ``planner.reserved_mb``) has a hand-built
+    widget and therefore no spec, but it is still a real key whose help must go
+    stale with it if it is ever renamed.
+    """
+    from pydantic import BaseModel
+
+    known: set[str] = set()
+    for section_name, section_field in Config.model_fields.items():
+        annotation = section_field.annotation
+        if not (isinstance(annotation, type) and issubclass(annotation, BaseModel)):
+            continue
+        for name, info in annotation.model_fields.items():
+            known.add(f"{section_name}.{info.alias or name}")
+
     stale = set(st.CONFIG_FIELD_HELP) - known
     assert not stale, stale
+    # ...and the generated specs are still the bulk of it: only the custom
+    # widgets are allowed to be absent from them.
+    assert set(st.CONFIG_FIELD_HELP) - {spec.key for spec in st.config_field_specs()} <= (
+        st.CUSTOM_WIDGET_KEYS
+    )
 
 
 def test_advanced_excludes_covered_keys_secrets_and_mappings() -> None:
@@ -659,6 +683,89 @@ def test_excluded_and_reserved_are_built_from_the_per_gpu_widgets() -> None:
     assert st.parse_reserved_mb("not a number") == 0
     assert st.parse_reserved_mb(-5) == 0
     assert st.parse_reserved_mb("2048.0") == 2048
+
+
+def test_the_per_tier_ttl_rows_keep_zero_and_drop_an_empty_box() -> None:
+    """The mirror image of ``reserved_mb_map``, and the difference matters: 0
+    is already how ``default_ttl_s`` spells "never idle-unload", so here it is
+    a real answer and only an empty box means "fall through to the default"
+    (D48)."""
+    assert st.ttl_by_priority_map({1: 3600, 2: "1800", 3: 0}) == {1: 3600, 2: 1800, 3: 0}
+    assert st.ttl_by_priority_map({1: "", 2: None, 3: 900}) == {3: 900}
+    assert st.ttl_by_priority_map({1: "   ", 2: None}) == {}
+    assert st.ttl_by_priority_map({}) == {}
+
+
+def test_a_bad_ttl_box_refuses_the_whole_mapping_instead_of_dropping_a_tier() -> None:
+    """The save writes the *whole* mapping, so a dropped box is a deleted timer.
+
+    Silently skipping the bad box used to mean typing '-5' into tier 1 deleted
+    tier 1's saved timer and the save reported success. Refusing here is what
+    keeps the other two tiers' policies alive.
+    """
+    with pytest.raises(ValueError) as bad:
+        st.ttl_by_priority_map({1: -5, 2: 1800})
+    message = str(bad.value)
+    assert "tier 1 — chat" in message
+    assert "'-5'" in message
+    assert "not a valid idle TTL" in message
+
+    # NiceGUI hands a number widget back as a float, so quoting the raw value
+    # would name a '-5.0' nobody typed.
+    with pytest.raises(ValueError) as as_float:
+        st.ttl_by_priority_map({1: -5.0})
+    assert "'-5'" in str(as_float.value)
+
+    # Every bad box is named, not just the first one found.
+    with pytest.raises(ValueError) as two_bad:
+        st.ttl_by_priority_map({1: -5, 2: "soon"})
+    both = str(two_bad.value)
+    assert "tier 1 — chat" in both
+    assert "tier 2 — agent" in both
+    assert "'soon'" in both
+
+
+def test_the_setup_tab_refuses_the_save_and_keeps_the_note_live() -> None:
+    """Static guard on the two halves of the TTL fix.
+
+    The pure helper can only raise; whether the tab *catches* it (rather than
+    500-ing the click handler) and whether the summary line under the boxes
+    still describes what is in them are wiring, and this is where they break.
+    """
+    import inspect
+
+    from studioforge.gui.tabs import setup as setup_tab
+
+    source = inspect.getsource(setup_tab)
+    assert "except ValueError as exc:" in source
+    assert 'notify_error(exc, what="idle unload per load priority")' in source
+    # The note is recomputed from the widgets, not frozen at render time.
+    assert "widget.on_value_change(lambda _: refresh_note())" in source
+
+
+def test_the_per_tier_ttl_note_says_which_tiers_fall_back() -> None:
+    empty = st.ttl_by_priority_note({}, default_ttl_s=1800)
+    assert "No per-tier timers" in empty
+
+    partial = st.ttl_by_priority_note({1: 0}, default_ttl_s=1800)
+    assert "chat" in partial and "never" in partial
+    assert "agent" in partial and "background" in partial
+    assert "falls back to the default" in partial
+
+
+def test_the_gui_tier_vocabulary_matches_the_core_one() -> None:
+    """``gui/state.py`` is pure presentation and imports nothing from core, so
+    the 1/2/3 vocabulary is a hand-kept copy. This is what keeps the copy
+    honest if a tier is ever added or renamed."""
+    from studioforge.core.priority import PRIORITY_LEVELS
+
+    assert set(st.PRIORITY_LABELS) == set(PRIORITY_LEVELS)
+    # Background is the default every untiered load lands on, so a chip for it
+    # would appear on every row and say nothing.
+    assert st.priority_badge_label(1) == "chat"
+    assert st.priority_badge_label(2) == "agent"
+    assert st.priority_badge_label(3) is None
+    assert st.priority_label(3) == "background"
 
 
 def test_the_device_policy_note_describes_both_knobs() -> None:

@@ -54,6 +54,16 @@ log = get_logger(__name__)
 #: automatically counts as a launch-time delta until proven request-time.
 _DEFAULT_SETTINGS = ModelSettings()
 
+#: ModelSettings fields proven NOT to be launch-time deltas: they never reach
+#: the child's argv, so a virtual model that sets one of them still shares its
+#: base's instance (D13). Normalised out of BOTH sides of the comparison in
+#: :meth:`ModelManager.serving_record`; gui/state.py's two sibling comparisons
+#: (``has_launch_overrides``, ``shares_base_instance``) carry the same list.
+#: ``priority`` joined it in D48: a tier is a scheduling opinion, and a tiered
+#: persona that split off its own llama-server would double the VRAM the
+#: preset sharing exists to save.
+_NON_LAUNCH_SETTINGS: dict[str, Any] = {"priority": None}
+
 #: Substrings in a failed launch's stderr tail that mean "the machine was out
 #: of memory *at that moment*". Taken from the real messages llama.cpp/CUDA
 #: emit, not invented: a model swap that overlaps the previous model's teardown
@@ -371,8 +381,12 @@ class ModelManager:
         self._rebalance_seen: dict[str, tuple[Any, float]] = {}
         #: model id -> the tier its last explicit load asked for (D46), so a
         #: JIT reload of the chat model keeps being the chat model. In-memory
-        #: on purpose: tiers describe what the clients are doing right now,
-        #: and a restart is a clean slate the next explicit load repopulates.
+        #: on purpose: tiers describe what the clients are doing right now, so
+        #: this memo sits ABOVE the persisted ``settings.priority`` floor and
+        #: below an explicit request tier. A restart clears it and the model
+        #: falls back to its setting rather than to a clean slate -- D48
+        #: revising D46, whose "a restart is the demotion path" left a chat
+        #: model silently background until something explicitly re-tiered it.
         self._model_priority: dict[str, int] = {}
         #: model id -> tier, for chat/agent loads currently in flight (gate
         #: wait included). While any hold stands, new inference and new loads
@@ -513,11 +527,15 @@ class ModelManager:
         keeps ten personas over one 30B base from costing ten loads. Any
         launch-time delta -- adapters, a ctx/kv override, anything at all in
         :class:`ModelSettings` -- means a different child argv, so the virtual
-        model keeps its own dedicated instance exactly as before.
+        model keeps its own dedicated instance exactly as before. The
+        exceptions are the fields listed in ``_NON_LAUNCH_SETTINGS``, which are
+        normalised out of both sides first.
         """
         if not record.is_virtual or record.base_model_id is None:
             return record
-        if record.settings != _DEFAULT_SETTINGS:
+        if record.settings.model_copy(update=_NON_LAUNCH_SETTINGS) != _DEFAULT_SETTINGS.model_copy(
+            update=_NON_LAUNCH_SETTINGS
+        ):
             return record
         base = self.registry.get(record.base_model_id)
         return base if base is not None else record
@@ -560,25 +578,52 @@ class ModelManager:
         if lock is not None and not lock.locked():
             self._locks.pop(model_id, None)
 
-    def _effective_priority(self, model_id: str) -> int:
-        """The tier a model is serving (or would load) at (D46).
+    def _settings_priority(self, model_id: str) -> int:
+        """The standing tier persisted in a model's settings, else background.
 
-        A running instance carries the truth; an unloaded model falls back to
-        the tier its last explicit load asked for, so the chat model stays the
-        chat model across a TTL unload and its JIT reload; a model nobody ever
-        tiered is background.
+        The bottom of the D48 ladder, and the reason a tier now outlives a
+        restart. Deliberately forgiving about the id: it is reached from
+        admission checks and TTL arithmetic, which run on serving ids that may
+        no longer be in the registry (a model deleted while a memo or an
+        instance outlived it), and "unknown" must answer background rather
+        than raise inside a request path.
+        """
+        record = self.registry.resolve(model_id)
+        if record is None:
+            return PRIORITY_BACKGROUND
+        tier = record.settings.priority
+        return PRIORITY_BACKGROUND if tier is None else int(tier)
+
+    def _effective_priority(self, model_id: str) -> int:
+        """The tier a model is serving (or would load) at (D46, D48).
+
+        A running instance carries the truth; then the memo of the tier its
+        last explicit load asked for, so the chat model stays the chat model
+        across a TTL unload and its JIT reload; then the standing
+        ``settings.priority``, which is what a restart falls back to; a model
+        nobody ever tiered is background.
         """
         instance = self.supervisor.get(model_id)
         if instance is not None:
             return instance.priority
-        return self._model_priority.get(model_id, PRIORITY_BACKGROUND)
+        memo = self._model_priority.get(model_id)
+        if memo is not None:
+            return memo
+        return self._settings_priority(model_id)
 
     def _resolve_tier(self, model_id: str, priority: int | None) -> int:
-        """The tier this load runs at: the validated explicit ask, else memory."""
+        """The tier this load runs at: explicit ask, memo, setting, background.
+
+        The same ladder :meth:`_effective_priority` walks, minus the running
+        instance -- a load is about to replace it (D48).
+        """
         tier = normalise_priority(priority)
-        if tier is None:
-            return self._model_priority.get(model_id, PRIORITY_BACKGROUND)
-        return tier
+        if tier is not None:
+            return tier
+        memo = self._model_priority.get(model_id)
+        if memo is not None:
+            return memo
+        return self._settings_priority(model_id)
 
     def _current_hold(self) -> tuple[str, int] | None:
         """The winning hold -- best tier, model id as the tiebreak -- or None.
@@ -592,15 +637,25 @@ class ModelManager:
         holder = min(holds, key=lambda mid: (holds[mid], mid))
         return holder, holds[holder]
 
-    def admission_check(self, model_id: str) -> None:
+    def admission_check(self, model_id: str, *, priority: int | None = None) -> None:
         """Raise the D46 hold refusal this model's traffic would get right now.
 
         For the API layer: the streaming endpoints call this *before* the 200
         and the SSE stream begin, so a held request is a real HTTP 503 with
         ``Retry-After`` instead of an in-band error frame most clients treat
         as fatal. ``ensure_loaded`` runs the same check as the backstop.
+
+        ``priority`` is the tier the *request* claimed (D48's per-request
+        tier): it gates this request's own admission, so a tier-1 turn is let
+        through a hold that a background turn for the same model would meet.
+        Omitted -- every pre-D48 caller -- the model's effective tier decides,
+        exactly as before. An invalid value is a 400 naming the parameter.
         """
-        self._refuse_if_held(model_id, priority=self._effective_priority(model_id))
+        tier = normalise_priority(priority)
+        self._refuse_if_held(
+            model_id,
+            priority=tier if tier is not None else self._effective_priority(model_id),
+        )
 
     def _refuse_if_held(self, model_id: str, *, priority: int) -> None:
         """503 anything a standing chat/agent load outranks (D46).
@@ -623,6 +678,11 @@ class ModelManager:
             f"a priority {hold_p} model ('{holder}') is loading; requests and "
             f"loads for lower-priority models are held off until it is serving "
             f"so it gets the cards and the bandwidth. Retry shortly.",
+            # A distinct code beside the class's own (the ``benchmark_busy``
+            # precedent): every other ModelBusyError means "wait for a
+            # request to finish", this one means "wait for a load", and a
+            # client that wants to tell them apart had only prose to match on.
+            code="priority_hold",
             details={
                 "busy": self.busy_snapshot(),
                 "retry_after_s": BUSY_RETRY_AFTER_S,
@@ -631,7 +691,7 @@ class ModelManager:
         )
 
     async def ensure_loaded(
-        self, name: str, *, source: str = "jit"
+        self, name: str, *, source: str = "jit", priority: int | None = None
     ) -> tuple[ModelRecord, InstanceInfo]:
         """Resolve a model name and make sure it is serving, loading if needed.
 
@@ -645,19 +705,38 @@ class ModelManager:
         keeps its identity); the returned instance may belong to its base --
         use ``instance.model_id`` for anything that talks to the supervisor.
 
-        A JIT load inherits the tier of the model's last explicit load (D46),
-        so the chat model reloading mid-conversation gets the chat tier's
-        rights; and while a better-tier load is in flight, requests for
-        worse-tier models are refused here with a 503 + Retry-After rather
-        than served -- they must drain, not compete.
+        A JIT load inherits the tier of the model's last explicit load (D46)
+        or its standing ``settings.priority`` (D48), so the chat model
+        reloading mid-conversation gets the chat tier's rights; and while a
+        better-tier load is in flight, requests for worse-tier models are
+        refused here with a 503 + Retry-After rather than served -- they must
+        drain, not compete.
+
+        Args:
+            name: model id or alias.
+            source: who asked, stamped on the instance and the log lines.
+            priority: the tier the *request* claimed (D48). It gates this
+                request's own admission verbatim -- a tier-1 turn is let
+                through a hold a background turn would meet -- and it tiers the
+                load this request triggers, but only *upwards*: the cold load
+                runs at the BETTER of this tier and the model's standing one,
+                so ``priority: 3`` on the chat model cannot park it at
+                background for its whole residency. Omitted, the model's
+                effective tier decides, which is every pre-D48 caller's
+                behaviour. It deliberately does NOT re-tier the model: it is
+                never written to the tier memo, and a model already serving is
+                returned untouched -- one request may not restamp what
+                everyone else's traffic runs at (only an explicit
+                ``load``/``load_recommended`` does that).
         """
         await self._await_boot()
         record = self.registry.resolve(name)
         if record is None:
             raise ModelNotFoundError(name, known=self.registry.known_ids())
         serving = self.serving_record(record)
-        priority = self._effective_priority(serving.id)
-        self._refuse_if_held(serving.id, priority=priority)
+        requested = normalise_priority(priority)
+        tier = requested if requested is not None else self._effective_priority(serving.id)
+        self._refuse_if_held(serving.id, priority=tier)
 
         instance = self.supervisor.get(serving.id)
         if instance is not None and instance.state == "ready":
@@ -673,15 +752,23 @@ class ModelManager:
                 if instance is not None and instance.state == "ready":
                     self.registry.touch(record.id)
                     return record, instance
-                # Re-resolve the tier under the lock: an explicit load that
-                # tiered this model while we queued must not be undone by a
-                # JIT reload cold-loading it at the stale background tier.
-                priority = self._effective_priority(serving.id)
+                # Re-resolved under the lock: an explicit load that tiered this
+                # model while we queued must not be undone by a JIT reload
+                # cold-loading it at the stale background tier.
+                standing = self._effective_priority(serving.id)
+                # The LOAD's tier is the better of the two, never the request's
+                # verbatim: a request may claim urgency for itself (that is
+                # what ``requested`` gates admission with, above), but it may
+                # not demote the model below what an explicit load or the saved
+                # setting established (D48). Otherwise one background-tagged
+                # turn cold-loads the chat model at tier 3 and it stays there
+                # for its whole residency, with no path back.
+                load_tier = standing if requested is None else min(requested, standing)
                 instance = await self._load_locked(
                     serving,
                     source=source,
-                    priority=priority,
-                    hold=priority < PRIORITY_BACKGROUND,
+                    priority=load_tier,
+                    hold=load_tier < PRIORITY_BACKGROUND,
                 )
                 self.registry.touch(record.id)
                 return record, instance
@@ -709,6 +796,7 @@ class ModelManager:
         require_resident: bool = False,
         priority: int | None = None,
         hold_traffic: bool = True,
+        enforce_parallel_cap: bool = True,
     ) -> InstanceInfo:
         """Explicit load (GUI/CLI/MCP). ``force`` reloads an already-running model.
 
@@ -752,6 +840,19 @@ class ModelManager:
         gate opens (a TTL unload, a crash), nothing is loaded -- a move must
         never resurrect a model nobody asked for.
 
+        ``parallel`` above the model's ``settings.max_parallel_cap`` is a 400
+        naming both numbers (D48), not a clamp: D14's "an explicit value is
+        honoured verbatim" and a stated per-model ceiling cannot both be
+        satisfied, so the conflict is refused loudly rather than resolved
+        silently in either direction. ``enforce_parallel_cap=False`` skips that
+        refusal, and is for the internal callers that **replay a shape this
+        server already launched** -- the priority restore, the rebalancer, the
+        parallel benchmark's teardown -- rather than a user stating a count.
+        Those three reproduce an existing instance's ``plan.parallel``, so a
+        cap lowered under a running model would otherwise turn every one of
+        them into a failure to put back what was there: the same tolerance the
+        legacy settings-row hole already grants a plain JIT load.
+
         ``priority`` is the load's tier (D46): 1 the active chat model, 2 a
         dispatched agent, 3 (or ``None``) background. An explicit tier is
         remembered per model, so the next load of the same model -- a JIT
@@ -783,6 +884,31 @@ class ModelManager:
                     )
                 }
             )
+        # A stated ``max_parallel_cap`` is a hard ceiling since D48, not just
+        # the estimator's bound: a request naming more slots is refused rather
+        # than clamped, because D14 promises an explicit value is honoured
+        # verbatim and honouring-a-smaller-number is the one thing that must
+        # not happen quietly. Only the REQUEST argument is checked -- a legacy
+        # settings row whose own ``parallel`` sits above a cap added later must
+        # not brick this model's JIT loads (that hole is documented in D48;
+        # the settings save path refuses new ones) -- and neither must a
+        # server-side replay of a shape already running, which is what
+        # ``enforce_parallel_cap=False`` is for.
+        cap = record.settings.max_parallel_cap
+        if (
+            enforce_parallel_cap
+            and parallel is not None
+            and cap is not None
+            and int(parallel) > int(cap)
+        ):
+            raise BadRequestError(
+                f"'{record.id}' caps its slot count at {int(cap)} "
+                f"(settings.max_parallel_cap) and this load asked for {int(parallel)}. "
+                f"Ask for {int(cap)} slots or fewer, or raise the cap in the model's "
+                f"settings -- an explicit parallel is never silently clamped.",
+                param="parallel",
+                details={"max_parallel_cap": int(cap), "requested": int(parallel)},
+            )
         tier = self._resolve_tier(record.id, priority)
         if hold_traffic:
             self._refuse_if_held(record.id, priority=tier)
@@ -802,11 +928,7 @@ class ModelManager:
                 if existing is not None and existing.state == "ready":
                     if not force:
                         if normalise_priority(priority) is not None:
-                            # Re-tiering a running model must reach the live
-                            # instance -- the planner's candidacy and
-                            # _effective_priority read it there, and a memo
-                            # the instance contradicts is a silent no-op.
-                            existing.priority = tier
+                            self._retier_resident(record, existing, tier)
                         return existing
                     reload_of = record.id
                 return await self._load_locked(
@@ -849,6 +971,8 @@ class ModelManager:
         *,
         prefer_modes: Sequence[str] | None = None,
         kv_min: str | None = None,
+        max_slots: int | None = None,
+        persist: bool = False,
         source: str = "api",
         priority: int | None = None,
     ) -> InstanceInfo:
@@ -887,6 +1011,31 @@ class ModelManager:
             kv_min: the lowest KV cache quality to accept -- ``"f16"`` means "do
                 not quantize the cache to reach this window at all". Omitted,
                 the full quality-first ladder is available.
+            max_slots: ceiling on the slot count this call may choose. The
+                estimator's answer is what a placement *could* sustain; a
+                caller that knows it has three bots wanting one window each
+                does not want the other five slots' KV cache priced in. Must
+                be >= 1. Omitted, the estimator's own number stands. It caps
+                the count the descent loop then verifies, so the winning plan
+                really is planned at the capped slots rather than planned
+                larger and launched smaller.
+            persist: write the *resolved* profile -- context per slot, both KV
+                cache types and the slot count -- into the model's saved
+                settings once the load succeeds, so the next plain load (a JIT
+                reload included) reproduces it. ``settings.priority`` is
+                written only when this call named a ``priority`` of its own:
+                the resolved tier can come from the in-memory memo (what some
+                other client is doing right now) or be a materialised
+                background default, and neither is a standing decision this
+                caller made. Omitted, whatever tier the row already had is
+                left alone. The trade: it freezes
+                the KV ladder and the slot estimator for this model, which
+                then stop responding to a changed machine; clear the fields
+                (``PATCH /api/models/{id}/settings`` with nulls) to hand the
+                decision back. Devices are deliberately not persisted -- a
+                placement is a one-shot load argument (D36). Refused for a
+                preset-only virtual model (it would rewrite the base and every
+                persona) and while the model is being benchmarked.
             source: who asked, stamped on the instance and the log lines (D36).
             priority: the load's tier (D46): 1 the active chat model, 2 a
                 dispatched agent, 3 (or omitted) background. A tier-1/2 load
@@ -899,14 +1048,26 @@ class ModelManager:
         from studioforge.core import placements as placements_mod
 
         validate_load_args(ctx_size=ctx_size, parallel=None, kv_cache_type=None)
+        if max_slots is not None and int(max_slots) < 1:
+            raise BadRequestError(
+                f"max_slots must be at least 1 slot (got {max_slots}); omit it to let "
+                f"the server size the slot count itself",
+                param="max_slots",
+            )
         await self._await_boot()
-        record = self.registry.resolve(name)
-        if record is None:
+        requested = self.registry.resolve(name)
+        if requested is None:
             raise ModelNotFoundError(name, known=self.registry.known_ids())
-        record = self.serving_record(record)
+        record = self.serving_record(requested)
+        if persist:
+            # Checked before the load rather than after it: this walk can take
+            # minutes, and a refusal the caller could have had immediately is
+            # worse the later it arrives.
+            self._refuse_unpersistable(requested, record)
+        asked_tier = normalise_priority(priority)
         tier = self._resolve_tier(record.id, priority)
         self._refuse_if_held(record.id, priority=tier)
-        if normalise_priority(priority) is not None:
+        if asked_tier is not None:
             # Same rule as load(): an explicit tier is remembered, but only
             # past the admission gate (D46).
             self._model_priority[record.id] = tier
@@ -966,6 +1127,12 @@ class ModelManager:
                     or _kv_rank(plan_now.kv_cache_type, plan_now.kv_cache_type_v)
                     <= _kv_rank(kv_min, kv_min)
                 )
+                # ...and within the slot ceiling this call named. Without this,
+                # a caller capping at two slots was handed back an eight-slot
+                # resident -- and, with persist, stored eight as the model's
+                # own profile. An over-cap resident falls through to a real
+                # reload, which is what max_slots asked for.
+                and (max_slots is None or int(plan_now.parallel) <= int(max_slots))
             ):
                 # Already exactly that. Reloading would cost a cold start and
                 # a window of "loading" for every client, to arrive where we are.
@@ -976,6 +1143,19 @@ class ModelManager:
                     devices=plan_now.devices,
                     source=source,
                 )
+                if asked_tier is not None:
+                    # The same re-tier load() does on its ready instance, and
+                    # for the same reason -- so the two explicit load routes
+                    # agree, and so the refresh_ttl inside the persist below
+                    # prices the tier this call just asked for rather than the
+                    # stale one still stamped on the child.
+                    self._retier_resident(record, resident, tier)
+                if persist:
+                    # The caller asked for this profile to become the model's
+                    # own; that it was already resident at it is not a reason
+                    # to skip the write, or "load-recommended --persist" would
+                    # be a no-op precisely when it is run twice.
+                    self._persist_load_profile(record, resident, asked_tier)
                 return resident
 
         probe: Any = self.planner.probe
@@ -1016,6 +1196,7 @@ class ModelManager:
                         catalog_mod=catalog_mod,
                         placements_mod=placements_mod,
                         priority=tier,
+                        max_slots=max_slots,
                     )
                     for mode in modes
                 ]
@@ -1037,7 +1218,7 @@ class ModelManager:
                 # resident at another context); evict_busy=False keeps D36's
                 # rule -- a model that is serving is never a candidate, and
                 # this path has no override for that by design.
-                return await self.load(
+                instance = await self.load(
                     record.id,
                     ctx_size=int(ctx_size),
                     kv_cache_type=winner["kv_cache_type"],
@@ -1049,6 +1230,13 @@ class ModelManager:
                     evict_busy=False,
                     priority=tier,
                 )
+                if persist:
+                    # After the load, not before: what gets written is what
+                    # actually launched (instance.plan), never what the walk
+                    # hoped for -- the two differ whenever the planner had to
+                    # step down on the way in.
+                    self._persist_load_profile(record, instance, asked_tier)
+                return instance
 
             raise self._recommendation_refused(record, int(ctx_size), attempts, trained=trained)
         finally:
@@ -1098,6 +1286,7 @@ class ModelManager:
         catalog_mod: Any,
         placements_mod: Any,
         priority: int = PRIORITY_BACKGROUND,
+        max_slots: int | None = None,
     ) -> dict[str, Any]:
         """Can this mode hold ``ctx_size`` per slot, and if not, what is in the way?
 
@@ -1107,6 +1296,9 @@ class ModelManager:
         Re-checked rather than assumed: the slot count comes from a capacity
         figure, and a placement that fits at one slot and not at four must come
         back as four-does-not-fit rather than as a load that fails.
+
+        ``max_slots`` caps the capacity the recommendation is drawn from, so
+        the descent loop verifies the capped count rather than a larger one.
         """
         from studioforge.core.kv_sensitivity import kv_quality_label, kv_quality_rank
 
@@ -1150,6 +1342,12 @@ class ModelManager:
             return attempt
 
         slots, _bound, _vram = catalog_mod.slots_for_plan(planner, pinned, result)
+        if max_slots is not None:
+            # Applied here rather than inside the planner's capacity sizing:
+            # the catalog's concurrency numbers describe what a placement
+            # could sustain and stay policy-free, so a per-call ceiling is
+            # this walk's business alone.
+            slots = min(slots, int(max_slots))
         wanted = catalog_mod.recommended_slots(record, result, slots, observations=observations)
         plan = result
         parallel = int(wanted["value"])
@@ -1705,6 +1903,12 @@ class ModelManager:
                     allow_evict=False,
                     priority=entry.priority,
                     hold_traffic=False,
+                    # The server reproducing a shape it already launched, not a
+                    # user stating a count: a cap lowered under the resident
+                    # must not be the reason a displaced model cannot be put
+                    # back -- the same tolerance the legacy settings-row hole
+                    # grants a plain JIT load (D48).
+                    enforce_parallel_cap=False,
                 )
                 log.info(
                     "restored after a priority eviction",
@@ -1912,8 +2116,65 @@ class ModelManager:
         return None
 
     def apply_effective_ttl(self, record: ModelRecord, instance: InstanceInfo) -> None:
-        """Stamp the effective TTL onto a running instance (0 == pinned)."""
-        instance.ttl_s = self.ttl_for(record)
+        """Stamp the effective TTL onto a running instance (0 == pinned).
+
+        The instance's own tier is passed explicitly rather than re-derived:
+        it is the truth about what this child is serving as, and the fallback
+        walk would only round-trip through the registry for an answer already
+        in hand (D48).
+        """
+        instance.ttl_s = self.ttl_for(record, priority=instance.priority)
+
+    def _retier_resident(self, record: ModelRecord, instance: InstanceInfo, tier: int) -> None:
+        """Apply an explicit tier to a model that is already serving (D46/D48).
+
+        Re-tiering a running model must reach the live instance: the planner's
+        candidacy and :meth:`_effective_priority` read the tier there, so a
+        memo the instance contradicts is a silent no-op and the "chat" model
+        stays evictable as background.
+
+        The TTL is restamped with it because the tier can change the effective
+        TTL (``models.ttl_by_priority``). That deliberately discards any
+        per-request ttl override standing on the instance -- a re-tier is a
+        statement about what the model *is*, and the tier's TTL outranks one
+        request's opinion about how long it should live -- which is why it is
+        skipped while the map is empty (the shipped default): there the
+        restamp cannot change the answer, and would throw the override away
+        for nothing.
+
+        Both explicit load routes go through here, so ``load`` and
+        ``load_recommended`` agree about what an already-resident model looks
+        like after a re-tier -- including for ``_persist_load_profile``'s
+        ``refresh_ttl``, which then prices the tier that was just asked for
+        rather than the stale one.
+        """
+        instance.priority = tier
+        if self.config.models.ttl_by_priority:
+            self.apply_effective_ttl(record, instance)
+
+    def effective_priority(self, model_id: str) -> int:
+        """The tier this model is serving at, or would load at next (D46/D48).
+
+        The public reading of the D48 ladder -- a running instance, then the
+        memo of the last explicit load, then ``settings.priority``, then
+        background -- for the API and GUI surfaces that report a model's tier.
+
+        A **soft** answer for anything not currently loaded: it is what the
+        next load would run at if nothing said otherwise, and an explicit
+        ``priority`` on that load (or a re-tier in between) still wins.
+        """
+        return self._effective_priority(model_id)
+
+    def effective_priority_for(self, record: ModelRecord) -> int:
+        """:meth:`effective_priority` for an already-resolved serving record.
+
+        Callers that have walked :meth:`serving_record` themselves -- the model
+        listing does it once per row -- should use this rather than resolving
+        the id a second time. Pass the SERVING record: a preset-only virtual
+        model has no tier of its own, because it has no instance of its own.
+        The same soft next-load caveat applies.
+        """
+        return self._effective_priority(record.id)
 
     def refresh_ttl(self, model_id: str) -> int | None:
         """Re-apply the effective TTL after settings change while loaded.
@@ -1953,6 +2214,145 @@ class ModelManager:
             self._pin_suppressed.discard(serving_id)
             self._pin_retry.pop(serving_id, None)
         return updated, effective if effective is not None else self.ttl_for(updated)
+
+    def _benchmark_owns(self, model_id: str) -> bool:
+        """Whether a benchmark run currently owns this model's settings row."""
+        return getattr(self.benchmarker, "benchmarking", None) == model_id
+
+    def _refuse_unpersistable(self, requested: ModelRecord, serving: ModelRecord) -> None:
+        """Raise if this model's resolved load profile must not be written (D48).
+
+        Two refusals, both of which would otherwise be silent damage:
+
+        * a preset-only virtual model serves on its *base*'s instance, so the
+          profile that was resolved describes the base -- persisting it would
+          rewrite the base's settings and, through them, every other persona
+          sharing it. The caller is told to name the base id instead.
+        * a benchmark rewrites these very fields per mode and restores them at
+          the end (the same hazard the settings routes guard), so a write
+          landing mid-run reaches SQLite and is then reverted in memory.
+        """
+        if serving.id != requested.id:
+            raise BadRequestError(
+                f"'{requested.id}' is a preset over '{serving.id}' and serves on that "
+                f"model's instance, so the profile this call resolved belongs to "
+                f"'{serving.id}'. Persisting it here would rewrite the base model's "
+                f"settings and every other preset sharing it -- call load_recommended "
+                f"with persist on '{serving.id}' if that is what you meant.",
+                param="persist",
+                details={"requested_model_id": requested.id, "serving_model_id": serving.id},
+            )
+        if self._benchmark_owns(serving.id):
+            raise BadRequestError(
+                f"'{serving.id}' is being benchmarked right now; the run rewrites the "
+                f"same settings this would persist and would overwrite it. Wait for "
+                f"the run to finish, or cancel it, then load with persist again.",
+                code="model_benchmarking",
+                param="persist",
+            )
+
+    def _persist_load_profile(
+        self, record: ModelRecord, instance: InstanceInfo, priority: int | None
+    ) -> None:
+        """Freeze what actually launched into the model's saved settings (D48).
+
+        The :meth:`set_pinned` shape -- save through the registry, then
+        ``refresh_ttl`` so the change bites the resident instance rather than
+        only the next load. Idempotent: running it twice writes the same row.
+
+        ``priority`` is the caller's **explicit ask**, not the resolved tier:
+        given, it becomes the model's standing tier; ``None``, whatever the row
+        already said is left untouched. Writing the resolved tier instead meant
+        a persist could capture another client's in-memory memo as this model's
+        permanent setting, or materialise the implicit background default as
+        though somebody had chosen it -- neither of which the caller said.
+
+        ``devices`` is deliberately absent from what is written, for the reason
+        :func:`reload_settings` omits it too: a placement is a one-shot load
+        argument (D36), and the cards that happened to be free this minute are
+        not a standing property of the model.
+
+        This is **best-effort bookkeeping after a load that already
+        succeeded**, so any save-time failure is a logged skip, never a raise:
+        the model is loaded either way, and turning a good load into an error
+        over the bookkeeping half is the worse answer. The known skips are a
+        benchmark that started *during* this (multi-minute) load, the registry
+        refusing the save itself -- most plausibly a resident whose slot count
+        predates a ``max_parallel_cap`` lowered under it, which the cap
+        cross-check (D48) will not store -- the record having been deleted
+        while the walk ran, and whatever the storage layer raises on a bad day.
+
+        The hard refusals are the ones :meth:`_refuse_unpersistable` makes
+        *before* the walk -- a preset-only virtual model, or a benchmark already
+        running -- and they are unchanged: still a 400, still before anything
+        is loaded.
+        """
+        plan = instance.plan
+        if plan is None:  # pragma: no cover - a ready instance always has a plan
+            log.warning("nothing to persist: the instance carries no plan", model_id=record.id)
+            return
+        if self._benchmark_owns(record.id):
+            # A benchmark that started during this (multi-minute) load. Skipped
+            # rather than raised: the load itself succeeded, and turning a
+            # successful load into an error over the bookkeeping half would be
+            # the worse answer.
+            log.warning(
+                "not persisting a load profile while this model is benchmarked",
+                model_id=record.id,
+            )
+            return
+        per_slot = int(plan.ctx_per_slot or plan.ctx_size)
+        update: dict[str, Any] = {
+            # settings.ctx_size is PER SLOT while a plan's ctx_size can be
+            # the total -- the same correction reload_settings makes, and
+            # for the same reason: writing the total here would quadruple
+            # a four-slot model's ask on its next load.
+            "ctx_size": per_slot,
+            "kv_cache_type": plan.kv_cache_type,
+            "kv_cache_type_v": plan.kv_cache_type_v,
+            "parallel": int(plan.parallel),
+        }
+        if priority is not None:
+            # Only an explicit ask is written; the key is absent otherwise, so
+            # model_copy carries the row's own tier through unchanged.
+            update["priority"] = priority
+        settings = record.settings.model_copy(update=update)
+        try:
+            updated = self.registry.save_settings(record.id, settings)
+        except StudioForgeError as exc:
+            # The save-time validation refused the row this load resolved (the
+            # reachable case: the early return for a model already resident at
+            # the requested context hands back a plan whose slot count predates
+            # a max_parallel_cap lowered afterwards, and the cap cross-check
+            # (D48) will not store parallel above the cap), or the record was
+            # deleted while this multi-minute walk ran. The load itself is done
+            # and correct, so this is a skip like the benchmark race above.
+            log.warning(
+                "not persisting a load profile the settings save refused",
+                model_id=record.id,
+                error=getattr(exc, "message", str(exc)),
+            )
+            return
+        except Exception as exc:  # noqa: BLE001 - bookkeeping never fails a good load
+            # Everything below the registry: a raw sqlite error, a disk that
+            # filled up. The contract for this helper is best-effort, and it
+            # applies to the storage layer too.
+            log.warning(
+                "not persisting a load profile: the settings save failed",
+                model_id=record.id,
+                error=str(exc),
+            )
+            return
+        self.refresh_ttl(updated.id)
+        log.info(
+            "persisted the resolved load profile",
+            model_id=record.id,
+            ctx_size=per_slot,
+            kv_cache_type=plan.kv_cache_type,
+            kv_cache_type_v=plan.kv_cache_type_v,
+            parallel=int(plan.parallel),
+            priority=priority,
+        )
 
     #: Observations read at startup to tune the planner's overhead fraction.
     #: Newest-first, so a factor that drifted a year ago cannot outvote how the
@@ -2329,12 +2729,35 @@ class ModelManager:
 
     # -- TTL --------------------------------------------------------------
 
-    def ttl_for(self, record: ModelRecord) -> int:
-        """Effective TTL in seconds; 0 means pinned (never idle-unload)."""
+    def ttl_for(self, record: ModelRecord, *, priority: int | None = None) -> int:
+        """Effective TTL in seconds; 0 means pinned (never idle-unload).
+
+        Four steps: a pin wins outright; then the model's own ``ttl_s``; then
+        ``models.ttl_by_priority`` for its load tier (D48), so a chat model can
+        outlive background work without either one carrying a per-model
+        override; then ``models.default_ttl_s``.
+
+        ``priority`` names the tier to price. Omitted, it is resolved the D46
+        way -- the running instance, the memo, the standing setting -- which
+        keeps every existing call site source-compatible and lets an *unloaded*
+        model still report a coherent ``effective_ttl_s``. The lookup is
+        skipped entirely while ``ttl_by_priority`` is empty (the shipped
+        default), so nothing about the pre-D48 answer changes on an upgrade.
+        """
         if record.settings.pinned:
             return 0
         if record.settings.ttl_s is not None:
             return record.settings.ttl_s
+        by_tier = self.config.models.ttl_by_priority
+        if by_tier:
+            tier = (
+                priority
+                if priority is not None
+                else self._effective_priority(self.serving_record(record).id)
+            )
+            ttl = by_tier.get(int(tier))
+            if ttl is not None:
+                return int(ttl)
         return self.config.models.default_ttl_s
 
     async def _ttl_loop(self) -> None:
@@ -2661,6 +3084,12 @@ class ModelManager:
                 require_resident=True,
                 source="rebalance",
                 hold_traffic=False,
+                # The server reproducing a shape it already launched, not a
+                # user stating a count: this is the resident's own
+                # ``plan.parallel`` going back up on different cards, so a cap
+                # lowered under it must not turn a move into an outage -- the
+                # same tolerance the legacy settings-row hole grants (D48).
+                enforce_parallel_cap=False,
             )
             log.info(
                 "rebalanced model",
@@ -3115,7 +3544,11 @@ class ModelManager:
             # and that load runs at the model's remembered tier (D46) -- a
             # tier-blind preview says "does not fit" for a chat model whose
             # real load would displace background residents and land fine.
-            priority=self._effective_priority(record.id),
+            # Read off the SERVING record, because that is where every load
+            # route reads it: a preset-only persona has no instance and no
+            # memo of its own, so asking under its own id answered background
+            # for a preview of a load that would run at the base's tier.
+            priority=self.effective_priority_for(self.serving_record(record)),
         )
         if isinstance(result, LoadRejected):
             return {

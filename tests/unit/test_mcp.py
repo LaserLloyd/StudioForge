@@ -35,7 +35,14 @@ from studioforge.mcp.management import (
     build_management_mcp,
     mount_management_mcp,
 )
-from studioforge.types import EngineInfo, GgufMeta, GpuInfo, ModelSettings
+from studioforge.types import (
+    EngineInfo,
+    GgufMeta,
+    GpuInfo,
+    InstanceInfo,
+    LoadPlan,
+    ModelSettings,
+)
 
 GIB = 1024**3
 
@@ -607,6 +614,55 @@ async def test_load_model_accepts_a_placements_row_load_args_shape(state: State)
         "devices",
         "priority",
     } <= set(schema["properties"])
+
+
+async def test_load_recommended_offers_every_knob_the_rest_route_does(state: State) -> None:
+    """Parity, deliberately: an agent that can only reach the MCP plane must
+    not be missing a knob a REST caller has (D48 added the last three)."""
+    server = build_management_mcp(state)
+    tool = next(t for t in await server.list_tools() if t.name == "load_recommended")
+    assert {
+        "model_id",
+        "ctx_size",
+        "prefer_mode",
+        "kv_min",
+        "priority",
+        "max_slots",
+        "persist",
+    } <= set(tool.input_schema["properties"])
+    assert tool.input_schema["properties"]["persist"]["default"] is False
+
+
+def test_a_compact_instance_carries_its_tier_and_what_drafting_resolved_to() -> None:
+    """One projection lights up server_status, model_info, load_model and
+    load_recommended -- so an agent can see who would win the cards, and which
+    side of a ``priority_hold`` refusal it is on (D48)."""
+    from studioforge.mcp.management import _compact_instance
+
+    instance = InstanceInfo(
+        model_id="chat/model",
+        state="ready",
+        port=18100,
+        priority=1,
+        plan=LoadPlan(model_id="chat/model", devices=[0], ctx_size=8192),
+    )
+    row = _compact_instance(instance)
+    assert row["priority"] == 1
+    # `null` ("the launch has not resolved drafting yet") and {"type": "none"}
+    # ("considered and declined, and here is why") are different answers;
+    # neither may be collapsed into the other.
+    assert row["speculative"] is None
+    instance.speculative = {"type": "none", "reason": "more than 4 slots"}
+    assert _compact_instance(instance)["speculative"] == {
+        "type": "none",
+        "reason": "more than 4 slots",
+    }
+
+
+def test_a_compact_instance_defaults_to_the_background_tier() -> None:
+    from studioforge.mcp.management import _compact_instance
+
+    assert _compact_instance(InstanceInfo(model_id="bg/model", state="ready"))["priority"] == 3
 
 
 async def test_load_model_rejects_a_priority_outside_the_three_tiers(state: State) -> None:

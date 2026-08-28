@@ -550,6 +550,30 @@ getting 131072 and finding out mid-conversation. So:
 `kv_min` ("give me 262144, but not at the cost of the cache") refuses a placement that only reaches
 the window by quantizing, and walks on to one that can afford it.
 
+`max_slots` caps the slot count for this call alone. The walk asks for `recommended_parallel` slots
+by default, and every one of them has its KV cache priced into the fit; a caller who knows there
+will be three conversations rather than eight passes `max_slots: 3` and often buys a larger window
+on the same cards for it. The cap is applied before the descent loop re-checks the plan, so the
+winning placement really is planned at the capped count rather than planned larger and launched
+smaller; below 1 it is a `400` naming the parameter. Nothing in the catalog moves: `max_parallel`
+and `recommended_parallel` remain answers about the hardware, and a per-call ceiling is the walk's
+business alone (D48).
+
+`persist` keeps the answer. A walk costs minutes and its result used to evaporate with the
+instance; `persist: true` writes what actually launched — context per slot, both KV cache types and
+the slot count, plus the tier when the same call named a `priority` — into the model's saved
+settings, so the next plain load, JIT included, reproduces it. A `persist` that says nothing about
+priority leaves the saved tier untouched rather than freezing the tier the load happened to run
+at. The placement is deliberately not written (a set of cards is a one-shot load argument, D36).
+The trade is that it freezes the KV ladder and the slot estimator for that model until those
+fields are nulled again through `PATCH /api/models/{id}/settings`. It is refused
+outright for a preset-only virtual model (the write would land on the base and every persona) and
+while that model is being benchmarked; after a successful load **any** failed write — a refusal, a
+record deleted mid-walk, a storage error — is skipped with a warning rather than failing the load.
+Over REST the flag needs the D32 admin credential when the caller is not on the box, even though
+the route itself is open — see
+[OPENCLAW.md](OPENCLAW.md#i-need-a-262144-token-window--load_recommended).
+
 Measured live on the scratch instance, 2026-08-19: `{"ctx_size": 32768}` loaded at exactly 32768 on
 `[0, 1]` with 2 slots and an f16 cache; `{"ctx_size": 65536}` against a 32768-token model returned
 the `400` above; `{"ctx_size": 12345, "prefer_mode": "dual_3090"}` loaded at exactly 12345 on

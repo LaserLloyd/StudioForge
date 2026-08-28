@@ -683,7 +683,11 @@ def _round_ctx_down(ctx: int) -> int:
 #: the per-slot context each conversation gets is small enough that a long
 #: agent transcript no longer fits, and llama.cpp's per-slot context
 #: checkpoints (32 each, unmodelled here) start to matter. A user who really
-#: wants more sets ``parallel`` explicitly, which is never capped.
+#: wants more sets ``parallel`` explicitly, which this module never clamps.
+#: Not to be confused with the per-model ``settings.max_parallel_cap``: since
+#: D48 that one is a hard ceiling the manager enforces, refusing an explicit
+#: ``parallel`` above it with a 400 rather than silently clamping it (D14 --
+#: explicit is honoured verbatim or refused loudly, never quietly rewritten).
 MAX_PARALLEL_CAP = 8
 
 #: How full a slot's context is assumed to be when sizing the knee. Slots
@@ -1940,6 +1944,12 @@ class Planner:
         reload credits the resident child's footprint back, see
         :meth:`plan_load`); ``extra_own_pids`` are pids that count as ours in
         the holder attribution beyond those in ``loaded``.
+
+        ``prefer_single_gpu`` (per-model setting, falling back to
+        ``planner.prefer_single_gpu``) governs the primary placement walk only.
+        The eviction-fallback round below still tries single-card placements
+        before splits regardless of the flag: there the alternative is refusing
+        the load outright, so the cheap option is always worth a try.
         """
         settings = record.settings
 
@@ -2019,11 +2029,19 @@ class Planner:
         affinity = self._affinity_for(record)
         pools = self._device_pools(order, gpu_map, affinity)
 
+        # Per-model override of the global policy; None = inherit (D48).
+        per_model_single = settings.prefer_single_gpu
+        prefer_single = (
+            per_model_single
+            if per_model_single is not None
+            else self.config.planner.prefer_single_gpu
+        )
+
         for pool, pool_note in pools:
             # Policy: the cheapest placement that fits. A single GPU avoids
             # tensor-split overhead and all cross-GPU traffic, so every
             # single-GPU option is tried (best card first) before any split.
-            if self.config.planner.prefer_single_gpu:
+            if prefer_single:
                 for index in pool:
                     result = self._try_devices(
                         record,

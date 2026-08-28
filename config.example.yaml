@@ -32,6 +32,11 @@
 #                           actually fits in VRAM, never below default_ctx.
 #   models.default_parallel "auto" sizes conversation slots per model and
 #                           placement; an explicit integer is honoured verbatim.
+#   models.ttl_by_priority  idle TTL per load tier, e.g. {1: 3600, 2: 1800,
+#                           3: 900} to keep the chat model resident an hour
+#                           while background work is reaped in 15 minutes.
+#                           Empty -- the shipped default -- means one
+#                           default_ttl_s for every tier.
 #   engine.pinned_tag       the llama.cpp build in use. `studioforge engine
 #                           --update` moves this on only after a smoke test.
 #   engine.cuda_variant     "auto" picks the CUDA build matching your driver;
@@ -83,6 +88,7 @@ models:
   extra_dirs: []
   default_ctx: 8192
   default_ttl_s: 1800
+  ttl_by_priority: {}
   default_kv_cache_type: auto
   default_parallel: auto
   ctx_per_slot_default: 32768

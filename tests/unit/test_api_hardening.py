@@ -19,6 +19,7 @@ import pytest
 from fastapi import Request
 
 from studioforge.api.auth import (
+    PIN_IN_QUERY_NOTE,
     PIN_WITHHELD_NOTE,
     REMOTE_ADMIN_NOTE,
     check_request,
@@ -479,6 +480,47 @@ def test_a_lan_caller_gets_403_on_an_admin_mutation_and_the_pin_admits_it(tmp_pa
     # A second app: the MCP session manager runs once per app instance.
     with TestClient(_open_app(tmp_path / "b"), client=("127.0.0.1", 50000)) as local:
         assert local.patch("/api/config", json={"models.default_ctx": 8192}).status_code == 200
+
+
+def test_persisting_a_load_profile_is_gated_though_the_route_itself_is_open(
+    tmp_path: Any,
+) -> None:
+    """``POST /load-recommended`` is deliberately ungated -- residency is open,
+    LM Studio parity -- but ``persist: true`` writes settings, exactly what
+    ``_ADMIN_SETTINGS_SUFFIXES`` protects. ``is_admin_mutation`` decides from
+    method and path alone and cannot see a body field, so the handler asks
+    (D32/D48). The 404s below are the ordinary unknown-model answer: reaching
+    one is how a caller proves it got past the gate.
+    """
+    from fastapi.testclient import TestClient
+
+    _reset_guard()
+    route = "/api/models/vendor/Nope-Q4_K_M/load-recommended"
+    persisting = {"ctx_size": 8192, "persist": True}
+
+    with TestClient(_open_app(tmp_path), client=("192.168.1.50", 50000)) as lan:
+        refused = lan.post(route, json=persisting)
+        assert refused.status_code == 403
+        assert refused.json()["error"]["code"] == "remote_admin_requires_credential"
+        # The refusal is about the flag, not the route: the same request
+        # without it is still served.
+        assert lan.post(route, json={"ctx_size": 8192}).status_code == 404
+        # ...and the pairing PIN admits the flag, as it does on a gated path.
+        with_pin = lan.post(route, json=persisting, headers={"X-MCP-Pin": "12345678"})
+        assert with_pin.status_code == 404, with_pin.text
+        # The retired query form never satisfies the body gate, not even with
+        # the CORRECT pin: it is refused before any comparison, and the refusal
+        # says why the URL that used to work does not, rather than reading as a
+        # wrong PIN. Pinned here because this gate is checked in the handler,
+        # not the middleware, and could regrow the old leniency on its own.
+        in_query = lan.post(f"{route}?pin=12345678", json=persisting)
+        assert in_query.status_code == 403, in_query.text
+        error = in_query.json()["error"]
+        assert error["code"] == "remote_admin_requires_credential"
+        assert PIN_IN_QUERY_NOTE in error["message"]
+
+    with TestClient(_open_app(tmp_path / "b"), client=("127.0.0.1", 50000)) as local:
+        assert local.post(route, json=persisting).status_code == 404
 
 
 def test_delete_of_an_unloaded_model_is_not_a_500(tmp_path: Any) -> None:

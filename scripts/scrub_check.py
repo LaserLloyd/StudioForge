@@ -195,9 +195,12 @@ CONTENT_RULES: list[tuple[re.Pattern, str]] = [
 ]
 
 # The marker in every comment syntax this repo actually contains: shell/Python,
-# C/JS block and line, HTML/Markdown, and SQL (the design docs carry DDL).
-OK_MARKER = re.compile(r"(?:#|//|--)\s*scrub-ok\b"
-                       r"|(?:/\*|<!--)\s*scrub-ok\b")
+# C/JS block and line, HTML/Markdown, SQL (the design docs carry DDL), and
+# Windows batch (`rem` / `::`) — this project ships .bat launchers, and a
+# launcher is exactly the kind of file that legitimately names a local path.
+OK_MARKER = re.compile(r"(?:#|//|--|::)\s*scrub-ok\b"
+                       r"|(?:/\*|<!--)\s*scrub-ok\b"
+                       r"|(?i:\brem)\s+scrub-ok\b")
 
 
 def load_local_rules(path: Path | None = None) -> list[tuple[re.Pattern, str]]:
@@ -718,6 +721,15 @@ def selftest() -> int:
             "gateway at 100.100.10.7  # scrub-ok: fixture\n", encoding="utf-8")
         if any("marked.txt" in p for p in scan(fixtures)):
             failures.append("a scrub-ok marker did not suppress the hit")
+
+        # The .bat launchers this project ships can only carry the marker in
+        # batch comment syntax, so `rem` and `::` must suppress it too.
+        (fixtures / "marked.bat").write_text(
+            'set "H=100.100.10.7"  rem scrub-ok: fixture\n'
+            ":: scrub-ok: fixture — gateway at 100.100.10.8\n",
+            encoding="utf-8")
+        if any("marked.bat" in p for p in scan(fixtures)):
+            failures.append("a batch scrub-ok marker did not suppress the hit")
 
         # --- commit-message fixtures ----------------------------------------
         for name, body in positives.items():

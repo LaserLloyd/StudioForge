@@ -217,6 +217,16 @@ class ModelsConfig(BaseModel):
     extra_dirs: list[Path] = Field(default_factory=list)
     default_ctx: PositiveInt = 8192
     default_ttl_s: NonNegativeInt = 1800  # 30 min; 0 = pinned/never unload
+    #: Idle TTL per load tier (1 chat / 2 agent / 3 background), consulted
+    #: between a model's own ``settings.ttl_s`` and ``default_ttl_s``: a chat
+    #: model can stay resident for an hour while background work is reaped in
+    #: minutes, without touching either model's saved settings. 0 means never
+    #: unload, as everywhere else. Empty by default -- an empty map gives every
+    #: tier ``default_ttl_s``, exactly the pre-D48 behaviour, so an upgrade
+    #: changes nothing; a populated shipped default would have silently
+    #: shortened background residency on existing installs, and shipped
+    #: defaults do not make policy decisions.
+    ttl_by_priority: dict[int, int] = Field(default_factory=dict)
     # "auto": the planner picks per model rather than forcing one type on the
     # whole library. At long context the KV cache dwarfs the weights, so the
     # right trade differs per model -- a 27B reaches native 262144 on f16 and
@@ -283,6 +293,26 @@ class ModelsConfig(BaseModel):
             return v
         if v < 1:
             raise ValueError("models.default_parallel must be >= 1")
+        return v
+
+    @field_validator("ttl_by_priority")
+    @classmethod
+    def _check_ttl_by_priority(cls, v: dict[int, int]) -> dict[int, int]:
+        # The tier set is hardcoded rather than imported from
+        # core/priority.py: config sits below core in the dependency direction
+        # (docs/DEVELOPMENT.md) and must not import from it, so the two are
+        # kept in step by hand.
+        for tier, ttl in v.items():
+            if tier not in (1, 2, 3):
+                raise ValueError(
+                    f"models.ttl_by_priority keys must be a tier -- 1 (chat), "
+                    f"2 (agent) or 3 (background); got {tier}"
+                )
+            if ttl < 0:
+                raise ValueError(
+                    f"models.ttl_by_priority[{tier}] must be >= 0 seconds "
+                    f"(0 means never unload); got {ttl}"
+                )
         return v
 
     @field_validator("dir")

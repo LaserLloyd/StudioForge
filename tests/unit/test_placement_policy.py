@@ -104,3 +104,61 @@ def test_a_single_card_placement_is_optimal() -> None:
     plan = planner.plan_load(record, ctx_size=4096, loaded=[])
     assert isinstance(plan, LoadPlan)
     assert plan.placement_tier == "optimal"
+
+
+# ---------------------------------------------------------------------------
+# Per-model prefer_single_gpu (D48)
+# ---------------------------------------------------------------------------
+
+
+def two_matched_5090s() -> Planner:
+    """Two identical cards, either of which holds the model on its own."""
+    config = make_config(headroom_fraction=0.0)
+    assert config.planner.prefer_single_gpu is True, "the shipped global policy"
+    return Planner(config, StubProbe([gpu(0, 32.0, 30.0, (12, 0)), gpu(1, 32.0, 30.0, (12, 0))]))
+
+
+def test_a_per_model_false_overrides_a_true_global() -> None:
+    """One model that is happier split must not cost every other model on the
+    box the single-card rule -- before D48, ``planner.prefer_single_gpu`` was
+    the only place to say it and it applied to the whole library."""
+    planner = two_matched_5090s()
+    record = make_record(
+        meta=make_meta(tensor_bytes=8 * GB),
+        settings=ModelSettings(prefer_single_gpu=False),
+    )
+    plan = planner.plan_load(record, ctx_size=4096, loaded=[])
+    assert isinstance(plan, LoadPlan)
+    assert plan.devices == [0, 1]
+
+
+def test_none_inherits_the_global_policy() -> None:
+    """The default, and the reason an upgrade changes nothing: every existing
+    model carries ``None``."""
+    planner = two_matched_5090s()
+    inherited = planner.plan_load(
+        make_record(meta=make_meta(tensor_bytes=8 * GB)), ctx_size=4096, loaded=[]
+    )
+    assert isinstance(inherited, LoadPlan)
+    assert inherited.devices == [0]
+    assert make_record().settings.prefer_single_gpu is None
+
+
+def test_a_per_model_true_holds_the_single_card_when_the_global_is_off() -> None:
+    """The override runs both ways: an operator who turned the global policy
+    off for the box can still keep one model on one card."""
+    config = make_config(headroom_fraction=0.0, prefer_single_gpu=False)
+    planner = Planner(config, StubProbe([gpu(0, 32.0, 30.0, (12, 0)), gpu(1, 32.0, 30.0, (12, 0))]))
+    meta = make_meta(tensor_bytes=8 * GB)
+
+    spread = planner.plan_load(make_record(meta=meta), ctx_size=4096, loaded=[])
+    assert isinstance(spread, LoadPlan)
+    assert spread.devices == [0, 1]
+
+    kept = planner.plan_load(
+        make_record(meta=meta, settings=ModelSettings(prefer_single_gpu=True)),
+        ctx_size=4096,
+        loaded=[],
+    )
+    assert isinstance(kept, LoadPlan)
+    assert kept.devices == [0]

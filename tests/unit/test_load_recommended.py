@@ -20,14 +20,17 @@ What these pin:
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from studioforge.core import manager as manager_module
 from studioforge.core.manager import ModelManager
 from studioforge.core.planner import BUSY_RETRY_AFTER_S, Planner
+from studioforge.core.priority import PRIORITY_BACKGROUND, PRIORITY_CHAT
 from studioforge.errors import BadRequestError, InsufficientVramError, ModelBusyError
-from studioforge.types import GB, InstanceInfo, LoadPlan, ModelSettings
+from studioforge.types import GB, InstanceInfo, LoadPlan, ModelSettings, VirtualPreset
 from tests.unit.test_catalog import dense_meta, record
 from tests.unit.test_load_retry import StubSupervisor
 from tests.unit.test_planner import make_config, rig_5090x2_3090x2
@@ -38,6 +41,9 @@ MODEL = "pub/dense-8b"
 class Registry:
     def __init__(self, records: list[Any]) -> None:
         self._records = {r.id: r for r in records}
+        #: Every ``save_settings`` call, newest last -- the persist tests below
+        #: assert on what was written, not just that something was.
+        self.saved: list[tuple[str, ModelSettings]] = []
 
     def resolve(self, name: str) -> Any:
         return self._records.get(name)
@@ -56,6 +62,22 @@ class Registry:
 
     def touch(self, model_id: str) -> None:
         return None
+
+    def save_settings(self, model_id: str, settings: ModelSettings) -> Any:
+        # The real registry re-validates here because this is reachable from
+        # the HTTP API, and since D48 it refuses a row whose ``parallel`` is
+        # above the model's ``max_parallel_cap``. Mirrored (only that check) so
+        # the persist tests below meet the same refusal the server would.
+        cap = settings.max_parallel_cap
+        if settings.parallel is not None and cap is not None and settings.parallel > cap:
+            raise BadRequestError(
+                f"parallel ({settings.parallel}) is above this model's max_parallel_cap ({cap}).",
+                param="settings",
+            )
+        self.saved.append((model_id, settings))
+        record = self._records[model_id]
+        record.settings = settings
+        return record
 
 
 class ParallelDb:
@@ -357,7 +379,9 @@ async def test_kv_min_walks_on_to_a_mode_that_can_afford_the_cache() -> None:
 # ---------------------------------------------------------------------------
 
 
-def resident_self(*, ctx: int, requests: int = 0, devices: list[int] | None = None) -> InstanceInfo:
+def resident_self(
+    *, ctx: int, requests: int = 0, devices: list[int] | None = None, parallel: int = 1
+) -> InstanceInfo:
     devs = devices or [0, 1]
     return InstanceInfo(
         model_id=MODEL,
@@ -373,7 +397,7 @@ def resident_self(*, ctx: int, requests: int = 0, devices: list[int] | None = No
             devices=devs,
             ctx_size=ctx,
             ctx_per_slot=ctx,
-            parallel=1,
+            parallel=parallel,
             kv_cache_type="f16",
             kv_cache_type_v="f16",
             per_gpu_bytes={d: int(29 * GB) for d in devs},
@@ -406,6 +430,41 @@ async def test_a_resident_model_already_at_that_context_is_returned_as_is() -> N
     assert instance.plan.ctx_per_slot == 65536
     assert supervisor.starts == 0
     assert supervisor.stopped == []
+
+
+async def test_the_resident_early_return_re_tiers_the_instance_it_hands_back() -> None:
+    """``load_recommended(priority=1)`` on a model that is already at that
+    context must re-tier it exactly as ``load(priority=1)`` does on its ready
+    instance -- the planner's candidacy and the effective-tier reads all live
+    on the instance, so a tier that stopped at the memo was a silent no-op on
+    this one route. The TTL is restamped with it, so the persist below prices
+    the tier that was just asked for rather than the stale one.
+    """
+    manager, supervisor = make_manager(loaded=[resident_self(ctx=65536)])
+    manager.config.models.ttl_by_priority = {1: 3600, 3: 900}
+    resident = supervisor.instances[MODEL]
+    assert resident.priority == PRIORITY_BACKGROUND
+
+    instance = await manager.load_recommended(MODEL, 65536, priority=PRIORITY_CHAT)
+
+    assert instance is resident
+    assert supervisor.starts == 0, "still the early return -- no cold start to re-tier"
+    assert instance.priority == PRIORITY_CHAT
+    assert instance.ttl_s == 3600, "the tier's TTL, not the one the old tier priced"
+
+
+async def test_the_resident_early_return_respects_the_slot_ceiling() -> None:
+    """An eight-slot resident is not the answer to "load this capped at two
+    slots" -- and with persist it would have stored the eight. An over-cap
+    resident falls through to a real reload, which is what max_slots asked
+    for."""
+    manager, supervisor = make_manager(loaded=[resident_self(ctx=16384, parallel=8)])
+
+    instance = await manager.load_recommended(MODEL, 16384, prefer_modes=["dual_5090"], max_slots=2)
+
+    assert supervisor.starts == 1, "the resident was over the ceiling, so it was reloaded"
+    assert instance.plan is not None
+    assert instance.plan.parallel <= 2
 
 
 async def test_a_resident_model_is_credited_with_its_own_footprint_for_the_walk() -> None:
@@ -488,3 +547,313 @@ async def test_every_card_excluded_is_a_structured_refusal() -> None:
     with pytest.raises(InsufficientVramError) as excinfo:
         await manager.load_recommended(MODEL, 16384)
     assert any("excluded_devices" in s for s in excinfo.value.details["suggestions"])
+
+
+# ---------------------------------------------------------------------------
+# max_slots: a per-call ceiling on what the estimator may choose (D48)
+# ---------------------------------------------------------------------------
+
+
+async def test_max_slots_caps_the_slot_count_this_call_may_choose() -> None:
+    """The estimator answers what a placement *could* sustain. A caller that
+    knows it has one bot does not want the other slots' KV cache priced into
+    the fit, and the cap is applied before the descent loop verifies it -- so
+    the winning plan really is planned at the capped count rather than planned
+    larger and launched smaller."""
+    manager, _supervisor = make_manager()
+    free = await manager.load_recommended(MODEL, 16384, prefer_modes=["dual_5090"])
+    assert free.plan is not None
+    assert free.plan.parallel > 1, "fixture must leave room for more than one slot"
+
+    # A fresh box for the second call, or the resident-at-that-context early
+    # return hands back the plan the first call made.
+    manager, _supervisor = make_manager()
+    capped = await manager.load_recommended(MODEL, 16384, prefer_modes=["dual_5090"], max_slots=1)
+    assert capped.plan is not None
+    assert capped.plan.parallel == 1
+
+
+async def test_a_max_slots_below_one_is_a_400_before_anything_is_planned() -> None:
+    manager, supervisor = make_manager()
+    with pytest.raises(BadRequestError) as excinfo:
+        await manager.load_recommended(MODEL, 16384, max_slots=0)
+    assert excinfo.value.param == "max_slots"
+    assert supervisor.starts == 0
+
+
+async def test_max_slots_above_what_fits_changes_nothing() -> None:
+    """A ceiling is a ceiling: it may never talk the planner *up* into slots
+    the placement cannot hold."""
+    manager, _supervisor = make_manager()
+    uncapped = await manager.load_recommended(MODEL, 16384, prefer_modes=["dual_5090"])
+    manager, _supervisor = make_manager()
+    generous = await manager.load_recommended(
+        MODEL, 16384, prefer_modes=["dual_5090"], max_slots=999
+    )
+    assert uncapped.plan is not None and generous.plan is not None
+    assert generous.plan.parallel == uncapped.plan.parallel
+
+
+# ---------------------------------------------------------------------------
+# persist: freeze what actually launched into the model's settings (D48)
+# ---------------------------------------------------------------------------
+
+
+PERSONA = "pub/dense-8b-persona"
+
+
+def preset_manager() -> tuple[ModelManager, StubSupervisor]:
+    """A preset-only virtual model over ``MODEL``, which shares its instance."""
+    base = record(MODEL, dense_meta(131072), mtime=1.0, size_bytes=8 * GB)
+    persona = base.model_copy(
+        update={
+            "id": PERSONA,
+            "name": "persona",
+            "is_virtual": True,
+            "base_model_id": MODEL,
+            "preset": VirtualPreset(temperature=0.4),
+            "settings": ModelSettings(),
+        }
+    )
+    config = make_config()
+    supervisor = StubSupervisor()
+    manager = ModelManager(
+        config,
+        registry=Registry([base, persona]),  # type: ignore[arg-type]
+        planner=Planner(config, rig_5090x2_3090x2(31.0), log_plans=False),
+        supervisor=supervisor,  # type: ignore[arg-type]
+        db=None,  # type: ignore[arg-type]
+    )
+    return manager, supervisor
+
+
+async def test_persist_writes_the_profile_that_actually_launched() -> None:
+    """What is written is ``instance.plan`` -- what the load really did -- not
+    what the mode walk hoped for; the two differ whenever the planner had to
+    step down on the way in."""
+    manager, _supervisor = make_manager()
+    refreshed: list[str] = []
+    real_refresh = manager.refresh_ttl
+
+    def spy(model_id: str) -> int | None:
+        refreshed.append(model_id)
+        return real_refresh(model_id)
+
+    manager.refresh_ttl = spy  # type: ignore[method-assign]
+
+    instance = await manager.load_recommended(
+        MODEL, 16384, prefer_modes=["dual_5090"], persist=True
+    )
+    assert instance.plan is not None
+    plan = instance.plan
+
+    assert [model_id for model_id, _ in manager.registry.saved] == [MODEL]
+    saved = manager.registry.saved[-1][1]
+    # settings.ctx_size is PER SLOT while a plan's ctx_size can be the total;
+    # writing the total would multiply a multi-slot model's ask on its next load.
+    assert saved.ctx_size == 16384
+    assert saved.ctx_size == int(plan.ctx_per_slot or plan.ctx_size)
+    assert saved.kv_cache_type == plan.kv_cache_type
+    assert saved.kv_cache_type_v == plan.kv_cache_type_v
+    assert saved.parallel == plan.parallel
+    assert saved.priority is None, "no tier was asked for, so none was invented"
+    # ...and the write bites the resident instance, not only the next load.
+    assert refreshed == [MODEL]
+
+
+async def test_persist_records_the_tier_the_caller_explicitly_asked_for() -> None:
+    manager, _supervisor = make_manager()
+    await manager.load_recommended(MODEL, 16384, priority=PRIORITY_CHAT, persist=True)
+    assert manager.registry.saved[-1][1].priority == PRIORITY_CHAT
+
+
+async def test_persist_without_a_tier_leaves_the_saved_one_exactly_as_it_was() -> None:
+    """Only an explicit ask is written. The RESOLVED tier can come from the
+    in-memory memo -- what some other client is doing right now -- or be the
+    implicit background default materialised into the row as though somebody
+    had chosen it; persisting a context profile must not do either.
+    """
+    manager, _supervisor = make_manager(settings=ModelSettings(priority=PRIORITY_CHAT))
+    # A memo from somebody else's load, which the resolver would otherwise win.
+    manager._model_priority[MODEL] = PRIORITY_BACKGROUND
+
+    await manager.load_recommended(MODEL, 16384, persist=True)
+
+    saved = manager.registry.saved[-1][1]
+    assert saved.ctx_size == 16384, "the profile is still written"
+    assert saved.priority == PRIORITY_CHAT, "the row's own tier, untouched"
+
+
+async def test_persist_leaves_the_placement_out_of_the_saved_settings() -> None:
+    """A placement is a one-shot load argument (D36) -- the cards that happened
+    to be free this minute are not a standing property of the model, and
+    freezing them would strand it the next time the box changes."""
+    manager, _supervisor = make_manager()
+    instance = await manager.load_recommended(
+        MODEL, 16384, prefer_modes=["dual_3090"], persist=True
+    )
+    assert instance.plan is not None
+    assert sorted(instance.plan.devices) == [2, 3]
+    saved = manager.registry.saved[-1][1]
+    assert saved.device_override is None
+    assert saved.allowed_devices is None
+
+
+async def test_a_load_without_persist_writes_nothing() -> None:
+    manager, _supervisor = make_manager()
+    await manager.load_recommended(MODEL, 16384)
+    assert manager.registry.saved == []
+
+
+async def test_persist_still_writes_when_the_model_is_already_at_that_context() -> None:
+    """That it was already resident at the profile is not a reason to skip the
+    write, or persist would be a no-op precisely when it is run twice."""
+    manager, supervisor = make_manager(loaded=[resident_self(ctx=65536)])
+    await manager.load_recommended(MODEL, 65536, persist=True)
+    assert supervisor.starts == 0, "the early return: no reload to arrive where we already are"
+    assert manager.registry.saved[-1][1].ctx_size == 65536
+
+
+async def test_persist_is_refused_while_the_model_is_being_benchmarked() -> None:
+    """A benchmark rewrites these very fields per mode and restores them at the
+    end, so a write landing mid-run reaches SQLite and is then reverted in
+    memory -- the same clobber hazard the settings routes guard."""
+    manager, supervisor = make_manager()
+    manager.benchmarker = SimpleNamespace(benchmarking=MODEL)
+
+    with pytest.raises(BadRequestError) as excinfo:
+        await manager.load_recommended(MODEL, 16384, persist=True)
+
+    assert excinfo.value.param == "persist"
+    assert excinfo.value.code == "model_benchmarking"
+    assert supervisor.starts == 0, "checked before the walk, so nothing was loaded"
+    assert manager.registry.saved == []
+
+
+class RecordingLog:
+    """Stands in for the manager module's structlog logger.
+
+    Neither ``caplog`` nor ``structlog.testing.capture_logs`` holds across test
+    orders here: the unit suite leaves structlog unconfigured (so nothing is
+    bound to stdlib logging for ``caplog`` to see), and once another test file
+    has called ``configure_logging`` the loggers are cached and root's handlers
+    -- pytest's capture handler included -- have been replaced. Swapping the
+    module logger is the one capture that works either way.
+    """
+
+    def __init__(self) -> None:
+        self.warnings: list[tuple[str, dict[str, Any]]] = []
+
+    def warning(self, event: str, **fields: Any) -> None:
+        self.warnings.append((event, fields))
+
+    def __getattr__(self, _name: str) -> Any:
+        return lambda *_a, **_kw: None
+
+
+async def test_a_save_refused_after_the_load_succeeded_is_skipped_not_raised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reachable version of this: a model already resident at the requested
+    context, on a plan whose slot count predates a ``max_parallel_cap`` lowered
+    afterwards. The early return hands that plan back, and the settings
+    validation will not store ``parallel`` above the cap.
+
+    Persist is bookkeeping *after* a load that already succeeded -- the model
+    IS loaded -- so the refusal is a warning and a skipped write, the same
+    answer as a benchmark that starts mid-load. Raising here reported failure
+    for a call that had done its job.
+    """
+    manager, supervisor = make_manager(
+        settings=ModelSettings(max_parallel_cap=1),
+        loaded=[resident_self(ctx=65536, parallel=4)],
+    )
+
+    recorder = RecordingLog()
+    monkeypatch.setattr(manager_module, "log", recorder)
+
+    instance = await manager.load_recommended(MODEL, 65536, persist=True)
+
+    assert instance.plan is not None
+    assert instance.plan.parallel == 4, "the resident is returned as it stands"
+    assert supervisor.starts == 0
+    assert manager.registry.saved == [], "the write was refused, so nothing was stored"
+    # ...but not silently.
+    assert recorder.warnings, "a skipped persist must leave a trail"
+    assert any(fields.get("model_id") == MODEL for _event, fields in recorder.warnings)
+    assert any(
+        "max_parallel_cap" in str(fields.get("error", "")) for _event, fields in recorder.warnings
+    )
+
+
+async def test_a_record_deleted_during_the_walk_is_a_skip_not_a_failed_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``save_settings`` raises more than the cap refusal: the model can be
+    deleted out from under a walk that takes minutes (``ModelNotFoundError``),
+    and the storage layer underneath it can raise anything at all. The helper
+    is best-effort by contract, so *any* save-time failure is a logged skip --
+    catching only ``BadRequestError`` turned a load that had already succeeded
+    into an error the caller could do nothing about.
+    """
+    from studioforge.errors import ModelNotFoundError
+
+    manager, supervisor = make_manager()
+
+    def gone(model_id: str, settings: ModelSettings) -> Any:
+        raise ModelNotFoundError(model_id, known=[])
+
+    monkeypatch.setattr(manager.registry, "save_settings", gone)
+    recorder = RecordingLog()
+    monkeypatch.setattr(manager_module, "log", recorder)
+
+    instance = await manager.load_recommended(MODEL, 16384, persist=True)
+
+    assert instance.state == "ready", "the load itself succeeded and is reported as such"
+    assert supervisor.starts == 1
+    assert any(fields.get("model_id") == MODEL for _event, fields in recorder.warnings)
+
+
+async def test_a_raw_storage_failure_during_persist_is_a_skip_too(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The DB layer below the registry raises plain ``sqlite3`` errors, which
+    are not ``StudioForgeError`` at all. Same contract, same answer."""
+    manager, supervisor = make_manager()
+
+    def boom(model_id: str, settings: ModelSettings) -> Any:
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(manager.registry, "save_settings", boom)
+    recorder = RecordingLog()
+    monkeypatch.setattr(manager_module, "log", recorder)
+
+    instance = await manager.load_recommended(MODEL, 16384, persist=True)
+
+    assert instance.state == "ready"
+    assert any(
+        "database is locked" in str(fields.get("error", "")) for _event, fields in recorder.warnings
+    )
+
+
+async def test_persist_on_a_preset_refuses_and_names_the_base_model() -> None:
+    """A preset-only virtual model serves on its BASE's instance, so the
+    resolved profile describes the base -- persisting it here would rewrite the
+    base's settings and every other persona sharing it."""
+    manager, supervisor = preset_manager()
+
+    with pytest.raises(BadRequestError) as excinfo:
+        await manager.load_recommended(PERSONA, 16384, persist=True)
+
+    assert excinfo.value.param == "persist"
+    assert MODEL in excinfo.value.message
+    assert excinfo.value.details == {
+        "requested_model_id": PERSONA,
+        "serving_model_id": MODEL,
+    }
+    assert supervisor.starts == 0
+    assert manager.registry.saved == []
+
+    # The same call without persist still loads, on the base's instance.
+    instance = await manager.load_recommended(PERSONA, 16384)
+    assert instance.model_id == MODEL

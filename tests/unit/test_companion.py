@@ -785,6 +785,73 @@ def test_coerce_like_uses_the_current_value_as_the_type_hint() -> None:
         cli_module._coerce_like(8192, "not-a-number")
 
 
+def test_null_clears_a_field_that_already_holds_a_value() -> None:
+    """`--set ctx_size=null` is the documented way out of a `--persist` freeze.
+
+    The clearing branch used to sit inside "the current value is None", so it
+    only worked on a field that was already empty -- which is never the case
+    when there is something to clear. An int field answered "expected an
+    integer, got 'null'", and the escape hatch did not exist.
+    """
+    assert cli_module._coerce_like(16384, "null") is None
+    assert cli_module._coerce_like(16384, "none") is None
+    assert cli_module._coerce_like("q8_0", "null") is None
+    assert cli_module._coerce_like("q8_0", "NULL") is None
+    assert cli_module._coerce_like(True, "null") is None
+    assert cli_module._coerce_like(0.5, "None") is None
+    assert cli_module._coerce_like([1], "null") is None
+    assert cli_module._coerce_like(None, "null") is None
+
+
+def test_clearing_does_not_swallow_ordinary_values() -> None:
+    """The hoisted null test must not shadow the type branches beneath it."""
+    assert cli_module._coerce_like(16384, "8192") == 8192
+    assert cli_module._coerce_like("f16", "q8_0") == "q8_0"
+    assert cli_module._coerce_like(True, "off") is False
+    assert cli_module._coerce_like(0.5, "0.75") == 0.75
+    assert cli_module._coerce_like({}, '{"a": 1}') == {"a": 1}
+    # An empty value keeps the pre-existing contract: empty string on a string
+    # field, cleared only where the field was already empty.
+    assert cli_module._coerce_like("f16", "") == ""
+    assert cli_module._coerce_like(None, "") is None
+
+
+def test_flatten_lists_an_empty_dict_as_its_own_key() -> None:
+    """An empty dict is a leaf, not an absence.
+
+    `models.ttl_by_priority` and `planner.reserved_mb` both default to `{}`;
+    recursing into them emitted no rows, so `sfctl config get` listed neither
+    and the keys were undiscoverable from the CLI.
+    """
+    flat = dict(cli_module._flatten({"models": {"ttl_by_priority": {}, "default_ctx": 8192}}))
+    assert flat["models.ttl_by_priority"] == {}
+    assert flat["models.default_ctx"] == 8192
+    # The root has no key to print, so an empty config stays an empty listing.
+    assert cli_module._flatten({}) == []
+
+
+def test_config_get_listing_carries_the_empty_dict_keys(monkeypatch: Any) -> None:
+    payload = {
+        "config": {
+            "models": {"ttl_by_priority": {}, "default_ctx": 8192},
+            "planner": {"reserved_mb": {}},
+        },
+        "config_path": "config.yaml",
+    }
+    monkeypatch.setattr(cli_module, "with_client", lambda work: payload)
+    result = runner.invoke(
+        cli_module.app,
+        ["--url", "http://rig:1234", "--no-color", "config", "get"],
+        # Wide enough that Rich has no reason to fold a key across two lines.
+        env={"COLUMNS": "200"},
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, _all_output(result)
+    rendered = _all_output(result)
+    assert "models.ttl_by_priority" in rendered
+    assert "planner.reserved_mb" in rendered
+
+
 def test_redact_tree_masks_secret_looking_keys() -> None:
     payload = {
         "server": {"api_key": "sf-secret-value-1234", "port": 1234},
@@ -1365,3 +1432,462 @@ def test_an_id_column_is_not_squeezed_to_nothing() -> None:
     by_header = {str(column.header): column for column in table.columns}
     assert by_header["Model"].min_width == cli_module._ID_COLUMN_MIN_WIDTH
     assert by_header["Ctx"].min_width is None
+
+
+# ---------------------------------------------------------------------------
+# D48: load tiers reach the CLI
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (1, "1"),
+        (2, "2"),
+        (3, "3"),
+        (None, ""),
+        # A server that predates D48 omits the key entirely; so does a row the
+        # server declined to tier. Neither is "no tier", so neither may borrow
+        # the "-" that the other columns use for "not applicable".
+        ("2", ""),
+        ({}, ""),
+        # `bool` subclasses `int`, so a naive isinstance check renders a JSON
+        # `true` (a shape no server sends, but one a proxy could) as the tier
+        # "True" in a column of digits.
+        (True, ""),
+        (False, ""),
+    ],
+)
+def test_fmt_priority_is_a_bare_digit_or_nothing(value: Any, expected: str) -> None:
+    assert cli_module.fmt_priority(value) == expected
+
+
+def test_status_loaded_table_carries_the_tier(monkeypatch: Any, live_server: ServerHandle) -> None:
+    """`sfctl status` is where an operator asks "why is my load being held?",
+    and until D48 the tier that answers it was in `/api/status` but not in the
+    table -- so a tier-1 resident and a background one looked identical.
+
+    Injected at the client because a real loaded instance needs a real GPU.
+    The two rows differ ONLY in `priority`, and every other cell is chosen to
+    contain no digit `2`, so the assertion below pins the Prio cell alone.
+    """
+    real_status = cli_module.StudioForgeClient.status
+
+    def _row(model_id: str, **extra: Any) -> dict[str, Any]:
+        return {
+            "model_id": model_id,
+            "state": "ready",
+            "plan": {"ctx_size": 4096},
+            "port": 9001,
+            "pid": 9004,
+            "active_requests": 0,
+            **extra,
+        }
+
+    async def status_with_two_instances(self: Any) -> Any:
+        payload = await real_status(self)
+        payload["loaded"] = [_row("tiered/alpha", priority=2), _row("legacy/alpha")]
+        return payload
+
+    monkeypatch.setattr(cli_module.StudioForgeClient, "status", status_with_two_instances)
+    result = _invoke(live_server, "status", env={"COLUMNS": "200"})
+    assert result.exit_code == 0, _all_output(result)
+    output = _all_output(result)
+
+    # The column exists, and sits between PID and the TTL countdown: they are
+    # one policy (`models.ttl_by_priority` looks the countdown up by tier).
+    assert "Prio" in output
+    assert output.index("PID") < output.index("Prio") < output.index("TTL left")
+
+    tiered = next(line for line in output.splitlines() if "tiered/alpha" in line)
+    legacy = next(line for line in output.splitlines() if "legacy/alpha" in line)
+    assert "2" in tiered
+    assert "2" not in legacy
+
+
+STUB_PROFILE = ServerProfile(name="stub", url="http://stub:1234")
+
+
+def _recording_transport(seen: list[Any]) -> httpx.MockTransport:
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, json={"plan": {"model_id": "m", "fits": True}})
+
+    return httpx.MockTransport(handler)
+
+
+async def test_load_recommended_omits_the_new_keys_when_the_flags_are_unset() -> None:
+    """A pre-D48 server must see the request it saw before, byte for byte.
+
+    `max_slots` and `persist` are additive, and FastAPI would reject an unknown
+    field, so "unset" has to mean absent rather than `null`/`false`.
+    """
+    seen: list[Any] = []
+
+    async with StudioForgeClient(STUB_PROFILE) as client:
+        client.http._transport = _recording_transport(seen)  # noqa: SLF001 - shape the wire
+        await client.load_recommended("m", ctx_size=8192)
+        # An explicit false is still "no opinion" -- it must not appear either.
+        await client.load_recommended("m", ctx_size=8192, max_slots=None, persist=False)
+
+    assert seen == [{"ctx_size": 8192}, {"ctx_size": 8192}]
+
+
+async def test_load_recommended_sends_the_new_keys_when_asked() -> None:
+    seen: list[Any] = []
+
+    async with StudioForgeClient(STUB_PROFILE) as client:
+        client.http._transport = _recording_transport(seen)  # noqa: SLF001 - shape the wire
+        await client.load_recommended(
+            "m",
+            ctx_size=8192,
+            prefer_mode="dual_5090",
+            kv_min="q8_0",
+            max_slots=2,
+            persist=True,
+            priority=1,
+        )
+
+    assert seen == [
+        {
+            "ctx_size": 8192,
+            "prefer_mode": "dual_5090",
+            "kv_min": "q8_0",
+            "max_slots": 2,
+            "persist": True,
+            "priority": 1,
+        }
+    ]
+
+
+def _load_recommended_kwargs(monkeypatch: Any, *flags: str) -> dict[str, Any]:
+    """Run `sfctl models load-recommended` against a recording client."""
+    captured: dict[str, Any] = {}
+
+    class _Recorder:
+        async def load_recommended(self, model: str, **kwargs: Any) -> Any:
+            captured["model"] = model
+            captured.update(kwargs)
+            return {"plan": {"model_id": model, "fits": True, "ctx_size": 8192}}
+
+        async def settings(self, model: str) -> Any:
+            # `--persist` reads the profile back; agreeing here keeps this test
+            # about the flags rather than about the verification warning.
+            return {"ctx_size": 8192}
+
+    monkeypatch.setattr(cli_module, "with_client", lambda work: asyncio.run(work(_Recorder())))
+    result = runner.invoke(
+        cli_module.app,
+        [
+            "--url",
+            "http://rig:1234",
+            "--no-color",
+            "models",
+            "load-recommended",
+            "big/model",
+            "--ctx",
+            "8192",
+            *flags,
+        ],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, _all_output(result)
+    return captured
+
+
+def test_load_recommended_flags_reach_the_client(monkeypatch: Any) -> None:
+    captured = _load_recommended_kwargs(monkeypatch, "--max-slots", "4", "--persist")
+    assert captured["model"] == "big/model"
+    assert captured["ctx_size"] == 8192
+    assert captured["max_slots"] == 4
+    assert captured["persist"] is True
+
+
+def test_load_recommended_defaults_are_the_no_opinion_values(monkeypatch: Any) -> None:
+    captured = _load_recommended_kwargs(monkeypatch)
+    assert captured["max_slots"] is None
+    assert captured["persist"] is False
+
+
+#: What the server reports as having actually launched. `ctx_per_slot` is the
+#: per-slot number; `ctx_size` on a plan can be the total across slots, which
+#: is exactly the unit trap the readback has to avoid.
+_LAUNCHED_PLAN = {
+    "model_id": "big/model",
+    "fits": True,
+    "ctx_size": 16384,
+    "ctx_per_slot": 8192,
+    "parallel": 2,
+    "kv_cache_type": "q8_0",
+    "kv_cache_type_v": "q8_0",
+}
+
+_PERSISTED_SETTINGS = {
+    "ctx_size": 8192,
+    "parallel": 2,
+    "kv_cache_type": "q8_0",
+    "kv_cache_type_v": "q8_0",
+}
+
+
+def _run_persist(monkeypatch: Any, settings: Any, *flags: str) -> Any:
+    """`load-recommended --persist` against a server whose settings are `settings`.
+
+    `settings=None` stands for a settings read that failed outright.
+    """
+
+    class _Recorder:
+        async def load_recommended(self, model: str, **kwargs: Any) -> Any:
+            return {"plan": dict(_LAUNCHED_PLAN)}
+
+        async def settings(self, model: str) -> Any:
+            if settings is None:
+                raise ApiError("boom", status_code=500)
+            return dict(settings)
+
+    monkeypatch.setattr(cli_module, "with_client", lambda work: asyncio.run(work(_Recorder())))
+    return runner.invoke(
+        cli_module.app,
+        [
+            "--url",
+            "http://rig:1234",
+            "--no-color",
+            "models",
+            "load-recommended",
+            "big/model",
+            "--ctx",
+            "8192",
+            "--persist",
+            *flags,
+        ],
+        catch_exceptions=False,
+    )
+
+
+def test_persist_says_nothing_when_the_server_really_wrote_the_profile(monkeypatch: Any) -> None:
+    result = _run_persist(monkeypatch, _PERSISTED_SETTINGS)
+    assert result.exit_code == 0, _all_output(result)
+    assert "did not persist" not in _all_output(result)
+
+
+def test_persist_warns_when_an_old_server_silently_dropped_it(monkeypatch: Any) -> None:
+    """A pre-D48 server answers 200 and ignores the unknown `persist` field.
+
+    FastAPI drops an extra body key rather than rejecting it, so the load
+    succeeds and the operator's explicit write intent evaporates with no
+    signal at all. The settings row is therefore read back, not assumed.
+    """
+    result = _run_persist(monkeypatch, {"ctx_size": None, "parallel": None})
+    assert result.exit_code == 0, _all_output(result)
+    output = _all_output(result)
+    assert "did not persist" in output
+    assert "sfctl models settings big/model" in output
+
+
+def test_persist_warning_names_the_field_that_disagrees(monkeypatch: Any) -> None:
+    """The NEW server's best-effort skip surfaces here too, so say what differs."""
+    result = _run_persist(monkeypatch, {**_PERSISTED_SETTINGS, "parallel": 4})
+    assert result.exit_code == 0, _all_output(result)
+    output = _all_output(result)
+    assert "did not persist" in output
+    assert "parallel" in output
+
+
+def test_persist_compares_ctx_per_slot_not_the_plans_total(monkeypatch: Any) -> None:
+    """`settings.ctx_size` is PER SLOT; a plan's `ctx_size` may be the total.
+
+    Comparing the two name-to-name would warn on every correctly persisted
+    multi-slot model, which is worse than not warning at all.
+    """
+    result = _run_persist(monkeypatch, _PERSISTED_SETTINGS)
+    assert "did not persist" not in _all_output(result)
+    # ...and the total really is the wrong number to have compared against.
+    assert _LAUNCHED_PLAN["ctx_size"] != _PERSISTED_SETTINGS["ctx_size"]
+
+
+def test_persist_warns_when_the_settings_cannot_be_read_back(monkeypatch: Any) -> None:
+    """Verification must never turn a successful load into a failed command."""
+    result = _run_persist(monkeypatch, None)
+    assert result.exit_code == 0, _all_output(result)
+    assert "could not be read back" in _all_output(result)
+
+
+def test_persist_warning_does_not_pollute_the_json_payload(monkeypatch: Any) -> None:
+    """The note is human-only, so it goes to stderr like every other one here.
+
+    `--json` promises a parseable stdout; a caller piping into `jq` must not
+    have to strip prose off the front of the payload.
+    """
+    result = _run_persist(monkeypatch, {"ctx_size": None}, "--json")
+    assert result.exit_code == 0, _all_output(result)
+    assert json.loads(result.stdout) == {"plan": _LAUNCHED_PLAN}
+    assert "did not persist" not in result.stdout
+    assert "did not persist" in result.stderr
+
+
+def test_no_readback_at_all_without_persist(monkeypatch: Any) -> None:
+    """Without `--persist` there is no write intent, so nothing is verified."""
+    asked: list[str] = []
+
+    class _Recorder:
+        async def load_recommended(self, model: str, **kwargs: Any) -> Any:
+            return {"plan": dict(_LAUNCHED_PLAN)}
+
+        async def settings(self, model: str) -> Any:
+            asked.append(model)
+            return {}
+
+    monkeypatch.setattr(cli_module, "with_client", lambda work: asyncio.run(work(_Recorder())))
+    result = runner.invoke(
+        cli_module.app,
+        ["--url", "http://rig:1234", "--no-color", "models", "load-recommended", "m", "--ctx", "8"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, _all_output(result)
+    assert asked == []
+    assert "did not persist" not in _all_output(result)
+
+
+def _busy_response(payload: Any, *, headers: dict[str, str] | None = None) -> httpx.Response:
+    request = httpx.Request("POST", "http://rig:1234/api/models/beta/load")
+    return httpx.Response(503, json=payload, headers=headers, request=request)
+
+
+def test_priority_hold_names_the_holder_and_its_tier() -> None:
+    """D46's refusal prose explains the POLICY at length; the operator staring
+    at a failed command needs the two facts -- who has the cards, and for how
+    long -- so the message is replaced rather than appended to."""
+    error = StudioForgeClient._error_from(  # noqa: SLF001 - the parser is the unit
+        _busy_response(
+            {
+                "error": {
+                    "message": (
+                        "a priority 1 model ('qwen-chat') is loading; requests and loads "
+                        "for lower-priority models are held off until it is serving so it "
+                        "gets the cards and the bandwidth. Retry shortly."
+                    ),
+                    "type": "server_error",
+                    "code": "priority_hold",
+                    "param": None,
+                    "studioforge": {
+                        "busy": {"loading": "qwen-chat"},
+                        "retry_after_s": 10,
+                        "priority_hold": {"model_id": "qwen-chat", "priority": 1},
+                    },
+                }
+            }
+        )
+    )
+    assert isinstance(error, ApiError)
+    assert error.code == "priority_hold"
+    assert error.status_code == 503
+    assert error.message == (
+        "held off while tier-1 'qwen-chat' loads (the server asked for 10s before retrying)"
+    )
+    assert "lower-priority models are held off" not in error.message
+    assert any("qwen-chat" in s and "sfctl status" in s for s in error.suggestions)
+    assert any("wait 10s" in s for s in error.suggestions)
+
+
+def test_priority_hold_is_recognised_from_the_details_block_alone() -> None:
+    """The code is the primary signal, but the holder block is what carries the
+    facts -- a 503 that only has the block must still be rewritten."""
+    error = StudioForgeClient._error_from(  # noqa: SLF001
+        _busy_response(
+            {
+                "error": {
+                    "message": "a priority 2 model ('agent-model') is loading; retry shortly.",
+                    "type": "server_error",
+                    "code": "model_busy",
+                    "studioforge": {"priority_hold": {"model_id": "agent-model", "priority": 2}},
+                }
+            }
+        )
+    )
+    assert isinstance(error, ApiError)
+    assert error.message == "held off while tier-2 'agent-model' loads"
+
+
+def test_priority_hold_without_a_holder_block_still_reads_as_a_hold() -> None:
+    """An older/leaner server may send the code with no diagnostics at all."""
+    error = StudioForgeClient._error_from(  # noqa: SLF001
+        _busy_response(
+            {"error": {"message": "held", "type": "server_error", "code": "priority_hold"}}
+        )
+    )
+    assert isinstance(error, ApiError)
+    assert error.message == "held off while 'another model' loads"
+    assert "tier-" not in error.message
+
+
+def test_priority_hold_never_renders_a_boolean_tier() -> None:
+    """`bool` is an `int`, so an unsanitised `true` would print "tier-True"."""
+    error = StudioForgeClient._error_from(  # noqa: SLF001
+        _busy_response(
+            {
+                "error": {
+                    "message": "held",
+                    "code": "priority_hold",
+                    "studioforge": {"priority_hold": {"model_id": "x", "priority": True}},
+                }
+            }
+        )
+    )
+    assert isinstance(error, ApiError)
+    assert error.message == "held off while 'x' loads"
+    assert "True" not in error.message
+
+
+def test_a_plain_model_busy_503_is_unchanged_by_the_hold_branch() -> None:
+    """The hold rewrite sits on the SHARED 503 path, so the ordinary
+    "a request is in flight" refusal is the regression to watch: its message,
+    suggestions and code must come through exactly as they did before D48."""
+    error = StudioForgeClient._error_from(  # noqa: SLF001
+        _busy_response(
+            {
+                "error": {
+                    "message": "model 'beta' is busy serving another request",
+                    "type": "server_error",
+                    "code": "model_busy",
+                    "param": None,
+                    "studioforge": {
+                        "busy": {"active_requests": 1},
+                        "retry_after_s": 10,
+                        "suggestions": ["try again once the current request drains"],
+                    },
+                }
+            }
+        )
+    )
+    assert isinstance(error, ApiError)
+    assert error.code == "model_busy"
+    assert error.status_code == 503
+    assert error.message == (
+        "model 'beta' is busy serving another request (the server asked for 10s before retrying)"
+    )
+    assert "held off" not in error.message
+    assert error.suggestions == [
+        "try again once the current request drains",
+        "wait 10s and run the same command again",
+    ]
+
+
+def test_a_benchmark_busy_503_is_also_untouched() -> None:
+    """The other per-raise code override on the same class (`benchmark_busy`)
+    shares the path; only `priority_hold` may claim the rewrite."""
+    error = StudioForgeClient._error_from(  # noqa: SLF001
+        _busy_response(
+            {
+                "error": {
+                    "message": "a parallel benchmark is running on 'gamma'",
+                    "code": "benchmark_busy",
+                    "studioforge": {"retry_after_s": 30},
+                }
+            },
+            headers={"Retry-After": "30"},
+        )
+    )
+    assert isinstance(error, ApiError)
+    assert error.code == "benchmark_busy"
+    assert error.message.startswith("a parallel benchmark is running on 'gamma'")
+    assert "held off" not in error.message

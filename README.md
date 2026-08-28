@@ -12,11 +12,13 @@ switching is a host change, not a rewrite.
 **Status:** v1.26-08-23. Windows is the reference platform and runs it daily; Linux is supported (CI
 runs both) and less battle-tested. Questions and bug reports: [Contact](#contact).
 
-**On versions.** There is one number here and it is the one in `pyproject.toml`: `GET /api/version`,
-`GET /health` and the `sfctl` package all report `0.2.0`. If a server you are talking to reports
-something else — a dated string such as `1.26-08-23` — you are talking to a private build from a
-different release line, not to this repository, and its tools and payloads may not match these
-docs. Check with `curl -s <host>/api/version`.
+**On versions.** StudioForge is calendar-versioned: a major, then the release date. The display
+version lives in `src/studioforge/__init__.py` — `1.26-08-23` — and is what `GET /api/version`,
+`GET /health`, the MCP `server_status` tool and `sfctl status` report. PEP 440 has no way to spell
+a hyphenated date, so both `pyproject.toml` files carry the same date as `1.26.8.23`, which is what
+`pip`/`uv` see in the wheel metadata; the `sfctl` companion ships from the same release and carries
+the same version, and release tags are `v1.26-08-23`. Check what a server is actually running with
+`curl -s <host>/api/version`.
 
 ---
 
@@ -87,7 +89,11 @@ are the ones you ask for.
   is chatting with, `2` a dispatched agent, `3` (or nothing) background. A chat load takes the
   fastest placement (idle background models are moved off its cards and reloaded afterwards
   where they fit), jumps the load queue, and holds background traffic off while it loads;
-  background can never displace it ([`DECISIONS.md`](DECISIONS.md) D46).
+  background can never displace it. The tier is saved per model (`settings.priority`), so it
+  survives a restart instead of quietly falling back to background; a single request can state
+  its own tier in the body of a chat completion; and traffic held off while a better-tier load
+  runs is refused with the distinct code `priority_hold` and a `Retry-After` worth honouring
+  ([`DECISIONS.md`](DECISIONS.md) D46, D48).
 - **Drop-in for LM Studio.** Same port, same `/v1/models` behaviour, same library on disk —
   switching a client is a host change.
 - **Built for agents.** 29 MCP tools with a catalog that hands an agent the exact load

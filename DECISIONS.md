@@ -3135,3 +3135,303 @@ block; options over GET; the clients rollup), `tests/unit/
 test_placement_policy.py` (min_ctx floor/refusal/explicit-ask, allowed_devices
 bound and empty-set refusal, mixed-generation grading),
 `tests/unit/test_api_hardening.py` (PATCH joins the D32 gate).
+
+## D48 -- A tier a restart cannot forget, and a load profile worth keeping
+
+**Problem.** D46 gave a load a tier and remembered it in memory, on the reasoning that a tier
+describes what the clients are doing *right now*. The hole is that the memo dies with the process.
+The chat model on this rig is tiered once, by the companion app, at the start of a session; every
+gateway restart -- an engine update, an autostart at login, a crash -- dropped that, and the next
+just-in-time reload came back at **background**: evictable by the next background load, holding
+nothing off, taking whatever placement was left. Nothing reported the demotion, because from the
+server's side nothing had failed. Alongside it, five smaller gaps found in the same pass: a
+`load_recommended` walk that costs minutes resolved a context/KV/slot profile and then threw it
+away; `settings.max_parallel_cap` was advice the estimator took and a load request could exceed;
+`planner.prefer_single_gpu` was a whole-box policy with no per-model exception; every tier idled
+out at one `models.default_ttl_s`; and a 503 raised by a hold was indistinguishable, by code, from
+a 503 meaning "a request is in flight".
+
+**Decision.** A tier is a **persisted setting** with the runtime memo above it, a request may state
+its own tier for its own turn, and the profile a recommendation walk resolves can be frozen into
+settings on request. Two per-model hints become answers.
+
+1. **One ladder, walked everywhere.** The tier of a load is: the explicit ask on the request, else
+   the in-memory memo of this model's last explicit load, else the model's saved
+   `settings.priority` (1 / 2 / 3, or null for "no standing opinion"), else background. Both
+   `_resolve_tier` and `_effective_priority` walk it, so admission, TTL arithmetic and the load
+   path cannot disagree. The memo still outranks the setting -- what the clients are doing this
+   minute beats the standing default -- and every internal caller (autoload, the pin reconciler,
+   the rebalancer, an admin restart, the GUI buttons) passes no tier and inherits the fallback.
+   The cost is one registry lookup -- a lock hop -- on the admission path whenever neither an
+   instance nor a memo answers. Caching the setting beside the memo was the alternative and was
+   not taken: it is a second copy of a value the settings routes can change under it, which is the
+   class of quiet disagreement this entry exists to close.
+
+   This **revises D46's amendment**, which recorded as deliberate that "the in-memory tier memo has
+   no decay (a restart or an explicit re-tier is the demotion path, and the TTL sweep still
+   reclaims idle residents of every tier)". The memo still has no decay, and a restart still clears
+   it. What changes is where a restart *lands*: not on background, but on the saved tier. A restart
+   is therefore no longer a demotion path -- an explicit re-tier is, and so is clearing the
+   setting. The TTL half stands and is now per tier (5).
+
+2. **A tier is not a launch-time delta (D13).** `priority` never reaches the child's argv, so the
+   three places that compare a whole `ModelSettings` against the defaults to decide whether a
+   preset-only virtual model may share its base's `llama-server` -- `ModelManager.serving_record`
+   and the GUI's `has_launch_overrides` / `shares_base_instance` -- normalise it out of both sides.
+   Without that, giving a persona a standing tier would have split it silently onto its own
+   instance and cost a second full copy of the model in VRAM, which is precisely the VRAM the
+   preset sharing exists to save.
+
+3. **A request may state its own tier.** `priority` is accepted in the JSON body of
+   `POST /v1/chat/completions` and `POST /v1/completions` (and their `/api/v0` twins by
+   delegation), consumed before forwarding exactly as LM Studio's `ttl` is. Junk is **refused**
+   with a 400 naming the parameter rather than ignored the way a junk `ttl` is: a mistyped TTL
+   costs a wrong idle timer, a mistyped tier silently demotes a chat turn to background and then
+   has it refused during the next load -- the failure this field exists to prevent. The threading
+   rule is one sentence: **a request's tier gates its own admission and tiers the just-in-time load
+   it triggers; it never re-tiers a running instance and never writes the memo.** A bot naming
+   `priority: 1` cannot promote the instance a person's chat is sharing. Security: the load routes
+   already accept an unauthenticated `priority: 1` on an open install, so a request-level tier adds
+   no privilege -- a tier-1 inference request can open a hold through its JIT load exactly as an
+   unauthenticated `load_model` could, and `server.api_key` remains the fence.
+
+4. **The hold answers in its own code.** The D46 hold refusal now carries `code: "priority_hold"`
+   beside its class (the `benchmark_busy` precedent). Every other `ModelBusyError` means "wait for
+   a request to finish"; this one means "wait for a *load* to finish", and a client that wanted to
+   tell them apart had only prose to match on. Class, status, `Retry-After` and
+   `details.priority_hold` are unchanged.
+
+5. **An idle timer per tier.** `models.ttl_by_priority` maps a tier to seconds and is consulted
+   between a model's own `settings.ttl_s` and `models.default_ttl_s`, so the chat model can stay
+   resident for an hour while background work is reaped in minutes without either model carrying a
+   per-model override. It ships **empty**, which gives every tier `default_ttl_s` -- byte-identical
+   to the pre-D48 answer, because a populated default would have quietly shortened background
+   residency on every existing install, and a shipped default does not make a policy decision. The
+   suggested `{1: 3600, 2: 1800, 3: 900}` lives in `config.example.yaml`'s annotation instead. The
+   tier is resolved from the *instance* when a TTL is stamped, and re-tiering a ready instance now
+   restamps it -- which deliberately discards any per-request `ttl` override standing on that
+   instance, because a re-tier is a statement about what the model is and outranks one request's
+   opinion about how long it should live.
+
+6. **`load_recommended` can keep what it found.** `kv_min` reaches the MCP tool (REST and the
+   manager already had it). `max_slots` caps the slot count for one call: the estimator's answer is
+   what a placement *could* sustain, and a caller that knows it has three bots does not want the
+   other five slots' KV cache priced into the fit. It is applied inside the walk, before the
+   descent loop verifies the count, so the winning plan is really planned at the capped number --
+   and deliberately not plumbed into the planner's capacity sizing, where the catalog's concurrency
+   figures stay policy-free. `persist` writes the resolved profile -- context per slot, both KV
+   cache types, the slot count and the tier -- into the model's saved settings after the load
+   succeeds, sourced from the plan that actually launched rather than from what the walk hoped for.
+   The placement is deliberately **not** written: a set of cards is a one-shot load argument (D36),
+   and the cards that happened to be free this minute are not a property of the model.
+
+   Two hard refusals run *before* the walk, because a refusal the caller could have had at once is
+   worse the later it arrives: a preset-only virtual model (the write would land on the base and
+   every persona sharing it; the message names the base id to call it on), and a benchmark already
+   running on that model (it rewrites these very fields and restores them at the end). *After* a
+   load has succeeded, anything that refuses the save is a **skip with a warning**, never a raise:
+   a benchmark that started during the multi-minute load, or the settings validation rejecting the
+   resolved row when a cap was lowered under a resident. The model is loaded either way, and
+   turning a good load into an error over its bookkeeping half is the worse answer -- so a success
+   here means the model is loaded and does not by itself prove the profile was saved. The trade
+   `persist` makes is stated wherever it is offered: it **freezes** the KV ladder and the slot
+   estimator for that model until the fields are nulled again (`PATCH /api/models/{id}/settings`
+   with nulls, D47).
+
+   This **revises D47**, which listed among the things it deliberately did not take "slot
+   save/restore across reloads". D47 declined the *automatic* half, and that still stands: nothing
+   is saved or restored behind the operator's back. `persist` is the explicit half -- a caller that
+   asks for the profile to be kept gets it written, once, and can clear it the same way it was set.
+
+   Over REST the flag is D32-gated inside the handler. `POST /load-recommended` stays ungated
+   (residency is open, LM Studio parity), but a body field that writes settings is exactly the box
+   change `_ADMIN_SETTINGS_SUFFIXES` protects, and `is_admin_mutation` can only see a method and a
+   path. `auth.require_admin_action` is the first body-gated admin check: `server.api_key`
+   configured (the middleware already authenticated the caller), else a local peer that is not a
+   cross-site browser page, else the MCP pairing PIN, else the existing 403
+   `remote_admin_requires_credential` -- worded so the caller knows the route stays open and the
+   same request without `persist` is accepted. The MCP tool needs no extra gate: a mutating MCP
+   POST from off the box already passes the D32 middleware, and stdio is local trust.
+
+7. **A stated cap is a ceiling, refused at both ends.** `settings.max_parallel_cap` was a bound on
+   the estimator that an explicit `parallel` walked straight past. Now `ModelManager.load` refuses
+   a **request** `parallel` above the cap (400, `param: "parallel"`, details carrying the cap and
+   the requested value) and `Registry.save_settings` refuses to store settings whose own `parallel`
+   exceeds the cap (`param: "settings"`). D14's promise -- an explicit value is honoured verbatim,
+   never silently clamped -- and a cap the operator stated cannot both be satisfied, so the
+   conflict is refused loudly rather than resolved quietly in either direction. The cross-check is
+   deliberately not a pydantic `model_validator`: `Registry._settings_from` falls back to
+   `ModelSettings()` when hydration raises, so a legacy row that violated a cap added later would
+   not merely fail to load, it would reset that model's every saved field on every scan.
+
+8. **`prefer_single_gpu` per model.** `settings.prefer_single_gpu` is a tri-state -- `None`
+   inherits `planner.prefer_single_gpu` -- read at the planner's single placement site. It governs
+   the **primary** placement walk only: the eviction-fallback round still tries single-card
+   placements before splits regardless of the flag, because there the alternative is refusing the
+   load outright and the cheap option is always worth a try.
+
+**Surfaces.** `settings.priority`, `settings.prefer_single_gpu` and the now-hard
+`settings.max_parallel_cap` over `PUT`/`PATCH /api/models/{id}/settings` and in the GUI settings
+dialog (*Load priority*, *Prefer a single GPU*, *Max parallel slots*); `models.ttl_by_priority` in
+`config.yaml` and as three per-tier rows on the Setup tab; `priority` in the body of
+`POST /v1/chat/completions` and `POST /v1/completions`; `kv_min`, `max_slots` and `persist` on
+`POST /api/models/{id}/load-recommended` and the `load_recommended` MCP tool, with `--max-slots`
+and `--persist` on `sfctl models load-recommended`; `priority` on `GET /api/models` rows, in the
+`studioforge` block of `/v1/models` for loaded models, and -- beside `speculative` -- on every MCP
+compact instance, which lights up `server_status`, `model_info`, `load_model` and
+`load_recommended` at once; the tier as a chip and a word in the detail line on the dashboard's
+loaded cards, and a `Prio` column in `sfctl status`; and `code: "priority_hold"` on the hold's 503,
+which `sfctl` rewrites into "held off while tier-1 'X' loads".
+
+**A refusal that was written in D46 goes live here.** `reserve_gpus` refuses a grant whose cards
+hold an *idle* chat- or agent-tier resident (`LeaseConflictError`, `force=true` overrides it
+exactly as it does for a pin) -- D46's rule that the lease plane must not be an end-run around the
+tiers. That branch was near-unreachable in practice while tiers died with the process: after any
+restart every resident was background. With tiers persisted it fires for real, so the workflows that
+lease cards on this rig -- ClawForge taking a card for a render, ClawChat reserving one for a
+companion -- should expect it and pass `force=true` deliberately rather than read it as a new
+refusal.
+
+**One vocabulary, three hand-kept copies.** The tier set 1/2/3 is now written out by hand in three
+places: the `ModelSettings.priority` validator, the `models.ttl_by_priority` config validator and
+the GUI's `PRIORITY_LABELS`. None of `types`, `config` or `gui` may import `core.priority` -- that
+is the dependency direction in `docs/DEVELOPMENT.md` -- so each carries a pointer comment to
+`core/priority.py`, and a unit test pins the GUI's copy against core's. A fourth tier would be four
+edits; that is the accepted price of the import rule, recorded so the next person finds all three.
+
+**Deliberately not taken here**: auto-queueing held loads -- the trade documented in
+`core/priority.py` stands, and an inference socket must drain rather than park through a
+multi-minute load; `min_slots` (`settings.parallel` already states a floor, and a second knob
+pointing the other way at the same estimator is two ways to say one thing); persisting the
+placement a `load_recommended` walk chose (a placement is a one-shot load argument, D36); lease
+priority classes and calendars, which D47 also declined and which still want their own decision;
+per-request tiers on `/v1/embeddings`, `/v1/rerank` and `/v1/tokenize` (the same scope `ttl` has --
+these are short calls, not the multi-minute loads a hold exists for); and the legacy hole in (7) --
+a settings row whose own `parallel` exceeds a cap added later still just-in-time loads, because
+only the request argument is checked. No settings write on such a model then succeeds until the
+pair is consistent -- the whole resulting row is validated, not just the fields sent, so any
+`PATCH` must also lower `parallel` or raise the cap -- and `parallel_bench`'s post-sweep restore
+of that model hits the same
+refusal if an operator lowers its cap mid-run: the restore is swallowed, the report says
+`restored: false` and carries a note, and the model is left at the benchmark's settings.
+
+**Tests.** `tests/unit/test_priority.py` (the resolution ladder -- the saved tier sitting between
+the memo and background, a fresh manager loading a saved chat model at the chat tier, a running
+instance still outranking the setting, a tier for a model that no longer exists answering
+background rather than raising; the request tier's admission, that it never re-tiers a running
+instance and leaves no memo behind; the `priority_hold` code and its details block; the D13 sharing
+pin, that a tiered persona still shares its base's instance),
+`tests/unit/test_gateway_lifecycle.py` (the `ttl_by_priority` matrix, an empty map answering
+exactly as it did before for every tier, a tier TTL of 0 keeping that tier resident, a re-tier
+restamping the effective TTL, and `_pop_priority` taking the field out of the upstream payload),
+`tests/unit/test_load_recommended.py` (`max_slots` capping the chosen count and the 400 below 1,
+what `persist` writes, that the placement is not among it, its two hard refusals and its post-load
+skips), `tests/unit/test_planner_parallel.py` and `tests/unit/test_registry.py` (both cap refusals,
+a request at the cap honoured verbatim, and a legacy row above the cap still hydrating with its
+fields intact and still loading), `tests/unit/test_placement_policy.py` (per-model
+`prefer_single_gpu` overriding the global in both directions, `None` inheriting it),
+`tests/unit/test_mcp.py` (the tool schema and the compact instance's new keys),
+`tests/unit/test_catalog_routes.py` and `tests/unit/test_api_hardening.py` (every body knob
+reaching the manager, the tier on `/api/models` rows and on `/v1/models` entries for loaded models
+only, and the body-gated `persist` 403), `tests/unit/test_request_priority.py` (the tier never
+reaching `llama-server` on either OpenAI route, the 400 naming the parameter, and a hold that
+refuses a background turn while a chat turn passes), `tests/unit/test_gui_setup_tab.py` and
+`tests/unit/test_gui.py` (the custom-widget bookkeeping for the per-tier TTL rows, the GUI's tier
+vocabulary pinned against core's, the D13 GUI half, and the settings-form round trip), and
+`tests/unit/test_companion.py` (the `Prio` column, the flags omitted when unset, the rewritten hold
+message, and a plain busy 503 left untouched by that branch).
+
+### D48, amended the same day: what the review pass corrected
+
+A second review round over the diff, before it ever ran. None of these is a
+new rule; each is the decision above actually enforced -- and two of them
+move a line the entry itself had drawn in the wrong place.
+
+* **A request tier cannot demote the load it triggers.** `ensure_loaded`
+  passed the request's tier straight into the just-in-time load, so a single
+  background-tagged turn against the chat model cold-loaded it at tier 3 and
+  it stayed there for the whole residency, with no path back -- the silent
+  demotion this whole entry exists to close, arriving through the very field
+  (3) added to prevent it. The load now runs at
+  `min(requested, standing)`, with `standing` re-resolved under the load lock
+  so an explicit load that tiered the model while this caller queued is not
+  undone. Admission is unchanged: a request is still gated on its *verbatim*
+  tier, so a turn may claim less urgency for itself without demoting the
+  model everybody else shares. The rule in (3) gains a clause: a request's
+  tier gates its own admission and tiers the load it triggers, **only
+  upwards**.
+* **Both explicit load routes re-tier a resident identically.** D46's
+  amendment made `load`'s ready-instance branch stamp the live instance;
+  `load_recommended`'s already-resident early return did not, so the same ask
+  answered differently depending on which door it arrived through -- and the
+  `refresh_ttl` inside `_persist_load_profile` then priced the stale tier.
+  Both routes now call one `_retier_resident` helper. That early return also
+  honours `max_slots` now: an over-cap resident is reloaded rather than
+  handed back, because being handed eight slots is not an answer to "cap this
+  call at three".
+* **The re-tier's TTL restamp is gated on a configured map.** (5) records the
+  restamp as deliberately discarding any per-request `ttl` override standing
+  on the instance. That trade is only worth making where a tier can change
+  the answer: while `models.ttl_by_priority` is empty -- the shipped default,
+  and therefore most installs -- the restamp cannot reprice anything and only
+  throws the override away for nothing. It now runs only when the map is
+  populated. The populated case is unchanged, and still discards the
+  override.
+* **`persist` writes a tier only when the caller named one.** It wrote the
+  *resolved* tier, which meant a call that said nothing about priority could
+  capture another client's in-memory memo as this model's permanent setting,
+  or materialise the implicit background default as though somebody had
+  chosen it -- a standing setting invented out of a runtime accident, which
+  is the class of quiet disagreement (1) exists to close. The parameter is
+  now the caller's **explicit ask**, and the key is simply absent from the
+  update when there is none, so the stored tier carries through untouched.
+  The post-load skip in (6) also widened past `BadRequestError` to every
+  `StudioForgeError` (the record deleted while the multi-minute walk ran) and
+  to whatever the storage layer raises on a bad day: the promise is that a
+  good load is never failed by its bookkeeping half, and a narrow `except`
+  only kept it for the failures that had been thought of.
+* **The cap's legacy hole is narrower than (7) recorded, in both
+  directions.** The *request* check now takes `enforce_parallel_cap=False`
+  from the three internal callers that replay a shape this server already
+  launched -- the priority-eviction restore, the D42 rebalancer, and
+  `parallel_bench`'s leave-as-found -- because each reproduces a live
+  instance's own `plan.parallel` rather than stating a count, and a cap
+  lowered under a resident must not be the reason the box cannot be put back
+  the way it was found. So the residual hole recorded in "deliberately not
+  taken" widens from "a legacy row still just-in-time loads" to **every path
+  that reproduces an existing instance keeps working**; and the `restored:
+  false` symptom recorded beside it no longer follows from a cap lowered
+  mid-run, since the benchmark's restore is exactly such a replay. What is
+  left of that symptom is a restore that fails for the ordinary reasons a
+  load fails. In the other direction, `Registry.save_settings`'s cross-check
+  now fires only when the submitted row **changes** `parallel` or
+  `max_parallel_cap`: refusing every save of a row that already carried the
+  conflict bricked unrelated edits -- a ttl, a pin, the GUI A/B helper's
+  save-and-restore round trip -- over a conflict this caller neither created
+  nor asserted. Touch either number and it is an assertion again, and it is
+  refused. Both refusals now carry the two numbers in machine-readable
+  `details`.
+* **A standing tier nothing would ever read is refused, not stored.** (2)
+  normalises `priority` out of the sharing comparison so a tiered persona
+  keeps sharing its base's `llama-server` -- which is also precisely why the
+  persona's own row is never the one a tier is read from: every tier read
+  resolves the serving record. Storing it showed the operator a saved value
+  that did nothing. `save_settings` now refuses a non-null `priority` on a
+  preset-only virtual model, naming the base id to set it on; a persona
+  carrying any launch override of its own keeps the field, because it earns
+  its own instance and its own row is then what `_settings_priority` reads
+  (the test mirrors `_NON_LAUNCH_SETTINGS`, and says so). The GUI disables
+  the select for a sharing persona rather than letting the operator meet the
+  refusal, and `plan_preview` now resolves its tier through the serving
+  record, so the preview prices the tier the load will actually run at.
+* **The product's own chat claims the chat tier.** The GUI Chat tab loaded at
+  the default -- background -- so a person typing into StudioForge's own
+  window could be held off, or outranked on the cards, by an agent's tier-2
+  load. It now loads at tier 1, which is the definition (3) gives that tier.
+* Smaller, same pass: `ModelManager.effective_priority` /
+  `effective_priority_for` are public, so `GET /api/models` no longer reaches
+  into the private ladder; the `ModelSettings.priority` validator rejects
+  `1.0` and `True`, which `int`-by-equality had been letting through; and the
+  Setup tab's per-tier TTL rows refuse a bad box **by name** instead of
+  dropping that tier from the mapping in silence, with the same message
+  shown under the rows as you type.

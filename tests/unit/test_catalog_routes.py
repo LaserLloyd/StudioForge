@@ -5,7 +5,9 @@ rather than logic and wiring is exactly where a rename goes unnoticed:
 
 * ``GET /api/catalog`` and its query parameters,
 * ``/api/status`` gaining each loaded model's ``requests_deferred``,
-* ``/v1/models`` gaining ``ctx_per_slot`` / ``max_parallel`` for loaded models.
+* ``/v1/models`` gaining ``ctx_per_slot`` / ``max_parallel`` for loaded models,
+* ``GET /api/models`` and ``POST .../load-recommended`` gaining the D48 load
+  tier and the ``max_slots`` / ``persist`` knobs.
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ from fastapi.testclient import TestClient
 from studioforge.api.app import build_state, create_app
 from studioforge.config import Config
 from studioforge.core import throughput
+from studioforge.errors import BadRequestError
 from studioforge.types import (
     GB,
     GgufMeta,
@@ -27,6 +30,8 @@ from studioforge.types import (
     LoadPlan,
     ModelCapabilities,
     ModelRecord,
+    ModelSettings,
+    VirtualPreset,
 )
 
 MODEL_ID = "vendor/thing-Q4_K_M"
@@ -97,6 +102,23 @@ class FakeRegistry:
     def save_settings(self, model_id: str, settings: Any) -> ModelRecord:
         record = self.get(model_id)
         assert record is not None
+        # Mirrors the real registry's D48 guard: a preset-only persona shares
+        # its base's llama-server, and a saved tier is a launch-time setting --
+        # writing one would silently split the persona onto a child of its own,
+        # which is the opposite of what "give my persona priority 1" means. The
+        # guard itself belongs to the registry's own suite; what the route test
+        # below pins is that PATCH/PUT surface this refusal as a clean 400.
+        if (
+            record.is_virtual
+            and record.base_model_id is not None
+            and getattr(settings, "priority", None) is not None
+        ):
+            raise BadRequestError(
+                f"'{model_id}' is served by its base model '{record.base_model_id}', "
+                f"so a priority cannot be saved on it -- save it on the base id "
+                f"instead, or give the persona launch settings of its own.",
+                param="priority",
+            )
         updated = record.model_copy(update={"settings": settings})
         self._records = [updated if r.id == model_id else r for r in self._records]
         return updated
@@ -411,6 +433,98 @@ def test_load_recommended_404s_on_an_unknown_model(app: Any) -> None:
     assert response.status_code == 404
 
 
+def test_load_recommended_forwards_every_body_knob_to_the_manager(app: Any) -> None:
+    """Wiring, which is exactly where a rename goes unnoticed: ``kv_min``,
+    ``priority``, ``max_slots`` and ``persist`` are all optional body fields
+    and all have to arrive as the manager's keyword arguments (D48)."""
+    seen: dict[str, Any] = {}
+
+    async def capture(model_id: str, ctx_size: int, **kwargs: Any) -> InstanceInfo:
+        seen.clear()
+        seen.update(model_id=model_id, ctx_size=ctx_size, **kwargs)
+        return InstanceInfo(model_id=model_id, state="ready", port=18100, plan=make_plan())
+
+    app.state.manager.load_recommended = capture
+
+    with TestClient(app, client=("127.0.0.1", 50000)) as http:
+        full = http.post(
+            f"/api/models/{MODEL_ID}/load-recommended",
+            json={
+                "ctx_size": 16384,
+                "kv_min": "q8_0",
+                "priority": 2,
+                "max_slots": 3,
+                "persist": True,
+            },
+        )
+        assert full.status_code == 200, full.text
+        assert seen["ctx_size"] == 16384
+        assert seen["kv_min"] == "q8_0"
+        assert seen["priority"] == 2
+        assert seen["max_slots"] == 3
+        assert seen["persist"] is True
+
+        # Omitted, they are the pre-D48 defaults -- an existing client's body
+        # means exactly what it meant before.
+        plain = http.post(f"/api/models/{MODEL_ID}/load-recommended", json={"ctx_size": 16384})
+        assert plain.status_code == 200, plain.text
+        assert seen["kv_min"] is None
+        assert seen["priority"] is None
+        assert seen["max_slots"] is None
+        assert seen["persist"] is False
+
+
+# ---------------------------------------------------------------------------
+# GET /api/models: the tier beside the TTL
+# ---------------------------------------------------------------------------
+
+
+def test_api_models_reports_the_tier_each_model_would_load_at(app: Any) -> None:
+    """Same soft-answer caveat as ``effective_ttl_s``: it is what the *next*
+    load would use, and a request may still name its own tier (D46/D48)."""
+    record = app.state.registry.get(MODEL_ID)
+    assert record is not None
+
+    with TestClient(app) as http:
+        assert http.get("/api/models").json()["models"][0]["priority"] == 3
+
+        # The saved setting is the floor a restart falls back to...
+        record.settings = ModelSettings(priority=2)
+        assert http.get("/api/models").json()["models"][0]["priority"] == 2
+
+        # ...and a running instance is the truth about what is serving.
+        loaded(
+            app,
+            InstanceInfo(
+                model_id=MODEL_ID, state="ready", port=18100, priority=1, plan=make_plan()
+            ),
+        )
+        row = http.get("/api/models").json()["models"][0]
+
+    assert row["loaded"] is True
+    assert row["priority"] == 1
+
+
+def test_v1_models_carries_the_tier_only_for_a_loaded_model(app: Any) -> None:
+    """An unloaded row's tier is a prediction, so it is left to GET /api/models
+    rather than put in the OpenAI vendor block beside real runtime facts."""
+    with TestClient(app) as http:
+        cold = http.get("/v1/models").json()["data"][0]
+        assert "priority" not in cold["studioforge"]
+
+        loaded(
+            app,
+            InstanceInfo(
+                model_id=MODEL_ID, state="ready", port=18100, priority=2, plan=make_plan()
+            ),
+        )
+        warm = http.get("/v1/models").json()["data"][0]
+
+    assert warm["studioforge"]["priority"] == 2
+    # ...and no new top-level OpenAI key was invented for it.
+    assert "priority" not in warm
+
+
 def test_parallel_observations_start_empty_and_are_readable(app: Any) -> None:
     """The rows behind recommended_parallel, so a caller can see the evidence."""
     with TestClient(app) as http:
@@ -533,6 +647,54 @@ def test_patch_settings_rejects_an_unknown_field(app: Any) -> None:
         response = http.patch(f"/api/models/{MODEL_ID}/settings", json={"ctxsize": 1})
     assert response.status_code == 400
     assert "ctxsize" in response.json()["error"]["message"]
+
+
+PERSONA_ID = "vendor/thing-Q4_K_M:coach"
+
+
+def make_persona(record_id: str = PERSONA_ID, base: str = MODEL_ID) -> ModelRecord:
+    """A preset-only persona: request-time behaviour only, so it is served by
+    its base's instance rather than a child of its own."""
+    return make_record(record_id).model_copy(
+        update={
+            "is_virtual": True,
+            "base_model_id": base,
+            "preset": VirtualPreset(system_prompt="you are a coach"),
+        }
+    )
+
+
+@pytest.mark.parametrize("verb", ["patch", "put"])
+def test_saving_a_tier_on_a_persona_is_a_400_that_names_the_base(app: Any, verb: str) -> None:
+    """A persona that shares its base's llama-server cannot carry a tier of its
+    own (D48), and the refusal has to reach the client as a readable 400 naming
+    the base id -- not a 500, and not a success that silently split the
+    persona onto its own child. The registry raises it; this pins that the
+    settings routes let it through unmangled, both verbs.
+    """
+    persona = make_persona()
+    registry = FakeRegistry([make_record(), persona])
+    app.state.registry = registry
+    app.state.manager.registry = registry
+    body: dict[str, Any] = (
+        {"priority": 1}
+        if verb == "patch"
+        else {**persona.settings.model_dump(mode="json"), "priority": 1}
+    )
+
+    with TestClient(app, client=LOOPBACK) as http:
+        response = getattr(http, verb)(f"/api/models/{PERSONA_ID}/settings", json=body)
+        # The base itself takes the same write: the refusal is about sharing an
+        # instance, not about the tier.
+        allowed = http.patch(f"/api/models/{MODEL_ID}/settings", json={"priority": 1})
+
+    assert response.status_code == 400, response.text
+    error = response.json()["error"]
+    assert error["param"] == "priority"
+    assert MODEL_ID in error["message"], "the refusal has to say where to save it instead"
+
+    assert allowed.status_code == 200, allowed.text
+    assert allowed.json()["priority"] == 1
 
 
 def test_evictions_endpoint_names_who_evicted_what_and_why(app: Any) -> None:

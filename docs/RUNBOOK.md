@@ -76,6 +76,30 @@ benchmarks refuse a busy rig the same way. `load_recommended` on a model
 that is itself serving is a **503** with `retry_after_s` rather than a reload under its clients;
 `load_model(force=true)` is the only thing that interrupts a stream.
 
+**A 503 with `error.code: priority_hold`.** Not a failure and not a busy model: a chat- or
+agent-tier load (D46) is in flight, and until it settles, loads and inference for worse-tier models
+are refused so they drain off the cards instead of competing with the upload. The action is the
+`Retry-After` header — the hold lifts by itself, typically in the seconds-to-minutes a load takes.
+Nothing is wrong with the model that was refused.
+
+Who is holding it: `GET /health` (or `/api/health`, or `server_status`) carries
+`busy.priority_hold` as `{model_id, priority}` while a hold stands, and `null` otherwise; the same
+block is repeated in the refusal's own `details`. `GET /api/status` and `sfctl status` list every
+loaded model with the tier it loaded at (`priority`, the `Prio` column), which is who wins the
+cards once the hold clears. `GET /api/evictions` is where to look afterwards: the ring says what
+the tier-1 load displaced and why (`reason: plan`), and the recently-active victims are reloaded
+automatically once it settles.
+
+Holds became far more common with D48, because a tier now survives a restart: a model whose
+`settings.priority` is 1 or 2 loads at that tier for ever after, including on the just-in-time
+reload after a TTL unload. A caller sending `priority: 3` on its own requests does not escape that:
+the tier it names governs its own admission, but the load it triggers runs at the better of the
+requested tier and the standing one, so the reload still comes up at tier 1 or 2 and still holds
+worse-tier traffic off while it runs. If a background job is being held off more than you expect,
+check that model's saved `priority` (Models tab, or `sfctl models settings <model>`) — and expect
+`reserve_gpus` to refuse a lease whose cards hold an idle chat- or agent-tier model, which
+`force=true` overrides exactly as it does for a pin.
+
 **A device OOMs while the plan said it fits.** The `load observation` INFO line now carries
 `per_device_mb`, and a card holding more than 15% over its planned share logs *"a device holds more
 than its planned share"* with both numbers (D40). llama.cpp puts the output layer on the **last**

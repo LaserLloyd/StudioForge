@@ -841,6 +841,12 @@ class ParallelBenchmarker:
                 evict_busy=False,
                 source="benchmark:parallel-restore",
                 hold_traffic=False,
+                # The server reproducing a shape it already launched, not a
+                # user stating a count: ``previous`` is the instance's own
+                # plan, and a max_parallel_cap lowered while the run was going
+                # must not be the reason the box is left in the benchmark's
+                # shape instead of the one it was found in (D48).
+                enforce_parallel_cap=False,
             )
             report.restored = True
         except Exception as exc:  # noqa: BLE001 - a failed restore must be reported, not raised

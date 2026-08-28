@@ -138,6 +138,18 @@ class ModelSettings(BaseModel):
     kv_cache_type_v: KvCacheType | None = None
     ttl_s: int | None = None
     pinned: bool = False
+    #: The standing load tier for this model: 1 active chat, 2 dispatched
+    #: agent, 3 background (D46's vocabulary, core/priority.py). ``None`` = no
+    #: standing opinion, so the model falls through to background like every
+    #: pre-D46 load. It is the LAST word, not the first: an explicit tier on
+    #: the load request wins, and so does the in-memory memo of what clients
+    #: are doing right now -- this is the default a restart falls back to,
+    #: which is what makes a tier outlive one (D48).
+    #: NOT a launch-time delta: it never reaches llama-server's argv, so the
+    #: three places that compare whole settings against the defaults to decide
+    #: whether a preset-only model may share its base's instance must exclude
+    #: it (D13; the exclusions live in core/manager.py and gui/state.py).
+    priority: int | None = None
     draft_model_id: str | None = None
     device_override: list[int] | None = None
     #: The set of CUDA devices the planner MAY choose among for this model --
@@ -145,6 +157,11 @@ class ModelSettings(BaseModel):
     #: big dense model with null settings otherwise sprawls across whatever
     #: cards are free, mixed generations included. ``None`` = any card.
     allowed_devices: list[int] | None = None
+    #: Per-model override of ``planner.prefer_single_gpu``. ``None`` = inherit
+    #: the global setting. Only the primary placement walk honours it: the
+    #: eviction-fallback round tries single-card placements first regardless,
+    #: because there the alternative is refusing the load outright.
+    prefer_single_gpu: bool | None = None
     engine_tag: str | None = None  # per-model engine pin
 
     # --- Tier 2: advanced ----------------------------------------------
@@ -176,10 +193,15 @@ class ModelSettings(BaseModel):
     #: so stored settings, the GUI's settings form and older API clients keep
     #: round-tripping; it will be removed once those stop reading it.
     defrag_thold: float | None = None
-    #: Upper bound on the slot count the parallel estimator may choose for THIS
-    #: model, on top of the global ``MAX_PARALLEL_CAP``. Only meaningful while
-    #: ``models.default_parallel`` is ``"auto"`` -- an explicit ``parallel``
-    #: is honoured verbatim and is never capped (DECISIONS.md D14/D17).
+    #: Upper bound on the slot count for THIS model, on top of the global
+    #: ``MAX_PARALLEL_CAP``. It bounds what the parallel estimator may choose
+    #: while ``models.default_parallel`` is ``"auto"``, and since D48 it is a
+    #: hard ceiling rather than an estimator-only hint: a load request naming a
+    #: ``parallel`` above it is REFUSED (400), and saving settings whose own
+    #: ``parallel`` exceeds it is refused too. D14 still holds -- an explicit
+    #: value is honoured verbatim, never silently clamped -- but a cap the user
+    #: stated is now an answer rather than advice, so the two are reconciled by
+    #: refusing loudly instead of picking one (D14/D17/D48).
     max_parallel_cap: int | None = None
     #: Emit ``--kv-unified``: one shared KV pool across slots rather than an
     #: equal slice each. Same total VRAM, but a single long request can then use
@@ -263,6 +285,31 @@ class ModelSettings(BaseModel):
     def _nonneg_ttl(cls, v: int | None) -> int | None:
         if v is not None and v < 0:
             raise ValueError("ttl_s must be >= 0 (0 means never unload)")
+        return v
+
+    @field_validator("priority", mode="before")
+    @classmethod
+    def _known_priority(cls, v: Any) -> Any:
+        # The tier set is hardcoded rather than imported from
+        # core/priority.py: this module imports nothing from core by design
+        # (see the module docstring), so the two must be kept in step by hand.
+        # ``mode="before"`` because pydantic coerces ``True`` to ``1`` in lax
+        # mode, and tier 1 is the one tier that must never be reached by
+        # accident -- by the time an "after" validator ran the bool would
+        # already have become a valid-looking chat tier.
+        # ``not isinstance(v, int)`` rather than membership alone: ``1.0 in
+        # (1, 2, 3)`` is True by float equality, so a JSON body carrying
+        # ``"priority": 1.0`` used to be stored as a float this model then
+        # handed to code that compares tiers -- while the request-level
+        # ``normalise_priority`` refuses the very same value. One tier
+        # vocabulary, one answer.
+        if v is None:
+            return None
+        if isinstance(v, bool) or not isinstance(v, int) or v not in (1, 2, 3):
+            raise ValueError(
+                "priority must be 1 (active chat), 2 (dispatched agent), "
+                "3 (background) or null (no standing tier)"
+            )
         return v
 
     @field_validator("max_parallel_cap")

@@ -188,7 +188,22 @@ SHARED SERVER: check server_status.busy. A load that must evict a model
 mid-request is REFUSED (pass force=true only if you can see what you are
 interrupting), and test_model and benchmark_parallel refuse outright while
 anything is serving, loading or benchmarking -- all of them come back with
-retry_after_s, so waiting is usually cheaper than retrying.
+retry_after_s, so waiting is usually cheaper than retrying. A fourth refusal
+carries its own code: while a tier-1 or tier-2 load is in flight, loads and
+inference for worse-tier models come back with code `priority_hold`, with
+details.priority_hold naming the model being loaded (and its tier) and
+details.retry_after_s the wait -- a wait, not a failure, so honour the number
+rather than retrying at once. server_status sees it coming: busy.priority_hold
+is that same standing hold (or null) BEFORE you meet it, so read it beside
+active_requests / loading / testing.
+
+Every loaded row carries `priority`, the tier that load was made at (1 the
+model a person is chatting with, 2 a dispatched agent, 3 background), which is
+what decides who is held off and who wins the cards. It also carries
+`speculative`: null means the launch has not resolved drafting yet,
+{"type": "none", "reason": ...} means drafting was considered and declined --
+and above 4 slots automatic speculation always declines itself, because it
+trades spare compute for latency and a saturated batch has none to spare.
 
 A model's GPUs can change while it sits idle: when the box is quiet, the
 server relocates an idle model whose placement went stale (still sharing a
@@ -347,6 +362,16 @@ def _compact_instance(instance: Any) -> dict[str, Any]:
         # "gui", "autoload"... On a box several clients share, a model that
         # appeared without a requester is not a diagnosable event (D36).
         "loaded_by": instance.loaded_by,
+        # The tier this instance was loaded at (D46): 1 active chat, 2
+        # dispatched agent, 3 background. Read it beside `loaded_by` to see
+        # who would win the cards, and to know which side of a
+        # `priority_hold` refusal you are on.
+        "priority": instance.priority,
+        # What drafting this launch actually resolved to (D38). ``None`` and
+        # ``{"type": "none"}`` are different answers -- "not yet decided" vs
+        # "considered and declined, and here is `reason`" -- so neither is
+        # collapsed into the other.
+        "speculative": instance.speculative,
         "ttl_s": instance.ttl_s,
         "ttl_remaining_s": (
             round(instance.ttl_remaining_s) if instance.ttl_remaining_s is not None else None
@@ -897,7 +922,9 @@ def build_management_mcp(state: Any) -> MCPServer:
 
         Returns:
             The running instance: port, pid, devices, planned VRAM breakdown,
-            and the plan's ``max_parallel``.
+            the plan's ``max_parallel``, the tier it loaded at (``priority``)
+            and its resolved ``speculative`` block (``null`` = not decided yet,
+            ``{"type": "none", "reason": ...}`` = considered and declined).
         """
         instance = await state.manager.load(
             model_id,
@@ -921,7 +948,10 @@ def build_management_mcp(state: Any) -> MCPServer:
         model_id: str,
         ctx_size: int,
         prefer_mode: str | None = None,
+        kv_min: str | None = None,
         priority: int | None = None,
+        max_slots: int | None = None,
+        persist: bool = False,
     ) -> dict[str, Any]:
         """**The easy way to load.** Say the model and the context you need.
 
@@ -957,20 +987,70 @@ def build_management_mcp(state: Any) -> MCPServer:
             prefer_mode: A hardware-mode key from a ``placements[]`` row
                 (``dual_5090``, ``dual_3090``, ``all_gpus``, ``single_5090`` on
                 this rig) to try that placement instead of the default order.
+            kv_min: The lowest KV cache quality this load may accept -- "f16",
+                "q8_0" or "q4_0", those three only. It is a floor on the
+                quality-first ladder, not a choice: pass "f16" to mean "do not
+                quantize the cache to reach this window at all", and a window
+                that would need a worse cache is refused with the same
+                structured error instead of being reached quietly at lower
+                quality. Omitted, the whole ladder is available (a q4_0 K cache
+                is still never chosen automatically).
             priority: The load's tier: 1 for the model a person is actively
                 chatting with, 2 for a dispatched agent, 3 (or omitted) for
                 background work. A tier-1/2 load takes the best placement even
                 when idle worse-tier models must be displaced for it; the
                 recently active ones are reloaded afterwards where they fit.
+            max_slots: Ceiling on the number of concurrent slots this load may
+                choose, >= 1. The server's own answer is what the placement
+                *could* sustain; if you know how many conversations will really
+                run -- three bots, one window each -- cap it here and the KV
+                cache for the slots you will not use is never priced into the
+                fit, which often buys a larger window instead. Omitted, the
+                recommendation stands.
+            persist: Write the profile this call resolves -- context per slot,
+                both KV cache types, the slot count and the tier -- into the
+                model's saved settings, so a later plain load (including the
+                automatic one an inference request triggers) reproduces it
+                without you asking again. The trade: it freezes the KV ladder
+                and the slot estimator for this model, which then stop adapting
+                to what else is resident or to a changed machine; the settings
+                fields have to be nulled to hand the decision back, and no MCP
+                tool writes per-model settings, so that undo happens elsewhere:
+                ``PATCH /api/models/{id}/settings`` on the management REST port
+                with ``{"ctx_size": null, "kv_cache_type": null,
+                "kv_cache_type_v": null, "parallel": null, "priority": null}``
+                (a merge-patch: an explicit null clears exactly that field and
+                nothing else), the same fields set back to "Auto" in the
+                GUI's model settings dialog, or ``sfctl models settings
+                <model> --set ctx_size=null`` and friends from a shell -- a
+                literal null clears the field whatever it holds. Devices are
+                deliberately not persisted -- a placement is a one-shot load
+                argument. Refused for a preset-only virtual model (the write
+                would land on the base model and every persona sharing it, so
+                call it on the base id) and while that model is being
+                benchmarked. Both are checked before the walk begins, so the
+                refusal is an ordinary error result naming the reason and
+                nothing was loaded. After a successful load the write is
+                best-effort instead: anything that refuses it then -- a
+                benchmark that started *during* the load, or the settings
+                validation rejecting the resolved row (a resident whose slot
+                count predates a max_parallel_cap lowered under it) -- leaves
+                the load standing and skips only the write, so a success here
+                means the model is loaded but does not by itself prove the
+                profile was saved.
 
         Returns:
             The running instance: port, pid, devices, the KV cache type chosen,
-            the slot count, and the planned VRAM breakdown.
+            the slot count, the tier it loaded at (``priority``), its resolved
+            ``speculative`` block, and the planned VRAM breakdown.
         """
         instance = await state.manager.load_recommended(
             model_id,
             int(ctx_size),
             prefer_modes=[prefer_mode] if prefer_mode else None,
+            kv_min=kv_min,
+            max_slots=max_slots,
+            persist=persist,
             source="mcp:load_recommended",
             priority=priority,
         )
@@ -1550,18 +1630,25 @@ def build_management_mcp(state: Any) -> MCPServer:
 
         **Before load_model or test_model on a shared server, read ``busy``.**
         It carries ``active_requests`` (and which models are serving),
-        ``loading`` (model ids whose load is in flight) and ``testing`` (the
-        model a smoke test has claimed, or null). A load that would have to
-        evict a model mid-request is refused rather than granted, and
-        ``test_model`` refuses outright while any of those is non-zero -- so
-        checking here first turns a refusal into a short wait.
+        ``loading`` (model ids whose load is in flight), ``testing`` (the
+        model a smoke test has claimed, or null) and ``priority_hold`` (the
+        chat/agent load currently holding worse-tier traffic off, as
+        ``{"model_id", "priority"}``, or null -- the standing hold, read here
+        *before* a `priority_hold` refusal rather than after one). A load that
+        would have to evict a model mid-request is refused rather than granted,
+        and ``test_model`` refuses outright while any of those is non-zero --
+        so checking here first turns a refusal into a short wait.
 
         Returns:
             Per-GPU VRAM and utilization, every loaded model with its port,
-            remaining TTL and who loaded it (``loaded_by``), the active
-            llama.cpp engine tag, the total number of models in the library,
-            queue depth, what the server is busy with, active downloads,
-            engine-process attribution and whether the server is draining.
+            remaining TTL, who loaded it (``loaded_by``), the tier it loaded at
+            (``priority``: 1 active chat, 2 dispatched agent, 3 background) and
+            its resolved ``speculative`` block (``null`` = not decided yet,
+            ``{"type": "none", "reason": ...}`` = considered and declined, so
+            ``reason`` says why drafting is off), the active llama.cpp engine
+            tag, the total number of models in the library, queue depth, what
+            the server is busy with, active downloads, engine-process
+            attribution and whether the server is draining.
         """
         engine = state.engine_manager.active() if state.engine_manager is not None else None
         downloader = getattr(state, "downloader", None)

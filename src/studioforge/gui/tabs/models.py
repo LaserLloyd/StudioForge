@@ -41,6 +41,16 @@ _REASONING_FORMATS = ("", "none", "deepseek", "deepseek-legacy")
 _REASONING = ("", "on", "off", "auto")
 _TRI = {"auto": "Auto", "on": "On", "off": "Off"}
 
+#: Standing load tier (D46/D48). The stored value is ``int | None``; the widget
+#: speaks strings so the blank option is a real option rather than a falsy
+#: number, and the round trip goes through the two helpers below.
+_PRIORITIES = {
+    "": "None — no standing tier",
+    "1": "1 — chat",
+    "2": "2 — agent",
+    "3": "3 — background",
+}
+
 
 def _tri_to_value(text: str | None) -> bool | None:
     return {"on": True, "off": False}.get(str(text or "auto"))
@@ -50,6 +60,14 @@ def _tri_from_value(value: bool | None) -> str:
     if value is None:
         return "auto"
     return "on" if value else "off"
+
+
+def _priority_to_value(text: str | None) -> int | None:
+    return int(text) if text in ("1", "2", "3") else None
+
+
+def _priority_from_value(value: int | None) -> str:
+    return str(value) if value in (1, 2, 3) else ""
 
 
 # ---------------------------------------------------------------------------
@@ -729,6 +747,31 @@ def _settings_dialog(ctx: GuiContext, record: Any, table: Any) -> None:  # noqa:
                 .props("dense outlined")
                 .classes("w-52")
             )
+            priority = ui.select(
+                _PRIORITIES, value=_priority_from_value(form["priority"]), label="Load priority"
+            )
+            priority.props("dense outlined").classes("w-56")
+            # A preset-only persona rides its base's instance (D13), so it has
+            # no child of its own to tier and the registry refuses a standing
+            # tier on it outright. Don't offer the write.
+            #
+            # Read once, at open: the fields above can be edited in this same
+            # dialog, so a persona that shares now may stop sharing before Save
+            # (add a context override) without this select re-enabling. That is
+            # accepted -- the registry's refusal is the backstop, and it names
+            # the base -- rather than re-deriving a record from the half-typed
+            # form on every keystroke.
+            locked = st.priority_lock_note(record)
+            if locked:
+                priority.tooltip(locked)
+                priority.disable()
+            else:
+                priority.tooltip(
+                    "Standing tier for this model when nothing else says otherwise (D46/D48). "
+                    "A tier on the request itself, and what clients are doing right now, both "
+                    "outrank it; this is what a restart falls back to. Tier 1 and 2 loads may "
+                    "evict lower tiers and hold their traffic while they load."
+                )
         draft_note = ui.label("").classes("text-xs text-warning")
         if not drafts:
             ui.label(
@@ -749,6 +792,12 @@ def _settings_dialog(ctx: GuiContext, record: Any, table: Any) -> None:  # noqa:
                 threads_batch = _num("Threads (batch)", form["threads_batch"])
             with ui.row().classes("w-full gap-3 flex-wrap items-center"):
                 parallel = _num("Parallel slots", form["parallel"])
+                max_parallel_cap = _num("Max parallel slots", form["max_parallel_cap"])
+                max_parallel_cap.tooltip(
+                    "Ceiling on this model's slot count. Bounds the estimator while "
+                    "models.default_parallel is 'auto', and since D48 it is hard: an "
+                    "explicit parallel above it is refused rather than clamped."
+                )
                 cont = ui.toggle(_TRI, value=_tri_from_value(form["cont_batching"]))
                 cont.props("dense").tooltip("Continuous batching")
                 flash = ui.select(
@@ -767,6 +816,14 @@ def _settings_dialog(ctx: GuiContext, record: Any, table: Any) -> None:  # noqa:
                 mlock = ui.checkbox("mlock", value=bool(form["mlock"]))
                 no_mmap = ui.toggle(_TRI, value=_tri_from_value(form["no_mmap"]))
                 no_mmap.props("dense").tooltip("no-mmap")
+            with ui.row().classes("w-full gap-3 flex-wrap items-center"):
+                ui.label("Prefer a single GPU").classes("text-xs opacity-70")
+                prefer_single = ui.toggle(_TRI, value=_tri_from_value(form["prefer_single_gpu"]))
+                prefer_single.props("dense").tooltip(
+                    "Auto inherits planner.prefer_single_gpu. Governs the primary "
+                    "placement walk only: when nothing fits and the planner falls back to "
+                    "evicting, single-card placements are tried first either way."
+                )
             with ui.row().classes("w-full gap-3 flex-wrap"):
                 rope_base = _num("rope-freq-base", form["rope_freq_base"], precision=None)
                 rope_scale = _num("rope-freq-scale", form["rope_freq_scale"], precision=None)
@@ -826,11 +883,14 @@ def _settings_dialog(ctx: GuiContext, record: Any, table: Any) -> None:  # noqa:
                     "pinned": pinned.value,
                     "draft_model_id": draft.value,
                     "device_override": device.value,
+                    "priority": _priority_to_value(priority.value),
                     "batch_size": batch.value,
                     "ubatch_size": ubatch.value,
                     "threads": threads.value,
                     "threads_batch": threads_batch.value,
                     "parallel": parallel.value,
+                    "max_parallel_cap": max_parallel_cap.value,
+                    "prefer_single_gpu": _tri_to_value(prefer_single.value),
                     "cont_batching": _tri_to_value(cont.value),
                     "flash_attn": flash.value,
                     "split_mode": split.value,

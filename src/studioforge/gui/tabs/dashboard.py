@@ -358,6 +358,15 @@ def _loaded_card(
                 )
             if pinned:
                 ui.badge("pinned", color="accent").classes("text-xs")
+            tier_badge = st.priority_badge_label(instance.priority)
+            if tier_badge:
+                # Only tiers above background get a badge: background is the
+                # default every untiered load lands on, so badging it would put
+                # a chip on every row and say nothing. The tier is in the detail
+                # line below either way (D46/D48).
+                ui.badge(tier_badge, color="secondary").classes("text-xs").tooltip(
+                    st.priority_tooltip(instance.priority)
+                )
             ui.badge(
                 st.activity_label(introspection),
                 color=st.activity_colour(introspection),
@@ -389,6 +398,7 @@ def _loaded_card(
             f" · {st.activity_slots_text(introspection)}"
             f" · {st.device_text(instance)}"
             f" · TTL {st.instance_ttl_text(instance, pinned=pinned)}"
+            f" · tier {st.priority_label(instance.priority)}"
         ).classes("text-xs font-mono opacity-80")
         ui.label(
             f"active requests {instance.active_requests}"

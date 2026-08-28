@@ -16,7 +16,12 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 
 from studioforge import __version__
-from studioforge.api.auth import PIN_WITHHELD_NOTE, may_reveal_pin, redact_config_dict
+from studioforge.api.auth import (
+    PIN_WITHHELD_NOTE,
+    may_reveal_pin,
+    redact_config_dict,
+    require_admin_action,
+)
 from studioforge.config import RESTART_REQUIRED_KEYS, apply_overrides
 from studioforge.core import parallel_bench
 from studioforge.core.benchmark import (
@@ -80,6 +85,19 @@ async def health(request: Request) -> dict[str, Any]:
 
 @router.get("/status")
 async def status(request: Request) -> dict[str, Any]:
+    """Live server snapshot: GPUs, residents, queue, downloads, VRAM holders.
+
+    Two keys on every ``loaded[]`` row are worth naming because nothing else
+    reports them per instance: ``priority`` is the tier that load was actually
+    made at (1 active chat, 2 dispatched agent, 3 background) -- the hard
+    answer, not the soft prediction ``GET /api/models`` gives for an unloaded
+    model -- and ``speculative`` is what drafting resolved to, where ``null``
+    means the launch has not decided yet and ``{"type": "none", "reason": ...}``
+    means it was considered and declined.
+
+    ``busy.priority_hold`` alongside says whether a chat/agent load is
+    currently holding worse-tier traffic off.
+    """
     state = _state(request)
     engine = state.engine_manager.active()
     downloads = 0
@@ -326,6 +344,20 @@ async def touch_lease(lease_id: str, request: Request) -> dict[str, Any]:
 
 @router.get("/models")
 async def list_models(request: Request) -> dict[str, Any]:
+    """The whole library, each row's saved record plus what it is doing now.
+
+    Additive per-row keys on top of the stored ``ModelRecord``: ``loaded`` /
+    ``state`` / ``port`` (is there a child, and where), ``ttl_remaining_s`` and
+    ``effective_ttl_s`` (0 means pinned), ``active_requests`` and
+    ``last_tokens_per_second``, and ``priority`` -- the tier this model would
+    load at right now (D46/D48): the running instance if there is one, else the
+    in-memory memo of what clients have been asking for, else the saved
+    ``settings.priority``, else background.
+
+    ``priority`` and ``effective_ttl_s`` share a caveat: both are **soft
+    answers** about the *next* load, not promises. A request may still name its
+    own tier, and a tier that outranks the standing one wins.
+    """
     state = _state(request)
     from studioforge.api.app import wait_for_boot
 
@@ -335,7 +367,8 @@ async def list_models(request: Request) -> dict[str, Any]:
     for record in state.registry.all():
         # Preset-only virtual models serve from their base's instance; report
         # them loaded whenever the base is.
-        instance = loaded.get(state.manager.serving_record(record).id)
+        serving = state.manager.serving_record(record)
+        instance = loaded.get(serving.id)
         models.append(
             {
                 **record.model_dump(mode="json"),
@@ -344,6 +377,11 @@ async def list_models(request: Request) -> dict[str, Any]:
                 "port": instance.port if instance else None,
                 "ttl_remaining_s": instance.ttl_remaining_s if instance else None,
                 "effective_ttl_s": state.manager.ttl_for(record),
+                # The soft "what tier would the next load use" answer -- see
+                # the docstring. The serving record this loop already resolved
+                # is passed in, so the accessor does not repeat that registry
+                # lookup on the way to the same answer.
+                "priority": state.manager.effective_priority_for(serving),
                 "active_requests": instance.active_requests if instance else 0,
                 "last_tokens_per_second": (instance.last_tokens_per_second if instance else None),
             }
@@ -478,7 +516,13 @@ async def load_model(
     picks and reloading the recently active ones afterwards where they fit --
     jumps the load queue, and holds new worse-tier traffic off (503 +
     Retry-After) while it loads. The tier is remembered per model, so a JIT
-    reload keeps it.
+    reload keeps it -- and since D48 a saved ``settings.priority`` is the floor
+    that survives a restart.
+
+    The mirror image: while a better-tier load holds the server, this route
+    answers 503 with the code ``priority_hold`` (not the generic busy code),
+    ``Retry-After`` and ``details.priority_hold`` naming the model being loaded
+    and its tier. It is a wait, not a failure -- honour the header.
     """
     state = _state(request)
     instance = await state.manager.load(
@@ -501,8 +545,32 @@ async def load_recommended(
     request: Request,
     ctx_size: int = Body(..., embed=True),
     prefer_mode: str | None = Body(None),
-    kv_min: str | None = Body(None),
-    priority: int | None = Body(None),
+    kv_min: str | None = Body(
+        None,
+        description=(
+            "Lowest KV cache quality to accept: 'f16', 'q8_0' or 'q4_0'. The window is "
+            "refused rather than reached with a worse cache than this."
+        ),
+    ),
+    priority: int | None = Body(
+        None,
+        description="Load tier: 1 active chat, 2 dispatched agent, 3 (or omitted) background.",
+    ),
+    max_slots: int | None = Body(
+        None,
+        description=(
+            "Ceiling on the slot count this load may choose (>= 1). Omitted, the "
+            "estimator's own recommendation stands."
+        ),
+    ),
+    persist: bool = Body(
+        False,
+        description=(
+            "Write the resolved context, KV cache types, slot count and tier into the "
+            "model's saved settings. Admin: needs server.api_key, a local caller or the "
+            "MCP PIN."
+        ),
+    ),
 ) -> dict[str, Any]:
     """Load at exactly ``ctx_size`` per slot; the server picks everything else.
 
@@ -516,13 +584,70 @@ async def load_recommended(
     work and what is in the way, with ``retry_after_s`` when the cause is a
     model that is serving right now. Above the model's trained window it is a
     400 with the number that would be accepted.
+
+    ``kv_min`` is the lowest KV cache quality this call will accept -- ``f16``,
+    ``q8_0`` or ``q4_0``. It floors the quality-first ladder rather than
+    steering it: a window that needs a worse cache than the floor is refused
+    with the same structured 507, never quietly quantized to reach the number.
+    Omitted, the whole ladder is available (and a q4_0 K cache is still never
+    chosen automatically).
+
+    ``max_slots`` caps the slot count for this load only. The estimator's
+    answer is what a placement *could* sustain; a caller that knows it has
+    three bots wanting one window each does not want the other five slots' KV
+    cache priced into the fit. Must be >= 1 (400 naming the parameter
+    otherwise). The cap applies before the descent loop, so the winning plan is
+    really planned at the capped count rather than planned larger and launched
+    smaller.
+
+    ``persist`` writes the *resolved* profile -- context per slot, both KV
+    cache types, the slot count and the tier -- into the model's saved settings
+    once the load succeeds, so the next plain load (a JIT reload included)
+    reproduces it. The trade: it freezes the KV ladder and the slot estimator
+    for this model, which then stop responding to a changed machine; null those
+    fields with ``PATCH /api/models/{id}/settings`` to hand the decision back.
+    Devices are deliberately **not** persisted -- a placement is a one-shot
+    load argument (D36). It is refused for a preset-only virtual model (the
+    write would land on the base model and every persona sharing it -- call it
+    on the base id instead) and while the model is being benchmarked; both are
+    checked before the walk begins, so the 400 arrives with nothing loaded.
+    Afterwards the write is best-effort: anything that refuses it once the load
+    has succeeded -- a benchmark that started *during* the load, or the settings
+    validation rejecting the resolved row (a resident whose slot count predates
+    a ``max_parallel_cap`` lowered under it) -- leaves the load standing and
+    skips only the write, with a warning in the server log.
+
+    ``priority`` is the load's tier (D46): 1 the active chat model, 2 a
+    dispatched agent, 3 (or omitted) background.
+
+    **Auth.** The route itself is ungated (residency is open, LM Studio
+    parity), but ``persist: true`` writes settings -- the same box change
+    ``PUT /settings`` is gated for (D32) -- so that field alone needs
+    ``server.api_key``, a caller on this machine, or the MCP pairing PIN. The
+    refusal is a 403 ``remote_admin_requires_credential`` and the same request
+    without ``persist`` still loads.
+
+    A load held off by a higher-tier load in flight is a 503 with code
+    ``priority_hold``, ``Retry-After`` and ``details.priority_hold`` naming the
+    holder -- distinct from the other 503s this route can return, so honour the
+    header rather than retrying immediately.
     """
     state = _state(request)
+    if persist:
+        # The path-based D32 middleware cannot see a body field, and this one
+        # writes settings that outlive the instance.
+        require_admin_action(
+            request,
+            state.config,
+            "persisting the resolved load profile to this model's saved settings",
+        )
     instance = await state.manager.load_recommended(
         model_id,
         int(ctx_size),
         prefer_modes=[prefer_mode] if prefer_mode else None,
         kv_min=kv_min,
+        max_slots=max_slots,
+        persist=persist,
         source="api:/api/models/{id}/load-recommended",
         priority=priority,
     )
@@ -575,6 +700,10 @@ async def put_settings(
     its default, silently. That has already cost a deliberate
     ``reasoning_format`` once -- a client that means "change one field" wants
     ``PATCH`` below, and should only PUT a payload it first GETs and merges.
+
+    ``priority`` saved here is the **standing default** a restart falls back to
+    (D48); a tier this server session already remembers from an explicit load
+    still outranks it until the next restart or the next explicitly tiered load.
     """
     state = _state(request)
     record = state.registry.resolve(model_id)
@@ -601,6 +730,10 @@ async def patch_settings(
     leaking into ``content``, a model sprawling across cards). A key that is
     not a settings field is a 400 naming it, not an ignored no-op -- a typoed
     field that "worked" is the same failure class this verb exists to close.
+
+    ``priority`` saved here is the **standing default** a restart falls back to
+    (D48); a tier this server session already remembers from an explicit load
+    still outranks it until the next restart or the next explicitly tiered load.
     """
     state = _state(request)
     record = state.registry.resolve(model_id)

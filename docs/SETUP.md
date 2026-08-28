@@ -305,6 +305,7 @@ models:
   default_parallel: auto     # or an integer
   default_kv_cache_type: auto
   default_ttl_s: 1800        # 0 = never idle-unload
+  ttl_by_priority: {}        # per-tier idle timeouts; {} = default_ttl_s for every tier
   default_model: null
 engine:
   pinned_tag: b10425
@@ -318,6 +319,16 @@ hf:
 logging:
   level: INFO
 ```
+
+**Idle timeouts per tier.** `models.default_ttl_s` is how long *any* idle model stays resident.
+`models.ttl_by_priority` refines it by load tier — `1` the model a person is chatting with, `2` a
+dispatched agent, `3` background (D46's tiers, and since D48 a tier a model keeps across a
+restart) — and is consulted between a model's own `settings.ttl_s` and `default_ttl_s`.
+`{1: 3600, 2: 1800, 3: 900}` is the shape worth starting from: the chat model stays warm for an
+hour, background work is reclaimed in fifteen minutes, and neither needs a per-model override to
+get there. It ships **empty**, which gives every tier `default_ttl_s` — exactly the behaviour
+before it existed, so an upgrade changes nothing until you fill it in. A tier set to `0` never
+idle-unloads, as `0` does everywhere else. The Setup tab edits the three rows directly.
 
 The equivalent commands:
 

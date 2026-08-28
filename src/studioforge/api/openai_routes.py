@@ -27,6 +27,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from studioforge.api.vision import prepare_messages
+from studioforge.core.priority import normalise_priority
 from studioforge.errors import (
     BadRequestError,
     ModelNotFoundError,
@@ -132,6 +133,12 @@ def _decorate_openai_entry(state: Any, entry: dict[str, Any]) -> None:
         entry["studioforge"]["max_parallel"] = plan.max_parallel
         entry["studioforge"]["parallel"] = plan.parallel
         entry["studioforge"]["parallel_limited_by"] = plan.parallel_limited_by
+        # The tier this instance was loaded at (D46): 1 active chat, 2
+        # dispatched agent, 3 background. A client that meets a 503
+        # `priority_hold` reads it to see which side of the hold it is on.
+        # Loaded models only -- an unloaded row's tier is a prediction, and
+        # GET /api/models is where that soft answer belongs.
+        entry["studioforge"]["priority"] = instance.priority
     entry["studioforge"]["state"] = entry["state"]
 
 
@@ -173,6 +180,36 @@ async def chat_completions(request: Request) -> Any:
     instead of an error frame buried in a 200 SSE stream -- clients handle the
     former and routinely mishandle the latter. Only the load itself is deferred
     into the stream, where it is covered by keep-alives.
+
+    Two additive body fields are consumed here and never forwarded upstream:
+    LM Studio's ``ttl`` (seconds of idle life for a JIT-loaded model), and
+    ``priority`` -- this request's load tier (D46's vocabulary): ``1`` the
+    model a person is actively chatting with, ``2`` a dispatched agent, ``3``
+    (or omitted) background. Anything else is a 400 naming the parameter, so a
+    typo cannot quietly demote a chat turn.
+
+    A request's tier gates **its own admission** -- a tier-1 turn is let
+    through a hold that would 503 a background turn for the same model, and
+    admission reads the requested tier verbatim -- and it tiers the
+    just-in-time load it triggers, so that load jumps the queue and may
+    displace idle worse-tier models.
+
+    What it cannot do is **demote**. The load runs at the better of the
+    requested tier and the model's standing one (the memo of its last explicit
+    load, else ``settings.priority``), so a background turn naming
+    ``priority: 3`` against the model a person is chatting with loads it at the
+    chat tier, not below it. Nor does it re-tier a model that is already
+    running: a bot naming ``priority: 1`` cannot promote the instance a
+    person's chat is sharing, and the tier a resident carries stays what
+    loaded it. The standing default lives in the model's ``settings.priority``
+    (D48); this field is per-turn and remembers nothing.
+
+    **Break for old clients (D48).** Before this field existed an unknown
+    ``priority`` in the body was forwarded to llama-server and ignored. It is
+    now validated and consumed: anything outside 1, 2 and 3 is a 400 naming the
+    parameter, ``true`` included. A client that was sending some other
+    ``priority`` -- a float, a string, a 0-based scale -- stops working loudly
+    rather than being silently demoted to background.
     """
     state = _app_state(request)
     body = await _json_body(request)
@@ -203,6 +240,7 @@ async def chat_completions(request: Request) -> Any:
     _validate_response_format(payload)
     _normalize_sampler_aliases(payload)
     ttl_override = _pop_ttl(payload)
+    priority = _pop_priority(payload)
     # After alias normalization, so a client's `repetition_penalty` counts as
     # an explicit choice that blocks the preset's repeat_penalty default.
     if record.preset is not None:
@@ -217,16 +255,18 @@ async def chat_completions(request: Request) -> Any:
         # held request must be a real HTTP 503 with Retry-After, not an
         # in-band error frame most clients treat as fatal. ensure_loaded
         # repeats the check inside the stream as the backstop.
-        state.manager.admission_check(serving.id)
+        state.manager.admission_check(serving.id, priority=priority)
         # Load inside the stream so a multi-minute cold start is covered by
         # keep-alive comments rather than silence.
         return StreamingResponse(
-            _stream_with_jit_load(state, serving, payload, ttl_override),
+            _stream_with_jit_load(state, serving, payload, ttl_override, priority),
             media_type="text/event-stream",
             headers=SSE_HEADERS,
         )
 
-    await state.manager.ensure_loaded(serving.id, source="jit:/v1/chat/completions")
+    await state.manager.ensure_loaded(
+        serving.id, source="jit:/v1/chat/completions", priority=priority
+    )
     _apply_ttl_override(state, serving.id, ttl_override)
     return await _forward(state, serving, "/v1/chat/completions", payload)
 
@@ -239,7 +279,11 @@ def _resolve_or_404(state: Any, name: str) -> ModelRecord:
 
 
 async def _stream_with_jit_load(
-    state: Any, record: ModelRecord, payload: dict[str, Any], ttl_override: int | None
+    state: Any,
+    record: ModelRecord,
+    payload: dict[str, Any],
+    ttl_override: int | None,
+    priority: int | None = None,
 ) -> AsyncIterator[bytes]:
     """Emit SSE keep-alives while a model loads, then proxy the real stream.
 
@@ -248,9 +292,13 @@ async def _stream_with_jit_load(
     is progressing perfectly well -- one of the most common ways a local LLM
     server looks broken when it is not. ``:`` comment lines are valid SSE that
     every compliant parser ignores.
+
+    ``priority`` is the request's own tier (D48), forwarded so the load this
+    turn triggers is queued and placed at that tier. It gates the load, not the
+    resident: a model already serving is never re-tiered from here.
     """
     loader = asyncio.ensure_future(
-        state.manager.ensure_loaded(record.id, source="jit:/v1/chat/completions")
+        state.manager.ensure_loaded(record.id, source="jit:/v1/chat/completions", priority=priority)
     )
     # If the client disconnects mid-load this generator is closed while the task
     # is still running. The load is deliberately NOT cancelled -- the model will
@@ -305,6 +353,17 @@ def _consume_load_exception(task: asyncio.Task[Any]) -> None:
 
 @router.post("/v1/completions")
 async def completions(request: Request) -> Any:
+    """Legacy text completions -- the same JIT loading as chat completions.
+
+    Takes the same two additive body fields, consumed here and never forwarded
+    upstream: ``ttl`` (idle seconds for a JIT-loaded model) and ``priority``,
+    this request's load tier -- ``1`` an active chat, ``2`` a dispatched agent,
+    ``3`` (or omitted) background. Anything else is a 400 naming the parameter.
+    The tier gates this request's own admission (read verbatim) and tiers the
+    load it triggers, but it cannot demote: the load runs at the better of this
+    tier and the model's standing one (memo, else ``settings.priority``). It
+    never re-tiers a model that is already running.
+    """
     state = _app_state(request)
     body = await _json_body(request)
     model_name = _require_model(body, state.config)
@@ -315,18 +374,23 @@ async def completions(request: Request) -> Any:
         raise BadRequestError("'prompt' is required", param="prompt")
     _normalize_sampler_aliases(payload)
     ttl_override = _pop_ttl(payload)
+    priority = _pop_priority(payload)
     if record.preset is not None:
         # Sampler defaults only: there are no messages to carry a system prompt.
         record.preset.apply_to_payload(payload, chat=False)
     serving = state.manager.serving_record(record)
     _note_client(state, request, serving.id)
-    await state.manager.ensure_loaded(serving.id, source="jit:/v1/completions")
+    await state.manager.ensure_loaded(serving.id, source="jit:/v1/completions", priority=priority)
     _apply_ttl_override(state, serving.id, ttl_override)
     return await _forward(state, serving, "/v1/completions", payload)
 
 
 @router.post("/v1/embeddings")
 async def embeddings(request: Request) -> Any:
+    """Embeddings. ``ttl`` and ``priority`` are **not** consumed here --
+    chat/completions only; an unknown field is forwarded to the engine, which
+    ignores it -- so give an embedding model a standing tier through its
+    settings instead."""
     state = _app_state(request)
     body = await _json_body(request)
     model_name = _require_model(body, state.config)
@@ -355,6 +419,9 @@ async def embeddings(request: Request) -> Any:
 
 @router.post("/v1/rerank")
 async def rerank(request: Request) -> Any:
+    """Rerank. ``ttl`` and ``priority`` are **not** consumed here --
+    chat/completions only; an unknown field is forwarded to the engine, which
+    ignores it -- so set a standing tier in the model's settings instead."""
     state = _app_state(request)
     body = await _json_body(request)
     record = _resolve_or_404(state, _require_model(body, state.config))
@@ -368,6 +435,9 @@ async def rerank(request: Request) -> Any:
 
 @router.post("/v1/tokenize")
 async def tokenize(request: Request) -> Any:
+    """Tokenize. ``ttl`` and ``priority`` are **not** consumed here --
+    chat/completions only; an unknown field is forwarded to the engine, which
+    ignores it -- so set a standing tier in the model's settings instead."""
     state = _app_state(request)
     body = await _json_body(request)
     record = _resolve_or_404(state, _require_model(body, state.config))
@@ -462,6 +532,27 @@ def _pop_ttl(payload: dict[str, Any]) -> int | None:
         return None
     seconds = int(raw)
     return seconds if seconds > 0 else None
+
+
+def _pop_priority(payload: dict[str, Any]) -> int | None:
+    """Take the request's ``priority`` tier out of the upstream payload (D48).
+
+    llama-server does not know the field, so it is consumed here exactly like
+    ``ttl``: forwarding it would be an unknown-parameter error on some builds
+    and silently ignored on others.
+
+    Unlike :func:`_pop_ttl`, junk is **refused** rather than ignored --
+    ``normalise_priority`` raises a 400 naming the parameter for anything that
+    is not 1, 2, 3 or absent (``True`` included, since it is an ``int`` in
+    Python and tier 1 is the one tier that must never be reached by accident).
+    The asymmetry is deliberate: a mistyped TTL costs a wrong idle timer, while
+    a mistyped tier silently demotes a chat turn to background and it is
+    refused traffic during the next load -- the failure this field exists to
+    prevent, and one nothing downstream could attribute back to the typo.
+    """
+    if "priority" not in payload:
+        return None
+    return normalise_priority(payload.pop("priority"))
 
 
 def _apply_ttl_override(state: Any, model_id: str, ttl_s: int | None) -> None:
@@ -864,11 +955,17 @@ async def v0_retrieve_model(model_id: str, request: Request) -> JSONResponse:
 
 @router.post("/api/v0/chat/completions")
 async def v0_chat_completions(request: Request) -> Any:
+    """LM Studio's ``/api/v0`` twin of ``POST /v1/chat/completions``: an
+    identical body, the additive ``ttl`` and ``priority`` fields included; see
+    that operation's description."""
     return await chat_completions(request)
 
 
 @router.post("/api/v0/completions")
 async def v0_completions(request: Request) -> Any:
+    """LM Studio's ``/api/v0`` twin of ``POST /v1/completions``: an identical
+    body, the additive ``ttl`` and ``priority`` fields included; see that
+    operation's description."""
     return await completions(request)
 
 

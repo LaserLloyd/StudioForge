@@ -170,6 +170,50 @@ def instance_ttl_text(instance: InstanceInfo | None, *, pinned: bool = False) ->
     return ttl_text(instance.ttl_remaining_s, pinned=pinned)
 
 
+#: The tier vocabulary (D46) as words. Kept as a literal map rather than an
+#: import of ``core.priority``: this module is pure presentation and imports
+#: nothing from ``core``. The numbers are the contract (1/2/3) and are pinned
+#: by ``core.priority.PRIORITY_LEVELS``.
+PRIORITY_LABELS: Final[dict[int, str]] = {1: "chat", 2: "agent", 3: "background"}
+
+
+def priority_label(priority: int | None) -> str:
+    """Tier as a word, for a status chip or a detail line.
+
+    An unrecognised number is shown verbatim (``P4``) rather than swallowed: a
+    tier this UI does not know about is exactly the thing worth seeing.
+    """
+    if priority is None:
+        return UNKNOWN
+    return PRIORITY_LABELS.get(priority, f"P{priority}")
+
+
+def priority_badge_label(priority: int | None) -> str | None:
+    """The same word, but only when it is worth a badge.
+
+    Background is the tier every load that never said lands on, so a badge for
+    it would appear on every row and carry no information. ``None`` means "do
+    not draw a chip"; the tier is still printed in the card's detail line.
+    """
+    if priority is None or priority >= 3:
+        return None
+    return priority_label(priority)
+
+
+def priority_tooltip(priority: int | None) -> str:
+    """What the chip's tier buys this instance, in one sentence (D46/D48)."""
+    if priority is None:
+        return "No load tier recorded for this instance."
+    word = priority_label(priority)
+    if priority == 1:
+        detail = "outranks every other tier when VRAM is contended"
+    elif priority == 2:
+        detail = "outranks background work, yields to the active chat model"
+    else:
+        detail = "yields to every higher tier; first to be evicted"
+    return f"Load priority {priority} ({word}): {detail}."
+
+
 def pin_tooltip(pinned: bool, *, auto_load_pinned: bool) -> str:
     """What clicking the pin button commits the server to (D41).
 
@@ -629,6 +673,14 @@ PRESET_FORM_FIELDS: Final = (
 #: Preset fields that are integers (NiceGUI number inputs hand back floats).
 _PRESET_INT_FIELDS: Final = frozenset({"top_k", "max_tokens"})
 
+#: Settings that are scheduling policy rather than launch flags: they never
+#: reach the child's argv, so they must be excluded from every D13
+#: whole-settings comparison. ``priority`` (D48) is the live one -- a persona
+#: given a standing tier would otherwise stop sharing its base's instance and
+#: silently cost a second full copy of the model in VRAM. The same exclusion
+#: lives in ``ModelManager.serving_record``; the two must agree.
+_NON_LAUNCH_SETTINGS: Final[dict[str, Any]] = {"priority": None}
+
 
 def has_launch_overrides(settings: ModelSettings) -> bool:
     """Whether these settings (adapters aside) change the child's argv.
@@ -638,7 +690,8 @@ def has_launch_overrides(settings: ModelSettings) -> bool:
     beforehand in the settings dialog and would silently cost a dedicated
     instance if the UI did not surface it.
     """
-    return settings.model_copy(update={"adapters": []}) != _DEFAULT_MODEL_SETTINGS
+    stripped = settings.model_copy(update={"adapters": [], **_NON_LAUNCH_SETTINGS})
+    return stripped != _DEFAULT_MODEL_SETTINGS
 
 
 def shares_base_instance(record: ModelRecord) -> bool:
@@ -649,7 +702,27 @@ def shares_base_instance(record: ModelRecord) -> bool:
     """
     if not record.is_virtual or record.base_model_id is None:
         return False
-    return record.settings == _DEFAULT_MODEL_SETTINGS
+    return record.settings.model_copy(update=dict(_NON_LAUNCH_SETTINGS)) == _DEFAULT_MODEL_SETTINGS
+
+
+def priority_lock_note(record: ModelRecord) -> str | None:
+    """Why the settings dialog's Load priority select is disabled, or ``None``.
+
+    A preset-only virtual model has no instance of its own to tier: it rides
+    its base's child, and a standing tier on it would be a setting nothing ever
+    reads. The registry refuses that write outright, so the select must not
+    offer it -- an enabled control whose Save always fails is worse than a
+    disabled one that says why. A persona with launch overrides (or adapters)
+    gets its own instance and keeps the select.
+    """
+    if not shares_base_instance(record):
+        return None
+    base = record.base_model_id or UNKNOWN
+    return (
+        f"this persona shares '{base}'s instance — set the tier on the base model. "
+        f"Give it a launch override (context size, KV type, a LoRA) and it gets an "
+        f"instance of its own, and a tier of its own with it."
+    )
 
 
 def virtual_instance_note(
@@ -3882,6 +3955,77 @@ def reserved_mb_map(entries: Mapping[int, Any]) -> dict[int, int]:
     return out
 
 
+def _ttl_box_text(raw: Any) -> str:
+    """What the user sees in the box, for an error message about it.
+
+    NiceGUI hands a number widget's value back as a float, so the box someone
+    typed ``-5`` into arrives as ``-5.0`` -- quoting that back at them names a
+    number they never typed.
+    """
+    if isinstance(raw, float) and raw.is_integer():
+        return str(int(raw))
+    return str(raw)
+
+
+def ttl_by_priority_map(entries: Mapping[int, Any]) -> dict[int, int]:
+    """Per-tier idle timers from three number widgets (D48).
+
+    Unlike a VRAM reservation, ``0`` is a real answer here -- it is how
+    ``models.default_ttl_s`` already spells "never idle-unload" -- so only an
+    empty box means "no entry for this tier, fall through to the default".
+
+    A negative or unparseable box raises :class:`ValueError` naming the tier
+    rather than being dropped. Dropping it was the quiet bug: the caller writes
+    the *whole* mapping (``apply_config_updates`` cannot patch one key inside a
+    dict), so a typo in one box deleted that tier's existing timer and the save
+    then reported success. The config validator would refuse the bad value
+    anyway; this refuses it before it can take a good value down with it.
+
+    Raises:
+        ValueError: one message per bad box, naming the tier and what was in it.
+    """
+    out: dict[int, int] = {}
+    bad: list[str] = []
+    for tier, raw in sorted(entries.items()):
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            continue
+        try:
+            seconds = int(float(raw))
+        except (TypeError, ValueError, OverflowError):
+            seconds = -1
+        if seconds < 0:
+            bad.append(
+                f"tier {int(tier)} — {priority_label(int(tier))}: "
+                f"'{_ttl_box_text(raw)}' is not a valid idle TTL"
+            )
+            continue
+        out[int(tier)] = seconds
+    if bad:
+        raise ValueError(
+            "; ".join(bad) + " (seconds, 0 or more; leave a box empty to use the default)"
+        )
+    return out
+
+
+def ttl_by_priority_note(mapping: Mapping[int, int] | None, *, default_ttl_s: int) -> str:
+    """Plain-language summary of the per-tier TTL rows under the widget."""
+    entries = {int(k): int(v) for k, v in (mapping or {}).items()}
+    if not entries:
+        return (
+            f"No per-tier timers: every tier uses the default above "
+            f"({format_duration(default_ttl_s) if default_ttl_s else 'never idle-unload'})."
+        )
+    parts = [
+        f"{priority_label(tier)} {format_duration(seconds) if seconds else 'never'}"
+        for tier, seconds in sorted(entries.items())
+    ]
+    missing = [priority_label(tier) for tier in (1, 2, 3) if tier not in entries]
+    text = "Per-tier idle timers: " + ", ".join(parts) + "."
+    if missing:
+        text += f" {', '.join(missing)} falls back to the default above."
+    return text
+
+
 def excluded_devices_list(flags: Mapping[int, Any]) -> list[int]:
     """Sorted, de-duplicated CUDA indices from a map of per-GPU toggles."""
     return sorted({int(index) for index, flag in flags.items() if bool(flag)})
@@ -4075,17 +4219,19 @@ def where_things_live(config: Any, *, source: str = "") -> list[tuple[str, str]]
 #: never logged -- ``config._register_secrets`` puts all three in the redactor.
 SECRET_KEYS: Final = frozenset({"server.api_key", "hf.token", "mcp.pin"})
 
-#: Keys whose *type* rules out a generated widget: two CUDA-index mappings and
-#: the per-family quant-affinity table. Each has a purpose-built row control,
-#: and each is excluded from the generated Advanced section so there is exactly
-#: one control per key. ``excluded_devices`` is a plain ``list[int]`` and would
-#: render as a text box, but a row of per-GPU checkboxes next to the live VRAM
-#: figures is the only form in which it is actually checkable.
+#: Keys whose *type* rules out a generated widget: two CUDA-index mappings, the
+#: per-family quant-affinity table and the per-tier TTL map. Each has a
+#: purpose-built row control, and each is excluded from the generated Advanced
+#: section so there is exactly one control per key. ``excluded_devices`` is a
+#: plain ``list[int]`` and would render as a text box, but a row of per-GPU
+#: checkboxes next to the live VRAM figures is the only form in which it is
+#: actually checkable.
 CUSTOM_WIDGET_KEYS: Final = frozenset(
     {
         "planner.excluded_devices",
         "planner.reserved_mb",
         "planner.quant_affinity",
+        "models.ttl_by_priority",
     }
 )
 
@@ -4368,6 +4514,11 @@ CONFIG_FIELD_HELP: Final[Mapping[str, str]] = {
         "'auto' keeps full-quality KV where it is affordable and quantizes only where it is not."
     ),
     "models.default_ttl_s": "Idle unload timer, in seconds. 0 means never idle-unload.",
+    "models.ttl_by_priority": (
+        "Per-tier idle timers, consulted between a model's own ttl_s and the default "
+        "above (D48). Blank rows fall through to the default, so leaving all three empty "
+        "keeps today's single timer for every tier."
+    ),
     "models.auto_load_pinned": (
         "Load pinned models at startup and keep them resident: one that goes down "
         "is reloaded automatically (D41)."

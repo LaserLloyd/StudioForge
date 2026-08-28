@@ -31,7 +31,7 @@ from studioforge.core import registry as registry_module
 from studioforge.core.registry import Registry, ScanResult, _cache_key, _mmproj_core
 from studioforge.db import Database
 from studioforge.errors import BadRequestError, ModelNotFoundError
-from studioforge.types import AdapterAttachment, GgufMeta, ModelSettings
+from studioforge.types import AdapterAttachment, GgufMeta, ModelSettings, VirtualPreset
 
 GIB = 1024**3
 
@@ -697,6 +697,141 @@ def test_save_settings_rejects_invalid_values(scanned: Registry) -> None:
 def test_save_settings_unknown_model(scanned: Registry) -> None:
     with pytest.raises(ModelNotFoundError):
         scanned.save_settings("nope/nope", ModelSettings())
+
+
+def test_save_settings_refuses_a_parallel_above_the_models_own_cap(scanned: Registry) -> None:
+    """Since D48 ``max_parallel_cap`` is a hard ceiling rather than an
+    estimator hint, so the two numbers cannot both be saved."""
+    with pytest.raises(BadRequestError) as excinfo:
+        scanned.save_settings(QWEN_TINY, ModelSettings(parallel=4, max_parallel_cap=2))
+    assert excinfo.value.param == "settings"
+    assert "4" in excinfo.value.message and "2" in excinfo.value.message
+    # The machine-readable twin of the load path's refusal, which has carried
+    # both numbers since D48.
+    assert excinfo.value.details == {"max_parallel_cap": 2, "parallel": 4}
+
+    # Either half alone still saves, and so does parallel == cap.
+    scanned.save_settings(QWEN_TINY, ModelSettings(parallel=4))
+    scanned.save_settings(QWEN_TINY, ModelSettings(max_parallel_cap=2))
+    scanned.save_settings(QWEN_TINY, ModelSettings(parallel=2, max_parallel_cap=2))
+
+
+def test_an_unrelated_edit_to_a_legacy_conflicted_row_still_saves(
+    scanned: Registry, db: Database
+) -> None:
+    """A row that already carried the conflict -- hydrated from before the cap
+    was a ceiling -- must stay editable. Refusing every save of it bricked
+    unrelated edits (a ttl, a pin, the GUI A/B helper's save-and-restore
+    round-trip) over a conflict this caller neither created nor asserted."""
+    db.save_model_settings(
+        QWEN_TINY,
+        ModelSettings(parallel=8, max_parallel_cap=2).model_dump(mode="json"),
+    )
+    scanned.scan()
+
+    saved = scanned.save_settings(
+        QWEN_TINY, ModelSettings(parallel=8, max_parallel_cap=2, ttl_s=120)
+    )
+
+    assert saved.settings.ttl_s == 120
+    assert saved.settings.parallel == 8, "the inherited conflict is carried, not repaired"
+    assert saved.settings.max_parallel_cap == 2
+
+
+@pytest.mark.parametrize(
+    "submitted",
+    [
+        ModelSettings(parallel=4, max_parallel_cap=2),  # moved parallel up
+        ModelSettings(parallel=2, max_parallel_cap=1),  # moved the cap down
+    ],
+)
+def test_moving_either_number_into_conflict_is_still_refused(
+    scanned: Registry, submitted: ModelSettings
+) -> None:
+    """Touch either field and the pair is an assertion again -- from a row that
+    was already conflicted just as much as from a clean one."""
+    scanned.save_settings(QWEN_TINY, ModelSettings(parallel=2, max_parallel_cap=2))
+    with pytest.raises(BadRequestError) as excinfo:
+        scanned.save_settings(QWEN_TINY, submitted)
+    assert excinfo.value.param == "settings"
+
+
+# ---------------------------------------------------------------------------
+# A tier nothing would read is refused, not stored (D48)
+# ---------------------------------------------------------------------------
+
+
+def _preset_persona(reg: Registry, model_id: str = "virtual/persona") -> Any:
+    """A preset-only virtual model: no adapters, no launch overrides at all,
+    so it serves on its base's instance."""
+    return reg.create_virtual_model(
+        id=model_id,
+        base_model_id=QWEN_TINY,
+        name="Persona",
+        adapters=[],
+        preset=VirtualPreset(temperature=0.4),
+    )
+
+
+def test_a_tier_on_a_persona_that_shares_its_base_is_refused_naming_the_base(
+    scanned: Registry,
+) -> None:
+    """The value would be inert: a preset-only virtual model serves on its
+    BASE's instance, and every tier read resolves the serving record -- so the
+    persona's own row is never consulted. A saved setting that silently does
+    nothing is worse than a 400 saying where the tier belongs."""
+    persona = _preset_persona(scanned)
+
+    with pytest.raises(BadRequestError) as excinfo:
+        scanned.save_settings(persona.id, ModelSettings(priority=1))
+
+    assert excinfo.value.param == "priority"
+    assert QWEN_TINY in excinfo.value.message
+    assert excinfo.value.details == {"model_id": persona.id, "base_model_id": QWEN_TINY}
+    assert scanned.get_settings(persona.id).priority is None
+
+    # Everything else about the persona still saves; only the tier is refused.
+    scanned.save_settings(persona.id, ModelSettings(ttl_s=120))
+
+
+def test_a_persona_with_its_own_launch_overrides_keeps_the_tier(scanned: Registry) -> None:
+    """A launch-time delta splits the persona off onto its own instance (D13),
+    and there ``_settings_priority`` reads this very row -- so the tier is real
+    and is stored."""
+    persona = _preset_persona(scanned, "virtual/own-instance")
+
+    saved = scanned.save_settings(persona.id, ModelSettings(priority=1, ctx_size=8192))
+
+    assert saved.settings.priority == 1
+    assert saved.settings.ctx_size == 8192
+
+
+def test_a_tier_on_the_base_model_is_saved_as_it_always_was(scanned: Registry) -> None:
+    """The refusal is about *inert* tiers only. A real model's tier is the one
+    thing D48 exists to persist."""
+    saved = scanned.save_settings(QWEN_TINY, ModelSettings(priority=1))
+    assert saved.settings.priority == 1
+    assert scanned.get_settings(QWEN_TINY).priority == 1
+
+
+def test_a_legacy_row_whose_parallel_exceeds_the_cap_still_hydrates(
+    scanned: Registry, db: Database
+) -> None:
+    """The cross-check lives in ``save_settings``, deliberately NOT in a
+    pydantic model validator: ``_settings_from`` falls back to
+    ``ModelSettings()`` when hydration raises, so a row that violated a cap
+    added later would not merely fail to load -- it would silently reset every
+    other field of that model to its default on every scan (D48)."""
+    db.save_model_settings(
+        QWEN_TINY,
+        ModelSettings(parallel=8, max_parallel_cap=2, ctx_size=16384).model_dump(mode="json"),
+    )
+    scanned.scan()
+
+    settings = scanned.get_settings(QWEN_TINY)
+    assert settings.parallel == 8
+    assert settings.max_parallel_cap == 2
+    assert settings.ctx_size == 16384, "a reset would have taken every other field with it"
 
 
 def test_touch_sets_last_used_at(scanned: Registry) -> None:

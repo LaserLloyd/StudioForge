@@ -891,6 +891,13 @@ class Registry:
         from the HTTP API. ``None`` fields are persisted *as null*, never
         back-filled with the global defaults -- "Auto" must stay a decision
         deferred to load time, when the planner can see actual free VRAM.
+
+        Three checks that pydantic deliberately does not carry run here as
+        well: the chat template file must still exist, ``parallel`` may not be
+        *moved into* conflict with ``max_parallel_cap``, and a preset-only
+        virtual model may not be given a ``priority`` that nothing would ever
+        read. All three would be wrong as model validators -- see the comments
+        below.
         """
         record = self.get(model_id)
         if record is None:
@@ -910,6 +917,69 @@ class Registry:
             validated.chat_template_file = validate_chat_template_file(validated.chat_template_file)
         except ValueError as exc:
             raise BadRequestError(str(exc), param="chat_template_file") from exc
+
+        # The parallel/cap cross-check lives here rather than in a pydantic
+        # model_validator for the same reason as the filesystem check above,
+        # only sharper: ``_settings_from`` falls back to ``ModelSettings()``
+        # when hydration raises, so a legacy row that violated a cap added
+        # later would not merely fail to load -- it would silently reset all
+        # 46 fields of that model to defaults on every scan. Save time is the
+        # only place this can be enforced without that risk (D48).
+        #
+        # And only when this save CHANGES one of the two numbers. A row that
+        # already carried the conflict (hydrated from before the cap was a
+        # ceiling, or written by an older build) must stay editable: refusing
+        # every save of it bricked unrelated edits -- a ttl, a pin, the GUI
+        # A/B helper's save-and-restore round-trip -- for a conflict this
+        # caller neither created nor asserted. Touch either field and it is an
+        # assertion again, and it is refused.
+        cap = validated.max_parallel_cap
+        stored = record.settings
+        asserts_the_pair = (
+            validated.parallel != stored.parallel
+            or validated.max_parallel_cap != stored.max_parallel_cap
+        )
+        if (
+            asserts_the_pair
+            and validated.parallel is not None
+            and cap is not None
+            and validated.parallel > cap
+        ):
+            raise BadRequestError(
+                f"parallel ({validated.parallel}) is above this model's "
+                f"max_parallel_cap ({cap}). Since the cap became a hard ceiling "
+                f"rather than an estimator hint, the two cannot both be saved: "
+                f"raise the cap or lower the slot count.",
+                param="settings",
+                # The machine-readable twin of the load path's refusal, which
+                # has carried both numbers since D48.
+                details={"max_parallel_cap": int(cap), "parallel": int(validated.parallel)},
+            )
+
+        # A standing tier on a preset-only virtual model is inert, not merely
+        # unusual: such a model serves on its BASE's instance, and every tier
+        # read -- the planner's candidacy, the TTL arithmetic, the effective
+        # tier the API reports -- resolves the serving record, so the persona's
+        # own row is never consulted. Storing it would show the user a saved
+        # value that does nothing. Refused only while the submitted row would
+        # STILL share the base: the test mirrors ``_NON_LAUNCH_SETTINGS`` in
+        # core/manager.py (``priority`` is the one field normalised out of the
+        # sharing comparison), so a persona with any launch override of its own
+        # keeps the field -- it gets its own instance, where its own row is
+        # what ``_settings_priority`` reads.
+        if (
+            validated.priority is not None
+            and record.is_virtual
+            and record.base_model_id is not None
+            and validated.model_copy(update={"priority": None}) == ModelSettings()
+        ):
+            raise BadRequestError(
+                f"a tier on '{model_id}' would be ignored -- the shared instance is "
+                f"'{record.base_model_id}'s; set priority on '{record.base_model_id}', "
+                f"or give '{model_id}' its own launch overrides first.",
+                param="priority",
+                details={"model_id": model_id, "base_model_id": record.base_model_id},
+            )
 
         self._db.save_model_settings(model_id, validated.model_dump(mode="json"))
         if record.is_virtual and record.base_model_id is not None:

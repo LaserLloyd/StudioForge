@@ -296,6 +296,78 @@ conversation can use the whole `--ctx-size`. The cost is measured and real — t
 exceeded"** *mid-generation*, where the partitioned pool had refused them cleanly before any work
 started. Turn it on for a single-user long-context model; leave it off for an agent host.
 
+## Load tiers, and what a restart keeps
+
+A load's tier (D46 — `1` chat, `2` agent, `3` background) lives in two places with different
+lifetimes, and the difference is worth knowing before relying on either:
+
+* **The in-memory memo** — the tier of a model's last explicit load — is what keeps the chat model
+  at the chat tier across an idle unload and the just-in-time reload after it. A restart clears it.
+* **`settings.priority`** — saved per model, and therefore the floor a restart falls back to (D48).
+  Set it where the tier is a standing fact about the model rather than a fact about this session.
+
+So a restart no longer drops a tiered model to background, but it does drop it to its *saved* tier:
+a model with no saved `priority` is background again until something tiers it explicitly. There is
+still no decay of any kind — nothing demotes a tier over time, and the only demotions are an
+explicit re-tier and clearing the setting.
+
+Two consequences of a tier that now persists:
+
+* `reserve_gpus` refuses a lease whose cards hold an **idle** chat- or agent-tier model
+  (`force=true` overrides it, exactly as for a pin). The rule is D46's, but it was rarely reached
+  while every restart reset residents to background.
+* A per-request `priority` on a chat completion governs that request only. It never re-tiers a
+  running instance and is never remembered, so it cannot be used to set a standing tier — that is
+  what the setting is for. It cannot *lower* one either: the just-in-time load a request triggers
+  runs at the better of the requested tier and the model's standing tier, so a background-tagged
+  turn can never cold-load the chat model as background and leave it there. Only the request's own
+  admission uses the requested tier verbatim.
+
+## `persist` freezes what it saved
+
+`load_recommended(..., persist=true)` writes the resolved context per slot, both KV cache types and
+the slot count into the model's saved settings — plus the tier, but only when that same call named
+a `priority`. A `persist` that says nothing about priority leaves the saved tier exactly as it was,
+rather than freezing whatever tier the model happened to be running at into a setting nobody chose.
+Those are ordinary saved settings, so the planner stops deciding them: the KV ladder and the slot
+estimator no longer respond to a changed machine — another card, a heavier neighbour, a new engine
+— until the fields are cleared again (`PATCH /api/models/{id}/settings` with nulls). It is a
+freeze, not a hint, and it is the price of not repeating a multi-minute walk.
+
+The placement is deliberately **not** part of it: devices are never persisted, so the cards are
+still chosen fresh on every load (D36). A profile saved while two GPUs happened to be free does not
+pin the model to them.
+
+The write is also best-effort once the load has succeeded: **any** save-time failure is a logged
+skip rather than an error — a benchmark that starts during the load, the settings validation
+rejecting the resolved row, the model deleted while the multi-minute walk ran, or the storage layer
+failing. The model is loaded either way. A success proves the load, not the save — read the
+settings back if it matters. (`sfctl models load-recommended --persist` reads them back for you and
+warns on stderr if what was saved disagrees with what launched.)
+
+## A `max_parallel_cap` added under an existing row is not retroactive
+
+`settings.max_parallel_cap` is a hard ceiling since D48, but only two doors check it: a load
+request naming `parallel` above the cap is refused (`400`), and a settings save that *moves* the
+row into conflict is refused (`400`). A row that already carried `parallel: 8` when the cap was
+later set to 4 therefore keeps loading at 8 — deliberately, because bricking a model's
+just-in-time loads over a settings edit is worse than honouring a stale number. What follows:
+
+* an inherited conflict does not block unrelated edits. The cross-check fires only when the
+  submitted row **changes** `parallel` or `max_parallel_cap`, so a ttl, a pin or the GUI's A/B
+  save-and-restore round trip still saves on such a row. Move either of the two numbers and you are
+  asserting the pair again: raising `parallel` under the old cap, or lowering the cap under the old
+  `parallel`, is refused until they agree.
+* the paths that *replay* a shape the server already launched are exempt from the request check:
+  the reload after a priority eviction, the D42 rebalancer's move, and `benchmark_parallel`'s
+  restore of what it displaced. Each reproduces a live plan's own slot count rather than stating
+  one, so a cap lowered mid-run no longer leaves the box in the benchmark's shape with
+  `restored: false` in the report. A restore can still fail for the ordinary reasons a load fails
+  (no room, the model busy), and is still reported that way rather than raised.
+
+Both refusals carry the two numbers under `error.studioforge` (`max_parallel_cap` beside the
+offending slot count), so a client can act on them without parsing the message.
+
 ## LoRA
 
 * Adapters must be **GGUF** adapters. PEFT `.bin`/`.safetensors` adapters are not loadable by
@@ -305,7 +377,16 @@ started. Turn it on for a single-user long-context model; leave it off for an ag
 * Two virtual models over the same base share one `llama-server` instance **only when they differ
   purely in request-time fields** (system prompt / sampler-default presets). Any launch-time delta
   — an adapter set, a ctx/kv override — still costs a dedicated instance, because it changes the
-  child's argv.
+  child's argv. `priority` is deliberately not counted as such a delta: a tier is a scheduling
+  opinion that never reaches argv, so it must not be the thing that splits a persona onto a second
+  full copy of the model in VRAM (D48).
+* Which is also why a preset-only persona cannot carry its own tier. Saving a non-null `priority`
+  on a virtual model that would still share its base's instance is **refused** (`400`,
+  `param: "priority"`, and the message names the base id to set it on). It used to be accepted and
+  silently inert: every tier read resolves the *serving* record, so the persona's own row was never
+  consulted. A persona with a launch override of its own keeps the field, because it earns its own
+  instance and its own row is then what gets read. The GUI disables the *Load priority* select for
+  a sharing persona rather than letting you meet the refusal.
 * Quality of a LoRA over a heavily quantized base (Q4 and below) is often poor. That is a llama.cpp
   property, not a bug here.
 

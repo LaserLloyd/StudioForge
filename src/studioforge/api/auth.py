@@ -258,6 +258,73 @@ REMOTE_ADMIN_NOTE = (
 )
 
 
+#: The D32 refusal for a body-gated action rather than a whole route. Same
+#: three ways out as :data:`REMOTE_ADMIN_NOTE`, worded for a request whose
+#: other fields are perfectly acceptable: the caller is told the route itself
+#: stays open, so dropping the one field is a working retry.
+REMOTE_ADMIN_ACTION_NOTE = (
+    "server.api_key is not set, so a field that changes the server's own saved state is "
+    "only accepted from this machine or with the MCP pairing PIN (header 'X-MCP-Pin', or "
+    "as the bearer token -- sfctl sends it that way). A browser request from another origin "
+    "is not 'this machine', even on loopback. Set server.api_key on the Setup tab to manage "
+    "the server remotely with a real credential. The rest of this route stays open: the same "
+    "request without that field is accepted."
+)
+
+
+def require_admin_action(request: Request, config: Config, action: str) -> None:
+    """D32 for an admin action the path-based middleware cannot see (D48).
+
+    :func:`is_admin_mutation` decides from ``method`` + ``path`` alone, which is
+    everything it can know before the body is read. Some routes are deliberately
+    open as a whole and carry ONE optional flag that writes settings --
+    ``POST /api/models/{id}/load-recommended`` with ``persist: true`` is the
+    first: residency stays open for LM Studio parity, but the persisted profile
+    outlives the instance exactly like the ``PUT /settings`` that
+    ``_ADMIN_SETTINGS_SUFFIXES`` guards. A handler calls this once it has parsed
+    the body and knows the box change is really being asked for.
+
+    Same three acceptances as the middleware's D32 branch, in the same order:
+    ``server.api_key`` configured means :func:`check_request` already
+    authenticated this request and there is nothing left to prove; otherwise a
+    caller on this machine that is not a cross-site browser page; otherwise the
+    MCP pairing PIN. Anything else is the existing 403
+    ``remote_admin_requires_credential``, with ``action`` naming the thing being
+    refused so the message is about the flag, not the route.
+
+    Args:
+        request: the live request -- its peer, ``Origin`` and headers are read.
+        config: the server config, for ``server.api_key`` and ``mcp.pin``.
+        action: what is being refused, as a noun phrase for the message
+            ("persisting the resolved profile to this model's settings").
+
+    Raises:
+        AuthError: 403 ``remote_admin_requires_credential``.
+    """
+    if config.server.api_key:
+        return
+    if is_local_request(request) and not cross_site_browser_request(request):
+        return
+
+    mcp_config = getattr(config, "mcp", None)
+    pin = getattr(mcp_config, "pin", None) if mcp_config else None
+    candidate = extract_pin(request) or extract_key(request)
+    client = _client_of(request) if candidate else None
+    if pin and candidate and _matches(candidate, str(pin)):
+        GUARD.record_success(client)
+        return
+    # Fed into the same process-wide lockout the middleware consults on the way
+    # in, so a wrong PIN costs the same here as it does on a gated path.
+    if candidate:
+        GUARD.record_failure(client)
+    note = " " + PIN_IN_QUERY_NOTE if pin_in_query(request) else ""
+    raise AuthError(
+        f"Refusing {action}: " + REMOTE_ADMIN_ACTION_NOTE + note,
+        code="remote_admin_requires_credential",
+        status_code=403,
+    )
+
+
 def check_request(request: Request, config: Config) -> None:
     """Raise :class:`AuthError` unless the request is authorized.
 

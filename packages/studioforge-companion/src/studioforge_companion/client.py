@@ -236,6 +236,32 @@ class StudioForgeClient:
         raw_suggestions = details.get("suggestions") if details else None
         suggestions = [str(s) for s in raw_suggestions] if isinstance(raw_suggestions, list) else []
 
+        # D48: a 503 has two meanings behind the one ModelBusyError class.
+        # "A request is in flight" is a state you might act on; "a higher-tier
+        # load has the cards" (D46) is a queue you are standing in, and the
+        # generic prose reads like the model is broken. The server marks the
+        # second with its own code beside the class and a holder block, so name
+        # the holder and its tier. The message is REPLACED rather than appended
+        # to, because the server-side sentence explains the D46 policy at
+        # length and the operator needs the one fact: who, and how long. No new
+        # exit code -- the table in this module's docstring is a published
+        # contract and scripts branch on it.
+        hold = details.get("priority_hold") if details else None
+        if code == "priority_hold" or isinstance(hold, dict):
+            holder_block = hold if isinstance(hold, dict) else {}
+            holder = str(holder_block.get("model_id") or "another model")
+            tier = holder_block.get("priority")
+            # A bool is an int in Python and would render as "tier-True".
+            tier_text = (
+                f"tier-{tier} " if isinstance(tier, int) and not isinstance(tier, bool) else ""
+            )
+            message = f"held off while {tier_text}'{holder}' loads"
+            suggestions = [
+                *suggestions,
+                "nothing is wrong with the model you asked for -- the hold lifts as soon "
+                f"as '{holder}' is serving; watch for it with 'sfctl status'",
+            ]
+
         # A 503 carries a wait, in the header and again in the diagnostics
         # block. Both were dropped, so "busy, try again in 10 minutes" reached
         # the caller as an unexplained failure -- the shape most likely to be
@@ -458,6 +484,8 @@ class StudioForgeClient:
         ctx_size: int,
         prefer_mode: str | None = None,
         kv_min: str | None = None,
+        max_slots: int | None = None,
+        persist: bool = False,
         priority: int | None = None,
     ) -> Any:
         """Load at exactly ``ctx_size`` per slot, or refuse with a 507.
@@ -465,12 +493,23 @@ class StudioForgeClient:
         The distinction from :meth:`load` is the whole point: this one either
         gives the window that was asked for or says it cannot, instead of
         quietly shrinking it.
+
+        ``max_slots`` caps the slot count the planner may choose; ``persist``
+        writes the shape that actually launched back into the model's settings
+        so later loads repeat it, at the cost of freezing the KV ladder and the
+        slot estimator until those fields are cleared. Both keys are omitted
+        from the body when unset, so a pre-D48 server sees exactly the request
+        it saw before rather than a 422 for an unknown field.
         """
         body: dict[str, Any] = {"ctx_size": ctx_size}
         if prefer_mode is not None:
             body["prefer_mode"] = prefer_mode
         if kv_min is not None:
             body["kv_min"] = kv_min
+        if max_slots is not None:
+            body["max_slots"] = max_slots
+        if persist:
+            body["persist"] = True
         if priority is not None:
             body["priority"] = priority
         return await self.post(f"models/{_path_segment(model)}/load-recommended", body)

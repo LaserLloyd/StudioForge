@@ -569,6 +569,7 @@ def _library_body(ctx: GuiContext, refresh: Any) -> None:
     ).classes("text-xs opacity-70")
     fields.row("models.default_kv_cache_type", label="KV cache type")
     fields.row("models.default_ttl_s", label="Idle unload after (s)")
+    ttl_widgets = _ttl_by_priority_rows(ctx)
     fields.row(
         "models.auto_load_pinned", label="Load pinned models at startup and keep them loaded"
     )
@@ -581,7 +582,81 @@ def _library_body(ctx: GuiContext, refresh: Any) -> None:
     fields.row("models.preload_default_model", label="Preload that default at startup")
 
     with ui.row().classes("items-center gap-3"):
-        _save_button(ctx, fields, refresh)
+        result = ui.label("").classes("text-xs")
+
+        async def save() -> None:
+            updates = fields.updates()
+            # apply_config_updates cannot patch a leaf inside a dict, so the
+            # whole mapping goes or nothing does -- and it only goes when it
+            # differs from what is on disk, or every Save on this section would
+            # rewrite an unchanged key and claim a change.
+            #
+            # Because it is a whole-mapping write, a bad box cannot simply be
+            # skipped: dropping it would delete that tier's saved timer and the
+            # save would report success. Refuse the whole save instead, naming
+            # the tier, and leave every other field on this section untouched.
+            try:
+                tiers = st.ttl_by_priority_map(
+                    {tier: widget.value for tier, widget in ttl_widgets.items()}
+                )
+            except ValueError as exc:
+                notify_error(exc, what="idle unload per load priority")
+                result.set_text("not saved")
+                return
+            current = {int(k): int(v) for k, v in ctx.config.models.ttl_by_priority.items()}
+            if tiers != current:
+                updates["models.ttl_by_priority"] = tiers
+            await _save(ctx, updates, result, refresh)
+
+        ui.button("Save", icon="save", on_click=save).props("color=primary dense")
+
+
+def _ttl_by_priority_rows(ctx: GuiContext) -> dict[int, Any]:
+    """Three optional per-tier idle timers (``models.ttl_by_priority``, D48).
+
+    Dict-typed, so it cannot come from the generated Advanced section -- it is
+    in ``CUSTOM_WIDGET_KEYS`` and gets this control instead. Sits next to the
+    default TTL it overrides, because the only way to read either number
+    correctly is against the other: a tier with no box filled in uses the
+    default above, which is what a fresh install ships with.
+    """
+    current = {int(k): int(v) for k, v in ctx.config.models.ttl_by_priority.items()}
+    widgets: dict[int, Any] = {}
+    with ui.row().classes("w-full items-center gap-3 flex-wrap"):
+        ui.label("Idle unload per load priority (s)").classes("text-xs opacity-80")
+        for tier in (1, 2, 3):
+            widgets[tier] = (
+                ui.number(
+                    f"{tier} — {st.priority_label(tier)}",
+                    value=current.get(tier),
+                    precision=0,
+                )
+                .props("dense outlined clearable")
+                .classes("w-40")
+            )
+    note = ui.label("").classes("text-xs font-mono opacity-80")
+
+    def refresh_note() -> None:
+        """Describe what is *in the boxes*, not what was on disk at render time.
+
+        Same live-derived-text pattern as the settings dialog's hints: a
+        sentence that stops matching the widget above it the moment a box is
+        touched reads as the truth and is not.
+        """
+        try:
+            typed = st.ttl_by_priority_map({t: w.value for t, w in widgets.items()})
+        except ValueError as exc:
+            note.set_text(str(exc))
+            return
+        note.set_text(st.ttl_by_priority_note(typed, default_ttl_s=ctx.config.models.default_ttl_s))
+
+    for widget in widgets.values():
+        widget.on_value_change(lambda _: refresh_note())
+    refresh_note()
+    ui.label(f"models.ttl_by_priority · {st.CONFIG_FIELD_HELP['models.ttl_by_priority']}").classes(
+        "text-xs opacity-60"
+    )
+    return widgets
 
 
 def _disk_report(ctx: GuiContext) -> dict[str, Any] | None:
