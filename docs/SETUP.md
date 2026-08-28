@@ -38,7 +38,7 @@ the one button that fixes them.
 | **Model library** | `models.dir` exists and has at least one `.gguf` in it | **Detect LM Studio library**, or type a path |
 | **Models indexed** | The registry has scanned that library. It is what `/v1/models`, the catalog and the planner read | **Rescan now** |
 | **GPUs** | NVML sees at least one card. StudioForge is GPU-only: no GPU, no inference | Check the driver, then **Re-probe** |
-| **llama.cpp engine** | A versioned engine is installed under `engines/<tag>/` and active | **Install engine b10425** |
+| **llama.cpp engine** | A versioned engine is installed under `engines/<tag>/` and active | **Install engine `<the pinned tag>`** — the button names whatever `engine.pinned_tag` is set to |
 | **Gateway port** | Something is listening on `server.port`, and that something is us rather than LM Studio or a second copy of StudioForge | Quit the other one, or change the port |
 | **MCP pairing PIN** | Required while `mcp.pin_required` is on — and, with no `server.api_key`, for every MCP caller that is not on this machine whatever the toggle says (D32) | **Generate PIN** |
 | *HuggingFace token* | Optional. Only gated or private repositories need one | Paste one into **Downloads & HuggingFace** |
@@ -141,6 +141,21 @@ Engines are versioned artifacts under `engines/<tag>/`, never "whatever `llama-s
 (D3). The panel shows the active tag, every installed tag, and offers **smoke test** and
 **activate + reload** per tag.
 
+**Installing is not activating (D49).** **Install** unpacks a build into `engines/<tag>/` and leaves
+the live engine exactly where it was; **activate + reload** is what makes a build the one new loads
+use. Activating writes both halves at once — `active.json`, which the next load reads, *and*
+`engine.pinned_tag`, which survives a restart — because writing one without the other is drift, and
+`active.json` wins. That is also why editing the pinned tag in the form below on its own changes
+nothing: the card shows a **pin b10425 · active b10549** badge when the two disagree, and the fix is
+to activate the build you want. Rollback is the same move in the other direction, onto a tag that is
+still installed.
+
+Activating does not disturb running models: each `llama-server` child keeps the build it was
+launched with until it is reloaded. **Dashboard → Restart engines** is what moves the resident
+models onto the new build. Activating also re-validates every model's saved expert `extra_flags`
+against the new engine and warns about the ones it no longer accepts — llama-server *ignores* flags
+it does not recognise, so an engine switch can otherwise drop a setting silently (D2, D49-6).
+
 **`engine.cuda_variant`** is `auto`, which picks the highest CUDA build this driver can actually
 run. The rule runs one way only: a build compiled against CUDA *X.Y* needs a driver advertising
 *X.Y or newer* — CUDA compatibility runs forward, not back. Blackwell (sm_120) cards therefore need
@@ -150,17 +165,34 @@ see what it had to work with.
 
 **Check for update** asks GitHub for the newest release that has an asset *this* box can install —
 verified by reading the asset list, not by taking whatever tag sorts first — and never calls a
-downgrade an update. Installing a new engine does not disturb running models: each `llama-server`
-child keeps the build it was launched with until it is reloaded.
+downgrade an update.
+
+**What the release list is filtered by, and what an empty answer means.** Only `bNNNN` build tags
+are offered: a draft release has no downloadable assets, and a version tag (`vX.Y.Z`) is not an
+engine build under any option. GitHub's **prerelease flag is not a filter** — upstream marks
+ordinary builds with it, and for ten days in August 2026 honouring it hid every build newer than the
+one installed (D49-1). So an empty result means *no release carried an asset for this OS, arch and
+CUDA variant*, not that no build exists — and both **Check for update** and **List releases** say
+which it was, counted: *"checked 100 releases; 74 filtered (71 prerelease non-build tags, 3
+non-bNNNN tags)"*. `studioforge engine --check` and `--list` print the same sentence.
+
+**Who may press these buttons.** Install, activate + reload, smoke test and Dashboard → Restart
+engines all change the box, so with no `server.api_key` set they are accepted only from a browser
+**on this machine** (D32). A viewer who cannot use them sees them disabled with the two ways in:
+open the panel on the box, or set `server.api_key` (Setup tab, on the box) and sign in with it.
+*Check for update* and *List releases* stay available to everyone — they read GitHub and change
+nothing.
 
 **Linux + NVIDIA always builds from source.** Upstream publishes no Linux CUDA archive at any tag
 (the `ubuntu` assets are cpu, vulkan, rocm, sycl and openvino), so on Linux every install path —
-first run, **Install engine**, `engine --update`, the MCP tool — compiles the pinned tag with
+first run, **Install engine**, `engine --install`, `engine --update` — compiles the pinned tag with
 `allow_source_build` (default on) and needs `git`, `cmake` and a CUDA toolkit whose `nvcc` matches
 the driver. The build takes minutes, lands in `engines/<tag>-local/`, is reused on the next
 install of the same tag, and is smoke-tested like a download. With `allow_source_build: false` the
 refusal names those prerequisites. The ROCm tarball serves AMD cards the same way a Windows zip
-does. `keep_versions` is how many old engine directories survive a prune.
+does. `keep_versions` is how many old engine directories survive a prune — and pruning runs **only
+during an install**, never at startup, so a box can sit with more builds than that until the next
+one. The card says so when it does; nothing deletes your rollback engine while you are not looking.
 
 ---
 
@@ -335,8 +367,9 @@ The equivalent commands:
 ```bash
 studioforge config                  # the effective config, secrets redacted
 studioforge scan                    # index the model library, no server needed
-studioforge engine --check          # is there a newer llama.cpp release?
-studioforge engine --update         # install it, smoke-test it, then pin it
+studioforge engine --check          # is there a newer llama.cpp release? (and what was filtered)
+studioforge engine --update         # install it, smoke-test it, and activate+pin only if that passed
+studioforge engine --activate b10549   # switch to a build that is already installed, and pin it
 studioforge autostart enable        # Startup folder / systemd --user
 studioforge autostart disable
 ```

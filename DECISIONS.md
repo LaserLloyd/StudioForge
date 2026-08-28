@@ -3435,3 +3435,260 @@ move a line the entry itself had drawn in the wrong place.
   Setup tab's per-tier TTL rows refuse a bad box **by name** instead of
   dropping that tier from the mapping in silence, with the same message
   shown under the rows as you type.
+
+## D49 -- A filter that hid 120 builds, and an install that had already switched
+
+**Problem.** Three failures, found together on 2026-08-28 by asking the live rig a simple question
+-- *is there a newer llama.cpp?* -- and disbelieving the answer.
+
+**The blackout.** Every surface said no. `GET /api/engine/releases` returned `[]`, the Server tab's
+update line said "Engine b10549" and nothing else, and `studioforge engine --check` printed
+"already on the newest release". All three were reading one function, and that function was
+wrong: upstream now publishes its ordinary `bNNNN` build releases with GitHub's `prerelease` flag
+**set**. Measured against the API that afternoon: of the newest 100 release entries, 71 were
+prerelease `bNNNN` builds, and the first entry the filter let through was `b10549` -- the build
+already installed on this box. **120 builds (`b10550` through `b10669`) existed and were invisible
+to every caller at once**, and the product reported that as being up to date. The filter had not
+broken; upstream's metadata had moved under a rule written for a different shape, and nothing
+anywhere could say so, because the filter's reasons went to `log.debug` and were dropped.
+
+Two things made it worse rather than merely wrong. The release list was fetched as **one**
+over-sized page, so the answer cliffed on the caller's `limit`: with 71 of 100 entries rejected,
+`limit=5` fetched 20 entries and returned nothing, `limit=20` fetched 40 and returned nothing, and
+`limit=50` fetched 100 and returned 26 -- one repository, three different universes, depending on
+who asked. And "no update available" and "every candidate was filtered out" rendered identically,
+so the one piece of information a user could have acted on was the one piece never shown.
+
+**The activation-ordering lie.** `install()` ended with `_finalize(..., activate=True)`,
+unconditionally. `engine --update` therefore installed-and-activated, *then* smoke-tested, and on
+failure printed `keeping b10425 active` -- while `active.json` already named the build that had
+just failed its GPU micro-load. The comment above that branch stated the invariant ("never
+activated until the smoke test passes") that the code three lines below violated. The same
+implicit activate is where pin/active drift came from: nothing but the CLI ever wrote
+`engine.pinned_tag`, so `PATCH /api/config` could set the pin, report success, and change nothing,
+because `active()` reads `active.json` first. The disagreement was a boot-time log line and
+nothing else.
+
+**The locked-out remote operator.** On the shipped default (no `server.api_key`), D32 accepts
+box-changing routes only from the machine itself. The GUI knew that and rendered every engine
+button enabled anyway, so a browser on another machine got a red toast per click with no way to
+learn what would ever make it work. `POST /api/engine/validate-flags` was gated with the rest of
+`/api/engine/` by a path prefix, though it changes nothing on the box -- it reads one binary's
+`--help` -- so the one thing a remote operator most wants before saving expert flags was the one
+thing refused. In the other direction the GUI was *more* permissive than the API: `smoke_engine`
+had no `require_local_admin` at all, and it spawns a real GPU micro-load.
+
+**Two prior statements this entry revises.**
+
+The first is the release filter's own rationale, written on 2026-08-18 against a `v0.1.2`
+prerelease that carried no assets:
+
+> `prerelease` entries are excluded unless `include_prerelease`, because upstream uses them for
+> things that are not build releases
+
+That was a true observation turned into a false rule. The `v0.1.2` case was never about the
+prerelease flag: a `vX.Y.Z` tag is rejected by the tag scheme (`^b\d+$`), unconditionally and for
+reasons that have nothing to do with release kind -- `pinned_tag`, the `llama-bNNNN-bin-...` asset
+parser, `engines/<tag>/`, `active.json` and the source-build `git clone --branch <tag>` all assume
+`bNNNN`. The prerelease rejection was the cheap-looking second lock on a door the tag regex
+already held shut, and it is the lock that later jammed against the whole building. **Revised: the
+flag decides nothing for a tag that matches `ENGINE_TAG_RE`.** Drafts stay rejected always (their
+assets genuinely 404), the tag scheme stays unconditional, and asset eligibility -- "does this
+release carry an archive this OS, arch and driver can run" -- is what it always should have been:
+the real gate.
+
+Beside it, in the same docstring:
+
+> Sorted by build number descending rather than trusting the API's order, and over-fetched
+> (`per_page >= 2*limit`) so filtering out prereleases cannot return fewer tags than asked for.
+
+The second half is not a weaker guarantee than it sounds, it is not a guarantee at all: doubling
+the page size bounds the *filtering rate* it survives, and 71% was over that bound at every
+`limit`. **Revised:** the contract is now "fewer is possible, and what was filtered is recorded" --
+paging replaces over-fetching, and `last_release_scan` carries the shortfall's reasons so the
+caller can say them out loud.
+
+The second prior statement is D3's update procedure:
+
+> **Update procedure:** bump `engine.pinned_tag` in `config.yaml` (or use the Server tab / `sfctl
+> update engine`), which fetches, extracts, smoke-tests, and activates. Rollback = set the tag
+> back; the previous directory is still there.
+
+Three things wrong with one sentence. Bumping the pin fetches nothing and activates nothing --
+that was true when the pin was read at boot and stopped being true when `active.json` was
+introduced as the load-time answer. `sfctl update engine` has never existed (`sfctl update`
+manages *StudioForge's own* releases). And the rollback it promises is the part that matters at
+3 a.m.: setting the tag back is a no-op, so an operator following this line watched the old build
+stay unused and the new one keep serving. **Revised:** the pin is what survives a restart and
+`active.json` is what the next load reads; changing one without the other is drift, and the
+supported move -- forwards or backwards -- is `POST /api/engine/activate`, `studioforge engine
+--activate <tag>`, or the GUI's *activate + reload*, each of which writes **both**.
+
+**Decision.** Sixteen items, landed together because they are one path.
+
+1. **A `bNNNN` tag is a build release whatever GitHub calls it.** `_release_skip_reason` skips the
+   prerelease rejection for tags matching `ENGINE_TAG_RE`; drafts are rejected always; the tag
+   scheme is unconditional (`include_prerelease=True` widens the release *kind*, never the tag
+   scheme). The three reasons are module constants -- `SKIP_DRAFT`, `SKIP_PRERELEASE`,
+   `SKIP_TAG_SCHEME` -- so counts group on a stable string rather than on a sentence somebody will
+   reword.
+
+2. **The release list is paged.** `list_releases` walks `page=1..RELEASE_MAX_PAGES` (3) at
+   `RELEASE_PAGE_SIZE` (100), stopping when `limit` eligible tags are in hand or a short page
+   proves it was the last one, deduplicating tags across pages. A run of ineligible entries now
+   costs another request rather than the answer.
+
+3. **A filtered-out universe says so.** `EngineManager.last_release_scan` records
+   `{examined, kept, skipped, pages, reasons: {reason: count}}`; `check_update` folds it in as
+   `filtered` plus a rendered `filter_summary`; and one module function,
+   `describe_release_filter(scan)`, is the single renderer -- *"checked 100 releases; 74 filtered
+   (71 prerelease non-build tags, 3 non-bNNNN tags)"* -- so the GUI update line, the List-releases
+   dialog, `engine --check` and REST cannot word the same number three ways. `check_update`'s
+   existing `skipped` list keeps its `[{tag, reason}]` shape and its existing meaning (a per-tag
+   *asset* probe failed), because consumers iterate it; the filter counts are the new keys.
+
+4. **Installing and activating are separate decisions.** `install(tag, *, progress=None,
+   force=False, activate=False)` -- the implicit activate is gone, and that is a deliberate
+   behaviour break. `EngineManager.activate(tag)` validates the tag is installed, writes
+   `active.json`, warms the flag cache, and deliberately does **not** pin: the pin lives beside the
+   call, in one shared place per surface, so two writers cannot hold two opinions. `ensure_engine`'s
+   bootstrap and the source-build path pass `activate=True` (the first engine on a box must
+   activate). `engine --update` installs with `activate=False`, smoke-tests, and only on success
+   activates, pins and sweeps -- its failure branch now truthfully keeps the current engine and
+   says the new build is installed but unused. New `engine --activate <tag>`, and
+   `engine --install <tag> --activate-after-install` for the caller's own choice.
+
+5. **`POST /api/engine/activate`.** D32-gated. Rewrites `active.json`, sets and saves
+   `engine.pinned_tag` by exactly the path `PATCH /api/config` uses (dotted override → model
+   validation → `save()` → the section swapped onto the live config, which every component shares
+   by reference), runs the flag sweep, and returns `{tag, previous, offenders, note}`. `previous`
+   is the undo. `note` names `POST /api/restart/backend` (Dashboard → *Restart engines*), because
+   the single most-reported surprise about switching engines is that loaded children keep the
+   binary they were launched with. `GET /api/engine` gains `drift` -- `{pinned, active}` when they
+   disagree, `null` otherwise -- and both GUI engine cards render it as a warning badge beside the
+   active line.
+
+6. **Saved expert flags are re-checked on every switch.** `revalidate_extra_flags(tag, records)`
+   takes any iterable of things with `.id` and `.settings.extra_flags` (this module owns no
+   database handle) and returns `[{model_id, errors}]`. Called after a successful activation by the
+   route, the GUI and `engine --update`, **before** any force-reload. It never blocks the
+   activation: llama-server *ignores* flags it does not recognise, so a stale flag is invisible at
+   load time -- which is exactly why the warning has to be loud. This is D2's failure mode
+   (`--draft-max` accepted then ignored) arriving through the engine switch instead of through a
+   typo.
+
+7. **A reinstall cannot overwrite a binary something is executing.** `EngineManager.tag_in_use` is
+   an optional hook the API wires to the supervisor; any re-download over a present tag -- the
+   failed-smoke fallthrough *and* `force=True` -- is refused with an `EngineError` naming the
+   loaded models, and a hook that raises is treated conservatively as "in use". Extraction now goes
+   to a sibling `_<tag>.new` and is swapped in (old directory moved aside, staging renamed into
+   place, restored on failure), so a locked file can never leave a half-overwritten live directory.
+   The already-present and local-build branches preserve the on-disk variant and the original
+   `installed_at` instead of stamping `prebuilt`/now -- the two stamps that had been disarming the
+   too-old-driver warning and reshuffling prune's ordering.
+
+8. **The capabilities snapshot stops passing itself off as the running engine.**
+   `engine_capabilities.json` is a snapshot taken at one tag; `library_summary` was using it for a
+   hard *"unsupported by this engine"* verdict against whatever engine happened to be active.
+   It now appends to `unsupported_by_engine` only when the architecture list actually describes the
+   active build (a live checkout, or a snapshot whose `source_tag` is the running tag); otherwise
+   the model lands in an advisory `unknown_to_architecture_list` bucket beside
+   `architecture_list_describes_engine`, `..._source` and `..._detail`, and `studioforge
+   capabilities` prints it as a `?` line naming where the list came from rather than a verdict.
+   `scripts/refresh_engine_capabilities.py` shallow-clones llama.cpp at a tag, reuses the live
+   `extract_from_checkout` (a second parser would drift) and rewrites the snapshot with its
+   `source_tag`; `docs/RELEASING.md` carries it as a step.
+
+9. **The panel renders the D32 verdict instead of discovering it on click.** One
+   `viewer_may_change_box(ctx)` verdict per engine card: Install, *activate + reload*, *smoke test*
+   and the Dashboard's *Restart engines* are disabled for a viewer who cannot act, each carrying
+   one tooltip that names both ways in -- a browser on the box, or set `server.api_key` -- plus one
+   lock line on the card. *List releases* and *Check for update* stay open: they change nothing.
+   `require_local_admin` now runs **before** the busy spinner, and `smoke_engine` gained it,
+   closing the drift where the GUI was more permissive than its own REST twin on a GPU micro-load.
+
+10. **A ~600 MB download reports progress.** `install()` maintains
+    `EngineManager.install_progress` (`{tag, phase, fraction, done, error, updated_at}`) behind
+    whatever callback the caller passed, `GET /api/engine` exposes it for pollers, and the GUI
+    paints it into the busy notification from a 0.5 s timer -- polling, not painting from the
+    callback, which is the discipline the Downloads tab already uses.
+
+11. **`validate-flags` takes either shape, and is open.** `extra_flags` accepts a string or a list
+    of strings (joined with spaces -- the same separator the saved setting is split on); anything
+    else is a 400 naming both shapes, and a list with a non-string names the offending index and
+    its type. The route joins a small `_OPEN_POST_PATHS` allowlist in `is_admin_mutation`, checked
+    *before* the prefix match: the prefix rule is deliberately body-blind and path-only, which is
+    right for `/api/engine/install` and wrong for a POST that execs one binary's `--help`. The save
+    that makes the flags stick stays gated.
+
+12. **The flags cache is warmed, not discovered.** `engines/<tag>/flags.txt` had exactly one writer,
+    reached only from flag validation, so a fresh install reported "no flags" -- reading as a build
+    that supports nothing -- until somebody happened to validate a flag string against it. One
+    `--help` run of the binary we have just smoke-tested, after a fresh install and inside
+    `activate()`. Never fatal; the lazy path stays.
+
+13. **The download path fails legibly.** A disk precheck refuses up front, naming the drive,
+    required (asset × 2.5) and free -- and says nothing when the volume cannot be measured, rather
+    than blocking on an unknown. `_download` widens its `except` to `OSError` and cleans up the
+    `.part`. And a GitHub 403/429 with `x-ratelimit-remaining: 0` becomes an error naming the reset
+    time and `GITHUB_TOKEN`/`GH_TOKEN` -- headers `_api_headers` has honoured since it was written
+    without ever saying so anywhere a user would look.
+
+14. **The Update launcher will not touch a live rig.** `Update StudioForge.bat` probes
+    `http://127.0.0.1:1234/health` with the venv Python and, when a server answers, skips both the
+    engine update and the smoke test, pointing at the GUI (Setup or Server → Install, then activate;
+    Dashboard → *Restart engines*) and at the REST pair. It probes the **default** port only, and
+    says so: a server moved off `1234` is not detected. Its comments describe the
+    install-then-smoke-then-activate order, which is the first time they have described the code.
+
+15. **The keep_versions overage is surfaced, not acted on.** Pruning runs only during an install, so
+    a box sits with more builds than `engine.keep_versions` and no sign of it. Both engine cards now
+    say *"N installed, keep_versions M — older unpinned builds are pruned at the next install."*
+
+16. **A weekly canary asks upstream the same question.**
+    `.github/workflows/upstream-canary.yml` (Monday cron + manual dispatch, ubuntu, no GPU) builds a
+    real `EngineManager` against a throwaway data directory, asserts `list_releases(limit=10)` is
+    non-empty and that the newest tag yields a selectable win/x64 CUDA asset through the real
+    `select_asset`, prints the filter summary, and exits 0 with a notice on a rate-limit refusal.
+    The next time upstream's metadata moves, this fails on a Monday instead of a user failing to
+    get an update for ten days.
+
+**Surfaces.** `POST /api/engine/activate`; `activate` on `POST /api/engine/install`; `drift` and
+`install_progress` on `GET /api/engine`; `filtered` and `filter_summary` on `check_update` (and so
+on `GET /api/capabilities?check_update=true`); a string-or-list body and no credential requirement
+on `POST /api/engine/validate-flags`; `studioforge engine --activate <tag>`,
+`--activate-after-install`, and a counted filter line under `--check`/`--list`; the drift badge, the
+filter line, the keep_versions note, the install progress text, the disabled-control tooltips and
+the lock banner on both engine cards; and the running-server refusal in
+`launchers\Update StudioForge.bat`.
+
+**Deliberately not taken here.** *Auto-pruning old engines at startup* -- the overage is real
+(four installed against `keep_versions: 3` on this rig) but deleting the rollback engine unprompted
+on a live box is destructive, and prune already runs where it belongs, at install time; saying so on
+the card is enough (15). *MCP tools for the engine* -- the tool counts are test-enforced against the
+servers themselves, REST, the GUI and the CLI all cover the path, and a fourth caller for a
+once-a-month operation is not worth a number that has to be reconciled. *Regenerating the `b10425`
+capabilities snapshot and bumping the shipped default pin* -- both are the operator's call against
+the rig they run, not a decision to slip into a round about update plumbing; the script is provided
+and `docs/RELEASING.md` names the step. *A GUI for StudioForge's own self-update* -- a separate
+surface with its own rollback machinery (`core/updater.py`), unchanged here.
+
+**Tests.** `tests/unit/test_engine.py` (a prerelease `bNNNN` offered, a draft `bNNNN` not, a
+prerelease `vX.Y.Z` not, each asserting which reason constant it recorded; the page walk -- a first
+page of 100 ineligible entries still yielding `limit=5` from page 2, five ineligible pages stopping
+at the budget, a short page stopping without a wasted request; `describe_release_filter`'s exact
+sentence and `check_update` carrying the counts without disturbing `skipped`; install leaving
+`active.json` absent and `activate=True` writing it; `activate()` refusing an uninstalled tag,
+warming the flags and leaving the pin alone; the reinstall refusals and a failed swap leaving the
+installed engine byte-identical; the reused local build keeping its variant and `installed_at`; the
+disk precheck and the rate-limit error; the revalidation sweep's offenders and its never-raises
+contract; the CLI's install → smoke → activate order, including a failing smoke that leaves
+`active.json` and the pin unmoved; and the four engine routes),
+`tests/unit/test_api_hardening.py` (activate and smoke-test joining the D32 list, validate-flags
+joining the open list, and both accepted body shapes through the middleware from a LAN peer),
+`tests/unit/test_engine_features.py` (the capabilities advisory bucket under a stale snapshot, the
+hard verdict at the running tag, and the report's `capability_source_tag`),
+`tests/unit/test_gui.py` (the filter counts in the empty update line, `engine_filter_note`'s
+preference order, the drift badge, the keep_versions note, the offender warning, the progress line,
+and `smoke_engine` in the require-local-admin list), and
+`tests/unit/test_bat_launchers.py` (the launcher's new block).

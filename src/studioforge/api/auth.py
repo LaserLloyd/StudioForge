@@ -157,11 +157,28 @@ _ADMIN_SETTINGS_SUFFIXES: tuple[tuple[str, str], ...] = (
 )
 _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
+#: Exact paths that are POSTs by shape but reads by effect, and so stay open
+#: even under an admin prefix. Checked FIRST, ahead of the prefix match,
+#: because the prefix rule is deliberately body-blind and path-only: that is
+#: the right coarseness for ``/api/engine/install`` (600 MB onto this disk) and
+#: the wrong one for ``/api/engine/validate-flags``, which execs the engine's
+#: own ``--help`` and compares strings. Nothing on the box changes, so gating it
+#: only stopped a remote operator checking expert flags *before* saving them --
+#: while the save itself stays gated by ``_ADMIN_SETTINGS_SUFFIXES``, which is
+#: where the box change actually happens. D49.
+_OPEN_POST_PATHS = frozenset({"/api/engine/validate-flags"})
+
 
 def is_admin_mutation(method: str, path: str) -> bool:
-    """Whether ``method path`` is one of the routes D32 guards on an open install."""
+    """Whether ``method path`` is one of the routes D32 guards on an open install.
+
+    ``_OPEN_POST_PATHS`` wins over the prefix match: a POST that only reads is
+    not a box change, whatever prefix it happens to live under (D49).
+    """
     verb = (method or "").upper()
     if verb not in _MUTATING_METHODS:
+        return False
+    if path in _OPEN_POST_PATHS:
         return False
     if any(path == p.rstrip("/") or path.startswith(p) for p in _ADMIN_MUTATION_PREFIXES):
         return True

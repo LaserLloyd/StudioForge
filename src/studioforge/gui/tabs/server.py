@@ -13,10 +13,13 @@ client out, so a secret field is only included in the update when
 :func:`studioforge.gui.state.masked_secret_changed` says it really changed.
 
 **Shared with the Setup tab.** The engine actions (:func:`install_engine`,
-:func:`smoke_engine`, :func:`activate_engine`) and the OpenClaw snippet
-builders (:func:`openclaw_payload`, :func:`snippets`, :func:`snippet_block`)
-are public because :mod:`studioforge.gui.tabs.setup` renders the same controls.
-There is one implementation of each; two panels calling it is the point.
+:func:`smoke_engine`, :func:`activate_engine`), the update-row painter
+(:func:`paint_engine_update`) and the OpenClaw snippet builders
+(:func:`openclaw_payload`, :func:`snippets`, :func:`snippet_block`) are public
+because :mod:`studioforge.gui.tabs.setup` renders the same controls. There is
+one implementation of each; two panels calling it is the point -- the two
+copies of the update row had already drifted into passing different refresh
+callbacks for the same button (D49-9).
 """
 
 from __future__ import annotations
@@ -29,12 +32,17 @@ from studioforge import __version__
 from studioforge.gui import state as st
 from studioforge.gui.tabs import (
     GuiContext,
+    admin_control,
+    api_request,
     apply_config_updates,
+    badge,
     busy,
     notify_error,
     panel_guard,
+    remote_viewer_banner,
     require_local_admin,
     run_blocking,
+    viewer_may_change_box,
 )
 
 
@@ -45,8 +53,11 @@ def render(ctx: GuiContext) -> None:
         _openclaw_panel(ctx)
         _health_panel(ctx)
         _config_panel(ctx)
-        _engine_panel(ctx)
-        _capabilities_panel(ctx)
+        # The capabilities panel's update banner installs engines, so it is
+        # handed the Engine panel's own refresh: painting an install into a
+        # stale engine list was the no-op refresh of D49-9.
+        engine_refresh = _engine_panel(ctx)
+        _capabilities_panel(ctx, engine_refresh)
 
 
 # ---------------------------------------------------------------------------
@@ -94,11 +105,15 @@ def _setup_panel(ctx: GuiContext) -> None:
                             on_click=lambda: _scan_models(ctx, refresh),
                         ).props("outline dense")
                     elif item.action == "install-engine":
+                        # activate=True: this is the first-run bootstrap, and
+                        # the only engine on the box (D49-4). Leaving it
+                        # inactive would leave the checklist item red after the
+                        # install it names succeeded.
                         ui.button(
                             f"Install engine {ctx.config.engine.pinned_tag}",
                             icon="download",
                             on_click=lambda: install_engine(
-                                ctx, ctx.config.engine.pinned_tag, refresh
+                                ctx, ctx.config.engine.pinned_tag, refresh, activate=True
                             ),
                         ).props("outline dense")
 
@@ -583,10 +598,19 @@ async def _unload_all(ctx: GuiContext) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _engine_panel(ctx: GuiContext) -> None:
+def _engine_panel(ctx: GuiContext) -> Any:
+    """The Server tab's engine controls; returns its own refresh callable.
+
+    The refresh goes back to :func:`render` because the capabilities panel's
+    update banner installs engines too, and an install that repaints nothing is
+    how a working install came to look like a failed one (D49-9).
+    """
     ui.label("Engine").classes("text-lg font-medium")
     body = ui.column().classes("w-full gap-1")
     releases_box = ui.column().classes("w-full gap-1")
+    # D49-9: one verdict for the whole panel, taken from the viewer looking at
+    # it. Every control below changes the box.
+    may_change = viewer_may_change_box(ctx)
 
     def refresh() -> None:
         body.clear()
@@ -595,6 +619,8 @@ def _engine_panel(ctx: GuiContext) -> None:
             if manager is None:
                 ui.label("engine manager unavailable").classes("text-xs opacity-60")
                 return
+            if not may_change:
+                remote_viewer_banner()
             active = manager.active()
             if active is None:
                 ui.label(
@@ -602,57 +628,147 @@ def _engine_panel(ctx: GuiContext) -> None:
                     "install it below."
                 ).classes("text-sm text-warning")
             else:
-                ui.label(f"active: {active.tag} ({active.variant})").classes("text-sm font-medium")
+                with ui.row().classes("items-center gap-2"):
+                    ui.label(f"active: {active.tag} ({active.variant})").classes(
+                        "text-sm font-medium"
+                    )
+                    drift = st.engine_drift_badge(ctx.config.engine.pinned_tag, active.tag)
+                    if drift:
+                        badge(drift, colour="warning").tooltip(st.ENGINE_DRIFT_NOTE)
                 ui.label(
                     f"{active.version_string or st.UNKNOWN} · smoke tested "
                     f"{active.smoke_tested} · {active.server_binary}"
                 ).classes("text-xs font-mono opacity-70")
-            for info in manager.installed():
+            installed = list(manager.installed())
+            for info in installed:
                 marker = "★" if info.active else "·"
                 with ui.row().classes("items-center gap-2"):
                     ui.label(f"{marker} {info.tag} ({info.variant})").classes(
                         "text-xs font-mono grow"
                     )
-                    ui.button("smoke test", on_click=lambda t=info.tag: smoke_engine(ctx, t)).props(
-                        "flat dense"
+                    admin_control(
+                        ui.button(
+                            "smoke test", on_click=lambda t=info.tag: smoke_engine(ctx, t)
+                        ).props("flat dense"),
+                        may_change=may_change,
+                        what="engine smoke test",
                     )
-                    ui.button(
-                        "activate + reload",
-                        on_click=lambda t=info.tag: activate_engine(ctx, t, refresh),
-                    ).props("flat dense")
+                    admin_control(
+                        ui.button(
+                            "activate + reload",
+                            on_click=lambda t=info.tag: activate_engine(ctx, t, refresh),
+                        ).props("flat dense"),
+                        may_change=may_change,
+                        what="activate engine",
+                    )
+            overage = st.engine_keep_versions_note(
+                len(installed), int(ctx.config.engine.keep_versions)
+            )
+            if overage:
+                ui.label(overage).classes("text-xs text-warning")
 
     refresh()
 
     with ui.row().classes("items-center gap-2"):
         tag_input = ui.input("tag to install", value=ctx.config.engine.pinned_tag)
         tag_input.props("dense outlined").classes("w-40")
-        ui.button(
-            "Install",
-            icon="download",
-            on_click=lambda: install_engine(ctx, tag_input.value, refresh),
-        ).props("outline dense")
+        admin_control(
+            ui.button(
+                "Install",
+                icon="download",
+                on_click=lambda: install_engine(ctx, tag_input.value, refresh),
+            ).props("outline dense"),
+            may_change=may_change,
+            what="engine install",
+            tooltip=(
+                "Downloads the build. It does not become the active engine until you "
+                "activate it (D49-4)."
+            ),
+        )
+        # Reading GitHub changes nothing, so it stays open to every viewer.
         ui.button(
             "List releases", icon="list", on_click=lambda: _releases(ctx, releases_box)
         ).props("outline dense")
 
+    return refresh
 
-async def install_engine(ctx: GuiContext, tag: Any, refresh: Any) -> None:
+
+async def install_engine(
+    ctx: GuiContext, tag: Any, refresh: Any, *, activate: bool = False
+) -> None:
+    """Install an engine build, activating it only when asked (D49-4).
+
+    ``activate=False`` is what a button press means: installing is a download,
+    and moving the whole box onto a different binary is a second decision, made
+    with 'activate + reload'. Only the first-run checklist passes ``True`` --
+    the engine it installs is the only one on the box.
+
+    Progress is threaded through to the spinner (D49-10) because the download
+    is ~600 MB and a motionless "this can take a while" is indistinguishable
+    from a hang.
+    """
     tag = str(tag or "").strip()
     if not tag:
         ui.notify("enter a tag", type="warning")
         return
-    with busy(message=f"Installing engine {tag} (this can take a while)…"):
+    # D49-9: the gate runs BEFORE the spinner. Opening a "this can take a
+    # while" notification and closing it half a second later with a refusal
+    # reads as a failed install rather than a refused one.
+    try:
+        require_local_admin(ctx, "engine install")
+    except Exception as exc:  # noqa: BLE001
+        notify_error(exc, what="engine install")
+        return
+
+    seen: dict[str, Any] = {"phase": "", "fraction": 0.0}
+
+    def on_progress(phase: str, fraction: float) -> None:
+        # Recorded, not painted. The download loop calls this once per
+        # megabyte and the source build once per compiler line; the timer
+        # below throttles that to something a browser can keep up with -- the
+        # same discipline the Downloads tab polls the downloader with.
+        seen["phase"] = phase
+        seen["fraction"] = fraction
+
+    with busy(message=f"Installing engine {tag} (this can take a while)…") as spinner:
+        ticker: Any = None
         try:
-            require_local_admin(ctx, "engine install")
-            info = await ctx.engine_manager.install(tag)
+            ticker = ui.timer(
+                0.5,
+                lambda: spinner.set_message(
+                    st.install_progress_line(str(tag), seen["phase"], seen["fraction"])
+                ),
+            )
+            info = await ctx.engine_manager.install(tag, activate=activate, progress=on_progress)
         except Exception as exc:  # noqa: BLE001
             notify_error(exc, what="engine install")
             return
-    ui.notify(f"installed {info.tag} ({info.variant})", type="positive")
+        finally:
+            if ticker is not None:
+                ticker.cancel()
+    message = f"installed {info.tag} ({info.variant})"
+    if activate:
+        message += " and made it the active engine"
+    else:
+        # D49-10: said on every install, not only inside the update banner.
+        # "I installed the new engine and nothing changed" is this note.
+        message += f". {st.ENGINE_UPDATE_NOTE}"
+    ui.notify(message, type="positive", multi_line=True, close_button=not activate)
     refresh()
 
 
 async def smoke_engine(ctx: GuiContext, tag: str) -> None:
+    """Load a tiny model on the GPU with ``tag``'s binary and unload it.
+
+    Gated (D49-9). It reads like a read, but it spawns the engine and takes
+    VRAM on a live rig, and the REST twin has been D32-gated all along: the
+    panel being the more permissive of the two was the drift worth closing.
+    """
+    try:
+        require_local_admin(ctx, "engine smoke test")
+    except Exception as exc:  # noqa: BLE001
+        notify_error(exc, what="smoke test")
+        return
     with busy(message=f"Smoke testing {tag}…"):
         try:
             ok, detail = await ctx.engine_manager.smoke_test(tag)
@@ -673,13 +789,31 @@ async def activate_engine(ctx: GuiContext, tag: str, refresh: Any) -> None:
     A running child keeps the binary it started with, so switching engines only
     means anything once the models are restarted -- doing it in one action is
     what makes the change observable.
+
+    Both halves are written -- ``active.json``, which wins at load time, and
+    ``engine.pinned_tag``, which survives a restart -- by calling
+    ``POST /api/engine/activate`` in-process rather than repeating it here
+    (D49-5). Writing only one of them is the no-op the drift badge exists for,
+    and the route also runs the extra-flags revalidation sweep (D49-6), which a
+    second implementation would have quietly skipped.
     """
+    # D49-9: gate first, spinner second -- a refusal must not look like a
+    # failed activation. The route is D32-gated by the API middleware, which
+    # this in-process call does not pass through, so the panel applies it.
+    try:
+        require_local_admin(ctx, "activate engine")
+    except Exception as exc:  # noqa: BLE001
+        notify_error(exc, what="activate engine")
+        return
     with busy(message=f"Activating {tag} and reloading models…"):
         try:
-            require_local_admin(ctx, "activate engine")
-            await run_blocking(ctx.engine_manager.set_active, tag)
-            ctx.config.engine.pinned_tag = tag
-            await run_blocking(ctx.config.save)
+            from studioforge.api.mgmt_routes import engine_activate
+
+            payload = dict(await engine_activate(api_request(ctx), tag=tag))
+            # The reload is the GUI's own half: a running child keeps the
+            # binary it started with, so switching engines only means anything
+            # once the models are restarted, and doing both in one action is
+            # what makes the change observable.
             loaded = [i.model_id for i in ctx.supervisor.list()]
             for model_id in loaded:
                 await ctx.manager.load(model_id, force=True, source="gui")
@@ -687,25 +821,36 @@ async def activate_engine(ctx: GuiContext, tag: str, refresh: Any) -> None:
             notify_error(exc, what="activate engine")
             return
     ui.notify(f"{tag} active; reloaded {len(loaded)} model(s)", type="positive")
+    warning = st.flag_offender_warning(payload.get("offenders"))
+    if warning:
+        # D49-6: llama-server ignores flags it does not know, so a stale flag
+        # is dropped in silence unless something says this.
+        ui.notify(warning, type="warning", multi_line=True, close_button=True)
     refresh()
 
 
 async def _releases(ctx: GuiContext, box: Any) -> None:
     with busy(message="Fetching llama.cpp releases…"):
         try:
-            releases = await ctx.engine_manager.list_releases(20)
+            releases = list(await ctx.engine_manager.list_releases(20))
         except Exception as exc:  # noqa: BLE001
             notify_error(exc, what="list releases")
             return
+        # D49-3: the filter's reasons now reach the dialog instead of dying in
+        # log.debug. The scan belongs to the call that just ran.
+        scan = getattr(ctx.engine_manager, "last_release_scan", None)
     box.clear()
     with box:
         ui.label("available releases").classes("text-xs font-medium")
         ui.label(", ".join(releases) or "none").classes("text-xs font-mono opacity-70")
+        counts = st.release_filter_line(scan)
+        if counts:
+            # An empty list and a list every entry was thrown out of read the
+            # same to a user, and only one of them is worth reporting.
+            ui.label(counts).classes("text-xs opacity-70")
         # Saying so beats someone comparing this list against GitHub's front
         # page and concluding the fetch is broken.
-        ui.label("prereleases and non-bNNNN tags are hidden: they carry no engine build").classes(
-            "text-xs opacity-60"
-        )
+        ui.label(st.RELEASE_FILTER_NOTE).classes("text-xs opacity-60")
 
 
 # ---------------------------------------------------------------------------
@@ -713,7 +858,7 @@ async def _releases(ctx: GuiContext, box: Any) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _capabilities_panel(ctx: GuiContext) -> None:
+def _capabilities_panel(ctx: GuiContext, engine_refresh: Any = None) -> None:
     """What this backend supports, cross-referenced against *this* library.
 
     Ordered by what the question actually was. The user's complaint was "I can't
@@ -731,6 +876,7 @@ def _capabilities_panel(ctx: GuiContext) -> None:
     body = ui.column().classes("w-full gap-2")
     update_row = ui.row().classes("w-full items-center gap-2")
     report_holder: dict[str, Any] = {"report": None}
+    may_change = viewer_may_change_box(ctx)
 
     async def load() -> None:
         body.clear()
@@ -748,6 +894,17 @@ def _capabilities_panel(ctx: GuiContext) -> None:
         with body, panel_guard("Backend capabilities"):
             _capabilities_body(ctx, report)
 
+    def after_install() -> None:
+        """Repaint the Engine panel *and* this one after an install (D49-9).
+
+        The banner used to be handed ``lambda: None``: the install ran, the
+        engine list above went on showing what was there before it, and the
+        only way to see the new build was a page reload.
+        """
+        if engine_refresh is not None:
+            engine_refresh()
+        ui.timer(0.1, load, once=True)
+
     async def check_update() -> None:
         update_row.clear()
         with update_row:
@@ -761,9 +918,9 @@ def _capabilities_panel(ctx: GuiContext) -> None:
             payload = await ctx.engine_manager.check_update(limit=5)
         except Exception as exc:  # noqa: BLE001
             payload = {"checked": True, "error": str(exc)}
-        _paint_update(ctx, update_row, payload)
+        paint_engine_update(ctx, update_row, payload, after_install, may_change=may_change)
 
-    _paint_update(ctx, update_row, None)
+    paint_engine_update(ctx, update_row, None, after_install, may_change=may_change)
     ui.timer(0.1, load, once=True)
     with ui.row().classes("items-center gap-2"):
         ui.button("Refresh", icon="refresh", on_click=load).props("outline dense")
@@ -794,17 +951,37 @@ def _build_capability_report(ctx: GuiContext) -> dict[str, Any]:
     return result
 
 
-def _paint_update(ctx: GuiContext, row: Any, update: dict[str, Any] | None) -> None:
+def paint_engine_update(
+    ctx: GuiContext,
+    row: Any,
+    update: dict[str, Any] | None,
+    refresh: Any,
+    *,
+    may_change: bool = True,
+) -> None:
+    """Paint the update line and its Install button into ``row``.
+
+    One implementation for both engine panels: the Server tab's version used to
+    pass ``lambda: None`` as its refresh while the Setup tab's passed the real
+    one, so the same button left the page in two different states (D49-9).
+    ``refresh`` is called after a successful install; ``may_change`` carries
+    the D32 verdict for the button.
+    """
     row.clear()
     with row:
         ui.label(st.engine_update_line(update)).classes("text-sm")
         if st.engine_update_available(update):
             latest = str((update or {}).get("latest") or "")
-            ui.button(
-                f"Install {latest}",
-                icon="download",
-                on_click=lambda tag=latest: install_engine(ctx, tag, lambda: None),
-            ).props("outline dense color=primary").tooltip(st.ENGINE_UPDATE_NOTE)
+            admin_control(
+                ui.button(
+                    f"Install {latest}",
+                    icon="download",
+                    on_click=lambda tag=latest: install_engine(ctx, tag, refresh),
+                ).props("outline dense color=primary"),
+                may_change=may_change,
+                what="engine install",
+                tooltip=st.ENGINE_UPDATE_NOTE,
+            )
             ui.label(st.ENGINE_UPDATE_NOTE).classes("text-xs opacity-70")
 
 

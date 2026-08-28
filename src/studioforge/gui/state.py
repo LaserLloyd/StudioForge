@@ -3387,7 +3387,11 @@ def engine_update_line(update: Mapping[str, Any] | None) -> str:
     current = str(payload.get("current") or UNKNOWN)
     latest = payload.get("latest")
     if not latest:
-        return f"Engine {current}. No installable release was found on GitHub."
+        # D49-3: "none" and "we threw away every release we saw" are the same
+        # sentence to a user, and only one of them is a bug worth reporting.
+        note = engine_filter_note(payload)
+        tail = f" — {note}." if note else ""
+        return f"Engine {current}. No installable release was found on GitHub.{tail}"
     if payload.get("update_available"):
         variant = payload.get("latest_variant")
         suffix = f" ({variant})" if variant else ""
@@ -3407,6 +3411,196 @@ ENGINE_UPDATE_NOTE: Final = (
     "keeps the build it was launched with. Use 'Restart engines' on the Dashboard to "
     "move the loaded models onto the new build."
 )
+
+#: What the release list is actually filtered by, said where the list is shown.
+#: The old wording claimed prereleases were hidden because they carry no build;
+#: on 2026-08-28 upstream was publishing ordinary ``bNNNN`` builds with
+#: ``prerelease: true`` and that sentence was defending a blackout of 120
+#: releases (DECISIONS D49-1). The tag scheme is the filter that means anything.
+RELEASE_FILTER_NOTE: Final = (
+    "Only bNNNN build tags are listed: a draft release has no downloadable assets and a "
+    "version tag (vX.Y.Z) is not an engine build. GitHub's 'prerelease' flag is not a "
+    "filter — upstream marks ordinary builds with it."
+)
+
+#: What a drift badge means, in the words of the rule that causes it.
+ENGINE_DRIFT_NOTE: Final = (
+    "The pinned tag and the active engine disagree. The active engine wins — active.json is "
+    "read before engine.pinned_tag — so editing the pin on its own moves nothing. Use "
+    "'activate + reload' on the build you want; it sets both."
+)
+
+#: Longest raw reason echoed verbatim in a counted line before it is clipped.
+#: The asset-probe reasons are whole sentences naming driver versions; a count
+#: line is a summary, and the detail is in the log.
+_SKIP_REASON_CLIP: Final = 90
+
+
+def _skip_label(reason: Any) -> str:
+    text = " ".join(str(reason or "unknown reason").split())
+    if len(text) > _SKIP_REASON_CLIP:
+        return text[: _SKIP_REASON_CLIP - 1].rstrip() + "…"
+    return text
+
+
+def release_skip_counts(skipped: Any) -> list[tuple[str, int]]:
+    """``(reason, count)`` pairs for the releases a check did not offer.
+
+    Tolerant of both shapes a caller can hold (D49-3): a list of
+    ``{"tag": ..., "reason": ...}`` records -- ``check_update``'s per-tag asset
+    failures -- or an already-aggregated ``{reason: count}`` mapping. Ordered
+    commonest-first and then alphabetically, so two checks that saw the same
+    releases print the same line.
+    """
+    counts: dict[str, int] = {}
+    if isinstance(skipped, Mapping):
+        for reason, count in skipped.items():
+            label = _skip_label(reason)
+            counts[label] = counts.get(label, 0) + (_maybe_int(count) or 0)
+    else:
+        for entry in _sequence(skipped):
+            reason = entry.get("reason") if isinstance(entry, Mapping) else entry
+            label = _skip_label(reason)
+            counts[label] = counts.get(label, 0) + 1
+    return sorted(
+        ((reason, count) for reason, count in counts.items() if count > 0),
+        key=lambda pair: (-pair[1], pair[0]),
+    )
+
+
+def release_filter_line(source: Any) -> str:
+    """One sentence about what the release filter dropped (D49-3).
+
+    Takes whatever the caller holds. A ``last_release_scan`` mapping is handed
+    straight to :func:`studioforge.core.engine.describe_release_filter`: it
+    composes ``"checked 100 releases; 74 filtered (71 prerelease non-build
+    tags, …)"`` for ``engine --check`` and REST too, and the panel wording the
+    same fact differently is how three surfaces come to disagree about one
+    number. A bare list of skip records (or a ``{reason: count}`` mapping) is
+    counted here instead.
+
+    Empty when there is nothing to explain, so a caller may append it
+    unconditionally. It exists because before D49-3 the reasons went to
+    ``log.debug`` and were dropped, which made "upstream published nothing" and
+    "we discarded all 120 of them" the same empty list.
+    """
+    # Imported here so this formatting module does not pull the engine's HTTP
+    # client in behind it; it is a pure function of its argument either way.
+    from studioforge.core.engine import describe_release_filter
+
+    if isinstance(source, Mapping) and ("examined" in source or "reasons" in source):
+        return describe_release_filter(source)
+    counts = release_skip_counts(source)
+    if not counts:
+        return ""
+    total = sum(count for _, count in counts)
+    detail = ", ".join(f"{count} {reason}" for reason, count in counts)
+    return f"{total} release{'' if total == 1 else 's'} filtered: {detail}"
+
+
+def engine_filter_note(update: Mapping[str, Any] | None) -> str:
+    """What a :meth:`check_update` payload says its filter threw away.
+
+    Prefers the sentence the check already composed (``filter_summary``), then
+    its raw scan, then its per-tag skips -- so a payload from before D49-3
+    still says something rather than nothing.
+    """
+    payload = _mapping(update)
+    summary = str(payload.get("filter_summary") or "").strip()
+    if summary:
+        return summary
+    scan = payload.get("filtered")
+    if isinstance(scan, Mapping) and scan:
+        return release_filter_line(scan)
+    return release_filter_line(payload.get("skipped"))
+
+
+def flag_offender_warning(offenders: Any) -> str | None:
+    """One warning for the models an engine switch just invalidated (D49-6).
+
+    ``POST /api/engine/activate`` revalidates every saved ``extra_flags``
+    string against the build it just activated and reports
+    ``[{model_id, errors}]``. It never refuses the switch -- llama-server
+    ignores flags it does not recognise, which is precisely why this has to be
+    loud: the model reloads, looks healthy, and runs without the setting.
+    """
+    rows: list[str] = []
+    for entry in _sequence(offenders):
+        if not isinstance(entry, Mapping):
+            continue
+        model_id = str(entry.get("model_id") or UNKNOWN)
+        errors = "; ".join(str(error) for error in _sequence(entry.get("errors")) if error)
+        rows.append(f"{model_id} ({errors})" if errors else model_id)
+    if not rows:
+        return None
+    return (
+        f"{len(rows)} model(s) have saved extra_flags this engine does not accept. "
+        "llama-server ignores unknown flags, so they will be dropped in silence at the "
+        "next load: " + " · ".join(rows)
+    )
+
+
+def engine_drift_badge(pinned: Any, active: Any) -> str | None:
+    """``pin b10425 · active b10549`` when the two disagree (D49-5).
+
+    ``active.json`` is read before ``engine.pinned_tag``, so a pin that does
+    not match is not a plan for the next restart -- it is a setting that does
+    nothing. Before D49 the only place that said so was one line in the boot
+    log, which nobody reads while wondering why the version did not change.
+    """
+    pin = str(pinned or "").strip()
+    running = str(active or "").strip()
+    if not pin or not running or pin == running:
+        return None
+    return f"pin {pin} · active {running}"
+
+
+def engine_keep_versions_note(installed: int, keep_versions: int) -> str | None:
+    """The pruning overage, said out loud rather than acted on (D49-15).
+
+    Pruning only runs during an install, so a box can sit for weeks with more
+    builds than ``engine.keep_versions`` and no sign of it -- and then lose the
+    rollback engine to a prune nobody connected to the install they just ran.
+    Deleting them at startup instead would be worse; saying so is enough.
+    """
+    if keep_versions <= 0 or installed <= keep_versions:
+        return None
+    return (
+        f"{installed} installed, keep_versions {keep_versions} — older unpinned builds are "
+        "pruned at the next install."
+    )
+
+
+#: ``ProgressFn`` phase names (core.engine) in words a person recognises.
+_INSTALL_PHASES: Final = {
+    "download": "downloading",
+    "cudart": "downloading the CUDA runtime",
+    "extract": "extracting",
+    "smoke": "smoke testing",
+    "done": "finishing",
+    "clone": "cloning the source",
+    "configure": "configuring the build",
+    "build": "compiling",
+}
+
+
+def install_progress_line(tag: str, phase: Any, fraction: Any) -> str:
+    """Spinner text for an engine install (D49-10).
+
+    A ~600 MB download behind a spinner that has said the same eight words for
+    four minutes is indistinguishable from a hang, which is how "the panel
+    froze" reports start. Unknown phases are shown verbatim rather than hidden:
+    a name we have not met is still more than no name.
+    """
+    name = _INSTALL_PHASES.get(str(phase or "").strip(), str(phase or "").strip())
+    head = f"Installing engine {tag}"
+    if not name:
+        return f"{head} (this can take a while)…"
+    try:
+        percent = max(0.0, min(1.0, float(fraction))) * 100.0
+    except (TypeError, ValueError):
+        percent = 0.0
+    return f"{head} — {name} {percent:.0f}%"
 
 
 def filter_architectures(names: Sequence[str], needle: str | None) -> list[str]:

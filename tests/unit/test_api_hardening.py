@@ -75,6 +75,11 @@ def open_config(pin: str | None = "12345678") -> Config:
         ("POST", "/api/restart/server"),
         ("POST", "/api/restart/backend"),
         ("POST", "/api/engine/install"),
+        # Activating rewrites active.json AND engine.pinned_tag: it moves the
+        # whole box onto a different binary, so it is as much a box change as
+        # the install that fetched it (D49-5).
+        ("POST", "/api/engine/activate"),
+        ("POST", "/api/engine/smoke-test"),
         ("POST", "/api/update/install"),
         ("POST", "/api/update/rollback"),
         ("POST", "/api/vram/reclaim"),
@@ -134,6 +139,11 @@ def test_admin_mutations_from_the_lan_need_a_credential_on_an_open_install(
         ("GET", "/api/models/vendor/Some-Model/profiles"),
         ("GET", "/api/models/vendor/Some-Model/parallel-observations"),
         ("GET", "/api/vram/holders"),
+        # A POST by shape, a read by effect: it execs one binary's --help and
+        # compares strings. Gating it only stopped a remote operator checking
+        # expert flags BEFORE the save that makes them stick -- and that save
+        # (PUT /settings) is gated, which is where the box change happens (D49-11).
+        ("POST", "/api/engine/validate-flags"),
     ],
 )
 def test_reads_inference_and_residency_stay_open_from_the_lan(method: str, path: str) -> None:
@@ -480,6 +490,67 @@ def test_a_lan_caller_gets_403_on_an_admin_mutation_and_the_pin_admits_it(tmp_pa
     # A second app: the MCP session manager runs once per app instance.
     with TestClient(_open_app(tmp_path / "b"), client=("127.0.0.1", 50000)) as local:
         assert local.patch("/api/config", json={"models.default_ctx": 8192}).status_code == 200
+
+
+def test_the_open_post_allowlist_admits_validate_flags_and_nothing_beside_it(
+    tmp_path: Any,
+) -> None:
+    """The one exception to the ``/api/engine/`` prefix, end to end (D49-11).
+
+    The prefix rule is deliberately body-blind and path-only. That is the right
+    coarseness for ``POST /api/engine/install`` (600 MB onto this disk) and the
+    wrong one for ``validate-flags``, which changes nothing. The allowlist is
+    checked ahead of the prefix, so this route -- and only this route -- is
+    served to a LAN caller with no credential.
+    """
+    from fastapi.testclient import TestClient
+
+    _reset_guard()
+    with TestClient(_open_app(tmp_path), client=("192.168.1.50", 50000)) as lan:
+        checked = lan.post("/api/engine/validate-flags", json={"extra_flags": "--top-k 20"})
+        assert checked.status_code == 200, checked.text
+        assert "errors" in checked.json()
+
+        for path, body in (
+            ("/api/engine/install", {"tag": "b10549"}),
+            ("/api/engine/activate", {"tag": "b10549"}),
+            ("/api/engine/smoke-test", {"tag": "b10549"}),
+        ):
+            refused = lan.post(path, json=body)
+            assert refused.status_code == 403, f"{path}: {refused.text}"
+            assert refused.json()["error"]["code"] == "remote_admin_requires_credential"
+
+
+def test_validate_flags_takes_a_string_or_a_list_and_names_the_shape_otherwise(
+    tmp_path: Any,
+) -> None:
+    """Both call shapes, because both callers exist (D49-11).
+
+    The GUI holds one editable string; ``sfctl`` and most scripts hold an
+    argv-shaped list. A list used to 400 with a raw pydantic dump that never
+    said which shape was wanted.
+    """
+    from fastapi.testclient import TestClient
+
+    _reset_guard()
+    with TestClient(_open_app(tmp_path), client=("192.168.1.50", 50000)) as lan:
+        assert lan.post("/api/engine/validate-flags", json={"extra_flags": ""}).json()["ok"] is True
+        as_list = lan.post(
+            "/api/engine/validate-flags", json={"extra_flags": ["--top-k", "20", "--min-p"]}
+        )
+        assert as_list.status_code == 200, as_list.text
+
+        bad = lan.post("/api/engine/validate-flags", json={"extra_flags": {"top_k": 20}})
+        assert bad.status_code == 400
+        message = bad.json()["error"]["message"]
+        assert "list of strings" in message and "string of flags" in message
+        assert "got dict" in message
+
+        # A list with a non-string names the offending index rather than
+        # answering "got list" to someone who did send a list.
+        mixed = lan.post("/api/engine/validate-flags", json={"extra_flags": ["--top-k", 20]})
+        assert mixed.status_code == 400
+        assert "item 1 is int" in mixed.json()["error"]["message"]
 
 
 def test_persisting_a_load_profile_is_gated_though_the_route_itself_is_open(

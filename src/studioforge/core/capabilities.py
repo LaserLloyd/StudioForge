@@ -118,6 +118,11 @@ class EngineCapabilities:
     ggml_types: list[str]
     source: str  # "checkout" | "snapshot"
     source_detail: str
+    #: The tag the architecture list actually describes: the snapshot's
+    #: ``source_tag``, or the running tag for a checkout (a checkout is
+    #: resolved from the pinned tag, so it is the build's own source tree).
+    #: Empty when unknown, which counts as "does not describe this engine".
+    source_tag: str = ""
     #: What this *build* advertises, read from its own ``--help``
     #: (:class:`studioforge.core.engine.EngineFeatures`). Distinct from the
     #: architecture/quant lists above, which come from llama.cpp's source at the
@@ -127,6 +132,20 @@ class EngineCapabilities:
 
     def supports_architecture(self, arch: str) -> bool:
         return arch.lower() in {a.lower() for a in self.architectures}
+
+    @property
+    def describes_active_engine(self) -> bool:
+        """Whether the architecture list is this build's, or somebody else's.
+
+        The shipped snapshot is pinned to one tag (``b10425``) and the engine
+        moves independently of it, so "this engine does not support X" was a
+        claim about a build the user may not be running -- stated as fact, in
+        the one place that decides whether a model gets flagged unrunnable. A
+        checkout is resolved from the running tag, so it counts; a snapshot only
+        counts when its ``source_tag`` matches. Anything else is advisory
+        (D49-8).
+        """
+        return self.source == "checkout" or (bool(self.source_tag) and self.source_tag == self.tag)
 
 
 @dataclass
@@ -163,6 +182,8 @@ class CapabilityReport:
                 "ggml_types": self.engine.ggml_types,
                 "capability_source": self.engine.source,
                 "capability_source_detail": self.engine.source_detail,
+                "capability_source_tag": self.engine.source_tag,
+                "capability_describes_engine": self.engine.describes_active_engine,
                 "features": self.engine.features,
                 "feature_rows": engine_feature_rows(self.engine.features),
             },
@@ -317,14 +338,16 @@ def engine_capabilities(config: Config, engine_manager: Any = None) -> EngineCap
                 ggml_types=extracted["ggml_types"],
                 source="checkout",
                 source_detail=str(root),
+                source_tag=tag,
                 features=features,
             )
 
     snapshot = load_snapshot()
     snap_tag = str(snapshot.get("source_tag") or "")
     detail = f"bundled snapshot for {snap_tag or 'an unknown tag'}"
-    if snap_tag and snap_tag != tag:
+    if snap_tag != tag:
         # Say so plainly: the running engine is not the one the list came from.
+        # ``scripts/refresh_engine_capabilities.py`` regenerates the snapshot.
         detail += f"; the active engine is {tag}, so this list may be out of date"
     return EngineCapabilities(
         tag=tag,
@@ -337,6 +360,7 @@ def engine_capabilities(config: Config, engine_manager: Any = None) -> EngineCap
         ggml_types=list(snapshot["ggml_types"]),
         source="snapshot",
         source_detail=detail,
+        source_tag=snap_tag,
         features=features,
     )
 
@@ -384,14 +408,26 @@ def hardware_capabilities(
 def library_summary(records: list[ModelRecord], engine: EngineCapabilities) -> dict[str, Any]:
     """What is in the library, grouped the way a user thinks about it.
 
-    Also flags any architecture the pinned engine does not know -- that is the
-    one case where a model in the library genuinely cannot be run, and it is
-    invisible until the load fails.
+    Also flags any architecture the engine does not know -- that is the one case
+    where a model in the library genuinely cannot be run, and it is invisible
+    until the load fails.
+
+    **The verdict is only given when the architecture list actually describes
+    the running build** (D49-8). The list ships as a snapshot pinned to one tag
+    and the engine moves on its own, so a model using an architecture added
+    *after* the snapshot was taken was being reported as unsupported by an
+    engine that supports it perfectly well -- a hard "cannot run this" derived
+    from a list about a different build. When the list does not describe the
+    active engine those models go to ``unknown_to_architecture_list`` instead,
+    and ``architecture_list_describes_engine`` says which of the two happened so
+    a caller can word it honestly.
     """
     by_arch: dict[str, int] = {}
     by_quant: dict[str, int] = {}
     caps = {"vision": 0, "tools": 0, "thinking": 0, "embedding": 0, "multi_part": 0}
     unsupported: list[dict[str, str]] = []
+    advisory: list[dict[str, str]] = []
+    authoritative = engine.describes_active_engine
 
     for record in records:
         by_arch[record.architecture] = by_arch.get(record.architecture, 0) + 1
@@ -400,7 +436,8 @@ def library_summary(records: list[ModelRecord], engine: EngineCapabilities) -> d
             if getattr(record.capabilities, key, False):
                 caps[key] += 1
         if engine.architectures and not engine.supports_architecture(record.architecture):
-            unsupported.append({"model_id": record.id, "architecture": record.architecture})
+            row = {"model_id": record.id, "architecture": record.architecture}
+            (unsupported if authoritative else advisory).append(row)
 
     return {
         "model_count": len(records),
@@ -409,6 +446,10 @@ def library_summary(records: list[ModelRecord], engine: EngineCapabilities) -> d
         "by_quant": dict(sorted(by_quant.items(), key=lambda kv: (-kv[1], kv[0]))),
         "capabilities": caps,
         "unsupported_by_engine": unsupported,
+        "unknown_to_architecture_list": advisory,
+        "architecture_list_describes_engine": authoritative,
+        "architecture_list_source": engine.source,
+        "architecture_list_detail": engine.source_detail,
     }
 
 

@@ -233,6 +233,144 @@ def test_the_report_carries_the_engines_own_feature_surface(tmp_path: Path) -> N
     assert "draft-mtp" in caps.features["spec_types"]
 
 
+# ---------------------------------------------------------------------------
+# D49-8: the "unsupported" verdict is only given by a list that describes the
+# build actually running
+# ---------------------------------------------------------------------------
+
+
+def _caps(**kwargs: object) -> object:
+    """An :class:`EngineCapabilities` for the architecture-list questions only."""
+    from studioforge.core.capabilities import EngineCapabilities
+
+    defaults: dict[str, object] = {
+        "tag": "b10549",
+        "variant": "cuda-13.3",
+        "version_string": "build 10549",
+        "smoke_tested": True,
+        "installed_at": 1.0,
+        "architectures": ["llama", "qwen3"],
+        "quant_types": [],
+        "ggml_types": [],
+        "source": "snapshot",
+        "source_detail": "shipped snapshot",
+        "source_tag": "b10425",
+    }
+    defaults.update(kwargs)
+    return EngineCapabilities(**defaults)  # type: ignore[arg-type]
+
+
+def _model(model_id: str, architecture: str) -> object:
+    from studioforge.types import ModelRecord
+
+    return ModelRecord(
+        id=model_id,
+        name=model_id,
+        path=Path("models") / f"{model_id}.gguf",
+        size_bytes=1,
+        architecture=architecture,
+    )
+
+
+def test_a_snapshot_from_another_build_never_calls_a_model_unsupported() -> None:
+    """The shipped list is pinned to one tag; the engine moves on its own.
+
+    ``engine_capabilities.json`` describes ``b10425``. Running ``b10549``, a
+    model whose architecture was added upstream *after* the snapshot was taken
+    was reported as unsupported by an engine that runs it perfectly well -- a
+    hard "cannot run this" derived from a list about a different build (D49-8).
+    """
+    from studioforge.core.capabilities import library_summary
+
+    engine = _caps()  # snapshot b10425 describing a b10549 install
+    assert engine.describes_active_engine is False
+
+    summary = library_summary([_model("vendor/New-Arch-Q4_K_M", "kimi-linear")], engine)
+
+    assert summary["unsupported_by_engine"] == []
+    assert summary["unknown_to_architecture_list"] == [
+        {"model_id": "vendor/New-Arch-Q4_K_M", "architecture": "kimi-linear"}
+    ]
+    assert summary["architecture_list_describes_engine"] is False
+    assert summary["architecture_list_source"] == "snapshot"
+    assert summary["architecture_list_detail"] == "shipped snapshot"
+
+
+def test_a_snapshot_taken_at_the_running_tag_does_give_the_verdict() -> None:
+    """When the list IS this build's, "unsupported" is a fact worth stating."""
+    from studioforge.core.capabilities import library_summary
+
+    engine = _caps(source_tag="b10549")
+    assert engine.describes_active_engine is True
+
+    summary = library_summary([_model("vendor/New-Arch-Q4_K_M", "kimi-linear")], engine)
+
+    assert summary["unknown_to_architecture_list"] == []
+    assert summary["unsupported_by_engine"] == [
+        {"model_id": "vendor/New-Arch-Q4_K_M", "architecture": "kimi-linear"}
+    ]
+    assert summary["architecture_list_describes_engine"] is True
+
+
+def test_a_checkout_always_describes_the_engine_it_was_resolved_from() -> None:
+    """A checkout is found from the running tag, so it is that build's source."""
+    from studioforge.core.capabilities import library_summary
+
+    engine = _caps(source="checkout", source_detail="llama.cpp checkout", source_tag="")
+    assert engine.describes_active_engine is True
+    summary = library_summary([_model("vendor/New-Arch-Q4_K_M", "kimi-linear")], engine)
+    assert len(summary["unsupported_by_engine"]) == 1
+
+
+def test_a_supported_architecture_is_never_flagged_either_way() -> None:
+    """Neither bucket collects a model the list does know about."""
+    from studioforge.core.capabilities import library_summary
+
+    known = [_model("vendor/Llama-Q4_K_M", "llama")]
+    for engine in (_caps(), _caps(source_tag="b10549")):
+        summary = library_summary(known, engine)
+        assert summary["unsupported_by_engine"] == []
+        assert summary["unknown_to_architecture_list"] == []
+
+
+def test_an_empty_architecture_list_makes_no_claim_at_all() -> None:
+    """No list, no verdict -- and no advisory row pretending to be one."""
+    from studioforge.core.capabilities import library_summary
+
+    summary = library_summary([_model("vendor/X-Q4_K_M", "kimi-linear")], _caps(architectures=[]))
+    assert summary["unsupported_by_engine"] == []
+    assert summary["unknown_to_architecture_list"] == []
+
+
+def test_the_report_says_which_build_the_architecture_list_describes() -> None:
+    """A caller has to be able to word it honestly, so the report carries both."""
+    from studioforge.core.capabilities import (
+        CapabilityReport,
+        HardwareCapabilities,
+    )
+
+    hardware = HardwareCapabilities(
+        gpus=[],
+        total_vram_bytes=0,
+        largest_gpu_bytes=0,
+        usable_largest_bytes=0,
+        usable_total_bytes=0,
+        blackwell_present=False,
+        driver_version=None,
+        cuda_driver_version=None,
+    )
+    payload = CapabilityReport(
+        engine=_caps(),  # type: ignore[arg-type]
+        hardware=hardware,
+        features={},
+        library={},
+    ).to_dict()
+
+    assert payload["engine"]["capability_source_tag"] == "b10425"
+    assert payload["engine"]["capability_describes_engine"] is False
+    assert payload["engine"]["tag"] == "b10549"
+
+
 def test_feature_rows_distinguish_absent_from_off() -> None:
     """ "Not advertised" and "off" are different facts; conflating them makes a
     missing feature read as a disabled one."""

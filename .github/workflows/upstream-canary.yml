@@ -1,0 +1,125 @@
+name: upstream canary
+
+# Does the real llama.cpp releases API still look the way the engine manager
+# thinks it does? On 2026-08-18 upstream published a `v0.1.2` prerelease with no
+# build assets; the fix filtered every prerelease. Upstream then started tagging
+# its ordinary `bNNNN` builds as prereleases, and that filter quietly hid 120
+# newer engines for ten days -- with a green unit suite the whole time, because
+# every fixture in it was written by us (D49-16).
+#
+# So this job asks GitHub, not a fixture. It is the only workflow allowed to
+# touch the network on purpose, it installs nothing GPU-shaped, and it is not
+# part of the merge gate: a red canary means upstream changed, which is
+# information, not a broken pull request.
+
+on:
+  schedule:
+    # Mondays, 06:17 UTC. Off the hour because scheduled jobs at :00 queue
+    # behind everyone else's cron.
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-canary
+  cancel-in-progress: false
+
+jobs:
+  releases:
+    name: llama.cpp releases are still installable
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        # Pinned exactly, for the reason ci.yml gives: setup-uv publishes no
+        # moving major tag, so `@v10` fails before checkout.
+        uses: astral-sh/setup-uv@v10.0.1
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install the package
+        run: |
+          uv venv --python 3.12 .venv
+          uv pip install --python .venv -e "."
+
+      - name: Ask GitHub for real releases
+        env:
+          # The runner's token lifts the 60/hour anonymous limit to 1000/hour,
+          # which is also a live test of the GITHUB_TOKEN path in _api_headers.
+          GITHUB_TOKEN: ${{ github.token }}
+          SF_GPU_PROBE: "null"
+        run: |
+          uv run --python .venv python - <<'PY'
+          import asyncio
+          import os
+          import sys
+          import tempfile
+
+          # A throwaway data dir: the manager creates engines/ and config.yaml
+          # under it and this job installs no engine, so nothing survives it.
+          os.environ["SF_DATA_DIR"] = tempfile.mkdtemp(prefix="sf-canary-")
+
+          from studioforge.config import load_config
+          from studioforge.core.engine import EngineError, EngineManager, describe_release_filter
+          from studioforge.types import GpuInfo
+
+          # The rig this project targets, described rather than detected: the
+          # runner has no GPU, and the question is whether upstream still ships
+          # an asset a Windows CUDA box could install.
+          RIG = [
+              GpuInfo(
+                  index=0,
+                  name="NVIDIA GeForce RTX 5090",
+                  total_bytes=32 * 1024**3,
+                  free_bytes=32 * 1024**3,
+                  compute_capability=(12, 0),
+              )
+          ]
+
+
+          async def main() -> int:
+              config = load_config(None, create=True)
+              config.ensure_dirs()
+              manager = EngineManager(config)
+              manager.os_token, manager.arch_token = "win", "x64"
+              try:
+                  tags = await manager.list_releases(limit=10)
+                  print("filter:", describe_release_filter(manager.last_release_scan) or "nothing")
+                  if not tags:
+                      print("::error::list_releases(limit=10) returned NO installable tags. "
+                            "Upstream's release metadata has changed shape again -- see "
+                            "_release_skip_reason and DECISIONS.md D49-1.")
+                      return 1
+                  print("newest installable tags:", " ".join(tags))
+
+                  newest = tags[0]
+                  assets = await manager.list_assets(newest)
+                  asset = manager.select_asset(assets, gpus=RIG, cuda_driver=(13, 3))
+                  if asset is None:
+                      variants = sorted({a.variant for a in assets if a.os_token == "win"})
+                      print(f"::error::{newest} has no selectable win/x64 CUDA asset for a "
+                            f"CUDA 13.3 driver. Windows variants offered: {variants or 'none'}. "
+                            "Either upstream renamed its archives (parse_asset_name) or it has "
+                            "stopped publishing Windows CUDA builds.")
+                      return 1
+                  print(f"{newest}: would install {asset.name} ({asset.variant}, "
+                        f"{asset.size_bytes / 1024**2:.0f} MiB)")
+              except EngineError as exc:
+                  # Rate limiting is not a regression, and a canary that cries
+                  # wolf on it stops being read. Skip, loudly, with the reason.
+                  if "rate limit" in str(exc).lower():
+                      print(f"::notice::skipped: {exc}")
+                      return 0
+                  print(f"::error::{exc}")
+                  return 1
+              finally:
+                  await manager.aclose()
+              return 0
+
+
+          sys.exit(asyncio.run(main()))
+          PY

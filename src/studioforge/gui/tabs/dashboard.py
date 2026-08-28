@@ -17,11 +17,13 @@ from nicegui import ui
 from studioforge.gui import state as st
 from studioforge.gui.tabs import (
     GuiContext,
+    admin_control,
     api_request,
     busy,
     notify_error,
     require_local_admin,
     run_blocking,
+    viewer_may_change_box,
 )
 
 LOG_TAIL_LINES = 40
@@ -288,11 +290,19 @@ def _loaded_panel(ctx: GuiContext) -> None:
         ).props("outline dense color=negative").tooltip(
             "Unload every resident model and free all VRAM."
         )
-        ui.button(
-            "Restart engines",
-            icon="autorenew",
-            on_click=lambda: _restart_engines(ctx, refresh),
-        ).props("outline dense").tooltip(st.RESTART_ENGINES_HELP)
+        # D49-9: 'Restart engines' is how an installed engine actually reaches
+        # the running children, so it is disabled with the engine controls
+        # rather than left to fail with a red toast.
+        admin_control(
+            ui.button(
+                "Restart engines",
+                icon="autorenew",
+                on_click=lambda: _restart_engines(ctx, refresh),
+            ).props("outline dense"),
+            may_change=viewer_may_change_box(ctx),
+            what="restart engines",
+            tooltip=st.RESTART_ENGINES_HELP,
+        )
         ui.button(
             "Restart server",
             icon="power_settings_new",

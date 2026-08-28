@@ -1016,34 +1016,189 @@ async def set_adapter_scales(
 # ---------------------------------------------------------------------------
 
 
+#: What an activation does *not* do, said in the response because this is the
+#: single most-reported surprise about switching engines: a running
+#: llama-server child holds its own binary open and keeps it until it is
+#: replaced. Names the route that does the replacing so the answer to "and now
+#: what?" is in the same payload.
+ENGINE_ACTIVATE_NOTE = (
+    "Loaded models are not disturbed: each llama-server child keeps the build it was "
+    "launched with until it is reloaded. Call POST /api/restart/backend (Dashboard -> "
+    "Restart engines) to move the resident models onto the newly activated build."
+)
+
+
+def _extra_flags_text(value: Any) -> str:
+    """One flag string from either accepted shape (D49-11).
+
+    Callers disagree about how a flag list travels: the GUI holds one editable
+    string, while ``sfctl`` and most scripts hold an argv-shaped list. Refusing
+    the list form produced a raw pydantic dump that never named the shape it
+    wanted, so both are accepted here and a list is joined with spaces -- which
+    is exactly how the saved ``settings.extra_flags`` string is split again.
+
+    Raises:
+        BadRequestError: 400 naming both accepted shapes.
+    """
+    shapes = (
+        "'extra_flags' must be a string of flags (\"--foo 1 --bar\") or a list of "
+        'strings (["--foo", "1", "--bar"])'
+    )
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        # Named per element, because "got list" to someone who did send a list
+        # is the same unhelpful answer the raw pydantic dump gave.
+        for index, item in enumerate(value):
+            if not isinstance(item, str):
+                raise BadRequestError(
+                    f"{shapes}; item {index} is {type(item).__name__}, not a string",
+                    param="extra_flags",
+                )
+        return " ".join(value)
+    raise BadRequestError(f"{shapes}; got {type(value).__name__}", param="extra_flags")
+
+
+async def _flag_revalidation_sweep(state: Any, tag: str) -> list[dict[str, Any]]:
+    """Every saved ``extra_flags`` re-checked against ``tag`` (D49-6).
+
+    Saved flags are validated once, at save time, against whatever engine was
+    current then -- and llama.cpp renames and removes flags between builds while
+    llama-server ignores what it does not recognise. So a switch can silently
+    drop a setting the operator believes is in force (the D2 failure). The sweep
+    never blocks the switch: a stale flag is a warning, which is precisely why
+    it has to be a loud one.
+    """
+    return list(await state.engine_manager.revalidate_extra_flags(tag, state.registry.all()))
+
+
 @router.get("/engine")
 async def engine_status(request: Request) -> dict[str, Any]:
+    """The engine inventory: what is pinned, what is live, what is installed.
+
+    ``drift`` is non-null when ``engine.pinned_tag`` and the actually-active
+    build disagree -- ``active.json`` wins at load time, so a pin edited on its
+    own (via ``PATCH /api/config``) changes nothing until something activates
+    it, and before D49 that disagreement was a boot-time log line and nothing
+    else. ``install_progress`` is the latest snapshot from an in-flight
+    ``POST /api/engine/install`` (tag, phase, fraction, done/error) or ``null``
+    when no install has run in this process; a ~600 MB download is otherwise a
+    blind wait for the caller.
+    """
     state = _state(request)
     active = state.engine_manager.active()
+    pinned = state.config.engine.pinned_tag
+    active_tag = active.tag if active else None
+    drift = {"pinned": pinned, "active": active_tag} if active_tag != pinned else None
     return {
-        "pinned_tag": state.config.engine.pinned_tag,
+        "pinned_tag": pinned,
         "active": active.model_dump(mode="json") if active else None,
         "installed": [e.model_dump(mode="json") for e in state.engine_manager.installed()],
+        "drift": drift,
+        # getattr, not attribute access: an engine manager that has never run an
+        # install in this process reports nothing rather than making the status
+        # card -- polled by the Dashboard on a timer -- fail.
+        "install_progress": getattr(state.engine_manager, "install_progress", None),
     }
 
 
 @router.get("/engine/releases")
 async def engine_releases(request: Request, limit: int = Query(20)) -> dict[str, Any]:
+    """Installable llama.cpp builds, newest first.
+
+    Upstream publishes build releases with GitHub's ``prerelease`` flag set, so
+    the answer is filtered on asset eligibility rather than on that flag (D49-1);
+    an empty list means no build carried an asset for this OS/arch/CUDA variant,
+    not that no build exists.
+    """
     state = _state(request)
     return {"releases": await state.engine_manager.list_releases(limit)}
 
 
 @router.post("/engine/install")
 async def engine_install(
-    request: Request, tag: str = Body(...), force: bool = Body(False)
+    request: Request,
+    tag: str = Body(...),
+    force: bool = Body(False),
+    activate: bool = Body(False),
 ) -> dict[str, Any]:
+    """Download and unpack a llama.cpp build. Does not switch to it.
+
+    **Behaviour change (D49-4).** Installing used to activate the new build as
+    its last step, unconditionally -- which is how a failed smoke test could
+    leave ``active.json`` pointing at the build that had just failed while the
+    CLI printed "keeping <current>". Install and activate are now separate
+    decisions: this route unpacks the binary and leaves the live engine exactly
+    where it was. Pass ``activate: true`` for the old behaviour, or -- better --
+    call ``POST /api/engine/activate`` afterwards, which additionally pins the
+    tag in ``engine.pinned_tag`` (so it survives a restart) and revalidates
+    saved expert flags against the new build.
+
+    ``force`` re-downloads a build that is already present. Poll ``GET
+    /api/engine`` for ``install_progress`` while this runs; the response itself
+    arrives only on completion.
+    """
     state = _state(request)
-    info = await state.engine_manager.install(tag, force=force)
+    info = await state.engine_manager.install(tag, force=force, activate=activate)
     return info.model_dump(mode="json")
+
+
+@router.post("/engine/activate")
+async def engine_activate(request: Request, tag: str = Body(..., embed=True)) -> dict[str, Any]:
+    """Make an installed build the live engine, and pin it (D49-5).
+
+    Three things, because doing fewer of them is what produced pin/active drift:
+    ``active.json`` is rewritten (that is what new loads read),
+    ``engine.pinned_tag`` is set and saved (that is what survives a restart, and
+    what a rollback edits), and every saved ``extra_flags`` string is
+    revalidated against the new build.
+
+    ``offenders`` is ``[{model_id, errors}]`` for models whose saved flags no
+    longer parse -- a warning, never a refusal: llama-server ignores flags it
+    does not know, so the switch would otherwise take effect with a setting
+    silently dropped. ``previous`` is the tag that was live before, for an
+    undo. ``note`` is :data:`ENGINE_ACTIVATE_NOTE`.
+
+    The tag must already be installed (``POST /api/engine/install`` first);
+    activating a missing build is an error rather than an implicit download.
+    """
+    state = _state(request)
+    before = state.engine_manager.active()
+    previous = before.tag if before else None
+
+    await state.engine_manager.activate(tag)
+
+    # Same persistence path as PATCH /api/config: the dotted-path override so
+    # the value is validated by the config model, save() to disk, then the
+    # section swapped onto the live config object -- which every component
+    # shares by reference, so the new pin is in force without a restart.
+    updated = apply_overrides(state.config, {"engine.pinned_tag": tag})
+    updated.save()
+    state.config.engine = updated.engine
+
+    offenders = await _flag_revalidation_sweep(state, tag)
+    log.info(
+        "engine activated",
+        tag=tag,
+        previous=previous,
+        offenders=[entry.get("model_id") for entry in offenders],
+    )
+    return {
+        "tag": tag,
+        "previous": previous,
+        "offenders": offenders,
+        "note": ENGINE_ACTIVATE_NOTE,
+    }
 
 
 @router.post("/engine/smoke-test")
 async def engine_smoke_test(request: Request, tag: str = Body(..., embed=True)) -> dict[str, Any]:
+    """Load a tiny model on the GPU with this build and report whether it ran.
+
+    A real micro-load, not a ``--version`` check: it is the only thing that
+    catches a driver too old for the CUDA build. It costs a few seconds of GPU,
+    which is why the route is D32-gated like the rest of ``/api/engine/``.
+    """
     state = _state(request)
     ok, detail = await state.engine_manager.smoke_test(tag)
     return {"tag": tag, "ok": ok, "detail": detail}
@@ -1051,11 +1206,27 @@ async def engine_smoke_test(request: Request, tag: str = Body(..., embed=True)) 
 
 @router.post("/engine/validate-flags")
 async def engine_validate_flags(
-    request: Request, extra_flags: str = Body(...), tag: str | None = Body(None)
+    request: Request, extra_flags: Any = Body(...), tag: str | None = Body(None)
 ) -> dict[str, Any]:
+    """Check expert flags against a build's own ``--help`` before saving them.
+
+    ``extra_flags`` takes either shape: a single string (``"--foo 1 --bar"``) or
+    a list of strings (``["--foo", "1", "--bar"]``, joined with spaces). Anything
+    else is a 400 naming both (D49-11). ``tag`` defaults to the pinned build.
+
+    Open without a credential even on an install with no ``server.api_key``:
+    unlike its neighbours under ``/api/engine/`` this changes nothing on the box
+    -- it reads one binary's help text -- and pre-checking a flag is exactly what
+    a remote operator should be able to do before ``PUT /api/models/{id}/settings``
+    (which is gated) makes it stick. The first validation run for a tag execs
+    that build's ``--help`` and caches the accepted flags in
+    ``engines/<tag>/flags.txt``, so it is slower than the runs after it.
+    """
     state = _state(request)
     effective = tag or state.config.engine.pinned_tag
-    errors = await state.engine_manager.validate_extra_flags(effective, extra_flags)
+    errors = await state.engine_manager.validate_extra_flags(
+        effective, _extra_flags_text(extra_flags)
+    )
     return {"tag": effective, "ok": not errors, "errors": errors}
 
 
@@ -1086,7 +1257,14 @@ async def get_config(request: Request) -> dict[str, Any]:
 
 @router.patch("/config")
 async def set_config(request: Request, updates: dict[str, Any] = Body(...)) -> dict[str, Any]:
-    """Apply dotted-path updates, validate, persist, and report restart needs."""
+    """Apply dotted-path updates, validate, persist, and report restart needs.
+
+    One key here does less than it looks: ``engine.pinned_tag`` records which
+    build *should* be live, but ``active.json`` is what a load actually reads, so
+    setting the pin alone leaves the running engine untouched and shows up as
+    ``drift`` on ``GET /api/engine``. Use ``POST /api/engine/activate`` to switch
+    engines -- it does both, and revalidates saved expert flags (D49-5).
+    """
     state = _state(request)
     updated = apply_overrides(state.config, updates)
     updated.save()

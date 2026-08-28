@@ -533,10 +533,68 @@ def scan(
     db.close()
 
 
+def _registry_records(config: Config) -> list[Any]:
+    """Every model record, for the extra-flags sweep. ``[]`` when unavailable.
+
+    The CLI has no long-lived object graph, and an engine update must not fail
+    because the registry could not be opened -- the sweep is a warning pass, so
+    "could not check" degrades to "checked nothing" with a line saying so.
+    """
+    if not config.db_path.exists():
+        return []
+    try:
+        from studioforge.core.registry import Registry
+        from studioforge.db import Database
+
+        db = Database(config.db_path)
+        try:
+            return list(Registry(config, db).all())
+        finally:
+            db.close()
+    except Exception as exc:  # noqa: BLE001 - a warning pass must not break the update
+        typer.echo(f"  (could not read the model registry to re-check saved flags: {exc})")
+        return []
+
+
+async def _activate_and_pin(manager: Any, config: Config, tag: str) -> None:
+    """Activate ``tag``, pin it, and re-check every saved extra-flags string.
+
+    The three steps that D49-5 keeps together everywhere: ``active.json`` is
+    what loads read, ``engine.pinned_tag`` is what survives a restart, and the
+    sweep (D49-6) is the only thing that notices a flag the new build no longer
+    honours -- llama-server ignores what it does not recognise, so nothing else
+    ever would.
+    """
+    await manager.activate(tag)
+    config.engine.pinned_tag = tag
+    config.save()
+    typer.echo(f"engine {tag} is now active and pinned in {config.config_path}")
+    offenders = await manager.revalidate_extra_flags(tag, _registry_records(config))
+    for entry in offenders:
+        typer.echo(f"  WARNING {entry['model_id']}: {'; '.join(entry['errors'])}")
+    if offenders:
+        typer.echo(
+            "  those flags are saved per model and llama-server would ignore them "
+            "silently; fix them in the Models tab"
+        )
+    typer.echo(
+        "running instances keep their current engine; reload a model (Dashboard -> "
+        "Restart engines) to pick up the new one"
+    )
+
+
 @app.command("engine")
 def engine_cmd(
     config_path: Path | None = typer.Option(None, "--config", "-c"),
     install: str | None = typer.Option(None, help="Install a specific llama.cpp tag"),
+    activate: str | None = typer.Option(
+        None, "--activate", help="Make an installed build the live engine and pin it"
+    ),
+    activate_after_install: bool = typer.Option(
+        False,
+        "--activate-after-install",
+        help="With --install: activate and pin the build once it is installed",
+    ),
     smoke_test: bool = typer.Option(False, "--smoke-test", help="Smoke-test the active engine"),
     check: bool = typer.Option(False, "--check", help="Report the newest release, install nothing"),
     update: bool = typer.Option(
@@ -546,8 +604,14 @@ def engine_cmd(
         False, "--list", help="List the installable llama.cpp release tags and exit"
     ),
 ) -> None:
-    """Inspect, install or update llama.cpp engine builds."""
-    from studioforge.core.engine import EngineManager
+    """Inspect, install, activate or update llama.cpp engine builds.
+
+    Installing and activating are separate (D49-4): ``--install`` unpacks a
+    build and leaves the live engine alone, ``--activate`` switches to one that
+    is already installed, and ``--update`` does both in the only safe order --
+    install, smoke-test, and activate only if the test passed.
+    """
+    from studioforge.core.engine import EngineManager, describe_release_filter
 
     config = _load(config_path)
     config.ensure_dirs()
@@ -557,9 +621,18 @@ def engine_cmd(
         if list_releases:
             tags = await manager.list_releases(limit=20)
             typer.echo(" ".join(tags) or "no installable releases were returned")
-            typer.echo(
-                "(prereleases and non-bNNNN tags are hidden: they ship no llama-server build)"
+            # A list that silently differs from GitHub's front page has to say
+            # so, and say by how much: "none" and "all 100 were filtered" are
+            # very different problems (D49-3).
+            summary = describe_release_filter(getattr(manager, "last_release_scan", None))
+            note = (
+                "drafts and non-bNNNN tags are hidden; prereleases are NOT, "
+                "because upstream tags ordinary builds that way"
             )
+            typer.echo(f"({summary}; {note})" if summary else f"({note})")
+            return
+        if activate:
+            await _activate_and_pin(manager, config, activate)
             return
         if check or update:
             status = await manager.check_update(limit=10)
@@ -571,6 +644,9 @@ def engine_cmd(
             variant = status.get("latest_variant")
             suffix = f" ({variant})" if variant else ""
             typer.echo(f"active: {current}    newest installable: {latest or 'none'}{suffix}")
+            filtered_line = status.get("filter_summary")
+            if filtered_line:
+                typer.echo(f"  {filtered_line}")
             for entry in status.get("skipped") or []:
                 typer.echo(f"  skipped {entry['tag']}: {entry['reason']}")
             if latest is None:
@@ -584,25 +660,32 @@ def engine_cmd(
                 typer.echo(f"run 'studioforge engine --update' to move to {latest}")
                 return
             else:
-                # Install and smoke-test BEFORE repinning: an engine that fails
-                # its micro-load must not become the default, or every
-                # subsequent load breaks. Verified engines only.
-                typer.echo(f"installing {latest} ...")
-                info = await manager.install(latest)
+                # Install, smoke-test, and only THEN activate and pin (D49-4).
+                # The old order installed *and activated* in one call and ran
+                # the smoke test afterwards, so this branch printed "keeping
+                # b10425" while active.json already said b10488 -- the failed
+                # build was live, and the message said the opposite.
+                typer.echo(f"installing {latest} (not activating it yet) ...")
+                info = await manager.install(latest, activate=False)
                 ok, detail = await manager.smoke_test(info.tag)
                 if not ok:
-                    typer.echo(f"smoke test FAILED for {latest}; keeping {current}\n{detail}")
+                    typer.echo(
+                        f"smoke test FAILED for {latest}; keeping {current} active. "
+                        f"{latest} stays installed but unused -- 'studioforge engine "
+                        f"--activate {latest}' would switch to it anyway.\n{detail}"
+                    )
                     raise typer.Exit(1)
-                config.engine.pinned_tag = latest
-                config.save()
-                typer.echo(f"engine updated to {latest} and pinned in {config.config_path}")
-                typer.echo(
-                    "running instances keep their current engine; reload a model to pick "
-                    "up the new one"
-                )
+                await _activate_and_pin(manager, config, info.tag)
         if install:
-            info = await manager.install(install)
+            info = await manager.install(install, activate=activate_after_install)
             typer.echo(f"installed {info.tag} ({info.variant}) at {info.path}")
+            if activate_after_install:
+                await _activate_and_pin(manager, config, info.tag)
+            else:
+                typer.echo(
+                    f"the active engine is unchanged; run 'studioforge engine "
+                    f"--activate {info.tag}' to switch to it"
+                )
         else:
             info = await manager.ensure_engine()
             typer.echo(f"active engine: {info.tag} ({info.variant})")
@@ -845,11 +928,23 @@ def capabilities_cmd(
         f"multi-part {caps['multi_part']}"
     )
     unsupported = library["unsupported_by_engine"]
+    advisory = library.get("unknown_to_architecture_list") or []
     if unsupported:
         typer.echo(
             f"  !! {len(unsupported)} model(s) use an architecture this engine does not know:"
         )
         for entry in unsupported[:5]:
+            typer.echo(f"       {entry['model_id']}  ({entry['architecture']})")
+    elif advisory:
+        # D49-8: the list is from another build, so this is a "check it",
+        # not a verdict. Saying "unsupported" from a b10425 snapshot about a
+        # b10549 engine is a claim the data cannot support.
+        typer.echo(
+            f"  ?  {len(advisory)} model(s) use an architecture missing from the "
+            f"{engine.source} list ({engine.source_detail}), which does not describe "
+            f"{engine.tag} -- they may load fine:"
+        )
+        for entry in advisory[:5]:
             typer.echo(f"       {entry['model_id']}  ({entry['architecture']})")
     else:
         typer.echo("  every model in your library uses an architecture this engine supports")

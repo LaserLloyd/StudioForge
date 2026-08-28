@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
@@ -174,6 +174,41 @@ def require_local_admin(ctx: GuiContext, what: str) -> None:
     )
 
 
+def admin_control(control: Any, *, may_change: bool, what: str, tooltip: str = "") -> Any:
+    """Disable a box-changing control the current viewer may not use (D49-9).
+
+    Before this, every engine button rendered enabled for a remote viewer on an
+    open install and answered the click with a red toast -- which teaches the
+    operator that the panel is broken rather than that they are on the wrong
+    side of D32. A disabled button carrying the reason names the two ways in.
+
+    Courtesy, not enforcement: :func:`require_local_admin` still runs inside
+    the action, because a disabled button is one WebSocket message away from
+    being enabled again.
+
+    Exactly one tooltip is attached either way -- NiceGUI appends a tooltip
+    element per call, so calling it twice would render two.
+    """
+    if not may_change:
+        control.disable()
+        control.tooltip(f"{what}: {REMOTE_VIEWER_NOTE}")
+    elif tooltip:
+        control.tooltip(tooltip)
+    return control
+
+
+def remote_viewer_banner() -> None:
+    """One line at the top of a card whose controls are disabled (D49-9).
+
+    Per card, not per button: a row of greyed-out buttons with eight identical
+    tooltips is noise, and the answer -- open the panel on the box, or set an
+    API key -- is the same one for all of them.
+    """
+    with ui.row().classes("w-full items-center gap-2 no-wrap"):
+        ui.icon("lock", color="warning", size="1rem")
+        ui.label(REMOTE_VIEWER_NOTE).classes("text-xs text-warning")
+
+
 async def apply_config_updates(ctx: GuiContext, updates: dict[str, Any]) -> dict[str, Any]:
     """The GUI's one and only "change a setting".
 
@@ -238,14 +273,38 @@ async def run_blocking[T](fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
     return await asyncio.to_thread(lambda: fn(*args, **kwargs))
 
 
+class BusySpinner:
+    """Handle yielded by :func:`busy` so a long action can retitle its spinner.
+
+    The engine install is the case that needs it: several minutes of download
+    behind a fixed "Installing…" reads as a hang (D49-10). Retitling is a
+    silent no-op when the caller asked for no message, so no caller has to
+    check, and a failed cosmetic update never fails the action it decorates.
+    """
+
+    def __init__(self, notification: Any = None) -> None:
+        self._notification = notification
+
+    def set_message(self, text: str) -> None:
+        if self._notification is None or not text:
+            return
+        with suppress(Exception):  # cosmetic: a dismissed notification is not an error
+            self._notification.message = text
+            self._notification.update()
+
+
 @contextmanager
-def busy(button: Any = None, *, message: str = "") -> Iterator[None]:
-    """Disable a control and show a spinner while an action runs."""
+def busy(button: Any = None, *, message: str = "") -> Iterator[BusySpinner]:
+    """Disable a control and show a spinner while an action runs.
+
+    Yields the spinner: an action that knows how far along it is can keep the
+    message current; every other caller ignores the value.
+    """
     notification = ui.notification(message, spinner=True, timeout=None) if message else None
     if button is not None:
         button.disable()
     try:
-        yield
+        yield BusySpinner(notification)
     finally:
         if button is not None:
             button.enable()
@@ -269,7 +328,9 @@ def mono(text: str, *, classes: str = "") -> Any:
 
 __all__ = [
     "REMOTE_VIEWER_NOTE",
+    "BusySpinner",
     "GuiContext",
+    "admin_control",
     "api_request",
     "apply_config_updates",
     "badge",
@@ -278,6 +339,7 @@ __all__ = [
     "mono",
     "notify_error",
     "panel_guard",
+    "remote_viewer_banner",
     "require_local_admin",
     "run_blocking",
     "section",

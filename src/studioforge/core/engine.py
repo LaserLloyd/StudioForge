@@ -13,6 +13,10 @@ Responsibilities:
 * selection -- pick the right prebuilt archive for this box's driver/arch;
 * install -- download, verify, extract (flattening nested archives), fetch the
   matching CUDA runtime bundle, smoke test;
+* activation -- which installed build new loads use. Separate from install
+  since D49-4: unpacking a binary and deciding to run it are different
+  decisions, and conflating them meant a build that failed its smoke test was
+  already the active engine by the time anyone could say so;
 * inventory -- what is installed, which tag is active, pruning old versions;
 * verification -- ``--version`` / ``--list-devices`` / a real micro-load;
 * flag surface -- the ``--help`` flag set used to validate the expert-tier
@@ -184,6 +188,22 @@ _SAFE_TAG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 #: Same scheme, plus the ``-local`` suffix :meth:`build_from_source` appends, so
 #: a source-built active tag still compares numerically against upstream.
 _BUILD_NUMBER_RE = re.compile(r"^b(\d+)(?:-local)?$")
+
+#: GitHub's maximum page size, and how many pages :meth:`list_releases` will
+#: walk before it gives up (D49-2). Three is a budget, not a guess: 300 entries
+#: is roughly a fortnight of llama.cpp builds, so a caller asking for 20 tags
+#: gets them even through a run of ineligible releases, while a repository whose
+#: entire front page is uninstallable cannot turn one "check for updates" click
+#: into an unbounded crawl of the API's rate limit.
+RELEASE_PAGE_SIZE = 100
+RELEASE_MAX_PAGES = 3
+
+#: The reasons :func:`_release_skip_reason` returns, as constants so the
+#: per-reason counts in :meth:`EngineManager.check_update` group on a stable
+#: string rather than on prose a later edit could split in two.
+SKIP_DRAFT = "draft release (unpublished; its assets 404)"
+SKIP_PRERELEASE = "prerelease that is not a bNNNN build release"
+SKIP_TAG_SCHEME = "tag is not a bNNNN llama.cpp build release"
 
 _ARCH_ALIASES = {
     "amd64": "x64",
@@ -749,6 +769,46 @@ def extract_engine_zip(zip_path: Path, dest: Path) -> Path | None:
     return binary
 
 
+def _swap_engine_dir(staged: Path, dest: Path) -> None:
+    """Put a freshly extracted engine at ``dest``, moving any old one aside.
+
+    Two renames within one directory rather than an extraction over a live
+    tree (D49-7). A rename is refused *before* anything is destroyed when the
+    directory is busy -- on Windows an open ``llama-server.exe`` makes the move
+    fail as a whole -- whereas an in-place extract discovers the same lock
+    halfway through, having already replaced some of the DLLs a running child
+    depends on. On failure the previous directory is put back and the error
+    says which engine is still in place.
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    backup: Path | None = None
+    if dest.exists():
+        backup = dest.parent / f"_{dest.name}.old-{int(time.time())}"
+        shutil.rmtree(backup, ignore_errors=True)
+        try:
+            dest.rename(backup)
+        except OSError as exc:
+            raise EngineError(
+                f"could not replace the existing engine at {dest}: {exc}. Something is "
+                "holding a file in that directory open -- unload every model using this "
+                "build (Models tab, or POST /api/models/unload-all) and try again; the "
+                "engine that was there is untouched"
+            ) from exc
+    try:
+        staged.rename(dest)
+    except OSError as exc:
+        if backup is not None:
+            with contextlib.suppress(OSError):
+                backup.rename(dest)
+        raise EngineError(f"could not move the new engine into {dest}: {exc}") from exc
+    if backup is not None:
+        shutil.rmtree(backup, ignore_errors=True)
+
+
+def _fmt_bytes(value: int) -> str:
+    return f"{value / 1024**3:.1f} GiB"
+
+
 def _is_tarball(path: Path) -> bool:
     return path.name.endswith((".tar.gz", ".tgz"))
 
@@ -905,11 +965,30 @@ class EngineManager:
         *,
         probe: GpuProbe | None = None,
         client: httpx.AsyncClient | None = None,
+        tag_in_use: Callable[[str], list[str]] | None = None,
     ) -> None:
         self.config = config
         self._probe: Any = probe
         self._client = client
         self._owns_client = client is None
+        #: "Which loaded models are running engine ``<tag>``?", or ``None`` when
+        #: nobody has said (the CLI, a test, first-run bootstrap). Set by
+        #: ``api.app.build_state`` to a supervisor-backed check; consulted only
+        #: before a reinstall re-extracts over a live directory (D49-7), so an
+        #: unwired manager behaves exactly as it did before -- it just cannot
+        #: name the children it would have broken.
+        self.tag_in_use: Callable[[str], list[str]] | None = tag_in_use
+        #: The latest install phase, for ``GET /api/engine`` to poll (D49-10):
+        #: ``{tag, phase, fraction, done, error, updated_at}``. ``None`` until an
+        #: install runs in this process. Process-local by design -- it describes
+        #: an in-flight transfer, not durable state.
+        self.install_progress: dict[str, Any] | None = None
+        #: What the last :meth:`list_releases` call saw and threw away (D49-3):
+        #: ``{examined, kept, skipped, pages, reasons: {reason: count}}``. Kept
+        #: on the manager rather than returned so the signature stays a plain
+        #: list of tags for its half-dozen callers; :meth:`check_update` folds it
+        #: into its payload and :func:`describe_release_filter` renders it.
+        self.last_release_scan: dict[str, Any] | None = None
         self._flag_cache: dict[str, set[str]] = {}
         self._removed_cache: dict[str, dict[str, str | None]] = {}
         self._help_cache: dict[str, str] = {}
@@ -1013,8 +1092,10 @@ class EngineManager:
         <none>``. Three filters, each guarding a different assumption:
 
         * ``draft`` entries are not published at all and their assets 404;
-        * ``prerelease`` entries are excluded unless ``include_prerelease``,
-          because upstream uses them for things that are not build releases;
+        * a ``prerelease`` entry is excluded unless ``include_prerelease`` --
+          **only when its tag is not a build tag** (D49-1). Upstream publishes
+          ordinary ``bNNNN`` builds with the flag set, so honouring it there hid
+          every newer engine; see :func:`_release_skip_reason`;
         * the tag must match :data:`ENGINE_TAG_RE`. This one is **unconditional**
           -- ``include_prerelease=True`` widens the release *kind*, never the tag
           scheme -- because ``pinned_tag``, the ``llama-bNNNN-bin-...`` asset
@@ -1022,38 +1103,68 @@ class EngineManager:
           ``git clone --branch <tag>`` all assume ``bNNNN``. A ``vX.Y.Z`` tag is
           not an engine this manager can install under any flag.
 
-        Sorted by build number descending rather than trusting the API's order,
-        and over-fetched (``per_page >= 2*limit``) so filtering out prereleases
-        cannot return fewer tags than asked for.
+        Sorted by build number descending rather than trusting the API's order.
+
+        **Paged, and it can still return fewer tags than asked for (D49-2).**
+        The single over-fetched page this used to do made the answer cliff on
+        ``limit``: with the filter of the day rejecting 71 of the newest 100
+        entries, ``limit=5`` fetched 20 and returned nothing, ``limit=20``
+        fetched 40 and returned nothing, and ``limit=50`` fetched 100 and
+        returned 26 -- the same repository, three different universes. It now
+        walks ``page=1..`` at :data:`RELEASE_PAGE_SIZE` until ``limit`` eligible
+        tags are in hand or :data:`RELEASE_MAX_PAGES` are exhausted, so a run of
+        ineligible entries costs another request rather than the answer. Beyond
+        that budget the honest contract is "fewer": what was filtered, and why,
+        is recorded in :attr:`last_release_scan` for the caller to say so.
         """
         url = f"{GITHUB_API}/repos/{self.config.engine.repo}/releases"
-        per_page = min(100, max(limit * 2, 20))
-        try:
-            resp = await self.client.get(url, params={"per_page": per_page})
-            resp.raise_for_status()
-            payload = resp.json()
-        except httpx.HTTPError as exc:
-            raise EngineError(f"could not list llama.cpp releases: {exc}") from exc
-        if not isinstance(payload, list):
-            raise EngineError("unexpected response listing llama.cpp releases")
-
         tags: list[str] = []
-        skipped: list[dict[str, str]] = []
-        for entry in payload:
-            if not isinstance(entry, dict):
-                continue
-            tag = entry.get("tag_name")
-            if not isinstance(tag, str) or not tag:
-                continue
-            reason = _release_skip_reason(entry, tag, include_prerelease=include_prerelease)
-            if reason is not None:
-                skipped.append({"tag": tag, "reason": reason})
-                continue
-            tags.append(tag)
-        if skipped:
+        seen: set[str] = set()
+        reasons: dict[str, int] = {}
+        examined = 0
+        pages = 0
+        for page in range(1, RELEASE_MAX_PAGES + 1):
+            try:
+                resp = await self.client.get(
+                    url, params={"per_page": RELEASE_PAGE_SIZE, "page": page}
+                )
+                _raise_for_rate_limit(resp, "list llama.cpp releases")
+                resp.raise_for_status()
+                payload = resp.json()
+            except httpx.HTTPError as exc:
+                raise EngineError(f"could not list llama.cpp releases: {exc}") from exc
+            if not isinstance(payload, list):
+                raise EngineError("unexpected response listing llama.cpp releases")
+            pages = page
+            for entry in payload:
+                if not isinstance(entry, dict):
+                    continue
+                tag = entry.get("tag_name")
+                if not isinstance(tag, str) or not tag or tag in seen:
+                    continue
+                seen.add(tag)
+                examined += 1
+                reason = _release_skip_reason(entry, tag, include_prerelease=include_prerelease)
+                if reason is not None:
+                    reasons[reason] = reasons.get(reason, 0) + 1
+                    continue
+                tags.append(tag)
+            # A short page is the last page: asking for page 2 of a repository
+            # with 40 releases returns [] and costs a request to learn it.
+            if len(tags) >= limit or len(payload) < RELEASE_PAGE_SIZE:
+                break
+
+        self.last_release_scan = {
+            "examined": examined,
+            "kept": len(tags),
+            "skipped": sum(reasons.values()),
+            "pages": pages,
+            "reasons": dict(reasons),
+        }
+        if reasons:
             # Once, at debug: this is normal upstream traffic, not an incident,
             # but "why is b10488 not offered" needs an answer somewhere.
-            log.debug("engine.releases.filtered", skipped=skipped, kept=len(tags))
+            log.debug("engine.releases.filtered", reasons=reasons, kept=len(tags), pages=pages)
         tags.sort(key=lambda t: build_number(t) or 0, reverse=True)
         return tags[:limit]
 
@@ -1075,11 +1186,19 @@ class EngineManager:
         must not hide the perfectly good build underneath it.
 
         Returns ``checked``/``current``/``latest``/``update_available``/
-        ``recent``/``latest_variant``/``skipped``. ``current`` is the **active**
-        tag (``active.json`` wins over ``engine.pinned_tag`` -- see
-        :meth:`check_pinned_tag`), falling back to the pin. A per-tag asset
-        failure lands in ``skipped`` and never raises; only a failure to list
-        releases at all raises :class:`EngineError`, so a caller can show it.
+        ``recent``/``latest_variant``/``skipped``/``filtered``/
+        ``filter_summary``. ``current`` is the **active** tag (``active.json``
+        wins over ``engine.pinned_tag`` -- see :meth:`check_pinned_tag`),
+        falling back to the pin. A per-tag asset failure lands in ``skipped``
+        (``[{tag, reason}]``) and never raises; only a failure to list releases
+        at all raises :class:`EngineError`, so a caller can show it.
+
+        ``filtered`` is :attr:`last_release_scan` -- how many releases were read
+        and how many each filter reason dropped -- and ``filter_summary`` is
+        that as one sentence (:func:`describe_release_filter`). Both exist
+        because "no update available" and "every release was filtered out" look
+        identical from the outside, and for ten days in August 2026 the second
+        one was rendering as the first on every surface (D49-3).
         """
         current = self._read_active() or self.config.engine.pinned_tag
         releases = await self.list_releases(limit)
@@ -1123,6 +1242,7 @@ class EngineManager:
         current_n = build_number(current)
         latest_n = build_number(latest)
         update_available = latest_n is not None and (current_n is None or latest_n > current_n)
+        scan = dict(self.last_release_scan or {})
         return {
             "checked": True,
             "current": current,
@@ -1131,6 +1251,8 @@ class EngineManager:
             "recent": list(releases),
             "latest_variant": latest_variant,
             "skipped": skipped,
+            "filtered": scan,
+            "filter_summary": describe_release_filter(scan),
         }
 
     async def list_assets(self, tag: str) -> list[EngineAsset]:
@@ -1140,6 +1262,7 @@ class EngineManager:
             resp = await self.client.get(url)
             if resp.status_code == 404:
                 raise EngineError(f"llama.cpp release '{tag}' does not exist upstream")
+            _raise_for_rate_limit(resp, f"fetch llama.cpp release '{tag}'")
             resp.raise_for_status()
             payload = resp.json()
         except httpx.HTTPError as exc:
@@ -1440,6 +1563,93 @@ class EngineManager:
         )
         tmp.replace(path)
 
+    async def activate(self, tag: str) -> EngineInfo:
+        """Make an installed build the live engine (D49-4/D49-5).
+
+        The explicit half of the split that :meth:`install` gave up: installing
+        unpacks a binary, activating decides that new loads should use it. The
+        tag must already be installed -- activating a build that is not there
+        would write an ``active.json`` every subsequent load falls back out of,
+        which is drift wearing a success message.
+
+        Writes ``active.json`` only. **The pin is the caller's job**: the config
+        key ``engine.pinned_tag`` is what survives a restart, and the route
+        (``POST /api/engine/activate``) and the GUI set it beside this call so
+        the two cannot be written from two different places with two different
+        opinions. Warms the flag cache (D49-12) so the first validation against
+        the new build does not pay for a ``--help`` run.
+        """
+        info = self.get(tag)
+        if info is None:
+            installed = ", ".join(entry.tag for entry in self.installed()) or "none"
+            raise EngineError(
+                f"cannot activate engine '{tag}': it is not installed under {self.engines_dir} "
+                f"(installed: {installed}). Install it first"
+            )
+        self.set_active(tag)
+        info.active = True
+        await self._warm_flag_cache(tag)
+        log.info("engine.activated", tag=tag, variant=info.variant)
+        return info
+
+    async def _warm_flag_cache(self, tag: str) -> None:
+        """Populate ``engines/<tag>/flags.txt`` now rather than on first use.
+
+        :attr:`EngineInfo.flags` is a view of that file and the only writer is
+        :meth:`supported_flags`, reached only from flag validation -- so a fresh
+        install reported "no flags" until somebody happened to validate an
+        expert-tier flag string against it, which reads as a build that supports
+        nothing. One ``--help`` run of a binary we have just smoke-tested fixes
+        it (D49-12). Never fatal: the lazy path still works.
+        """
+        try:
+            await self.supported_flags(tag)
+        except Exception as exc:  # noqa: BLE001 - a cold cache is not an install failure
+            log.debug("engine.flags.warm_failed", tag=tag, error=str(exc))
+
+    async def revalidate_extra_flags(
+        self, tag: str, records: Iterable[Any]
+    ) -> list[dict[str, Any]]:
+        """Re-check every saved ``extra_flags`` string against ``tag`` (D49-6).
+
+        Expert-tier flags are validated once, at save time, against whichever
+        engine was current then. llama.cpp renames and removes flags between
+        builds -- ``b10425`` removed the entire ``--draft*`` surface -- and
+        llama-server *ignores* what it does not recognise, so an engine switch
+        can silently drop a setting the operator still believes is in force.
+        That is the D2 failure exactly, and it is invisible: the model loads,
+        just without speculative decoding.
+
+        Takes the records rather than a registry on purpose: this module owns no
+        database handle (see the module docstring), and the callers -- the
+        activate route, the GUI, ``engine --update`` -- each already have one.
+        Anything with ``.id`` and ``.settings.extra_flags`` will do.
+
+        Returns ``[{"model_id", "errors"}]`` for the models that now have a
+        problem, ``[]`` when everything still validates. A caller **warns**; it
+        never refuses the activation, because the reload will launch either way
+        and a silently-dropped flag is the thing being prevented.
+        """
+        offenders: list[dict[str, Any]] = []
+        for record in records:
+            settings = getattr(record, "settings", None)
+            extra = str(getattr(settings, "extra_flags", "") or "").strip()
+            if not extra:
+                continue
+            try:
+                errors = await self.validate_extra_flags(tag, extra)
+            except EngineError as exc:  # an unreadable --help must not hide the rest
+                errors = [f"cannot validate flags against {tag}: {exc}"]
+            if errors:
+                offenders.append({"model_id": getattr(record, "id", "?"), "errors": list(errors)})
+        if offenders:
+            log.warning(
+                "engine.extra_flags.stale",
+                tag=tag,
+                models=[entry["model_id"] for entry in offenders],
+            )
+        return offenders
+
     def _write_meta(self, info: EngineInfo) -> None:
         payload = {
             "tag": info.tag,
@@ -1464,14 +1674,64 @@ class EngineManager:
         *,
         progress: ProgressFn | None = None,
         force: bool = False,
+        activate: bool = False,
     ) -> EngineInfo:
         """Download, extract and verify the best prebuilt engine for ``tag``.
 
         Serialised per tag (see ``_install_locks``): a second concurrent call
         waits, then finds the engine present and returns it.
+
+        **``activate`` defaults to False, and that is a behaviour change
+        (D49-4).** Installing used to flip ``active.json`` as its last step,
+        unconditionally, which is how ``engine --update`` could smoke-test the
+        new build, fail, print "keeping b10425" and exit -- with every
+        subsequent load already running the build that had just failed. Install
+        and activate are separate decisions now; the callers that genuinely mean
+        "and use it" (bootstrap, an operator ticking the box) say so. See
+        :meth:`activate`.
+
+        Progress is mirrored onto :attr:`install_progress` for pollers whatever
+        the caller passes (D49-10).
         """
         async with self._install_lock(tag):
-            return await self._install_locked(tag, progress=progress, force=force)
+            tracked = self._progress_tracker(tag, progress)
+            try:
+                info = await self._install_locked(
+                    tag, progress=tracked, force=force, activate=activate
+                )
+            except BaseException as exc:
+                self._note_progress(tag, "error", 1.0, error=str(exc) or type(exc).__name__)
+                raise
+            self._note_progress(tag, "done", 1.0, done=True)
+            return info
+
+    def _progress_tracker(self, tag: str, progress: ProgressFn | None) -> ProgressFn:
+        """The caller's progress callback, with :attr:`install_progress` behind it."""
+
+        def report(phase: str, fraction: float) -> None:
+            self._note_progress(tag, phase, fraction)
+            if progress is not None:
+                progress(phase, fraction)
+
+        return report
+
+    def _note_progress(
+        self,
+        tag: str,
+        phase: str,
+        fraction: float,
+        *,
+        done: bool = False,
+        error: str | None = None,
+    ) -> None:
+        self.install_progress = {
+            "tag": tag,
+            "phase": phase,
+            "fraction": max(0.0, min(1.0, fraction)),
+            "done": done or error is not None,
+            "error": error,
+            "updated_at": time.time(),
+        }
 
     async def _install_locked(
         self,
@@ -1479,6 +1739,7 @@ class EngineManager:
         *,
         progress: ProgressFn | None,
         force: bool,
+        activate: bool,
     ) -> EngineInfo:
         dest = self.engine_dir(tag)
         existing = find_server_binary(dest)
@@ -1487,7 +1748,22 @@ class EngineManager:
             if smoke.ok or smoke.no_model:
                 log.info("engine.install.already_present", tag=tag, smoke_ok=smoke.ok)
                 _emit(progress, "done", 1.0)
-                return self._finalize(dest, existing, "prebuilt", smoke, activate=True)
+                # The build on disk is NOT necessarily "prebuilt", and it was
+                # not installed just now. Hardcoding both was how a reused
+                # source build lost its ``cuda-*`` variant -- disarming
+                # _warn_driver_too_old, which only warns for a CUDA variant --
+                # and how a restamped installed_at reshuffled prune's ordering
+                # so the *oldest* engine looked newest (D49-7).
+                current = self._info_for(dest, existing, self._read_active())
+                return self._finalize(
+                    dest,
+                    existing,
+                    current.variant,
+                    smoke,
+                    activate=activate,
+                    build_log=current.build_log,
+                    installed_at=current.installed_at,
+                )
             log.warning("engine.install.reinstall_after_failed_smoke", tag=tag, detail=smoke.detail)
 
         local = self.engine_dir(f"{tag}-local")
@@ -1502,7 +1778,32 @@ class EngineManager:
             if smoke.ok or smoke.no_model:
                 log.info("engine.install.local_build_present", tag=tag, smoke_ok=smoke.ok)
                 _emit(progress, "done", 1.0)
-                return self._finalize(local, local_binary, "source-local", smoke, activate=True)
+                current = self._info_for(local, local_binary, self._read_active())
+                return self._finalize(
+                    local,
+                    local_binary,
+                    current.variant or "source-local",
+                    smoke,
+                    activate=activate,
+                    build_log=current.build_log,
+                    installed_at=current.installed_at,
+                )
+
+        # D49-7. Everything below re-extracts over ``dest``. On Windows a
+        # running llama-server holds its own .exe and DLLs open, so the
+        # extraction fails partway with WinError 32 and leaves the LIVE engine
+        # directory half-overwritten -- the one failure mode that breaks models
+        # which were working a second ago. Refuse while children hold the tag,
+        # and name them, because "unload something" is not actionable.
+        if existing is not None:
+            holders = self._tag_holders(tag)
+            if holders:
+                raise EngineError(
+                    f"engine {tag} is in use by {len(holders)} loaded model(s): "
+                    f"{', '.join(holders)}. Reinstalling would overwrite the binary those "
+                    "children are running. Unload them (Models tab, or POST "
+                    "/api/models/unload-all) and try again"
+                )
 
         assets = await self.list_assets(tag)
         asset = self.select_asset(
@@ -1523,7 +1824,7 @@ class EngineManager:
                     prebuilt_variants=variants,
                 )
                 return await self.build_from_source(
-                    tag, arches=self.cuda_arches(), progress=progress
+                    tag, arches=self.cuda_arches(), progress=progress, activate=activate
                 )
             raise EngineError(
                 f"no GPU-capable llama-server build for {self.os_token}/{self.arch_token} at "
@@ -1534,28 +1835,41 @@ class EngineManager:
                 f"engine.allow_source_build: true to enable it"
             )
 
+        self._check_disk_space(asset)
         self.config.downloads_dir.mkdir(parents=True, exist_ok=True)
         archive = self.config.downloads_dir / asset.name
         await self._download(asset.url, archive, asset.size_bytes, "download", progress)
         _verify_archive(archive)
 
-        if force and dest.exists():
-            shutil.rmtree(dest, ignore_errors=True)
-        _emit(progress, "extract", 0.0)
-        binary = extract_engine_archive(archive, dest)
-        _emit(progress, "extract", 1.0)
+        # Extract to a sibling and swap, never in place (D49-7): a failure --
+        # a truncated archive, a locked file, a full disk -- must leave the
+        # existing engine directory exactly as it was.
+        # Underscore-prefixed: ``installed()`` skips those, so a staging tree
+        # left behind by a crash is never mistaken for an installed engine.
+        staging = dest.parent / f"_{dest.name}.new"
+        shutil.rmtree(staging, ignore_errors=True)
+        try:
+            _emit(progress, "extract", 0.0)
+            extract_engine_archive(archive, staging)
+            _emit(progress, "extract", 1.0)
 
-        if asset.needs_cudart and asset.cudart_url:
-            cudart = self.config.downloads_dir / Path(asset.cudart_url).name
-            await self._download(asset.cudart_url, cudart, 0, "cudart", progress)
-            _verify_zip(cudart)
-            extract_engine_zip(cudart, dest)
+            if asset.needs_cudart and asset.cudart_url:
+                cudart = self.config.downloads_dir / Path(asset.cudart_url).name
+                await self._download(asset.cudart_url, cudart, 0, "cudart", progress)
+                _verify_zip(cudart)
+                extract_engine_zip(cudart, staging)
 
-        _make_executable(dest)
-        if binary is None:
-            binary = find_server_binary(dest)
-        if binary is None:
-            raise EngineError(f"{asset.name} contained no {BIN_NAME}")
+            _make_executable(staging)
+            if find_server_binary(staging) is None:
+                raise EngineError(f"{asset.name} contained no {BIN_NAME}")
+            _swap_engine_dir(staging, dest)
+        except BaseException:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+
+        binary = find_server_binary(dest)
+        if binary is None:  # pragma: no cover - the swap just put one there
+            raise EngineError(f"{BIN_NAME} is missing from {dest} after extraction")
 
         _emit(progress, "smoke", 0.0)
         smoke = await self._smoke(tag, None)
@@ -1567,7 +1881,58 @@ class EngineManager:
         if smoke.no_model:
             log.warning("engine.install.smoke_partial", tag=tag, detail=smoke.detail)
         _emit(progress, "done", 1.0)
-        return self._finalize(dest, binary, asset.variant, smoke, activate=True)
+        info = self._finalize(dest, binary, asset.variant, smoke, activate=activate)
+        await self._warm_flag_cache(tag)
+        return info
+
+    def _tag_holders(self, tag: str) -> list[str]:
+        """Model ids whose running child uses engine ``tag`` (D49-7).
+
+        ``[]`` when no hook is wired (the CLI, a test, bootstrap): this manager
+        deliberately knows nothing about the supervisor, so the answer comes
+        from :attr:`tag_in_use`. A hook that raises is treated as "cannot tell",
+        and cannot-tell must not read as "nothing is running" -- the whole point
+        is to avoid overwriting a binary in use -- so it reports a placeholder
+        holder and the reinstall is refused.
+        """
+        hook = self.tag_in_use
+        if hook is None:
+            return []
+        try:
+            return [str(name) for name in hook(tag)]
+        except Exception as exc:  # noqa: BLE001 - see the docstring: be conservative
+            log.warning("engine.tag_in_use.failed", tag=tag, error=str(exc))
+            return ["(could not check which models are loaded)"]
+
+    def _check_disk_space(self, asset: EngineAsset) -> None:
+        """Refuse an install that obviously cannot fit (D49-13).
+
+        The archive lands in ``downloads/`` and is then extracted beside it, so
+        the peak is the download plus the unpacked tree; 2.5x the asset is the
+        rule of thumb for a CUDA zip (~600 MB compressed, ~1.4 GB unpacked).
+        ENOSPC used to surface as a bare ``OSError`` from the middle of a stream
+        with a ``.part`` file left behind and no number in the message, which is
+        an expensive way to learn the disk is full. Unmeasurable is not full:
+        :func:`studioforge.core.diskspace.disk_report` reports its own failure
+        and this then says nothing rather than blocking on a guess.
+        """
+        if asset.size_bytes <= 0:
+            return
+        from studioforge.core.diskspace import disk_report
+
+        report = disk_report(self.config.downloads_dir, 0)
+        if report.get("error") or not report.get("free_bytes"):
+            return
+        required = int(asset.size_bytes * 2.5)
+        free = int(report["free_bytes"])
+        if free >= required:
+            return
+        raise EngineError(
+            f"not enough free space on {report['drive']} to install {asset.tag}: "
+            f"{_fmt_bytes(required)} required (the {_fmt_bytes(asset.size_bytes)} archive "
+            f"plus room to unpack it), {_fmt_bytes(free)} free. Free some space, or point "
+            f"the data directory at a larger volume"
+        )
 
     def _finalize(
         self,
@@ -1578,7 +1943,15 @@ class EngineManager:
         *,
         activate: bool,
         build_log: Path | None = None,
+        installed_at: float | None = None,
     ) -> EngineInfo:
+        """Write ``engine.json`` for a just-verified engine, activating on request.
+
+        ``installed_at`` is passed by the already-present paths so a *reuse*
+        keeps the original stamp: prune orders by it, and restamping it "now"
+        made the oldest build look like the newest one (D49-7).
+        """
+        stamp = time.time() if installed_at is None else installed_at
         info = EngineInfo(
             tag=dest.name,
             path=dest,
@@ -1588,6 +1961,7 @@ class EngineManager:
             smoke_tested=smoke.ok,
             smoke_tested_at=time.time() if smoke.ok else None,
             active=activate,
+            installed_at=stamp,
             build_log=build_log,
         )
         self._write_meta(info)
@@ -1603,7 +1977,15 @@ class EngineManager:
         phase: str,
         progress: ProgressFn | None,
     ) -> Path:
-        """Stream ``url`` to ``target``, reusing a complete previous download."""
+        """Stream ``url`` to ``target``, reusing a complete previous download.
+
+        Both failure families end the same way -- no ``.part`` left behind, one
+        :class:`EngineError` naming the URL (D49-13). ``OSError`` is in there
+        because the write is the half that fails on a full disk: ENOSPC escaped
+        as a raw ``OSError`` from inside ``handle.write``, which reached the GUI
+        as an unhandled exception and left a half-gigabyte ``.part`` on the
+        volume that had just run out of room.
+        """
         if _reuse_completed_download(target, expected_bytes):
             log.info("engine.download.cached", name=target.name, bytes=expected_bytes)
             _emit(progress, phase, 1.0)
@@ -1623,8 +2005,9 @@ class EngineManager:
                         done += len(chunk)
                         if total:
                             _emit(progress, phase, done / total)
-        except httpx.HTTPError as exc:
-            tmp.unlink(missing_ok=True)
+        except (httpx.HTTPError, OSError) as exc:
+            with contextlib.suppress(OSError):
+                tmp.unlink(missing_ok=True)
             raise EngineError(f"download of {url} failed: {exc}") from exc
         if expected_bytes and done != expected_bytes:
             tmp.unlink(missing_ok=True)
@@ -1656,12 +2039,17 @@ class EngineManager:
         *,
         arches: Sequence[str],
         progress: ProgressFn | None = None,
+        activate: bool = False,
     ) -> EngineInfo:
         """Build ``llama-server`` from source for exactly this box's arches.
 
         The fallback path for a GPU too new for any prebuilt archive (or a
         driver too old for the newest CUDA build). Installs to
         ``engines/<tag>-local/`` so it never collides with a prebuilt ``<tag>``.
+
+        ``activate`` follows :meth:`install` (D49-4): a build is not the live
+        engine until somebody says so. ``ensure_engine`` says so, because the
+        first engine on a box has to be usable.
         """
         arch_list = (
             self.cuda_arches([])
@@ -1739,9 +2127,11 @@ class EngineManager:
             raise EngineError(
                 f"source-built engine {dest.name} failed its smoke test: {smoke.detail}"
             )
-        return self._finalize(
-            dest, binary, "source-local", smoke, activate=True, build_log=log_path
+        info = self._finalize(
+            dest, binary, "source-local", smoke, activate=activate, build_log=log_path
         )
+        await self._warm_flag_cache(dest.name)
+        return info
 
     async def _prepare_source(self, tag: str, log_path: Path, progress: ProgressFn | None) -> Path:
         vendor = self.vendor_dir
@@ -1925,11 +2315,17 @@ class EngineManager:
             else None
         )
         if asset is not None:
-            return await self.install(tag, progress=progress)
+            # activate=True: this is the bootstrap path (D49-4). Nothing is
+            # running yet and there may be no other engine on the box at all, so
+            # "installed but not live" would be a server that cannot load a
+            # model. Every *later* install is an explicit decision.
+            return await self.install(tag, progress=progress, activate=True)
 
         if self.config.engine.allow_source_build:
             log.info("engine.ensure.source_build", tag=tag)
-            return await self.build_from_source(tag, arches=self.cuda_arches(), progress=progress)
+            return await self.build_from_source(
+                tag, arches=self.cuda_arches(), progress=progress, activate=True
+            )
 
         gpus = self._gpus()
         detected = ", ".join(f"{g.name} (sm_{g.sm_arch or '?'})" for g in gpus) or "no GPUs"
@@ -2272,7 +2668,10 @@ class EngineManager:
         Flags the engine declares but reports as removed are excluded: they are
         parsed and ignored at runtime, so treating them as supported is exactly
         the failure mode this validation exists to prevent. Cached to
-        ``engines/<tag>/flags.txt`` so a restart does not re-run the binary.
+        ``engines/<tag>/flags.txt`` so a restart does not re-run the binary --
+        the same file :attr:`EngineInfo.flags` reads, which is why install and
+        activation warm this (D49-12) instead of leaving a fresh build looking
+        as though it advertised no flags at all.
         """
         cached = self._flag_cache.get(tag)
         if cached is not None:
@@ -2500,14 +2899,104 @@ def _release_skip_reason(
 
     Split out so the reason is a string both the debug log and a test can read,
     rather than a boolean that says a tag was dropped without saying why.
+
+    **The prerelease flag does not decide anything for a ``bNNNN`` tag (D49-1).**
+    The filter was written on 2026-08-18 against a ``v0.1.2`` prerelease that
+    carried no prebuilt archives, and rejecting *every* prerelease looked like
+    the cheap way to keep it out. Upstream then started publishing its ordinary
+    build releases with ``prerelease: true``: measured live on 2026-08-28, 71 of
+    the newest 100 entries were prerelease ``bNNNN`` builds, so this function was
+    filtering out all 120 builds newer than the one installed and every surface
+    -- the GUI, ``engine --check``, ``GET /api/engine/releases`` -- reported an
+    empty universe. A tag matching :data:`ENGINE_TAG_RE` **is** a build release
+    whatever the flag says; the ``v0.1.2`` case is still rejected by the tag
+    scheme, and "does this release actually carry an asset for this box" was
+    always the real gate (:meth:`EngineManager.check_update` probes it).
+    Drafts stay rejected unconditionally: their assets genuinely 404.
     """
     if entry.get("draft") is True:
-        return "draft release (unpublished; its assets 404)"
-    if entry.get("prerelease") is True and not include_prerelease:
-        return "prerelease"
-    if not ENGINE_TAG_RE.match(tag):
-        return "tag is not a bNNNN llama.cpp build release"
+        return SKIP_DRAFT
+    is_build_tag = bool(ENGINE_TAG_RE.match(tag))
+    if entry.get("prerelease") is True and not include_prerelease and not is_build_tag:
+        return SKIP_PRERELEASE
+    if not is_build_tag:
+        return SKIP_TAG_SCHEME
     return None
+
+
+#: Short human labels for the skip reasons, for :func:`describe_release_filter`.
+#: The reason strings themselves are explanations; a one-line summary needs
+#: nouns it can count ("71 prerelease non-build tags").
+_SKIP_LABELS: dict[str, str] = {
+    SKIP_DRAFT: "draft",
+    SKIP_PRERELEASE: "prerelease non-build tag",
+    SKIP_TAG_SCHEME: "non-bNNNN tag",
+}
+
+
+def describe_release_filter(scan: Mapping[str, Any] | None) -> str:
+    """One sentence for a :attr:`EngineManager.last_release_scan` (D49-3).
+
+    ``"checked 100 releases; 74 filtered (71 prerelease non-build tags, 3
+    non-bNNNN tags)"``. Empty string when there is nothing to say, so a caller
+    can append it unconditionally.
+
+    Written here rather than in each surface because the GUI update line, the
+    List-releases dialog and ``engine --check`` were all rendering the same
+    empty answer three different ways, and none of them could say *why* it was
+    empty -- which is the only information a user can act on.
+    """
+    if not scan:
+        return ""
+    examined = int(scan.get("examined") or 0)
+    if not examined:
+        return ""
+    reasons = scan.get("reasons") or {}
+    parts: list[str] = []
+    if isinstance(reasons, Mapping):
+        for reason, count in sorted(reasons.items(), key=lambda kv: (-int(kv[1]), str(kv[0]))):
+            label = _SKIP_LABELS.get(str(reason), str(reason))
+            parts.append(f"{int(count)} {label}{'s' if int(count) != 1 else ''}")
+    skipped = int(scan.get("skipped") or 0)
+    text = f"checked {examined} release{'s' if examined != 1 else ''}"
+    if skipped:
+        text += f"; {skipped} filtered"
+        if parts:
+            text += f" ({', '.join(parts)})"
+    return text
+
+
+def _raise_for_rate_limit(resp: httpx.Response, action: str) -> None:
+    """Turn GitHub's rate-limit 403/429 into an error that says what to do.
+
+    Unauthenticated GitHub API calls get 60 requests an hour per IP, and a
+    ``check for updates`` that pages releases and probes three tags' assets
+    spends six of them. Exhausted, the API answers ``403`` with
+    ``x-ratelimit-remaining: 0`` -- indistinguishable, through
+    ``raise_for_status``, from a repository that has been made private, so the
+    message was "could not list llama.cpp releases: Client error '403
+    Forbidden'" and the fix (wait, or set a token) was nowhere in it. The two
+    rate-limit headers are the whole diagnosis, so they go in the message
+    (D49-13); :meth:`EngineManager._api_headers` has honoured ``GITHUB_TOKEN`` /
+    ``GH_TOKEN`` since it was written without ever saying so anywhere a user
+    would look.
+    """
+    if resp.status_code not in (403, 429):
+        return
+    remaining = (resp.headers.get("x-ratelimit-remaining") or "").strip()
+    if remaining not in ("0", "-0"):
+        return
+    reset = (resp.headers.get("x-ratelimit-reset") or "").strip()
+    when = "an unknown time"
+    if reset.isdigit():
+        when = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(int(reset)))
+    raise EngineError(
+        f"GitHub's API rate limit is exhausted, so StudioForge cannot {action}. "
+        f"The limit resets at {when} (x-ratelimit-reset={reset or 'absent'}). "
+        "Unauthenticated calls get 60 per hour per IP; set GITHUB_TOKEN or GH_TOKEN "
+        "to a personal access token (no scopes needed for public repositories) and "
+        "restart StudioForge to raise that to 5000"
+    )
 
 
 def _os_matches(asset_os: str, host_os: str) -> bool:

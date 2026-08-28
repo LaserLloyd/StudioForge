@@ -147,6 +147,60 @@ def _file_in_use_check(supervisor: Any, registry: Any) -> Any:
     return check
 
 
+def _tag_in_use_check(supervisor: Any, engine_manager: Any) -> Any:
+    """ "Which loaded models are running this engine build?" for the installer.
+
+    A reinstall over an already-present tag re-extracts the zip over a directory
+    whose ``llama-server.exe`` a running child holds open: on Windows that is a
+    ``WinError 32`` partway through the extraction, which is how a live engine
+    directory ends up half-overwritten (D49-7). The installer refuses instead,
+    naming the models that would have to be unloaded first, and this is where it
+    gets the names.
+
+    **The attribution is approximate, and knowingly so.** An instance records the
+    tag it was *asked* for, and the overwhelmingly common load asks for nothing
+    -- ``engine_tag`` is ``None``, meaning "whatever was active at spawn". There
+    is no record of what that was, so a ``None`` is attributed to whatever is
+    active *now*. The two are the same on a box where nobody has activated a
+    different build since those models loaded, and different exactly after an
+    activation: a child launched from b1 and still running it is then counted
+    against b2. Reinstalling b1 in that window is not refused. Making this exact
+    means stamping the resolved tag on the instance at spawn -- a supervisor
+    change, not an API one.
+
+    Failure is answered conservatively, like :func:`_file_in_use_check`: a
+    supervisor that cannot be listed reports a placeholder holder rather than
+    "nothing is using it", because the wrong answer here overwrites a running
+    binary.
+    """
+
+    def in_use(tag: str) -> list[str]:
+        wanted = str(tag)
+        try:
+            instances = supervisor.list()
+        except Exception as exc:  # noqa: BLE001 - see the docstring: be conservative
+            log.warning(
+                "could not list loaded models; treating the engine as in use",
+                engine_tag=wanted,
+                error=str(exc),
+            )
+            return ["(could not list loaded models)"]
+        try:
+            active = engine_manager.active()
+            active_tag = active.tag if active is not None else None
+        except Exception as exc:  # noqa: BLE001 - an unreadable active.json is not fatal
+            log.warning("could not read the active engine", error=str(exc))
+            active_tag = None
+        holders: list[str] = []
+        for instance in instances:
+            launched_with = getattr(instance, "engine_tag", None) or active_tag
+            if launched_with == wanted:
+                holders.append(instance.model_id)
+        return holders
+
+    return in_use
+
+
 def rescan_when_group_completes(downloader: Any, registry: Any) -> Any:
     """Progress callback that rescans the registry when a download group finishes.
 
@@ -429,6 +483,10 @@ def build_state(config: Config, *, version: str = __version__) -> Any:
     # The probe goes in so an unload can log the VRAM it actually reclaimed
     # rather than asserting that it did.
     supervisor = Supervisor(config, resolve_binary=engine_manager.server_binary, probe=probe)
+    # Late-bound rather than a constructor argument: the supervisor already
+    # depends on the engine manager for `resolve_binary`, and the reverse
+    # dependency (D49-7's "is this build in use?") would otherwise be a cycle.
+    engine_manager.tag_in_use = _tag_in_use_check(supervisor, engine_manager)
     manager = ModelManager(
         config,
         registry=registry,

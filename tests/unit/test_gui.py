@@ -350,7 +350,11 @@ def test_require_local_admin_is_the_one_rule_every_box_changing_action_uses(
             "_restart_server_dialog",
         ],
         "models.py": ["_toggle_pin", "_delete_dialog", "_settings_dialog"],
-        "server.py": ["install_engine", "activate_engine", "_register_protocol"],
+        # ``smoke_engine`` joined the list in D49-9: it reads like a read, but
+        # it spawns the engine and takes VRAM on a live rig, and the REST twin
+        # has been D32-gated all along -- the panel being the more permissive of
+        # the two was the drift worth closing.
+        "server.py": ["install_engine", "activate_engine", "smoke_engine", "_register_protocol"],
         "setup.py": ["_set_autostart", "_restart_dialog"],
         "download.py": ["_enqueue", "_control"],
     }
@@ -3004,6 +3008,122 @@ def test_engine_update_line_names_the_variant_when_the_check_knows_it() -> None:
     assert st.engine_update_line({**prebuilt, "latest_variant": "source"}).endswith(
         "b10488 (source) is available."
     )
+
+
+def test_the_empty_update_line_says_how_many_releases_were_filtered() -> None:
+    """ "None" and "we discarded all 120 of them" were the same sentence (D49-3).
+
+    For ten days in August 2026 the second one rendered as the first on every
+    surface, and the count is the only part a user can act on.
+    """
+    blackout = {
+        "checked": True,
+        "current": "b10549",
+        "latest": None,
+        "filter_summary": (
+            "checked 100 releases; 74 filtered (71 prerelease non-build tags, 3 non-bNNNN tags)"
+        ),
+    }
+    line = st.engine_update_line(blackout)
+    # Asserted by part rather than as one literal: the count is the guarantee,
+    # and the joining punctuation between the two sentences is cosmetic.
+    assert line.startswith("Engine b10549.")
+    assert "No installable release was found on GitHub" in line
+    assert line.endswith(
+        "checked 100 releases; 74 filtered (71 prerelease non-build tags, 3 non-bNNNN tags)."
+    )
+    # Nothing to explain: the sentence stops cleanly rather than trailing a dash.
+    assert st.engine_update_line({"checked": True, "current": "b10549", "latest": None}) == (
+        "Engine b10549. No installable release was found on GitHub."
+    )
+
+
+def test_the_filter_note_prefers_the_sentence_the_check_already_composed() -> None:
+    """One renderer, three surfaces: the panel must not word the number itself."""
+    scan = {"examined": 4, "kept": 3, "skipped": 1, "pages": 1, "reasons": {"draft release": 1}}
+    assert st.engine_filter_note({"filter_summary": "checked 100 releases"}) == (
+        "checked 100 releases"
+    )
+    # ...then the raw scan, handed straight to core.engine.describe_release_filter.
+    assert st.engine_filter_note({"filtered": scan}).startswith("checked 4 releases; 1 filtered")
+    # ...and finally a pre-D49-3 payload's per-tag skips, counted here.
+    legacy = {"skipped": [{"tag": "b1", "reason": "no asset"}, {"tag": "b2", "reason": "no asset"}]}
+    assert st.engine_filter_note(legacy) == "2 releases filtered: 2 no asset"
+    assert st.engine_filter_note({}) == ""
+
+
+def test_release_skip_counts_takes_either_shape_and_orders_them_the_same_way() -> None:
+    records = [
+        {"tag": "b1", "reason": "no asset"},
+        {"tag": "b2", "reason": "no asset"},
+        {"tag": "b3", "reason": "draft release"},
+    ]
+    assert st.release_skip_counts(records) == [("no asset", 2), ("draft release", 1)]
+    # The aggregated mapping form (last_release_scan["reasons"]) sorts identically.
+    assert st.release_skip_counts({"draft release": 1, "no asset": 2}) == [
+        ("no asset", 2),
+        ("draft release", 1),
+    ]
+    assert st.release_skip_counts(None) == []
+
+
+def test_the_release_filter_note_no_longer_claims_prereleases_are_hidden() -> None:
+    """The dialog's old sentence was defending the blackout (D49-1)."""
+    assert "prerelease" in st.RELEASE_FILTER_NOTE
+    assert "not a filter" in st.RELEASE_FILTER_NOTE
+    assert "bNNNN" in st.RELEASE_FILTER_NOTE
+
+
+def test_the_drift_badge_appears_only_when_the_pin_and_the_engine_disagree() -> None:
+    """A pin that does not match is not a plan -- it is a setting doing nothing."""
+    assert st.engine_drift_badge("b10425", "b10549") == "pin b10425 · active b10549"
+    assert st.engine_drift_badge("b10549", "b10549") is None
+    assert st.engine_drift_badge("b10425", None) is None
+    assert st.engine_drift_badge(None, "b10549") is None
+    assert st.engine_drift_badge("", "  ") is None
+    assert "active.json" in st.ENGINE_DRIFT_NOTE
+
+
+def test_the_keep_versions_note_reports_the_overage_without_acting_on_it() -> None:
+    """Pruning runs only during an install, so the overage is otherwise invisible.
+
+    Deleting the extras at startup would be worse -- b10425 is the rollback
+    engine on the live rig -- so D49-15 surfaces it and changes nothing.
+    """
+    assert st.engine_keep_versions_note(4, 3) == (
+        "4 installed, keep_versions 3 — older unpinned builds are pruned at the next install."
+    )
+    assert st.engine_keep_versions_note(3, 3) is None
+    assert st.engine_keep_versions_note(2, 3) is None
+    assert st.engine_keep_versions_note(4, 0) is None
+
+
+def test_the_flag_offender_warning_names_every_model_and_its_rejected_flag() -> None:
+    """llama-server ignores unknown flags, which is why this has to be loud."""
+    warning = st.flag_offender_warning(
+        [
+            {"model_id": "vendor/A-Q4_K_M", "errors": ["unknown flag '--draft-max'"]},
+            {"model_id": "vendor/B-Q8_0", "errors": []},
+        ]
+    )
+    assert warning is not None
+    assert "vendor/A-Q4_K_M (unknown flag '--draft-max')" in warning
+    assert "vendor/B-Q8_0" in warning
+    assert "ignores unknown flags" in warning
+    assert st.flag_offender_warning([]) is None
+    assert st.flag_offender_warning(None) is None
+
+
+def test_the_install_progress_line_moves_and_survives_an_unknown_phase() -> None:
+    """A motionless spinner on a ~600 MB download reads as a hang (D49-10)."""
+    assert st.install_progress_line("b10549", "download", 0.42) == (
+        "Installing engine b10549 — downloading 42%"
+    )
+    assert st.install_progress_line("b10549", "smoke", 1.0).endswith("smoke testing 100%")
+    # A phase name we have not met is still more than no name.
+    assert "verifying" in st.install_progress_line("b10549", "verifying", 0.0)
+    assert st.install_progress_line("b10549", "", None).endswith("(this can take a while)…")
+    assert st.install_progress_line("b10549", "download", "nonsense").endswith("downloading 0%")
 
 
 def test_server_tab_update_check_delegates_to_the_engine_manager() -> None:

@@ -39,10 +39,13 @@ from nicegui import ui
 from studioforge.gui import state as st
 from studioforge.gui.tabs import (
     GuiContext,
+    admin_control,
     apply_config_updates,
+    badge,
     busy,
     notify_error,
     panel_guard,
+    remote_viewer_banner,
     require_local_admin,
     run_blocking,
     viewer_may_change_box,
@@ -52,6 +55,7 @@ from studioforge.gui.tabs.server import (
     copy_text,
     install_engine,
     openclaw_payload,
+    paint_engine_update,
     smoke_engine,
     snippets,
 )
@@ -481,7 +485,10 @@ async def _run_action(ctx: GuiContext, action: str, refresh: Any) -> None:
     elif action == "detect-library":
         await _detect_library(ctx, refresh)
     elif action == "install-engine":
-        await install_engine(ctx, ctx.config.engine.pinned_tag, refresh)
+        # activate=True (D49-4): the checklist item exists because there is no
+        # engine on this box, so the one it installs must become the active
+        # one -- otherwise the item it was fixing stays red.
+        await install_engine(ctx, ctx.config.engine.pinned_tag, refresh, activate=True)
     elif action == "generate-pin":
         await _generate_pin(ctx, refresh)
     elif action == "set-api-key":
@@ -878,6 +885,10 @@ def _engine_body(ctx: GuiContext, refresh: Any) -> None:
     if manager is None:
         ui.label("engine manager unavailable on this instance").classes("text-xs opacity-60")
         return
+    # D49-9: one verdict for the card. Everything below it changes the box.
+    may_change = viewer_may_change_box(ctx)
+    if not may_change:
+        remote_viewer_banner()
 
     active = _safe(manager.active, None)
     if active is None:
@@ -885,7 +896,13 @@ def _engine_body(ctx: GuiContext, refresh: Any) -> None:
             f"No engine installed. The pinned tag is {ctx.config.engine.pinned_tag} — install it."
         ).classes("text-sm text-warning")
     else:
-        ui.label(f"active: {active.tag} ({active.variant})").classes("text-sm font-medium")
+        with ui.row().classes("items-center gap-2"):
+            ui.label(f"active: {active.tag} ({active.variant})").classes("text-sm font-medium")
+            # D49-5: the pin is the field two rows down, and it is the one that
+            # does nothing when they disagree. Say so where both are visible.
+            drift = st.engine_drift_badge(ctx.config.engine.pinned_tag, active.tag)
+            if drift:
+                badge(drift, colour="warning").tooltip(st.ENGINE_DRIFT_NOTE)
         ui.label(
             f"{active.version_string or st.UNKNOWN} · smoke tested {active.smoke_tested} · "
             f"{active.server_binary}"
@@ -896,10 +913,25 @@ def _engine_body(ctx: GuiContext, refresh: Any) -> None:
         with ui.row().classes("items-center gap-2 w-full no-wrap"):
             ui.label(line).classes("text-xs font-mono grow truncate")
             tag = str(info.get("tag") or "")
-            ui.button("smoke test", on_click=lambda t=tag: smoke_engine(ctx, t)).props("flat dense")
-            ui.button(
-                "activate + reload", on_click=lambda t=tag: activate_engine(ctx, t, refresh)
-            ).props("flat dense")
+            admin_control(
+                ui.button("smoke test", on_click=lambda t=tag: smoke_engine(ctx, t)).props(
+                    "flat dense"
+                ),
+                may_change=may_change,
+                what="engine smoke test",
+            )
+            admin_control(
+                ui.button(
+                    "activate + reload", on_click=lambda t=tag: activate_engine(ctx, t, refresh)
+                ).props("flat dense"),
+                may_change=may_change,
+                what="activate engine",
+            )
+    overage = st.engine_keep_versions_note(len(installed), int(ctx.config.engine.keep_versions))
+    if overage:
+        # D49-15: pruning only runs during an install, so the overage sits
+        # there silently until the install that acts on it.
+        ui.label(overage).classes("text-xs text-warning")
 
     fields = _Fields(ctx, _payload(ctx))
     fields.row("engine.pinned_tag", label="Pinned tag")
@@ -916,7 +948,7 @@ def _engine_body(ctx: GuiContext, refresh: Any) -> None:
 
     ui.separator()
     update_row = ui.row().classes("w-full items-center gap-2")
-    _paint_update(ctx, update_row, None, refresh)
+    paint_engine_update(ctx, update_row, None, refresh, may_change=may_change)
 
     async def check() -> None:
         update_row.clear()
@@ -927,31 +959,26 @@ def _engine_body(ctx: GuiContext, refresh: Any) -> None:
             payload = await manager.check_update(limit=5)
         except Exception as exc:  # noqa: BLE001
             payload = {"checked": True, "error": str(exc)}
-        _paint_update(ctx, update_row, payload, refresh)
+        paint_engine_update(ctx, update_row, payload, refresh, may_change=may_change)
 
     with ui.row().classes("items-center gap-2"):
         tag_input = ui.input("tag to install", value=ctx.config.engine.pinned_tag)
         tag_input.props("dense outlined").classes("w-40")
-        ui.button(
-            "Install",
-            icon="download",
-            on_click=lambda: install_engine(ctx, tag_input.value, refresh),
-        ).props("outline dense")
-        ui.button("Check for update", icon="cloud_download", on_click=check).props("outline dense")
-
-
-def _paint_update(ctx: GuiContext, row: Any, update: dict[str, Any] | None, refresh: Any) -> None:
-    row.clear()
-    with row:
-        ui.label(st.engine_update_line(update)).classes("text-sm")
-        if st.engine_update_available(update):
-            latest = str((update or {}).get("latest") or "")
+        admin_control(
             ui.button(
-                f"Install {latest}",
+                "Install",
                 icon="download",
-                on_click=lambda tag=latest: install_engine(ctx, tag, refresh),
-            ).props("outline dense color=primary")
-            ui.label(st.ENGINE_UPDATE_NOTE).classes("text-xs opacity-70")
+                on_click=lambda: install_engine(ctx, tag_input.value, refresh),
+            ).props("outline dense"),
+            may_change=may_change,
+            what="engine install",
+            tooltip=(
+                "Downloads the build. It does not become the active engine until you "
+                "activate it (D49-4)."
+            ),
+        )
+        # A GitHub read changes nothing here, so it stays open to every viewer.
+        ui.button("Check for update", icon="cloud_download", on_click=check).props("outline dense")
 
 
 # ---------------------------------------------------------------------------

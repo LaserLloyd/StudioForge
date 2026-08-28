@@ -67,18 +67,48 @@ uv pip install --python "%PY%" -e ".[dev]" || goto :failed
 REM ------------------------------------------------------------- 3. engine
 echo.
 echo [3/4] Checking for a newer llama.cpp engine...
-REM --update installs the newest release, smoke-tests it, and only then makes
-REM it the default. A build that fails its micro-load is never pinned.
-"%PY%" -m studioforge engine --update
-if not "%ERRORLEVEL%"=="0" (
-  echo   Engine update did not complete - the previous engine is still active.
+
+REM This step rewrites engines\ INSIDE THE LIVE DATA DIR, and a running server
+REM holds llama-server.exe and its DLLs open through every loaded model. Ask
+REM the gateway whether it is up before touching anything (D49-14): a reinstall
+REM under a live server is refused by the installer anyway, and a smoke test
+REM would take a GPU out from under whatever is using it. Two seconds, no
+REM dependencies beyond the venv Python that step 2 just built. The DEFAULT
+REM port only: a server moved off 1234 by config.yaml is not detected here, so
+REM stop it yourself before running this.
+set "SF_SERVER_LIVE="
+"%PY%" -c "import urllib.request;urllib.request.urlopen('http://127.0.0.1:1234/health',timeout=2)" >nul 2>&1
+if "%ERRORLEVEL%"=="0" set "SF_SERVER_LIVE=1"
+
+if defined SF_SERVER_LIVE (
+  echo   SKIPPED: a StudioForge server is answering on http://127.0.0.1:1234.
+  echo   Updating the engine under a running server would overwrite binaries its
+  echo   loaded models are executing. Use the running server instead:
+  echo     - GUI: Setup tab ^(or Server tab^) - llama.cpp engine - Check / Install,
+  echo       then Activate; then Dashboard - Restart engines.
+  echo     - REST: POST /api/engine/install then POST /api/engine/activate.
+  echo   Or stop the server ^("Stop StudioForge.bat"^) and re-run this script.
+) else (
+  REM --update installs the newest release, smoke-tests the INSTALLED-but-not-
+  REM yet-active build, and activates and pins it only if that test passes
+  REM (D49-4). A build that fails is left on disk, unused, and the previous
+  REM engine stays active - which is what the message says, now truthfully.
+  "%PY%" -m studioforge engine --update
+  if not "!ERRORLEVEL!"=="0" (
+    echo   Engine update did not complete - the previous engine is still active.
+  )
 )
 
 REM ------------------------------------------------------------- 4. verify
 echo.
 echo [4/4] Verifying...
 "%PY%" -m studioforge scan
-"%PY%" -m studioforge engine --smoke-test
+if defined SF_SERVER_LIVE (
+  echo   Skipping the engine smoke test: it micro-loads a model on the GPU, and
+  echo   a server is running. Use the GUI's "Smoke test" button instead.
+) else (
+  "%PY%" -m studioforge engine --smoke-test
+)
 
 echo.
 echo   Update complete. Start the server with "launchers\Start StudioForge.bat".

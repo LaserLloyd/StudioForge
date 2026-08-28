@@ -19,8 +19,10 @@ import json
 import os
 import sys
 import tarfile
+import time
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -30,13 +32,21 @@ from studioforge.config import Config
 from studioforge.core.engine import (
     BIN_NAME,
     ENGINE_TAG_RE,
+    RELEASE_MAX_PAGES,
+    RELEASE_PAGE_SIZE,
+    SKIP_DRAFT,
+    SKIP_PRERELEASE,
+    SKIP_TAG_SCHEME,
     EngineAsset,
     EngineError,
     EngineManager,
+    _raise_for_rate_limit,  # internal: the rate-limit diagnosis
     _SmokeResult,  # internal: build tests stub the smoke step
+    _swap_engine_dir,  # internal: the extract-to-sibling-then-swap step
     _verify_archive,  # internal: the pre-extract integrity check
     build_assets,
     build_number,
+    describe_release_filter,
     extract_engine_archive,
     extract_engine_zip,
     find_server_binary,
@@ -693,16 +703,17 @@ async def test_ensure_engine_falls_back_to_source_build(
     async def fake_assets(tag: str) -> list[EngineAsset]:
         return list(ASSETS)
 
-    async def fake_build(tag: str, *, arches: Any, progress: Any = None) -> Any:
+    async def fake_build(tag: str, *, arches: Any, progress: Any = None, activate: bool = False):
         built["tag"] = tag
         built["arches"] = list(arches)
+        built["activate"] = activate
         directory = _fake_engine(tmp_config.engines_dir, f"{tag}-local", 1_000)
         return mgr._finalize(  # exercises the real finalizer + active.json write
             directory,
             directory / BIN_NAME,
             "source-local",
             _SmokeResult(True, "ok"),
-            activate=True,
+            activate=activate,
         )
 
     monkeypatch.setattr(mgr, "list_assets", fake_assets)
@@ -712,6 +723,10 @@ async def test_ensure_engine_falls_back_to_source_build(
     assert built["tag"] == TAG
     assert built["arches"] == ["86", "120"]
     assert info.variant == "source-local"
+    # Bootstrap is the one caller that means "and use it": the box has no other
+    # engine, so a build that is not activated leaves nothing to load (D49-4).
+    assert built["activate"] is True
+    assert info.active is True
 
 
 @pytest.mark.asyncio
@@ -728,16 +743,17 @@ async def test_install_falls_back_to_source_build_on_linux(
     async def fake_assets(tag: str) -> list[EngineAsset]:
         return list(ASSETS)
 
-    async def fake_build(tag: str, *, arches: Any, progress: Any = None) -> Any:
+    async def fake_build(tag: str, *, arches: Any, progress: Any = None, activate: bool = False):
         built["tag"] = tag
         built["arches"] = list(arches)
+        built["activate"] = activate
         directory = _fake_engine(tmp_config.engines_dir, f"{tag}-local", 1_000)
         return mgr._finalize(
             directory,
             directory / BIN_NAME,
             "source-local",
             _SmokeResult(True, "ok"),
-            activate=True,
+            activate=activate,
         )
 
     monkeypatch.setattr(mgr, "list_assets", fake_assets)
@@ -745,8 +761,12 @@ async def test_install_falls_back_to_source_build_on_linux(
 
     info = await mgr.install(TAG)
 
-    assert built == {"tag": TAG, "arches": ["86", "120"]}
+    # The caller's activate flag rides all the way through the source-build
+    # fallback: a plain install(TAG) builds without switching to it (D49-4).
+    assert built == {"tag": TAG, "arches": ["86", "120"], "activate": False}
     assert info.tag == f"{TAG}-local" and info.variant == "source-local"
+    assert info.active is False
+    assert not (tmp_config.engines_dir / "active.json").exists()
 
 
 @pytest.mark.asyncio
@@ -793,7 +813,525 @@ async def test_install_reuses_an_existing_local_build(
     info = await mgr.install(TAG)
 
     assert info.tag == f"{TAG}-local"
+    # Reuse is not activation (D49-4). This assertion used to read ``is True``
+    # -- the reuse branch flipped active.json for anyone who merely re-ran an
+    # install, which is the drift the split exists to stop.
+    assert info.active is False
+    assert not (tmp_config.engines_dir / "active.json").exists()
+
+    activated = await mgr.install(TAG, activate=True)
+    assert activated.active is True
+    assert (
+        json.loads((tmp_config.engines_dir / "active.json").read_text(encoding="utf-8"))["tag"]
+        == f"{TAG}-local"
+    )
+
+
+# ---------------------------------------------------------------------------
+# D49-4/7/12/13: install and activate are separate, and neither may overwrite
+# a live engine directory
+# ---------------------------------------------------------------------------
+
+
+def _stub_prebuilt(
+    mgr: EngineManager,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    assets: list[EngineAsset] | None = None,
+    help_text: str = SAMPLE_HELP,
+) -> dict[str, list[Any]]:
+    """Everything the download branch of ``install`` would otherwise reach for.
+
+    No GitHub, no ~600 MB stream, no GPU micro-load and -- importantly -- no
+    exec of the fake binary the extraction leaves behind: ``_capture`` is
+    stubbed, so the flag-cache warm (D49-12) is observable without running
+    anything.
+    """
+    seen: dict[str, list[Any]] = {"downloads": [], "captures": []}
+
+    async def fake_assets(tag: str) -> list[EngineAsset]:
+        return list(ASSETS if assets is None else assets)
+
+    async def fake_download(
+        url: str, target: Path, expected_bytes: int, phase: str, progress: Any
+    ) -> Path:
+        seen["downloads"].append(phase)
+        _emit_progress(progress, phase)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        _make_zip(target, {BIN_NAME: b"BINARY", "ggml-cuda.dll": b"LIB"})
+        return target
+
+    async def fake_smoke(tag: str, tiny_model: Any) -> _SmokeResult:
+        return _SmokeResult(True, "stubbed", version_ok=True, version_string="build 10425")
+
+    async def fake_capture(binary: Path, args: Any) -> tuple[int, str]:
+        seen["captures"].append(list(args))
+        return 0, help_text
+
+    monkeypatch.setattr(mgr, "list_assets", fake_assets)
+    monkeypatch.setattr(mgr, "_download", fake_download)
+    monkeypatch.setattr(mgr, "_smoke", fake_smoke)
+    monkeypatch.setattr(mgr, "_capture", fake_capture)
+    return seen
+
+
+def _emit_progress(progress: Any, phase: str) -> None:
+    if progress is not None:
+        progress(phase, 1.0)
+
+
+@pytest.mark.asyncio
+async def test_install_unpacks_a_build_without_making_it_the_active_engine(
+    manager: EngineManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The D49-4 behaviour break, stated as a guarantee.
+
+    Installing used to call ``set_active`` as its last step unconditionally, so
+    ``engine --update`` could install, smoke-test, fail, print "keeping b10425"
+    and exit with ``active.json`` already naming the build that had just failed.
+    """
+    _stub_prebuilt(manager, monkeypatch)
+
+    info = await manager.install(TAG)
+
+    assert info.tag == TAG and info.variant == "cuda-13.3"
+    assert info.active is False
+    assert not (manager.engines_dir / "active.json").exists()
+    assert manager.active() is not None  # the fallback still resolves a build
+    assert manager._read_active() is None
+
+
+@pytest.mark.asyncio
+async def test_install_activates_only_when_the_caller_asks(
+    manager: EngineManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``activate=True`` is what bootstrap and the first-run checklist pass."""
+    _stub_prebuilt(manager, monkeypatch)
+
+    info = await manager.install(TAG, activate=True)
+
     assert info.active is True
+    payload = json.loads((manager.engines_dir / "active.json").read_text(encoding="utf-8"))
+    assert payload["tag"] == TAG
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_install_warms_the_flags_cache(
+    manager: EngineManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``EngineInfo.flags`` reads ``flags.txt``; only validation used to write it.
+
+    A build reported "no flags" until somebody happened to validate an
+    expert-tier string against it, which reads as an engine that supports
+    nothing at all (D49-12).
+    """
+    seen = _stub_prebuilt(manager, monkeypatch)
+
+    await manager.install(TAG)
+
+    assert seen["captures"] == [["--help"]], "exactly one --help of the verified binary"
+    assert (manager.engine_dir(TAG) / "flags.txt").is_file()
+    info = manager.get(TAG)
+    assert info is not None
+    assert "--ctx-size" in info.flags
+
+
+@pytest.mark.asyncio
+async def test_activate_refuses_a_tag_that_is_not_installed(
+    manager: EngineManager,
+) -> None:
+    """Writing active.json for an absent build is drift wearing a success message."""
+    _fake_engine(manager.engines_dir, "b10500", 1_000)
+
+    with pytest.raises(EngineError) as excinfo:
+        await manager.activate("b99999")
+
+    message = str(excinfo.value)
+    assert "b99999" in message
+    assert "b10500" in message  # names what IS installed
+    assert not (manager.engines_dir / "active.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_activate_writes_active_json_warms_the_flags_and_leaves_the_pin_alone(
+    manager: EngineManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Activation is one write plus a warm; the pin belongs to the caller (D49-4).
+
+    ``engine.pinned_tag`` is deliberately NOT touched here: the route, the GUI
+    and the CLI helper set it beside this call so the two halves cannot be
+    written from two places with two opinions.
+    """
+    _fake_engine(manager.engines_dir, "b10500", 2_000)
+    manager.config.engine.pinned_tag = TAG
+    captures: list[Any] = []
+
+    async def fake_capture(binary: Path, args: Any) -> tuple[int, str]:
+        captures.append(list(args))
+        return 0, SAMPLE_HELP
+
+    monkeypatch.setattr(manager, "_capture", fake_capture)
+
+    info = await manager.activate("b10500")
+
+    assert info.tag == "b10500" and info.active is True
+    payload = json.loads((manager.engines_dir / "active.json").read_text(encoding="utf-8"))
+    assert payload["tag"] == "b10500"
+    assert captures == [["--help"]]
+    assert (manager.engine_dir("b10500") / "flags.txt").is_file()
+    assert manager.config.engine.pinned_tag == TAG
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_help_does_not_fail_the_activation(
+    manager: EngineManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cold flag cache is a cosmetic problem; a refused activation is not."""
+    _fake_engine(manager.engines_dir, "b10500", 2_000)
+
+    async def boom(binary: Path, args: Any) -> tuple[int, str]:
+        raise OSError("not an executable")
+
+    monkeypatch.setattr(manager, "_capture", boom)
+
+    info = await manager.activate("b10500")
+    assert info.active is True
+
+
+@pytest.mark.asyncio
+async def test_reusing_an_installed_build_keeps_its_variant_and_installed_at(
+    manager: EngineManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The already-present branch stamped "prebuilt"/now over the truth (D49-7).
+
+    Both stamps are load-bearing: ``_warn_driver_too_old`` only fires for a
+    ``cuda-*`` variant, so overwriting a source build's variant disarmed it, and
+    ``prune`` orders by ``installed_at``, so restamping it made the oldest
+    engine look like the newest one.
+    """
+    _installed_engine(manager, smoke_tested=True, variant="source-local")
+
+    async def fake_smoke(tag: str, tiny_model: Any) -> _SmokeResult:
+        return _SmokeResult(True, "stubbed", version_ok=True)
+
+    async def boom(tag: str) -> list[EngineAsset]:  # pragma: no cover - must not run
+        raise AssertionError("a present engine must not be re-downloaded")
+
+    monkeypatch.setattr(manager, "_smoke", fake_smoke)
+    monkeypatch.setattr(manager, "list_assets", boom)
+
+    info = await manager.install(TAG)
+
+    assert info.variant == "source-local"
+    assert info.installed_at == 1_000_000
+    assert info.active is False
+
+
+@pytest.mark.asyncio
+async def test_a_reinstall_is_refused_while_loaded_models_hold_the_tag(
+    manager: EngineManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The failed-smoke fallthrough used to re-download over a live directory.
+
+    On Windows a running llama-server holds its own ``.exe`` and DLLs open, so
+    the extraction fails partway and leaves the LIVE engine half-overwritten --
+    breaking models that were working a second earlier (D49-7).
+    """
+    _installed_engine(manager, smoke_tested=False)
+    manager.tag_in_use = lambda tag: ["vendor/Model-A-Q4_K_M", "vendor/Model-B-Q8_0"]
+
+    async def failing_smoke(tag: str, tiny_model: Any) -> _SmokeResult:
+        return _SmokeResult(False, "micro-load failed: CUDA error: out of memory")
+
+    async def boom(tag: str) -> list[EngineAsset]:  # pragma: no cover - must not run
+        raise AssertionError("the refusal must happen before any download")
+
+    monkeypatch.setattr(manager, "_smoke", failing_smoke)
+    monkeypatch.setattr(manager, "list_assets", boom)
+
+    with pytest.raises(EngineError) as excinfo:
+        await manager.install(TAG)
+
+    message = str(excinfo.value)
+    assert "vendor/Model-A-Q4_K_M" in message and "vendor/Model-B-Q8_0" in message
+    assert "unload" in message.lower()
+
+
+@pytest.mark.asyncio
+async def test_force_does_not_get_past_the_in_use_refusal(
+    manager: EngineManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``force`` re-downloads a healthy build -- it is not an override for this."""
+    _installed_engine(manager, smoke_tested=True)
+    manager.tag_in_use = lambda tag: ["vendor/Model-A-Q4_K_M"]
+    _stub_prebuilt(manager, monkeypatch)
+
+    with pytest.raises(EngineError, match="vendor/Model-A-Q4_K_M"):
+        await manager.install(TAG, force=True)
+
+
+@pytest.mark.asyncio
+async def test_a_hook_that_cannot_answer_refuses_rather_than_assuming_idle(
+    manager: EngineManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ "Cannot tell" must not read as "nothing is running"."""
+    _installed_engine(manager, smoke_tested=True)
+
+    def unavailable(tag: str) -> list[str]:
+        raise RuntimeError("supervisor is not listable")
+
+    manager.tag_in_use = unavailable
+    _stub_prebuilt(manager, monkeypatch)
+
+    with pytest.raises(EngineError, match="could not check"):
+        await manager.install(TAG, force=True)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_swap_leaves_the_installed_engine_exactly_as_it_was(
+    manager: EngineManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Extraction goes to a sibling and swaps; a failure is a no-op (D49-7)."""
+    from studioforge.core import engine as engine_module
+
+    dest = _fake_engine(manager.engines_dir, TAG, 1_000_000)
+    (dest / "ggml-cuda.dll").write_bytes(b"ORIGINAL")
+    _stub_prebuilt(manager, monkeypatch)
+
+    def refuse(staged: Path, target: Path) -> None:
+        raise EngineError(f"could not replace the existing engine at {target}: WinError 32")
+
+    monkeypatch.setattr(engine_module, "_swap_engine_dir", refuse)
+
+    with pytest.raises(EngineError, match="could not replace the existing engine"):
+        await manager.install(TAG, force=True)
+
+    assert (dest / BIN_NAME).read_bytes() == b"fake"
+    assert (dest / "ggml-cuda.dll").read_bytes() == b"ORIGINAL"
+    # ...and the staging tree is cleaned up rather than left to be mistaken for
+    # an install (``installed()`` skips underscore-prefixed directories anyway).
+    assert not (dest.parent / f"_{dest.name}.new").exists()
+    assert {info.tag for info in manager.installed()} == {TAG}
+
+
+def test_swap_engine_dir_replaces_the_old_directory_and_cleans_up(tmp_path: Path) -> None:
+    dest = tmp_path / "engines" / TAG
+    dest.mkdir(parents=True)
+    (dest / BIN_NAME).write_bytes(b"OLD")
+    staged = tmp_path / "engines" / f"_{TAG}.new"
+    staged.mkdir()
+    (staged / BIN_NAME).write_bytes(b"NEW")
+
+    _swap_engine_dir(staged, dest)
+
+    assert (dest / BIN_NAME).read_bytes() == b"NEW"
+    assert not staged.exists()
+    assert list((tmp_path / "engines").iterdir()) == [dest]
+
+
+def test_swap_engine_dir_puts_the_old_directory_back_when_the_move_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The half-second between "moved aside" and "moved in" must not lose it."""
+    dest = tmp_path / "engines" / TAG
+    dest.mkdir(parents=True)
+    (dest / BIN_NAME).write_bytes(b"OLD")
+    staged = tmp_path / "engines" / f"_{TAG}.new"
+    staged.mkdir()
+
+    real_rename = Path.rename
+
+    def flaky(self: Path, target: Any) -> Path:
+        if self == staged:
+            raise OSError(32, "the process cannot access the file")
+        return real_rename(self, target)
+
+    monkeypatch.setattr(Path, "rename", flaky)
+
+    with pytest.raises(EngineError, match="could not move the new engine"):
+        _swap_engine_dir(staged, dest)
+
+    assert (dest / BIN_NAME).read_bytes() == b"OLD"
+
+
+@pytest.mark.asyncio
+async def test_the_disk_precheck_names_what_it_needs_and_what_is_free(
+    manager: EngineManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ENOSPC used to arrive as a bare OSError from mid-stream (D49-13)."""
+    from studioforge.core import diskspace
+
+    big = build_assets(
+        TAG,
+        [
+            _asset(f"llama-{TAG}-bin-win-cuda-13.3-x64.zip", 800 * 1024**2),
+            _asset("cudart-llama-bin-win-cuda-13.3-x64.zip", 20 * 1024**2),
+        ],
+    )
+    _stub_prebuilt(manager, monkeypatch, assets=big)
+    monkeypatch.setattr(
+        diskspace, "disk_report", lambda path, need: {"drive": "E:\\", "free_bytes": 1024**3}
+    )
+
+    with pytest.raises(EngineError) as excinfo:
+        await manager.install(TAG)
+
+    message = str(excinfo.value)
+    assert "E:\\" in message
+    assert "2.0 GiB required" in message
+    assert "1.0 GiB free" in message
+
+
+@pytest.mark.asyncio
+async def test_unmeasurable_free_space_does_not_block_the_install(
+    manager: EngineManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A disk we cannot measure is not a full disk; refusing on a guess is worse."""
+    from studioforge.core import diskspace
+
+    _stub_prebuilt(manager, monkeypatch)
+    monkeypatch.setattr(
+        diskspace, "disk_report", lambda path, need: {"error": "WinError 21", "drive": "?"}
+    )
+
+    info = await manager.install(TAG)
+    assert info.tag == TAG
+
+
+def test_a_rate_limited_github_reply_names_the_reset_time_and_the_token_vars() -> None:
+    """403 + ``x-ratelimit-remaining: 0`` is a diagnosis, not a generic failure.
+
+    Through ``raise_for_status`` it was indistinguishable from a repository
+    that had been made private, and the fix -- wait, or set a token
+    ``_api_headers`` has honoured all along -- appeared nowhere (D49-13).
+    """
+    reset = 1_780_000_000
+    resp = httpx.Response(
+        403,
+        headers={"x-ratelimit-remaining": "0", "x-ratelimit-reset": str(reset)},
+        request=httpx.Request("GET", "https://api.github.invalid/releases"),
+    )
+
+    with pytest.raises(EngineError) as excinfo:
+        _raise_for_rate_limit(resp, "list llama.cpp releases")
+
+    message = str(excinfo.value)
+    assert "list llama.cpp releases" in message
+    assert time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(reset)) in message
+    assert "GITHUB_TOKEN" in message and "GH_TOKEN" in message
+
+    # A 403 that is not a rate limit, and a 429 with quota left, both pass through.
+    _raise_for_rate_limit(httpx.Response(403), "list llama.cpp releases")
+    _raise_for_rate_limit(
+        httpx.Response(429, headers={"x-ratelimit-remaining": "12"}), "list llama.cpp releases"
+    )
+    _raise_for_rate_limit(httpx.Response(200), "list llama.cpp releases")
+
+
+@pytest.mark.asyncio
+async def test_list_releases_surfaces_the_rate_limit_rather_than_a_403(
+    tmp_config: Config,
+) -> None:
+    def limited(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            403,
+            headers={"x-ratelimit-remaining": "0", "x-ratelimit-reset": "1780000000"},
+            json={"message": "API rate limit exceeded"},
+        )
+
+    mgr = EngineManager(
+        tmp_config,
+        probe=StubProbe(MIXED_GPUS, (13, 3)),
+        client=httpx.AsyncClient(transport=httpx.MockTransport(limited)),
+    )
+
+    with pytest.raises(EngineError, match="GITHUB_TOKEN"):
+        await mgr.list_releases(limit=5)
+
+
+# ---------------------------------------------------------------------------
+# D49-6: the extra-flags revalidation sweep
+# ---------------------------------------------------------------------------
+
+
+def _record(model_id: str, extra_flags: Any) -> Any:
+    return SimpleNamespace(id=model_id, settings=SimpleNamespace(extra_flags=extra_flags))
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_names_the_model_and_the_flag_the_new_build_rejects(
+    manager: EngineManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The D2 failure, caught at the switch instead of never (D49-6).
+
+    llama-server *ignores* flags it does not recognise, so a build that dropped
+    ``--draft-max`` loads the model, looks healthy, and silently runs without
+    speculative decoding. Nothing re-ran the save-time validation on an engine
+    change, so nothing ever noticed.
+    """
+    _fake_engine(manager.engines_dir, TAG, 1_000)
+
+    async def fake_capture(binary: Path, args: Any) -> tuple[int, str]:
+        return 0, SAMPLE_HELP
+
+    monkeypatch.setattr(manager, "_capture", fake_capture)
+
+    offenders = await manager.revalidate_extra_flags(
+        TAG,
+        [
+            _record("vendor/Clean-Q4_K_M", "--ctx-size 8192"),
+            _record("vendor/Stale-Q4_K_M", "--draft-max 4"),
+            _record("vendor/Unset-Q4_K_M", ""),
+            _record("vendor/None-Q4_K_M", None),
+        ],
+    )
+
+    assert [entry["model_id"] for entry in offenders] == ["vendor/Stale-Q4_K_M"]
+    detail = "; ".join(offenders[0]["errors"])
+    assert "--draft-max" in detail
+    assert "removed in this release" in detail
+    assert "--spec-draft-n-max" in detail
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_is_silent_when_every_saved_flag_still_validates(
+    manager: EngineManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_engine(manager.engines_dir, TAG, 1_000)
+
+    async def fake_capture(binary: Path, args: Any) -> tuple[int, str]:
+        return 0, SAMPLE_HELP
+
+    monkeypatch.setattr(manager, "_capture", fake_capture)
+
+    assert (
+        await manager.revalidate_extra_flags(
+            TAG, [_record("vendor/A", "--ctx-size 4096"), _record("vendor/B", "--flash-attn on")]
+        )
+        == []
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_never_raises_however_broken_the_input(
+    manager: EngineManager,
+) -> None:
+    """It runs mid-activation; an exception here would abort a switch that worked.
+
+    The engine is not installed at all, so validation cannot read a ``--help``:
+    that becomes an error string against the model, not a traceback.
+    """
+    offenders = await manager.revalidate_extra_flags(
+        "b99999",
+        [
+            _record("vendor/Broken", "--ctx-size 4096"),
+            SimpleNamespace(settings=None),  # no id, no settings object
+            SimpleNamespace(),  # not a record at all
+        ],
+    )
+
+    assert [entry["model_id"] for entry in offenders] == ["vendor/Broken"]
+    assert "cannot validate" in "; ".join(offenders[0]["errors"])
 
 
 # ---------------------------------------------------------------------------
@@ -1044,7 +1582,10 @@ async def test_two_installs_of_one_tag_share_one_download(
     entered = asyncio.Event()
     release = asyncio.Event()
 
-    async def fake_locked(tag: str, *, progress: Any, force: bool) -> Any:
+    async def fake_locked(tag: str, *, progress: Any, force: bool, activate: bool) -> Any:
+        # The keyword list is the contract install() calls this with; a double
+        # that lags it raises TypeError *inside* the lock, so the waiter never
+        # wakes and the test hangs rather than failing (D49-4 added activate).
         downloads.append(tag)
         entered.set()
         await release.wait()
@@ -1102,7 +1643,12 @@ def _release(
 
 
 #: The shape ``GET /repos/ggml-org/llama.cpp/releases`` really returned on
-#: 2026-08-18, verified against the live API.
+#: 2026-08-18, verified against the live API. Its build entries are
+#: ``prerelease: false`` because that is what upstream published *then*; ten
+#: days later they were all ``true`` and this fixture stopped describing the
+#: world (D49-1). It stays as the 2026-08-18 regression case -- the asset-less
+#: ``v0.1.2`` tag -- and the current metadata lives in the fixtures beside the
+#: prerelease tests below.
 RELEASES_2026_08_18: list[dict[str, Any]] = [
     _release("v0.1.2", prerelease=True),
     _release("b10488", assets=_win_cuda_assets("b10488")),
@@ -1111,16 +1657,30 @@ RELEASES_2026_08_18: list[dict[str, Any]] = [
 ]
 
 
-def _github(releases: list[dict[str, Any]], seen: list[Any] | None = None) -> httpx.AsyncClient:
-    """A client answering the two GitHub endpoints the manager calls."""
-    by_tag = {str(entry["tag_name"]): entry for entry in releases}
+def _github(
+    releases: list[dict[str, Any]],
+    seen: list[Any] | None = None,
+    *,
+    pages: list[list[dict[str, Any]]] | None = None,
+) -> httpx.AsyncClient:
+    """A client answering the two GitHub endpoints the manager calls.
+
+    ``pages`` serves ``?page=N`` from a list of pages, the way the real API
+    does; without it every request gets ``releases`` (a short page, so the
+    manager stops after one). ``seen`` collects ``(per_page, page)`` so a test
+    can assert how the walk was actually driven (D49-2).
+    """
+    served = pages if pages is not None else [releases]
+    by_tag = {str(entry["tag_name"]): entry for page in served for entry in page}
 
     def handler(request: httpx.Request) -> httpx.Response:
         path = request.url.path
         if path.endswith("/releases"):
+            number = int(request.url.params.get("page") or 1)
             if seen is not None:
-                seen.append(request.url.params.get("per_page"))
-            return httpx.Response(200, json=releases)
+                seen.append((request.url.params.get("per_page"), number))
+            body = served[number - 1] if 1 <= number <= len(served) else []
+            return httpx.Response(200, json=body)
         entry = by_tag.get(path.rsplit("/", 1)[-1])
         if entry is None:
             return httpx.Response(404, json={"message": "Not Found"})
@@ -1135,8 +1695,13 @@ def _github_manager(
     *,
     cuda: tuple[int, int] | None = (13, 3),
     seen: list[Any] | None = None,
+    pages: list[list[dict[str, Any]]] | None = None,
 ) -> EngineManager:
-    mgr = EngineManager(config, probe=StubProbe(MIXED_GPUS, cuda), client=_github(releases, seen))
+    mgr = EngineManager(
+        config,
+        probe=StubProbe(MIXED_GPUS, cuda),
+        client=_github(releases, seen, pages=pages),
+    )
     mgr.os_token, mgr.arch_token = "win", "x64"
     return mgr
 
@@ -1162,8 +1727,76 @@ async def test_list_releases_drops_the_v0_1_2_prerelease(tmp_config: Config) -> 
     seen: list[Any] = []
     mgr = _github_manager(tmp_config, RELEASES_2026_08_18, seen=seen)
     assert await mgr.list_releases(limit=5) == ["b10488", "b10486", "b10485"]
-    # Over-fetched, so filtering cannot starve the caller of its `limit` tags.
-    assert int(seen[0]) >= 20
+    # A full page every time, numbered from 1 (D49-2). The old
+    # ``per_page=min(100, max(limit*2, 20))`` made the ANSWER depend on the
+    # limit: with most entries filtered, limit=5 fetched 20 and returned none
+    # while limit=50 fetched 100 and returned 26, from one repository.
+    assert seen == [("100", 1)]
+
+
+@pytest.mark.asyncio
+async def test_a_prerelease_flagged_build_release_is_still_offered(tmp_config: Config) -> None:
+    """The 2026-08-28 blackout, in one assertion (D49-1).
+
+    Upstream began publishing its ordinary ``bNNNN`` builds with GitHub's
+    ``prerelease`` flag set: 71 of the newest 100 entries, measured live that
+    day. The 2026-08-18 filter rejected every prerelease outright, so all 120
+    builds newer than the installed one became invisible to the GUI, to
+    ``engine --check`` and to ``GET /api/engine/releases`` at once -- and the
+    empty answer was indistinguishable from "upstream published nothing".
+    A ``bNNNN`` tag is a build release whatever the flag says.
+    """
+    releases = [
+        _release("b10669", prerelease=True, assets=_win_cuda_assets("b10669")),
+        _release("b10550", prerelease=True, assets=_win_cuda_assets("b10550")),
+        _release("b10549", assets=_win_cuda_assets("b10549")),
+    ]
+    mgr = _github_manager(tmp_config, releases)
+
+    assert await mgr.list_releases(limit=5) == ["b10669", "b10550", "b10549"]
+    scan = mgr.last_release_scan
+    assert scan is not None
+    assert (scan["examined"], scan["kept"], scan["skipped"]) == (3, 3, 0)
+
+
+@pytest.mark.asyncio
+async def test_a_draft_build_release_is_never_offered(tmp_config: Config) -> None:
+    """A draft is unpublished: its assets 404, so the flag still decides."""
+    releases = [
+        _release("b10999", draft=True, prerelease=True, assets=_win_cuda_assets("b10999")),
+        _release("b10549", prerelease=True, assets=_win_cuda_assets("b10549")),
+    ]
+    mgr = _github_manager(tmp_config, releases)
+
+    assert await mgr.list_releases(limit=5) == ["b10549"]
+    assert mgr.last_release_scan is not None
+    assert mgr.last_release_scan["reasons"] == {SKIP_DRAFT: 1}
+
+
+@pytest.mark.asyncio
+async def test_a_prerelease_version_tag_is_still_rejected(tmp_config: Config) -> None:
+    """The case the filter was written for on 2026-08-18 stays rejected.
+
+    ``v0.1.2`` carried no prebuilt archive at all, and D49-1 did not soften
+    that: the *tag scheme* rejects it, which is the check that was always doing
+    the work. The reason recorded is the prerelease one, because that test runs
+    first -- either way the tag never reaches an install.
+    """
+    releases = [
+        _release("v0.1.2", prerelease=True),
+        _release("b10549", prerelease=True, assets=_win_cuda_assets("b10549")),
+    ]
+    mgr = _github_manager(tmp_config, releases)
+
+    assert await mgr.list_releases(limit=5) == ["b10549"]
+    assert mgr.last_release_scan is not None
+    assert mgr.last_release_scan["reasons"] == {SKIP_PRERELEASE: 1}
+
+    # ...and a non-prerelease vX.Y.Z is rejected by the scheme alone.
+    plain = _github_manager(tmp_config, [_release("v0.1.3"), _release("b10549")])
+    assert await plain.list_releases(limit=5) == ["b10549"]
+    assert plain.last_release_scan is not None
+    assert plain.last_release_scan["reasons"] == {SKIP_TAG_SCHEME: 1}
 
 
 @pytest.mark.asyncio
@@ -1174,6 +1807,8 @@ async def test_list_releases_include_prerelease_never_widens_the_tag_scheme(
 
     A ``vX.Y.Z`` tag is uninstallable under any flag: the asset parser, the
     engine directory layout and the source-build clone all assume ``bNNNN``.
+    Since D49-1 the flag makes no difference to a ``bNNNN`` build either way --
+    it only ever governed the tags that are rejected regardless.
     """
     releases = [
         _release("v0.1.2", prerelease=True),
@@ -1181,7 +1816,7 @@ async def test_list_releases_include_prerelease_never_widens_the_tag_scheme(
         _release("b10488", assets=_win_cuda_assets("b10488")),
     ]
     mgr = _github_manager(tmp_config, releases)
-    assert await mgr.list_releases(limit=5) == ["b10488"]
+    assert await mgr.list_releases(limit=5) == ["b10490", "b10488"]
     assert await mgr.list_releases(limit=5, include_prerelease=True) == ["b10490", "b10488"]
 
 
@@ -1210,6 +1845,147 @@ async def test_list_releases_network_failure_still_raises(tmp_config: Config) ->
     )
     with pytest.raises(EngineError, match="could not list llama.cpp releases"):
         await mgr.list_releases()
+
+
+# ---------------------------------------------------------------------------
+# D49-2: the walk is paged, and D49-3: what it dropped is reportable
+# ---------------------------------------------------------------------------
+
+
+def _page(tags: list[str], **kwargs: Any) -> list[dict[str, Any]]:
+    return [_release(tag, assets=_win_cuda_assets(tag), **kwargs) for tag in tags]
+
+
+@pytest.mark.asyncio
+async def test_list_releases_pages_on_until_it_has_the_count_it_was_asked_for(
+    tmp_config: Config,
+) -> None:
+    """A run of ineligible entries costs another request, not the answer (D49-2).
+
+    The single over-fetched page this used to do meant a page full of tags the
+    filter rejects starved the caller: on 2026-08-28 the newest 100 entries
+    were 71 prereleases and the answer to ``limit=5`` was an empty list.
+    """
+    seen: list[Any] = []
+    ineligible = [_release(f"v0.{index}.0") for index in range(RELEASE_PAGE_SIZE)]
+    builds = _page([f"b{10600 + index}" for index in range(RELEASE_PAGE_SIZE)], prerelease=True)
+    mgr = _github_manager(tmp_config, [], seen=seen, pages=[ineligible, builds])
+
+    assert await mgr.list_releases(limit=5) == ["b10699", "b10698", "b10697", "b10696", "b10695"]
+    assert seen == [("100", 1), ("100", 2)]
+    scan = mgr.last_release_scan
+    assert scan is not None
+    assert scan["examined"] == 200
+    assert scan["pages"] == 2
+    assert scan["reasons"] == {SKIP_TAG_SCHEME: RELEASE_PAGE_SIZE}
+
+
+@pytest.mark.asyncio
+async def test_list_releases_stops_at_the_page_budget_and_says_what_it_saw(
+    tmp_config: Config,
+) -> None:
+    """ "Fewer than asked" is the honest contract past the budget (D49-2/D49-3).
+
+    The docstring used to claim the over-fetch meant it "cannot return fewer
+    than asked", which was false in exactly the case that mattered. Three pages
+    is the cap; what was examined and why it was dropped is recorded so a
+    surface can say "checked 300 releases" instead of "none".
+    """
+    seen: list[Any] = []
+    pages = [
+        [_release(f"v{page}.{index}.0") for index in range(RELEASE_PAGE_SIZE)] for page in range(5)
+    ]
+    mgr = _github_manager(tmp_config, [], seen=seen, pages=pages)
+
+    assert await mgr.list_releases(limit=5) == []
+    assert len(seen) == RELEASE_MAX_PAGES
+    scan = mgr.last_release_scan
+    assert scan is not None
+    assert scan["pages"] == RELEASE_MAX_PAGES
+    assert scan["examined"] == RELEASE_PAGE_SIZE * RELEASE_MAX_PAGES
+    assert scan["kept"] == 0
+    assert "checked 300 releases" in describe_release_filter(scan)
+
+
+@pytest.mark.asyncio
+async def test_list_releases_stops_on_a_short_page_without_a_wasted_request(
+    tmp_config: Config,
+) -> None:
+    """A repository with three releases must not be asked for page 2."""
+    seen: list[Any] = []
+    mgr = _github_manager(tmp_config, [], seen=seen, pages=[_page(["b10549", "b10548", "b10547"])])
+
+    assert await mgr.list_releases(limit=20) == ["b10549", "b10548", "b10547"]
+    assert seen == [("100", 1)]
+    assert mgr.last_release_scan is not None
+    assert mgr.last_release_scan["pages"] == 1
+
+
+def test_describe_release_filter_counts_each_reason_by_name() -> None:
+    """The one renderer every surface shares (D49-3).
+
+    Before this, the GUI update line, the List-releases dialog and
+    ``engine --check`` each said "none" in their own words and none of them
+    could say why -- which is the only part a user can act on.
+    """
+    text = describe_release_filter(
+        {
+            "examined": 100,
+            "kept": 26,
+            "skipped": 74,
+            "pages": 1,
+            "reasons": {SKIP_PRERELEASE: 71, SKIP_TAG_SCHEME: 3},
+        }
+    )
+    assert text == (
+        "checked 100 releases; 74 filtered (71 prerelease non-build tags, 3 non-bNNNN tags)"
+    )
+    # Nothing to say stays empty, so a caller can append it unconditionally.
+    assert describe_release_filter(None) == ""
+    assert describe_release_filter({"examined": 0}) == ""
+    assert describe_release_filter({"examined": 3, "skipped": 0, "reasons": {}}) == (
+        "checked 3 releases"
+    )
+
+
+@pytest.mark.asyncio
+async def test_check_update_carries_the_filter_counts_without_disturbing_skipped(
+    tmp_config: Config,
+) -> None:
+    """``filtered``/``filter_summary`` are new; ``skipped`` keeps its shape.
+
+    Existing consumers iterate ``skipped`` for ``entry["tag"]``/``["reason"]``
+    -- the per-tag asset-probe failures -- so the release-filter counts land in
+    a separate key rather than being mixed in (D49-3).
+    """
+    tmp_config.engine.pinned_tag = TAG
+    mgr = _github_manager(tmp_config, RELEASES_2026_08_18)
+    mgr.set_active(TAG)
+
+    status = await mgr.check_update()
+
+    assert status["skipped"] == []  # every probed tag had an asset
+    assert status["filtered"]["examined"] == 4
+    assert status["filtered"]["reasons"] == {SKIP_PRERELEASE: 1}
+    assert status["filter_summary"] == (
+        "checked 4 releases; 1 filtered (1 prerelease non-build tag)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_check_update_says_every_release_was_filtered_rather_than_nothing(
+    tmp_config: Config,
+) -> None:
+    """The blackout as a user would have met it: nothing offered, and why."""
+    tmp_config.engine.allow_source_build = False
+    mgr = _github_manager(tmp_config, [_release(f"v0.{index}.0") for index in range(4)])
+    mgr.set_active(TAG)
+
+    status = await mgr.check_update()
+
+    assert status["latest"] is None and status["update_available"] is False
+    assert status["recent"] == []
+    assert status["filter_summary"] == ("checked 4 releases; 4 filtered (4 non-bNNNN tags)")
 
 
 @pytest.mark.asyncio
@@ -1400,6 +2176,169 @@ async def test_capabilities_route_uses_check_update(
     assert "v0.1.2" not in update["recent"]
 
 
+# ---------------------------------------------------------------------------
+# D49-4/5/10 at the REST surface
+# ---------------------------------------------------------------------------
+
+
+def _engine_state(config: Config, manager: Any, records: Any = ()) -> Any:
+    return type(
+        "State",
+        (),
+        {
+            "config": config,
+            "engine_manager": manager,
+            "registry": SimpleNamespace(all=lambda: list(records)),
+        },
+    )()
+
+
+def _stub_capture(manager: EngineManager, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_capture(binary: Path, args: Any) -> tuple[int, str]:
+        return 0, SAMPLE_HELP
+
+    monkeypatch.setattr(manager, "_capture", fake_capture)
+
+
+@pytest.mark.asyncio
+async def test_engine_status_reports_drift_only_when_the_pin_and_the_active_build_differ(
+    tmp_config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``active.json`` wins at load time, so a lone pin edit changes nothing.
+
+    Before D49-5 that disagreement was a boot-time log line and nothing else:
+    ``PATCH /api/config`` with a new ``engine.pinned_tag`` returned 200 and the
+    box kept running the old build, with no surface saying so.
+    """
+    from studioforge.api import mgmt_routes
+
+    tmp_config.engine.pinned_tag = TAG
+    mgr = EngineManager(tmp_config, probe=StubProbe(MIXED_GPUS, (13, 3)))
+    _fake_engine(mgr.engines_dir, TAG, 1_000)
+    _fake_engine(mgr.engines_dir, "b10549", 2_000)
+    _stub_capture(mgr, monkeypatch)
+    request = _FakeRequest(_engine_state(tmp_config, mgr))
+
+    mgr.set_active(TAG)
+    assert (await mgmt_routes.engine_status(request))["drift"] is None
+
+    mgr.set_active("b10549")
+    payload = await mgmt_routes.engine_status(request)
+    assert payload["drift"] == {"pinned": TAG, "active": "b10549"}
+    assert payload["pinned_tag"] == TAG
+    assert payload["active"]["tag"] == "b10549"
+
+
+@pytest.mark.asyncio
+async def test_engine_status_carries_the_install_progress_snapshot(
+    manager: EngineManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ~600 MB download is otherwise a blind wait for a REST caller (D49-10).
+
+    Read with ``getattr`` on purpose -- the Dashboard polls this route on a
+    timer, so a manager that has never run an install in this process must
+    report nothing rather than fail.
+    """
+    from studioforge.api import mgmt_routes
+
+    request = _FakeRequest(_engine_state(manager.config, manager))
+    assert (await mgmt_routes.engine_status(request))["install_progress"] is None
+
+    _stub_prebuilt(manager, monkeypatch)
+    await manager.install(TAG)
+
+    progress = (await mgmt_routes.engine_status(request))["install_progress"]
+    assert progress["tag"] == TAG
+    assert progress["done"] is True and progress["error"] is None
+
+    # A manager without the attribute at all degrades to null, not a 500.
+    bare = SimpleNamespace(active=lambda: None, installed=list)
+    blank = await mgmt_routes.engine_status(_FakeRequest(_engine_state(manager.config, bare)))
+    assert blank["install_progress"] is None
+
+
+@pytest.mark.asyncio
+async def test_the_install_route_does_not_activate_unless_asked(
+    manager: EngineManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``activate`` defaults to False on the wire too (D49-4)."""
+    from studioforge.api import mgmt_routes
+
+    _stub_prebuilt(manager, monkeypatch)
+    request = _FakeRequest(_engine_state(manager.config, manager))
+
+    # Called with the route's own defaults spelled out: reached through FastAPI
+    # these arrive as ``Body(False)``, and the point is the value they carry.
+    payload = await mgmt_routes.engine_install(request, tag=TAG, force=False, activate=False)
+    assert payload["tag"] == TAG
+    assert payload["active"] is False
+    assert not (manager.engines_dir / "active.json").exists()
+
+    reinstalled = await mgmt_routes.engine_install(request, tag=TAG, force=False, activate=True)
+    assert reinstalled["active"] is True
+    assert manager._read_active() == TAG
+
+
+@pytest.mark.asyncio
+async def test_the_activate_route_switches_pins_sweeps_and_names_the_previous_build(
+    manager: EngineManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The three writes D49-5 keeps together, plus the note nobody expects.
+
+    A running llama-server child keeps the build it was launched with, which is
+    the single most-reported surprise about switching engines -- so the route
+    that switches says so in its own response.
+    """
+    from studioforge.api import mgmt_routes
+
+    manager.config.engine.pinned_tag = TAG
+    _fake_engine(manager.engines_dir, TAG, 1_000)
+    _fake_engine(manager.engines_dir, "b10549", 2_000)
+    manager.set_active(TAG)
+    _stub_capture(manager, monkeypatch)
+    records = [
+        _record("vendor/Stale-Q4_K_M", "--draft-max 4"),
+        _record("vendor/Fine-Q4_K_M", "--ctx-size 4096"),
+    ]
+    request = _FakeRequest(_engine_state(manager.config, manager, records))
+
+    payload = await mgmt_routes.engine_activate(request, tag="b10549")
+
+    assert payload["tag"] == "b10549"
+    assert payload["previous"] == TAG
+    assert payload["note"] == mgmt_routes.ENGINE_ACTIVATE_NOTE
+    assert "POST /api/restart/backend" in payload["note"]
+    assert [entry["model_id"] for entry in payload["offenders"]] == ["vendor/Stale-Q4_K_M"]
+    assert "--draft-max" in "; ".join(payload["offenders"][0]["errors"])
+
+    # Both halves are written: the one loads read, and the one a restart reads.
+    assert manager._read_active() == "b10549"
+    assert manager.config.engine.pinned_tag == "b10549"
+    assert "pinned_tag: b10549" in manager.config.config_path.read_text(encoding="utf-8")
+
+    # ...and the drift the pair exists to prevent is gone.
+    assert (await mgmt_routes.engine_status(request))["drift"] is None
+
+
+@pytest.mark.asyncio
+async def test_the_activate_route_refuses_a_build_that_is_not_installed(
+    manager: EngineManager,
+) -> None:
+    """Activation is not an implicit download; the pin must not move either."""
+    from studioforge.api import mgmt_routes
+
+    manager.config.engine.pinned_tag = TAG
+    _fake_engine(manager.engines_dir, TAG, 1_000)
+    manager.set_active(TAG)
+    request = _FakeRequest(_engine_state(manager.config, manager))
+
+    with pytest.raises(EngineError, match="b99999"):
+        await mgmt_routes.engine_activate(request, tag="b99999")
+
+    assert manager._read_active() == TAG
+    assert manager.config.engine.pinned_tag == TAG
+
+
 class _StubCliManager:
     """Records what the CLI asked for; never touches GitHub or the filesystem."""
 
@@ -1423,8 +2362,105 @@ class _StubCliManager:
     async def list_releases(self, limit: int = 30, **_kwargs: Any) -> list[str]:
         return ["b10488", "b10486"]
 
+    last_release_scan: dict[str, Any] | None = {
+        "examined": 100,
+        "kept": 26,
+        "skipped": 74,
+        "pages": 1,
+        "reasons": {SKIP_PRERELEASE: 71, SKIP_TAG_SCHEME: 3},
+    }
 
-def _cli(monkeypatch: pytest.MonkeyPatch, tmp_config: Config, *args: str) -> Any:
+
+class _EngineCliManager:
+    """A CLI double that writes the one file the ordering argument is about.
+
+    ``active.json`` is written by :meth:`activate` and by an ``activate=True``
+    install, and by nothing else -- exactly as the real manager behaves since
+    D49-4. That is what lets a test assert what ``engine --update`` *left
+    behind* rather than what it printed, which is the whole point: the old code
+    printed "keeping b10425" over an ``active.json`` that already said b10488.
+    """
+
+    calls: list[str] = []
+    smoke_ok: bool = True
+    offenders: list[dict[str, Any]] = []
+
+    def __init__(self, config: Any, **_kwargs: Any) -> None:
+        self.config = config
+
+    # --- helpers ---------------------------------------------------------
+
+    def _write_active(self, tag: str) -> None:
+        self.config.engines_dir.mkdir(parents=True, exist_ok=True)
+        (self.config.engines_dir / "active.json").write_text(
+            json.dumps({"tag": tag}), encoding="utf-8"
+        )
+
+    @staticmethod
+    def _info(tag: str, *, active: bool) -> Any:
+        return SimpleNamespace(
+            tag=tag,
+            variant="cuda-13.3",
+            path=Path("engines") / tag,
+            active=active,
+            smoke_tested=True,
+        )
+
+    # --- the manager surface the CLI uses --------------------------------
+
+    async def check_update(self, *, limit: int = 5, probe_assets: int = 3) -> dict[str, Any]:
+        type(self).calls.append(f"check_update(limit={limit})")
+        return {
+            "checked": True,
+            "current": TAG,
+            "latest": "b10488",
+            "update_available": True,
+            "recent": ["b10488"],
+            "latest_variant": "cuda-13.3",
+            "skipped": [],
+            "filtered": {},
+            "filter_summary": "checked 10 releases",
+        }
+
+    async def install(self, tag: str, *, activate: bool = False, **_kwargs: Any) -> Any:
+        type(self).calls.append(f"install({tag}, activate={activate})")
+        if activate:
+            self._write_active(tag)
+        return self._info(tag, active=activate)
+
+    async def smoke_test(self, tag: str, **_kwargs: Any) -> tuple[bool, str]:
+        type(self).calls.append(f"smoke_test({tag})")
+        return type(self).smoke_ok, f"micro-load detail for {tag}"
+
+    async def activate(self, tag: str) -> Any:
+        type(self).calls.append(f"activate({tag})")
+        self._write_active(tag)
+        return self._info(tag, active=True)
+
+    async def revalidate_extra_flags(self, tag: str, records: Any) -> list[dict[str, Any]]:
+        type(self).calls.append(f"revalidate_extra_flags({tag})")
+        return list(type(self).offenders)
+
+    async def ensure_engine(self) -> Any:
+        return self._info(TAG, active=True)
+
+    def installed(self) -> list[Any]:
+        return []
+
+
+def _active_tag(config: Config) -> str | None:
+    path = config.engines_dir / "active.json"
+    if not path.is_file():
+        return None
+    return str(json.loads(path.read_text(encoding="utf-8"))["tag"])
+
+
+def _cli(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_config: Config,
+    *args: str,
+    manager_cls: type[Any] = _StubCliManager,
+) -> Any:
     """Invoke the real CLI with the config load and the manager stubbed out.
 
     ``_load`` is replaced rather than pointed at a temp file because it also
@@ -1436,8 +2472,9 @@ def _cli(monkeypatch: pytest.MonkeyPatch, tmp_config: Config, *args: str) -> Any
     from studioforge.core import engine as engine_module
 
     _StubCliManager.calls = []
+    _EngineCliManager.calls = []
     monkeypatch.setattr(main_cli, "_load", lambda _path: tmp_config)
-    monkeypatch.setattr(engine_module, "EngineManager", _StubCliManager)
+    monkeypatch.setattr(engine_module, "EngineManager", manager_cls)
     return CliRunner().invoke(main_cli.app, list(args), catch_exceptions=False)
 
 
@@ -1453,14 +2490,146 @@ def test_cli_engine_check_reports_the_verified_tag(
     assert "skipped b10490" in result.output
 
 
-def test_cli_engine_list_says_prereleases_are_hidden(
+def test_cli_engine_list_says_what_the_filter_actually_drops(
     monkeypatch: pytest.MonkeyPatch, tmp_config: Config
 ) -> None:
+    """The sentence under the list is now true, and counted (D49-1/D49-3).
+
+    It used to read "prereleases and non-bNNNN tags are hidden", which on
+    2026-08-28 was a claim defending a blackout of 120 build releases. The tag
+    scheme is the filter that means anything, and the counts say how much the
+    list differs from GitHub's front page.
+    """
     result = _cli(monkeypatch, tmp_config, "engine", "--list")
     assert result.exit_code == 0
     assert "b10488 b10486" in result.output
-    # A list that silently differs from GitHub's front page needs to say so.
-    assert "prereleases" in result.output
+    assert "checked 100 releases; 74 filtered" in result.output
+    assert "prereleases are NOT" in result.output
+    assert "drafts and non-bNNNN tags are hidden" in result.output
+
+
+# ---------------------------------------------------------------------------
+# D49-4/5/6 at the CLI: install, smoke-test, and only then activate
+# ---------------------------------------------------------------------------
+
+
+def test_cli_engine_update_keeps_the_current_engine_when_the_smoke_test_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_config: Config
+) -> None:
+    """The message and the filesystem finally agree.
+
+    ``install()`` used to activate unconditionally and the smoke test ran
+    afterwards, so this branch printed "keeping b10425" while ``active.json``
+    already said b10488 -- the failed build was live and the output said the
+    opposite. The install is now ``activate=False``, so the lie is not
+    expressible.
+    """
+    _EngineCliManager.smoke_ok = False
+    tmp_config.engines_dir.mkdir(parents=True, exist_ok=True)
+    (tmp_config.engines_dir / "active.json").write_text(json.dumps({"tag": TAG}), encoding="utf-8")
+    try:
+        result = _cli(monkeypatch, tmp_config, "engine", "--update", manager_cls=_EngineCliManager)
+    finally:
+        _EngineCliManager.smoke_ok = True
+
+    assert result.exit_code == 1
+    assert _EngineCliManager.calls == [
+        "check_update(limit=10)",
+        "install(b10488, activate=False)",
+        "smoke_test(b10488)",
+    ]
+    assert "activate(b10488)" not in _EngineCliManager.calls
+    assert _active_tag(tmp_config) == TAG, "the failed build must not be live"
+    assert tmp_config.engine.pinned_tag != "b10488"
+    assert "keeping b10425 active" in result.output
+    assert "stays installed but unused" in result.output
+
+
+def test_cli_engine_update_activates_pins_and_sweeps_once_the_smoke_test_passes(
+    monkeypatch: pytest.MonkeyPatch, tmp_config: Config
+) -> None:
+    """The three writes D49-5 keeps together, in the only safe order."""
+    _EngineCliManager.offenders = [
+        {"model_id": "vendor/Stale-Q4_K_M", "errors": ["unknown flag '--draft-max'"]}
+    ]
+    try:
+        result = _cli(monkeypatch, tmp_config, "engine", "--update", manager_cls=_EngineCliManager)
+    finally:
+        _EngineCliManager.offenders = []
+
+    assert result.exit_code == 0
+    assert _EngineCliManager.calls[:5] == [
+        "check_update(limit=10)",
+        "install(b10488, activate=False)",
+        "smoke_test(b10488)",
+        "activate(b10488)",
+        "revalidate_extra_flags(b10488)",
+    ]
+    assert _active_tag(tmp_config) == "b10488"
+    assert tmp_config.engine.pinned_tag == "b10488"
+    # ...and the pin is on disk, so it survives the restart it exists for.
+    assert "pinned_tag: b10488" in tmp_config.config_path.read_text(encoding="utf-8")
+    # The sweep is a warning, never a refusal: llama-server ignores flags it
+    # does not know, which is exactly why it has to be said out loud (D49-6).
+    assert "WARNING vendor/Stale-Q4_K_M" in result.output
+    assert "--draft-max" in result.output
+    assert "Restart engines" in result.output
+
+
+def test_cli_engine_activate_switches_and_pins_an_installed_build(
+    monkeypatch: pytest.MonkeyPatch, tmp_config: Config
+) -> None:
+    """``--activate`` is the half of the split that has no download in it (D49-4)."""
+    result = _cli(
+        monkeypatch, tmp_config, "engine", "--activate", "b10488", manager_cls=_EngineCliManager
+    )
+
+    assert result.exit_code == 0
+    assert _EngineCliManager.calls == [
+        "activate(b10488)",
+        "revalidate_extra_flags(b10488)",
+    ]
+    assert "check_update(limit=10)" not in _EngineCliManager.calls
+    assert _active_tag(tmp_config) == "b10488"
+    assert tmp_config.engine.pinned_tag == "b10488"
+    assert "now active and pinned" in result.output
+
+
+def test_cli_engine_install_leaves_the_active_engine_alone_and_says_so(
+    monkeypatch: pytest.MonkeyPatch, tmp_config: Config
+) -> None:
+    result = _cli(
+        monkeypatch, tmp_config, "engine", "--install", "b10488", manager_cls=_EngineCliManager
+    )
+
+    assert result.exit_code == 0
+    assert _EngineCliManager.calls == ["install(b10488, activate=False)"]
+    assert _active_tag(tmp_config) is None
+    assert "the active engine is unchanged" in result.output
+    assert "engine --activate b10488" in result.output
+
+
+def test_cli_engine_install_can_activate_after_the_install_when_asked(
+    monkeypatch: pytest.MonkeyPatch, tmp_config: Config
+) -> None:
+    result = _cli(
+        monkeypatch,
+        tmp_config,
+        "engine",
+        "--install",
+        "b10488",
+        "--activate-after-install",
+        manager_cls=_EngineCliManager,
+    )
+
+    assert result.exit_code == 0
+    assert _EngineCliManager.calls == [
+        "install(b10488, activate=True)",
+        "activate(b10488)",
+        "revalidate_extra_flags(b10488)",
+    ]
+    assert _active_tag(tmp_config) == "b10488"
+    assert tmp_config.engine.pinned_tag == "b10488"
 
 
 # ---------------------------------------------------------------------------

@@ -135,8 +135,9 @@ are the ones you ask for.
 
 3. Double-click **`launchers\Update StudioForge.bat`** — creates the virtualenv, installs the
    dependencies, then installs the **newest** llama.cpp release that has a build your driver can
-   run, smoke-tests it, and pins to it. A build that fails its smoke test is never pinned. (`b10425`
-   is the build the numbers in these docs were measured on, not necessarily the one you will get.)
+   run, smoke-tests it, and only then activates and pins it. A build that fails its smoke test is
+   installed but never made active (D49). (`b10425` is the build the numbers in these docs were
+   measured on, not necessarily the one you will get.)
 4. Double-click **`launchers\Start StudioForge.bat`**. The control panel opens at
    <http://127.0.0.1:8080> on its **Setup** tab — a checklist with a button for each unmet item.
    (Prefer a notification-area icon that keeps the server alive and restarts it if it crashes?
@@ -319,7 +320,7 @@ desktop shortcut.
 | **StudioForge Tray.bat** | Notification-area icon: starts the server, restarts it if it crashes, start/stop, free VRAM, copy the MCP URL |
 | **Open StudioForge GUI.bat** | Opens the control panel of an already-running server |
 | **StudioForge Autostart.bat** | Turns "start when I log in" on or off (tray, or server only) |
-| **Update StudioForge.bat** | Pulls code (if a git remote exists), syncs dependencies, updates the llama.cpp engine, verifies |
+| **Update StudioForge.bat** | Pulls code (if a git remote exists), syncs dependencies, then installs the newest llama.cpp engine, smoke-tests it, and activates and pins it **only if that passed**; rescans the library. Skips the engine step entirely while a server is answering on `:1234`, since it would overwrite binaries the loaded models are executing — use the panel or `POST /api/engine/install` + `/api/engine/activate` instead |
 
 The same from a terminal, on any platform: `studioforge serve --open`, `studioforge gui`,
 `studioforge scan`, `studioforge config`, `studioforge engine --check | --update`,

@@ -107,6 +107,75 @@ device of the list and the planner charges it there; a persistent overrun on one
 charge is too small for it -- raise `planner.headroom_fraction` a little, or pin `device_override`
 with the roomier card last.
 
+## The engine: updates, activation and drift
+
+**"Check for update" finds nothing.** It now tells you which kind of nothing it is. Both the panel
+and `studioforge engine --check` print a counted line under the answer — *"checked 100 releases; 74
+filtered (71 prerelease non-build tags, 3 non-bNNNN tags)"* — and `check_update`'s payload carries
+the same as `filter_summary` (plus the raw counts in `filtered`). Read it as:
+
+| The line says | What it means | Action |
+| --- | --- | --- |
+| `checked N releases` with no `filtered` clause, and no newer tag | you really are on the newest build | none |
+| most of `N` filtered as **non-bNNNN tags** | upstream's front page is version tags, not builds | none — the builds are further down; the walk pages up to 300 releases |
+| `0 releases` checked | the list call itself came back empty | check network, then the rate-limit case below |
+| a newer tag appears in `skipped` with *"no asset for win/x64 ... compatible with this driver"* | the build exists but ships nothing this driver can run | update the NVIDIA driver, or pin `engine.cuda_variant` lower |
+
+Before D49 this was the *only* symptom of a real blackout: on 2026-08-28 upstream began flagging
+every `bNNNN` build release as a prerelease, the filter dropped all of them, and every surface
+reported "already on the newest release" while 120 newer builds existed. The prerelease flag is no
+longer a filter, and the counts exist so the same failure cannot be silent twice.
+
+**`GitHub's API rate limit is exhausted`** — unauthenticated calls get 60 per hour per IP and one
+update check spends about six. The message names the reset time. Set `GITHUB_TOKEN` or `GH_TOKEN` to
+a personal access token (no scopes needed for a public repository) and restart; that raises it to
+5000/hour.
+
+**The pin and the active engine disagree** (`pin b10425 · active b10549` on the engine card, or
+`drift` non-null in `GET /api/engine`). `active.json` is read **before** `engine.pinned_tag`, so the
+active build is what every new load gets and editing the pin on its own — Setup tab, `PATCH
+/api/config`, `config.yaml` — changes nothing at all. It is not an error state; it just means the
+two were written separately. Settle it by activating the build you actually want, which writes
+both:
+
+* GUI: **activate + reload** on that tag (Setup or Server tab);
+* REST: `POST /api/engine/activate {"tag": "b10549"}`;
+* CLI: `studioforge engine --activate b10549`.
+
+**Rolling an engine back** is the same move onto an older installed tag — not "set the pinned tag
+back", which does nothing (this corrects D3's original update procedure; see D49). The previous
+directory is still under `engines/`; bare `studioforge engine`, `GET /api/engine` and the engine
+card each list what is installed (`studioforge engine --list` is the other question — which tags
+GitHub offers). Then **Dashboard → Restart engines** (`POST /api/restart/backend`), because every
+`llama-server` child keeps the build it was launched with until it is reloaded.
+
+**"Installed, but the engine did not change."** Since D49-4 that is correct: `POST
+/api/engine/install`, the panel's **Install** button and `studioforge engine --install` unpack a
+build and leave the live engine alone. Activate it as a second, deliberate step. `engine --update`
+still does the whole thing — install, smoke-test, then activate and pin **only if the test passed**
+— and its failure message ("`b10549` stays installed but unused") is now true, where it used to say
+"keeping b10425" with `active.json` already pointing at the build that had just failed.
+
+**A model's flags stopped working after an engine switch.** Activation re-validates every saved
+`extra_flags` string against the new build and warns per model (`offenders` in the activate
+response, a toast in the GUI, a WARNING from `engine --update`/`--activate`). llama.cpp renames and
+removes flags between builds and llama-server *ignores* what it does not recognise, so this is
+otherwise invisible — the model loads, just without the setting (D2, D49-6). Fix them in the Models
+tab; `POST /api/engine/validate-flags` checks a string or a list against any tag and needs no
+credential.
+
+**An install refuses with "in use" or "not enough disk space".** Both are new refusals, and both are
+conservative. A re-download over a tag whose binary a loaded model is executing is refused naming
+those models — unload them (or restart the backend) first; `force=true` does not override it,
+because the failure it prevents is a half-overwritten live engine directory. The disk precheck wants
+roughly 2.5× the asset (~1.5 GB free for a ~600 MB zip) and stays silent when the volume cannot be
+measured rather than blocking on an unknown.
+
+**`launchers\Update StudioForge.bat` skipped the engine step.** By design: it probes
+`http://127.0.0.1:1234/health` and refuses to rewrite `engines/` under a running server. Use the GUI
+or the REST pair, or stop the server and re-run it. It probes the **default** port only — a server
+moved off `1234` is not detected, so stop it yourself.
+
 ## VRAM is held and nothing is loaded
 
 `GET /api/vram/holders` (or the Dashboard's VRAM holders panel) names every process on every

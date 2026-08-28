@@ -55,6 +55,37 @@ upload order. An sdist sitting beside the release zip could therefore be handed 
 release tree. The sdist is built and hashed, but it ships inside the zip's `dist/` directory rather
 than as its own asset.
 
+## Bumping the shipped engine pin
+
+`engine.pinned_tag` ships as `b10425` — the llama.cpp build every number in these docs was measured
+against (D2). Moving it is a deliberate release decision, not housekeeping: it changes what a fresh
+install downloads on first run, and the flag surface it validates expert settings against.
+
+When you do move it, **regenerate the capabilities snapshot in the same commit**:
+
+```bash
+python scripts/refresh_engine_capabilities.py b10549 --dry-run   # see what would change
+python scripts/refresh_engine_capabilities.py b10549
+```
+
+`src/studioforge/data/engine_capabilities.json` is the architecture / ftype / ggml-type list behind
+`studioforge capabilities` and the Setup tab's library summary, and it is a **snapshot taken at one
+tag**. The script shallow-clones `ggml-org/llama.cpp` at the tag (`git clone --branch <tag>
+--depth 1`, so it needs `git` and network), runs the same `extract_from_checkout` parser the live
+report uses — a second parser here would drift — and rewrites the file with `source_tag` set. It
+touches exactly that one file and prints a diff summary. `--checkout <path>` reuses a tree you
+already have, if you are sure it is at the right tag.
+
+Leaving it stale is not fatal, and since D49-8 it is not a lie either: when `source_tag` is not the
+running engine's tag, an unrecognised architecture is reported as *unknown to the architecture list
+from `<tag>`* rather than as unsupported by the engine. The cost of not regenerating is therefore a
+weaker answer, not a wrong one — but a release that bumps the pin and ships a snapshot from the
+previous one has given up a verdict for no reason.
+
+Then update the four places the tag is quoted as an example: `config.example.yaml`, the README
+quickstart note, `docs/SETUP.md`'s headless YAML, and D2 in `DECISIONS.md` if the measurements were
+redone.
+
 ## Building the same assets by hand
 
 ```bash
