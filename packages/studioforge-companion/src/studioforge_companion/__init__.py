@@ -10,6 +10,6 @@ Nothing here imports ``studioforge``.
 
 from __future__ import annotations
 
-__version__ = "1.26-08-23"
+__version__ = "1.26-08-28"
 
 __all__ = ["__version__"]
