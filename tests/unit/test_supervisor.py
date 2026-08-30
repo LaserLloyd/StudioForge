@@ -16,16 +16,20 @@ One live test exercises the real ``llama-server.exe`` when it is installed.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import os
 import socket
 import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
+from types import SimpleNamespace
 
 import psutil
 import pytest
 
 from studioforge.config import Config
+from studioforge.core import supervisor as supervisor_module
+from studioforge.core.engine import EngineFeatures
 from studioforge.core.supervisor import (
     ALL_GPU_LAYERS,
     CPU_OFFLOAD_FLAGS,
@@ -1207,6 +1211,203 @@ async def test_unlaunchable_binary_raises_model_load_error(config: Config, tmp_p
     assert "Could not launch llama-server" in excinfo.value.message
     assert supervisor.get("qwen2.5-7b") is None
     await supervisor.aclose()
+
+
+# ---------------------------------------------------------------------------
+# What a child was actually launched with (D50)
+# ---------------------------------------------------------------------------
+
+
+async def test_a_child_records_the_engine_it_was_actually_launched_with(
+    config: Config, tmp_path: Path, fake_binary: Path
+) -> None:
+    """``engine_tag`` on its own could not answer "is this resident already on
+    the build I just activated?": it holds the per-model *pin*, and almost every
+    load pins nothing. The 2026-08-30 log said ``engine_tag=None`` on both halves
+    of a double reload, so no layer could skip the redundant half."""
+    supervisor = Supervisor(
+        config,
+        resolve_binary=resolver(fake_binary),
+        resolve_engine_tag=lambda tag: tag or "b10689",
+        launch_prefix=[sys.executable, "-u"],
+    )
+    try:
+        info = await supervisor.start(make_record(tmp_path), make_plan())
+        assert info.engine_tag is None, "the request: this model pins nothing"
+        assert info.resolved_engine_tag == "b10689", "the build it is really running"
+    finally:
+        await supervisor.aclose()
+
+
+async def test_a_pinned_model_keeps_both_the_pin_and_the_build(
+    config: Config, tmp_path: Path, fake_binary: Path
+) -> None:
+    supervisor = Supervisor(
+        config,
+        resolve_binary=resolver(fake_binary),
+        resolve_engine_tag=lambda tag: tag or "b10689",
+        launch_prefix=[sys.executable, "-u"],
+    )
+    record = make_record(tmp_path, settings=ModelSettings(engine_tag="b10425"))
+    try:
+        info = await supervisor.start(record, make_plan())
+        assert info.engine_tag == "b10425"
+        assert info.resolved_engine_tag == "b10425"
+    finally:
+        await supervisor.aclose()
+
+
+async def test_every_deliberate_start_gets_a_higher_launch_number(
+    config: Config, tmp_path: Path, fake_binary: Path
+) -> None:
+    """It is what lets a forced reload queued behind an identical one prove the
+    child serving now is newer than its own request."""
+    supervisor = fake_sup(config, fake_binary)
+    record = make_record(tmp_path)
+    try:
+        first = (await supervisor.start(record, make_plan())).spawn_seq
+        await supervisor.stop(record.id)
+        second = (await supervisor.start(record, make_plan())).spawn_seq
+        other = make_record(tmp_path, "model-b")
+        third = (await supervisor.start(other, make_plan("model-b"))).spawn_seq
+    finally:
+        await supervisor.aclose()
+
+    assert first >= 1
+    assert second > first, "a restart is a new child"
+    assert third > second, "the counter is machine-wide, not per model"
+
+
+async def test_the_ready_line_names_the_build_and_the_launch_number(
+    config: Config, tmp_path: Path, fake_binary: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``model_ready`` is what a log review reads. It has to say which build the
+    child is on, and it must not report a pin nobody asked for."""
+    supervisor = Supervisor(
+        config,
+        resolve_binary=resolver(fake_binary),
+        resolve_engine_tag=lambda tag: tag or "b10689",
+        launch_prefix=[sys.executable, "-u"],
+    )
+    lines: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        supervisor_module,
+        "log",
+        SimpleNamespace(
+            info=lambda event, **fields: lines.append((event, fields)),
+            warning=lambda *_a, **_kw: None,
+            debug=lambda *_a, **_kw: None,
+            error=lambda *_a, **_kw: None,
+        ),
+    )
+    try:
+        await supervisor.start(make_record(tmp_path), make_plan(), source="gui")
+    finally:
+        await supervisor.aclose()
+
+    ready = next(fields for event, fields in lines if event == "model_ready")
+    assert ready["engine_tag"] == "b10689"
+    assert ready["spawn_seq"] == 1
+    assert ready["source"] == "gui"
+    assert "pinned_engine_tag" not in ready, "an unpinned model has no pin to report"
+
+
+async def test_the_ready_line_shows_a_real_pin_beside_the_build(
+    config: Config, tmp_path: Path, fake_binary: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = Supervisor(
+        config,
+        resolve_binary=resolver(fake_binary),
+        resolve_engine_tag=lambda tag: tag or "b10689",
+        launch_prefix=[sys.executable, "-u"],
+    )
+    lines: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        supervisor_module,
+        "log",
+        SimpleNamespace(
+            info=lambda event, **fields: lines.append((event, fields)),
+            warning=lambda *_a, **_kw: None,
+            debug=lambda *_a, **_kw: None,
+            error=lambda *_a, **_kw: None,
+        ),
+    )
+    record = make_record(tmp_path, settings=ModelSettings(engine_tag="b10425"))
+    try:
+        await supervisor.start(record, make_plan())
+    finally:
+        await supervisor.aclose()
+
+    ready = next(fields for event, fields in lines if event == "model_ready")
+    assert ready["engine_tag"] == "b10425"
+    assert ready["pinned_engine_tag"] == "b10425"
+
+
+def cache_ram_engine(_tag: str | None) -> EngineFeatures:
+    """An engine that advertises ``--cache-ram`` and nothing else new."""
+    return dataclasses.replace(EngineFeatures.unknown("b10689"), cache_ram=True)
+
+
+async def test_a_child_records_the_host_cache_it_was_granted(
+    config: Config, tmp_path: Path, fake_binary: Path
+) -> None:
+    """So ``GET /api/models`` can show who holds what out of the shared pool --
+    a pool nobody can see the shares of is unauditable. A reload re-grants for
+    free: the outgoing child is stopped, and out of the instance table, before
+    its replacement spawns."""
+    config.engine.cache_ram_mb = 6144
+    supervisor = Supervisor(
+        config,
+        resolve_binary=resolver(fake_binary),
+        launch_prefix=[sys.executable, "-u"],
+        engine_features=cache_ram_engine,
+    )
+    record = make_record(tmp_path)
+    try:
+        info = await supervisor.start(record, make_plan())
+        assert info.cache_ram_mib == 6144
+        await supervisor.stop(record.id)
+        again = await supervisor.start(record, make_plan())
+        assert again.cache_ram_mib == 6144, "the stopped child is not still holding a share"
+    finally:
+        await supervisor.aclose()
+
+
+async def test_the_second_resident_shares_the_automatic_pool_rather_than_repeating_it(
+    config: Config, tmp_path: Path, fake_binary: Path
+) -> None:
+    """The pre-D50 reading handed the full 25%-of-RAM allowance to every child,
+    so N residents promised N times a cap whose comment said it could never make
+    the box swap."""
+    supervisor = Supervisor(
+        config,
+        resolve_binary=resolver(fake_binary),
+        launch_prefix=[sys.executable, "-u"],
+        engine_features=cache_ram_engine,
+    )
+    try:
+        first = await supervisor.start(make_record(tmp_path), make_plan())
+        second = await supervisor.start(make_record(tmp_path, "model-b"), make_plan("model-b"))
+        assert first.cache_ram_mib is not None and second.cache_ram_mib is not None
+        assert first.cache_ram_mib > second.cache_ram_mib, "the pool was already claimed"
+    finally:
+        await supervisor.aclose()
+
+
+async def test_no_grant_is_recorded_when_the_engine_has_no_such_flag(
+    config: Config, tmp_path: Path, fake_binary: Path
+) -> None:
+    """A grant nobody spends is a phantom holding down everybody else's share.
+
+    The fake engine advertises nothing (``features_for`` cannot read a --help
+    out of it), which is exactly the "engine does not offer --cache-ram" case.
+    """
+    supervisor = fake_sup(config, fake_binary)
+    try:
+        info = await supervisor.start(make_record(tmp_path), make_plan())
+        assert info.cache_ram_mib is None
+    finally:
+        await supervisor.aclose()
 
 
 # ---------------------------------------------------------------------------

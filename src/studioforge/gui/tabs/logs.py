@@ -13,7 +13,7 @@ from typing import Any
 from nicegui import ui
 
 from studioforge.gui import state as st
-from studioforge.gui.tabs import GuiContext, run_blocking
+from studioforge.gui.tabs import GuiContext, element_alive, run_blocking
 
 SERVER_SOURCE = "StudioForge server"
 LEVELS = ("ALL", "DEBUG", "INFO", "WARNING", "ERROR")
@@ -50,6 +50,12 @@ def render(ctx: GuiContext) -> None:
     async def refresh() -> None:
         # Driven by the Follow timer, so a panel_guard card would stack one per
         # tick forever. Report staleness in place and keep the last good body.
+        #
+        # D50: the staleness label belongs to the same panel as the body, so the
+        # liveness check goes here rather than only inside -- writing "log view
+        # is stale" into a page that no longer exists helps nobody.
+        if not element_alive(body):
+            return
         try:
             await _refresh_once()
         except Exception as exc:  # noqa: BLE001 - a poll must never kill the tab
@@ -58,27 +64,34 @@ def render(ctx: GuiContext) -> None:
         stale.set_text("")
 
     async def _refresh_once() -> None:
-        if True:
-            lines = int(count.value or 200)
-            if source.value == SERVER_SOURCE:
-                from studioforge.logging import RING_BUFFER
+        # D50: a timer body that awaits file I/O, so the page can be rebuilt
+        # underneath it mid-tick. Checked on entry (cheap, and this is also
+        # reached from the source/level pickers) and again after the awaits,
+        # because that is the window that actually opens.
+        if not element_alive(body):
+            return
+        lines = int(count.value or 200)
+        if source.value == SERVER_SOURCE:
+            from studioforge.logging import RING_BUFFER
 
-                wanted = None if level.value == "ALL" else str(level.value)
-                entries = RING_BUFFER.tail(lines, wanted)
-                path_label.set_text(f"in-memory ring buffer · {len(entries)} line(s)")
-                body.set_text("\n".join(st.log_line_text(entry) for entry in entries) or "(empty)")
-                return
-            model_id = str(source.value)
-            supervisor = ctx.supervisor
-            if supervisor is None:
-                body.set_text("(supervisor unavailable)")
-                return
-            # File I/O off the event loop: a 100k-line log would otherwise stall
-            # every other viewer of the panel.
-            text_lines: list[str] = await run_blocking(supervisor.tail_log, model_id, lines)
-            path: Any = await run_blocking(supervisor.log_path, model_id)
-            path_label.set_text(str(path) if path else "(no log file yet)")
-            body.set_text("\n".join(text_lines) or "(empty)")
+            wanted = None if level.value == "ALL" else str(level.value)
+            entries = RING_BUFFER.tail(lines, wanted)
+            path_label.set_text(f"in-memory ring buffer · {len(entries)} line(s)")
+            body.set_text("\n".join(st.log_line_text(entry) for entry in entries) or "(empty)")
+            return
+        model_id = str(source.value)
+        supervisor = ctx.supervisor
+        if supervisor is None:
+            body.set_text("(supervisor unavailable)")
+            return
+        # File I/O off the event loop: a 100k-line log would otherwise stall
+        # every other viewer of the panel.
+        text_lines: list[str] = await run_blocking(supervisor.tail_log, model_id, lines)
+        path: Any = await run_blocking(supervisor.log_path, model_id)
+        if not element_alive(body):
+            return
+        path_label.set_text(str(path) if path else "(no log file yet)")
+        body.set_text("\n".join(text_lines) or "(empty)")
 
     async def tick() -> None:
         if follow.value:

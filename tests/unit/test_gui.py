@@ -3370,3 +3370,429 @@ async def test_the_gate_closes_a_cross_site_websocket_even_without_a_key(config:
     )
     await gate(same_site, receive, send)
     assert reached["inner"] is True
+
+
+# ---------------------------------------------------------------------------
+# D50: one long action at a time, and a panel that can tell it is dead
+#
+# The 2026-08-30 log review: "activate + reload" fired twice 118 ms apart (an
+# ordinary double-click), both runs proceeded, every resident was force-reloaded
+# twice, and a 37 GB model was killed 3.6 s after it reported ready.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def tab_notifications(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, dict[str, Any]]]:
+    """Capture ``ui.notify`` from :mod:`studioforge.gui.tabs` without a browser.
+
+    Only that module's name is replaced, so nothing else in the GUI is affected
+    and the guard under test keeps its real notification call.
+    """
+    from types import SimpleNamespace
+
+    from studioforge.gui import tabs
+
+    captured: list[tuple[str, dict[str, Any]]] = []
+
+    def notify(message: Any, **kwargs: Any) -> None:
+        captured.append((str(message), kwargs))
+
+    monkeypatch.setattr(tabs, "ui", SimpleNamespace(notify=notify))
+    return captured
+
+
+def test_single_flight_ignores_a_second_run_and_says_so(
+    tab_notifications: list[tuple[str, dict[str, Any]]],
+) -> None:
+    """The double-click case: the second run must do nothing, visibly."""
+    from studioforge.gui.tabs import single_flight
+
+    with single_flight("engine.activate", "engine activation") as first:
+        assert first is True
+        with single_flight("engine.activate", "engine activation") as second:
+            assert second is False
+
+    assert len(tab_notifications) == 1
+    message, kwargs = tab_notifications[0]
+    assert message.startswith("engine activation is already running")
+    assert "ignored" in message
+    assert kwargs["type"] == "warning"
+
+    # ...and the key is free again once the first run finishes.
+    with single_flight("engine.activate", "engine activation") as third:
+        assert third is True
+    assert len(tab_notifications) == 1
+
+
+def test_single_flight_releases_its_key_when_the_action_raises(
+    tab_notifications: list[tuple[str, dict[str, Any]]],
+) -> None:
+    """A failed activation must not wedge the button for the life of the process."""
+    from studioforge.gui.tabs import single_flight
+
+    with pytest.raises(RuntimeError), single_flight("engine.install", "engine install") as claimed:
+        assert claimed is True
+        raise RuntimeError("download failed")
+
+    with single_flight("engine.install", "engine install") as again:
+        assert again is True
+    assert tab_notifications == []
+
+
+def test_single_flight_keys_are_independent_per_model(
+    tab_notifications: list[tuple[str, dict[str, Any]]],
+) -> None:
+    """Restarting a *different* model while one restarts is legitimate."""
+    from studioforge.gui.tabs import single_flight
+
+    with single_flight("models.restart:a", "restart of a") as first:
+        assert first is True
+        with single_flight("models.restart:b", "restart of b") as other:
+            assert other is True
+        with single_flight("models.restart:a", "restart of a") as same:
+            assert same is False
+
+    assert len(tab_notifications) == 1
+    assert tab_notifications[0][0].startswith("restart of a is already running")
+
+
+def test_every_long_gui_action_claims_a_single_flight_key() -> None:
+    """Static guard: the list of actions D50 covers, pinned to the source.
+
+    Written as an inspection because these handlers each take a live manager, a
+    supervisor and a browser to drive, and the thing worth pinning is simply
+    that none of them lost its guard.
+    """
+    import inspect
+
+    from studioforge.gui.tabs import dashboard, server
+
+    for func in (
+        server.activate_engine,
+        server.install_engine,
+        server.smoke_engine,
+        dashboard._restart_engines,
+        dashboard._restart_model,
+        dashboard._unload_one,
+        dashboard._unload_all_dialog,
+        dashboard._restart_server_dialog,
+    ):
+        assert "single_flight(" in inspect.getsource(func), f"{func.__name__} lost its guard"
+
+    # Per-model actions key on the model, or restarting one model would block
+    # every other model's button.
+    assert 'single_flight(f"models.restart:{model_id}"' in inspect.getsource(
+        dashboard._restart_model
+    )
+    assert 'single_flight(f"models.unload:{model_id}"' in inspect.getsource(dashboard._unload_one)
+
+
+# ---------------------------------------------------------------------------
+# D50: "activate + reload" stops hand-rolling the reload
+# ---------------------------------------------------------------------------
+
+
+def _code_of(func: Any) -> str:
+    """A function's source with its docstring dropped.
+
+    These guards assert on what the code *does*, and a docstring that names the
+    implementation it replaced would otherwise trip them.
+    """
+    import inspect
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
+    body = list(tree.body[0].body)  # type: ignore[attr-defined]
+    if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+        body = body[1:]
+    return "\n".join(ast.unparse(node) for node in body)
+
+
+def test_activate_engine_delegates_the_reload_to_the_restart_handler() -> None:
+    """The GUI's third copy of "restart the backend" is gone.
+
+    It aborted on the first failure, reloaded children that were already on the
+    build being activated, and was free to drift from the route and the manager.
+    """
+    from studioforge.gui.tabs import server as server_tab
+
+    code = _code_of(server_tab.activate_engine)
+    assert "restart_backend(api_request(ctx), only_stale_engine=True)" in code
+    # The hand-rolled loop and its abort-on-first-failure semantics.
+    assert "force=True" not in code
+    assert "for model_id in loaded" not in code
+    assert "engine_adopt_note(" in code
+
+
+def test_engine_adopt_note_names_what_moved_what_did_not_and_what_failed() -> None:
+    restarted = st.engine_adopt_note("b10673", {"restarted": ["a", "b"], "failed": []})
+    assert "b10673 is now the active engine" in restarted
+    assert "reloaded 2 model(s) onto it: a, b" in restarted
+
+    # The idempotent second click: everything was already current, and saying
+    # "nothing" would read as a failure and invite a third press.
+    idempotent = st.engine_adopt_note(
+        "b10673",
+        {
+            "restarted": [],
+            "skipped": [
+                {"model_id": "a", "engine_tag": "b10673", "reason": "already on the active engine"},
+                {"model_id": "b", "engine_tag": "b10673", "reason": "already on the active engine"},
+            ],
+            "failed": [],
+        },
+    )
+    assert "2 already on the active engine: a, b" in idempotent
+
+    # A partial failure has to name the models it did not reach.
+    mixed = st.engine_adopt_note(
+        "b10673",
+        {
+            "restarted": ["a"],
+            "skipped": [{"model_id": "b", "engine_tag": None, "reason": "loading"}],
+            "failed": [{"model_id": "c", "error": "out of VRAM"}],
+        },
+    )
+    assert "reloaded 1 model(s) onto it: a" in mixed
+    assert "1 still loading, left alone: b" in mixed
+    assert "FAILED c: out of VRAM" in mixed
+
+    empty = st.engine_adopt_note("b10673", {"restarted": [], "skipped": [], "failed": []})
+    assert "nothing was loaded" in empty
+    assert "b10673 is now the active engine" in st.engine_adopt_note("b10673", None)
+
+
+def test_restart_backend_note_reports_skips_rather_than_claiming_an_empty_box() -> None:
+    """ "Neither restarted nor failed" is no longer the same as "nothing loaded"."""
+    everything_current = st.restart_backend_note(
+        {
+            "restarted": [],
+            "skipped": [{"model_id": "a", "reason": "already on the active engine"}],
+            "failed": [],
+        }
+    )
+    assert "no models are loaded" not in everything_current
+    assert "1 already on the active engine: a" in everything_current
+
+    mid_load = st.restart_backend_note(
+        {"restarted": [], "skipped": [{"model_id": "b", "reason": "loading"}], "failed": []}
+    )
+    assert "1 still loading, left alone: b" in mid_load
+
+    # A reason we have not met still reaches the operator rather than vanishing.
+    unknown = st.restart_backend_note(
+        {"restarted": [], "skipped": [{"model_id": "c", "reason": "quiesced"}], "failed": []}
+    )
+    assert "skipped: c (quiesced)" in unknown
+
+    # ...and a genuinely empty box still says so.
+    assert "no models are loaded" in st.restart_backend_note({"restarted": [], "failed": []})
+    assert "no models are loaded" in st.restart_backend_note(None)
+
+
+def test_already_running_note_says_the_first_run_is_still_working() -> None:
+    note = st.already_running_note("engine activation")
+    assert note.startswith("engine activation is already running")
+    assert "ignored" in note
+    assert "in flight" in note
+
+
+# ---------------------------------------------------------------------------
+# D50: a loading child looks like one
+# ---------------------------------------------------------------------------
+
+
+def test_instance_chip_puts_the_lifecycle_ahead_of_the_slot_activity() -> None:
+    """A 27B mid-spawn rendered "Idle - actual ctx - 0 busy / 0 idle" for ~30 s."""
+    idle_slots = _introspection([{"id": 0, "is_processing": False}])
+
+    loading = InstanceInfo(model_id="m", state="loading")
+    assert st.instance_chip(loading, None) == ("Loading…", "warning")
+    # Even when a stale introspection would have answered "Idle".
+    assert st.instance_chip(loading, idle_slots) == ("Loading…", "warning")
+
+    failed = InstanceInfo(model_id="m", state="failed")
+    assert st.instance_chip(failed, None) == ("Failed", "negative")
+
+    # Everything else falls through to the activity pair, unchanged.
+    ready = InstanceInfo(model_id="m", state="ready")
+    generating = _introspection(
+        [{"id": 0, "is_processing": True, "n_prompt_tokens": 5, "n_decoded": 9}]
+    )
+    assert st.instance_chip(ready, generating) == ("Generating - 9 tokens", "positive")
+    assert st.instance_chip(ready, idle_slots) == ("Idle", "grey")
+    assert st.instance_chip(ready, None) == (st.UNKNOWN, "grey")
+
+
+def test_loaded_count_text_breaks_a_spawn_out_of_the_loaded_count() -> None:
+    ready = InstanceInfo(model_id="a", state="ready")
+    loading = InstanceInfo(model_id="b", state="loading")
+    assert st.loaded_count_text([]) == "0 loaded"
+    assert st.loaded_count_text([ready]) == "1 loaded"
+    assert st.loaded_count_text([ready, loading]) == "1 loaded · 1 loading"
+    assert st.loaded_count_text([loading, loading]) == "0 loaded · 2 loading"
+
+
+def test_the_header_status_line_uses_the_loading_aware_count() -> None:
+    import inspect
+
+    from studioforge.gui import app
+
+    source = inspect.getsource(app._status_line)
+    assert "loaded_count_text(loaded)" in source
+    assert "{len(loaded)} loaded" not in source
+
+
+def test_the_dashboard_card_badges_the_instance_state_not_only_the_activity() -> None:
+    import inspect
+
+    from studioforge.gui.tabs import dashboard
+
+    source = inspect.getsource(dashboard._loaded_card)
+    assert "st.instance_chip(instance, introspection)" in source
+    assert "st.activity_label(introspection)" not in source
+
+
+# ---------------------------------------------------------------------------
+# D50: the per-child engine-drift badge (the other half of D49's pin-vs-active)
+# ---------------------------------------------------------------------------
+
+
+def test_instance_engine_drift_is_silent_unless_both_builds_are_known() -> None:
+    """An unprovable child is not a drifting child.
+
+    ``resolved_engine_tag`` is ``None`` when the build could not be identified,
+    and badging that would put a permanent warning on every row of an install
+    whose engines do not resolve -- which is how a warning stops being read.
+    """
+    assert st.instance_engine_drift(None, "b10673") is None
+    assert st.instance_engine_drift("b10549", None) is None
+    assert st.instance_engine_drift("", "  ") is None
+    assert st.instance_engine_drift("b10673", "b10673") is None
+
+    drift = st.instance_engine_drift("b10549", "b10673")
+    assert drift is not None
+    label, tooltip = drift
+    assert label == "engine b10549"
+    assert "b10549" in tooltip
+    assert "b10673" in tooltip
+    assert "keeps the build it was launched with" in tooltip
+
+
+def test_the_active_engine_tag_never_breaks_a_card() -> None:
+    """Every failure is ``None``: a badge is not worth the panel."""
+    from types import SimpleNamespace
+
+    from studioforge.gui.tabs import GuiContext, dashboard
+
+    class _Boom:
+        def active(self) -> Any:
+            raise RuntimeError("active.json is unreadable")
+
+    def ctx_with(engine_manager: Any) -> GuiContext:
+        return GuiContext(config=Config(), api_state=SimpleNamespace(engine_manager=engine_manager))
+
+    assert dashboard._active_engine_tag(ctx_with(None)) is None
+    assert dashboard._active_engine_tag(ctx_with(_Boom())) is None
+    assert dashboard._active_engine_tag(ctx_with(SimpleNamespace(active=lambda: None))) is None
+    manager = SimpleNamespace(active=lambda: SimpleNamespace(tag="b10673"))
+    assert dashboard._active_engine_tag(ctx_with(manager)) == "b10673"
+
+
+# ---------------------------------------------------------------------------
+# D50: a repaint of a dead panel is not an error
+# ---------------------------------------------------------------------------
+
+
+def test_nicegui_still_exposes_the_deletion_flags_the_guard_reads() -> None:
+    """Pinned because :func:`element_alive` is built on them.
+
+    NiceGUI 3.16 marks every element of a client deleted *before* the weakrefs
+    can die, so the element flag alone covers the disconnected-client case too.
+    """
+    from nicegui.client import Client
+    from nicegui.element import Element
+
+    assert isinstance(Element.is_deleted, property)
+    assert isinstance(Client.is_deleted, property)
+
+
+def test_element_alive_answers_gone_for_anything_it_cannot_verify() -> None:
+    from types import SimpleNamespace
+
+    from studioforge.gui.tabs import element_alive
+
+    live_client = SimpleNamespace(is_deleted=False)
+    assert element_alive(SimpleNamespace(is_deleted=False, client=live_client)) is True
+    assert element_alive(SimpleNamespace(is_deleted=True, client=live_client)) is False
+    assert (
+        element_alive(SimpleNamespace(is_deleted=False, client=SimpleNamespace(is_deleted=True)))
+        is False
+    )
+    assert element_alive(None) is False
+
+    class _ClientGone:
+        is_deleted = False
+
+        @property
+        def client(self) -> Any:
+            raise RuntimeError("The client this element belongs to has been deleted.")
+
+    assert element_alive(_ClientGone()) is False
+
+
+def test_the_repaint_closures_bail_out_on_a_deleted_panel() -> None:
+    """The ``ERROR nicegui - The parent element this slot belongs to has been
+    deleted`` line at 04:20:33 came from one of these repainting after an await.
+    """
+    import inspect
+
+    from studioforge.gui.tabs import dashboard, logs
+    from studioforge.gui.tabs import server as server_tab
+
+    for func in (
+        dashboard._loaded_panel,
+        server_tab._engine_panel,
+        server_tab._capabilities_panel,
+        logs.render,
+    ):
+        assert "element_alive(" in inspect.getsource(func), f"{func.__name__} repaints unguarded"
+
+
+# ---------------------------------------------------------------------------
+# D50: one clock in the Live log
+# ---------------------------------------------------------------------------
+
+
+def test_log_stamp_utc_is_utc_and_shaped_like_structlogs_iso_stamp() -> None:
+    """Timezone-independent by construction: the epoch is read as UTC."""
+    assert st.log_stamp_utc(0) == "1970-01-01T00:00:00Z"
+    assert st.log_stamp_utc(1755178000.5) == "2025-08-14T13:26:40.500000Z"
+    assert st.log_stamp_utc(None) == st.UNKNOWN
+    # The shape the module already recognises as "a line that carries its own
+    # structlog header" -- which is the point: one clock, one format.
+    assert st._RENDERED_LOG_LINE_RE.match(st.log_stamp_utc(1755178000.5))
+    assert st._RENDERED_LOG_LINE_RE.match(st.log_stamp_utc(1755178000))
+
+
+def test_format_timestamp_is_left_on_local_time_for_every_other_surface() -> None:
+    """Only the log views moved; a TTL or a "2 hours ago" is still local."""
+    assert st.format_timestamp(1755178000.5) == time.strftime(
+        "%H:%M:%S", time.localtime(1755178000.5)
+    )
+
+
+def test_log_line_text_stamps_plain_records_in_the_same_clock_as_structlog() -> None:
+    """The Logs tab used to interleave "13:20:33" with "2026-08-30T04:20:33Z"."""
+    text = st.log_line_text(
+        {"ts": 1755178000.5, "level": "ERROR", "logger": "nicegui", "message": "slot deleted"}
+    )
+    assert text.startswith("2025-08-14T13:26:40.500000Z ")
+    assert "ERROR" in text
+    assert "nicegui" in text
+    assert text.endswith("slot deleted")
+
+    # A line that already carries a structlog header still passes straight
+    # through, undecorated.
+    rendered = "2026-08-30T04:20:33.044095Z [error    ] boom [studioforge.core]"
+    assert st.log_line_text({"ts": 1.0, "message": rendered}) == rendered

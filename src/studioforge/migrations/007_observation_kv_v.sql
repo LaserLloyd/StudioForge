@@ -1,0 +1,22 @@
+-- 007_observation_kv_v.sql: the V half of the KV cache type, so one stored
+-- observation can be matched back to the exact plan that produced it.
+--
+-- load_observations recorded kv_cache_type -- the K cache -- and nothing about
+-- V. That was enough for D18/D40 calibration, which never looks at a single
+-- row: it averages actual/predicted across everything clean and moves one
+-- global fraction. D51 does the opposite. It reads ONE row back at plan time
+-- and spends its measured footprint as the estimate, so every knob that moves
+-- the footprint has to be in the key or the measurement is being spent on a
+-- placement it does not describe. K and V are configured independently
+-- (kv_cache_type / kv_cache_type_v) and a q8_0 V cache is about half the V
+-- bytes of an f16 one on every cached layer -- easily gigabytes on a long
+-- context, which is exactly the size of error this feature exists to remove.
+--
+-- Rows written before this migration keep NULL, and NULL is read as "this row
+-- cannot say", not as "it matched". Database.matching_observation therefore
+-- accepts such a row only for a lookup whose V type equals its K type -- the
+-- symmetric case that every default placement produces, and the only one a
+-- pre-007 row is safe to describe -- and skips it for any asymmetric cache.
+-- The alternative, assuming symmetry, would let a K-only row silently license
+-- an estimate for a cache it may never have been measured with.
+ALTER TABLE load_observations ADD COLUMN kv_cache_type_v TEXT;

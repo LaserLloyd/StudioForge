@@ -46,12 +46,22 @@ FlashAttn = Literal["on", "off", "auto"]
 
 #: Ceiling for the automatic host-RAM prompt cache, in MiB. 32 GiB on a 128 GiB
 #: box: big enough to hold many agent prefixes, small enough that the cache can
-#: never be the reason the machine starts swapping.
+#: never be the reason the machine starts swapping. Since D50 this is the size
+#: of a pool the resident children SHARE, not a per-child allowance: the old
+#: reading handed the same 32 GiB to every child, so four residents promised
+#: 128 GiB of a 128 GiB box and the sentence above stopped being true.
 CACHE_RAM_AUTO_MAX_MIB = 32768
 #: Fraction of system RAM the automatic setting will claim.
 CACHE_RAM_AUTO_FRACTION = 0.25
 #: What ``cache_ram_mb: "auto"`` falls back to when system RAM cannot be read.
 CACHE_RAM_AUTO_FALLBACK_MIB = 8192
+#: Floor under one child's share of the automatic pool, in MiB. A grant of 0 is
+#: not "a small cache", it is ``--cache-ram 0``, which turns the host prompt
+#: cache OFF -- and a starved cache still recovers some evicted prefixes, while
+#: no cache recovers none. So the Nth resident onto a full pool gets this rather
+#: than nothing, and the spawn logs a warning with the numbers, because past
+#: that point the pool is an intention rather than a bound.
+CACHE_RAM_MIN_GRANT_MIB = 4096
 
 APP_NAME = "studioforge"
 
@@ -338,8 +348,18 @@ class EngineConfig(BaseModel):
     #: identical VRAM at 8192 and 32768) and is quality-neutral -- it only lets
     #: the engine keep evicted prompt prefixes in system memory instead of
     #: recomputing them, which is exactly the OpenClaw pattern of re-sending a
-    #: long, near-identical agent prompt. ``"auto"`` = 25% of system RAM capped
-    #: at 32 GiB; ``0`` disables it; ``-1`` is the engine's "no limit".
+    #: long, near-identical agent prompt. ``0`` disables it; ``-1`` is the
+    #: engine's "no limit".
+    #:
+    #: The two settings have deliberately different scopes (D50). ``"auto"`` is
+    #: a **machine-wide pool** -- 25% of system RAM capped at 32 GiB, divided
+    #: among the live children, each spawn granted what the others are not
+    #: holding (floored at :data:`CACHE_RAM_MIN_GRANT_MIB`). An explicit integer
+    #: is **per child, verbatim**: the operator named a number, so every child
+    #: gets that number and the total is theirs to reason about -- D14's "an
+    #: explicit value is honoured" outranks our arithmetic. Only the automatic
+    #: setting ever claimed the box could not swap because of it, so only the
+    #: automatic setting has to make that true.
     cache_ram_mb: int | Literal["auto"] = "auto"
     #: ``-ub/--ubatch-size`` default for every model that does not set its own.
     #: ``None`` leaves the engine's 512. Raising it buys prompt-processing
@@ -380,7 +400,15 @@ class EngineConfig(BaseModel):
 
 
 def resolve_cache_ram_mb(value: int | str) -> int | None:
-    """Turn ``engine.cache_ram_mb`` into the number that reaches ``--cache-ram``.
+    """Turn ``engine.cache_ram_mb`` into a MiB budget.
+
+    An integer is the operator's own per-child number and comes back verbatim.
+    ``"auto"`` resolves to the **whole pool** the live children share (D50), not
+    to one child's grant -- :func:`grant_cache_ram_mib` divides it. Splitting the
+    two keeps the "how big is the budget" question (needs psutil, answers the
+    same every time) apart from the "whose turn is it" question (needs the live
+    instance table, answers differently on every spawn), so only the second one
+    needs a supervisor to test.
 
     ``None`` means "pass nothing" -- reserved for a value we cannot resolve, so
     the engine keeps its own default rather than being handed a guess.
@@ -396,6 +424,29 @@ def resolve_cache_ram_mb(value: int | str) -> int | None:
     if total_mib <= 0:  # pragma: no cover - defensive
         return CACHE_RAM_AUTO_FALLBACK_MIB
     return max(1024, min(CACHE_RAM_AUTO_MAX_MIB, int(total_mib * CACHE_RAM_AUTO_FRACTION)))
+
+
+def grant_cache_ram_mib(pool_mib: int, held_mib: int) -> int:
+    """One child's share of the automatic ``--cache-ram`` pool, in MiB (D50).
+
+    ``held_mib`` is what the OTHER live children were already granted, so the
+    arriving child gets what is left. Two things make that not quite a plain
+    subtraction:
+
+    * The result is floored at :data:`CACHE_RAM_MIN_GRANT_MIB`, because the
+      alternative at the bottom of the pool is ``--cache-ram 0``, which does not
+      mean "a tiny cache" -- it switches the host prompt cache off. A starved
+      cache recovers some evicted prefixes; no cache recovers none. The floor is
+      therefore a deliberate, bounded over-commit, and the caller warns when it
+      bites, rather than an accounting error.
+    * Negative ``held_mib`` (an unlimited ``-1`` grant that leaked into the sum,
+      say) is clamped to zero: nobody may hand out MORE than the pool by holding
+      a negative share.
+
+    Pure arithmetic on purpose -- no config, no instance table -- so the sharing
+    rule can be tested without standing up a supervisor.
+    """
+    return max(CACHE_RAM_MIN_GRANT_MIB, pool_mib - max(0, held_mib))
 
 
 class QuantAffinity(BaseModel):
@@ -450,6 +501,29 @@ class PlannerConfig(BaseModel):
     image_tokens_default: PositiveInt = 1024
     mmproj_compute_mb: NonNegativeInt = 512
     prefer_single_gpu: bool = True
+    #: Trust what a configuration MEASURED last time over what the formula
+    #: computes for it (D51).
+    #:
+    #: The planner has recorded predicted-vs-actual VRAM per load since D18 and
+    #: nothing read it back at plan time: the only feedback loop was one global
+    #: ``compute_overhead_fraction`` calibrated once at startup. A single
+    #: scalar cannot fix two signs at once, and the live rig had both open on
+    #: 2026-08-30 -- Dark-Scarlett-27B measured 4% ABOVE its estimate while
+    #: Gemma-4-E4B measured 8202 MB against a predicted 13377 (ratio 0.613),
+    #: and the planner predicted 13377 again twelve seconds after that
+    #: observation landed. E4B-style architectures (per-layer embeddings, KV
+    #: sharing) are simply not what the generic formula describes, and a 5 GB
+    #: phantom on a 24 GB card refuses a co-residency that fits or forces a
+    #: mixed-generation split measured here at half speed.
+    #:
+    #: With this on, a plan whose model, context, slots, KV cache types and
+    #: device COUNT all match a clean successful observation takes that
+    #: measurement plus 10% instead, clamped to 0.60-1.30 of the formula's own
+    #: answer so a fluke or a contaminated row can move the estimate but never
+    #: replace it. Only per-device per-pid rows are eligible; the pre-D40
+    #: history in the same table is unreadable and stays unread. Off makes the
+    #: whole feature inert -- no lookup, no note, formula only.
+    observed_correction: bool = True
     #: Whether the sweep may relocate an idle resident whose placement went
     #: stale (D42) -- e.g. still sharing a card with another model long after
     #: the layout that forced it is gone. ``"auto"`` reloads it onto the

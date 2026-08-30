@@ -109,7 +109,9 @@ engine:
   smoke_test_timeout_s: 180.0
   # Host-RAM prompt cache (`--cache-ram`): evicted prompt prefixes are kept in
   # system memory instead of recomputed. Costs no VRAM, changes no output, so
-  # it is on by default; "auto" = 25% of RAM capped at 32 GiB, 0 disables it.
+  # it is on by default. "auto" = a POOL of 25% of RAM capped at 32 GiB, shared
+  # out among the loaded models; an explicit integer is per model, verbatim.
+  # 0 disables it, -1 is the engine's "no limit".
   cache_ram_mb: auto
   # `--ubatch-size` for every model that does not set its own. Raising it
   # buys prompt speed with compute-buffer VRAM the planner then charges per
@@ -135,6 +137,11 @@ planner:
   image_tokens_default: 1024
   mmproj_compute_mb: 512
   prefer_single_gpu: true
+  # Trust what a configuration measured last time over what the formula
+  # computes for it (D51): a clean per-device observation of the same model at
+  # the same context, slots, KV cache types and device COUNT is taken as the
+  # estimate plus 10%, clamped to 0.60-1.30 of the formula's own answer.
+  observed_correction: true
   rebalance: auto
   # What the catalog's one recommended load per model optimises for (D36):
   # "quality" = the best KV cache that reaches the context floor, then the

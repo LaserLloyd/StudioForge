@@ -37,11 +37,13 @@ from studioforge.gui.tabs import (
     apply_config_updates,
     badge,
     busy,
+    element_alive,
     notify_error,
     panel_guard,
     remote_viewer_banner,
     require_local_admin,
     run_blocking,
+    single_flight,
     viewer_may_change_box,
 )
 
@@ -613,6 +615,10 @@ def _engine_panel(ctx: GuiContext) -> Any:
     may_change = viewer_may_change_box(ctx)
 
     def refresh() -> None:
+        # D50: held by the install/activate handlers and by the capabilities
+        # panel's ``after_install``, all of which call it after an await.
+        if not element_alive(body):
+            return
         body.clear()
         with body, panel_guard("Engine"):
             manager = ctx.engine_manager
@@ -706,6 +712,11 @@ async def install_engine(
     Progress is threaded through to the spinner (D49-10) because the download
     is ~600 MB and a motionless "this can take a while" is indistinguishable
     from a hang.
+
+    Single-flighted on one key for every tag (D50): two installs racing into the
+    same engines directory is a worse accident than two installs of the same
+    build, and a several-minute download is the button most likely to be pressed
+    twice.
     """
     tag = str(tag or "").strip()
     if not tag:
@@ -720,41 +731,46 @@ async def install_engine(
         notify_error(exc, what="engine install")
         return
 
-    seen: dict[str, Any] = {"phase": "", "fraction": 0.0}
-
-    def on_progress(phase: str, fraction: float) -> None:
-        # Recorded, not painted. The download loop calls this once per
-        # megabyte and the source build once per compiler line; the timer
-        # below throttles that to something a browser can keep up with -- the
-        # same discipline the Downloads tab polls the downloader with.
-        seen["phase"] = phase
-        seen["fraction"] = fraction
-
-    with busy(message=f"Installing engine {tag} (this can take a while)…") as spinner:
-        ticker: Any = None
-        try:
-            ticker = ui.timer(
-                0.5,
-                lambda: spinner.set_message(
-                    st.install_progress_line(str(tag), seen["phase"], seen["fraction"])
-                ),
-            )
-            info = await ctx.engine_manager.install(tag, activate=activate, progress=on_progress)
-        except Exception as exc:  # noqa: BLE001
-            notify_error(exc, what="engine install")
+    with single_flight("engine.install", f"engine install ({tag})") as claimed:
+        if not claimed:
             return
-        finally:
-            if ticker is not None:
-                ticker.cancel()
-    message = f"installed {info.tag} ({info.variant})"
-    if activate:
-        message += " and made it the active engine"
-    else:
-        # D49-10: said on every install, not only inside the update banner.
-        # "I installed the new engine and nothing changed" is this note.
-        message += f". {st.ENGINE_UPDATE_NOTE}"
-    ui.notify(message, type="positive", multi_line=True, close_button=not activate)
-    refresh()
+        seen: dict[str, Any] = {"phase": "", "fraction": 0.0}
+
+        def on_progress(phase: str, fraction: float) -> None:
+            # Recorded, not painted. The download loop calls this once per
+            # megabyte and the source build once per compiler line; the timer
+            # below throttles that to something a browser can keep up with --
+            # the same discipline the Downloads tab polls the downloader with.
+            seen["phase"] = phase
+            seen["fraction"] = fraction
+
+        with busy(message=f"Installing engine {tag} (this can take a while)…") as spinner:
+            ticker: Any = None
+            try:
+                ticker = ui.timer(
+                    0.5,
+                    lambda: spinner.set_message(
+                        st.install_progress_line(str(tag), seen["phase"], seen["fraction"])
+                    ),
+                )
+                info = await ctx.engine_manager.install(
+                    tag, activate=activate, progress=on_progress
+                )
+            except Exception as exc:  # noqa: BLE001
+                notify_error(exc, what="engine install")
+                return
+            finally:
+                if ticker is not None:
+                    ticker.cancel()
+        message = f"installed {info.tag} ({info.variant})"
+        if activate:
+            message += " and made it the active engine"
+        else:
+            # D49-10: said on every install, not only inside the update banner.
+            # "I installed the new engine and nothing changed" is this note.
+            message += f". {st.ENGINE_UPDATE_NOTE}"
+        ui.notify(message, type="positive", multi_line=True, close_button=not activate)
+        refresh()
 
 
 async def smoke_engine(ctx: GuiContext, tag: str) -> None:
@@ -763,24 +779,30 @@ async def smoke_engine(ctx: GuiContext, tag: str) -> None:
     Gated (D49-9). It reads like a read, but it spawns the engine and takes
     VRAM on a live rig, and the REST twin has been D32-gated all along: the
     panel being the more permissive of the two was the drift worth closing.
+
+    Single-flighted (D50) for the same reason it is gated: it takes VRAM, and
+    two of them at once take it twice while models are trying to load.
     """
     try:
         require_local_admin(ctx, "engine smoke test")
     except Exception as exc:  # noqa: BLE001
         notify_error(exc, what="smoke test")
         return
-    with busy(message=f"Smoke testing {tag}…"):
-        try:
-            ok, detail = await ctx.engine_manager.smoke_test(tag)
-        except Exception as exc:  # noqa: BLE001
-            notify_error(exc, what="smoke test")
+    with single_flight("engine.smoke", f"engine smoke test ({tag})") as claimed:
+        if not claimed:
             return
-    ui.notify(
-        f"{tag}: {'PASS' if ok else 'FAIL'}\n{detail[:400]}",
-        type="positive" if ok else "negative",
-        multi_line=True,
-        close_button=True,
-    )
+        with busy(message=f"Smoke testing {tag}…"):
+            try:
+                ok, detail = await ctx.engine_manager.smoke_test(tag)
+            except Exception as exc:  # noqa: BLE001
+                notify_error(exc, what="smoke test")
+                return
+        ui.notify(
+            f"{tag}: {'PASS' if ok else 'FAIL'}\n{detail[:400]}",
+            type="positive" if ok else "negative",
+            multi_line=True,
+            close_button=True,
+        )
 
 
 async def activate_engine(ctx: GuiContext, tag: str, refresh: Any) -> None:
@@ -796,6 +818,21 @@ async def activate_engine(ctx: GuiContext, tag: str, refresh: Any) -> None:
     (D49-5). Writing only one of them is the no-op the drift badge exists for,
     and the route also runs the extra-flags revalidation sweep (D49-6), which a
     second implementation would have quietly skipped.
+
+    The reload is now the same kind of call (D50). It used to be a hand-rolled
+    ``for model_id in loaded: load(force=True)`` inside one ``try``, which had
+    three faults the route does not: it aborted on the first failure and left
+    every model after it on the old engine in silence; it reloaded children that
+    were *already* on the build being activated, since nothing recorded what a
+    child was running until ``resolved_engine_tag``; and being a third copy of
+    "restart the backend" it was free to drift from the other two, which is
+    exactly what it had done. ``only_stale_engine=True`` is what makes this
+    idempotent: press it twice and the second press finds every child current
+    and restarts nothing.
+
+    The literal keyword matters -- ``restart_backend``'s parameter is a FastAPI
+    ``Body``, so an unfilled default arrives here as a ``FieldInfo`` and the
+    route treats anything that is not literally ``True`` as false.
     """
     # D49-9: gate first, spinner second -- a refusal must not look like a
     # failed activation. The route is D32-gated by the API middleware, which
@@ -805,28 +842,39 @@ async def activate_engine(ctx: GuiContext, tag: str, refresh: Any) -> None:
     except Exception as exc:  # noqa: BLE001
         notify_error(exc, what="activate engine")
         return
-    with busy(message=f"Activating {tag} and reloading models…"):
-        try:
-            from studioforge.api.mgmt_routes import engine_activate
-
-            payload = dict(await engine_activate(api_request(ctx), tag=tag))
-            # The reload is the GUI's own half: a running child keeps the
-            # binary it started with, so switching engines only means anything
-            # once the models are restarted, and doing both in one action is
-            # what makes the change observable.
-            loaded = [i.model_id for i in ctx.supervisor.list()]
-            for model_id in loaded:
-                await ctx.manager.load(model_id, force=True, source="gui")
-        except Exception as exc:  # noqa: BLE001
-            notify_error(exc, what="activate engine")
+    # D50: the double-click this whole decision came from was on this button.
+    # One key for every tag -- two activations at once are two full rounds of
+    # reloads over the same models, whichever builds they name.
+    with single_flight("engine.activate", f"engine activation ({tag})") as claimed:
+        if not claimed:
             return
-    ui.notify(f"{tag} active; reloaded {len(loaded)} model(s)", type="positive")
-    warning = st.flag_offender_warning(payload.get("offenders"))
-    if warning:
-        # D49-6: llama-server ignores flags it does not know, so a stale flag
-        # is dropped in silence unless something says this.
-        ui.notify(warning, type="warning", multi_line=True, close_button=True)
-    refresh()
+        with busy(message=f"Activating {tag} and reloading models…"):
+            try:
+                from studioforge.api.admin_routes import restart_backend
+                from studioforge.api.mgmt_routes import engine_activate
+
+                payload = dict(await engine_activate(api_request(ctx), tag=tag))
+                # Mirrors ``dashboard._restart_engines``: call the handler
+                # in-process so the GUI and the API cannot drift on what
+                # "restart the backend" means.
+                adopted = dict(await restart_backend(api_request(ctx), only_stale_engine=True))
+            except Exception as exc:  # noqa: BLE001
+                notify_error(exc, what="activate engine")
+                return
+        # A run with failures is not a green toast: some models are still on
+        # the old engine, and the note names which.
+        ui.notify(
+            st.engine_adopt_note(tag, adopted),
+            type="warning" if adopted.get("failed") else "positive",
+            multi_line=True,
+            close_button=bool(adopted.get("failed")),
+        )
+        warning = st.flag_offender_warning(payload.get("offenders"))
+        if warning:
+            # D49-6: llama-server ignores flags it does not know, so a stale
+            # flag is dropped in silence unless something says this.
+            ui.notify(warning, type="warning", multi_line=True, close_button=True)
+        refresh()
 
 
 async def _releases(ctx: GuiContext, box: Any) -> None:
@@ -879,17 +927,26 @@ def _capabilities_panel(ctx: GuiContext, engine_refresh: Any = None) -> None:
     may_change = viewer_may_change_box(ctx)
 
     async def load() -> None:
+        # D50: the report is built off the event loop, so the panel this paints
+        # into can be gone by the time it comes back -- and it is re-entered
+        # from ``after_install`` after an install that took minutes.
+        if not element_alive(body):
+            return
         body.clear()
         with body:
             ui.label("Reading the engine's capabilities…").classes("text-xs opacity-60")
         try:
             report = await run_blocking(_build_capability_report, ctx)
         except Exception as exc:  # noqa: BLE001 - an optional panel, never the page
+            if not element_alive(body):
+                return
             body.clear()
             with body:
                 ui.label(f"capabilities unavailable: {exc}").classes("text-sm opacity-70")
             return
         report_holder["report"] = report
+        if not element_alive(body):
+            return
         body.clear()
         with body, panel_guard("Backend capabilities"):
             _capabilities_body(ctx, report)
@@ -900,7 +957,14 @@ def _capabilities_panel(ctx: GuiContext, engine_refresh: Any = None) -> None:
         The banner used to be handed ``lambda: None``: the install ran, the
         engine list above went on showing what was there before it, and the
         only way to see the new build was a page reload.
+
+        D50: an install is minutes long, so by the time this runs the page may
+        have been rebuilt underneath it. ``ui.timer`` would then be created
+        against a dead slot, which is the error this whole guard exists for --
+        and the fresh panel is already painting itself anyway.
         """
+        if not element_alive(body):
+            return
         if engine_refresh is not None:
             engine_refresh()
         ui.timer(0.1, load, once=True)

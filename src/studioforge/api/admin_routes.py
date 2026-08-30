@@ -144,24 +144,35 @@ async def restart_model(model_id: str, request: Request) -> dict[str, Any]:
 
 
 @router.post("/restart/backend")
-async def restart_backend(request: Request) -> dict[str, Any]:
+async def restart_backend(
+    request: Request, only_stale_engine: bool = Body(False, embed=True)
+) -> dict[str, Any]:
     """Restart every loaded model's engine process, keeping the API up.
 
     Used after an engine update: running children keep the engine they were
     launched with, so a reload is what actually moves them onto the new build.
+
+    ``only_stale_engine=true`` restarts just the children that are *not* already
+    on the active build, which is what makes calling this after an activation
+    idempotent -- the D50 case, where a double-clicked button reloaded every
+    resident twice. Leave it false for "recycle everything", which is what a
+    misbehaving model needs.
+
+    The loop itself lives in :meth:`ModelManager.reload_resident`; this route
+    used to carry its own copy, and the GUI carried a third with different
+    failure semantics. The response keeps ``restarted``/``failed``/``count``
+    verbatim for the tray, and adds ``skipped`` and ``active_engine``.
     """
     state = _state(request)
-    loaded = [i.model_id for i in state.supervisor.list() if i.state == "ready"]
-    restarted: list[str] = []
-    failed: list[dict[str, str]] = []
-    for model_id in loaded:
-        try:
-            await state.manager.load(model_id, force=True, source="restart-resume")
-            restarted.append(model_id)
-        except Exception as exc:
-            log.warning("could not restart model", model_id=model_id, error=str(exc))
-            failed.append({"model_id": model_id, "error": str(exc)})
-    return {"restarted": restarted, "failed": failed, "count": len(restarted)}
+    # ``is True``, not ``bool(...)``: the GUI calls this handler as a plain
+    # Python function with only the request, so an unfilled ``Body`` default
+    # arrives as FastAPI's FieldInfo object -- which is truthy, and would have
+    # quietly turned the Dashboard's "Restart engines" into "restart only the
+    # stale ones". Anything that is not literally True means restart everything,
+    # which is this endpoint's long-standing behaviour.
+    return await state.manager.reload_resident(
+        only_stale_engine=only_stale_engine is True, source="restart-resume"
+    )
 
 
 @router.post("/restart/server")

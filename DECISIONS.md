@@ -3692,3 +3692,265 @@ hard verdict at the running tag, and the report's `capability_source_tag`),
 preference order, the drift badge, the keep_versions note, the offender warning, the progress line,
 and `smoke_engine` in the require-local-admin list), and
 `tests/unit/test_bat_launchers.py` (the launcher's new block).
+
+
+---
+
+## D50 -- The build a child is actually running, and the reload that already happened
+
+**Problem (seen live, 2026-08-30).** A log review of the live rig read a 31-second window in which
+nothing was wrong and everything was wasted. The GUI's *activate + reload* button had fired
+**twice, 118 ms apart** -- one double-click on a button whose work takes half a minute. Each run
+force-reloaded every loaded model, so both models were stopped and relaunched twice back to back,
+and a 37 GB model was killed **3.6 seconds after it finished becoming ready**. No error was logged,
+because nothing failed: the second round faithfully restarted two children that had just been
+restarted.
+
+The GUI's double-fire is a GUI bug and is fixed as one (below). The reason the second round was
+*able* to be pure churn is three gaps in core, and those are what this entry is mostly about.
+
+**Gap 1: nothing recorded which engine a child was running.** `InstanceInfo.engine_tag` holds the
+per-model **pin** -- the tag the load *asked* for -- and `None` means "whatever is active". Almost
+every load pins nothing, so almost every instance carried `None`, and every `model_ready` line in
+the log said `engine_tag=None`. The question "is this resident already on the build I just
+activated?" was therefore unanswerable by any layer: not by the reload loop, not by an operator
+reading the log, not by an agent over MCP. Engine drift -- a child serving for hours on a build
+that was superseded while it ran -- was invisible in exactly the surfaces built to show it. D49-7's
+"is this build in use?" check already knew about this hole and documented it as a supervisor change
+it could not make.
+
+*Decision.* The supervisor stamps `InstanceInfo.resolved_engine_tag` at spawn, taken from the
+engine manager's own `EngineInfo` -- the same object the binary path comes from -- via a
+`resolve_engine_tag` callable injected exactly like `resolve_binary` and `engine_features`, so core
+still knows nothing about the engine manager. A supervisor built without one (the GUI's command
+preview, tests) falls back to the build directory's name; a resolver that throws yields `None`, and
+**every reader treats `None` as "cannot prove this child is current"**, which reloads rather than
+skips. `model_ready` now logs the resolved build as `engine_tag=`, and reports the request
+separately as `pinned_engine_tag=` only when there genuinely is a pin. The tag is on
+`GET /api/models`, on `/api/status`, and in the MCP `_compact_instance` whitelist.
+`_tag_in_use_check` reads it too, so refusing a reinstall over a running build is now exact rather
+than a guess that went wrong precisely after an activation.
+
+**Gap 2: the reload loop existed three times.** `POST /api/restart/backend` had the canonical
+per-model loop; the GUI's *activate + reload* carried its own copy, inside one `try`, which aborted
+on the first failure -- one model's OOM left every model after it on the old engine, in silence --
+and reloaded children that were already on the build being activated, because of Gap 1. The
+Dashboard's *Restart engines* had had the right pattern all along, and said so in its own
+docstring: call the API handler in-process, so the GUI and the API cannot drift.
+
+*Decision.* One implementation: `ModelManager.reload_resident(only_stale_engine=, source=)`. The
+route is a two-line call into it and keeps `restarted` / `failed` / `count` verbatim (the tray reads
+`count` and lists `failed`), adding `skipped` and `active_engine`. Per-model try/except stays the
+point of the loop rather than defensive padding: a resident that no longer fits must not stop the
+others being moved onto the new engine.
+
+`only_stale_engine=True` is what *activate + reload* passes, and it is what makes **engine
+activation idempotent**: a child already on the active build is skipped, with the reason logged, so
+running the same request twice restarts nothing the second time. Children still `loading` are
+skipped under either flag -- their spawn resolves the active engine on the way through, so they are
+already becoming what a reload would make them, and force-reloading a load in flight is how one
+click turns into two cold loads of the same weights. A direct Python call to the route handler (the
+GUI's pattern) must pass the flag as a **literal keyword** -- an unfilled FastAPI `Body` default
+arrives as a truthy `FieldInfo`, so the route treats anything that is not literally `True` as
+false; without that, the Dashboard's *Restart engines* would have quietly become
+"restart only the stale ones".
+
+**Gap 3: an identical forced reload queued behind one restarted a child seconds old.** The
+per-model lock serialises reloads correctly; it just has no opinion about whether the second one
+still has work to do.
+
+*Decision.* Every deliberately started child gets a monotonic `InstanceInfo.spawn_seq`. `load()`
+reads the resident's number **before** it queues for the per-model lock; if the child holding the
+model when it gets in carries a higher one, somebody already did the restart it was about to do,
+and the call folds -- logging `forced_reload_coalesced` and returning the live instance. A fold
+requires all of: `force=True`, the instance `ready`, a newer `spawn_seq`, **no** explicit
+`ctx_size` / `kv_cache_type` / `kv_cache_type_v` / `parallel` / `devices`, and the instance already
+on the active engine. The tuning-argument clause excludes the D42 rebalancer and the D46 restore
+for free (both pass `devices`), so a fold can never quietly cancel a move; the engine clause exists
+because an engine adoption is precisely the reload that must never be swallowed. An explicit
+`priority` still re-stamps the ready instance the way the un-forced path does (D46): the reload
+folds, the tier does not.
+
+This is deliberately **not** a rate limiter. Two *deliberate* identical restarts cannot be issued
+closer together than one child restart takes to finish, so a genuine "reload it again, I mean it"
+always arrives after the sequence number it is compared against has stopped moving, and always
+runs. A crash relaunch does not bump `spawn_seq`, for the same reason: a reload queued behind a
+crash is a human asking for a clean child, and the relaunch was not what they asked for.
+
+**A fourth thing, found while reading the same launch path: `--cache-ram` was per-child.**
+`engine.cache_ram_mb: "auto"` resolved to min(25% of system RAM, 32 GiB) and that number was handed
+to **every** child. The constant's own comment claimed the cache "can never be the reason the
+machine starts swapping" -- true for one resident, and false for the four this rig runs, which
+between them promised 128 GiB of a 128 GiB box.
+
+*Decision.* `"auto"` is now a machine-wide **pool**, not a per-child allowance. Each spawn is
+granted the pool minus what the other live children hold, floored at `CACHE_RAM_MIN_GRANT_MIB`
+(4096) -- because `--cache-ram 0` does not mean "a small cache", it switches the host prompt cache
+off, and a starved cache still recovers some evicted prefixes while no cache recovers none. When
+the floor forces the total past the pool the spawn logs `cache_ram_pool_oversubscribed` with the
+numbers, because past that point the pool is an intention rather than a bound and the operator
+staring at a swapping box deserves to be told. An **explicit integer stays per child, verbatim**,
+including `0` and `-1`: D14 says an explicit value is honoured, the operator named a number, and
+only the automatic setting ever claimed the total was bounded. The grant is recorded on
+`InstanceInfo.cache_ram_mib` -- a pool nobody can see the shares of is unauditable -- and computed
+once at spawn, then passed into `build_command`, so the number in the argv and the number the API
+reports cannot drift apart. A reload re-grants correctly for free: the outgoing child is stopped,
+and out of the instance table, before its replacement spawns.
+
+**What this costs.** The first resident onto an empty pool still takes all of it, so the *second*
+model on a busy box gets the floor rather than a fair half. That is the deliberate cheap version:
+the alternative is re-granting live children, which means restarting them. The floor plus the
+warning make the failure legible instead of silent, which is the property the old code lacked.
+
+**The GUI half.** Seven changes, each carrying its full rationale in its docstring:
+
+1. `gui.tabs.single_flight(key, what)` -- one long action at a time, process-wide, guarded at the
+   *action* rather than the button (most handlers are lambdas with no button in scope, and a
+   disabled button is one WebSocket message away from being enabled again). A second click toasts
+   `st.already_running_note` instead of being swallowed: a long action that answers a click with
+   nothing is how the double-click happened in the first place. Applied to `activate_engine`,
+   `install_engine`, `smoke_engine`, `_restart_engines`, `_restart_model` and `_unload_one` (keyed
+   per model -- restarting one model must not block another's button), and the unload-all and
+   restart-server confirms. Process-wide, not per-client: the thing being protected is the rig, and
+   two browsers pointed at the same box are the same accident as one browser double-clicking.
+   First line of defence, not the only one -- Gap 3's fold is correct even for two clicks that
+   never met a GUI; this one is instant and says so.
+2. `activate_engine` stops hand-rolling the reload: after the D32 gate and the single-flight claim
+   it calls `engine_activate` in-process as before, then
+   `restart_backend(api_request(ctx), only_stale_engine=True)` -- the `_restart_engines` pattern,
+   for its stated reason.
+3. A partial adoption is legible: `st.engine_adopt_note(tag, payload)` names what moved, what was
+   already current, and -- with ids -- what failed; a run with failures toasts `warning`, not
+   `positive`. `st.restart_backend_note` gains the same skip reporting, so "nothing to restart --
+   no models are loaded" is reserved for the case it actually describes rather than also covering
+   an everything-was-already-current run.
+4. Lifecycle before activity: `st.instance_chip` renders `Loading...` (warning) and `Failed`
+   (negative) from the instance's own state before falling through to the activity pair -- a child
+   mid-spawn has no slots to be busy or idle in, and wore `Idle · actual ctx — · 0 busy / 0 idle ·
+   build —` for its whole 30-second load, indistinguishable from a hung idle child.
+   `st.loaded_count_text` breaks the header's count apart the same way: `1 loaded · 1 loading`.
+5. Per-child engine drift: `st.instance_engine_drift(resolved, active)` badges a running child
+   whose `resolved_engine_tag` disagrees with the active build -- the per-child half of D49's
+   pin-vs-active badge, and the question *activate + reload* exists to close. Silent unless both
+   tags are known: an unprovable child is not a drifting child, and a permanent warning on every
+   row is how a warning stops being read.
+6. A repaint of a dead panel is not an error: `gui.tabs.element_alive` reads NiceGUI 3.16's
+   `Element.is_deleted` (and the client's), answering "gone" for anything it cannot verify, and the
+   repaint closures held across awaits -- the Dashboard's loaded-models `refresh`, the engine
+   panel's, the capabilities `load`/`after_install`, the Logs tab's -- bail out silently. This is
+   the `ERROR nicegui -- The parent element this slot belongs to has been deleted` line from the
+   log: the page it belonged to no longer existed, and a fresh panel with its own timer was already
+   drawing the same thing.
+7. One clock in the log views: `st.log_stamp_utc` stamps plain-stdlib records in structlog's own
+   `iso` shape, so `13:20:33 ERROR nicegui` no longer sits nine hours apart from the
+   `2026-08-30T04:20:33Z` structlog line describing the same instant. `format_timestamp` is
+   untouched -- TTLs and "2 hours ago" are legitimately local; a log is the one surface where two
+   clocks cannot coexist.
+
+**Tests.** `tests/unit/test_reload_resident.py` (the response shape; stale-engine skipping and the
+idempotent second activation; `loading` children skipped; per-model failure isolation; an unknown
+active engine reloading everything; route backward-compat for the tray plus `only_stale_engine`,
+including the `FieldInfo` direct-call shape; and the coalescing matrix driven through a real
+double-click race -- fold, no fold on explicit `ctx_size`/`devices`/`parallel`, no fold on engine
+mismatch, priority still re-stamped, two sequential deliberate reloads both running),
+`tests/unit/test_supervisor.py` (the resolved tag stamped for pinned and unpinned loads;
+`spawn_seq` machine-wide across restarts; `model_ready` naming the build; the cache-ram grant
+recorded, re-granted on reload, and shared rather than repeated by a second resident),
+`tests/unit/test_supervisor_features.py` (pool arithmetic without a supervisor; grants summing to
+the pool; the floor and its `cache_ram_pool_oversubscribed` warning; explicit `int`/`0`/`-1`
+untouched; `-1` never counted as a negative share; the argv carrying the recorded grant; the
+engine-tag resolver, its directory-name fallback and its failure path), and
+`tests/unit/test_gui.py` (single_flight claiming, blocking, per-model keys and release-on-raise;
+`engine_adopt_note` and `restart_backend_note` across restarted/skipped/failed mixes;
+`instance_chip` and `loaded_count_text`; `instance_engine_drift` including the unknown-tag
+silences; `log_stamp_utc`'s shape and `log_line_text`'s passthrough; and source guards pinning
+`activate_engine` to the delegated reload).
+
+---
+
+## D51 -- The planner reads its own observations at plan time
+
+**Problem.** The planner has recorded predicted-vs-actual VRAM on every load since D18
+(`Planner.observe` -> the `load_observations` table), and **nothing read those rows back at plan
+time**. The single feedback loop was one global `compute_overhead_fraction`, calibrated once at
+startup and clamped to 0.03-0.15. One global scalar cannot be two signs at once, and the live rig
+had both open simultaneously on 2026-08-30: Dark-Scarlett-27B measured 37258 MB against a formula
+35742 (ratio 1.042, an UNDER-estimate), while Gemma-4-E4B measured 8202 MB against a predicted
+13377 (ratio 0.613, a 5 GB phantom) -- and the planner predicted 13377 for it again **twelve
+seconds after** that observation landed. E4B-style architectures (per-layer embeddings, KV sharing)
+are simply not what the generic GGUF-geometry formula describes, and raising the global fraction to
+cover Dark-Scarlett makes the Gemma phantom worse. The cost is not cosmetic: a 5 GB phantom on a
+24 GB 3090 refuses a co-residency that fits, or pushes the model onto a mixed-generation split this
+project's own measurements put at roughly half speed.
+
+**Decision.** At plan time, when a clean successful observation of the same configuration of the
+same model exists, trust the measured footprint plus a safety margin, clamped to a band around the
+formula:
+
+    corrected_total = clamp(observed_actual x OBS_SAFETY,
+                            formula_total x OBS_BAND_MIN,
+                            formula_total x OBS_BAND_MAX)
+
+`OBS_SAFETY = 1.10` -- the measured child plus 10%: tensor-split proportions are recomputed from
+live free VRAM on every load, so "the same placement" is never bit-identical, and the error
+direction must stay *refuse*, never *OOM*. `OBS_BAND_MIN = 0.60` -- a poisoned or fluke row can
+never talk the estimate below 60% of the formula (the live Gemma case lands at 0.674, inside it).
+`OBS_BAND_MAX = 1.30` -- past 30% over, the formula is missing a term and quietly padding every
+plan would hide the bug instead of fixing it. As with `OVERHEAD_FRACTION_MIN`/`MAX`, the clamp is
+the point, not a detail: a feedback loop with no bound is a way to make the planner slowly wrong
+with nobody noticing. Worked, from the log: Dark-Scarlett 35742 -> 40984 (x1.147, MORE
+conservative, its real risk direction); Gemma-4-E4B 13377 -> 9022 (x0.674, ~4.3 GB of phantom
+released). `planner.observed_correction: false` makes the whole feature inert.
+
+**The matching key** is `model_id`, `ctx_size` (as `LoadPlan` stores it), `parallel`,
+`kv_cache_type`, `kv_cache_type_v`, and the device **COUNT**, not the device list: each card costs
+a CUDA context, so the count is a real term, but D42's rebalancer moves a model between same-count
+device sets and the tensor split is recomputed every load, so matching the exact list would make
+the feature almost never fire. Newest matching row wins -- the newest measurement is the one taken
+against the engine build and driver in use now. Only `ok` rows carrying `note='per_pid_v2'`
+(`OBSERVATION_NOTE_PER_PID_DEVICE`) are eligible: the rest of the table is contaminated history
+(whole-device sums at a median ratio of 2.97; Windows per-pid totals counted once per card, D40),
+and a single such row spent as an estimate would triple a model's apparent size. Two independent
+guards -- the note check makes a dirty row *unable* to be spent, and `OBS_BAND_MAX` bounds the
+damage if a future contamination shape sneaks past it.
+
+**Where it lands.** `Planner._safe_estimate` -- the one funnel every candidate estimate flows
+through (the fit check in `_try_devices`, the slot walk in `max_slots_by_vram`, the forced
+placement in `_plan_on_devices`, the numbers a `LoadRejected` reports). Correcting anywhere
+downstream would leave those disagreeing: a plan sized against a measurement but refused against a
+formula. Because `VramEstimate.total_bytes` is a derived sum, the correction is spread uniformly
+across the terms (`scaled_estimate`): the Gemma correction is -4.3 GB and `compute_bytes` -- the
+term that exists to absorb unmodelled overhead -- physically cannot hold it, and a total corrected
+without its KV term would make `_reject`'s `total - kv` describe a placement that does not exist.
+The chosen plan carries a note ("estimate corrected x0.67 from the last load of this exact
+configuration ...") into the `load planned` line and the API response; per rung it is DEBUG only.
+The lookup is injected (`observation_lookup`, wired to `Database.matching_observation` in
+`build_state`) beside the D18 sink; it is memoized per `plan_load` call (keyed with `model_id`, so
+two racing plans can never cross-attribute a measurement), latches OFF for the rest of the pass on
+the first exception after one warning -- a database that cannot answer must cost accuracy, never a
+refused load -- and is simply absent for `fits_on` and the catalog's throwaway planners, which stay
+formula-only.
+
+**Schema.** `migrations/007_observation_kv_v.sql` adds `load_observations.kv_cache_type_v`, and
+`observe()` now stores it. Calibration never needed the V type (it averages ratios across every
+model); reading ONE row back as an estimate does, because K and V are set independently and a
+quantized V cache is roughly half the V bytes. Pre-007 rows keep NULL, and NULL is read as "this
+row cannot say", not "it matched": such a row is accepted only for a lookup whose V equals its K
+(the symmetric default) and skipped for any asymmetric cache it might not describe.
+
+**Known limits, deliberately accepted.** *Draft and adapter composition is not in the key*: a row
+does not record whether the measured child carried a speculative draft or LoRA adapters, so a model
+whose speculative config changes is transiently mis-corrected -- bounded by the band, and
+self-healing on the next load, whose row (newest-wins) describes the new composition.
+*Calibration double-counting*: `observe()` stores the corrected `predicted_bytes`/`weights_bytes`
+for corrected plans, so D18's `suggest_overhead_fraction` mostly stops reacting to errors D51 has
+already absorbed (a correctly-corrected load has a negative shortfall and is skipped); the case to
+watch is a hard-clamped-down model that then genuinely overruns, whose shortfall reads larger than
+it is -- the existing 0.03-0.15 clamp bounds it, now doing double duty.
+
+**Tests.** `tests/unit/test_planner_observed.py` (34: the clamp band at both edges and the 10%
+margin; per-device shares scaled with the total; the flag, the missing lookup, the missing row and
+the mismatched ctx/parallel/kv/device-count each a no-op; dirty rows unable to match; the NULL-V
+rule both ways; a raising lookup latching off after one warning while the plan proceeds; the memo
+answering once per pass; `fits_on` staying formula-only; migration 007 applying and `observe()`
+storing the V type; and the db/planner note constants agreeing).

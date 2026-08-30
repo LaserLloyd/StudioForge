@@ -862,6 +862,11 @@ class ModelManager:
         fit), jumps the load queue, and -- unless ``hold_traffic`` is
         ``False``, the internal callers' setting -- holds new worse-tier
         traffic off with a 503 while it is in flight.
+
+        A ``force`` that spent its wait queued behind an *identical* ``force``
+        folds instead of restarting a child seconds old (D50) -- see
+        :meth:`_reload_already_done` for exactly when, and for the double-click
+        that made it necessary.
         """
         validate_load_args(
             ctx_size=ctx_size,
@@ -919,6 +924,14 @@ class ModelManager:
             # refused must not re-tier the model as a side effect.
             self._model_priority[record.id] = tier
         hold = tier < PRIORITY_BACKGROUND and hold_traffic
+        # The child we are about to queue behind, identified by its launch
+        # number rather than by its identity: the per-model lock can be held for
+        # minutes by a cold load, and what matters when we finally get in is
+        # whether the resident is still the one this request was aimed at (D50).
+        # Read before the lock on purpose -- after it, the answer is already the
+        # outcome we are trying to detect.
+        queued_behind = self.supervisor.get(record.id)
+        seq_before = queued_behind.spawn_seq if queued_behind is not None else -1
         lock = await self._lock_for(record.id)
         self._load_waiters[record.id] = self._load_waiters.get(record.id, 0) + 1
         try:
@@ -929,6 +942,28 @@ class ModelManager:
                     if not force:
                         if normalise_priority(priority) is not None:
                             self._retier_resident(record, existing, tier)
+                        return existing
+                    if self._reload_already_done(
+                        existing,
+                        seq_before,
+                        ctx_size=ctx_size,
+                        kv_cache_type=kv_cache_type,
+                        kv_cache_type_v=kv_cache_type_v,
+                        parallel=parallel,
+                        devices=devices,
+                    ):
+                        if normalise_priority(priority) is not None:
+                            # The reload folds; the tier the caller stated does
+                            # not. Same re-stamp the un-forced path does (D46).
+                            self._retier_resident(record, existing, tier)
+                        log.info(
+                            "forced_reload_coalesced",
+                            model_id=record.id,
+                            source=source,
+                            spawn_seq=existing.spawn_seq,
+                            spawn_seq_queued_behind=seq_before,
+                            engine_tag=existing.resolved_engine_tag,
+                        )
                         return existing
                     reload_of = record.id
                 return await self._load_locked(
@@ -957,6 +992,172 @@ class ModelManager:
                 self._prune_lock(record.id)
             else:
                 self._load_waiters[record.id] = remaining
+
+    def _active_engine_tag(self) -> str | None:
+        """The engine build a load that pins nothing would launch with (D50).
+
+        Asked of the supervisor, which already owns the engine resolution this
+        package injects, rather than of an engine manager core is not allowed to
+        know about. ``None`` means "cannot be established" -- no engine
+        installed, an unreadable ``active.json``, a supervisor double that does
+        not answer the question -- and every caller reads ``None`` as *cannot
+        prove this child is current*. That direction reloads rather than skips,
+        because a redundant reload costs half a minute and a missed one leaves a
+        superseded engine serving.
+        """
+        resolver = getattr(self.supervisor, "active_engine_tag", None)
+        if resolver is None:
+            return None
+        try:
+            tag = resolver()
+        except Exception as exc:  # noqa: BLE001 - naming the engine is never fatal
+            log.debug("active engine tag unavailable", error=str(exc))
+            return None
+        return str(tag) if tag else None
+
+    def _reload_already_done(
+        self,
+        instance: InstanceInfo,
+        seq_before: int,
+        *,
+        ctx_size: int | None,
+        kv_cache_type: Any,
+        kv_cache_type_v: Any,
+        parallel: int | None,
+        devices: Sequence[int] | None,
+    ) -> bool:
+        """Did somebody already do the forced reload this call queued for? (D50)
+
+        The failure it exists to prevent, from the 2026-08-30 log review: the
+        GUI's "activate + reload" button fired twice 118 ms apart -- one
+        double-click -- and each run force-reloaded every resident. Both models
+        were therefore reloaded twice back to back, ~31 seconds of pure churn,
+        and a 37 GB model was killed 3.6 seconds after it finished becoming
+        ready. Nothing about the second round was *wrong*: it faithfully
+        restarted a child that had just been restarted, because nothing in the
+        stack could tell it that.
+
+        ``spawn_seq`` can. The caller notes the resident's launch number before
+        it starts queueing for the per-model lock; if the child holding the
+        model when it finally gets in carries a HIGHER one, that child is not
+        the one this request was aimed at -- somebody replaced it while we
+        waited, and the restart has already happened.
+
+        Everything below that clause is about never folding a reload that would
+        have done something *different*:
+
+        * The instance must be ``ready``. A ``failed`` or ``unloading`` child
+          has not been reloaded, it has died, and that still needs fixing.
+        * No explicit tuning argument may be present. ``ctx_size``,
+          ``kv_cache_type``, ``kv_cache_type_v``, ``parallel`` and ``devices``
+          each make this load a different shape from the one that just ran, so
+          it is not a duplicate of anything. That test also excludes, for free,
+          every internal caller that replays a placement -- the D42 rebalancer
+          and the D46 restore both pass ``devices`` -- so a fold can never
+          quietly cancel a move.
+        * The child must already be on the active engine. An engine activation
+          is precisely the reload that must never be swallowed: skipping it
+          leaves a superseded build serving, which is a worse version of the bug
+          this decision exists to fix. An unknown tag on either side is not a
+          match.
+
+        What this deliberately is not is a rate limiter. Two *deliberate*
+        identical restarts cannot be issued closer together than one child
+        restart takes to finish -- a human clicking twice, an agent retrying a
+        call it believed had failed, both land inside that window and both mean
+        one restart -- so a genuine "reload it again, I mean it" always arrives
+        after the sequence number it is compared against has stopped moving, and
+        always runs.
+        """
+        if instance.state != "ready" or instance.spawn_seq <= seq_before:
+            return False
+        if any(
+            arg is not None for arg in (ctx_size, kv_cache_type, kv_cache_type_v, parallel, devices)
+        ):
+            return False
+        active = self._active_engine_tag()
+        return active is not None and instance.resolved_engine_tag == active
+
+    async def reload_resident(
+        self, *, only_stale_engine: bool = False, source: str
+    ) -> dict[str, Any]:
+        """Recycle every resident llama-server child, keeping the API up.
+
+        The single implementation of that operation. It existed twice before
+        D50 -- inline in the GUI's "activate + reload" button and again in
+        ``POST /api/restart/backend`` -- with different failure semantics, and
+        the copy that fired twice on 2026-08-30 was the GUI's.
+
+        The per-model try/except is the point of the loop, not defensive
+        padding: a resident that no longer fits, or whose file has been moved,
+        must not stop the other residents being moved onto the new engine. Those
+        come back named in ``failed`` and the caller decides what it is worth.
+
+        ``only_stale_engine=True`` is what "activate + reload" passes, and it is
+        the thing that makes engine activation IDEMPOTENT. A child already
+        running the active build has nothing to gain from a restart, so it is
+        skipped and the reason is logged. Run the same request twice and the
+        second run finds every child current and restarts nothing -- which is
+        what a double-clicked button should cost. Without it the second run is a
+        full second round of minute-long reloads over models that were correct
+        already.
+
+        Children still ``loading`` are skipped under either flag: their spawn
+        resolves the active engine on the way through, so they are already
+        becoming what a reload would make them, and force-reloading a load in
+        flight is how one click becomes two cold loads of the same weights.
+
+        An active engine that cannot be established reports ``active_engine:
+        null`` and skips nobody -- see :meth:`_active_engine_tag` for why that
+        is the safe direction.
+        """
+        active = self._active_engine_tag()
+        restarted: list[str] = []
+        skipped: list[dict[str, Any]] = []
+        failed: list[dict[str, str]] = []
+        # Snapshot first: each load below stops and respawns a child, which
+        # mutates the supervisor's table underneath a live iteration.
+        for instance in list(self.supervisor.list()):
+            model_id = instance.model_id
+            reason: str | None = None
+            if instance.state == "loading":
+                reason = "loading"
+            elif instance.state != "ready":
+                continue
+            elif (
+                only_stale_engine and active is not None and instance.resolved_engine_tag == active
+            ):
+                reason = "already on the active engine"
+            if reason is not None:
+                skipped.append(
+                    {
+                        "model_id": model_id,
+                        "engine_tag": instance.resolved_engine_tag,
+                        "reason": reason,
+                    }
+                )
+                log.info(
+                    "reload_resident_skipped",
+                    model_id=model_id,
+                    reason=reason,
+                    engine_tag=instance.resolved_engine_tag,
+                    active_engine=active,
+                    source=source,
+                )
+                continue
+            try:
+                await self.load(model_id, force=True, source=source)
+                restarted.append(model_id)
+            except Exception as exc:  # noqa: BLE001 - one model's failure is not the others'
+                log.warning("could not restart model", model_id=model_id, error=str(exc))
+                failed.append({"model_id": model_id, "error": str(exc)})
+        return {
+            "restarted": restarted,
+            "skipped": skipped,
+            "failed": failed,
+            "count": len(restarted),
+            "active_engine": active,
+        }
 
     #: Contexts the "Load recommended" buttons offer, and the ones the MCP
     #: docstring names. Not a limit -- any integer up to the trained window is

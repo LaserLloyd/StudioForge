@@ -20,9 +20,11 @@ from studioforge.gui.tabs import (
     admin_control,
     api_request,
     busy,
+    element_alive,
     notify_error,
     require_local_admin,
     run_blocking,
+    single_flight,
     viewer_may_change_box,
 )
 
@@ -316,6 +318,15 @@ def _loaded_panel(ctx: GuiContext) -> None:
     container = ui.column().classes("w-full gap-2")
 
     async def refresh() -> None:
+        # D50: every card's buttons hold this closure and call it after their
+        # own await, and so does the timer. If the page was rebuilt while a
+        # reload ran, ``container`` belongs to a page that no longer exists and
+        # drawing into it raises NiceGUI's "the parent element this slot belongs
+        # to has been deleted" -- which is what the 2026-08-30 reload logged.
+        # The rebuilt page has its own panel and its own timer; this one has
+        # simply nowhere to paint.
+        if not element_alive(container):
+            return
         if in_flight["busy"]:
             return
         in_flight["busy"] = True
@@ -326,8 +337,13 @@ def _loaded_panel(ctx: GuiContext) -> None:
             return
         finally:
             in_flight["busy"] = False
+        if not element_alive(container):
+            return
         stale.set_text("")
         loaded_ids[:] = [instance.model_id for instance, _, _ in entries]
+        # Once per repaint, not once per card: ``active()`` reads ``active.json``
+        # and scans the install dir, and this runs on the refresh timer.
+        active_engine = _active_engine_tag(ctx)
         container.clear()
         with container:
             if not entries:
@@ -336,10 +352,30 @@ def _loaded_panel(ctx: GuiContext) -> None:
                 ).classes("text-sm opacity-70")
                 return
             for instance, introspection, pinned in entries:
-                _loaded_card(ctx, instance, introspection, pinned, refresh)
+                _loaded_card(ctx, instance, introspection, pinned, refresh, active_engine)
 
     ui.timer(ctx.refresh_interval, refresh)
     ui.timer(0.1, refresh, once=True)
+
+
+def _active_engine_tag(ctx: GuiContext) -> str | None:
+    """The build new loads will use, or ``None`` when it cannot be established.
+
+    Every failure is ``None`` rather than an exception: this feeds a badge, and
+    a dashboard that refuses to draw a model's card because the engine manager
+    is missing, unreadable or absent has traded a missing badge for a missing
+    panel. ``None`` simply means the per-child drift comparison has nothing to
+    compare against and stays silent (D50).
+    """
+    manager = ctx.engine_manager
+    if manager is None:
+        return None
+    try:
+        active = manager.active()
+    except Exception:  # noqa: BLE001 - a badge is never worth the card
+        return None
+    tag = getattr(active, "tag", None)
+    return str(tag) if tag else None
 
 
 def _loaded_card(
@@ -348,6 +384,7 @@ def _loaded_card(
     introspection: dict[str, Any] | None,
     pinned: bool,
     refresh: Any,
+    active_engine: str | None = None,
 ) -> None:
     with ui.card().classes("w-full"), ui.column().classes("w-full gap-1"):
         with ui.row().classes("w-full items-center gap-2 no-wrap"):
@@ -377,10 +414,17 @@ def _loaded_card(
                 ui.badge(tier_badge, color="secondary").classes("text-xs").tooltip(
                     st.priority_tooltip(instance.priority)
                 )
-            ui.badge(
-                st.activity_label(introspection),
-                color=st.activity_colour(introspection),
-            ).classes("text-xs")
+            drift = st.instance_engine_drift(
+                getattr(instance, "resolved_engine_tag", None), active_engine
+            )
+            if drift:
+                # D50, the per-child half of the D49 pin-vs-active badge: this
+                # one says the activation has not reached *this* process yet.
+                ui.badge(drift[0], color="warning").classes("text-xs").tooltip(drift[1])
+            # D50: lifecycle before activity -- a child mid-spawn has no slots
+            # to be busy or idle in, and rendered "Idle" for the whole load.
+            chip_label, chip_colour = st.instance_chip(instance, introspection)
+            ui.badge(chip_label, color=chip_colour).classes("text-xs")
             ui.button(
                 icon="push_pin",
                 on_click=lambda model_id=instance.model_id, p=pinned: _toggle_pin(
@@ -452,28 +496,39 @@ async def _toggle_pin(ctx: GuiContext, model_id: str, pinned: bool, refresh: Any
 
 
 async def _unload_one(ctx: GuiContext, model_id: str, refresh: Any) -> None:
-    with busy(message=f"Unloading {model_id}…"):
-        try:
-            await ctx.manager.unload(model_id)
-        except Exception as exc:  # noqa: BLE001
-            notify_error(exc, what="unload")
+    # Keyed per model (D50): unloading two different models at once is normal,
+    # unloading the same one twice is a double-click racing a child's exit.
+    with single_flight(f"models.unload:{model_id}", f"unload of {model_id}") as claimed:
+        if not claimed:
             return
-    ui.notify(f"{model_id} unloaded", type="positive")
-    await refresh()
+        with busy(message=f"Unloading {model_id}…"):
+            try:
+                await ctx.manager.unload(model_id)
+            except Exception as exc:  # noqa: BLE001
+                notify_error(exc, what="unload")
+                return
+        ui.notify(f"{model_id} unloaded", type="positive")
+        await refresh()
 
 
 async def _restart_model(ctx: GuiContext, model_id: str, refresh: Any) -> None:
-    with busy(message=f"Restarting {model_id}…"):
-        try:
-            # A force-load rather than unload-then-load: the planner runs once
-            # against current free VRAM, and a failure never leaves the model
-            # unloaded when it was working a moment ago.
-            instance = await ctx.manager.load(model_id, force=True, source="gui")
-        except Exception as exc:  # noqa: BLE001
-            notify_error(exc, what="restart model")
+    # Keyed per model (D50): a minute-long reload behind a button that stays
+    # enabled is the D50 double-click in miniature, but restarting a *different*
+    # model meanwhile is a legitimate thing to want.
+    with single_flight(f"models.restart:{model_id}", f"restart of {model_id}") as claimed:
+        if not claimed:
             return
-    ui.notify(f"{model_id} restarted on port {instance.port}", type="positive")
-    await refresh()
+        with busy(message=f"Restarting {model_id}…"):
+            try:
+                # A force-load rather than unload-then-load: the planner runs
+                # once against current free VRAM, and a failure never leaves the
+                # model unloaded when it was working a moment ago.
+                instance = await ctx.manager.load(model_id, force=True, source="gui")
+            except Exception as exc:  # noqa: BLE001
+                notify_error(exc, what="restart model")
+                return
+        ui.notify(f"{model_id} restarted on port {instance.port}", type="positive")
+        await refresh()
 
 
 def _unload_all_dialog(ctx: GuiContext, loaded_ids: list[str], refresh: Any) -> None:
@@ -484,14 +539,20 @@ def _unload_all_dialog(ctx: GuiContext, loaded_ids: list[str], refresh: Any) -> 
 
         async def confirm() -> None:
             dialog.close()
-            with busy(message="Unloading every model…"):
-                try:
-                    unloaded = await ctx.manager.unload_all()
-                except Exception as exc:  # noqa: BLE001
-                    notify_error(exc, what="unload all")
+            # D50: the dialog closes on the first click, but a second click
+            # lands before it does often enough -- and this one stops every
+            # child on the box.
+            with single_flight("models.unload_all", "unload all") as claimed:
+                if not claimed:
                     return
-            ui.notify(f"unloaded {len(unloaded)} model(s)", type="positive")
-            await refresh()
+                with busy(message="Unloading every model…"):
+                    try:
+                        unloaded = await ctx.manager.unload_all()
+                    except Exception as exc:  # noqa: BLE001
+                        notify_error(exc, what="unload all")
+                        return
+                ui.notify(f"unloaded {len(unloaded)} model(s)", type="positive")
+                await refresh()
 
         with ui.row().classes("justify-end gap-2 w-full"):
             ui.button("Cancel", on_click=dialog.close).props("flat")
@@ -504,18 +565,27 @@ async def _restart_engines(ctx: GuiContext, refresh: Any) -> None:
 
     Calls the management handler in-process rather than reimplementing its loop,
     so the GUI and the API cannot drift on what "restart the backend" means.
-    """
-    with busy(message="Restarting the inference engines…"):
-        try:
-            require_local_admin(ctx, "restart engines")
-            from studioforge.api.admin_routes import restart_backend
 
-            payload = await restart_backend(api_request(ctx))
-        except Exception as exc:  # noqa: BLE001
-            notify_error(exc, what="restart engines")
+    Deliberately *not* ``only_stale_engine``: "Restart engines" is the control
+    for a misbehaving child, and a child that is misbehaving on the active build
+    is exactly the one a staleness filter would skip.
+    """
+    # D50: minutes of reloads behind a button that never disables. Same key
+    # shape as every other long action, so a second click is told, not obeyed.
+    with single_flight("models.restart_engines", "engine restart") as claimed:
+        if not claimed:
             return
-    ui.notify(st.restart_backend_note(payload), type="positive", multi_line=True)
-    await refresh()
+        with busy(message="Restarting the inference engines…"):
+            try:
+                require_local_admin(ctx, "restart engines")
+                from studioforge.api.admin_routes import restart_backend
+
+                payload = await restart_backend(api_request(ctx))
+            except Exception as exc:  # noqa: BLE001
+                notify_error(exc, what="restart engines")
+                return
+        ui.notify(st.restart_backend_note(payload), type="positive", multi_line=True)
+        await refresh()
 
 
 def _restart_server_dialog(ctx: GuiContext, banner: Any) -> None:
@@ -531,20 +601,26 @@ def _restart_server_dialog(ctx: GuiContext, banner: Any) -> None:
 
         async def confirm() -> None:
             dialog.close()
-            banner.set_text("Restarting the server… this page will reconnect by itself.")
-            try:
-                require_local_admin(ctx, "restart server")
-                from studioforge.api.admin_routes import restart_server
+            # D50: two restart requests are two respawn attempts racing one
+            # dying process, which is how a restart turns into a box with no
+            # gateway on it.
+            with single_flight("server.restart", "server restart") as claimed:
+                if not claimed:
+                    return
+                banner.set_text("Restarting the server… this page will reconnect by itself.")
+                try:
+                    require_local_admin(ctx, "restart server")
+                    from studioforge.api.admin_routes import restart_server
 
-                # confirm=True is required by the endpoint; the dialog above is
-                # what that confirmation means here.
-                payload = await restart_server(api_request(ctx), confirm=True)
-            except Exception as exc:  # noqa: BLE001
-                banner.set_text("")
-                notify_error(exc, what="restart server")
-                return
-            banner.set_text(st.restart_server_note(payload))
-            ui.notify(st.restart_server_note(payload), type="warning", multi_line=True)
+                    # confirm=True is required by the endpoint; the dialog above
+                    # is what that confirmation means here.
+                    payload = await restart_server(api_request(ctx), confirm=True)
+                except Exception as exc:  # noqa: BLE001
+                    banner.set_text("")
+                    notify_error(exc, what="restart server")
+                    return
+                banner.set_text(st.restart_server_note(payload))
+                ui.notify(st.restart_server_note(payload), type="warning", multi_line=True)
 
         with ui.row().classes("justify-end gap-2 w-full"):
             ui.button("Cancel", on_click=dialog.close).props("flat")

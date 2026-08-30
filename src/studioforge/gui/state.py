@@ -27,6 +27,7 @@ import types
 import typing
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import PurePath
 from typing import Any, Final
 
@@ -246,6 +247,32 @@ def format_datetime(epoch: float | int | None) -> str:
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(float(epoch)))
 
 
+def log_stamp_utc(epoch: float | int | None) -> str:
+    """A log record's time in structlog's own ``iso`` shape (D50).
+
+    Only the log views use this. Everything else on the panel legitimately
+    shows local time -- a TTL, a download's "2 hours ago" -- and
+    :func:`format_timestamp` stays exactly as it was for them.
+
+    A log is the one surface where two clocks cannot coexist. The ring buffer
+    holds both already-rendered structlog lines (which carry their own
+    ``2026-08-30T04:20:33.044095Z``) and plain-stdlib records that
+    :func:`log_line_text` has to stamp itself, and stamping those with local
+    ``%H:%M:%S`` interleaved "13:20:33" with "04:20:33Z" in the same scrolling
+    box -- 9 hours apart, same instant, no marking to say so. That is not a
+    cosmetic complaint: the 2026-08-30 review had to hand-convert NiceGUI's
+    error line before it could be placed against the reload it came from.
+
+    The rendering is structlog's, not an imitation of it: ``TimeStamper(fmt=
+    "iso")`` is ``datetime.now(UTC).isoformat()`` with ``+00:00`` swapped for
+    ``Z``, so the same instant formats identically whichever half of the buffer
+    it came from -- including the dropped-microseconds case on an exact second.
+    """
+    if epoch is None:
+        return UNKNOWN
+    return datetime.fromtimestamp(float(epoch), tz=UTC).isoformat().replace("+00:00", "Z")
+
+
 def format_when(epoch: float | int | None, *, now: float | None = None) -> str:
     """Human "when", coarsening with age: ``"2 hours ago"`` … ``"18 Jul 2025"``.
 
@@ -313,11 +340,15 @@ def log_line_text(entry: Mapping[str, Any]) -> str:
     second timestamp and level printed every line's metadata twice. A message
     that clearly carries its own header is therefore shown as-is, and the
     prefix is only added for plain-stdlib records that need one.
+
+    That prefix is UTC (D50). The two kinds of line sit in one scrolling box
+    and used to be stamped from two different clocks -- see
+    :func:`log_stamp_utc` for why one of them had to give.
     """
     message = str(entry.get("message") or entry.get("msg") or "")
     if _RENDERED_LOG_LINE_RE.match(message):
         return message.rstrip()
-    stamp = format_timestamp(entry.get("ts"))
+    stamp = log_stamp_utc(entry.get("ts"))
     level = str(entry.get("level") or "INFO")
     logger = str(entry.get("logger") or "")
     prefix = f"{stamp} {level:<8}"
@@ -883,6 +914,45 @@ def activity_colour(introspection: Mapping[str, Any] | None) -> str:
     return ACTIVITY_COLOURS.get(activity_state(introspection), "grey")
 
 
+def instance_chip(instance: Any, introspection: Mapping[str, Any] | None) -> tuple[str, str]:
+    """``(label, colour)`` for a child's status badge -- lifecycle first (D50).
+
+    :func:`activity_label` answers "what is this model doing with its slots",
+    which is only a question once there *are* slots. A child that is still
+    spawning has none, cannot answer ``/slots``, and therefore fell through to
+    the empty-activity branch and rendered "Idle" -- next to ``actual ctx —``,
+    ``0 busy / 0 idle``, ``build —``. The 2026-08-30 snapshot caught a 27B model
+    wearing that for ~30 seconds of load, indistinguishable from a hung idle
+    child, on the one screen an operator opens to find out whether the thing is
+    coming up. ``failed`` had the same hole.
+
+    So the instance's own state wins where it has something to say, and
+    everything else -- the whole of normal running -- falls through to the
+    activity pair unchanged.
+    """
+    state = str(getattr(instance, "state", "") or "")
+    if state == "loading":
+        return ("Loading…", "warning")
+    if state == "failed":
+        return ("Failed", "negative")
+    return (activity_label(introspection), activity_colour(introspection))
+
+
+def loaded_count_text(instances: Sequence[Any]) -> str:
+    """The header's model count, with a spawn in flight broken out (D50).
+
+    ``f"{len(loaded)} loaded"`` counted a child that is still loading as loaded,
+    so the header claimed residency the moment a spawn started and said nothing
+    while the weights streamed -- the same blind spot as the Dashboard chip, on
+    the one line that is visible from every tab. A load in flight is the state
+    an operator most wants named, so it gets its own count and the "loaded"
+    number goes back to meaning what it says.
+    """
+    loading = sum(1 for instance in instances if str(getattr(instance, "state", "")) == "loading")
+    text = f"{len(instances) - loading} loaded"
+    return f"{text} · {loading} loading" if loading else text
+
+
 def activity_slots_text(introspection: Mapping[str, Any] | None) -> str:
     """``busy/idle`` from the derived activity, falling back to ``/slots``."""
     activity = _activity(introspection)
@@ -1052,22 +1122,127 @@ def unload_all_prompt(model_ids: Sequence[str]) -> str:
     )
 
 
+def already_running_note(what: str) -> str:
+    """What a second click on an already-running action is told (D50).
+
+    Said rather than swallowed. A long action that answers a click with nothing
+    at all is how the 2026-08-30 double-click happened in the first place: the
+    button did not disable, the first run was invisible for thirty seconds, and
+    the natural response to a dead-looking button is to press it again.
+    """
+    return (
+        f"{what} is already running. This click was ignored — the first one is still "
+        "in flight, and its result will appear when it finishes."
+    )
+
+
+#: ``ModelManager.reload_resident``'s skip reasons, verbatim. Matched (rather
+#: than reformatted) so an unrecognised reason still reaches the operator below
+#: instead of being silently dropped.
+SKIP_ALREADY_CURRENT: Final = "already on the active engine"
+SKIP_LOADING: Final = "loading"
+
+
+def _skip_phrases(skipped: Any) -> list[str]:
+    """``reload_resident``'s ``skipped`` rows as display phrases (D50).
+
+    A skip is a *result*, not an absence: "already on the active engine" is what
+    makes a second activation cost nothing, and hiding it renders an idempotent
+    second click as "nothing happened" -- which reads as a failure and invites a
+    third. Each reason is counted and its models named, because "2 skipped" over
+    a four-model box is the question, not the answer.
+    """
+    current: list[str] = []
+    loading: list[str] = []
+    other: list[str] = []
+    for entry in _sequence(skipped):
+        if not isinstance(entry, Mapping):
+            continue
+        model_id = str(entry.get("model_id") or UNKNOWN)
+        reason = str(entry.get("reason") or "").strip()
+        if reason == SKIP_ALREADY_CURRENT:
+            current.append(model_id)
+        elif reason == SKIP_LOADING:
+            loading.append(model_id)
+        else:
+            other.append(f"{model_id} ({reason})" if reason else model_id)
+    phrases: list[str] = []
+    if current:
+        phrases.append(f"{len(current)} already on the active engine: {', '.join(current)}")
+    if loading:
+        phrases.append(f"{len(loading)} still loading, left alone: {', '.join(loading)}")
+    if other:
+        phrases.append(f"skipped: {', '.join(other)}")
+    return phrases
+
+
+def _failure_phrases(failed: Any) -> list[str]:
+    """``{model_id, error}`` rows, one named phrase each.
+
+    Never a bare count: "3 of 4 restarted" leaves the operator hunting for which
+    one did not.
+    """
+    return [
+        f"FAILED {item.get('model_id')}: {item.get('error')}"
+        for item in _sequence(failed)
+        if isinstance(item, Mapping)
+    ]
+
+
 def restart_backend_note(payload: Mapping[str, Any] | None) -> str:
     """Outcome line for ``POST /api/restart/backend``.
 
-    Failures are named individually rather than folded into a count: "3 of 4
-    restarted" leaves the operator hunting for which one did not.
+    Skips are reported (D50). Before the shared ``reload_resident`` loop the
+    only two outcomes were restarted and failed, so "neither" could only mean
+    an empty box -- and this said exactly that. It is now also what an
+    everything-was-already-current run and an everything-was-mid-load run look
+    like, and answering either of those with "no models are loaded" tells the
+    operator something that is plainly false while they watch the models run.
     """
     if not payload:
         return "nothing to restart — no models are loaded"
     restarted = [str(m) for m in (payload.get("restarted") or [])]
-    failed = payload.get("failed") or []
-    if not restarted and not failed:
+    skips = _skip_phrases(payload.get("skipped"))
+    failures = _failure_phrases(payload.get("failed"))
+    if not restarted and not skips and not failures:
         return "nothing to restart — no models are loaded"
     parts = [f"restarted {len(restarted)} engine(s): {', '.join(restarted)}"] if restarted else []
-    for item in failed:
-        if isinstance(item, Mapping):
-            parts.append(f"FAILED {item.get('model_id')}: {item.get('error')}")
+    if not restarted and skips:
+        parts.append("nothing needed restarting")
+    parts.extend(skips)
+    parts.extend(failures)
+    return " · ".join(parts)
+
+
+def engine_adopt_note(tag: Any, payload: Mapping[str, Any] | None) -> str:
+    """Outcome line for "activate + reload" (D50).
+
+    Three facts, because the button does three things and used to report one:
+    which models moved onto the new build, how many were already on it, and --
+    named, with their ids -- which ones did not make it.
+
+    The old loop was ``for model_id in loaded: load(force=True)`` inside a
+    single try, so the first failure aborted it: every model after the failing
+    one was left on the old engine, the toast never appeared, and the red one
+    that replaced it named a single model. A partial adoption has to be legible,
+    since it is the case where somebody has to go and do something.
+
+    The already-current count is the other half. With ``only_stale_engine`` a
+    second click restarts nothing at all, and a control that says "nothing"
+    after being pressed does not look idempotent, it looks broken.
+    """
+    name = str(tag or "").strip() or UNKNOWN
+    data = payload or {}
+    restarted = [str(m) for m in (data.get("restarted") or [])]
+    skips = _skip_phrases(data.get("skipped"))
+    failures = _failure_phrases(data.get("failed"))
+    parts = [f"{name} is now the active engine"]
+    if restarted:
+        parts.append(f"reloaded {len(restarted)} model(s) onto it: {', '.join(restarted)}")
+    parts.extend(skips)
+    parts.extend(failures)
+    if not restarted and not skips and not failures:
+        parts.append("nothing was loaded, so nothing needed reloading")
     return " · ".join(parts)
 
 
@@ -3555,6 +3730,35 @@ def engine_drift_badge(pinned: Any, active: Any) -> str | None:
     return f"pin {pin} · active {running}"
 
 
+def instance_engine_drift(resolved: Any, active: Any) -> tuple[str, str] | None:
+    """``(badge, tooltip)`` for a child running something other than the active
+    build, or ``None`` (D50).
+
+    The per-child half of :func:`engine_drift_badge`. That one compares two
+    *settings* and answers "will the next load use what I pinned"; this one
+    compares a running process against the active build and answers "did the
+    engine I activated actually reach this model" -- which is the question the
+    activation button exists to close, and which nothing on the panel could
+    answer before ``resolved_engine_tag`` existed.
+
+    Silent unless both tags are known. ``resolved_engine_tag`` is ``None`` when
+    the child's build could not be identified at all, and an unprovable child is
+    not a drifting child: badging it would put a permanent warning on every row
+    of an install whose engines cannot be resolved, which is how a warning stops
+    being read.
+    """
+    running = str(resolved or "").strip()
+    current = str(active or "").strip()
+    if not running or not current or running == current:
+        return None
+    return (
+        f"engine {running}",
+        f"This child is running {running}; the active engine is {current}. A running "
+        "llama-server keeps the build it was launched with — restart this model (or "
+        "use 'Restart engines') to move it onto the active one.",
+    )
+
+
 def engine_keep_versions_note(installed: int, keep_versions: int) -> str | None:
     """The pruning overage, said out loud rather than acted on (D49-15).
 
@@ -4755,6 +4959,10 @@ CONFIG_FIELD_HELP: Final[Mapping[str, str]] = {
         "that quality; throughput = the biggest window, preferring one that serves two slots."
     ),
     "planner.compute_overhead_fraction": "Calibrated allowance for compute and graph buffers.",
+    "planner.observed_correction": (
+        "Trust what a configuration measured on its last load over the formula, within "
+        "0.60-1.30 of the formula's answer (D51). Off = plan from the formula alone."
+    ),
     "gateway.allow_private_image_hosts": (
         "Let a request's image_url fetch loopback/LAN/link-local hosts. Off is the SSRF "
         "guard: the caller picks the URL, so on an open install it would be an "

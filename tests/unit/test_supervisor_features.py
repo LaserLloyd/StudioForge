@@ -24,10 +24,12 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import Callable, Sequence
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from studioforge.config import Config
+from studioforge.config import CACHE_RAM_MIN_GRANT_MIB, Config, grant_cache_ram_mib
+from studioforge.core import supervisor as supervisor_module
 from studioforge.core.engine import EngineFeatures, parse_engine_features
 from studioforge.core.supervisor import (
     DEFAULT_SPEC_DRAFT_N_MAX,
@@ -458,6 +460,203 @@ def test_cache_ram_honours_an_explicit_value(config: Config, tmp_path: Path) -> 
         make_record(tmp_path), make_plan(), port=18100, features=B10425
     )
     assert value_after(argv, "--cache-ram") == "4096"
+
+
+# ---------------------------------------------------------------------------
+# --cache-ram is a machine-wide pool under "auto" (D50)
+# ---------------------------------------------------------------------------
+
+
+def hold_cache_ram(supervisor: Supervisor, tmp_path: Path, **grants: int) -> None:
+    """Put live children in the table holding the given grants, in MiB."""
+    for model_id, granted in grants.items():
+        plan = make_plan()
+        supervisor._instances[model_id] = _Instance(
+            info=InstanceInfo(model_id=model_id, state="ready", plan=plan, cache_ram_mib=granted),
+            record=make_record(tmp_path, model_id),
+            plan=plan,
+            port=18100,
+            engine_tag="b10425",
+            draft=None,
+            adapters=(),
+            log_path=tmp_path / f"{model_id}.log",
+        )
+
+
+def test_the_automatic_grant_is_what_the_other_children_are_not_holding(
+    config: Config, tmp_path: Path
+) -> None:
+    """Before D50 every child was handed the whole 25%-of-RAM allowance, so four
+    residents promised four times it and the "this can never make the box swap"
+    comment was only true for one of them."""
+    supervisor = sup(config, make_binary(tmp_path))
+    pool = supervisor._cache_ram_grant()
+    assert pool is not None
+
+    hold_cache_ram(supervisor, tmp_path, first=pool // 2)
+
+    assert supervisor._cache_ram_grant() == pool - pool // 2
+
+
+def test_the_grants_of_the_live_children_add_up_to_the_pool(config: Config, tmp_path: Path) -> None:
+    """To the pool, not to a multiple of it. Before D50 each of these children
+    was handed the whole allowance."""
+    supervisor = sup(config, make_binary(tmp_path))
+    pool = supervisor._cache_ram_grant()
+    assert pool is not None and pool > 4 * CACHE_RAM_MIN_GRANT_MIB
+
+    share = pool // 4
+    hold_cache_ram(supervisor, tmp_path, m0=share, m1=share)
+    grant = supervisor._cache_ram_grant()
+
+    assert grant == pool - 2 * share
+    assert 2 * share + grant <= pool, "three residents, one pool's worth of RAM"
+
+
+def test_a_starved_grant_is_floored_rather_than_switched_off(
+    config: Config, tmp_path: Path
+) -> None:
+    """``--cache-ram 0`` does not mean "a small cache", it turns the host prompt
+    cache off. A starved cache still recovers some evicted prefixes."""
+    supervisor = sup(config, make_binary(tmp_path))
+    pool = supervisor._cache_ram_grant()
+    assert pool is not None
+
+    hold_cache_ram(supervisor, tmp_path, hog=pool)
+
+    assert supervisor._cache_ram_grant() == CACHE_RAM_MIN_GRANT_MIB
+
+
+def test_the_floor_pushing_past_the_pool_is_said_out_loud(
+    config: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Past the floor the pool is an intention rather than a bound, and the
+    operator staring at a swapping box needs the numbers to see that."""
+    supervisor = sup(config, make_binary(tmp_path))
+    pool = supervisor._cache_ram_grant()
+    assert pool is not None
+    hold_cache_ram(supervisor, tmp_path, hog=pool)
+
+    warnings: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        supervisor_module,
+        "log",
+        SimpleNamespace(
+            warning=lambda event, **fields: warnings.append((event, fields)),
+            info=lambda *_a, **_kw: None,
+            debug=lambda *_a, **_kw: None,
+        ),
+    )
+    supervisor._cache_ram_grant()
+
+    assert [event for event, _ in warnings] == ["cache_ram_pool_oversubscribed"]
+    fields = warnings[0][1]
+    assert fields["pool_mib"] == pool
+    assert fields["held_mib"] == pool
+    assert fields["grant_mib"] == CACHE_RAM_MIN_GRANT_MIB
+
+
+def test_an_arriving_child_does_not_have_to_share_with_itself(
+    config: Config, tmp_path: Path
+) -> None:
+    """``start`` inserts the instance before ``_spawn`` runs, so its own row is
+    in the table by the time the grant is computed. A reload re-grants correctly
+    for the same reason from the other side: the outgoing child is stopped, and
+    out of the table, before the replacement spawns."""
+    supervisor = sup(config, make_binary(tmp_path))
+    pool = supervisor._cache_ram_grant()
+    assert pool is not None
+    hold_cache_ram(supervisor, tmp_path, mine=pool // 2)
+
+    assert supervisor._cache_ram_grant(exclude="mine") == pool
+
+
+def test_an_explicit_value_stays_per_child_verbatim(config: Config, tmp_path: Path) -> None:
+    """The operator named a number; every child gets that number (D14). Only the
+    automatic setting ever claimed the total was bounded."""
+    config.engine.cache_ram_mb = 8192
+    supervisor = sup(config, make_binary(tmp_path))
+    hold_cache_ram(supervisor, tmp_path, first=8192, second=8192, third=8192)
+
+    assert supervisor._cache_ram_grant() == 8192
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_the_disabling_values_are_passed_through_untouched(
+    config: Config, tmp_path: Path, value: int
+) -> None:
+    config.engine.cache_ram_mb = value
+    supervisor = sup(config, make_binary(tmp_path))
+    assert supervisor._cache_ram_grant() == value
+
+
+def test_an_unlimited_grant_is_not_counted_as_a_negative_share(
+    config: Config, tmp_path: Path
+) -> None:
+    """You cannot subtract "all of it" from a pool, and nobody may end up with
+    MORE than the pool because somebody else holds -1."""
+    supervisor = sup(config, make_binary(tmp_path))
+    pool = supervisor._cache_ram_grant()
+    hold_cache_ram(supervisor, tmp_path, unlimited=-1)
+
+    assert supervisor._cache_ram_grant() == pool
+
+
+def test_the_pool_arithmetic_needs_no_supervisor() -> None:
+    assert grant_cache_ram_mib(32768, 0) == 32768
+    assert grant_cache_ram_mib(32768, 8192) == 24576
+    assert grant_cache_ram_mib(32768, 32768) == CACHE_RAM_MIN_GRANT_MIB
+    assert grant_cache_ram_mib(32768, 999999) == CACHE_RAM_MIN_GRANT_MIB
+    assert grant_cache_ram_mib(32768, -5000) == 32768
+
+
+def test_the_argv_carries_the_grant_the_instance_records(config: Config, tmp_path: Path) -> None:
+    """One computation, two readers: a second one could disagree with the first
+    and then GET /api/models would be reporting a number nothing was launched
+    with."""
+    supervisor = sup(config, make_binary(tmp_path))
+    argv = supervisor.build_command(
+        make_record(tmp_path), make_plan(), port=18100, features=B10425, cache_ram_mib=1234
+    )
+    assert value_after(argv, "--cache-ram") == "1234"
+
+
+# ---------------------------------------------------------------------------
+# Which build a launch actually lands on (D50)
+# ---------------------------------------------------------------------------
+
+
+def test_the_resolved_engine_tag_comes_from_the_injected_resolver(
+    config: Config, tmp_path: Path
+) -> None:
+    """The engine manager's own answer, taken off the EngineInfo the binary was
+    chosen from -- not a string parsed out of a path."""
+    supervisor = Supervisor(
+        config,
+        resolve_binary=resolver(make_binary(tmp_path)),
+        resolve_engine_tag=lambda tag: tag or "b10689",
+    )
+    assert supervisor.active_engine_tag() == "b10689"
+    assert supervisor.resolved_engine_tag("b10425") == "b10425"
+
+
+def test_without_a_resolver_the_build_directory_names_the_engine(
+    config: Config, tmp_path: Path
+) -> None:
+    """A plausible tag beats None for a supervisor built without an engine
+    manager -- the GUI's command preview, every test."""
+    assert sup(config, make_binary(tmp_path)).active_engine_tag() == "b10425"
+
+
+def test_an_unresolvable_engine_answers_none_rather_than_raising(config: Config) -> None:
+    """Naming the build is bookkeeping. A load must not fail because of it, and
+    None reads as "cannot prove this child is current", which reloads."""
+
+    def explode(_tag: str | None) -> Path:
+        raise RuntimeError("no engine is installed")
+
+    supervisor = Supervisor(config, resolve_binary=explode)
+    assert supervisor.active_engine_tag() is None
 
 
 def test_no_new_flags_reach_an_engine_that_does_not_advertise_them(

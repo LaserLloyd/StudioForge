@@ -875,6 +875,34 @@ class InstanceInfo(BaseModel):
     port: int | None = None
     pid: int | None = None
     engine_tag: str | None = None
+    #: The build this child was ACTUALLY launched with. ``engine_tag`` above is
+    #: the per-model pin *request*, and it is ``None`` for almost every load
+    #: because "whatever is active" is what almost every load asks for -- so on
+    #: 2026-08-30 a log review trying to answer "is this resident already on the
+    #: engine I just activated?" found every ``model_ready`` line saying
+    #: ``engine_tag=None`` and could not tell. Nothing could, which is why
+    #: "activate + reload" reloaded every child unconditionally and a
+    #: double-clicked button reloaded them all twice (D50). Filled at spawn from
+    #: the engine the binary was resolved out of; ``None`` only when the engine
+    #: could not be identified at all, which every reader must treat as "cannot
+    #: prove this child is current" rather than as a match.
+    resolved_engine_tag: str | None = None
+    #: Monotonic launch counter, stamped by the supervisor when this child was
+    #: deliberately started. It exists so a forced reload that spent minutes
+    #: queued behind an *identical* forced reload can prove the child serving
+    #: now is NEWER than its own request -- i.e. that somebody already did the
+    #: restart it was about to do -- and fold instead of restarting a child that
+    #: is seconds old (D50). A crash relaunch deliberately does not bump it: a
+    #: reload queued behind a crash is a human asking for a clean child, and the
+    #: relaunch was not what they asked for.
+    spawn_seq: int = 0
+    #: MiB of host RAM this child was granted for its ``--cache-ram`` prompt
+    #: cache, or ``None`` when the engine has no such flag. Recorded because
+    #: under ``cache_ram_mb: "auto"`` the grant comes out of a machine-wide pool
+    #: (D50) -- before that, N residents each promised 25% of system RAM and the
+    #: "this cache can never be the reason the box swaps" claim only held for
+    #: one of them -- and a pool nobody can see the shares of is unauditable.
+    cache_ram_mib: int | None = None
     plan: LoadPlan | None = None
     started_at: float | None = None
     last_activity_at: float | None = None

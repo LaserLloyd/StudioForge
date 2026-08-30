@@ -54,7 +54,12 @@ from typing import IO, TYPE_CHECKING, Any
 import httpx
 import psutil
 
-from studioforge.config import Config, resolve_cache_ram_mb
+from studioforge.config import (
+    CACHE_RAM_MIN_GRANT_MIB,
+    Config,
+    grant_cache_ram_mib,
+    resolve_cache_ram_mb,
+)
 from studioforge.core.engine import EngineFeatures, probe_engine_features
 from studioforge.core.planner import attention_kind, effective_ubatch, is_moe
 from studioforge.errors import ModelLoadError, ModelUnloadError
@@ -827,9 +832,25 @@ class Supervisor:
         launch_prefix: Sequence[str] = (),
         probe: GpuProbe | None = None,
         engine_features: Callable[[str | None], EngineFeatures] | None = None,
+        resolve_engine_tag: Callable[[str | None], str | None] | None = None,
     ) -> None:
         self._config = config
         self._resolve_binary = resolve_binary
+        # Third callable of the same injection family as resolve_binary and
+        # engine_features: maps a REQUESTED tag (None = "the active engine") to
+        # the tag that request actually lands on. It has to be separate from
+        # resolve_binary because that one returns a Path and a path is not an
+        # answer -- D50 needs the engine manager's own idea of the build, from
+        # the same EngineInfo the binary came out of, so that "this child is
+        # already on b10689" is a fact rather than a string parsed off a
+        # directory name. The default does parse the directory name, because a
+        # supervisor built without an engine manager (the GUI command preview,
+        # every test) should still degrade to a plausible tag rather than None.
+        self._resolve_engine_tag = resolve_engine_tag or self._engine_tag_from_binary
+        # Monotonic count of deliberate starts. See InstanceInfo.spawn_seq: it
+        # is what lets a queued forced reload tell "the child I was going to
+        # restart" from "a child somebody restarted while I waited".
+        self._spawn_seq = 0
         # Same injection story as resolve_binary: a callable, not the engine
         # manager, so this module keeps knowing nothing about it. The default
         # reads engines/<tag>/features.json (written at boot), falling back to
@@ -880,6 +901,43 @@ class Supervisor:
         self._features[key] = features
         return features
 
+    def _engine_tag_from_binary(self, tag: str | None) -> str | None:
+        """Default ``resolve_engine_tag``: the build directory's own name.
+
+        Engines live at ``engines/<tag>/llama-server.exe``, so the parent
+        directory *is* the tag. Only a fallback -- the injected resolver reads
+        it off the ``EngineInfo`` the binary was chosen from, which is the same
+        answer without the layout assumption -- but a plausible tag beats
+        ``None`` for a supervisor built without an engine manager, and ``None``
+        is what every D50 comparison reads as "cannot prove this is current".
+        """
+        return self._resolve_binary(tag).parent.name or None
+
+    def resolved_engine_tag(self, tag: str | None) -> str | None:
+        """Which build a launch asking for ``tag`` would actually use.
+
+        ``None`` when the engine cannot be identified -- nothing is installed,
+        the pinned tag is missing, the resolver threw. Never raises: this is
+        bookkeeping, and a load must not fail because we could not name the
+        build it is about to run. The spawn itself fails loudly a few lines
+        later if the binary is genuinely unresolvable.
+        """
+        try:
+            resolved = self._resolve_engine_tag(tag)
+        except Exception as exc:  # noqa: BLE001 - see the docstring
+            log.warning("engine_tag_unresolved", engine_tag=tag, error=str(exc))
+            return None
+        return str(resolved) if resolved else None
+
+    def active_engine_tag(self) -> str | None:
+        """The build a load that pins nothing would launch with, or ``None``.
+
+        The one question "activate + reload" has to answer to be idempotent:
+        a resident whose :attr:`InstanceInfo.resolved_engine_tag` already equals
+        this needs no reload at all (D50).
+        """
+        return self.resolved_engine_tag(None)
+
     # ------------------------------------------------------------------
     # Command building
     # ------------------------------------------------------------------
@@ -895,6 +953,7 @@ class Supervisor:
         adapters: Sequence[tuple[AdapterRecord, float]] = (),
         features: EngineFeatures | None = None,
         resolved: ResolvedFeatures | None = None,
+        cache_ram_mib: int | None = None,
     ) -> list[str]:
         """Build the full argv for one ``llama-server`` child.
 
@@ -910,7 +969,13 @@ class Supervisor:
         GUI's command-line preview and by tests) it defaults to "advertises
         nothing", which yields the pre-gating flag surface -- never a guess.
         ``resolved`` lets :meth:`_spawn` pass in a resolution it has already
-        recorded on the plan instead of computing it twice.
+        recorded on the plan instead of computing it twice. ``cache_ram_mib``
+        is there for the same reason and matters more: under ``"auto"`` the
+        ``--cache-ram`` grant depends on what the other live children hold, so
+        :meth:`_spawn` computes it once, stamps it on the instance and passes it
+        here -- the number in the argv and the number ``GET /api/models`` shows
+        are then the same number, not two computations that can disagree.
+        Omitted (preview, tests) it is computed from the current instance table.
         """
         settings = record.settings
         binary = self._resolve_binary(engine_tag or settings.engine_tag)
@@ -955,7 +1020,7 @@ class Supervisor:
         # loudly instead. Verified accepted by b10425.
         argv += ["--fit", "off"]
 
-        argv += self._optional_args(record, plan, engine)
+        argv += self._optional_args(record, plan, engine, cache_ram_mib=cache_ram_mib)
         argv += self._concurrency_args(record, plan, engine)
 
         if record.kind == "embedding":
@@ -1016,8 +1081,60 @@ class Supervisor:
         args += ["--main-gpu", str(main)]
         return args
 
+    def _cache_ram_grant(self, *, exclude: str | None = None) -> int | None:
+        """MiB for this child's ``--cache-ram``, or ``None`` to pass nothing.
+
+        Two settings, two scopes (D50). An explicit ``engine.cache_ram_mb``
+        integer is the operator's own number and every child gets it verbatim,
+        including ``0`` (off) and ``-1`` (no limit) -- D14 says an explicit
+        value is honoured, and the total is then theirs to reason about.
+
+        ``"auto"`` is a machine-wide POOL, and this is where it is divided. The
+        old reading handed the full pool to every child, so the comment
+        promising the cache "can never be the reason the machine starts
+        swapping" was only true for one resident: four of them on this rig
+        promised 4 x 32 GiB of a 128 GiB box. Each spawn now gets what the other
+        LIVE children were not granted, floored so that the last one in still
+        has a cache at all. ``exclude`` drops the arriving child's own row --
+        :meth:`start` inserts it before :meth:`_spawn` runs, and a child must
+        not be asked to share with itself.
+
+        Unlimited grants (``-1``) are counted as zero rather than as a negative
+        share: you cannot subtract "all of it" from a pool, and the operator who
+        typed ``-1`` opted out of the accounting anyway.
+        """
+        configured = self._config.engine.cache_ram_mb
+        resolved = resolve_cache_ram_mb(configured)
+        if configured != "auto" or resolved is None:
+            return resolved
+        held = sum(
+            inst.info.cache_ram_mib or 0
+            for model_id, inst in self._instances.items()
+            if model_id != exclude and (inst.info.cache_ram_mib or 0) > 0
+        )
+        grant = grant_cache_ram_mib(resolved, held)
+        if held + grant > resolved:
+            # The floor won, which means the pool is now an intention rather
+            # than a bound. Say so with the numbers: this is the one line that
+            # tells an operator staring at a swapping box that the automatic
+            # cache is over-committed and the fix is a smaller explicit value.
+            log.warning(
+                "cache_ram_pool_oversubscribed",
+                pool_mib=resolved,
+                held_mib=held,
+                grant_mib=grant,
+                floor_mib=CACHE_RAM_MIN_GRANT_MIB,
+                residents=len(self._instances) - (1 if exclude in self._instances else 0),
+            )
+        return grant
+
     def _optional_args(
-        self, record: ModelRecord, plan: LoadPlan, features: EngineFeatures
+        self,
+        record: ModelRecord,
+        plan: LoadPlan,
+        features: EngineFeatures,
+        *,
+        cache_ram_mib: int | None = None,
     ) -> list[str]:
         settings = record.settings
         args: list[str] = []
@@ -1051,8 +1168,12 @@ class Supervisor:
         # memory, so the next request that carries it does not re-prefill.
         # Costs no VRAM (measured identical at 8192 and 32768 MiB) and cannot
         # change a token, so it is on by default under the quality-first rule.
+        # It does cost host RAM, though, which is why the automatic setting is
+        # a shared pool rather than a per-child allowance -- see
+        # _cache_ram_grant. The precomputed value wins so that the argv and the
+        # instance's recorded grant cannot drift apart.
         if features.cache_ram:
-            cache_ram = resolve_cache_ram_mb(self._config.engine.cache_ram_mb)
+            cache_ram = cache_ram_mib if cache_ram_mib is not None else self._cache_ram_grant()
             if cache_ram is not None:
                 args += ["--cache-ram", str(cache_ram)]
 
@@ -1323,6 +1444,12 @@ class Supervisor:
         whoever asked for it (D36). ``priority`` is the load's tier (D46),
         stamped the same way; the crash-relaunch loop reuses this instance's
         info, so the tier survives a restart.
+
+        Every child that gets here also gets a ``spawn_seq`` (D50). It counts
+        *deliberate* starts, not processes -- the crash-relaunch loop reuses
+        this same info and leaves the number alone -- because its one reader is
+        a forced reload asking "did somebody already do the restart I queued
+        for?", and a crash is not somebody doing it.
         """
         async with self._lock(record.id):
             existing = self._instances.get(record.id)
@@ -1332,11 +1459,13 @@ class Supervisor:
 
             tag = engine_tag or record.settings.engine_tag
             port = self._allocate_port()
+            self._spawn_seq += 1
             info = InstanceInfo(
                 model_id=record.id,
                 state="loading",
                 port=port,
                 engine_tag=tag,
+                spawn_seq=self._spawn_seq,
                 plan=plan,
                 ttl_s=record.settings.ttl_s,
                 loaded_by=source,
@@ -1373,19 +1502,40 @@ class Supervisor:
             inst.info.started_at = time.time()
             inst.info.last_activity_at = time.time()
             inst.watcher = asyncio.create_task(self._watch(inst), name=f"sf-watch-{record.id}")
+            # ``engine_tag`` here is the build this child is RUNNING, not the
+            # build it asked for. Until D50 it was the request, which is None
+            # for almost every load -- so the 2026-08-30 log said
+            # `engine_tag=None` on both halves of a double reload and no reader
+            # could tell that the second round was pure churn. The request is
+            # only worth a field of its own when it was an actual per-model pin.
+            extra: dict[str, Any] = {"pinned_engine_tag": tag} if tag else {}
             log.info(
                 "model_ready",
                 model_id=record.id,
                 port=port,
                 pid=inst.info.pid,
-                engine_tag=tag,
+                engine_tag=inst.info.resolved_engine_tag,
+                spawn_seq=inst.info.spawn_seq,
                 source=source,
+                **extra,
             )
             return inst.info
 
     async def _spawn(self, inst: _Instance) -> None:
         """Create the child process and start pumping its output."""
         features = await self.features_for(inst.engine_tag)
+        # Which build this child will actually be, recorded before the argv is
+        # even built (D50): `inst.engine_tag` is the request, and a request of
+        # None -- what almost every load carries -- names nothing at all.
+        inst.info.resolved_engine_tag = self.resolved_engine_tag(inst.engine_tag)
+        # The host prompt cache comes out of a shared pool under "auto", so the
+        # grant depends on what the other live children hold and has to be
+        # computed here, once, rather than independently by whoever asks. Only
+        # when the engine actually offers the flag: a grant nobody spends is a
+        # phantom holding down everybody else's share.
+        inst.info.cache_ram_mib = (
+            self._cache_ram_grant(exclude=inst.record.id) if features.cache_ram else None
+        )
         decided = self.resolve(inst.record, inst.plan, features, inst.draft)
         self._record_resolution(inst, decided)
         argv = self.build_command(
@@ -1397,6 +1547,7 @@ class Supervisor:
             adapters=inst.adapters,
             features=features,
             resolved=decided,
+            cache_ram_mib=inst.info.cache_ram_mib,
         )
         inst.argv = argv
         # The shim must be the OUTERMOST element, ahead of the launch prefix

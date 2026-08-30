@@ -380,6 +380,13 @@ def _compact_instance(instance: Any) -> dict[str, Any]:
         "total_requests": instance.total_requests,
         "last_tokens_per_second": instance.last_tokens_per_second,
         "last_error": instance.last_error,
+        # The llama.cpp build this child is ACTUALLY running (D50), not the
+        # per-model pin -- which is null for almost every load and so answers
+        # nothing. It is here because engine drift is invisible otherwise: a
+        # child keeps the engine it was launched with, so after an activation a
+        # resident can serve for hours on the previous build, and an agent
+        # chasing a behaviour change deserves to see that in one field.
+        "engine_tag": instance.resolved_engine_tag,
     }
 
 

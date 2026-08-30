@@ -157,16 +157,17 @@ def _tag_in_use_check(supervisor: Any, engine_manager: Any) -> Any:
     naming the models that would have to be unloaded first, and this is where it
     gets the names.
 
-    **The attribution is approximate, and knowingly so.** An instance records the
-    tag it was *asked* for, and the overwhelmingly common load asks for nothing
-    -- ``engine_tag`` is ``None``, meaning "whatever was active at spawn". There
-    is no record of what that was, so a ``None`` is attributed to whatever is
-    active *now*. The two are the same on a box where nobody has activated a
-    different build since those models loaded, and different exactly after an
-    activation: a child launched from b1 and still running it is then counted
-    against b2. Reinstalling b1 in that window is not refused. Making this exact
-    means stamping the resolved tag on the instance at spawn -- a supervisor
-    change, not an API one.
+    **The attribution is exact since D50**, and it was not before. An instance
+    used to record only the tag it was *asked* for, and the overwhelmingly
+    common load asks for nothing -- ``engine_tag`` is ``None``, "whatever was
+    active at spawn" -- with no record of what that turned out to be, so a
+    ``None`` was attributed to whatever is active *now*. Right up until somebody
+    activated a different build: a child launched from b1 and still running it
+    was then counted against b2, and reinstalling b1 over its own open
+    ``llama-server.exe`` was not refused. The supervisor now stamps
+    :attr:`~studioforge.types.InstanceInfo.resolved_engine_tag` at spawn, so
+    that guess is only the fallback for an instance predating the stamp (or one
+    whose engine could not be identified), where the old approximation stands.
 
     Failure is answered conservatively, like :func:`_file_in_use_check`: a
     supervisor that cannot be listed reports a placeholder holder rather than
@@ -193,12 +194,45 @@ def _tag_in_use_check(supervisor: Any, engine_manager: Any) -> Any:
             active_tag = None
         holders: list[str] = []
         for instance in instances:
-            launched_with = getattr(instance, "engine_tag", None) or active_tag
+            launched_with = (
+                getattr(instance, "resolved_engine_tag", None)
+                or getattr(instance, "engine_tag", None)
+                or active_tag
+            )
             if launched_with == wanted:
                 holders.append(instance.model_id)
         return holders
 
     return in_use
+
+
+def _engine_tag_resolver(engine_manager: Any) -> Any:
+    """ "Which build does a request for this tag actually land on?" (D50).
+
+    The supervisor stamps the answer on every child it starts, so "activate +
+    reload" can skip the residents that are already current instead of
+    restarting all of them -- twice, when the button is double-clicked.
+
+    ``None`` in means "whatever is active", which is what nearly every load
+    asks for; a pinned tag is looked up so that a pin naming a build that is
+    not installed comes back as itself rather than as the active one -- the
+    spawn is going to fail on that pin a moment later, and the recorded tag
+    should say what it tried, not what it would have used instead. ``None`` out
+    means the engine could not be identified at all, which every reader treats
+    as "cannot prove this child is current".
+    """
+
+    def resolve(tag: str | None) -> str | None:
+        try:
+            info = engine_manager.get(tag) if tag else engine_manager.active()
+        except Exception as exc:  # noqa: BLE001 - naming a build is never fatal
+            log.warning("could not resolve the engine tag", engine_tag=tag, error=str(exc))
+            return tag
+        if info is None:
+            return tag
+        return str(info.tag)
+
+    return resolve
 
 
 def rescan_when_group_completes(downloader: Any, registry: Any) -> Any:
@@ -478,11 +512,23 @@ def build_state(config: Config, *, version: str = __version__) -> Any:
         config,
         probe,
         observation_sink=lambda row: db.record_load_observation(**row),
+        # The read side of the same table (D51): the sink has been writing
+        # predicted-vs-actual since D18 and nothing read it back at plan time.
+        observation_lookup=db.matching_observation,
         leases=leases,
     )
     # The probe goes in so an unload can log the VRAM it actually reclaimed
-    # rather than asserting that it did.
-    supervisor = Supervisor(config, resolve_binary=engine_manager.server_binary, probe=probe)
+    # rather than asserting that it did. `resolve_engine_tag` is the same shape
+    # of injection as `resolve_binary` -- a callable, so core keeps knowing
+    # nothing about the engine manager -- and answers the question a Path
+    # cannot: which build a request for `tag` (None = the active one) lands on,
+    # taken from the EngineInfo rather than parsed off a directory name (D50).
+    supervisor = Supervisor(
+        config,
+        resolve_binary=engine_manager.server_binary,
+        resolve_engine_tag=_engine_tag_resolver(engine_manager),
+        probe=probe,
+    )
     # Late-bound rather than a constructor argument: the supervisor already
     # depends on the engine manager for `resolve_binary`, and the reverse
     # dependency (D49-7's "is this build in use?") would otherwise be a cycle.

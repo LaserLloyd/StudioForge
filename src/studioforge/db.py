@@ -39,7 +39,7 @@ log = get_logger(__name__)
 
 #: Highest migration version this build of the code ships. ``migrate()``
 #: brings any older database up to this.
-SCHEMA_VERSION: int = 6
+SCHEMA_VERSION: int = 7
 
 #: SQLite's own words for "this file is not a usable database". Only a message
 #: carrying one of these is treated as corruption by ``migrate_with_recovery``;
@@ -112,7 +112,30 @@ _OBSERVATION_COLUMNS: tuple[str, ...] = (
     # the plan's share and the child's measured footprint on each card.
     "per_gpu_planned",
     "per_gpu_actual",
+    # The V half of the KV cache type (migration 007, D51). NULL on older rows;
+    # see :meth:`Database.matching_observation` for what NULL is allowed to
+    # match, and why it is not read as "the same as K".
+    "kv_cache_type_v",
 )
+
+#: The only ``load_observations.note`` whose ``actual_bytes`` is trustworthy:
+#: our own child's VRAM, attributed per pid AND per device. Everything before
+#: it either summed whole-device usage (contaminated by every other process on
+#: the card) or, on Windows, counted one per-process total once per card, so a
+#: four-GPU load "measured" four times its footprint. Duplicated here as a
+#: literal rather than imported: ``db`` is a leaf module and importing
+#: ``core.planner`` for one string would invert the dependency and make the
+#: database layer depend on the planner. The authority is
+#: :data:`studioforge.core.planner.OBSERVATION_NOTE_PER_PID_DEVICE`, and
+#: ``tests/unit/test_planner_observed.py`` asserts the two agree.
+OBSERVATION_NOTE_TRUSTED: str = "per_pid_v2"
+
+#: How many of a model's newest observations :meth:`Database.matching_observation`
+#: scans for one matching configuration. A model is loaded at a handful of
+#: distinct (context, slots, cache, device-count) shapes at most, and the
+#: ladder walks contexts downward, so a match that is not in the newest 50 rows
+#: is old enough that the engine build or the rig around it has probably moved.
+_OBSERVATION_MATCH_WINDOW: int = 50
 
 _THROUGHPUT_COLUMNS: tuple[str, ...] = (
     "model_id",
@@ -760,6 +783,85 @@ class Database:
                 record["ok"] = bool(record["ok"])
             out.append(record)
         return out
+
+    def matching_observation(
+        self,
+        model_id: str,
+        *,
+        ctx_size: int,
+        parallel: int,
+        kv_cache_type: str | None,
+        kv_cache_type_v: str | None,
+        device_count: int,
+    ) -> dict[str, Any] | None:
+        """The newest trustworthy load of *this exact configuration*, or ``None``.
+
+        The planner spends this row's ``actual_bytes`` as its estimate (D51),
+        which makes the match rule a safety property rather than a convenience:
+        a row that describes a different placement is worse than no row at all,
+        because it is confidently wrong instead of merely approximate.
+
+        What must be equal, and why each one:
+
+        * ``model_id``, ``ctx_size``, ``parallel`` -- the three inputs the
+          weights and KV terms are computed from. ``ctx_size`` is compared as
+          the planner stores it (``LoadPlan.ctx_size``), so caller and row are
+          always speaking about the same number whatever the per-slot/total
+          reading of "context" is elsewhere.
+        * ``kv_cache_type`` / ``kv_cache_type_v`` -- the cache quantization,
+          which moves the KV term by a factor of two per half. A pre-007 row
+          has NULL for V (see ``migrations/007_observation_kv_v.sql``) and is
+          treated as *unable to say* rather than as symmetric: it matches only
+          a lookup asking for the same V as its K, and is skipped for any
+          asymmetric cache it might not describe.
+
+        What must NOT be equal: the device *list*. Only the device COUNT is
+        compared. Each card costs a CUDA context, so the count is a real term
+        in the estimate -- but D42's rebalancer moves a model between
+        same-count device sets, and the tensor-split proportions are recomputed
+        from live free VRAM on every load, so the exact list changes run to run
+        for placements that are otherwise identical. Matching on the list would
+        make this feature almost never fire, which is the same as not shipping
+        it.
+
+        Only ``ok`` rows carrying :data:`OBSERVATION_NOTE_TRUSTED` are
+        eligible. Everything else in this table is contaminated history whose
+        median actual/predicted ratio is 2.97 -- a single such row adopted as
+        an estimate would triple the model's apparent footprint and refuse
+        loads that fit, so the note check is what makes a dirty row unable to
+        poison the planner rather than merely unlikely to.
+
+        Newest first; the first clean match wins. An older row is not averaged
+        in: the newest measurement is the one taken against the engine build
+        and driver in use now.
+        """
+        for row in self.load_observations(model_id, limit=_OBSERVATION_MATCH_WINDOW):
+            if not row.get("ok"):
+                continue
+            if str(row.get("note") or "") != OBSERVATION_NOTE_TRUSTED:
+                continue
+            actual = row.get("actual_bytes")
+            if not isinstance(actual, int) or actual <= 0:
+                continue
+            if row.get("ctx_size") != ctx_size or row.get("parallel") != parallel:
+                continue
+            row_k = row.get("kv_cache_type")
+            if row_k != kv_cache_type:
+                continue
+            row_v = row.get("kv_cache_type_v")
+            if row_v is None or row_v == "":
+                # Pre-007: V unknown. Safe only where V was never asked to
+                # differ from K -- the symmetric default.
+                if kv_cache_type_v is not None and kv_cache_type_v != row_k:
+                    continue
+            elif row_v != kv_cache_type_v:
+                continue
+            devices = str(row.get("devices") or "")
+            row_count = len([part for part in devices.split(",") if part.strip()])
+            if row_count != device_count:
+                continue
+            return row
+        return None
 
     # ------------------------------------------------------------------
     # Throughput calibration

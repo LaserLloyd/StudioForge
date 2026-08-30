@@ -13,11 +13,12 @@ records predicted-vs-actual through :meth:`Planner.observe`, and
 
 from __future__ import annotations
 
+import contextlib
 import itertools
 import json
 import math
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
 from studioforge.config import Config, FlashAttn, KvCacheType, QuantAffinity, SplitMode
@@ -879,12 +880,28 @@ class Planner:
         probe: GpuProbe,
         *,
         observation_sink: Callable[[dict[str, object]], None] | None = None,
+        observation_lookup: Callable[..., dict[str, Any] | None] | None = None,
         log_plans: bool = True,
         leases: LeaseBook | None = None,
     ) -> None:
         self.config = config
         self.probe = probe
         self._observation_sink = observation_sink
+        #: The other half of the loop the sink opens (D51): "what did this
+        #: exact configuration of this model really weigh last time?". Without
+        #: it the planner writes observations nothing ever reads back, which is
+        #: what shipped until 2026-08-30. ``None`` in every planner that has no
+        #: database behind it (tests, the catalog's throwaway instances) and
+        #: the whole feature is then inert.
+        self._observation_lookup = observation_lookup
+        #: Per-``plan_load`` lookup cache; ``None`` outside a planning pass.
+        #: See :class:`_ObservationMemo`. Surfaces that ask the planner
+        #: hypothetical questions without loading anything -- ``fits_on`` for
+        #: the pre-download context matrix, the catalog's per-tier sweep --
+        #: run with it unset and stay formula-only: they ask about models that
+        #: have often never been loaded here at all, and they ask dozens of
+        #: times per repo, which is the one shape this cache cannot absorb.
+        self._obs_memo: _ObservationMemo | None = None
         #: Standing GPU leases (D43). A card leased to someone other than the
         #: model being planned is absent from every placement; ``None`` (tests,
         #: the catalog's throwaway planners) means no leases exist.
@@ -1257,23 +1274,24 @@ class Planner:
                     blocked,
                 )
         own = [i.pid for i in credited if i.pid is not None]
-        result = self._plan_load(
-            record,
-            ctx_size=ctx_size,
-            kv_cache_type=kv_cache_type,
-            kv_cache_type_v=kv_cache_type_v,
-            parallel=parallel,
-            loaded=[i for i in others if i.model_id not in preempt_ids],
-            draft=draft,
-            adapters=adapters,
-            allow_evict=evict_allowed,
-            gpus=gpus_view,
-            extra_own_pids=own,
-            evict_busy=evict_busy,
-            source=source,
-            parallel_auto=parallel_auto,
-            priority=priority,
-        )
+        with self._observation_pass():
+            result = self._plan_load(
+                record,
+                ctx_size=ctx_size,
+                kv_cache_type=kv_cache_type,
+                kv_cache_type_v=kv_cache_type_v,
+                parallel=parallel,
+                loaded=[i for i in others if i.model_id not in preempt_ids],
+                draft=draft,
+                adapters=adapters,
+                allow_evict=evict_allowed,
+                gpus=gpus_view,
+                extra_own_pids=own,
+                evict_busy=evict_busy,
+                source=source,
+                parallel_auto=parallel_auto,
+                priority=priority,
+            )
         if isinstance(result, LoadPlan):
             if reload_of is not None and resident is not None:
                 if reload_of not in result.evict_model_ids:
@@ -2244,6 +2262,23 @@ class Planner:
 
     # -- placement helpers ------------------------------------------------
 
+    @contextlib.contextmanager
+    def _observation_pass(self) -> Iterator[None]:
+        """Give one planning pass its own observed-footprint lookup cache (D51).
+
+        Entered once per :meth:`plan_load`, around the whole ladder, so every
+        rung of one load shares one set of answers and the next load asks the
+        database again. Saved and restored rather than simply cleared: a
+        planner is not guaranteed to be planning one load at a time, and a
+        nested or concurrent pass must not leave the outer one without a cache.
+        """
+        previous = self._obs_memo
+        self._obs_memo = _ObservationMemo()
+        try:
+            yield
+        finally:
+            self._obs_memo = previous
+
     def _safe_estimate(
         self,
         record: ModelRecord,
@@ -2256,8 +2291,26 @@ class Planner:
         draft_ctx: int | None,
         adapters: Sequence[AdapterRecord],
     ) -> VramEstimate:
+        """The formula estimate, corrected by what this configuration measured (D51).
+
+        This is where the correction lands because this is the one funnel every
+        candidate estimate flows through -- the fit check in
+        :meth:`_try_devices`, the slot walk in :meth:`max_slots_by_vram`, the
+        forced placement in :meth:`_plan_on_devices`, and the numbers a
+        :class:`LoadRejected` reports. Correcting anywhere further downstream
+        would leave those disagreeing with each other: a plan sized against a
+        measured footprint but refused against a formula one, or the reverse.
+
+        It is applied BEFORE any fit or refusal decision and before the
+        per-device split is taken, so each card's share is a share of the
+        corrected total rather than of a number the last load disproved.
+
+        The metadata-less fallback is deliberately left alone: an on-disk file
+        size is not a formula, so there is no band to clamp a measurement
+        against and nothing the correction could honestly say about it.
+        """
         try:
-            return self.estimate(
+            estimate = self.estimate(
                 record,
                 ctx_size=ctx,
                 parallel=slots,
@@ -2272,6 +2325,121 @@ class Planner:
             # No metadata: fall back to the on-disk size so the rejection still
             # carries a number rather than zeros.
             return VramEstimate(weights_bytes=int(record.size_bytes))
+        correction = self._observed_correction(
+            record,
+            ctx=ctx,
+            slots=slots,
+            kv_k=kv_k,
+            kv_v=kv_v,
+            n_devices=n_devices,
+            formula_bytes=estimate.total_bytes,
+        )
+        if correction is None:
+            return estimate
+        return scaled_estimate(estimate, correction.factor)
+
+    def _observed_correction(
+        self,
+        record: ModelRecord,
+        *,
+        ctx: int,
+        slots: int,
+        kv_k: KvCacheType,
+        kv_v: KvCacheType,
+        n_devices: int,
+        formula_bytes: int,
+    ) -> ObservedCorrection | None:
+        """Look up what this configuration last really weighed, and by how much
+        the formula should move because of it (D51).
+
+        Inert -- returning ``None`` without touching the database -- unless all
+        three are true: ``planner.observed_correction`` is on, a lookup is
+        wired in, and this call is inside a planning pass (see
+        :attr:`_obs_memo`). Every result is memoized for the rest of the pass,
+        including "there is nothing", because the ladder asks the same question
+        once per placement per context rung.
+
+        A lookup that raises disables itself for the rest of the pass after one
+        warning. The correction is an accuracy improvement; a broken database
+        must never be able to turn it into a refused load.
+        """
+        memo = self._obs_memo
+        if memo is None or memo.failed:
+            return None
+        if self._observation_lookup is None:
+            return None
+        if not self.config.planner.observed_correction:
+            return None
+        key = (record.id, int(ctx), int(slots), str(kv_k), str(kv_v), int(n_devices))
+        if key in memo.rows:
+            return memo.rows[key]
+        try:
+            row = self._observation_lookup(
+                record.id,
+                ctx_size=int(ctx),
+                parallel=int(slots),
+                kv_cache_type=kv_k,
+                kv_cache_type_v=kv_v,
+                device_count=int(n_devices),
+            )
+        except Exception as exc:  # noqa: BLE001 -- any failure means "no history"
+            memo.failed = True
+            log.warning(
+                "observed-footprint lookup failed; planning from the formula alone",
+                model_id=record.id,
+                error=str(exc),
+                detail=(
+                    "a database that cannot answer must cost accuracy, never a load: "
+                    "the correction is skipped for the rest of this planning pass"
+                ),
+            )
+            return None
+        correction: ObservedCorrection | None = None
+        actual = row.get("actual_bytes") if row is not None else None
+        if isinstance(actual, (int, float)) and actual > 0:
+            correction = observed_correction(
+                formula_bytes=formula_bytes, observed_bytes=int(actual)
+            )
+        memo.rows[key] = correction
+        if correction is not None:
+            # DEBUG, not INFO: the ladder applies this once per placement per
+            # context rung and only one of those becomes a load. The note on
+            # the chosen plan is the line a human is meant to see.
+            log.debug(
+                "estimate corrected from the last load of this configuration",
+                model_id=record.id,
+                ctx=ctx,
+                parallel=slots,
+                devices=n_devices,
+                formula_mb=round(correction.formula_bytes / MB),
+                observed_mb=round(correction.observed_bytes / MB),
+                corrected_mb=round(correction.formula_bytes * correction.factor / MB),
+                factor=round(correction.factor, 3),
+                clamped=correction.clamped,
+            )
+        return correction
+
+    def _memoized_correction(
+        self,
+        model_id: str,
+        *,
+        ctx: int,
+        slots: int,
+        kv_k: KvCacheType,
+        kv_v: KvCacheType,
+        n_devices: int,
+    ) -> ObservedCorrection | None:
+        """The correction already spent on this configuration's estimate, for the note.
+
+        Read-only on purpose. :meth:`_safe_estimate` has already decided and
+        cached; re-deriving it here would mean recomputing a factor against an
+        estimate that is itself already corrected, which is how a correction
+        turns into a compounding one.
+        """
+        memo = self._obs_memo
+        if memo is None:
+            return None
+        return memo.rows.get((model_id, int(ctx), int(slots), str(kv_k), str(kv_v), int(n_devices)))
 
     def _try_devices(
         self,
@@ -2350,6 +2518,31 @@ class Planner:
             "kv_bytes_per_token": per_token,
         }
 
+        # Whatever history moved this estimate travels with the plan (D51). A
+        # placement whose numbers came from a measurement rather than from the
+        # formula has to say so, or the `load planned` line and the API
+        # response describe a calculation nobody can reproduce. Asked at
+        # ``chosen_slots``, which is what the estimate above was finally sized
+        # at once auto-parallel had its say.
+        # ``chosen_slots`` first, then the count originally asked for: when the
+        # slot sizer bails early (no usable KV geometry) it hands back the
+        # estimate it was given, which was corrected at ``slots``. Falling back
+        # keeps the note describing the estimate actually in ``shared`` rather
+        # than going quiet about a correction that was really applied.
+        correction: ObservedCorrection | None = None
+        for candidate_slots in dict.fromkeys((chosen_slots, slots)):
+            correction = self._memoized_correction(
+                record.id,
+                ctx=ctx,
+                slots=candidate_slots,
+                kv_k=kv_k,
+                kv_v=kv_v,
+                n_devices=len(devices),
+            )
+            if correction is not None:
+                break
+        obs_notes = [correction.note] if correction is not None else []
+
         if len(devices) == 1:
             index = devices[0]
             return LoadPlan(
@@ -2358,7 +2551,10 @@ class Planner:
                 split_mode="none",
                 main_gpu=index,
                 per_gpu_bytes={index: total_needed},
-                notes=[f"single-GPU placement on CUDA{index} (no tensor-split overhead)"],
+                notes=[
+                    f"single-GPU placement on CUDA{index} (no tensor-split overhead)",
+                    *obs_notes,
+                ],
                 **shared,
             )
 
@@ -2395,7 +2591,7 @@ class Planner:
             split_mode=self._split_mode_for(record),
             main_gpu=devices[0],
             per_gpu_bytes=per_gpu,
-            notes=[],
+            notes=list(obs_notes),
             **shared,
         )
 
@@ -3229,6 +3425,13 @@ class Planner:
                     "ctx_size": plan.ctx_size,
                     "parallel": plan.parallel,
                     "kv_cache_type": plan.kv_cache_type,
+                    # The V half too (migration 007). Calibration never needed
+                    # it -- it averages ratios across every model. Reading ONE
+                    # row back as an estimate (D51) does: K and V are set
+                    # independently and a quantized V cache is roughly half the
+                    # V bytes, so a row that cannot name its V type cannot
+                    # safely describe the placement that asks for it.
+                    "kv_cache_type_v": plan.kv_cache_type_v,
                     "devices": ",".join(str(d) for d in plan.devices),
                     "predicted_bytes": predicted,
                     "actual_bytes": actual_bytes,
@@ -3273,6 +3476,167 @@ def per_device_overruns(
         if actual > planned * PER_DEVICE_OVERRUN_WARN:
             out.append((device, planned, actual))
     return out
+
+
+#: --- observed-footprint correction (D51) --------------------------------
+#:
+#: What a measured child is multiplied by before the planner will spend it as
+#: an estimate. The observation is one sample of a placement the planner is
+#: about to make again but not identically: tensor-split proportions are
+#: recomputed from live free VRAM on every load, so the same model on the same
+#: two cards can land a little differently, and the compute buffers move with
+#: the batch the child happens to be serving when it is measured. 10% is the
+#: price of keeping the error direction pointed at "refuse", which costs a load
+#: that would have fit, rather than at "OOM", which costs a child mid-request.
+OBS_SAFETY = 1.10
+
+#: The floor the correction may pull the estimate down to, as a fraction of the
+#: formula's own answer. A row that is a fluke -- or contaminated in some way
+#: the note check has not yet learned to spot -- can talk the estimate down by
+#: at most 40%. The live Gemma-4-E4B case lands at 0.674, comfortably inside
+#: it; anything claiming a model is less than 60% of its computed size is more
+#: likely a measurement that missed an allocation than a discovery.
+OBS_BAND_MIN = 0.60
+
+#: And the ceiling. A load that measured far ABOVE its estimate is real
+#: information -- Dark-Scarlett-27B came in at 1.042 -- and the correction
+#: raises the estimate for it, which is the direction that prevents OOM. But
+#: past 30% over, the formula is not slightly stale, it is missing a term, and
+#: quietly padding every plan of that model would hide the bug instead of
+#: fixing it. The clamp is the point, not a detail: exactly as with
+#: :data:`OVERHEAD_FRACTION_MIN`, a feedback loop with no bound is a way to
+#: make the planner slowly wrong with nobody noticing.
+OBS_BAND_MAX = 1.30
+
+
+@dataclass(frozen=True)
+class ObservedCorrection:
+    """A measured footprint the planner has decided to trust, and by how much.
+
+    ``factor`` is what every term of the formula estimate is multiplied by;
+    ``note`` is the sentence the chosen plan carries into the ``load planned``
+    log and the API response, because a plan whose numbers were silently
+    overridden by history is a plan nobody can debug.
+    """
+
+    factor: float
+    observed_bytes: int
+    formula_bytes: int
+    clamped: bool
+    note: str
+
+
+def observed_correction(*, formula_bytes: int, observed_bytes: int) -> ObservedCorrection | None:
+    """Trust a measured footprint over the formula, within a band (D51).
+
+    ``corrected = clamp(observed * OBS_SAFETY, formula * OBS_BAND_MIN,
+    formula * OBS_BAND_MAX)``, and the returned ``factor`` is
+    ``corrected / formula``.
+
+    The formula is a good general estimator and a poor specific one. It is
+    built from GGUF geometry that every architecture reports slightly its own
+    way, so it is systematically wrong per *model family* while being roughly
+    right across the library -- and one global ``compute_overhead_fraction``
+    (:func:`calibrated_overhead_fraction`) cannot be two signs at once. The
+    live rig on 2026-08-30 had both signs open simultaneously:
+
+    * Dark-Scarlett-27B: formula 35742 MB, measured 37258 MB. Corrected to
+      40984 MB, a factor of 1.147 -- MORE conservative, which is this model's
+      real risk direction, since it was already over its estimate.
+    * Gemma-4-E4B: formula 13377 MB, measured 8202 MB. Corrected to 9022 MB, a
+      factor of 0.674, releasing ~4.3 GB of phantom. The formula does not model
+      per-layer embeddings or the KV sharing this architecture uses, and no
+      amount of global calibration was going to teach it: the planner predicted
+      13377 again twelve seconds after that observation landed.
+
+    A 5 GB phantom on a 24 GB 3090 is not a rounding error -- it refuses a
+    co-residency that fits, or pushes the model onto a mixed-generation split
+    this project's own measurements put at half the speed.
+
+    Returns ``None`` when there is nothing to do: a non-positive formula total
+    (no band to clamp against), a non-positive measurement, or a correction
+    that rounds to no change at all.
+    """
+    if formula_bytes <= 0 or observed_bytes <= 0:
+        return None
+    trusted = observed_bytes * OBS_SAFETY
+    low = formula_bytes * OBS_BAND_MIN
+    high = formula_bytes * OBS_BAND_MAX
+    corrected = min(high, max(low, trusted))
+    clamped = corrected != trusted
+    factor = corrected / formula_bytes
+    if abs(factor - 1.0) < 0.005:
+        return None
+    note = (
+        f"estimate corrected x{factor:.2f} from the last load of this exact "
+        f"configuration (observed {round(observed_bytes / MB)} MB against a formula "
+        f"estimate of {round(formula_bytes / MB)} MB)"
+    )
+    if clamped:
+        note += (
+            f"; clamped to the {OBS_BAND_MIN:.2f}-{OBS_BAND_MAX:.2f} band around the "
+            f"formula, so the measurement was only partly trusted"
+        )
+    return ObservedCorrection(
+        factor=factor,
+        observed_bytes=int(observed_bytes),
+        formula_bytes=int(formula_bytes),
+        clamped=clamped,
+        note=note,
+    )
+
+
+def scaled_estimate(estimate: VramEstimate, factor: float) -> VramEstimate:
+    """Every term of ``estimate`` multiplied by ``factor``.
+
+    ``VramEstimate.total_bytes`` is a derived sum, not a field, so a correction
+    to the total has to be spent across the terms. It is spread uniformly
+    rather than dumped into ``compute_bytes`` -- the term that exists to absorb
+    unmodelled overhead -- for one blunt reason: the Gemma-4-E4B correction is
+    -4.3 GB and ``compute_bytes`` is a fraction of that, so the fudge term
+    physically cannot hold it. Uniform scaling also keeps the arithmetic
+    downstream self-consistent: ``_reject`` computes its "largest context that
+    would fit" as ``total - kv``, and a total corrected without its KV term
+    would make that subtraction describe a placement that does not exist.
+
+    The cost is that ``weights_bytes`` and ``kv_bytes`` on a corrected estimate
+    are shares of a measured whole rather than the formula's own answers for
+    those terms. That is honest -- the measurement cannot say which term was
+    wrong, only that their sum was -- but it is why the per-device split in
+    :meth:`Planner._try_devices` keeps charging the output layer at its real
+    size and takes the corrected total as the body to divide.
+    """
+    return VramEstimate(
+        **{
+            field_name: max(0, int(round(value * factor)))
+            for field_name, value in estimate.model_dump().items()
+        }
+    )
+
+
+@dataclass
+class _ObservationMemo:
+    """One ``plan_load`` call's worth of observed-footprint lookups.
+
+    The context ladder plans the same model at several contexts, each against
+    up to every placement on the box, and each of those asks
+    :meth:`Planner._safe_estimate` again -- several dozen calls for one load.
+    Without this, each would be a SQLite round trip for an answer that cannot
+    have changed inside a single planning pass.
+
+    ``model_id`` is part of the key even though the memo is per-call, so that
+    two ``plan_load`` calls racing on one Planner can only ever share a cached
+    row, never cross-attribute one model's measurement to another.
+
+    ``failed`` latches the first exception out of the lookup for the rest of
+    the call. A database that cannot answer must cost one warning and nothing
+    else -- never a refused load, and never the same warning once per rung.
+    """
+
+    rows: dict[tuple[str, int, int, str, str, int], ObservedCorrection | None] = field(
+        default_factory=dict
+    )
+    failed: bool = False
 
 
 #: Written into ``load_observations.note`` when ``actual_bytes`` is our own

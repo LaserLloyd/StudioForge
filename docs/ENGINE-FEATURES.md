@@ -34,7 +34,7 @@ the full runs are in DECISIONS.md **D38**.
 | Feature | Flag | Default | Quality cost |
 | --- | --- | --- | --- |
 | Speculative decoding | `--spec-type` | **auto** (on where it pays) | none — distribution-preserving |
-| Host-RAM prompt cache | `--cache-ram` | **on**, 25% of RAM capped at 32 GiB | none |
+| Host-RAM prompt cache | `--cache-ram` | **on**, a shared pool of 25% of RAM capped at 32 GiB | none |
 | Prompt-cache reuse | `--cache-reuse 256` | **on** | none |
 | Flash attention | `--flash-attn on` | **on** | none |
 | Partitioned KV pool | `--no-kv-unified` | **on** above one slot | none (a capacity trade, not a quality one) |
@@ -113,10 +113,17 @@ a prefix that left it. Exactly the OpenClaw pattern — a long, near-identical a
 again after another model borrowed the slot.
 
 **Default.** On. `engine.cache_ram_mb: auto` = 25% of system RAM capped at 32 GiB (32 GiB on this
-128 GiB box). Set an integer for MiB, `0` to disable, `-1` for the engine's "no limit". The figure
-is a **per-child cap**, not a reservation: each loaded model may keep up to that much of evicted
-prompt prefixes in host memory, so four resident models could between them use up to four times
-it under sustained, prefix-heavy traffic. Lower it on a box where host RAM is tight.
+128 GiB box). Set an integer for MiB, `0` to disable, `-1` for the engine's "no limit".
+
+The two settings have **different scopes** (D50). `auto` is a machine-wide **pool**: each model is
+granted what the other loaded models are not already holding, floored at 4 GiB so the last one in
+still has a cache at all, and the grant it got is on its row in `GET /api/models`
+(`cache_ram_mib`). An explicit integer is **per child, verbatim** — you named a number, every model
+gets that number, and four residents can then hold four times it. Before D50 `auto` behaved that
+way too, which is how a cap documented as unable to make the box swap came to promise 128 GiB of a
+128 GiB machine. If the floor pushes the total past the pool, the launch logs
+`cache_ram_pool_oversubscribed` with the numbers — lower the setting on a box where host RAM is
+tight.
 
 **Quality cost.** None: it is a cache of computed KV, not an approximation of it. **VRAM cost:
 none** — measured identical VRAM (1492 MiB) at `--cache-ram 8192` and at `32768`.

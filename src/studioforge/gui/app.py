@@ -366,7 +366,10 @@ def _status_line(ctx: GuiContext) -> str:
         if gpus
         else "no GPU"
     )
-    return f"{len(loaded)} loaded · {gpu_text}"
+    # D50: a child mid-spawn counted as loaded here, so the header claimed
+    # residency the moment a load started and said nothing for the ~30 s it
+    # took to arrive. ``loaded_count_text`` breaks the two apart.
+    return f"{st.loaded_count_text(loaded)} · {gpu_text}"
 
 
 def _default_tab(ctx: GuiContext) -> str:

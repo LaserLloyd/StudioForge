@@ -21,6 +21,7 @@ from nicegui import ui
 
 from studioforge.config import Config
 from studioforge.errors import StudioForgeError
+from studioforge.gui import state as st
 from studioforge.logging import get_logger
 
 log = get_logger(__name__)
@@ -293,6 +294,98 @@ class BusySpinner:
             self._notification.update()
 
 
+# ---------------------------------------------------------------------------
+# One long action at a time (D50)
+# ---------------------------------------------------------------------------
+
+#: Keys of the long actions currently in flight, process-wide.
+#:
+#: Process-wide, not per-client, deliberately: the thing being protected is the
+#: rig, not the page. Two browsers pointed at the same box double-loading every
+#: resident model is the same accident as one browser double-clicking, and the
+#: models are shared by both.
+_IN_FLIGHT: set[str] = set()
+
+
+@contextmanager
+def single_flight(key: str, what: str) -> Iterator[bool]:
+    """Claim a long action, or yield ``False`` because it is already running.
+
+    On 2026-08-30 the Server tab's "activate + reload" fired twice 118 ms apart
+    -- an ordinary double-click -- and both runs went through: every resident
+    model was force-reloaded twice, ~31 s of churn, and a 37 GB model was killed
+    3.6 seconds after it reported ready.
+
+    The guard lives at the *action*, not at the button, for two reasons. First,
+    :func:`busy` only disables a control when it is handed one, and most of
+    these handlers are ``lambda``s wired straight into ``on_click`` with the
+    button nowhere in scope -- ``activate_engine`` was exactly that. Second, a
+    disabled button is one WebSocket message and one browser tab away from being
+    enabled again, so it was never the thing that made this safe; it is a
+    courtesy, the same courtesy :func:`admin_control` provides.
+
+    First line of defence, not the only one: ``ModelManager`` folds a forced
+    reload that queued behind an identical one, so an unguarded double-click no
+    longer thrashes either. Both exist because they fail differently -- this one
+    is instant and says so, that one is correct even for two clicks that never
+    met a GUI.
+
+    Released in a ``finally``, so an action that raises does not wedge its key
+    for the life of the process.
+
+    Usage::
+
+        with single_flight("engine.activate", "engine activation") as claimed:
+            if not claimed:
+                return
+            ...
+    """
+    if key in _IN_FLIGHT:
+        log.info("gui action already in flight", key=key)
+        ui.notify(st.already_running_note(what), type="warning", multi_line=True)
+        yield False
+        return
+    _IN_FLIGHT.add(key)
+    try:
+        yield True
+    finally:
+        _IN_FLIGHT.discard(key)
+
+
+def element_alive(element: Any) -> bool:
+    """Whether it is still safe to repaint into ``element`` (D50).
+
+    A panel's ``refresh()`` is held by a timer, by its own action handlers and
+    by the buttons on the cards it drew, and every one of those calls it *after*
+    an await. If the page was rebuilt in the meantime -- a reconnect, a tab
+    switch, the repaint that follows a reload -- the container those closures
+    captured is gone, and building an element inside it raises ``The parent
+    element this slot belongs to has been deleted`` from NiceGUI's own
+    ``Slot.parent``, which is what appeared at 04:20:33 on 2026-08-30 as the
+    reloads finished.
+
+    That is not an error to report, it is a repaint with nowhere to go: the page
+    it belonged to no longer exists, and a fresh panel with its own timer is
+    already drawing the same thing. So the callers bail out silently.
+
+    NiceGUI 3.16 exposes ``Element.is_deleted``, and tears a client down by
+    marking every one of its elements deleted *before* the weakrefs can die
+    (``Client._handle_delete`` -> ``remove_all_elements``), so this one flag
+    covers both the rebuilt-panel and the disconnected-client cases. The
+    ``except`` is for the ordering nobody promised us: reaching a dead client
+    through a live element raises, and a liveness check that can itself raise is
+    not a liveness check.
+    """
+    if element is None:
+        return False
+    try:
+        if bool(element.is_deleted):
+            return False
+        return not bool(element.client.is_deleted)
+    except Exception:  # noqa: BLE001 - a check that cannot answer means "gone"
+        return False
+
+
 @contextmanager
 def busy(button: Any = None, *, message: str = "") -> Iterator[BusySpinner]:
     """Disable a control and show a spinner while an action runs.
@@ -335,6 +428,7 @@ __all__ = [
     "apply_config_updates",
     "badge",
     "busy",
+    "element_alive",
     "error_text",
     "mono",
     "notify_error",
@@ -343,6 +437,7 @@ __all__ = [
     "require_local_admin",
     "run_blocking",
     "section",
+    "single_flight",
     "viewer_host",
     "viewer_may_change_box",
 ]
