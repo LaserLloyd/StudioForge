@@ -2,10 +2,10 @@
 
 StudioForge is calendar-versioned. The display string -- what ``/health``, the
 GUI footer, the MCP ``server_status`` tool and the GitHub User-Agent all report
--- is ``1.26-08-28``: a major, then the release date. PEP 440 has no way to
+-- is ``1.26-08-30``: a major, then the release date. PEP 440 has no way to
 spell a hyphenated date, so the two ``pyproject.toml`` files carry the same
-date as ``1.26.8.28``, which is what ``pip``/``uv`` see in the wheel metadata.
-Release tags are ``v1.26-08-28``.
+date as ``1.26.8.30``, which is what ``pip``/``uv`` see in the wheel metadata.
+Release tags are ``v1.26-08-30``.
 
 Three spellings is two chances to drift, and the drift is silent: the updater
 compares ``/health``'s version against a GitHub tag, so a mismatch shows up as
@@ -33,9 +33,9 @@ if str(COMPANION_SRC) not in sys.path:
 import studioforge_companion  # noqa: E402
 
 #: The human/display version, and the tag with its ``v``.
-DISPLAY_VERSION = "1.26-08-28"
+DISPLAY_VERSION = "1.26-08-30"
 #: The same date, as the only thing PEP 440 will accept.
-PEP440_VERSION = "1.26.8.28"
+PEP440_VERSION = "1.26.8.30"
 
 
 def _pyproject_version(path: Path) -> str:

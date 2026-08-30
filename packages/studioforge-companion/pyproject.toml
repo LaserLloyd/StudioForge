@@ -1,10 +1,10 @@
 [project]
 name = "studioforge-companion"
-# The human/display version is `1.26-08-28` (see `__version__` in
+# The human/display version is `1.26-08-30` (see `__version__` in
 # `src/studioforge_companion/__init__.py`), matching the server it talks to.
 # PEP 440 cannot spell a hyphenated date, so the package metadata carries the
-# same date as `1.26.8.28`. Release tags are `v1.26-08-28`.
-version = "1.26.8.28"
+# same date as `1.26.8.30`. Release tags are `v1.26-08-30`.
+version = "1.26.8.30"
 description = "sfctl: thin remote control + MCP bridge for a StudioForge server (LLM serving over llama.cpp)."
 readme = "README.md"
 # 3.11, not 3.12: this package gets installed on whatever box runs the agent
