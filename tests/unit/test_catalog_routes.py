@@ -649,7 +649,7 @@ def test_patch_settings_rejects_an_unknown_field(app: Any) -> None:
     assert "ctxsize" in response.json()["error"]["message"]
 
 
-PERSONA_ID = "vendor/thing-Q4_K_M:coach"
+PERSONA_ID = "vendor/thing-Q4_K_M:coach"  # scrub-ok: generic-English fixture word
 
 
 def make_persona(record_id: str = PERSONA_ID, base: str = MODEL_ID) -> ModelRecord:
@@ -659,7 +659,7 @@ def make_persona(record_id: str = PERSONA_ID, base: str = MODEL_ID) -> ModelReco
         update={
             "is_virtual": True,
             "base_model_id": base,
-            "preset": VirtualPreset(system_prompt="you are a coach"),
+            "preset": VirtualPreset(system_prompt="you are a coach"),  # scrub-ok: generic-English fixture
         }
     )
 
