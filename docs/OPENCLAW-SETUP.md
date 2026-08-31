@@ -74,7 +74,7 @@ Do this first. Every later step assumes it, and it is the single most common thi
 curl -s -m 8 http://<rig-ip>:1234/health
 ```
 
-Expected: `{"status":"ok","version":"1.26-08-30",...}` — the version comes from this repository's
+Expected: `{"status":"ok","version":"1.26-08-31",...}` — the version comes from this repository's
 `studioforge/__init__.py`. A different string means you are talking to another build, and these
 instructions may not match it.
 

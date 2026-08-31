@@ -9,15 +9,15 @@ planner, a web control panel, a system tray, and an MCP control plane for agents
 LM Studio as the backend for [OpenClaw](docs/OPENCLAW.md) — it listens on LM Studio's port, so
 switching is a host change, not a rewrite.
 
-**Status:** v1.26-08-30. Windows is the reference platform and runs it daily; Linux is supported (CI
+**Status:** v1.26-08-31. Windows is the reference platform and runs it daily; Linux is supported (CI
 runs both) and less battle-tested. Questions and bug reports: [Contact](#contact).
 
 **On versions.** StudioForge is calendar-versioned: a major, then the release date. The display
-version lives in `src/studioforge/__init__.py` — `1.26-08-30` — and is what `GET /api/version`,
+version lives in `src/studioforge/__init__.py` — `1.26-08-31` — and is what `GET /api/version`,
 `GET /health`, the MCP `server_status` tool and `sfctl status` report. PEP 440 has no way to spell
-a hyphenated date, so both `pyproject.toml` files carry the same date as `1.26.8.30`, which is what
+a hyphenated date, so both `pyproject.toml` files carry the same date as `1.26.8.31`, which is what
 `pip`/`uv` see in the wheel metadata; the `sfctl` companion ships from the same release and carries
-the same version, and release tags are `v1.26-08-30`. Check what a server is actually running with
+the same version, and release tags are `v1.26-08-31`. Check what a server is actually running with
 `curl -s <host>/api/version`.
 
 ---
