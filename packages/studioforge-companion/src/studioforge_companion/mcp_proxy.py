@@ -413,6 +413,19 @@ class McpProxy:
         unprefixed = ", ".join(f"`{n}`" for n in sorted(WATCHDOG_UNPREFIXED))
         return (
             f"Control plane for the StudioForge LLM server at {self.profile.url}.\n\n"
+            # D52: the gate has to be taught HERE too, not only in the management
+            # server's own INSTRUCTIONS -- this stdio proxy builds its own string,
+            # and `sfctl mcp` is exactly the path OpenClaw reaches the server by.
+            # A routing primitive whose whole value is being asked FIRST is worth
+            # nothing if the text the agent actually reads still opens with
+            # "start by listing models".
+            "BEFORE YOU CHOOSE OR LOAD ANYTHING, ask whether what is already loaded "
+            'will do: `check_loaded_model(min_params="20b", vision=true)` takes a size '
+            "bar in billions plus capability tags (vision, audio, tools, thinking, "
+            'uncensored, or free-form `tags=["coding"]`). answer "yes" -> send the work '
+            "to POST /v1/chat/completions with the `model` id it returns and load "
+            'nothing; "no" -> `reason` names the gap, then pick and load a model as '
+            'below, or fall back to another provider. A bar it cannot verify is a "no".\n\n'
             "START WITH `list_models` -- it returns the model catalog newest-download-first; "
             "every model has `options` rows (one per context size) with `fits`, `devices`, "
             "`max_parallel`, estimated and measured tokens/sec, and a `load_args` object. "

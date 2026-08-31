@@ -83,11 +83,11 @@ others — want this shape:
 }
 ```
 
-`sfctl mcp` merges **two** upstream toolsets into one list of 29 tools:
+`sfctl mcp` merges **two** upstream toolsets into one list of 30 tools:
 
 | Tools | Source | Available when the main server is wedged? |
 | --- | --- | --- |
-| `list_models`, `model_options`, `model_info`, `load_model`, `load_recommended`, `unload_model`, `pin_model`, `reserve_gpus`, `release_gpus`, `test_model`, `benchmark_parallel`, `search_models`, `repo_details`, `download_model`, `delete_model`, `server_status`, `connection_info`, `get_config`, `set_config` | main app | no |
+| `list_models`, `model_options`, `model_info`, `check_loaded_model`, `load_model`, `load_recommended`, `unload_model`, `pin_model`, `reserve_gpus`, `release_gpus`, `test_model`, `benchmark_parallel`, `search_models`, `repo_details`, `download_model`, `delete_model`, `server_status`, `connection_info`, `get_config`, `set_config` | main app | no |
 | `restart_server`, `kill_model`, `nuke_all_models`, `reclaim_orphan_engines`, `tail_logs`, `gpu_status`, `rollback_update`, `recovery_health`, `recovery_get_config`, `recovery_set_config` | watchdog sidecar | **yes** |
 
 That split is the point: when the main server locks up, OpenClaw still holds working tools to
@@ -113,7 +113,61 @@ sfctl openclaw-setup
 
 Every number an agent needs to choose a model is in one call. This is the whole sequence.
 
-### 1. `list_models(limit=N)` — the catalog
+### 1. `check_loaded_model(...)` — is a load even needed?
+
+Before choosing or loading anything, ask whether what is **already** loaded meets the need. The
+operator usually has a model resident and most loaded models can do most jobs, so this is the cheap
+question that avoids a 40-second load, or a call out to a cloud provider, you did not have to make:
+
+```
+check_loaded_model(min_params="20b")                 # at least 20 billion parameters
+check_loaded_model(min_params="7b", vision=true)     # ...and it must read images
+check_loaded_model(tags=["coding"])                  # any size, must be a coding model
+```
+
+`min_params` is in **billions** — `20`, `"20"` and `"20b"` are the same bar, `"500m"` is 0.5B. The
+five booleans (`vision`, `audio`, `tools`, `thinking`, `uncensored`) are sugar for `tags`, which is
+free-form and takes a list or a comma-separated string.
+
+Then branch on `answer`:
+
+| `answer` | What to do |
+| --- | --- |
+| `"yes"` | Send the work to `POST /v1/chat/completions` with `model` set to the **`model` field of the response**. It is loaded and warm; do not call `load_model`. `connection_info` has the base URL. |
+| `"no"` | Read `reason` — "nothing is loaded", "largest loaded model is 4B, below the 20B bar", "no loaded model reports audio", "no loaded model can be verified as 'uncensored'" — then either `load_recommended` something that clears the bar (step 2 below picks it) or fall back to your other provider. |
+
+The answer carries the id on purpose. A bare yes would still cost you a `GET /v1/models` and a guess
+between three resident models; `model` goes straight into the next request. `params_b` and
+`params_source` say how big and how that was known (`metadata` exact, `name` read off the model id,
+`estimated` from file bytes and a few percent out, `unknown`). A mixture-of-experts model also
+reports `active_params_b`, its routed per-token count — **the bar is checked against the total**, not
+that. `instances[]` is the working for every resident model, each with `meets` and a `why_not` list,
+so a "no" is diagnosable without a second call.
+
+**Unknown is a "no".** The gate only ever passes what it can prove. A model whose size cannot be
+determined fails every `min_params` bar, and a tag no local source can speak to fails its bar with
+`cannot verify 'x'` rather than a confident `no x`. The cost of a false negative is one unnecessary
+load; the cost of a false positive is vision work sent to a text-only model.
+
+Where each tag's answer comes from, which is what decides whether an absence is a real "no" or an
+"unknown":
+
+| Tag | Source | An absence means |
+| --- | --- | --- |
+| `vision`, `tools`, `thinking` | The registry's per-model capabilities, derived from the GGUF at scan time (`vision` also passes on a running child's reported modalities, for a model served with a projector the record predates) | **`no`** — the file was inspected and said so |
+| `audio`, `video` | Only a *running* child's reported modalities. No GGUF field describes them | `unknown` — a silent child cannot be quoted |
+| `uncensored`, `coding`, `roleplay` | Whole name tokens (`abliterated`, `coder`, `rp`, …) and the GGUF `general.tags` array | `unknown` — a name without "uncensored" in it does not prove the model is censored |
+| anything else | Generic matcher: the literal tag as a whole name token, or in `general.tags` | `unknown` — same reason |
+| `embedding` | Not a gate tag | Answers `no` and points you at `/v1/embeddings`. Embedding models cannot chat, so they are never candidates and are excluded from the pool |
+
+Whole tokens only, both sides: `tags=["qwen"]` matches the `Qwen/` publisher token but **not**
+`Qwen3`. New tags need no server change — `tags=["vietnamese"]` or `tags=["medical"]` gets a truthful
+`yes`/`unknown` today.
+
+The same answer is on `GET /api/model-gate?min_params=20b&vision=true` for anything that speaks HTTP
+rather than MCP — a `GET`, so the D32 admin gate does not apply to it (D52).
+
+### 2. `list_models(limit=N)` — the catalog
 
 Sorted **newest download first**, so `limit=5` means "the models the user most recently got",
 which is usually what "my new model" means. Each model carries `options`: one row per context
@@ -151,7 +205,7 @@ window that cannot hold an agent's tool transcript is a failed task. `recommende
 which rule fired, and says `(below floor)` out loud when a model's own trained window cannot reach
 it.
 
-### 2. `load_model(**row["load_args"])`
+### 3. `load_model(**row["load_args"])`
 
 Returns once the child is serving. Loading may evict other **idle** models to make room; that is
 normal and is reported in the plan's `evict_model_ids`. A model with in-flight requests is never
@@ -209,7 +263,7 @@ restarts), else `settings.priority`, else background. So the setting is the floo
 tier decides how that one turn is admitted and can lift the load it triggers above the floor, never
 below it — and nothing about a request is remembered afterwards.
 
-### 3. Inference over HTTP, not MCP
+### 4. Inference over HTTP, not MCP
 
 ```bash
 POST http://<host>:1234/v1/chat/completions
@@ -220,7 +274,7 @@ knowing: a JIT load takes the planner's own choice of context, not the catalog r
 reading. If you need a specific window or slot count, call `load_model` first — a model that is
 already resident is used as-is.
 
-### 4. `model_options(model_id)` when the recommended row is not enough
+### 5. `model_options(model_id)` when the recommended row is not enough
 
 The full table for one model: every context tier, each with its own `fits`, `devices`,
 `kv_cache_type`, `max_parallel` and both speed columns. Use it when the task needs a bigger window
@@ -230,7 +284,7 @@ The trade-offs are visible rather than guessed: doubling `ctx_per_slot` costs `m
 how much depends on `attention_kind`), a `kv_cache_type` of `q8_0`/`q4_0` buys context back at some
 quality cost, and a row spread over more devices is usually slower per token than a single-GPU row.
 
-### 5. `search_models` → `repo_details` → `download_model`
+### 6. `search_models` → `repo_details` → `download_model`
 
 ```
 search_models(query="qwen3", sort="downloads", newer_than_days=90)
@@ -273,7 +327,7 @@ narrow the query rather than trusting the tail. `trending_score` appears only wi
 `sort="trending"` — HF omits the field entirely under any other ordering, so its absence is not a
 zero.
 
-### 6. `pin_model` — the model that must always answer
+### 7. `pin_model` — the model that must always answer
 
 ```
 pin_model(model_id="pub/agent-model")                 # keep loaded at all times
@@ -317,7 +371,7 @@ never moves it. Any *other* idle model may find itself quietly reloaded onto few
 contended cards once a minute on a quiet box — that is housekeeping (`planner.rebalance`), not
 something you did, and it never evicts or interrupts anything.
 
-### 7. `server_status` and `connection_info`
+### 8. `server_status` and `connection_info`
 
 `server_status` is free VRAM per GPU, every loaded model with its port and remaining TTL, queue
 depth, the active engine tag — and who is holding the VRAM (next section).

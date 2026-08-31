@@ -35,6 +35,12 @@ from studioforge.core.benchmark import (
 from studioforge.core.diskspace import disk_report
 from studioforge.core.leases import lease_view
 from studioforge.core.manager import validate_load_args
+from studioforge.core.model_gate import (
+    GateRequirement,
+    gate_answer,
+    parse_min_params,
+    parse_tags,
+)
 from studioforge.core.parallel_bench import (
     DEFAULT_MAX_TOKENS as PARALLEL_MAX_TOKENS,
 )
@@ -410,6 +416,80 @@ async def catalog(
     state = _state(request)
     return await run_in_threadpool(
         state.manager.catalog, model=model, compact=compact, refresh=refresh
+    )
+
+
+# Deliberately "/model-gate" and NOT "/models/gate": every other per-model route
+# is "/models/{model_id:path}/...", and a :path converter is greedy enough that a
+# literal sibling under the same prefix is a standing invitation to shadowing
+# bugs the day someone adds a model whose id starts with "gate/". A hyphenated
+# sibling of /models cannot collide with anything.
+@router.get("/model-gate")
+async def model_gate(
+    request: Request,
+    min_params: str | None = Query(
+        None, description="Size bar in billions: 20, '20b', '500m', '0.5b'"
+    ),
+    vision: bool = Query(False, description="Require image input"),
+    audio: bool = Query(False, description="Require audio input"),
+    tools: bool = Query(False, description="Require tool calling"),
+    thinking: bool = Query(False, description="Require a reasoning/thinking mode"),
+    uncensored: bool = Query(False, description="Require an uncensored/abliterated model"),
+    tags: str | None = Query(
+        None, description="Comma-separated extra tags, e.g. 'coding,roleplay,vietnamese'"
+    ),
+) -> dict[str, Any]:
+    """Is a loaded model above this bar, and which one should I send work to? (D52)
+
+    The routing question an agent asks *before* it decides between three
+    options: send this task to the local ``/v1`` API, spend 40 seconds loading
+    something bigger, or pay a cloud provider. The operator usually has
+    something loaded and most loaded models can do most jobs, so "is what is
+    already resident good enough" is the cheap question that avoids the other
+    two -- but only if it can be asked in one call.
+
+    The answer therefore carries the **model id**, not just a yes: a caller told
+    "yes, something qualifies" would still have to fetch ``/v1/models`` and
+    guess which of three resident models was meant. ``model`` goes straight into
+    the next ``/v1/chat/completions`` request. ``instances`` shows the working
+    for every resident model, and on a "no" ``reason`` names the gap and
+    ``hint`` points at the fix.
+
+    ``vision``/``audio``/``tools``/``thinking``/``uncensored`` are sugar for the
+    ``tags`` list -- every one of them lands in the same requirement set -- and
+    ``tags`` itself is free-form, so a caller can ask for something nobody
+    anticipated and get a truthful "yes" or "unknown" without a server change.
+
+    Read-only, and therefore **not** behind the D32 admin gate: that gate is
+    ``auth.is_admin_mutation``, which returns False for any verb outside
+    ``{POST, PUT, PATCH, DELETE}``, so a GET is open by construction and this
+    route needs no entry in any admin list. That is correct here -- routing
+    decisions are exactly what LAN clients are supposed to make, and this
+    endpoint reveals no more than ``GET /api/models`` already does.
+    """
+    state = _state(request)
+    try:
+        min_params_b = parse_min_params(min_params)
+    except ValueError as exc:
+        raise BadRequestError(str(exc), param="min_params") from exc
+
+    sugar = {
+        "vision": vision,
+        "audio": audio,
+        "tools": tools,
+        "thinking": thinking,
+        "uncensored": uncensored,
+    }
+    try:
+        requested = parse_tags(tags, extra=[name for name, on in sugar.items() if on])
+    except ValueError as exc:
+        raise BadRequestError(str(exc), param="tags") from exc
+
+    return await gate_answer(
+        GateRequirement(min_params_b=min_params_b, tags=requested),
+        registry=state.registry,
+        supervisor=state.supervisor,
+        introspect=state.manager.introspect,
     )
 
 
@@ -1416,8 +1496,8 @@ async def openclaw_setup(request: Request) -> JSONResponse:
                 else PIN_WITHHELD_NOTE
             ),
             "next_steps": [
-                "`sfctl mcp` merges the app's 19 management tools with the "
-                "watchdog's 10 recovery tools into one stdio tool list (29).",
+                "`sfctl mcp` merges the app's 20 management tools with the "
+                "watchdog's 10 recovery tools into one stdio tool list (30).",
                 "Start with list_models: it returns the catalog newest-download-first, "
                 "one options row per context size, exactly one marked recommended.",
                 "Pass that row's load_args verbatim to load_model, then send prompts "

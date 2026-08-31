@@ -245,11 +245,11 @@ others — want this shape:
 `sfctl mcp` is a **stdio** server — OpenClaw launches it as a child process, and it reads the
 profile you created in Step 4 to find the rig. No ports, no extra credentials in the JSON.
 
-It merges two upstream tool sets into one list of **29 tools**:
+It merges two upstream tool sets into one list of **30 tools**:
 
 | Source | Tools | Works when the main server is wedged? |
 | --- | --- | --- |
-| Main app (19) | `list_models`, `model_options`, `model_info`, `load_model`, `load_recommended`, `unload_model`, `pin_model`, `reserve_gpus`, `release_gpus`, `test_model`, `benchmark_parallel`, `search_models`, `repo_details`, `download_model`, `delete_model`, `server_status`, `connection_info`, `get_config`, `set_config` | no |
+| Main app (20) | `list_models`, `model_options`, `model_info`, `check_loaded_model`, `load_model`, `load_recommended`, `unload_model`, `pin_model`, `reserve_gpus`, `release_gpus`, `test_model`, `benchmark_parallel`, `search_models`, `repo_details`, `download_model`, `delete_model`, `server_status`, `connection_info`, `get_config`, `set_config` | no |
 | Watchdog (10) | `restart_server`, `kill_model`, `nuke_all_models`, `reclaim_orphan_engines`, `tail_logs`, `gpu_status`, `rollback_update`, `recovery_health`, `recovery_get_config`, `recovery_set_config` | **yes** |
 
 That split is the entire point of the separate sidecar: when the main server locks up, OpenClaw
@@ -288,7 +288,7 @@ sfctl recover
 With no flags this prints the watchdog's own health diagnosis. It goes to the **watchdog** on 1235, deliberately bypassing the main server, so a success here
 proves the recovery path OpenClaw depends on is live.
 
-Finally, restart OpenClaw and confirm it lists the 29 `studioforge` tools.
+Finally, restart OpenClaw and confirm it lists the 30 `studioforge` tools.
 
 ---
 

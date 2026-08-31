@@ -1130,6 +1130,19 @@ def test_proxy_instructions_document_the_mapping() -> None:
     assert "http://rig:1235" in text
 
 
+def test_proxy_instructions_teach_the_gate_before_a_load() -> None:
+    """Post-review (D52): this stdio proxy is the path OpenClaw actually reads
+    (`sfctl mcp`), and it builds its OWN instructions string rather than
+    forwarding the management server's -- so the gate has to be taught here too,
+    ahead of the "start by listing models" material, or the feature's whole
+    value ("ask first") never reaches the one agent it was built for."""
+    proxy = McpProxy(ServerProfile(name="rig", url="http://rig:1234"))
+    text = proxy.instructions()
+    assert 'check_loaded_model(min_params="20b", vision=true)' in text
+    assert "BEFORE YOU CHOOSE OR LOAD ANYTHING" in text
+    assert text.index("check_loaded_model") < text.index("START WITH `list_models`")
+
+
 def _result_text(result: Any) -> str:
     from studioforge_companion.mcp_proxy import result_text
 

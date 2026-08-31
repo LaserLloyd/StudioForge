@@ -136,15 +136,16 @@ others — want this shape:
 
 Add `"args": ["-s", "rig", "mcp"]` to pin a profile.
 
-`sfctl mcp` merges **two** upstream MCP servers into one list of **29 tools**.
+`sfctl mcp` merges **two** upstream MCP servers into one list of **30 tools**.
 
-**Management** (the main app, `<url>/mcp`) — 19 tools:
+**Management** (the main app, `<url>/mcp`) — 20 tools:
 
 | Tool | What it does |
 | --- | --- |
 | `list_models` | **Start here.** The catalog: every model newest-download-first, each with a table of loading options and a `load_args` object |
 | `model_options` | Every context tier for one model, when the recommended row is not what you need |
 | `model_info` | One model in detail, including what the running engine *actually* reports |
+| `check_loaded_model` | **Ask before loading.** Does what is already resident clear a bar — `min_params="20b"`, plus `vision`/`audio`/`tools`/`thinking`/`uncensored` or free-form `tags`? A yes carries the model id to send the work to; a no carries the reason |
 | `load_model` | Load now; pass a catalog row's `load_args` verbatim |
 | `load_recommended` | Name the model and the context; the server picks the GPUs, KV cache and slots and loads at exactly that window, or refuses with numbers |
 | `unload_model` | Free its VRAM immediately |

@@ -3954,3 +3954,171 @@ the mismatched ctx/parallel/kv/device-count each a no-op; dirty rows unable to m
 rule both ways; a raising lookup latching off after one warning while the plan proceeds; the memo
 answering once per pass; `fits_on` staying formula-only; migration 007 applying and `observe()`
 storing the V type; and the db/planner note constants agreeing).
+
+
+---
+
+## D52 -- The local-model gate: "is what is loaded good enough, and what do I call it?"
+
+**Problem.** The operator almost always has *something* loaded, and most loaded models can do most
+jobs. But every agent client -- an OpenClaw skill, a ClawChat bot -- reaches the same fork before
+every task and has no cheap way to resolve it: send this work to the local `/v1` API, spend forty
+seconds loading something bigger, or pay a cloud provider. Answering it from the existing surfaces
+means fetching `GET /api/models` or `/v1/models`, parsing model ids for sizes, guessing which of
+three resident models is the big one, and knowing that `Q4_K_M` is a quantization and `27B` is not.
+Every client that tried re-implemented that badly, and the failure mode is silent: a bot that
+decides a 4B is "probably fine" produces worse output with no error anywhere.
+
+**Decision.** One read-only question, asked two ways -- `GET /api/model-gate` and the MCP tool
+`check_loaded_model` -- answering a bar (minimum parameters and/or a set of capability tags)
+against *current residency only*. It never loads anything; it reports what is loaded and whether it
+clears the bar.
+
+**The answer carries the model id.** This is the part that makes it a routing primitive rather than
+a trivia question. A caller told "yes, something qualifies" still has to fetch the model list and
+guess which resident model was meant, so the response returns `model` (goes straight into the next
+`/v1/chat/completions`), `params_b`, `modalities` and the winner's `capabilities`. A yes you cannot
+act on is useless. `answer` is a literal `"yes"`/`"no"` string beside the boolean `ok` because weak
+clients pattern-match text.
+
+**Unknown never passes.** The gate's promise is "at least this big" / "this capability is present".
+A model we cannot *size* cannot make the first promise and a tag we cannot *verify* cannot make the
+second, so both fail closed -- an unsized model fails a `min_params` bar exactly as a 4B does. The
+asymmetry is deliberate: a false negative costs one unnecessary load, a false positive sends vision
+work to a text-only model and returns garbage. `why_not` keeps the two legible and separate
+("params 4.0B < 20.0B" versus "cannot verify 'uncensored'"), because they are different operational
+problems -- the first says load something bigger, the second says the library does not describe
+this model.
+
+**Sizing is layered, and says which layer answered.** `params_source` is `"metadata"` (an exact
+`general.parameter_count`, which `gguf.py` already parses into `GgufMeta.param_count`, or a count a
+running child reported), `"name"` (size tokens in the model id), or `"estimated"` (file bytes over
+the quantization's bits-per-weight). A caller that cares about the difference can see it. The name
+parser matters more than it sounds: model ids on this rig are dense with digits that are *not*
+sizes -- `Q4_K_M`, `Q8_0`, `b10689`, `BF16`, `f16`, `hb16`, `v2.0` -- so it matches whole tokens
+with boundary lookarounds rather than splitting the id, handles MoE (`122B` + `A10B` -> total 122,
+active 10), `8x7B` -> 56, and Gemma's effective-size `E4B` -> 4. It deliberately does **not** split
+on `.`: `SmolLM2-1.7B` would become `1` and `7B` and report a 1.7B model as clearing a 5B bar.
+Bare numbers in `min_params` are **billions** -- nobody says "a 7,000,000,000-parameter model" --
+and `"500m"` is 0.5, because a caller who thinks in millions should not have to convert.
+
+**Tags are one open set, not an enum.** `vision`/`audio`/`tools`/`thinking`/`uncensored` are named
+booleans on both surfaces that land in the same `tags` set the free-form `tags=` list feeds, and
+any tag outside the curated table falls through to a generic matcher (the literal tag as a whole
+name token, or in the GGUF's `general.tags`). `tags=vietnamese` or `tags=medical` therefore gets a
+truthful answer with **zero code change**, which is what stops this feature needing a release per
+tag. Verdicts are tri-state per candidate: `vision`/`tools`/`thinking` come from
+`ModelCapabilities`, which was derived from the file at scan time and so is a real `"no"` when
+false; `audio`/`video` have no local field at all and are `"unknown"` unless a running child lists
+them; curated and generic tags resolve to `"yes"` or `"unknown"` and **never** `"no"`, because a
+model id without "uncensored" in it does not thereby prove the model is censored -- most names
+simply do not describe their alignment. (HF repo tags would answer some of these exactly, but the
+downloader does not retain them; the GGUF `general.tags` array many conversions embed is the local
+stand-in, read lazily -- header-only, cached by `(path, mtime)`, off the event loop, and only when
+a requested tag actually needs a file.)
+
+**Selection.** Candidates are `ready` instances minus embedding-kind records (an embedding model is
+loaded, healthy, and completely unable to serve a chat request -- counting it would produce a yes
+that breaks the caller's very next call; asking for `tags=embedding` is refused with a pointer at
+`/v1/embeddings`). Largest total wins, unsized sorts last, ties break to the most recent
+`last_activity_at`: both are equally good answers, so the tie goes to the one whose weights and
+prompt cache are warm. MoE models report `active_params_b` beside the total; the bar gates on the
+**total**.
+
+**Reuse rather than a second implementation.** Parameter counts go through
+`core/throughput.py` -- its measured `BITS_PER_WEIGHT` table, the longest-prefix `bits_per_weight()`
+match for vendor suffixes, and the MoE dense-trunk `active_params()` model, so the gate and the
+catalog can never report different active sizes for one model. (Its unknown-quant default is 5.0
+bits, "between Q4 and Q5, which is where most of a real library lives"; the gate does not override
+it for a ~3% difference on a number whose whole layer is labelled `estimated`.) Modalities go
+through one `modalities_from()` that `gui.state.modalities_text` now renders too, so the Dashboard
+and the gate cannot drift on whether a running child accepts images.
+
+**Not behind the D32 admin gate, by construction.** `auth.is_admin_mutation` returns False for any
+verb outside `{POST, PUT, PATCH, DELETE}`, so a GET is open without an entry in any list. That is
+correct here: routing decisions are exactly what LAN clients are supposed to make, and the endpoint
+reveals nothing `GET /api/models` does not. The path is `/api/model-gate` and **not**
+`/api/models/gate` -- the per-model routes use a greedy `{model_id:path}` converter, and a literal
+sibling under that prefix is a standing invitation to a shadowing bug the day a model id starts
+with `gate/`.
+
+**A gate must never be the thing that breaks.** `introspect` talks HTTP to a child that may be
+mid-restart; any exception is treated as "the child did not answer" and the evaluation falls back to
+the scanned record, because failing a *routing* decision over a *reporting* problem is the wrong
+trade. The lazy `general.tags` header read swallows every error into an empty tag set for the same
+reason.
+
+**The MCP half.** `check_loaded_model` has parameter parity with the route (`min_params`, the five
+booleans, `tags` accepting **both** a list and a comma string -- an MCP client sends
+`["coding","roleplay"]`, an sfctl-style caller sends `"coding,roleplay"`, and a caller that gets it
+half right sends `["coding,roleplay"]`; all three are the same intent, so the tool joins and lets
+`parse_tags` split rather than 400ing on a spelling). The response is `gate_answer`'s dict
+verbatim: re-projecting it in the MCP layer would be a second place for the contract to drift. The
+five booleans are spelled out rather than derived from `SUGAR_TAGS` because the MCP JSON schema is
+what a weak model reads -- a named `vision: boolean` is discoverable, a `tags` array is not. A bad
+`min_params`/`tags` raises `BadRequestError`, which `_guard` renders as the module's standard
+error shape. The docstring follows the D41 weak-model pattern -- literal example calls, then a
+numbered recipe naming the *next* call for each branch -- and the INSTRUCTIONS block gains one
+QUICK RECIPES line plus a "BEFORE YOU CHOOSE OR LOAD ANYTHING" paragraph placed ahead of the
+pin/lease/load material, because the gate's entire value is being asked before the expensive
+decision. Existing pinned substrings were added to, never reworded.
+
+**Tool count 19 -> 20 (30 with the watchdog), in nine places** -- the `/api/openclaw-setup`
+`next_steps` text, four README mentions, `docs/OPENCLAW.md`, `docs/OPENCLAW-SETUP.md`,
+`docs/DEVELOPMENT.md`, the companion README and `sfctl mcp` docstring, and the `test_docs.py`
+assertions that exist to catch exactly this rot. Left alone on purpose: the companion proxy's
+`MANAGEMENT_FALLBACK_TOOLS`, which is advertised only while the main server is unreachable -- and a
+gate call against a dead server can answer nothing useful, so the omission is correct rather than a
+missed count. `docs/OPENCLAW.md`'s agent loop gains the gate as **step 1** (steps 2-8 renumbered,
+the D41 precedent) with the yes/no branch table and the tag-vocabulary table; the README gains the
+feature bullet; the Dashboard/Models/Setup screenshots were re-captured against the live v1.26-08-30
+GUI (the first two had been stale since D48 and predated every D50 chip and badge), with the same
+selective redaction the originals used.
+
+**Left as future work.** `general.size_label` -- the "27B"/"8x7B" string many conversions embed --
+is not retained on `GgufMeta`. Capturing it would mean bumping `META_FORMAT_VERSION` and rescanning
+the whole library, which is not worth it while the name parser covers every model on this rig.
+There is also no audio indicator anywhere in `ModelCapabilities` or the GGUF metadata this project
+parses, which is why an audio bar is answerable only from a live child.
+
+**Tests.** `tests/unit/test_model_gate.py` (95: the `min_params` parse matrix including the
+boolean, negative, junk and whitespace rejects; the size-token matrix with quant/engine-token
+immunity -- `Q8_0`, `Q4_K_M`, `b10689`, `BF16`, `hb16`, `v2.0` -- plus `1.7B`, `E4B`, `A10B` MoE,
+`8x7B`; the estimate fallback and its unknown-quant labelling; unknown size failing a bar; the
+tri-state verdict matrix per canonical tag with the unknown-fails wording; uncensored via name
+token and via `general.tags`; the generic matcher on arbitrary tags, whole-token only; the lazy
+gguf-tags reader cached by `(path, mtime)` and swallowing read errors; embedding exclusion and the
+`tags=embedding` refusal; largest-wins selection with the recency tie-break; introspection raising
+-> record fallback; the exact response key sets on yes and on no; route 200/400 and its open-GET
+status), `tests/unit/test_mcp.py` (the tool listed; REST-parity schema; yes carries the id; no
+names the gap; empty server; vision picks the vision model over the bigger text model; both `tags`
+spellings and the sugar booleans landing in one requirement; junk `min_params` -> the standard
+error shape; the INSTRUCTIONS pin), and `tests/unit/test_docs.py` (the 20/30 counts asserted
+against the real servers and the setup text).
+
+**Amended the same day, after an independent adversarial review.** Six findings, all taken:
+(1) the companion stdio proxy (`sfctl mcp` -- the path OpenClaw actually connects by) builds its
+own instructions string and never forwards the management server's, so the gate was taught on a
+surface the target agent never reads; the proxy now opens with the same BEFORE-YOU-CHOOSE-OR-LOAD
+recipe, pinned by `test_proxy_instructions_teach_the_gate_before_a_load`. (2) The documented bare
+number (`min_params=20`) was rejected at the MCP schema layer as a raw protocol error -- the
+`str`-only annotation meant pydantic refused it before `_guard` could answer in the friendly
+shape; the signature is now `str | int | float | None`, because the schema is the contract.
+(3) A live child's modalities can now VETO a stale vision capability: the record says what the
+file can do, the child says what this process was launched able to do, and a projector deleted
+after the scan (or a multimodal launched without `--mmproj`) is record-yes/live-no -- precisely
+the false positive the module exists to prevent. When the child answered, its answer decides
+vision in both directions; a silent child leaves the scan as the best available answer.
+(4) `min_params=0` -- the natural programmatic spelling of "no bar" -- was a literal bar that
+refused unsized models with "cannot prove >= 0.0B"; zero now means no bar. (5) `general.tags` is
+model-card tag soup, and a real creative-writing merge in this library carries `coding`, `math`
+and `stem` in its card tags -- so `coding` can no longer be proven by a card tag, only by a name
+token ("-Coder-"); identity tags (uncensored, roleplay -- now including "roleplaying") keep the
+file path, because tagging a card "uncensored" is the author describing the finetune itself.
+A card tag is a claim; a name token is an identity. (6) `supervisor.list()` was the one unguarded
+call in the evaluation, and only on the REST surface would its failure have been a 500; it now
+degrades to a refusal ("the loaded-model table could not be read; retry shortly") like every other
+failure path. One stale count the sweep missed (`docs/OPENCLAW-SETUP.md`'s "confirm it lists the
+29 tools" verification step) was corrected to 30, and the header-read docstring's "few
+milliseconds" was corrected to the measured 35-90 ms cold. Sugar-tag parity between the MCP
+schema and `SUGAR_TAGS` is now pinned on both surfaces.

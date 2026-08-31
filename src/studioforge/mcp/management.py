@@ -68,6 +68,12 @@ from studioforge.api.auth import redact_config_dict
 from studioforge.config import RESTART_REQUIRED_KEYS, Config, apply_overrides, load_config
 from studioforge.core import parallel_bench
 from studioforge.core.leases import lease_view
+from studioforge.core.model_gate import (
+    GateRequirement,
+    gate_answer,
+    parse_min_params,
+    parse_tags,
+)
 from studioforge.errors import BadRequestError, ModelNotFoundError, StudioForgeError
 from studioforge.logging import get_logger
 from studioforge.types import GB
@@ -88,6 +94,7 @@ and download new ones, and change configuration.
 QUICK RECIPES -- copy these exact calls; every argument name is literal:
   what models are there?        list_models()
   is the server busy? VRAM?     server_status()
+  is the loaded model enough?   check_loaded_model(min_params="20b", vision=true)
   load a model                  load_recommended(model_id="<id>", ctx_size=32768)
   free a model's VRAM           unload_model(model_id="<id>")
   keep a model loaded forever   pin_model(model_id="<id>")
@@ -97,6 +104,16 @@ QUICK RECIPES -- copy these exact calls; every argument name is literal:
   does it actually work?        test_model(model_id="<id>")
 Model ids come from list_models -- copy the `id` field exactly, slashes and
 all. The argument is always called model_id, never model or name.
+
+BEFORE YOU CHOOSE OR LOAD ANYTHING, ASK WHETHER WHAT IS ALREADY LOADED WILL DO:
+check_loaded_model(min_params="20b", vision=true) takes a size bar in billions
+plus any capability tags (vision, audio, tools, thinking, uncensored, or
+free-form ones like "coding"). answer "yes" -> send the work straight to
+/v1/chat/completions using the `model` id it returns; it is loaded and warm, so
+do not load anything. answer "no" -> `reason` names the gap ("nothing is
+loaded", "largest loaded model is 4B, below the 20B bar"), and you either
+load_recommended something that clears the bar or fall back to another
+provider. A bar it cannot prove is a "no": unverifiable never passes.
 
 TO KEEP A MODEL LOADED AT ALL TIMES: pin_model(model_id). A pinned model has
 no idle timeout, is never evicted to make room for another model, is loaded
@@ -841,6 +858,124 @@ def build_management_mcp(state: Any) -> MCPServer:
             payload["actual"] = detail.get("actual")
             payload["slots"] = detail.get("slots")
         return payload
+
+    @_guard
+    async def check_loaded_model(
+        # str | int | float, not just str (post-review fix, D52): the docstring
+        # promises `20` works, and the generated JSON schema is what enforces
+        # it -- a str-only annotation made pydantic reject the documented bare
+        # number BEFORE _guard could turn it into the friendly error shape.
+        min_params: str | int | float | None = None,
+        vision: bool = False,
+        audio: bool = False,
+        tools: bool = False,
+        thinking: bool = False,
+        uncensored: bool = False,
+        tags: list[str] | str | None = None,
+    ) -> dict[str, Any]:
+        """**Ask this BEFORE you load anything.** Is the already-loaded model good enough?
+
+        The operator usually has a model loaded already, and most loaded models
+        can do most jobs. This tool answers "is what is resident right now at
+        least this big / able to do this?" in one call, and -- when the answer
+        is yes -- hands back the **model id to put in your request**. That saves
+        you a 40-second load, or a call out to a cloud provider, that you did
+        not need to make.
+
+        The three calls you will make::
+
+            check_loaded_model(min_params="20b")
+            check_loaded_model(min_params="7b", vision=true)
+            check_loaded_model(tags=["coding"])
+
+        THE RECIPE. Call it, then read ``answer``:
+
+        1. ``answer == "yes"`` -- take the ``model`` field and send your work to
+           the local OpenAI-compatible API: ``POST /v1/chat/completions`` with
+           ``{"model": "<model>", "messages": [...]}``. Call ``connection_info``
+           once for the base URL (``openai_base_urls``). Do NOT call
+           ``load_model`` -- it is already loaded and warm.
+        2. ``answer == "no"`` -- read ``reason``, which names the gap in one
+           sentence ("nothing is loaded", "largest loaded model is 4B, below the
+           20B bar", "no loaded model reports audio"). Then either
+           ``load_recommended(model_id="<a bigger/right model>", ctx_size=...)``
+           -- use ``list_models`` to pick one -- or fall back to your other
+           provider. ``hint`` says the same thing in one line.
+
+        A bare number in ``min_params`` means **billions**: ``"20"``, ``20`` and
+        ``"20b"`` are all a 20-billion-parameter bar, and ``"500m"`` is 0.5B.
+
+        A tag the server cannot **verify** fails the bar, exactly like a "no":
+        the gate only ever answers yes to what it can prove, so it never sends
+        vision work to a text-only model.
+
+        Args:
+            min_params: The size bar in billions -- ``"20b"``, ``"7b"``,
+                ``"500m"``, or just ``"20"``. Omit for no size bar. A model
+                whose size cannot be determined at all fails any bar.
+            vision: Require image input (the model can read pictures).
+            audio: Require audio input. Only a *running* child can prove this,
+                so a model that does not report its modalities is "unknown"
+                and fails.
+            tools: Require tool/function calling.
+            thinking: Require a reasoning/thinking mode.
+            uncensored: Require an uncensored/abliterated model.
+            tags: Anything else, as a list (``["coding", "roleplay"]``) or a
+                comma-separated string (``"coding,roleplay"``) -- both work.
+                Free-form: ``"vietnamese"``, ``"medical"`` and words nobody
+                anticipated are matched against the model's name tokens and its
+                GGUF ``general.tags``, so an unlisted tag gets a truthful
+                "yes" or "unknown" rather than an error. Whole tokens only.
+
+        Returns:
+            ``{"ok", "answer": "yes"|"no", "model", "params_b",
+            "active_params_b", "params_source", "modalities", "capabilities",
+            "checked", "instances", "reason", "hint"}``. ``model`` is the id to
+            use and is ``null`` on a no, along with every other field that
+            describes a winner. ``params_source`` says how the size was known:
+            ``metadata`` (exact), ``name`` (read off the model id), ``estimated``
+            (from file bytes -- a few percent out) or ``unknown``.
+            ``active_params_b`` is set only for a mixture-of-experts model, whose
+            routed count is far below its total; the size bar is checked against
+            the **total**. ``instances`` shows the working for every loaded
+            model, each with ``meets`` and a ``why_not`` list, so a "no" can be
+            diagnosed without a second call.
+        """
+        try:
+            min_params_b = parse_min_params(min_params)
+        except ValueError as exc:
+            raise BadRequestError(str(exc), param="min_params") from exc
+
+        # The five booleans are sugar for `tags` -- they all land in the same
+        # requirement set. Kept spelled out (rather than derived from
+        # model_gate.SUGAR_TAGS) so the MCP schema an agent reads names them,
+        # and mirroring GET /api/model-gate exactly: one contract, two surfaces.
+        sugar = {
+            "vision": vision,
+            "audio": audio,
+            "tools": tools,
+            "thinking": thinking,
+            "uncensored": uncensored,
+        }
+        # sfctl-style callers send "coding,roleplay" where an MCP client sends
+        # ["coding", "roleplay"]. Joining first means the comma splitting in
+        # parse_tags handles both, including a list whose element is itself a
+        # comma string -- an interpolation mistake that should not be an error.
+        raw_tags = tags if isinstance(tags, str) else ",".join(str(t) for t in (tags or ()))
+        try:
+            requested = parse_tags(raw_tags, extra=[name for name, on in sugar.items() if on])
+        except ValueError as exc:
+            raise BadRequestError(str(exc), param="tags") from exc
+
+        # Returned verbatim: gate_answer's dict is already the compact,
+        # agent-readable shape, and re-projecting it here would be a second
+        # place for the response contract to drift from the REST route's.
+        return await gate_answer(
+            GateRequirement(min_params_b=min_params_b, tags=requested),
+            registry=state.registry,
+            supervisor=state.supervisor,
+            introspect=state.manager.introspect,
+        )
 
     @_guard
     async def load_model(
@@ -1862,6 +1997,7 @@ def build_management_mcp(state: Any) -> MCPServer:
         list_models,
         model_options,
         model_info,
+        check_loaded_model,
         load_model,
         load_recommended,
         unload_model,

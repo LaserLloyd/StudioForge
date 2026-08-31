@@ -60,6 +60,11 @@ EXPECTED_TOOLS = {
     # is opt-in for the one model the agent actually cares about.
     "model_options",
     "model_info",
+    # The routing gate (D52): "is what is already loaded good enough?", asked
+    # before anything is chosen or loaded. A tool of its own rather than a field
+    # on list_models because the answer depends on the *bar* the caller carries,
+    # and because a yes has to name the model id to send the work to.
+    "check_loaded_model",
     "load_model",
     # "the model and the context, and the server works the rest" -- the load
     # path an agent should reach for first, and the only one that is strict
@@ -741,6 +746,198 @@ async def test_pin_of_unknown_model_is_a_result_not_an_exception(state: State) -
     result = await call(server, "pin_model", model_id="no-such-model")
     assert result["ok"] is False
     assert "no-such-model" in result["error"]["message"]
+
+
+# ---------------------------------------------------------------------------
+# check_loaded_model -- the routing gate (D52)
+# ---------------------------------------------------------------------------
+#
+# The gate's own semantics (sizing, tag verdicts, unknown-fails) are tested
+# against the core module in test_model_gate.py. What is tested here is only
+# what the MCP layer adds: that the tool exists with the REST route's knobs,
+# that both spellings of `tags` reach the requirement, that a parse failure
+# comes back as a readable error *result* rather than a protocol error, and
+# that the gate's dict travels to the client unflattened.
+
+
+def residents(
+    state: State,
+    monkeypatch: pytest.MonkeyPatch,
+    *model_ids: str,
+    modalities: Any = None,
+) -> None:
+    """Pretend these models are loaded, without launching a llama-server.
+
+    Stubs the two seams the gate reads -- ``supervisor.list()`` for residency
+    and ``manager.introspect()`` for what a running child reports -- so the real
+    registry, and therefore real ``ModelRecord`` capabilities, stay in the loop.
+    ``modalities=None`` means "the child never answered", which is a different
+    verdict from an empty list and is the default a stub should have.
+    """
+    instances = [InstanceInfo(model_id=mid, state="ready", port=18100) for mid in model_ids]
+    monkeypatch.setattr(state.supervisor, "list", lambda: list(instances))
+
+    async def introspect(model_id: str) -> dict[str, Any]:
+        return {"loaded": True, "actual": {"modalities": modalities}}
+
+    monkeypatch.setattr(state.manager, "introspect", introspect)
+
+
+async def test_check_loaded_model_offers_every_knob_the_rest_route_does(state: State) -> None:
+    """Parity with ``GET /api/model-gate``: an agent that can only reach MCP
+    must not be missing a bar a REST caller can set."""
+    server = build_management_mcp(state)
+    tool = next(t for t in await server.list_tools() if t.name == "check_loaded_model")
+    assert {
+        "min_params",
+        "vision",
+        "audio",
+        "tools",
+        "thinking",
+        "uncensored",
+        "tags",
+    } <= set(tool.input_schema["properties"])
+    # Every capability flag defaults off, so a bare call is "anything loaded?"
+    for flag in ("vision", "audio", "tools", "thinking", "uncensored"):
+        assert tool.input_schema["properties"][flag]["default"] is False
+
+
+async def test_check_loaded_model_yes_carries_the_id_to_send_work_to(
+    state: State, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A yes the caller cannot act on is useless: the id, the size and how the
+    size was known all travel in the same answer."""
+    residents(state, monkeypatch, TINY)
+    server = build_management_mcp(state)
+    payload = await call(server, "check_loaded_model", min_params="0.25b")
+    assert payload["ok"] is True
+    assert payload["answer"] == "yes"
+    # Usable verbatim as the `model` field of a /v1/chat/completions request.
+    assert payload["model"] == TINY
+    assert payload["params_b"] == 0.5  # "0.5B" read out of the model id
+    assert payload["params_source"] == "name"
+    assert payload["reason"] is None
+    assert payload["checked"] == {"min_params_b": 0.25, "tags": []}
+
+
+async def test_check_loaded_model_no_names_the_gap_and_the_fix(
+    state: State, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The refusal has to be actionable on its own -- the sentence names the
+    largest thing loaded and the bar it missed, and every winner-describing
+    field is emptied so nothing reads as usable."""
+    residents(state, monkeypatch, TINY)
+    server = build_management_mcp(state)
+    payload = await call(server, "check_loaded_model", min_params="20b")
+    assert payload["ok"] is False
+    assert payload["answer"] == "no"
+    assert payload["model"] is None
+    assert payload["params_b"] is None
+    assert payload["reason"] == "largest loaded model is 0.5B, below the 20B bar"
+    assert "load_recommended" in payload["hint"]
+    # The working for every resident, so a "no" is diagnosable without a second call.
+    assert payload["instances"][0]["why_not"] == ["params 0.5B < 20.0B"]
+
+
+async def test_check_loaded_model_with_an_empty_server_says_nothing_is_loaded(
+    state: State,
+) -> None:
+    """No stub: the real supervisor has nothing running, which is the state an
+    agent meets on a cold box."""
+    server = build_management_mcp(state)
+    payload = await call(server, "check_loaded_model")
+    assert payload["answer"] == "no"
+    assert payload["reason"] == "nothing is loaded"
+
+
+async def test_check_loaded_model_picks_the_resident_that_can_see(
+    state: State, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A capability bar beats a size bar: the bigger text model loses to the
+    only one whose record says it does vision."""
+    residents(state, monkeypatch, TINY, VISION)
+    server = build_management_mcp(state)
+    payload = await call(server, "check_loaded_model", vision=True)
+    assert payload["answer"] == "yes"
+    assert payload["model"] == VISION
+    assert payload["capabilities"]["vision"] is True
+    assert payload["checked"]["tags"] == ["vision"]
+
+
+@pytest.mark.parametrize("spelling", ["coding,roleplay", ["coding", "roleplay"]])
+async def test_sugar_flags_and_either_spelling_of_tags_reach_the_requirement(
+    state: State, monkeypatch: pytest.MonkeyPatch, spelling: Any
+) -> None:
+    """sfctl-style callers send "a,b" where an MCP client sends ["a", "b"];
+    both land in the same requirement set, alongside the named booleans."""
+    residents(state, monkeypatch, TINY)
+    server = build_management_mcp(state)
+    payload = await call(
+        server, "check_loaded_model", thinking=True, uncensored=True, tags=spelling
+    )
+    assert payload["checked"]["tags"] == ["coding", "roleplay", "thinking", "uncensored"]
+    # TINY proves none of them, and unknown fails: each unproven tag says so
+    # rather than claiming a confident "no".
+    assert payload["answer"] == "no"
+    assert payload["instances"][0]["why_not"] == [
+        "cannot verify 'coding'",
+        "cannot verify 'roleplay'",
+        "no thinking",
+        "cannot verify 'uncensored'",
+    ]
+
+
+async def test_check_loaded_model_rejects_an_unreadable_min_params(state: State) -> None:
+    """A typo in an agent's config must be a legible error naming the parameter
+    and the accepted shapes -- not a protocol failure, and not a 500."""
+    server = build_management_mcp(state)
+    payload = await call(server, "check_loaded_model", min_params="twenty")
+    assert payload["ok"] is False
+    assert payload["error"]["param"] == "min_params"
+    message = payload["error"]["message"]
+    assert "cannot read min_params" in message
+    assert "'20b'" in message and "'500m'" in message
+
+
+async def test_check_loaded_model_accepts_the_documented_bare_number(
+    state: State, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Post-review (D52): the docstring promises ``min_params=20`` works, and a
+    ``str``-only annotation made pydantic reject the documented number at the
+    schema layer -- a raw protocol error, before ``_guard`` could answer in the
+    friendly shape. The signature is the contract the schema enforces."""
+    residents(state, monkeypatch, "vendor/plain-27B")
+    server = build_management_mcp(state)
+    for spelling in (20, 20.0, "20", "20b"):
+        payload = await call(server, "check_loaded_model", min_params=spelling)
+        assert payload["answer"] == "yes", spelling
+        assert payload["checked"]["min_params_b"] == 20.0
+
+
+async def test_check_loaded_model_sugar_names_match_the_core_list(state: State) -> None:
+    """The five booleans are spelled out for schema discoverability; this pins
+    them to ``model_gate.SUGAR_TAGS`` so a sixth sugar tag cannot land in core
+    and silently miss this surface (the REST route is pinned the same way)."""
+    from studioforge.core.model_gate import SUGAR_TAGS
+
+    server = build_management_mcp(state)
+    tool = next(t for t in await server.list_tools() if t.name == "check_loaded_model")
+    schema = tool.input_schema["properties"]
+    boolean_params = {
+        name
+        for name, spec in schema.items()
+        if spec.get("type") == "boolean" or {"type": "boolean"} in spec.get("anyOf", [{}])
+    }
+    assert boolean_params == set(SUGAR_TAGS)
+
+
+async def test_instructions_teach_the_gate_before_a_load(state: State) -> None:
+    """D52's whole value is being asked *first*, so the recipe block has to say
+    so in the imperative -- a weak model reads INSTRUCTIONS, not this file."""
+    server = build_management_mcp(state)
+    assert server.instructions is not None
+    assert 'check_loaded_model(min_params="20b", vision=true)' in server.instructions
+    assert "BEFORE YOU CHOOSE OR LOAD ANYTHING" in server.instructions
 
 
 # ---------------------------------------------------------------------------

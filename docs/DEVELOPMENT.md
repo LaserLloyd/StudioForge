@@ -70,6 +70,7 @@ core/
   gguf.py          GGUF header parser — geometry, quant, capabilities
   planner.py       VRAM arithmetic: what fits, where, at what context
   catalog.py       the rows an agent picks from (docs/CATALOG.md)
+  model_gate.py    "is what is loaded good enough?" — the routing gate (D52)
   manager.py       load/unload, pin reconciler (D41), rebalancer (D42)
   leases.py        GPU leases (D43)
   supervisor.py    llama-server children: launch args, health, kill
@@ -79,7 +80,7 @@ core/
   gpu.py           NVML probe
 gui/           NiceGUI panel; tabs/ is one module per tab (dashboard, models, download,
                benchmark, chat, logs, server, setup)
-mcp/           management-plane MCP server (19 tools)
+mcp/           management-plane MCP server (20 tools)
 tray/          Windows notification-area app
 watchdog/      recovery sidecar: its own process, port and MCP server (10 tools)
 ```

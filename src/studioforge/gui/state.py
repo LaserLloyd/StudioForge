@@ -35,6 +35,7 @@ from pydantic import BaseModel
 
 from studioforge.api.auth import redact
 from studioforge.config import RESTART_REQUIRED_KEYS
+from studioforge.core.model_gate import modalities_from
 from studioforge.types import GpuInfo, InstanceInfo, ModelRecord, ModelSettings, VirtualPreset
 
 #: Shown wherever a value is genuinely unknown, rather than zero.
@@ -983,17 +984,19 @@ def is_speculative(introspection: Mapping[str, Any] | None) -> bool:
 
 
 def modalities_text(introspection: Mapping[str, Any] | None) -> str:
-    """What the running server says it accepts (e.g. vision), as it says it."""
-    if not introspection:
+    """What the running server says it accepts (e.g. vision), as it says it.
+
+    The derivation itself lives in
+    :func:`studioforge.core.model_gate.modalities_from`, so this line and the
+    D52 gate can never disagree about whether a running child accepts images.
+    All this adds is how the two empty cases read to a human: the gate needs to
+    tell "the child never answered" from "the child answered, text only" because
+    they are opposite verdicts to it; on screen they are just different words.
+    """
+    modalities = modalities_from(introspection)
+    if modalities is None:
         return UNKNOWN
-    actual = introspection.get("actual")
-    modalities = actual.get("modalities") if isinstance(actual, Mapping) else None
-    if isinstance(modalities, Mapping):
-        enabled = sorted(k for k, v in modalities.items() if v)
-        return ", ".join(enabled) if enabled else "text only"
-    if isinstance(modalities, Sequence) and not isinstance(modalities, str):
-        return ", ".join(str(m) for m in modalities) or "text only"
-    return UNKNOWN
+    return ", ".join(modalities) if modalities else "text only"
 
 
 def build_info_text(introspection: Mapping[str, Any] | None) -> str:
