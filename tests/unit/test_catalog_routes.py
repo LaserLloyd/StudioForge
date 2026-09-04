@@ -294,6 +294,33 @@ def test_status_reports_requests_deferred_per_loaded_model(app: Any) -> None:
     assert entry["ctx_per_slot"] == 16384
 
 
+def test_status_and_leases_describe_a_lease_the_same_way(app: Any) -> None:
+    """One projection or none (D53).
+
+    ``idle_s``/``expires_at`` are properties on ``GpuLease``, so ``/api/status``
+    -- which dumped the model -- carried neither while ``/api/leases`` carried
+    both, and ``sfctl status`` rendered "-" in the two columns that answer "is
+    this lease still alive?". Set-equality of the keys, not a field list, so
+    the next derived field cannot drift apart the same way.
+    """
+    lease = app.state.manager.leases.acquire(
+        [0], holder="crucibleforge-judge", reason="8-stream benchmark"
+    )
+
+    with TestClient(app) as http:
+        from_status = http.get("/api/status").json()["leases"]
+        from_leases = http.get("/api/leases").json()["leases"]
+
+    assert len(from_status) == 1 and len(from_leases) == 1
+    assert from_status[0].keys() == from_leases[0].keys()
+    assert from_status[0]["id"] == lease.id
+    assert from_status[0]["idle_s"] == 0
+    assert from_status[0]["expires_at"] is not None
+    assert from_status[0]["state"] == "active"
+    assert from_status[0]["holder_family"] == "crucibleforge"
+    assert from_status[0]["kind"] == "benchmark"
+
+
 def test_status_reports_nulls_before_the_first_scrape(app: Any) -> None:
     """A model loaded seconds ago has no sample yet; that is not an error."""
     instance = InstanceInfo(model_id=MODEL_ID, state="ready", port=18100, plan=make_plan())
@@ -307,6 +334,97 @@ def test_status_reports_nulls_before_the_first_scrape(app: Any) -> None:
     assert entry["metrics_sampled_at"] is None
     # The plan-derived fields do not depend on a scrape.
     assert entry["max_parallel"] == 3
+
+
+def test_status_rows_carry_a_prompt_cache_block_from_the_collector(app: Any) -> None:
+    """Is the cache WORKING (D54): lifetime counters from the child's own
+    /metrics, read from the sweep's cache -- never scraped on the poll."""
+    instance = InstanceInfo(model_id=MODEL_ID, state="ready", port=18100, plan=make_plan())
+    loaded(app, instance)
+    app.state.manager._throughput_gauges = {
+        MODEL_ID: {
+            "sampled_at": 1_755_000_100.0,
+            throughput.METRIC_REQUESTS_DEFERRED: 0.0,
+            throughput.METRIC_PROMPT_TOKENS: 14000.0,
+            throughput.METRIC_PROMPT_TOKENS_CACHED: 33700.0,
+        }
+    }
+
+    with TestClient(app) as http:
+        body = http.get("/api/status").json()
+
+    block = body["loaded"][0]["prompt_cache"]
+    assert block["processed_total"] == 14000
+    assert block["cached_total"] == 33700
+    assert block["hit_ratio"] == pytest.approx(0.7065, abs=1e-3)
+    assert block["since"] == "child_start"
+    assert block["sampled_at"] == 1_755_000_100.0
+
+
+def test_prompt_cache_block_is_null_when_the_engine_has_no_cached_counter(app: Any) -> None:
+    """A pre-b10689 child exports ``prompt_tokens_total`` only. Null, not a
+    block of zeros that reads as "the cache never hits"."""
+    instance = InstanceInfo(model_id=MODEL_ID, state="ready", port=18100, plan=make_plan())
+    loaded(app, instance)
+    app.state.manager._throughput_gauges = {
+        MODEL_ID: {"sampled_at": 1_755_000_100.0, throughput.METRIC_PROMPT_TOKENS: 14000.0}
+    }
+
+    with TestClient(app) as http:
+        body = http.get("/api/status").json()
+        assert body["loaded"][0]["prompt_cache"] is None
+        # And before the first sweep at all.
+        app.state.manager._throughput_gauges = {}
+        assert http.get("/api/status").json()["loaded"][0]["prompt_cache"] is None
+
+
+def test_status_and_models_rows_carry_effective_for_loaded_models_and_null_otherwise(
+    app: Any,
+) -> None:
+    """What the child was REALLY launched with (D54): on the InstanceInfo dump
+    /api/status already sends, and added to the GET /api/models row -- the
+    closest thing to a per-model GET -- so a `null` in `settings` on the same
+    row is never read as "off"."""
+    from studioforge.types import EffectiveLaunch
+
+    effective = EffectiveLaunch(
+        cache_reuse=256,
+        cache_ram_mib=32603,
+        slot_prompt_similarity=0.3,
+        parallel=3,
+        ctx_per_slot=16384,
+        ctx_total=49152,
+        sources={"cache_reuse": "argv"},
+        summary=(
+            "prefix cache on (reuse 256, host 32603 MiB, routing 0.3), continuous batching on"
+        ),
+    )
+    instance = InstanceInfo(
+        model_id=MODEL_ID,
+        state="ready",
+        port=18100,
+        plan=make_plan(),
+        effective=effective,
+        launch_args=["llama-server.exe", "--model", "thing.gguf", "--cache-reuse", "256"],
+    )
+    loaded(app, instance)
+
+    with TestClient(app) as http:
+        status = http.get("/api/status").json()
+        models = http.get("/api/models").json()
+        row = status["loaded"][0]
+        assert row["effective"]["cache_reuse"] == 256
+        assert row["effective"]["sources"] == {"cache_reuse": "argv"}
+        assert row["launch_args"][0] == "llama-server.exe"
+
+        model_row = next(m for m in models["models"] if m["id"] == MODEL_ID)
+        assert model_row["settings"]["cache_reuse"] is None, "the saved setting: inherit"
+        assert model_row["effective"]["cache_reuse"] == 256, "what the child runs with"
+        assert model_row["effective"]["summary"].startswith("prefix cache on")
+
+        loaded(app, InstanceInfo(model_id="other/model", state="ready"))
+        cold = http.get("/api/models").json()
+        assert next(m for m in cold["models"] if m["id"] == MODEL_ID)["effective"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -329,6 +447,38 @@ def test_v1_models_exposes_concurrency_for_a_loaded_model(app: Any) -> None:
     assert entry["studioforge"]["max_parallel"] == 3
     assert entry["studioforge"]["parallel"] == 3
     assert entry["studioforge"]["parallel_limited_by"] == "knee"
+    assert entry["studioforge"]["effective"] is None, "no argv stamped on this stub"
+
+
+def test_v1_models_carries_the_compact_effective_launch_for_a_loaded_model(app: Any) -> None:
+    """The D41 vendor block gains the D54 compact subset: an OpenAI client that
+    only ever fetches /v1/models can see the prompt cache is on without a
+    second, StudioForge-specific request."""
+    from studioforge.types import EffectiveLaunch
+
+    instance = InstanceInfo(
+        model_id=MODEL_ID,
+        state="ready",
+        port=18100,
+        plan=make_plan(),
+        effective=EffectiveLaunch(
+            cache_reuse=256, parallel=3, ctx_per_slot=16384, summary="prefix cache on (reuse 256)"
+        ),
+    )
+    loaded(app, instance)
+
+    with TestClient(app) as http:
+        listed = http.get("/v1/models").json()["data"][0]
+        single = http.get(f"/v1/models/{MODEL_ID}").json()
+        for entry in (listed, single):
+            block = entry["studioforge"]["effective"]
+            assert block["cache_reuse"] == 256
+            assert block["summary"] == "prefix cache on (reuse 256)"
+            assert "sources" not in block, "the compact view; the full block is on /api/status"
+
+        loaded(app, InstanceInfo(model_id="other/model", state="ready"))
+        cold = http.get("/v1/models").json()["data"][0]
+        assert "effective" not in cold["studioforge"], "absent, like max_parallel, when not loaded"
 
 
 def test_v1_models_stays_quiet_about_concurrency_when_nothing_is_loaded(app: Any) -> None:
@@ -659,7 +809,9 @@ def make_persona(record_id: str = PERSONA_ID, base: str = MODEL_ID) -> ModelReco
         update={
             "is_virtual": True,
             "base_model_id": base,
-            "preset": VirtualPreset(system_prompt="you are a coach"),  # scrub-ok: generic-English fixture
+            "preset": VirtualPreset(
+                system_prompt="you are a coach"
+            ),  # scrub-ok: generic-English fixture
         }
     )
 

@@ -35,7 +35,7 @@ the full runs are in DECISIONS.md **D38**.
 | --- | --- | --- | --- |
 | Speculative decoding | `--spec-type` | **auto** (on where it pays) | none — distribution-preserving |
 | Host-RAM prompt cache | `--cache-ram` | **on**, a shared pool of 25% of RAM capped at 32 GiB | none |
-| Prompt-cache reuse | `--cache-reuse 256` | **on** | none |
+| Prompt-prefix reuse | `--cache-reuse 256`, `--slot-prompt-similarity 0.3` | **on** | none |
 | Flash attention | `--flash-attn on` | **on** | none |
 | Partitioned KV pool | `--no-kv-unified` | **on** above one slot | none (a capacity trade, not a quality one) |
 | Engine auto-fit | `--fit off` | **off** | n/a — it would break the GPU-only policy (D11) |
@@ -104,6 +104,51 @@ prompt or you are benchmarking a cache.
 
 ---
 
+## Prompt-prefix reuse (`--cache-reuse`, `--slot-prompt-similarity`)
+
+**What it is.** Three mechanisms, all on by default, all quality-neutral (a cache of computed KV,
+not an approximation of it):
+
+- **Prefix reuse.** With prompt caching on (the engine default, `--cache-prompt`), a request that
+  lands on a slot keeps the longest common prefix of the slot's previous prompt and skips its
+  prefill. No flag is needed for this; it is what recovers a shared story bible.
+- **Chunk reuse** (`--cache-reuse 256`). *After* the point of divergence, any run of at least 256
+  identical tokens still in the slot is shifted into place instead of recomputed. Second-order:
+  it matters for an edit in the middle of a prompt, not for the shared prefix.
+- **Slot routing** (`--slot-prompt-similarity 0.3` above one slot). A request is sent to the idle
+  slot whose previous prompt matches it best, so an agent's near-identical prompts land where the
+  prefix already is; the engine's 0.10 default scatters them.
+
+**Two limits that no setting removes.** A slot only reuses what *it* holds — there is no sharing
+across slots, so at `parallel: N` the first N concurrent requests each prefill the whole prompt.
+And a hybrid or recurrent model (`attention_kind: hybrid`) reuses back to the nearest *context
+checkpoint* (`--ctx-checkpoints 32`, `--checkpoint-min-step 8192`), which sit at user-message
+starts; the part of a prompt that differs must begin a user message. The arithmetic and the
+recipe are in [OPENCLAW-LONG-CONTEXT.md §4](OPENCLAW-LONG-CONTEXT.md#4-concurrent-requests-that-share-a-prefix).
+
+**What a child is really running with.** A per-model setting of `null` means *inherit*, and
+inherit is not off. Every instance view carries `effective` (D54) — `cache_prompt`,
+`cache_reuse`, `cache_ram_mib`, `cache_idle_slots`, `cont_batching`, `kv_unified`,
+`slot_prompt_similarity`, `parallel`, `ctx_per_slot`, batch sizes, checkpoints, `spec_type`,
+`flash_attn` — parsed from the final argv (last occurrence wins, so `extra_flags` are in the
+answer) with the engine's own defaults filled in and a `sources` map saying which is which.
+`inert` names a saved setting the child could not see; `summary` is the one-line version. It is on
+`/api/status loaded[]` (with the redacted `launch_args`), the `GET /api/models` row, `/introspect`,
+and, as a compact subset, on every MCP instance row. `cont_batching: false` now emits
+`--no-cont-batching` where the engine has it and logs `setting_inert` where it does not; before
+D54 it emitted nothing.
+
+**How to read its effect.** `timings.cache_n` (reused) against `timings.prompt_n` (processed) on
+the final response of every completion, streamed or not; `usage.prompt_tokens_details.cached_tokens`
+on non-streaming responses (streams need `stream_options.include_usage`); and per child the
+`prompt_cache` block on `/api/status loaded[]`, from `llamacpp:prompt_tokens_cached_total`.
+`usage.prompt_tokens` is the prompt's size and cannot show a hit.
+
+**Measuring it.** `scripts/measure_prefix_cache.py --model <id>` on an idle rig (it refuses to run
+under a lease or beside active requests, and never loads a model).
+
+---
+
 ## Host-RAM prompt cache (`--cache-ram`)
 
 **What it is.** When a slot's prompt prefix is evicted, the engine can keep it in *system* memory
@@ -117,8 +162,9 @@ again after another model borrowed the slot.
 
 The two settings have **different scopes** (D50). `auto` is a machine-wide **pool**: each model is
 granted what the other loaded models are not already holding, floored at 4 GiB so the last one in
-still has a cache at all, and the grant it got is on its row in `GET /api/models`
-(`cache_ram_mib`). An explicit integer is **per child, verbatim** — you named a number, every model
+still has a cache at all, and the grant it got is `cache_ram_mib` on the instance — on
+`/api/status loaded[]`, on `/introspect` → `instance`, and inside `effective` on the
+`GET /api/models` row (D54). An explicit integer is **per child, verbatim** — you named a number, every model
 gets that number, and four residents can then hold four times it. Before D50 `auto` behaved that
 way too, which is how a cap documented as unable to make the box swap came to promise 128 GiB of a
 128 GiB machine. If the floor pushes the total past the pool, the launch logs
@@ -128,8 +174,11 @@ tight.
 **Quality cost.** None: it is a cache of computed KV, not an approximation of it. **VRAM cost:
 none** — measured identical VRAM (1492 MiB) at `--cache-ram 8192` and at `32768`.
 
-**How to read its effect.** Watch prompt processing time on a repeated prefix: a hit shows up as a
-much smaller `timings.prompt_n` for the same request.
+**How to read its effect.** A hit shows up as `timings.cache_n` rising on the final response —
+`prompt_n` is what was actually processed, and `usage.prompt_tokens` is the prompt's size and
+never moves. Per child, `prompt_cache` on `/api/status loaded[]` carries the lifetime
+`cached_total` / `processed_total` / `hit_ratio` from the engine's own counters (see the
+prefix-reuse section above).
 
 ---
 

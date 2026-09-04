@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from studioforge.config import Config, FlashAttn, KvCacheType, QuantAffinity, SplitMode
 from studioforge.core.gpu import vram_processes
 from studioforge.core.kv_sensitivity import KV_QUALITY_LADDER
-from studioforge.core.leases import LeaseBook
+from studioforge.core.leases import LeaseBook, lease_view
 from studioforge.core.priority import PRIORITY_BACKGROUND
 from studioforge.logging import get_logger
 from studioforge.types import (
@@ -1270,8 +1270,14 @@ class Planner:
                             "widen or clear the model's allowed_devices setting, or free "
                             "one of the cards it names"
                         ],
+                        # Only when no lease is involved: _note_leases stamps
+                        # ``gpu_leased`` over this when one of the cards
+                        # allowed_devices names is leased away, because that is
+                        # the more specific -- and waitable -- cause.
+                        reason_code="allowed_devices_unavailable",
                     ),
                     blocked,
+                    allowed=allowed_set,
                 )
         own = [i.pid for i in credited if i.pid is not None]
         with self._observation_pass():
@@ -1327,7 +1333,18 @@ class Planner:
                     f"by the model's allowed_devices setting"
                 )
             self._grade_placement(result, gpus_view)
-        return self._note_leases(result, blocked)
+        # The cards this load could have used, for the gpu_leased verdict: a
+        # device_override IS that set (it outranks allowed_devices and
+        # excluded_devices alike, and a clash was already refused above), so a
+        # forced placement that simply does not fit is never blamed on a
+        # lease standing on cards it was never going to touch.
+        if forced:
+            usable: set[int] | None = forced
+        elif allowed is not None:
+            usable = {int(d) for d in allowed}
+        else:
+            usable = None
+        return self._note_leases(result, blocked, allowed=usable)
 
     def _grade_placement(self, plan: LoadPlan, gpus_view: Sequence[GpuInfo] | None) -> None:
         """Stamp ``placement_tier`` and say so when a split mixes generations.
@@ -1392,13 +1409,61 @@ class Planner:
             )
         return lines
 
-    def _note_leases(self, result: PlanResult, blocked: frozenset[int]) -> PlanResult:
-        """Say which cards a lease took away, on a plan and on a refusal alike."""
+    def _blocking_leases(self, blocked: frozenset[int]) -> list[dict[str, Any]]:
+        """The ``lease_view`` of every lease holding one of ``blocked``.
+
+        Attached to a refusal so a client backs off against a fact -- an
+        ``expires_at`` and a ``retry_after_s`` -- rather than substring-matching
+        the word "leased" out of the prose (D53).
+        """
+        if self.leases is None or not blocked:
+            return []
+        return [lease_view(lease) for lease in self.leases.all() if set(lease.devices) & blocked]
+
+    def _lease_candidates(self, allowed: set[int] | frozenset[int] | None) -> set[int]:
+        """The cards this load could have used if no lease stood.
+
+        Live cards, narrowed by the model's ``allowed_devices`` when it has one
+        and by ``planner.excluded_devices`` when it does not (an explicit
+        allow-list outranks the policy exclusion, exactly as it does in
+        placement). Empty when the probe cannot be asked -- which makes the
+        caller stamp nothing, the right answer when we do not know.
+        """
+        try:
+            live = {g.index for g in self.probe.list_gpus()}
+        except Exception:  # noqa: BLE001 - a sick probe must not break a refusal
+            return set()
+        if allowed is not None:
+            return live & {int(d) for d in allowed}
+        return live - set(self.config.planner.excluded_devices)
+
+    def _note_leases(
+        self,
+        result: PlanResult,
+        blocked: frozenset[int],
+        *,
+        allowed: set[int] | frozenset[int] | None = None,
+    ) -> PlanResult:
+        """Say which cards a lease took away, on a plan and on a refusal alike.
+
+        On a refusal it also stamps the machine-readable half -- ``gpu_leased``
+        plus the lease records -- but **only when the leases took every card
+        this load could have used**. A lease standing on some other card while
+        a model genuinely does not fit is context, not cause, and calling that
+        refusal ``gpu_leased`` would send a client away to wait for a release
+        that will not change the answer.
+        """
         if not blocked:
             return result
         lines = self._lease_lines(blocked)
         if isinstance(result, LoadRejected):
             result.suggestions.extend(lines)
+            candidates = self._lease_candidates(allowed)
+            if candidates and candidates <= blocked:
+                result.leases = self._blocking_leases(frozenset(candidates))
+                # A lease outranks whatever coarser code got there first: it is
+                # the specific, waitable cause, and the only one with a clock.
+                result.reason_code = "gpu_leased"
         else:
             result.notes.extend(lines)
         return result
@@ -1415,6 +1480,8 @@ class Planner:
                 *self._lease_lines(frozenset(clash)),
                 "load without the device override and let the planner place it elsewhere",
             ],
+            reason_code="gpu_leased",
+            leases=self._blocking_leases(frozenset(clash)),
         )
         log.info(
             "load rejected: device leased to another holder",

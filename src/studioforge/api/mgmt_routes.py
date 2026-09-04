@@ -111,6 +111,11 @@ async def status(request: Request) -> dict[str, Any]:
         downloads = len(state.downloader.active())
     payload = state.manager.status(engine=engine, active_downloads=downloads)
     data = payload.model_dump(mode="json")
+    # The derived clocks are @property on GpuLease, so a plain model_dump drops
+    # them: /api/status showed a lease with no idle_s and no expiry while
+    # /api/leases showed both, and `sfctl status` rendered "-" in the two
+    # columns that answer "is this lease alive?". One projection, everywhere.
+    data["leases"] = [lease_view(lease) for lease in state.manager.leases.all()]
     # A running benchmark was invisible here -- REST clients had to learn of
     # it from a 503 on their next POST. Present while one runs, null after.
     running = _benchmark_jobs(state).running()
@@ -194,6 +199,13 @@ def _attach_child_metrics(state: Any, data: dict[str, Any]) -> None:
             gauges.get(throughput.METRIC_BUSY_SLOTS) if gauges else None
         )
         entry["metrics_sampled_at"] = gauges.get("sampled_at") if gauges else None
+        # Is this child's prompt cache WORKING -- as opposed to configured,
+        # which `effective` on the same row answers (D54). Lifetime totals
+        # from the child's own counters; null until the first scrape and on
+        # an engine without `prompt_tokens_cached_total`, never a fake zero.
+        entry["prompt_cache"] = throughput.prompt_cache_block(
+            gauges, started_at=entry.get("started_at")
+        )
         entry["max_parallel"] = plan.get("max_parallel")
         entry["ctx_per_slot"] = plan.get("ctx_per_slot") or plan.get("ctx_size")
 
@@ -363,6 +375,11 @@ async def list_models(request: Request) -> dict[str, Any]:
     ``priority`` and ``effective_ttl_s`` share a caveat: both are **soft
     answers** about the *next* load, not promises. A request may still name its
     own tier, and a tier that outranks the standing one wins.
+
+    ``effective`` (D54) is the opposite kind of answer: the launch settings a
+    *running* child was really started with -- prompt cache, continuous
+    batching, KV pool shape, slots -- parsed from its argv with the engine's
+    defaults filled in. ``null`` for anything not loaded.
     """
     state = _state(request)
     from studioforge.api.app import wait_for_boot
@@ -390,6 +407,14 @@ async def list_models(request: Request) -> dict[str, Any]:
                 "priority": state.manager.effective_priority_for(serving),
                 "active_requests": instance.active_requests if instance else 0,
                 "last_tokens_per_second": (instance.last_tokens_per_second if instance else None),
+                # What the running child was REALLY launched with (D54), so a
+                # `null` in `settings` on the same row is never read as "off".
+                # Null when not loaded: there is no argv to be honest about.
+                "effective": (
+                    instance.effective.model_dump(mode="json")
+                    if instance is not None and instance.effective is not None
+                    else None
+                ),
             }
         )
     return {"models": models, "count": len(models)}

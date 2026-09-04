@@ -8,6 +8,7 @@ restart. They are pinned here because nothing else would catch a reintroduction.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from types import SimpleNamespace
 from typing import Any
@@ -1400,3 +1401,192 @@ def test_newest_mtime_falls_back_when_nothing_readable(tmp_path) -> None:
     from studioforge.core.registry import _newest_mtime
 
     assert _newest_mtime([tmp_path / "nope.gguf"], fallback=42.0) == 42.0
+
+
+# ---------------------------------------------------------------------------
+# An over-long prompt is a 400 about the prompt, not a 502 about the server
+# ---------------------------------------------------------------------------
+
+
+class _Refusal:
+    """An upstream response, shaped like the ones llama-server actually sends."""
+
+    def __init__(self, status_code: int, message: str) -> None:
+        self.status_code = status_code
+        self._message = message
+        self.text = json.dumps({"error": {"message": message}})
+
+    def json(self) -> Any:
+        return {"error": {"message": self._message, "type": "server_error"}}
+
+    async def aread(self) -> bytes:
+        return self.text.encode()
+
+    async def __aenter__(self) -> _Refusal:
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        return None
+
+
+class _RefusingClient:
+    def __init__(self, response: _Refusal) -> None:
+        self._response = response
+
+    def stream(self, *_args: object, **_kwargs: object) -> _Refusal:
+        return self._response
+
+    async def post(self, *_args: object, **_kwargs: object) -> _Refusal:
+        return self._response
+
+
+def _loaded_state(response: _Refusal, ctx_per_slot: int = 16384) -> Any:
+    supervisor = CountingSupervisor()
+    supervisor.instances["test/model"] = InstanceInfo(
+        model_id="test/model",
+        state="ready",
+        plan=LoadPlan(
+            model_id="test/model", devices=[0], ctx_size=ctx_per_slot, ctx_per_slot=ctx_per_slot
+        ),
+    )
+    state = FakeState(supervisor, [])
+    state.client = _RefusingClient(response)
+    return state
+
+
+_LLAMA_WORDING = (
+    "the request exceeds the available context size. try increasing the context size "
+    "or enable context shift"
+)
+
+
+def test_a_prompt_bigger_than_the_slot_is_a_400_naming_the_limit() -> None:
+    """The engine knows; the gateway used to bury it in a 502.
+
+    A failover client has to tell "this model cannot hold this prompt" (route
+    elsewhere, or shorten) from "the engine fell over" (retry, alert), and only
+    one of those is worth a retry.
+    """
+    state = _loaded_state(_Refusal(400, _LLAMA_WORDING), ctx_per_slot=16384)
+    error = openai_routes._context_overflow(state.client._response, make_record(), state)
+
+    assert error is not None
+    assert error.status_code == 400
+    assert error.code == "context_exceeded"
+    assert error.details["ctx_per_slot"] == 16384
+    assert error.details["loaded_context_length"] == 16384
+    assert error.details["model_id"] == "test/model"
+    # Never claimed, because it was never measured: knowing the prompt's real
+    # token count needs a tokenize round-trip this path does not make.
+    assert "prompt_tokens" not in error.details
+    assert "16384" in error.message
+
+
+def test_an_unrelated_upstream_400_is_still_an_upstream_error() -> None:
+    state = _loaded_state(_Refusal(400, "invalid grammar in the response_format schema"))
+    assert openai_routes._context_overflow(state.client._response, make_record(), state) is None
+
+    server_fault = _loaded_state(_Refusal(500, _LLAMA_WORDING))
+    assert (
+        openai_routes._context_overflow(server_fault.client._response, make_record(), server_fault)
+        is None
+    ), "a 500 mentioning context is the engine failing, not the prompt being long"
+
+
+async def test_the_streaming_path_maps_the_same_refusal() -> None:
+    """A stream must not be the reason a client cannot tell the two apart."""
+    state = _loaded_state(_Refusal(400, _LLAMA_WORDING))
+    chunks = [
+        chunk
+        async for chunk in openai_routes._stream_upstream(
+            state, make_record(), "http://x/v1/chat/completions", {}, 0.0
+        )
+    ]
+
+    body = b"".join(chunks)
+    assert b"[DONE]" in body, "an unterminated stream reads as a hang"
+    frame = json.loads(body.split(b"data: ", 1)[1].split(b"\n\n", 1)[0])
+    assert frame["error"]["code"] == "context_exceeded"
+    assert frame["error"]["studioforge"]["ctx_per_slot"] == 16384
+    assert state.supervisor.active == 0, "the request slot is still released"
+
+
+async def test_the_non_streaming_path_raises_it_too() -> None:
+    from studioforge.errors import BadRequestError, UpstreamError
+
+    state = _loaded_state(_Refusal(400, _LLAMA_WORDING))
+    with pytest.raises(BadRequestError) as excinfo:
+        await openai_routes._forward(state, make_record(), "/v1/chat/completions", {})
+
+    assert excinfo.value.code == "context_exceeded"
+    assert excinfo.value.status_code == 400
+    assert state.supervisor.active == 0
+
+    plain = _loaded_state(_Refusal(400, "invalid grammar"))
+    with pytest.raises(UpstreamError) as upstream:
+        await openai_routes._forward(plain, make_record(), "/v1/chat/completions", {})
+    assert upstream.value.status_code == 400
+    assert upstream.value.code == "upstream_error"
+
+
+class _TypedRefusal(_Refusal):
+    """b10689's shape: ``type: exceed_context_size_error`` plus the two counts
+    (server-common.cpp ``format_error_response`` + server-task.cpp
+    ``server_task_result_error::to_json``)."""
+
+    def __init__(self, n_prompt_tokens: int, n_ctx: int) -> None:
+        super().__init__(
+            400,
+            f"request ({n_prompt_tokens} tokens) exceeds the available context size "
+            f"({n_ctx} tokens), try increasing it",
+        )
+        self._n_prompt_tokens = n_prompt_tokens
+        self._n_ctx = n_ctx
+
+    def json(self) -> Any:
+        return {
+            "error": {
+                "code": 400,
+                "message": self._message,
+                "type": "exceed_context_size_error",
+                "n_prompt_tokens": self._n_prompt_tokens,
+                "n_ctx": self._n_ctx,
+            }
+        }
+
+
+def test_the_engines_typed_refusal_is_recognised_and_its_measured_count_relayed() -> None:
+    """b10689 types the refusal and reports what it counted.
+
+    The type is the discriminator when it is there -- no prose is consulted --
+    and ``prompt_tokens`` appears because the *engine* measured it; the gateway
+    still tokenizes nothing and still invents nothing.
+    """
+    state = _loaded_state(_TypedRefusal(n_prompt_tokens=20000, n_ctx=16384), ctx_per_slot=16384)
+    error = openai_routes._context_overflow(state.client._response, make_record(), state)
+
+    assert error is not None and error.code == "context_exceeded"
+    assert error.details["prompt_tokens"] == 20000
+    assert error.details["engine_n_ctx"] == 16384
+    assert error.details["ctx_per_slot"] == 16384
+
+    # The type alone is enough, whatever the wording becomes.
+    reworded = _TypedRefusal(n_prompt_tokens=9, n_ctx=8)
+    reworded._message = "nope"
+    reworded.text = json.dumps({"error": {"message": "nope"}})
+    state = _loaded_state(reworded)
+    assert openai_routes._context_overflow(reworded, make_record(), state) is not None
+
+
+def test_a_400_that_merely_says_exceeds_is_not_a_context_refusal() -> None:
+    """A sampler-parameter 400 must not send a client off to shorten its prompt."""
+    state = _loaded_state(_Refusal(400, "Failed to initialize samplers: n_probs exceeds the limit"))
+    assert openai_routes._context_overflow(state.client._response, make_record(), state) is None
+    # ...while the older untyped wordings of the real refusal still map.
+    for wording in (
+        "input (9000 tokens) is larger than the max context size (8192 tokens). skipping",
+        "Context size has been exceeded.",
+    ):
+        old = _loaded_state(_Refusal(400, wording))
+        mapped = openai_routes._context_overflow(old.client._response, make_record(), old)
+        assert mapped is not None and "prompt_tokens" not in mapped.details, wording

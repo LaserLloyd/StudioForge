@@ -664,6 +664,45 @@ def test_a_compact_instance_carries_its_tier_and_what_drafting_resolved_to() -> 
     }
 
 
+def test_a_compact_instance_carries_the_effective_launch_and_its_summary() -> None:
+    """One edit lights up server_status, model_info, load_model and
+    load_recommended (D54): an agent that reads ``settings.cache_reuse: null``
+    can see, on the same row, that the child runs with reuse 256 -- and quote
+    one line about it."""
+    from studioforge.mcp.management import _compact_instance
+    from studioforge.types import EffectiveLaunch
+
+    instance = InstanceInfo(model_id="chat/model", state="ready", port=18100)
+    assert _compact_instance(instance)["effective"] is None, "no argv yet"
+    instance.effective = EffectiveLaunch(
+        cache_reuse=256,
+        cache_ram_mib=32603,
+        slot_prompt_similarity=0.3,
+        parallel=3,
+        ctx_per_slot=16384,
+        ctx_total=49152,
+        spec_type="draft-mtp",
+        inert=["cont_batching"],
+        sources={"cache_reuse": "argv"},
+        summary="prefix cache on (reuse 256, host 32603 MiB, routing 0.3)",
+    )
+    row = _compact_instance(instance)["effective"]
+    assert row == {
+        "summary": "prefix cache on (reuse 256, host 32603 MiB, routing 0.3)",
+        "cache_prompt": True,
+        "cache_reuse": 256,
+        "cache_ram_mib": 32603,
+        "cont_batching": True,
+        "kv_unified": False,
+        "slot_prompt_similarity": 0.3,
+        "parallel": 3,
+        "ctx_per_slot": 16384,
+        "spec_type": "draft-mtp",
+        "inert": ["cont_batching"],
+    }
+    assert "sources" not in row, "the compact view; the full block is on /api/status"
+
+
 def test_a_compact_instance_defaults_to_the_background_tier() -> None:
     from studioforge.mcp.management import _compact_instance
 
@@ -1008,6 +1047,45 @@ async def test_server_status_reports_gpus_loaded_and_engine(state: State) -> Non
     assert payload["engine_tag"] == "b10425"
     assert payload["active_downloads"] == 0
     assert payload["draining"] is False
+
+
+async def test_server_status_rows_carry_prompt_cache_counters(state: State) -> None:
+    """Whether each child's prompt cache is WORKING, from the collector's last
+    sweep (D54) -- null before one, never a fake zero."""
+    from studioforge.core import throughput
+    from studioforge.core.supervisor import _Instance
+    from studioforge.types import LoadPlan
+
+    plan = LoadPlan(model_id=TINY, devices=[0], ctx_size=4096)
+    state.supervisor._instances[TINY] = _Instance(
+        info=InstanceInfo(model_id=TINY, state="ready", port=18100, plan=plan),
+        record=state.registry.get(TINY),
+        plan=plan,
+        port=18100,
+        engine_tag=None,
+        draft=None,
+        adapters=(),
+        log_path=state.config.data_dir / "tiny.log",
+    )
+    server = build_management_mcp(state)
+    payload = await call(server, "server_status")
+    (row,) = payload["loaded"]
+    assert row["model_id"] == TINY
+    assert row["prompt_cache"] is None, "no sweep yet"
+    assert row["effective"] is None, "no argv yet"
+
+    state.manager._throughput_gauges = {
+        TINY: {
+            "sampled_at": 1_755_000_100.0,
+            throughput.METRIC_PROMPT_TOKENS: 1000.0,
+            throughput.METRIC_PROMPT_TOKENS_CACHED: 3000.0,
+        }
+    }
+    payload = await call(server, "server_status")
+    (row,) = payload["loaded"]
+    assert row["prompt_cache"]["cached_total"] == 3000
+    assert row["prompt_cache"]["processed_total"] == 1000
+    assert row["prompt_cache"]["hit_ratio"] == pytest.approx(0.75)
 
 
 async def test_server_status_survives_a_missing_engine_manager(state: State) -> None:

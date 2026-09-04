@@ -846,14 +846,30 @@ class LoadRejected(BaseModel):
     #: in the way. ``None`` for every other refusal, because "try again later"
     #: is bad advice when nothing is going to change.
     retry_after_s: float | None = None
+    #: Stable machine code for WHY this refusal happened, when the cause is
+    #: structural rather than arithmetic. ``None`` means the ordinary "it does
+    #: not fit" refusal, which the 507's own ``insufficient_vram`` already
+    #: names. ``"gpu_leased"`` when a D43 lease is the cause -- the box has the
+    #: VRAM, somebody else has the promise, and those need opposite client
+    #: responses (D53).
+    reason_code: str | None = None
+    #: ``lease_view`` projections of every lease standing in the way, so a
+    #: client can back off against a fact (``expires_at``, ``retry_after_s``)
+    #: instead of substring-matching prose.
+    leases: list[dict[str, Any]] = Field(default_factory=list)
 
     def message(self) -> str:
-        required_gb = self.required_bytes / GB
-        available_gb = self.available_bytes / GB
-        text = (
-            f"Cannot load '{self.model_id}' entirely in VRAM: needs "
-            f"{required_gb:.2f} GiB, {available_gb:.2f} GiB usable. {self.reason}"
-        )
+        text = f"Cannot load '{self.model_id}' entirely in VRAM: "
+        # A lease refusal has no arithmetic behind it: nothing was estimated,
+        # because the cards were never on offer. Rendering the zeros anyway
+        # said "needs 0.00 GiB, 0.00 GiB usable", which reads as a sizing bug
+        # and buries the real reason (D53).
+        if self.required_bytes or self.available_bytes:
+            text += (
+                f"needs {self.required_bytes / GB:.2f} GiB, "
+                f"{self.available_bytes / GB:.2f} GiB usable. "
+            )
+        text += self.reason
         if self.suggestions:
             text += " Suggestions: " + "; ".join(self.suggestions)
         return text
@@ -865,6 +881,75 @@ PlanResult = LoadPlan | LoadRejected
 # ---------------------------------------------------------------------------
 # Running instances
 # ---------------------------------------------------------------------------
+
+
+class EffectiveLaunch(BaseModel):
+    """What the child is REALLY running with (D54).
+
+    Parsed from the child's final argv -- last occurrence wins, exactly as
+    llama.cpp reads a repeated flag -- with the engine's documented defaults
+    filled in for anything the argv does not mention. It exists because a
+    saved per-model setting of ``null`` means "inherit", and a client read it
+    as "off": SPEC A1 asked for prefix caching to be "enabled" on a launch that
+    already carried ``--cache-reuse 256 --cache-ram 32603
+    --slot-prompt-similarity 0.3`` and continuous batching. ``sources`` says,
+    per field, whether the value came from the argv (settings, config, plan and
+    ``extra_flags`` alike -- the argv is the only thing the engine sees) or is
+    the engine's own default.
+    """
+
+    #: Server-wide prompt caching (``--cache-prompt``). The longest-common-
+    #: prefix reuse path needs nothing else to be on.
+    cache_prompt: bool = True
+    #: ``--cache-reuse``: minimum chunk length reused by KV shifting AFTER the
+    #: point of divergence. 0 = chunk reuse off; the prefix path is still on.
+    cache_reuse: int = 0
+    #: ``--cache-ram`` in MiB; ``None`` when the engine has no such flag,
+    #: 0 = off, -1 = unlimited.
+    cache_ram_mib: int | None = None
+    #: Idle slots are snapshotted into the host cache when a new task lands.
+    #: Reported False whenever ``cache_ram_mib`` is 0 or absent -- the engine
+    #: disables it without a host cache to save into.
+    cache_idle_slots: bool = True
+    cont_batching: bool = True
+    kv_unified: bool = False
+    #: ``--slot-prompt-similarity``; 0.0 = no prefix-aware slot routing.
+    slot_prompt_similarity: float = 0.10
+    parallel: int = 1
+    ctx_per_slot: int = 0
+    ctx_total: int = 0
+    batch_size: int = 2048
+    ubatch_size: int = 512
+    ctx_checkpoints: int | None = None
+    checkpoint_min_step: int | None = None
+    spec_type: str = "none"
+    flash_attn: str = "auto"
+    #: field -> ``"argv"`` | ``"engine_default"``.
+    sources: dict[str, str] = Field(default_factory=dict)
+    #: Saved settings the child cannot see -- e.g. ``cont_batching: false`` on
+    #: an engine that has no ``--no-cont-batching``. Empty when every setting
+    #: reached the argv. The load also logs ``setting_inert`` for each.
+    inert: list[str] = Field(default_factory=list)
+    #: One human line for the Dashboard and MCP, e.g. "prefix cache on (reuse
+    #: 256, host 32603 MiB, routing 0.3), continuous batching on, 3 slots x
+    #: 131072, partitioned KV, spec draft-mtp".
+    summary: str = ""
+
+    def compact(self) -> dict[str, Any]:
+        """The subset an agent needs to answer "is the prompt cache on?"."""
+        return {
+            "summary": self.summary,
+            "cache_prompt": self.cache_prompt,
+            "cache_reuse": self.cache_reuse,
+            "cache_ram_mib": self.cache_ram_mib,
+            "cont_batching": self.cont_batching,
+            "kv_unified": self.kv_unified,
+            "slot_prompt_similarity": self.slot_prompt_similarity,
+            "parallel": self.parallel,
+            "ctx_per_slot": self.ctx_per_slot,
+            "spec_type": self.spec_type,
+            "inert": list(self.inert),
+        }
 
 
 class InstanceInfo(BaseModel):
@@ -903,6 +988,16 @@ class InstanceInfo(BaseModel):
     #: "this cache can never be the reason the box swaps" claim only held for
     #: one of them -- and a pool nobody can see the shares of is unauditable.
     cache_ram_mib: int | None = None
+    #: The resolved launch settings, parsed from the argv the child was
+    #: really started with (D54). ``None`` until the spawn has built that
+    #: argv. Read this, not ``settings``, to answer "is X on for this child":
+    #: a ``null`` setting inherits, and inherit is not off.
+    effective: EffectiveLaunch | None = None
+    #: That argv, redacted: every absolute path is reduced to its basename
+    #: and the value after ``--api-key`` / ``--api-key-file`` /
+    #: ``--ssl-key-file`` (which ``extra_flags`` could carry) is replaced.
+    #: The exact command line lived only in the child's log file before this.
+    launch_args: list[str] | None = None
     plan: LoadPlan | None = None
     started_at: float | None = None
     last_activity_at: float | None = None

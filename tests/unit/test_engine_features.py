@@ -82,6 +82,54 @@ def test_engine_defaults_are_captured_from_the_help_text() -> None:
     assert caps.kv_unified_default == "enabled if number of slots is auto"
 
 
+def test_features_record_cont_batching_and_similarity_defaults() -> None:
+    """The defaults behind the switches a launch may leave unsaid (D54).
+
+    They are what ``effective_launch`` reports for a silent argv, so a client
+    reading a ``null`` setting is told "on (engine default)" rather than
+    guessing "off" -- the misreading behind SPEC A1."""
+    caps = features()
+    assert caps.cont_batching_default is True
+    assert caps.cache_prompt_default is True
+    assert caps.cache_idle_slots is True
+    assert caps.has("--no-cont-batching") and caps.has("-nocb")
+    assert caps.checkpoint_min_step_default == 8192
+    assert caps.slot_prompt_similarity_default == pytest.approx(0.10)
+
+
+def test_a_features_file_written_before_d54_keeps_the_engine_defaults() -> None:
+    """An older ``features.json`` has none of the new keys. The fallback must be
+    the common.h constant, not False: "unknown" rendered as "off" is exactly
+    the lie the field exists to end."""
+    data = features().to_dict()
+    for key in (
+        "cont_batching_default",
+        "cache_prompt_default",
+        "cache_idle_slots",
+        "checkpoint_min_step_default",
+        "slot_prompt_similarity_default",
+    ):
+        data.pop(key)
+    old = EngineFeatures.from_dict(data)
+    assert old.known is True
+    assert old.cont_batching_default is True
+    assert old.cache_prompt_default is True
+    # The old file never wrote the key, but it DID write the flag list, and
+    # that is where the fact lives: the live rig's cached b10689 features.json
+    # predates D54 and advertises --cache-idle-slots. False here would have
+    # `effective` report the host cache half-off on every cached engine until
+    # the help was re-parsed.
+    assert old.cache_idle_slots is True
+    assert old.checkpoint_min_step_default is None
+    assert old.slot_prompt_similarity_default is None
+
+    without_flag = dict(data)
+    without_flag["flags"] = [f for f in data["flags"] if f != "--cache-idle-slots"]
+    assert EngineFeatures.from_dict(without_flag).cache_idle_slots is False
+    # An explicit value in the file still wins over the flag list.
+    assert EngineFeatures.from_dict({**data, "cache_idle_slots": False}).cache_idle_slots is False
+
+
 def test_removed_flags_are_not_advertised() -> None:
     """b10425 accepts ``--draft`` and ignores it; treating it as live is the
     exact failure D2 recorded."""

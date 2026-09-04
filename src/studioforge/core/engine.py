@@ -464,6 +464,17 @@ class EngineFeatures:
     fit: bool = False
     reasoning_budget: bool = False
     spec_draft_n_max_default: int | None = None
+    #: The defaults behind the prompt-cache and batching switches StudioForge
+    #: does NOT always pass (D54). They exist so ``effective_launch`` can say
+    #: what a child is really running with when the argv is silent, instead
+    #: of a client reading a ``null`` setting as "off" -- which is exactly how
+    #: SPEC A1 came to claim prefix caching was disabled on a launch that
+    #: carried ``--cache-reuse 256``. ``None`` means the help did not say.
+    cont_batching_default: bool = True
+    cache_prompt_default: bool = True
+    cache_idle_slots: bool = False
+    checkpoint_min_step_default: int | None = None
+    slot_prompt_similarity_default: float | None = None
 
     @classmethod
     def unknown(cls, tag: str = "") -> EngineFeatures:
@@ -500,6 +511,11 @@ class EngineFeatures:
             "fit": self.fit,
             "reasoning_budget": self.reasoning_budget,
             "spec_draft_n_max_default": self.spec_draft_n_max_default,
+            "cont_batching_default": self.cont_batching_default,
+            "cache_prompt_default": self.cache_prompt_default,
+            "cache_idle_slots": self.cache_idle_slots,
+            "checkpoint_min_step_default": self.checkpoint_min_step_default,
+            "slot_prompt_similarity_default": self.slot_prompt_similarity_default,
             "flags": sorted(self.flags),
         }
 
@@ -513,11 +529,32 @@ class EngineFeatures:
             value = data.get(key)
             return int(value) if isinstance(value, int) else None
 
+        def _float(key: str) -> float | None:
+            value = data.get(key)
+            return float(value) if isinstance(value, int | float) else None
+
+        def _bool_default(key: str, fallback: bool) -> bool:
+            # A features.json written before D54 has no such key; the engine
+            # default it would have recorded is the common.h one, so the
+            # fallback is that constant rather than False.
+            value = data.get(key)
+            return bool(value) if isinstance(value, bool) else fallback
+
         flags = data.get("flags")
+        flag_set = frozenset(str(f) for f in flags) if isinstance(flags, list) else frozenset()
+        # Pre-D54 files never wrote this key, but they DID write the flag
+        # list, and the flag list is where the fact lives: an engine that
+        # advertises --cache-idle-slots has idle-slot snapshots on by
+        # default. Reading the missing key as False would make `effective`
+        # report the cache half-off on every cached engine until the help is
+        # re-parsed -- the exact "unknown rendered as off" this field ends.
+        cache_idle_slots = data.get("cache_idle_slots")
+        if not isinstance(cache_idle_slots, bool):
+            cache_idle_slots = "--cache-idle-slots" in flag_set
         return cls(
             tag=str(data.get("tag") or ""),
             known=bool(data.get("known")),
-            flags=frozenset(str(f) for f in flags) if isinstance(flags, list) else frozenset(),
+            flags=flag_set,
             split_modes=_tuple("split_modes"),
             spec_types=_tuple("spec_types"),
             flash_attn_values=_tuple("flash_attn_values"),
@@ -531,6 +568,11 @@ class EngineFeatures:
             fit=bool(data.get("fit")),
             reasoning_budget=bool(data.get("reasoning_budget")),
             spec_draft_n_max_default=_int("spec_draft_n_max_default"),
+            cont_batching_default=_bool_default("cont_batching_default", True),
+            cache_prompt_default=_bool_default("cache_prompt_default", True),
+            cache_idle_slots=cache_idle_slots,
+            checkpoint_min_step_default=_int("checkpoint_min_step_default"),
+            slot_prompt_similarity_default=_float("slot_prompt_similarity_default"),
         )
 
 
@@ -568,6 +610,31 @@ def _default_int(desc: str) -> int | None:
 def _default_text(desc: str) -> str:
     match = _DEFAULT_RE.search(desc)
     return match.group(1).strip() if match else ""
+
+
+def _default_float(desc: str) -> float | None:
+    match = _DEFAULT_RE.search(desc)
+    if match is None:
+        return None
+    try:
+        return float(match.group(1).strip())
+    except ValueError:
+        return None
+
+
+def _default_enabled(desc: str, fallback: bool) -> bool:
+    """``(default: enabled)`` / ``(default: disabled)`` on a boolean pair.
+
+    ``fallback`` is the common.h constant, used when the help says nothing:
+    a switch whose default cannot be read is still a switch with a default,
+    and "unknown" must not be rendered as "off".
+    """
+    text = _default_text(desc).lower()
+    if text.startswith(("enabled", "true", "on")):
+        return True
+    if text.startswith(("disabled", "false", "off")):
+        return False
+    return fallback
 
 
 def parse_engine_features(help_text: str, tag: str = "") -> EngineFeatures:
@@ -611,6 +678,11 @@ def parse_engine_features(help_text: str, tag: str = "") -> EngineFeatures:
         fit="--fit" in flags,
         reasoning_budget="--reasoning-budget" in flags,
         spec_draft_n_max_default=_default_int(entries.get("--spec-draft-n-max", "")),
+        cont_batching_default=_default_enabled(entries.get("--cont-batching", ""), True),
+        cache_prompt_default=_default_enabled(entries.get("--cache-prompt", ""), True),
+        cache_idle_slots="--cache-idle-slots" in flags,
+        checkpoint_min_step_default=_default_int(entries.get("--checkpoint-min-step", "")),
+        slot_prompt_similarity_default=_default_float(entries.get("--slot-prompt-similarity", "")),
     )
 
 

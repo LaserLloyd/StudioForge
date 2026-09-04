@@ -33,8 +33,15 @@ from studioforge.core import supervisor as supervisor_module
 from studioforge.core.engine import EngineFeatures, parse_engine_features
 from studioforge.core.supervisor import (
     DEFAULT_SPEC_DRAFT_N_MAX,
+    ENGINE_DEFAULT_CACHE_RAM_MIB,
+    ENGINE_DEFAULT_CHECKPOINT_MIN_STEP,
+    ENGINE_DEFAULT_CTX_CHECKPOINTS,
+    ENGINE_DEFAULT_SLOT_PROMPT_SIMILARITY,
+    ENGINE_DEFAULT_UBATCH_SIZE,
     Supervisor,
     _Instance,
+    effective_launch,
+    redact_argv,
     resolve_spec_type,
     tensor_split_blockers,
 )
@@ -841,3 +848,271 @@ def test_a_micro_batch_above_the_logical_batch_raises_the_batch(
     argv = sup(config, binary).build_command(pinned, make_plan(), port=18100, features=B10425)
     assert argv.count("--batch-size") == 1
     assert value_after(argv, "--batch-size") == "1024"
+
+
+# ---------------------------------------------------------------------------
+# What the child was REALLY launched with (D54)
+# ---------------------------------------------------------------------------
+
+
+def engine_without_flags(*flags: str) -> EngineFeatures:
+    """b10425 minus some flags: an older build, still *known*."""
+    return dataclasses.replace(B10425, flags=frozenset(B10425.flags - set(flags)))
+
+
+def test_effective_launch_reads_engine_defaults_when_nothing_is_passed(
+    config: Config, tmp_path: Path
+) -> None:
+    """A one-slot launch passes none of the cache switches. The report must
+    still say what the engine does with them -- "not passed" is not "off"."""
+    config.engine.cache_ram_mb = 0  # explicit off: --cache-ram 0 IS passed
+    argv = sup(config, make_binary(tmp_path)).build_command(
+        make_record(tmp_path), make_plan(parallel=1), port=18100, features=B10425
+    )
+    eff = effective_launch(argv, B10425, make_plan(parallel=1))
+    assert eff.cache_prompt is True and eff.sources["cache_prompt"] == "engine_default"
+    assert eff.cont_batching is True and eff.sources["cont_batching"] == "engine_default"
+    assert eff.kv_unified is False and eff.sources["kv_unified"] == "engine_default"
+    assert eff.slot_prompt_similarity == pytest.approx(ENGINE_DEFAULT_SLOT_PROMPT_SIMILARITY)
+    assert eff.sources["slot_prompt_similarity"] == "engine_default"
+    assert eff.ubatch_size == ENGINE_DEFAULT_UBATCH_SIZE
+    assert eff.ctx_checkpoints == ENGINE_DEFAULT_CTX_CHECKPOINTS
+    assert eff.checkpoint_min_step == ENGINE_DEFAULT_CHECKPOINT_MIN_STEP
+    assert eff.parallel == 1 and eff.ctx_per_slot == 8192 and eff.ctx_total == 8192
+    assert eff.spec_type == "none"
+    assert eff.inert == []
+
+
+def test_effective_launch_shows_cache_reuse_on_at_256_when_the_setting_is_null(
+    config: Config, tmp_path: Path
+) -> None:
+    """SPEC A1's premise: ``cache_reuse: null`` was read as "off". The child
+    is launched with ``--cache-reuse 256 --cache-ram <pool>
+    --slot-prompt-similarity 0.3``, and the report says so, from the argv."""
+    record = make_record(tmp_path)
+    assert record.settings.cache_reuse is None
+    assert record.settings.cont_batching is None
+    plan = make_plan(parallel=3)
+    argv = sup(config, make_binary(tmp_path)).build_command(
+        record, plan, port=18100, features=B10425, cache_ram_mib=32603
+    )
+    eff = effective_launch(argv, B10425, plan, record.settings)
+    assert eff.cache_reuse == 256 and eff.sources["cache_reuse"] == "argv"
+    assert eff.cache_ram_mib == 32603 and eff.sources["cache_ram_mib"] == "argv"
+    assert eff.cache_idle_slots is True
+    assert eff.slot_prompt_similarity == pytest.approx(0.3)
+    assert eff.cont_batching is True
+    assert eff.kv_unified is False and eff.sources["kv_unified"] == "argv"  # --no-kv-unified
+    assert eff.parallel == 3 and eff.ctx_per_slot == 8192 and eff.ctx_total == 24576
+    assert eff.summary.startswith("prefix cache on (reuse 256, host 32603 MiB, routing 0.3)")
+    assert "continuous batching on" in eff.summary
+    assert "3 slots x 8192" in eff.summary
+    assert "partitioned KV" in eff.summary
+
+
+def test_effective_launch_takes_the_last_occurrence_so_extra_flags_win(
+    config: Config, tmp_path: Path
+) -> None:
+    """llama.cpp reads the last occurrence of a repeated flag; extra_flags go
+    last on purpose. The report must read the argv the same way, aliases
+    included -- ``-nocb`` is what a human types."""
+    record = make_record(
+        tmp_path, settings=ModelSettings(extra_flags="--cache-reuse 64 -nocb -sps 0.9 -kvu")
+    )
+    plan = make_plan(parallel=2)
+    argv = sup(config, make_binary(tmp_path)).build_command(
+        record, plan, port=18100, features=B10425
+    )
+    assert argv.count("--cache-reuse") == 2
+    eff = effective_launch(argv, B10425, plan, record.settings)
+    assert eff.cache_reuse == 64
+    assert eff.cont_batching is False and eff.sources["cont_batching"] == "argv"
+    assert eff.slot_prompt_similarity == pytest.approx(0.9)
+    assert eff.kv_unified is True, "-kvu after --no-kv-unified wins"
+    assert "continuous batching OFF" in eff.summary
+    assert "unified KV" in eff.summary
+
+
+def test_effective_cont_batching_is_true_by_default_and_false_only_with_the_no_flag() -> None:
+    plan = make_plan(parallel=1)
+    base = ["llama-server", "--ctx-size", "8192", "--parallel", "1"]
+    assert effective_launch(base, B10425, plan).cont_batching is True
+    assert effective_launch([*base, "--cont-batching"], B10425, plan).cont_batching is True
+    assert effective_launch([*base, "--no-cont-batching"], B10425, plan).cont_batching is False
+    assert effective_launch([*base, "-nocb"], B10425, plan).cont_batching is False
+    # An unknown engine falls back to the common.h default, and says so.
+    unknown = effective_launch(base, UNKNOWN, plan)
+    assert unknown.cont_batching is True and unknown.sources["cont_batching"] == "engine_default"
+
+
+def test_cont_batching_false_now_emits_the_no_flag_when_the_engine_has_it(
+    config: Config, tmp_path: Path
+) -> None:
+    """Before D54 ``cont_batching: false`` emitted nothing at all -- the GUI's
+    tri-state toggle had an "off" position that did nothing."""
+    record = make_record(tmp_path, settings=ModelSettings(cont_batching=False))
+    plan = make_plan(parallel=1)
+    argv = sup(config, make_binary(tmp_path)).build_command(
+        record, plan, port=18100, features=B10425
+    )
+    assert "--no-cont-batching" in argv
+    assert "--cont-batching" not in argv
+    eff = effective_launch(argv, B10425, plan, record.settings)
+    assert eff.cont_batching is False and eff.inert == []
+
+    on = make_record(tmp_path, settings=ModelSettings(cont_batching=True))
+    argv = sup(config, make_binary(tmp_path)).build_command(on, plan, port=18100, features=B10425)
+    assert "--cont-batching" in argv and "--no-cont-batching" not in argv
+
+
+def test_cont_batching_false_emits_nothing_on_an_engine_without_the_no_flag(
+    config: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A switch the child cannot see must not look honoured (D17's
+    --defrag-thold rule): no flag, a ``setting_inert`` warning naming it, and
+    the report lists it as inert while showing the engine default."""
+    warnings: list[tuple[str, dict[str, object]]] = []
+
+    class _Recorder:
+        def warning(self, event: str, **fields: object) -> None:
+            warnings.append((event, fields))
+
+        def __getattr__(self, _name: str) -> Callable[..., None]:
+            return lambda *_a, **_k: None
+
+    # The structlog sink is configured by whichever test ran first, so the
+    # event is asserted on the logger call itself rather than on stdout.
+    monkeypatch.setattr(supervisor_module, "log", _Recorder())
+    older = engine_without_flags("--no-cont-batching", "-nocb")
+    record = make_record(tmp_path, settings=ModelSettings(cont_batching=False))
+    plan = make_plan(parallel=1)
+    argv = sup(config, make_binary(tmp_path)).build_command(
+        record, plan, port=18100, features=older
+    )
+    assert "--no-cont-batching" not in argv and "--cont-batching" not in argv
+    (event, fields) = next((w for w in warnings if w[0] == "setting_inert"), (None, {}))
+    assert event == "setting_inert", warnings
+    assert fields["setting"] == "cont_batching" and fields["flag"] == "--no-cont-batching"
+    assert fields["model_id"] == record.id and fields["engine_known"] is True
+    eff = effective_launch(argv, older, plan, record.settings)
+    assert eff.cont_batching is True, "what the child actually does"
+    assert eff.inert == ["cont_batching"]
+    assert "inert: cont_batching" in eff.summary
+
+
+def test_effective_cache_idle_slots_is_off_when_cache_ram_is_zero() -> None:
+    """The engine disables idle-slot snapshots itself without a host cache to
+    put them in (b10689 server-context.cpp:1420-1423)."""
+    plan = make_plan(parallel=2)
+    base = ["llama-server", "--ctx-size", "16384", "--parallel", "2"]
+    assert effective_launch([*base, "--cache-ram", "8192"], B10425, plan).cache_idle_slots is True
+    off = effective_launch([*base, "--cache-ram", "0"], B10425, plan)
+    assert off.cache_idle_slots is False and off.cache_ram_mib == 0
+    assert "host cache off" in off.summary
+    # No --cache-ram passed: the engine's own default pool applies.
+    silent = effective_launch(base, B10425, plan)
+    assert silent.cache_ram_mib == 8192 and silent.sources["cache_ram_mib"] == "engine_default"
+    # A known engine with no host cache at all reports None, not a number.
+    no_cram = dataclasses.replace(B10425, cache_ram=False, cache_idle_slots=False)
+    none = effective_launch(base, no_cram, plan)
+    assert none.cache_ram_mib is None and none.cache_idle_slots is False
+    assert "no host cache" in none.summary
+    # Unknown engine: the common.h constant, marked as a default.
+    assert effective_launch(base, UNKNOWN, plan).cache_ram_mib == ENGINE_DEFAULT_CACHE_RAM_MIB
+
+
+def test_effective_ubatch_is_clamped_to_the_logical_batch_like_the_engine_does() -> None:
+    plan = make_plan(parallel=1)
+    eff = effective_launch(
+        ["llama-server", "-c", "8192", "-np", "1", "-b", "1024", "-ub", "4096"], B10425, plan
+    )
+    assert eff.batch_size == 1024 and eff.ubatch_size == 1024
+
+
+def test_effective_launch_resolves_spec_type_and_flash_attn_from_the_argv(
+    config: Config, tmp_path: Path
+) -> None:
+    record = make_record(tmp_path, meta=dense_meta(extra={"nextn_predict_layers": 1}))
+    plan = make_plan(parallel=1)
+    argv = sup(config, make_binary(tmp_path)).build_command(
+        record, plan, port=18100, features=B10425
+    )
+    eff = effective_launch(argv, B10425, plan, record.settings)
+    assert eff.spec_type == "draft-mtp" and eff.sources["spec_type"] == "argv"
+    assert eff.flash_attn == "on"
+    assert "spec draft-mtp" in eff.summary
+
+
+def test_launch_args_redact_the_api_key_flags(config: Config, tmp_path: Path) -> None:
+    """Nothing StudioForge emits carries a secret, but extra_flags is free text
+    and llama-server accepts --api-key; a status surface must never echo it.
+    Absolute paths go too -- a model row is not the place to map a disk."""
+    record = make_record(
+        tmp_path,
+        settings=ModelSettings(
+            extra_flags="--api-key sk-live-secret --api-key-file /etc/keys --ssl-key-file C:/k.pem"
+        ),
+    )
+    argv = sup(config, make_binary(tmp_path)).build_command(
+        record, make_plan(), port=18100, features=B10425
+    )
+    shown = redact_argv(argv)
+    joined = " ".join(shown)
+    assert "sk-live-secret" not in joined
+    assert "/etc/keys" not in joined and "k.pem" not in joined
+    assert shown.count("<redacted>") == 3
+    assert shown[0] == "llama-server.exe", "the binary by basename only"
+    assert shown[shown.index("--model") + 1] == "m.gguf"
+    assert not any(Path(token).is_absolute() for token in shown)
+    assert not any("\\" in token or (len(token) > 1 and token[1] == ":") for token in shown)
+    # The flags themselves stay, so the row still says an api key is in force.
+    assert "--api-key" in shown and "--ssl-key-file" in shown
+    # The one thing every StudioForge argv carries is exactly as built.
+    assert shown[shown.index("--ctx-size") + 1] == "8192"
+
+
+def test_redact_argv_handles_the_equals_spelling_and_relative_tokens() -> None:
+    argv = ["llama-server", "--api-key=abc", "--lora", "./adapters/a.gguf", "-fa", "on"]
+    shown = redact_argv(argv)
+    assert shown == [
+        "llama-server",
+        "--api-key=<redacted>",
+        "--lora",
+        "./adapters/a.gguf",
+        "-fa",
+        "on",
+    ]
+
+
+def test_redact_argv_hides_the_hugging_face_token_and_a_spaced_windows_path() -> None:
+    """``--hf-token`` / ``-hft`` is a credential llama-server takes on the
+    command line (b10689 common/arg.cpp); ``extra_flags`` could carry it. And
+    a Windows path with spaces and a user name in it must leave only the file
+    name behind, since the argv is served on ``/api/status``."""
+    argv = [
+        r"C:\Users\Some Person\AppData\Local\SF\engines\b10689\llama-server.exe",  # scrub-ok: fake
+        "--model",
+        r"D:\LLM Models\Some Person\Dark-Scarlett-27B.gguf",
+        "--hf-token",
+        "hf_secret_value",
+        "-hft",
+        "hf_other_secret",
+        "--hf-token=hf_third",
+        "--chat-template-file",
+        "/home/someone/templates/chatml.jinja",  # scrub-ok: invented fixture, redacted below
+    ]
+    shown = redact_argv(argv)
+    assert shown == [
+        "llama-server.exe",
+        "--model",
+        "Dark-Scarlett-27B.gguf",
+        "--hf-token",
+        "<redacted>",
+        "-hft",
+        "<redacted>",
+        "--hf-token=<redacted>",
+        "--chat-template-file",
+        "chatml.jinja",
+    ]
+    joined = " ".join(shown)
+    assert "Some Person" not in joined and "someone" not in joined and "hf_" not in joined

@@ -7,7 +7,9 @@ is the section to read if you are the agent; everything else is tuning and troub
 > verification at each step? See [OPENCLAW-SETUP.md](OPENCLAW-SETUP.md) — every hostname and
 > address on it is a placeholder to substitute. This page is the shorter reference.
 > For the formulas behind the catalog's columns see [CATALOG.md](CATALOG.md), and for
-> what long context costs on real models see [OPENCLAW-LONG-CONTEXT.md](OPENCLAW-LONG-CONTEXT.md).
+> what long context costs on real models see [OPENCLAW-LONG-CONTEXT.md](OPENCLAW-LONG-CONTEXT.md)
+> — its §4 is the one to read before sending concurrent requests that share a long prefix: what
+> the prompt cache reuses, what it cannot, and which response fields prove a hit.
 
 ---
 
@@ -371,6 +373,30 @@ never moves it. Any *other* idle model may find itself quietly reloaded onto few
 contended cards once a minute on a quiet box — that is housekeeping (`planner.rebalance`), not
 something you did, and it never evicts or interrupts anything.
 
+**Reading a lease record.** Every lease projection — `GET /api/leases`, `GET /api/status`,
+`server_status.leases`, and the ones attached to a refusal — carries the same keys:
+
+| key | meaning |
+| --- | --- |
+| `idle_s`, `expires_at` | the clocks. `expires_at` is `null` for a lease held until released |
+| `state` | `active`, `idle` (nothing has touched it for 5 min), or `expiring` (the sweep is within 5 min of releasing it). Expiry outranks idleness |
+| `holder_family` | everything before the first `-` in `holder`, lowercased. CrucibleForge leases as `crucibleforge` for a run and `crucibleforge-judge` for the judge phase; both answer `crucibleforge`, so match on this rather than on the exact holder |
+| `kind` | `benchmark`, `render`, `agent` or `other`, derived from `holder_family`. **Descriptive, never enforced** — the book is strictly first-come-first-served, and nothing preempts on this |
+| `retry_after_s` | how long to wait before asking again, capped at 300 s. `null` when there is no expiry. Capped on purpose: an early release is common, and a client asleep for two hours would never notice one |
+
+`/api/status` used to dump the stored fields only, so `idle_s` and `expires_at` were missing there
+while `/api/leases` had them — that is fixed (D53), and the two now return the same keys.
+
+**A lease refusal is not a shortfall.** When a load is refused *because* a lease holds the cards,
+the 507 carries `error.code: "gpu_leased"` instead of `insufficient_vram`, a `Retry-After` header,
+and `error.studioforge.lease` / `.leases` — the same records as above. Branch on the code; the
+prose is written for people and will keep improving. The status stays **507** so existing clients
+are unaffected, and the message no longer claims `needs 0.00 GiB, 0.00 GiB usable`: a lease refusal
+never got as far as arithmetic, so it now shows none. A streaming request meets the same 507 before
+the stream opens whenever the answer is certain (the model is not resident and every card it could
+use is leased); anything less certain still arrives as an SSE error frame, which now carries the
+same `code` and lease details.
+
 ### 8. `server_status` and `connection_info`
 
 `server_status` is free VRAM per GPU, every loaded model with its port and remaining TTL, queue
@@ -555,6 +581,24 @@ sharing an instance never hold each other off during its own reload.
 
 A row that says `fits: false` but whose `if_gpus_idle.fits` is true is not a hardware limit — the
 memory exists and something is holding it. `unload_model` on something else makes the row available.
+
+First check *which* refusal it is. A 507 carries a `code` saying so, and the three answers are
+different:
+
+| `error.code` | what it means | what to do |
+| --- | --- | --- |
+| `insufficient_vram` | the model genuinely does not fit | load smaller, or a shorter context — `error.studioforge.max_ctx_that_fits` says how short |
+| `gpu_leased` | the cards are leased to someone else (D43/D53) | wait. `Retry-After` and `error.studioforge.lease.retry_after_s` say how long; `.lease.holder_family` says who |
+| `allowed_devices_unavailable` | this model's `allowed_devices` names no usable card, and no lease is why | widen or clear the setting |
+
+A 507 with `busy_models` and a `retry_after_s` is a box that is *busy*, not full: those models
+would have freed the VRAM but are mid-request, and a load never interrupts a stream (D36).
+
+Not a 507 at all, but easy to confuse with one: a prompt larger than the slot the model is loaded
+with comes back as **`400` with `error.code: "context_exceeded"`** (it used to be a `502
+upstream_error`). `error.studioforge.ctx_per_slot` is the limit, `prompt_tokens` is present when
+the engine measured it, and the fix is on your side — shorten the prompt, or reload the model at a
+larger `ctx_size`. The server never silently truncates (D53).
 
 When *nothing* of yours is loaded and the VRAM is still missing, `server_status` names the holder.
 Every `llama-server` on the box is classified:

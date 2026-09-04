@@ -48,7 +48,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import IO, TYPE_CHECKING, Any
 
 import httpx
@@ -64,7 +64,14 @@ from studioforge.core.engine import EngineFeatures, probe_engine_features
 from studioforge.core.planner import attention_kind, effective_ubatch, is_moe
 from studioforge.errors import ModelLoadError, ModelUnloadError
 from studioforge.logging import get_logger
-from studioforge.types import AdapterRecord, InstanceInfo, LoadPlan, ModelRecord
+from studioforge.types import (
+    AdapterRecord,
+    EffectiveLaunch,
+    InstanceInfo,
+    LoadPlan,
+    ModelRecord,
+    ModelSettings,
+)
 
 if TYPE_CHECKING:
     from studioforge.core.gpu import GpuProbe
@@ -134,6 +141,299 @@ ENGINE_DEFAULT_BATCH_SIZE = 2048
 #: slot reuse almost accidental; 0.3 keeps an agent's near-identical prompts
 #: landing on the slot that already has the prefix cached.
 SLOT_PROMPT_SIMILARITY_MULTI = 0.3
+
+#: llama.cpp's own defaults for the knobs a launch may leave unsaid, from
+#: ``common/common.h`` at b10689 (``slot_prompt_similarity`` 0.10 :694,
+#: ``n_ctx_checkpoints`` 32 :629, ``checkpoint_min_step`` 8192 :631,
+#: ``cache_ram_mib`` 8192 :632, ``n_ubatch`` 512). Used by
+#: :func:`effective_launch` when the engine's help could not be read; a known
+#: engine's parsed defaults win.
+ENGINE_DEFAULT_UBATCH_SIZE = 512
+ENGINE_DEFAULT_SLOT_PROMPT_SIMILARITY = 0.10
+ENGINE_DEFAULT_CTX_CHECKPOINTS = 32
+ENGINE_DEFAULT_CHECKPOINT_MIN_STEP = 8192
+ENGINE_DEFAULT_CACHE_RAM_MIB = 8192
+
+#: Flags whose VALUE must never appear on a status surface. None of them is
+#: emitted by :meth:`Supervisor.build_command`, but ``extra_flags`` is free
+#: text and could carry any of them. ``--hf-token`` (``-hft``) is the Hugging
+#: Face credential llama-server accepts on the command line (b10689
+#: ``common/arg.cpp``); it is a secret exactly like the API key.
+_SECRET_VALUE_FLAGS = frozenset(
+    {"--api-key", "--api-key-file", "--ssl-key-file", "--hf-token", "-hft"}
+)
+
+#: Every spelling llama.cpp accepts for the flags :func:`effective_launch`
+#: reads (b10689 ``common/arg.cpp``). Value flags consume the next token;
+#: switch pairs set a boolean. Aliases matter because ``extra_flags`` is
+#: written by hand and ``-nocb`` is as legal as ``--no-cont-batching``.
+_VALUE_FLAG_ALIASES: dict[str, tuple[str, ...]] = {
+    "ctx_total": ("-c", "--ctx-size"),
+    "parallel": ("-np", "--parallel"),
+    "batch_size": ("-b", "--batch-size"),
+    "ubatch_size": ("-ub", "--ubatch-size"),
+    "cache_reuse": ("--cache-reuse",),
+    "cache_ram_mib": ("-cram", "--cache-ram"),
+    "slot_prompt_similarity": ("-sps", "--slot-prompt-similarity"),
+    "ctx_checkpoints": ("-ctxcp", "--ctx-checkpoints", "--swa-checkpoints"),
+    "checkpoint_min_step": ("-cms", "--checkpoint-min-step"),
+    "spec_type": ("--spec-type",),
+    "flash_attn": ("-fa", "--flash-attn"),
+}
+_SWITCH_ALIASES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    "cont_batching": (("-cb", "--cont-batching"), ("-nocb", "--no-cont-batching")),
+    "kv_unified": (("-kvu", "--kv-unified"), ("-no-kvu", "--no-kv-unified")),
+    "cache_prompt": (("--cache-prompt",), ("--no-cache-prompt",)),
+    "cache_idle_slots": (("--cache-idle-slots",), ("--no-cache-idle-slots",)),
+}
+
+
+def _is_absolute_path(token: str) -> bool:
+    return PureWindowsPath(token).is_absolute() or PurePosixPath(token).is_absolute()
+
+
+def _basename(token: str) -> str:
+    return PureWindowsPath(token).name or PurePosixPath(token).name or token
+
+
+def redact_argv(argv: Sequence[str]) -> list[str]:
+    """The argv as it may appear on a status surface (D54).
+
+    Every absolute path -- the binary, ``--model``, ``--mmproj``, ``--lora``,
+    ``--chat-template-file``, anything from ``extra_flags`` -- is reduced to
+    its basename, and the value after a key-carrying flag is replaced by
+    ``"<redacted>"``. The full command line stays where it always was, in the
+    child's log file, which is not served over HTTP.
+    """
+    out: list[str] = []
+    redact_next = False
+    for token in argv:
+        if redact_next:
+            out.append("<redacted>")
+            redact_next = False
+            continue
+        if token in _SECRET_VALUE_FLAGS:
+            out.append(token)
+            redact_next = True
+            continue
+        flag, sep, _value = token.partition("=")
+        if sep and flag in _SECRET_VALUE_FLAGS:
+            out.append(f"{flag}=<redacted>")
+            continue
+        out.append(_basename(token) if _is_absolute_path(token) else token)
+    return out
+
+
+def _parse_launch_argv(argv: Sequence[str]) -> tuple[dict[str, str], dict[str, bool]]:
+    """``({value flag: last value}, {switch: last state})`` from an argv.
+
+    Last occurrence wins for both kinds, which is how llama.cpp reads a
+    repeated option and the reason ``extra_flags`` goes last in
+    :meth:`Supervisor.build_command`.
+    """
+    value_of = {alias: key for key, aliases in _VALUE_FLAG_ALIASES.items() for alias in aliases}
+    switch_of: dict[str, tuple[str, bool]] = {}
+    for key, (on, off) in _SWITCH_ALIASES.items():
+        switch_of.update(dict.fromkeys(on, (key, True)))
+        switch_of.update(dict.fromkeys(off, (key, False)))
+
+    values: dict[str, str] = {}
+    switches: dict[str, bool] = {}
+    tokens = list(argv[1:])  # argv[0] is the binary
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if token in value_of and i + 1 < len(tokens):
+            values[value_of[token]] = tokens[i + 1]
+            i += 2
+            continue
+        if token in switch_of:
+            key, state = switch_of[token]
+            switches[key] = state
+        i += 1
+    return values, switches
+
+
+def _int_or(value: str | None, fallback: int) -> int:
+    try:
+        return int(value) if value is not None else fallback
+    except ValueError:
+        return fallback
+
+
+def _float_or(value: str | None, fallback: float) -> float:
+    try:
+        return float(value) if value is not None else fallback
+    except ValueError:
+        return fallback
+
+
+def effective_launch(
+    argv: Sequence[str],
+    features: EngineFeatures,
+    plan: LoadPlan,
+    settings: ModelSettings | None = None,
+) -> EffectiveLaunch:
+    """What the child really runs with: the argv, then the engine's defaults.
+
+    Pure. ``features`` supplies the defaults a known engine printed in its
+    help; an unknown engine (help unreadable) falls back to the b10689
+    ``common.h`` constants and marks them ``engine_default`` too -- the same
+    "advertises nothing" fallback D38 uses, applied to reporting rather than
+    to emission. ``settings`` is only consulted to name what the child
+    *cannot* see (:attr:`EffectiveLaunch.inert`).
+    """
+    values, switches = _parse_launch_argv(argv)
+    sources: dict[str, str] = {}
+
+    def src(field: str, from_argv: bool) -> None:
+        sources[field] = "argv" if from_argv else "engine_default"
+
+    parallel = _int_or(values.get("parallel"), plan.parallel)
+    if parallel < 1:  # llama.cpp's -1 = auto; StudioForge always passes a count
+        parallel = max(1, plan.parallel)
+    src("parallel", "parallel" in values)
+    ctx_total = _int_or(values.get("ctx_total"), plan.ctx_size * max(1, plan.parallel))
+    src("ctx_total", "ctx_total" in values)
+    ctx_per_slot = ctx_total // max(1, parallel)
+
+    cache_prompt = switches.get("cache_prompt", features.cache_prompt_default)
+    src("cache_prompt", "cache_prompt" in switches)
+    cache_reuse = _int_or(values.get("cache_reuse"), 0)
+    src("cache_reuse", "cache_reuse" in values)
+
+    cache_ram_mib: int | None
+    if "cache_ram_mib" in values:
+        cache_ram_mib = _int_or(values["cache_ram_mib"], ENGINE_DEFAULT_CACHE_RAM_MIB)
+    elif features.cache_ram:
+        cache_ram_mib = (
+            features.cache_ram_default_mib
+            if features.cache_ram_default_mib is not None
+            else ENGINE_DEFAULT_CACHE_RAM_MIB
+        )
+    elif features.known:
+        cache_ram_mib = None  # this build has no host cache at all
+    else:
+        cache_ram_mib = ENGINE_DEFAULT_CACHE_RAM_MIB
+    src("cache_ram_mib", "cache_ram_mib" in values)
+
+    # The engine turns idle-slot snapshots off itself when there is no host
+    # cache to put them in (b10689 server-context.cpp:1420-1423).
+    has_idle = features.cache_idle_slots or not features.known
+    cache_idle_slots = switches.get("cache_idle_slots", has_idle)
+    if not cache_ram_mib:
+        cache_idle_slots = False
+    src("cache_idle_slots", "cache_idle_slots" in switches)
+
+    cont_batching = switches.get("cont_batching", features.cont_batching_default)
+    src("cont_batching", "cont_batching" in switches)
+    # The engine's own default is "enabled if the slot count is auto", and
+    # StudioForge always passes an explicit count, so unsaid means partitioned.
+    kv_unified = switches.get("kv_unified", False)
+    src("kv_unified", "kv_unified" in switches)
+
+    similarity_default = (
+        features.slot_prompt_similarity_default
+        if features.slot_prompt_similarity_default is not None
+        else ENGINE_DEFAULT_SLOT_PROMPT_SIMILARITY
+    )
+    slot_prompt_similarity = _float_or(values.get("slot_prompt_similarity"), similarity_default)
+    src("slot_prompt_similarity", "slot_prompt_similarity" in values)
+
+    batch_size = _int_or(values.get("batch_size"), ENGINE_DEFAULT_BATCH_SIZE)
+    src("batch_size", "batch_size" in values)
+    # n_ubatch = min(n_batch, n_ubatch) inside llama.cpp: report the clamp.
+    ubatch_size = min(batch_size, _int_or(values.get("ubatch_size"), ENGINE_DEFAULT_UBATCH_SIZE))
+    src("ubatch_size", "ubatch_size" in values)
+
+    ctx_checkpoints: int | None
+    if "ctx_checkpoints" in values:
+        ctx_checkpoints = _int_or(values["ctx_checkpoints"], ENGINE_DEFAULT_CTX_CHECKPOINTS)
+    elif features.ctx_checkpoints or not features.known:
+        ctx_checkpoints = (
+            features.ctx_checkpoints_default
+            if features.ctx_checkpoints_default is not None
+            else ENGINE_DEFAULT_CTX_CHECKPOINTS
+        )
+    else:
+        ctx_checkpoints = None
+    src("ctx_checkpoints", "ctx_checkpoints" in values)
+
+    checkpoint_min_step: int | None
+    if "checkpoint_min_step" in values:
+        checkpoint_min_step = _int_or(
+            values["checkpoint_min_step"], ENGINE_DEFAULT_CHECKPOINT_MIN_STEP
+        )
+    elif features.has("--checkpoint-min-step") or not features.known:
+        checkpoint_min_step = (
+            features.checkpoint_min_step_default
+            if features.checkpoint_min_step_default is not None
+            else ENGINE_DEFAULT_CHECKPOINT_MIN_STEP
+        )
+    else:
+        checkpoint_min_step = None
+    src("checkpoint_min_step", "checkpoint_min_step" in values)
+
+    spec_type = values.get("spec_type") or SPEC_TYPE_NONE
+    src("spec_type", "spec_type" in values)
+    flash_attn = values.get("flash_attn") or "auto"
+    src("flash_attn", "flash_attn" in values)
+
+    inert: list[str] = []
+    if settings is not None and settings.cont_batching is False and cont_batching:
+        inert.append("cont_batching")
+
+    if cache_prompt:
+        cache_bits = [f"reuse {cache_reuse}" if cache_reuse else "chunk reuse off"]
+        if cache_ram_mib is None:
+            cache_bits.append("no host cache")
+        elif cache_ram_mib == 0:
+            cache_bits.append("host cache off")
+        elif cache_ram_mib < 0:
+            cache_bits.append("host cache unlimited")
+        else:
+            cache_bits.append(f"host {cache_ram_mib} MiB")
+        cache_bits.append(
+            f"routing {_fmt_float(slot_prompt_similarity)}"
+            if slot_prompt_similarity
+            else "no routing"
+        )
+        cache_text = "prefix cache on (" + ", ".join(cache_bits) + ")"
+    else:
+        cache_text = "prefix cache OFF"
+    slots_word = "slot" if parallel == 1 else "slots"
+    parts = [
+        cache_text,
+        "continuous batching " + ("on" if cont_batching else "OFF"),
+        f"{parallel} {slots_word} x {ctx_per_slot}",
+        "unified KV" if kv_unified else "partitioned KV",
+        f"spec {spec_type}",
+    ]
+    if inert:
+        parts.append("inert: " + ", ".join(inert))
+
+    return EffectiveLaunch(
+        cache_prompt=cache_prompt,
+        cache_reuse=cache_reuse,
+        cache_ram_mib=cache_ram_mib,
+        cache_idle_slots=cache_idle_slots,
+        cont_batching=cont_batching,
+        kv_unified=kv_unified,
+        slot_prompt_similarity=slot_prompt_similarity,
+        parallel=parallel,
+        ctx_per_slot=ctx_per_slot,
+        ctx_total=ctx_total,
+        batch_size=batch_size,
+        ubatch_size=ubatch_size,
+        ctx_checkpoints=ctx_checkpoints,
+        checkpoint_min_step=checkpoint_min_step,
+        spec_type=spec_type,
+        flash_attn=flash_attn,
+        sources=sources,
+        inert=inert,
+        summary=", ".join(parts),
+    )
+
 
 #: Lines of child output kept in memory per instance for error reporting.
 STDERR_RING_SIZE = 200
@@ -1148,8 +1448,31 @@ class Supervisor:
             args += ["--threads", str(settings.threads)]
         if settings.threads_batch is not None:
             args += ["--threads-batch", str(settings.threads_batch)]
-        if settings.cont_batching:
+        if settings.cont_batching is True:
             args.append("--cont-batching")
+        elif settings.cont_batching is False:
+            # Continuous batching is the engine's DEFAULT, so "off" needs a
+            # flag of its own -- and until D54 nothing emitted one, which left
+            # the GUI's tri-state toggle with an "off" position that did
+            # nothing. Same D17 rule that dropped --defrag-thold: a switch the
+            # child cannot see must not look honoured, so where the engine has
+            # no --no-cont-batching the load says so instead of staying quiet.
+            if features.has("--no-cont-batching"):
+                args.append("--no-cont-batching")
+            else:
+                log.warning(
+                    "setting_inert",
+                    model_id=record.id,
+                    setting="cont_batching",
+                    value=False,
+                    flag="--no-cont-batching",
+                    engine_known=features.known,
+                    detail=(
+                        "the engine does not advertise --no-cont-batching, so "
+                        "continuous batching stays at the engine default (on); "
+                        "the instance's `effective` block lists the setting as inert"
+                    ),
+                )
 
         # Prompt-cache reuse is ON by default: OpenClaw re-sends near-identical
         # long agent prompts constantly, and reusing the cached prefix is the
@@ -1550,6 +1873,11 @@ class Supervisor:
             cache_ram_mib=inst.info.cache_ram_mib,
         )
         inst.argv = argv
+        # What the child will REALLY run with, readable on every instance
+        # view (D54). Parsed from the final argv rather than re-derived from
+        # settings, so extra_flags and engine defaults are in the answer too.
+        inst.info.effective = effective_launch(argv, features, inst.plan, inst.record.settings)
+        inst.info.launch_args = redact_argv(argv)
         # The shim must be the OUTERMOST element, ahead of the launch prefix
         # as well as the engine argv: its body is
         # `os.execv(sys.argv[1], sys.argv[1:])`, so whatever follows it is

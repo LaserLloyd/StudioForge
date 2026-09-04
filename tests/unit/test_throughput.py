@@ -721,6 +721,91 @@ def test_parse_real_exposition_output() -> None:
     assert not any(k.startswith("#") for k in parsed)
 
 
+def test_parse_metrics_reads_the_cached_prompt_counter() -> None:
+    """b10689 exports ``prompt_tokens_cached_total`` ("reused from the cache")
+    beside ``prompt_tokens_total`` ("processed, excluding cached tokens"); the
+    pair is the lifetime hit ratio (D54)."""
+    text = (
+        "# HELP llamacpp:prompt_tokens_total Number of prompt tokens processed, "
+        "excluding cached tokens\n"
+        "llamacpp:prompt_tokens_total 14000\n"
+        "# HELP llamacpp:prompt_tokens_cached_total Number of prompt tokens reused "
+        "from the cache\n"
+        "llamacpp:prompt_tokens_cached_total 33700\n"
+    )
+    parsed = parse_metrics(text)
+    assert parsed[throughput.METRIC_PROMPT_TOKENS_CACHED] == 33700
+    assert parsed[throughput.METRIC_PROMPT_TOKENS] == 14000
+    assert set(throughput.CACHE_COUNTERS) == {
+        throughput.METRIC_PROMPT_TOKENS,
+        throughput.METRIC_PROMPT_TOKENS_CACHED,
+    }
+
+
+def test_prompt_cache_block_reports_the_hit_ratio_from_the_counters() -> None:
+    block = throughput.prompt_cache_block(
+        {
+            "sampled_at": 1_755_000_100.0,
+            throughput.METRIC_PROMPT_TOKENS: 14000.0,
+            throughput.METRIC_PROMPT_TOKENS_CACHED: 33700.0,
+        }
+    )
+    assert block == {
+        "processed_total": 14000,
+        "cached_total": 33700,
+        "hit_ratio": pytest.approx(33700 / 47700, abs=1e-4),
+        "since": "child_start",
+        "sampled_at": 1_755_000_100.0,
+    }
+
+
+def test_prompt_cache_block_is_null_without_the_cached_counter_never_a_fake_zero() -> None:
+    """Older engines have no cached counter. Rendering that as
+    ``cached_total: 0, hit_ratio: 0.0`` would read as "the cache never
+    hits" -- precisely the misreading the block exists to end."""
+    assert throughput.prompt_cache_block(None) is None
+    assert throughput.prompt_cache_block({}) is None
+    assert (
+        throughput.prompt_cache_block({"sampled_at": 1.0, throughput.METRIC_PROMPT_TOKENS: 500.0})
+        is None
+    )
+    # A child that has the counter but has not seen a prompt yet: totals of
+    # zero are real, the ratio is undefined.
+    fresh = throughput.prompt_cache_block(
+        {
+            "sampled_at": 1.0,
+            throughput.METRIC_PROMPT_TOKENS: 0.0,
+            throughput.METRIC_PROMPT_TOKENS_CACHED: 0.0,
+        }
+    )
+    assert fresh is not None
+    assert fresh["hit_ratio"] is None and fresh["cached_total"] == 0
+
+
+def test_prompt_cache_block_belongs_to_one_child_only() -> None:
+    """``since: child_start`` has to mean THIS child.
+
+    The sweep pops the gauges when it sees a model not ready, but a crash
+    relaunch faster than one sweep never shows it a non-ready state, and the
+    dead child's lifetime totals would be served as the new one's until the
+    next scrape. The sample carries the start stamp it was taken under; a
+    caller that knows the instance's stamp gets ``None`` on a mismatch.
+    """
+    sample = {
+        "sampled_at": 1_755_000_100.0,
+        "started_at": 1_755_000_000.0,
+        throughput.METRIC_PROMPT_TOKENS: 14000.0,
+        throughput.METRIC_PROMPT_TOKENS_CACHED: 33700.0,
+    }
+    assert throughput.prompt_cache_block(sample, started_at=1_755_000_000.0) is not None
+    assert throughput.prompt_cache_block(sample, started_at=1_755_000_500.0) is None
+    # A caller with no stamp, or a sample that recorded none, is not refused:
+    # the check is a guard against a KNOWN mismatch, not a new requirement.
+    assert throughput.prompt_cache_block(sample) is not None
+    unstamped = {k: v for k, v in sample.items() if k != "started_at"}
+    assert throughput.prompt_cache_block(unstamped, started_at=1_755_000_500.0) is not None
+
+
 def test_parse_strips_prometheus_labels() -> None:
     """llama.cpp emits none today; a release that adds them must not break us."""
     parsed = parse_metrics('llamacpp:n_decode_total{model="x"} 42')

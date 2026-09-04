@@ -431,6 +431,13 @@ That guarantees a non-empty reply, but it means:
 * `--cache-reuse` is **disabled by llama.cpp itself** for multimodal models — it logs
   `cache_reuse is not supported by multimodal, it will be disabled`. Vision models get no
   prompt-cache benefit.
+* **No prefix sharing across slots.** A slot reuses only the prompt *it* last held, so at
+  `parallel: N` the first N concurrent requests each prefill the whole prompt. And on hybrid or
+  recurrent models (`attention_kind: hybrid` — every Qwen3.5-family model here) prefix reuse is
+  quantised to *context checkpoints*: user-message starts at least `--checkpoint-min-step` (8192)
+  tokens apart, the last user message, and the prompt tail. The part of a prompt that differs
+  per request must begin a user message. Arithmetic and recipe in
+  [`OPENCLAW-LONG-CONTEXT.md` §4](OPENCLAW-LONG-CONTEXT.md#4-concurrent-requests-that-share-a-prefix).
 * Image token cost is read from mmproj metadata where present, otherwise a documented default of
   1024 tokens/image. That is a context-budget estimate, not a VRAM one.
 
@@ -482,4 +489,10 @@ library on disk, but not the same port — quit one or change `server.port`.
   [`COMPARISON.md`](COMPARISON.md) for what was considered and why.
 * No embedded model-quantization tooling — download the quant you want.
 * No multi-node / distributed inference (llama.cpp RPC exists but is not wired up).
-* No auth beyond a single shared API key. No per-user accounts, no rate limiting.
+* No auth beyond a single shared API key. No per-user accounts, no rate limiting. With
+  `server.api_key` unset, inference and read-only REST (`/v1/*`, `GET /api/status`,
+  `GET /api/leases`) are open to anything that can reach the bind address; only *box changes* are
+  gated, by D32 locality or the `X-MCP-Pin` header. Until a key is set, `GET /api/status` →
+  `clients` — the trailing-hour rollup by `X-SF-Client` label or peer IP — is the only attribution
+  surface. There is no half-way setting on purpose: see `OPENCLAW-SETUP.md` § "turning on a real
+  API key".

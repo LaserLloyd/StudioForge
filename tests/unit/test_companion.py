@@ -1904,3 +1904,90 @@ def test_a_benchmark_busy_503_is_also_untouched() -> None:
     assert error.code == "benchmark_busy"
     assert error.message.startswith("a parallel benchmark is running on 'gamma'")
     assert "held off" not in error.message
+
+
+# ---------------------------------------------------------------------------
+# Version skew: say so once, on stderr, and never fail because of it (D53)
+# ---------------------------------------------------------------------------
+
+
+def test_version_tuple_reads_both_spellings_of_one_release() -> None:
+    """The display date and its PEP 440 twin must compare equal.
+
+    `1.26-08-31` is what `/health` reports; `1.26.8.31` is what the wheel
+    metadata has to say, because PEP 440 cannot spell a hyphenated date. A
+    parser that saw those as different versions would warn on every single
+    invocation against a perfectly matched pair.
+    """
+    assert cli_module._version_tuple("1.26-08-31") == (1, 26, 8, 31)
+    assert cli_module._version_tuple("1.26.8.31") == (1, 26, 8, 31)
+    assert cli_module._version_tuple("1.26-08-28") < cli_module._version_tuple("1.26-08-31")
+    # Junk is silence, not a crash and not a warning.
+    assert cli_module._version_tuple("v1.26-08-31") is None
+    assert cli_module._version_tuple("dev") is None
+
+
+def test_a_stale_sfctl_warns_once_without_changing_the_exit_code(
+    live_server: ServerHandle, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Aug-26 doc's own item recurred at a three-day skew, so any
+    inequality warns -- worded as information, never fatal."""
+    monkeypatch.setattr(cli_module, "__version__", "1.26-08-01")
+    monkeypatch.setattr(cli_module, "_SKEW_WARNED", False)
+
+    result = _invoke(live_server, "status")
+
+    assert result.exit_code == 0, _all_output(result)
+    text = _all_output(result)
+    assert "warning: sfctl 1.26-08-01 is behind the server" in text
+    assert "uv tool install --reinstall" in text
+
+    # Once per process: sfctl runs in loops in scripts, and a warning that is
+    # noise is a warning nobody reads.
+    again = _invoke(live_server, "status")
+    assert "warning: sfctl" not in _all_output(again)
+
+
+def test_a_matched_pair_says_nothing(
+    live_server: ServerHandle, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from studioforge import __version__ as server_version
+
+    monkeypatch.setattr(cli_module, "__version__", server_version)
+    monkeypatch.setattr(cli_module, "_SKEW_WARNED", False)
+
+    result = _invoke(live_server, "status")
+    assert result.exit_code == 0, _all_output(result)
+    assert "warning: sfctl" not in _all_output(result)
+
+
+def test_json_output_stays_quiet_and_still_parses(
+    live_server: ServerHandle, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--json`` is a contract: a caller asking for machine output asked for
+    quiet, and a stray line is the difference between a script working and not."""
+    monkeypatch.setattr(cli_module, "__version__", "1.26-08-01")
+    monkeypatch.setattr(cli_module, "_SKEW_WARNED", False)
+
+    result = _invoke(live_server, "status", "--json")
+
+    assert result.exit_code == 0, _all_output(result)
+    assert "warning: sfctl" not in _all_output(result)
+    assert json.loads(result.output) is not None
+
+
+def test_an_unusable_health_answer_never_changes_a_command(
+    live_server: ServerHandle, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A version check must never be why a working command looks broken."""
+    monkeypatch.setattr(cli_module, "_SKEW_WARNED", False)
+    cli_module._warn_on_skew(None)
+    cli_module._warn_on_skew("not-a-version")
+    assert cli_module._SKEW_WARNED is False, "silence is not the once-per-process shot"
+
+    async def boom(self: Any) -> Any:
+        raise RuntimeError("no /health here")
+
+    monkeypatch.setattr(cli_module.StudioForgeClient, "health", boom)
+    result = _invoke(live_server, "status")
+    assert result.exit_code == 0, _all_output(result)

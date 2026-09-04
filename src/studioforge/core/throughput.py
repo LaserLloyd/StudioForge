@@ -682,6 +682,12 @@ def knee_for(
 #: the child's whole lifetime -- it cannot tell "fast now" from "was fast an
 #: hour ago". Two samples of a counter give the rate *between* them.
 METRIC_PROMPT_TOKENS = "llamacpp:prompt_tokens_total"
+#: "Number of prompt tokens reused from the cache" (b10689 server-task.cpp
+#: ``to_metrics``). ``prompt_tokens_total`` is documented there as *excluding*
+#: cached tokens, so the pair gives a lifetime hit ratio for free. Absent on
+#: builds that predate the counter -- and an absent counter must read as
+#: "unknown", never as a hit ratio of zero (D54).
+METRIC_PROMPT_TOKENS_CACHED = "llamacpp:prompt_tokens_cached_total"
 METRIC_PROMPT_SECONDS = "llamacpp:prompt_seconds_total"
 METRIC_PREDICTED_TOKENS = "llamacpp:tokens_predicted_total"
 METRIC_PREDICTED_SECONDS = "llamacpp:tokens_predicted_seconds_total"
@@ -696,6 +702,45 @@ GAUGE_METRICS: tuple[str, ...] = (
     METRIC_REQUESTS_DEFERRED,
     METRIC_REQUESTS_PROCESSING,
 )
+
+#: Cumulative counters kept beside the gauges so ``/api/status`` can show
+#: whether a child's prompt cache is working (D54). Totals since child start;
+#: a restart shows as a drop, which every consumer must tolerate.
+CACHE_COUNTERS: tuple[str, ...] = (METRIC_PROMPT_TOKENS, METRIC_PROMPT_TOKENS_CACHED)
+
+
+def prompt_cache_block(
+    gauges: Mapping[str, Any] | None, *, started_at: float | None = None
+) -> dict[str, Any] | None:
+    """The ``prompt_cache`` block for one instance, or ``None``.
+
+    ``None`` -- not a block of zeros -- when there is no sample yet or the
+    engine does not export ``prompt_tokens_cached_total`` (pre-b10689
+    builds): a fake 0 would read as "the cache never hits", which is the
+    misreading this block exists to end. ``hit_ratio`` is
+    ``cached / (cached + processed)`` over the child's lifetime, ``None``
+    until the child has seen a prompt.
+
+    ``started_at`` is the instance's own start stamp. A sample taken from a
+    *previous* child of the same model -- a crash relaunch faster than one
+    sweep -- says ``since: child_start`` about a child that no longer exists,
+    so a sample whose recorded start does not match is ``None`` too.
+    """
+    if not gauges or METRIC_PROMPT_TOKENS_CACHED not in gauges:
+        return None
+    sampled_from = gauges.get("started_at")
+    if started_at is not None and sampled_from is not None and sampled_from != started_at:
+        return None
+    cached = float(gauges[METRIC_PROMPT_TOKENS_CACHED])
+    processed = float(gauges.get(METRIC_PROMPT_TOKENS, 0.0))
+    total = cached + processed
+    return {
+        "processed_total": int(processed),
+        "cached_total": int(cached),
+        "hit_ratio": round(cached / total, 4) if total > 0 else None,
+        "since": "child_start",
+        "sampled_at": gauges.get("sampled_at"),
+    }
 
 
 def parse_metrics(text: str | None) -> dict[str, float]:

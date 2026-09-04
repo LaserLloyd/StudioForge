@@ -37,6 +37,7 @@ from rich.progress import (
 )
 from rich.table import Table
 
+from studioforge_companion import __version__
 from studioforge_companion.client import (
     EXIT_CODE_TABLE,
     EXIT_CONFIRM,
@@ -212,12 +213,77 @@ async def _await(coro: Awaitable[Any]) -> Any:
     return await coro
 
 
+#: Printed at most once per process. sfctl runs many commands in a loop in
+#: scripts, and a warning per HTTP call is noise -- a warning that is noise is
+#: a warning nobody reads.
+_SKEW_WARNED = False
+
+
+def _version_tuple(display: str) -> tuple[int, ...] | None:
+    """``1.26-08-31`` -> ``(1, 26, 8, 31)``; ``None`` when it is not our shape.
+
+    Hand-rolled on purpose. The format is fully controlled by this repo
+    (``YY.MM-DD`` dates, and the PEP 440 twin ``1.26.8.31`` that pyproject
+    carries), and the companion's whole point is installing anywhere on a thin
+    dependency list -- adding ``packaging`` to compare two dates we mint
+    ourselves would be a poor trade. The server reads its own versions the same
+    way in ``core/updater.py::_version_key``; this package deliberately imports
+    nothing from ``studioforge``.
+
+    Returns ``None`` for anything else, which the caller treats as "say
+    nothing": a version check must never be why a working command looks broken.
+    """
+    parts = display.strip().replace("-", ".").split(".")
+    try:
+        return tuple(int(part) for part in parts if part != "")
+    except ValueError:
+        return None
+
+
+def _warn_on_skew(server_version: str | None) -> None:
+    """Say so, once, when sfctl and the server are not the same build.
+
+    Not fatal and not an error: a mismatched pair usually works. But the
+    failure it prevents is the confusing one -- a command that is missing, or a
+    request shape the server rejects, blamed on the server rather than on a
+    stale ``uv tool install``. Suppressed under ``--json``, where stdout is a
+    parsing contract and a caller asking for JSON asked for quiet.
+    """
+    global _SKEW_WARNED
+    if _SKEW_WARNED or STATE.json_out or not server_version:
+        return
+    ours = _version_tuple(__version__)
+    theirs = _version_tuple(server_version)
+    if ours is None or theirs is None or ours == theirs:
+        # Unparseable either side: say nothing. A version check must never be
+        # the reason a working command looks broken.
+        return
+    _SKEW_WARNED = True
+    direction = "behind" if ours < theirs else "ahead of"
+    STATE.err.print(
+        f"warning: sfctl {__version__} is {direction} the server ({server_version}). "
+        f"Commands may be missing, or may send a shape the server does not accept. "
+        f"Reinstall with `uv tool install --reinstall studioforge-companion`."
+    )
+
+
 def with_client(work: Callable[[StudioForgeClient], Awaitable[Any]]) -> Any:
-    """Open a client for the resolved profile, run ``work``, close it."""
+    """Open a client for the resolved profile, run ``work``, close it.
+
+    Also the one place every server-touching command passes through, so the
+    version-skew check lives here: one unauthenticated ``/health`` GET on the
+    already-open connection pool, warning at most once per invocation.
+    """
     profile = _resolve_profile()
 
     async def _go() -> Any:
         async with StudioForgeClient(profile) as client:
+            try:
+                payload = await client.health()
+                if isinstance(payload, dict):
+                    _warn_on_skew(payload.get("version"))
+            except Exception:  # noqa: BLE001 - a skew check never fails a command
+                pass
             return await work(client)
 
     return run(_go())

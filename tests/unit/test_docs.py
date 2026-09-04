@@ -203,3 +203,44 @@ def test_no_doc_still_says_the_licence_is_unchosen_or_calls_the_bench_gauntlet()
     ).lower()
     assert "all rights reserved" not in text
     assert "gauntlet" not in text, "the benchmark suite is called CrucibleForge now"
+
+
+# ---------------------------------------------------------------------------
+# The prompt-prefix cache is documented with the signals that can show it (D54)
+# ---------------------------------------------------------------------------
+
+
+def test_engine_features_doc_names_the_real_cache_surfaces() -> None:
+    """The grant lives on the instance, not on a bare GET /api/models row, and
+    a cache hit shows in ``timings.cache_n`` -- ``prompt_n`` is the work done,
+    not a proxy for the hit."""
+    text = (REPO_ROOT / "docs" / "ENGINE-FEATURES.md").read_text(encoding="utf-8")
+    assert "/api/status" in text
+    assert "timings.cache_n" in text
+    assert "is on its row in `GET /api/models`" not in text
+    assert "much smaller `timings.prompt_n`" not in text
+    assert "## Prompt-prefix reuse" in text
+    assert "`effective`" in text and "setting_inert" in text
+
+
+def test_the_prefix_cache_doc_names_the_real_signals() -> None:
+    """OPENCLAW-LONG-CONTEXT.md must teach the truthful fields and must not
+    promise that ``usage.prompt_tokens`` drops -- the misreading behind A1."""
+    text = (REPO_ROOT / "docs" / "OPENCLAW-LONG-CONTEXT.md").read_text(encoding="utf-8")
+    assert "## 4. Concurrent requests that share a prefix" in text
+    assert "timings.cache_n" in text
+    assert "prompt_tokens_cached_total" in text
+    assert "`usage.prompt_tokens` never moves" in text
+    assert "never `usage.prompt_tokens`" in text
+    assert "3.6·P" in text, "the no-cross-slot-sharing arithmetic at parallel 3"
+    assert "begin a user message" in text, "the hybrid checkpoint rule"
+    assert 'cannot say "expected"' in text, "the honest A2 answer"
+    assert "`spec_type` `auto` vs `none`" in text and "benchmark_parallel" in text
+    assert "scripts/measure_prefix_cache.py" in text
+    assert (REPO_ROOT / "scripts" / "measure_prefix_cache.py").is_file()
+
+
+def test_openclaw_links_the_prefix_cache_section() -> None:
+    text = (REPO_ROOT / "docs" / "OPENCLAW.md").read_text(encoding="utf-8")
+    assert "OPENCLAW-LONG-CONTEXT.md" in text
+    assert "§4" in text and "share a long prefix" in text

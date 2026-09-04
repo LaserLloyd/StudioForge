@@ -144,6 +144,71 @@ def test_the_manager_carries_the_busy_detail_into_its_507() -> None:
     assert isinstance(error, InsufficientVramError)
     assert error.details["busy_models"][0]["model_id"] == "pub/busy"
     assert error.details["retry_after_s"] == BUSY_RETRY_AFTER_S
+    assert error.code == "insufficient_vram", "a busy box is still a VRAM refusal"
+
+
+def test_a_leased_refusal_becomes_a_507_that_says_gpu_leased() -> None:
+    """The twin of the busy case (D53): same status, a different code.
+
+    507 is kept on purpose -- ClawForge and the story drafter already branch on
+    it -- but a lease is not a shortfall, and a client that had to
+    substring-match the word "leased" now switches on ``error.code``.
+    """
+    from studioforge.core.leases import LeaseBook, lease_view
+    from studioforge.types import LoadRejected
+
+    book = LeaseBook()
+    lease = book.acquire([0, 1], holder="crucibleforge-judge", reason="8-stream benchmark")
+    rejected = LoadRejected(
+        model_id="pub/wanted",
+        reason="CUDA [0, 1] is leased to someone else",
+        reason_code="gpu_leased",
+        leases=[lease_view(lease)],
+    )
+    manager = ModelManager(
+        make_config(),
+        registry=StubRegistry({}),  # type: ignore[arg-type]
+        planner=busy_planner(),
+        supervisor=StubSupervisor(),  # type: ignore[arg-type]
+        db=None,  # type: ignore[arg-type]
+    )
+
+    error = manager._vram_error(rejected)
+    assert isinstance(error, InsufficientVramError)
+    assert error.status_code == 507, "the status is compatibility, the code is the news"
+    assert error.code == "gpu_leased"
+    assert error.details["lease"]["holder"] == "crucibleforge-judge"
+    assert error.details["lease"]["holder_family"] == "crucibleforge"
+    assert error.details["leases"] == [error.details["lease"]]
+    assert error.details["retry_after_s"] == error.details["lease"]["retry_after_s"]
+    assert "0.00 GiB" not in error.message
+
+
+def test_a_lease_held_until_released_still_advises_a_retry() -> None:
+    """No TTL means no countdown -- but "never retry" would be the wrong advice."""
+    from studioforge.core.leases import LEASE_OPEN_ENDED_RETRY_S, LeaseBook, lease_view
+    from studioforge.types import LoadRejected
+
+    book = LeaseBook()
+    lease = book.acquire([0], holder="comfyui", idle_ttl_s=None)
+    rejected = LoadRejected(
+        model_id="pub/wanted",
+        reason="leased",
+        reason_code="gpu_leased",
+        leases=[lease_view(lease)],
+    )
+    manager = ModelManager(
+        make_config(),
+        registry=StubRegistry({}),  # type: ignore[arg-type]
+        planner=busy_planner(),
+        supervisor=StubSupervisor(),  # type: ignore[arg-type]
+        db=None,  # type: ignore[arg-type]
+    )
+
+    error = manager._vram_error(rejected)
+    assert error.details["lease"]["retry_after_s"] is None
+    assert error.details["retry_after_s"] == LEASE_OPEN_ENDED_RETRY_S
+    assert error.details["lease"]["kind"] == "render"
 
 
 def test_force_lets_the_plan_evict_the_busy_model() -> None:

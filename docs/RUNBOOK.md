@@ -210,6 +210,14 @@ wrong-credential lockout as the main app (D44) and `?pin=` refused. Only `GET /h
 Verified 2026-08-26: an unauthenticated call to a destructive watchdog tool from off the box is
 a 401, and `tests/unit/test_watchdog.py` pins it.
 
+Re-verified 2026-09-04 against the code as it stands, so this is no longer a claim resting on a
+one-off probe. Both `X-MCP-Pin` and `X-StudioForge-Pin` are accepted, credentials are compared in
+constant time, a PIN in the query string is refused outright (D44), a non-ASCII credential byte is
+a 401 and not a 500, and a rotated key takes effect without a restart. Pinned by
+`tests/unit/test_watchdog.py` (unauthenticated 401, wrong key 401, key rotation, both PIN headers,
+`?pin=` refused) and `tests/unit/test_api_hardening.py::test_the_watchdog_also_refuses_a_pin_in_the_query_string`.
+No code change was needed.
+
 ## Restarts and who brings it back
 
 | You started it with | Restart from GUI/API/MCP does | Crash does |

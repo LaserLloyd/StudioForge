@@ -139,6 +139,13 @@ def _decorate_openai_entry(state: Any, entry: dict[str, Any]) -> None:
         # Loaded models only -- an unloaded row's tier is a prediction, and
         # GET /api/models is where that soft answer belongs.
         entry["studioforge"]["priority"] = instance.priority
+        # What the child was REALLY launched with (D54), the compact subset:
+        # an OpenAI client that reads `settings.cache_reuse: null` elsewhere
+        # sees here, on the row it already fetches, that the prompt cache is
+        # on. Null until the spawn has built its argv; absent when not loaded.
+        entry["studioforge"]["effective"] = (
+            instance.effective.compact() if instance.effective is not None else None
+        )
     entry["studioforge"]["state"] = entry["state"]
 
 
@@ -256,6 +263,12 @@ async def chat_completions(request: Request) -> Any:
         # in-band error frame most clients treat as fatal. ensure_loaded
         # repeats the check inside the stream as the backstop.
         state.manager.admission_check(serving.id, priority=priority)
+        # Same argument for a GPU lease (D53): when the cards this model would
+        # need are all leased away and it is not already serving, that is a
+        # real HTTP 507 with Retry-After, not an SSE frame inside a 200. Only
+        # the certain cases refuse here; the in-stream backstop below still
+        # catches everything else.
+        state.manager.lease_check(serving.id)
         # Load inside the stream so a multi-minute cold start is covered by
         # keep-alive comments rather than silence.
         return StreamingResponse(
@@ -319,7 +332,12 @@ async def _stream_with_jit_load(
         await loader
     except StudioForgeError as exc:
         log.warning("jit load failed mid-stream", model_id=record.id, error=exc.message)
-        yield _sse_error(exc.message, code=exc.code or "model_load_failed")
+        # The backstop for what lease_check could not decide before the 200:
+        # carrying the details means a `gpu_leased` frame still names the lease
+        # and its retry_after_s, the same as the HTTP envelope would have.
+        yield _sse_error(
+            exc.message, code=exc.code or "model_load_failed", details=exc.details or None
+        )
         yield b"data: [DONE]\n\n"
         return
     except Exception as exc:  # pragma: no cover - defensive
@@ -685,6 +703,9 @@ async def _forward(state: Any, record: ModelRecord, path: str, payload: dict[str
         elapsed = time.perf_counter() - started
         tps = _tokens_per_second(response, elapsed)
         if response.status_code >= 400:
+            overflow = _context_overflow(response, record, state)
+            if overflow is not None:
+                raise overflow
             raise UpstreamError(
                 _upstream_message(response, record.id, state),
                 status_code=response.status_code if response.status_code < 500 else 502,
@@ -756,6 +777,19 @@ async def _stream_upstream(
         ) as response:
             if response.status_code >= 400:
                 await response.aread()
+                # The same mapping as the non-streaming path: a stream must not
+                # be the reason a client cannot tell a prompt that is too long
+                # from an engine that fell over.
+                overflow = _context_overflow(response, record, state)
+                if overflow is not None:
+                    yield _sse_error(
+                        overflow.message,
+                        code="context_exceeded",
+                        details=overflow.details,
+                    )
+                    yield b"data: [DONE]\n\n"
+                    sent_done = True
+                    return
                 message = _upstream_message(response, record.id, state)
                 yield _sse_error(message, code="upstream_error")
                 yield b"data: [DONE]\n\n"
@@ -835,9 +869,103 @@ async def _stream_upstream(
             yield b"data: [DONE]\n\n"
 
 
-def _sse_error(message: str, *, code: str) -> bytes:
-    payload = {"error": {"message": message, "type": "server_error", "code": code}}
-    return f"data: {json.dumps(payload)}\n\n".encode()
+def _sse_error(message: str, *, code: str, details: dict[str, Any] | None = None) -> bytes:
+    payload: dict[str, Any] = {"error": {"message": message, "type": "server_error", "code": code}}
+    if details:
+        # Same vendor block as the HTTP envelope (StudioForgeError.to_payload),
+        # so a client parses one error shape whether or not it streamed.
+        payload["error"]["studioforge"] = details
+    return f"data: {json.dumps(payload, default=str)}\n\n".encode()
+
+
+#: The engine's own discriminator. b10689 (``server-common.cpp``
+#: ``format_error_response``) types the two "prompt larger than the slot"
+#: refusals ``exceed_context_size_error`` at HTTP 400 and adds
+#: ``n_prompt_tokens`` / ``n_ctx`` to the body (``server-task.cpp``
+#: ``server_task_result_error::to_json``). When the type is there, no prose
+#: is consulted.
+_CTX_OVERFLOW_ERROR_TYPE = "exceed_context_size_error"
+
+#: Fallback for engines that predate the typed error: the exact phrases
+#: llama-server has used for the same refusal, matched case-insensitively.
+#: Deliberately specific -- a bare "exceed" would also catch a 400 about a
+#: sampler parameter, and mapping that to ``context_exceeded`` sends a client
+#: to shorten a prompt that was never the problem.
+_CTX_OVERFLOW_MARKERS = (
+    "exceeds the available context",  # b10689 server-context.cpp:3182
+    "larger than the max context",  # b10689 server-context.cpp:3173
+    "context size has been exceeded",  # b10689 server-context.cpp:3668
+    "exceeds the context",  # older wordings of the same check
+    "context size",
+    "context window",
+    "n_ctx",
+)
+
+
+def _context_overflow(
+    response: httpx.Response, record: ModelRecord, state: Any
+) -> BadRequestError | None:
+    """A 400 from the engine that really means "your prompt is bigger than the slot".
+
+    Without this it left as a 502 ``upstream_error`` -- a server-fault status
+    for a request-shaped problem, with the actual limit buried in prose. A
+    failover client needs to tell "this model cannot hold this prompt" (try a
+    bigger model, shorten the prompt) from "the engine broke" (retry, alert),
+    and only one of those is worth retrying.
+
+    Deliberately a *mapping*, not a precheck: this server does not tokenize
+    the prompt to find out, so ``prompt_tokens`` is present **only when the
+    engine measured it** -- b10689 reports ``n_prompt_tokens`` on this error
+    -- and absent rather than guessed otherwise (D53). ``ctx_per_slot`` -- the
+    number the request had to fit inside -- is a fact the server already
+    publishes on ``GET /v1/models``, and it goes in the details. Only a 400
+    qualifies: a 500 that mentions context is the engine failing, not the
+    prompt being long.
+    """
+    if response.status_code != 400:
+        return None
+    error = _upstream_error_body(response)
+    upstream = _upstream_message(response, record.id, state)
+    if error.get("type") != _CTX_OVERFLOW_ERROR_TYPE:
+        text = upstream.lower()
+        if not any(marker in text for marker in _CTX_OVERFLOW_MARKERS):
+            return None
+    plan = getattr(state.supervisor.get(record.id), "plan", None)
+    ctx = (plan.ctx_per_slot or plan.ctx_size) if plan is not None else None
+    where = f" ({ctx} tokens per slot)" if ctx else ""
+    details: dict[str, Any] = {
+        "model_id": record.id,
+        "ctx_per_slot": ctx,
+        "loaded_context_length": plan.ctx_size if plan is not None else None,
+        # The engine's own words, kept because they name the numbers on
+        # builds that do not report them as fields.
+        "upstream_message": upstream,
+    }
+    measured = error.get("n_prompt_tokens")
+    if isinstance(measured, int) and not isinstance(measured, bool) and measured > 0:
+        # The engine counted this; the gateway is only relaying it.
+        details["prompt_tokens"] = measured
+    engine_ctx = error.get("n_ctx")
+    if isinstance(engine_ctx, int) and not isinstance(engine_ctx, bool) and engine_ctx > 0:
+        details["engine_n_ctx"] = engine_ctx
+    return BadRequestError(
+        f"The prompt does not fit the context '{record.id}' is loaded with{where}. "
+        f"Shorten the prompt, or load this model at a larger ctx_size -- this server "
+        f"never silently truncates.",
+        code="context_exceeded",
+        details=details,
+    )
+
+
+def _upstream_error_body(response: httpx.Response) -> dict[str, Any]:
+    """The ``error`` object of an engine refusal, or ``{}`` when there is none."""
+    try:
+        data = response.json()
+    except Exception:
+        return {}
+    if isinstance(data, dict) and isinstance(data.get("error"), dict):
+        return dict(data["error"])
+    return {}
 
 
 def _upstream_message(response: httpx.Response, model_id: str, state: Any) -> str:

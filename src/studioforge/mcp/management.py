@@ -66,7 +66,7 @@ from mcp.server.mcpserver import MCPServer
 from studioforge import __version__
 from studioforge.api.auth import redact_config_dict
 from studioforge.config import RESTART_REQUIRED_KEYS, Config, apply_overrides, load_config
-from studioforge.core import parallel_bench
+from studioforge.core import parallel_bench, throughput
 from studioforge.core.leases import lease_view
 from studioforge.core.model_gate import (
     GateRequirement,
@@ -404,6 +404,13 @@ def _compact_instance(instance: Any) -> dict[str, Any]:
         # resident can serve for hours on the previous build, and an agent
         # chasing a behaviour change deserves to see that in one field.
         "engine_tag": instance.resolved_engine_tag,
+        # What the child was REALLY launched with (D54): the compact subset
+        # that answers "is the prompt cache on for this model?" plus one
+        # quotable `summary` line. A per-model setting of null means
+        # "inherit", and an agent that read it as "off" asked for a feature
+        # that had been on since D17. `inert` names any saved setting the
+        # child cannot see. None until the spawn has built its argv.
+        "effective": instance.effective.compact() if instance.effective is not None else None,
     }
 
 
@@ -1790,7 +1797,12 @@ def build_management_mcp(state: Any) -> MCPServer:
             ``reason`` says why drafting is off), the active llama.cpp engine
             tag, the total number of models in the library, queue depth, what
             the server is busy with, active downloads, engine-process
-            attribution and whether the server is draining.
+            attribution and whether the server is draining. Each loaded row
+            also carries ``effective`` (the prompt-cache / batching / KV
+            settings the child was really launched with -- a ``null``
+            per-model setting means inherit, not off) and ``prompt_cache``
+            (lifetime ``processed_total`` / ``cached_total`` / ``hit_ratio``
+            from the child's own counters, ``null`` until sampled).
         """
         engine = state.engine_manager.active() if state.engine_manager is not None else None
         downloader = getattr(state, "downloader", None)
@@ -1804,12 +1816,24 @@ def build_management_mcp(state: Any) -> MCPServer:
         # Off the event loop: it walks the process table (~7 ms) and, on
         # Windows, may sample a performance counter.
         holders = await run_in_threadpool(_engine_holders, state)
+        # Whether each child's prompt cache is WORKING, from the collector's
+        # last /metrics sweep (D54) -- read from its cache, never scraped
+        # here. Null before the first sweep or on an engine without the
+        # cached-tokens counter; a fake zero would read as "never hits".
+        metrics = state.manager.metrics_snapshot()
+        loaded = []
+        for instance in status.loaded:
+            row = _compact_instance(instance)
+            row["prompt_cache"] = throughput.prompt_cache_block(
+                metrics.get(instance.model_id), started_at=instance.started_at
+            )
+            loaded.append(row)
         return {
             "ok": True,
             "version": status.version,
             "uptime_s": round(status.uptime_s, 1),
             "gpus": [_compact_gpu(g) for g in status.gpus],
-            "loaded": [_compact_instance(i) for i in status.loaded],
+            "loaded": loaded,
             "model_count": status.model_count,
             "queue_depth": status.queue_depth,
             "busy": state.manager.busy_snapshot(),

@@ -14,7 +14,15 @@ from typing import Any
 
 import pytest
 
-from studioforge.core.leases import LeaseBook, lease_view
+from studioforge.core.leases import (
+    LEASE_IDLE_AFTER_S,
+    LEASE_RETRY_CAP_S,
+    LeaseBook,
+    holder_family,
+    lease_kind,
+    lease_state,
+    lease_view,
+)
 from studioforge.core.planner import Planner
 from studioforge.errors import (
     BadRequestError,
@@ -98,6 +106,74 @@ def test_touch_never_moves_the_clock_backwards_and_expiry_respects_the_ttl() -> 
 
 
 # ---------------------------------------------------------------------------
+# The derived half of a lease record (D53)
+# ---------------------------------------------------------------------------
+
+
+def test_holder_family_collapses_a_phase_suffix() -> None:
+    """The outage this exists for: CrucibleForge leases under two names.
+
+    A consumer matching the holder exactly saw NO lease at all for the whole
+    judge phase, because the run holds as ``crucibleforge`` and the judge as
+    ``crucibleforge-judge``.
+    """
+    assert holder_family("crucibleforge") == "crucibleforge"
+    assert holder_family("crucibleforge-judge") == "crucibleforge"
+    assert holder_family("CrucibleForge-Judge") == "crucibleforge"
+    assert holder_family("api") == "api"
+    assert holder_family("") == ""
+
+
+def test_lease_kind_is_descriptive_and_never_policy() -> None:
+    book = LeaseBook()
+    bench = book.acquire([0], holder="crucibleforge-judge", model_ids=["mine"])
+    render = book.acquire([1], holder="clawforge2")
+    stranger = book.acquire([2], holder="somebody")
+
+    assert lease_kind(bench.holder) == "benchmark"
+    assert lease_kind(render.holder) == "render"
+    assert lease_kind(stranger.holder) == "other"
+    assert lease_view(bench)["kind"] == "benchmark"
+
+    # The point of "descriptive": placement is unchanged by any of it. Only
+    # ``model_ids`` decides who may use a card.
+    assert book.blocked_for("mine") == frozenset({1, 2})
+    assert book.blocked_for("other") == frozenset({0, 1, 2})
+
+
+def test_lease_state_moves_through_active_idle_and_expiring() -> None:
+    book = LeaseBook()
+    start = 1_000_000.0
+    lease = book.acquire([0], holder="api", idle_ttl_s=3600.0, now=start)
+    forever = book.acquire([1], holder="api", idle_ttl_s=None, now=start)
+
+    assert lease_state(lease, start) == "active"
+    assert lease_state(lease, start + LEASE_IDLE_AFTER_S + 1) == "idle"
+    # Expiry outranks idleness: a lease minutes from the sweep is "expiring"
+    # whatever its idle clock says.
+    assert lease_state(lease, start + 3600.0 - 10) == "expiring"
+
+    # No TTL, no expiry -- so it can go idle but never expiring.
+    assert lease_state(forever, start) == "active"
+    assert lease_state(forever, start + 10**6) == "idle"
+
+
+def test_lease_view_retry_advice_is_capped_and_absent_without_a_ttl() -> None:
+    book = LeaseBook()
+    now = time.time()
+    long_lease = book.acquire([0], holder="crucibleforge", idle_ttl_s=7200.0, now=now)
+    short = book.acquire([1], holder="api", idle_ttl_s=30.0, now=now)
+    forever = book.acquire([2], holder="api", idle_ttl_s=None, now=now)
+
+    # Two hours to run, but the advice is a re-ask interval: an early release
+    # is common and a client asleep for two hours would never see one.
+    assert lease_view(long_lease)["retry_after_s"] == LEASE_RETRY_CAP_S
+    assert 1 <= lease_view(short)["retry_after_s"] <= 30
+    assert lease_view(forever)["retry_after_s"] is None
+    assert lease_view(forever)["expires_at"] is None
+
+
+# ---------------------------------------------------------------------------
 # The planner
 # ---------------------------------------------------------------------------
 
@@ -143,6 +219,120 @@ def test_a_forced_placement_onto_a_leased_card_is_refused_not_honoured() -> None
     assert isinstance(result, LoadRejected), result
     assert "leased" in result.reason
     assert any(lease.id in line for line in result.suggestions)
+
+
+# ---------------------------------------------------------------------------
+# A lease refusal is a promise, not a shortfall (D53)
+# ---------------------------------------------------------------------------
+
+
+def test_a_lease_refusal_carries_a_code_and_the_lease_not_a_row_of_zeros() -> None:
+    """The three lease-shaped refusals all answer ``gpu_leased``.
+
+    And none of them claims "needs 0.00 GiB, 0.00 GiB usable" any more: a lease
+    refusal never got as far as arithmetic, and printing the zeros anyway read
+    as a sizing bug in the one message whose whole job is saying whose fault it
+    is not.
+    """
+    # 1. a forced placement onto someone else's card
+    book = LeaseBook()
+    lease = book.acquire([0], holder="crucibleforge", model_ids=["other/model"])
+    forced = make_planner(book).plan_load(make_record("mine/model", device_override=[0]))
+
+    # 2. leases removed every usable card
+    all_cards = LeaseBook()
+    everything = all_cards.acquire([0, 1, 2, 3], holder="crucibleforge", model_ids=["other/model"])
+    starved = make_planner(all_cards).plan_load(make_record("mine/model"))
+
+    # 3. allowed_devices matches only leased cards
+    narrow = LeaseBook()
+    theirs = narrow.acquire([0, 1], holder="crucibleforge", model_ids=["other/model"])
+    restricted = make_planner(narrow).plan_load(make_record("mine/model", allowed_devices=[0, 1]))
+
+    for result, held in ((forced, lease), (starved, everything), (restricted, theirs)):
+        assert isinstance(result, LoadRejected), result
+        assert result.reason_code == "gpu_leased"
+        assert [entry["id"] for entry in result.leases] == [held.id]
+        assert result.leases[0]["holder_family"] == "crucibleforge"
+        assert result.leases[0]["retry_after_s"] is not None
+        assert result.message().startswith("Cannot load 'mine/model' entirely in VRAM:")
+
+    # The two refusals that never reached the estimator no longer invent a row
+    # of zeros. (The third DID estimate -- with every card leased away there is
+    # genuinely 0.00 GiB usable, and saying so is honest, not a bug.)
+    for silent in (forced, restricted):
+        assert "GiB usable" not in silent.message(), silent.message()
+
+    # The word every existing client substring-matches is still there.
+    assert "leased" in forced.message()
+
+
+def test_allowed_devices_refused_for_a_non_lease_reason_says_so() -> None:
+    """Not every empty allowed_devices is a lease, and the codes differ."""
+    book = LeaseBook()
+    book.acquire([3], holder="crucibleforge", model_ids=["other/model"])
+    planner = make_planner(book)
+    # CUDA 7 does not exist on this rig, so no lease can be why it is missing.
+    result = planner.plan_load(make_record("mine/model", allowed_devices=[7]))
+
+    assert isinstance(result, LoadRejected), result
+    assert result.reason_code == "allowed_devices_unavailable"
+    assert result.leases == []
+
+
+def test_a_lease_on_a_card_this_load_never_wanted_is_context_not_cause() -> None:
+    """The false positive worth pinning.
+
+    A model that genuinely does not fit on the cards it CAN use must not be
+    told ``gpu_leased`` because some unrelated lease stands elsewhere -- that
+    sends a client away to wait for a release that will not change the answer.
+    """
+    book = LeaseBook()
+    book.acquire([3], holder="crucibleforge", model_ids=["other/model"])
+    planner = make_planner(book)
+    result = planner.plan_load(make_record("mine/model", ctx_size=100_000_000))
+
+    assert isinstance(result, LoadRejected), result
+    assert result.reason_code is None
+    assert result.leases == []
+    # The prose still names the lease -- it is useful context, just not the code.
+    assert any("leased" in line for line in result.suggestions)
+
+
+def test_an_ordinary_shortfall_keeps_its_numbers_and_has_no_code() -> None:
+    planner = make_planner(LeaseBook())
+    huge = make_record("mine/model", ctx_size=100_000_000)
+    result = planner.plan_load(huge)
+
+    assert isinstance(result, LoadRejected), result
+    assert result.reason_code is None
+    assert result.leases == []
+    assert "GiB usable" in result.message(), "a real shortfall still shows the arithmetic"
+
+
+def test_a_forced_placement_that_does_not_fit_is_not_blamed_on_leases_elsewhere() -> None:
+    """The cards a device_override names ARE the cards this load could use.
+
+    The override outranks ``planner.excluded_devices`` and ``allowed_devices``
+    alike, so the gpu_leased verdict must be taken over the forced set and
+    nothing else. Before this was pinned, an override onto an excluded card
+    computed the candidates as "live minus excluded", found every one of THOSE
+    leased away, and told the client to wait for a release that would never
+    make a too-big model fit on the card it was pinned to.
+    """
+    book = LeaseBook()
+    book.acquire([0, 1, 3], holder="crucibleforge", model_ids=["other/model"])
+    planner = make_planner(book, excluded_devices=[2])
+    forced = make_record("mine/model", device_override=[2], ctx_size=100_000_000)
+
+    result = planner.plan_load(forced)
+
+    assert isinstance(result, LoadRejected), result
+    assert result.reason_code is None, result.reason_code
+    assert result.leases == []
+    # A forced placement onto the leased cards themselves is still the clash.
+    clash = planner.plan_load(make_record("mine/model", device_override=[0, 2]))
+    assert isinstance(clash, LoadRejected) and clash.reason_code == "gpu_leased"
 
 
 def test_parallel_auto_sizes_slots_even_when_the_default_is_one() -> None:
@@ -402,3 +592,46 @@ def test_lease_profile_takes_the_measured_split_mode_only_for_those_cards() -> N
 def test_pinned_record_helper_accepts_settings_kwargs() -> None:
     """Sanity anchor: make_record forwards ModelSettings fields."""
     assert make_record("x", pinned=True).settings == ModelSettings(pinned=True)
+
+
+# ---------------------------------------------------------------------------
+# manager.lease_check: the streaming twin of admission_check (D53)
+# ---------------------------------------------------------------------------
+
+
+def test_lease_check_refuses_only_when_the_answer_is_certain() -> None:
+    """Conservative on purpose: it must never invent a refusal.
+
+    It runs before the 200 on a streaming request, where a wrong "no" is an
+    outage and a missed "no" merely falls through to the in-stream backstop
+    that has always been there.
+    """
+    from studioforge.errors import InsufficientVramError
+
+    forced = make_record("forced/model", device_override=[0])
+    free = make_record("free/model")
+    manager, supervisor = make_manager([forced, free])
+    manager.leases.acquire([0], holder="crucibleforge", model_ids=["someone/else"])
+
+    # Pinned to a card somebody else holds, and not loaded: certain.
+    with pytest.raises(InsufficientVramError) as excinfo:
+        manager.lease_check("forced/model")
+    assert excinfo.value.code == "gpu_leased"
+    assert excinfo.value.details["lease"]["holder"] == "crucibleforge"
+
+    # No override, and this stub manager has no probe to enumerate cards with:
+    # unknown is not a refusal.
+    manager.lease_check("free/model")
+
+    # Already serving: no load is needed, so no card has to be found. Refusing
+    # here would take a working model away from its clients over a lease that
+    # never touched it.
+    supervisor.instances["forced/model"] = placed("forced/model", [0])
+    manager.lease_check("forced/model")
+
+
+def test_lease_check_is_silent_when_nothing_is_leased() -> None:
+    record = make_record("mine/model", device_override=[0])
+    manager, _supervisor = make_manager([record])
+    manager.lease_check("mine/model")
+    manager.lease_check("never/heard/of/it")

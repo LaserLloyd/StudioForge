@@ -19,7 +19,12 @@ from typing import Any
 
 from studioforge.config import Config, KvCacheType
 from studioforge.core.gpu import vram_processes
-from studioforge.core.leases import DEFAULT_IDLE_TTL_S, LeaseBook
+from studioforge.core.leases import (
+    DEFAULT_IDLE_TTL_S,
+    LEASE_OPEN_ENDED_RETRY_S,
+    LeaseBook,
+    lease_view,
+)
 from studioforge.core.planner import BUSY_RETRY_AFTER_S, OBSERVATION_NOTE_PER_PID_DEVICE, Planner
 from studioforge.core.priority import PRIORITY_BACKGROUND, PriorityLock, normalise_priority
 from studioforge.core.registry import Registry
@@ -656,6 +661,61 @@ class ModelManager:
             model_id,
             priority=tier if tier is not None else self._effective_priority(model_id),
         )
+
+    def lease_check(self, model_id: str) -> None:
+        """Raise the 507 a *load* of this model would meet on GPU leases (D53).
+
+        The streaming twin of :meth:`admission_check`. A streaming request
+        loads inside the SSE body, so a lease refusal used to arrive as an
+        error frame inside an HTTP 200 -- invisible to any client that branches
+        on the status code, which is exactly the client a lease refusal is for.
+
+        Deliberately conservative: it refuses only where the answer is certain
+        no matter what the planner would have done, so it can never turn a load
+        that would have succeeded into a refusal.
+
+        * a model that is already serving is never refused -- no load is
+          needed, so no card has to be found;
+        * otherwise it refuses only when every device the model could possibly
+          use is leased away: a ``device_override`` wholly inside the blocked
+          set, or (with no override) every card the probe reports.
+
+        Anything less certain returns silently and the in-stream backstop --
+        ``ensure_loaded`` raising through ``_stream_with_jit_load`` -- emits the
+        error frame it always did, now carrying ``code: "gpu_leased"``.
+        """
+        instance = self.supervisor.get(model_id)
+        if instance is not None and instance.state in ("ready", "loading"):
+            return
+        blocked = self.leases.blocked_for(model_id)
+        if not blocked:
+            return
+        record = self.registry.resolve(model_id)
+        forced = set(record.settings.device_override or ()) if record is not None else set()
+        if forced:
+            candidates: set[int] = forced
+        else:
+            known = self._known_devices()
+            if not known:
+                return
+            candidates = set(known)
+        if not candidates <= set(blocked):
+            return
+        rejected = LoadRejected(
+            model_id=model_id,
+            reason=(
+                f"CUDA {sorted(candidates)} is leased to someone else and this model is not "
+                f"loaded, so serving this request would need a card nobody is offering; "
+                f"a lease is not a default to override, it is a promise to its holder"
+            ),
+            reason_code="gpu_leased",
+            leases=[
+                lease_view(lease)
+                for lease in self.leases.all()
+                if set(lease.devices) & set(blocked)
+            ],
+        )
+        raise self._vram_error(rejected)
 
     def _refuse_if_held(self, model_id: str, *, priority: int) -> None:
         """503 anything a standing chat/agent load outranks (D46).
@@ -1655,6 +1715,7 @@ class ModelManager:
             "retry_after_s": BUSY_RETRY_AFTER_S if busy else None,
             "suggestions": suggestions,
         }
+        code: str | None = None
         if rejected is not None:
             details.update(
                 required_bytes=rejected.required_bytes,
@@ -1663,9 +1724,22 @@ class ModelManager:
                 vram_holders=[h.model_dump() for h in rejected.vram_holders],
                 estimate_mb=rejected.estimate.breakdown_mb(),
             )
+            # The same discriminator the ordinary 507 carries (D53): this path
+            # builds its own error, so it has to say it too or a lease refusal
+            # would look like a shortfall depending on which endpoint asked.
+            code = rejected.reason_code or None
+            lease = rejected.leases[0] if rejected.leases else None
+            if lease is not None:
+                details["lease"] = lease
+                details["leases"] = rejected.leases
+                if details.get("retry_after_s") is None:
+                    details["retry_after_s"] = (
+                        lease.get("retry_after_s") or LEASE_OPEN_ENDED_RETRY_S
+                    )
         return InsufficientVramError(
             f"Cannot load '{record.id}' at exactly {ctx_size} tokens per slot on any "
             f"placement of this box. " + " ".join(suggestions),
+            code=code,
             details=details,
         )
 
@@ -2158,8 +2232,19 @@ class ModelManager:
 
     def _vram_error(self, rejected: LoadRejected) -> InsufficientVramError:
         """Turn a planner refusal into the 507, keeping every number with it."""
+        lease = rejected.leases[0] if rejected.leases else None
+        retry = rejected.retry_after_s
+        if retry is None and lease is not None:
+            # A lease with no TTL has no clock to count down, so fall back to a
+            # short re-ask interval rather than "never retry" (D53).
+            retry = lease.get("retry_after_s") or LEASE_OPEN_ENDED_RETRY_S
         return InsufficientVramError(
             rejected.message(),
+            # A lease is not a shortfall: the box has the VRAM, somebody else
+            # has the promise. Same 507 -- clients already branch on it -- but
+            # a code they can switch on instead of matching the word "leased".
+            # ``None`` leaves the class default (``insufficient_vram``) intact.
+            code=rejected.reason_code or None,
             details={
                 "required_bytes": rejected.required_bytes,
                 "available_bytes": rejected.available_bytes,
@@ -2176,7 +2261,12 @@ class ModelManager:
                 # freed the VRAM but are serving right now, so the refusal is
                 # worth retrying and says how long to wait (D36).
                 "busy_models": rejected.busy_models,
-                "retry_after_s": rejected.retry_after_s,
+                "retry_after_s": retry,
+                # A box that is LEASED rather than full. ``lease`` is the one
+                # standing in the way (the common case, and what a client
+                # renders); ``leases`` is all of them.
+                "lease": lease,
+                "leases": rejected.leases,
             },
         )
 
@@ -3409,7 +3499,16 @@ class ModelManager:
 
         self._throughput_gauges[model_id] = {
             "sampled_at": now,
+            # Which child these numbers belong to, so a relaunch faster than
+            # one sweep cannot serve the dead child's lifetime totals as the
+            # new one's (`throughput.prompt_cache_block` compares it).
+            "started_at": instance.started_at,
             **{name: counters[name] for name in throughput.GAUGE_METRICS if name in counters},
+            # Raw lifetime totals, kept so /api/status can render a
+            # prompt-cache hit ratio without a second scrape (D54). They
+            # reset with the child; a consumer diffing two snapshots must
+            # treat a drop as a restart, not as negative work.
+            **{name: counters[name] for name in throughput.CACHE_COUNTERS if name in counters},
         }
 
         baseline = self._throughput_baseline.get(model_id)
@@ -3475,6 +3574,12 @@ class ModelManager:
 
     def metrics_snapshot(self) -> dict[str, dict[str, Any]]:
         """Newest ``/metrics`` gauges per loaded model, for ``/api/status``.
+
+        Beside the gauges sit the two prompt-token counters
+        (:data:`throughput.CACHE_COUNTERS`), cumulative since the child
+        started; ``throughput.prompt_cache_block`` turns them into the
+        ``prompt_cache`` row, and is ``None`` when the engine has no cached
+        counter rather than a block of zeros.
 
         Read from the collector's cache rather than scraped on demand: status
         is polled continuously by the GUI, and adding a fan-out of HTTP calls

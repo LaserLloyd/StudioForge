@@ -67,3 +67,24 @@
 
 --sleep-idle-seconds SECONDS            number of seconds of idleness after which the server will sleep
                                         (default: -1; -1 = disabled)
+
+-cms,  --checkpoint-min-step N          minimum spacing between context checkpoints in tokens (default: 8192,
+                                        0 = no minimum)
+                                        (env: LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT)
+
+--cache-idle-slots, --no-cache-idle-slots
+                                        save idle slots to the prompt cache on new task, and clear them when
+                                        using unified KV (default: enabled, requires cache-ram)
+                                        (env: LLAMA_ARG_CACHE_IDLE_SLOTS)
+
+-cb,   --cont-batching, -nocb, --no-cont-batching
+                                        whether to enable continuous batching (a.k.a dynamic batching)
+                                        (default: enabled)
+                                        (env: LLAMA_ARG_CONT_BATCHING)
+
+--cache-prompt, --no-cache-prompt       whether to enable prompt caching (default: enabled)
+                                        (env: LLAMA_ARG_CACHE_PROMPT)
+
+-sps,  --slot-prompt-similarity SIMILARITY
+                                        how much the prompt of a request must match the prompt of a slot in
+                                        order to use that slot (default: 0.10, 0.0 = disabled)

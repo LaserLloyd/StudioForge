@@ -68,6 +68,89 @@ together, which is the point of the previous section.
 observed), `calibrated` (corrected by a factor learned from real traffic), `estimated` (nominal
 vendor bandwidth and FLOPS — an order of magnitude, not a promise).
 
+## 4. Concurrent requests that share a prefix
+
+The story-drafter pattern: one long shared bible, N per-chapter requests sent together. What the
+prompt cache does for it, what it cannot do, and how to tell the difference (D54).
+
+**What is on.** Every multi-slot launch on this server carries `--cache-reuse 256`, a share of the
+host-RAM prompt cache (`--cache-ram`, a 32 GiB pool split between residents), prefix-aware slot
+routing (`--slot-prompt-similarity 0.3`) and a partitioned KV pool (`--no-kv-unified`). Prompt
+caching and continuous batching are the engine's own defaults and are on unless a setting turns
+them off. A `null` in a model's `settings` (`cache_reuse`, `cont_batching`, `kv_unified`) means
+**inherit**, not off. Do not read the settings to learn what a child is doing — read `effective`,
+which is parsed from the argv the child was really started with and is on every instance view:
+`/api/status loaded[]`, the `GET /api/models` row, `/introspect`, and the MCP `server_status` /
+`model_info` rows (a compact subset with a one-line `summary`, e.g. *"prefix cache on (reuse 256,
+host 32603 MiB, routing 0.3), continuous batching on, 3 slots x 131072, partitioned KV, spec
+draft-mtp"*).
+
+**`usage.prompt_tokens` never moves.** It is the *size* of the prompt, not the work done, and a
+fully warm cache leaves it exactly where it was. The truthful signals:
+
+| signal | where | notes |
+| --- | --- | --- |
+| `timings.cache_n` / `timings.prompt_n` | the final response of every completion, **streamed or not**, no request flag | tokens reused / tokens actually processed; the gateway passes them through untouched |
+| `usage.prompt_tokens_details.cached_tokens` | non-streaming responses | on a stream only with `stream_options: {"include_usage": true}` |
+| `prompt_cache` on `/api/status loaded[]` | `{processed_total, cached_total, hit_ratio, since: "child_start"}` | from the child's own `/metrics` counter `llamacpp:prompt_tokens_cached_total`; `null` until sampled or on an engine without the counter |
+
+**Two hard limits.**
+
+1. **No sharing across slots.** A slot reuses only what *it* already holds. At `parallel: N` the
+   first N concurrent requests land on N different (empty) slots and each prefills the whole
+   prompt; only the requests that follow on a warmed slot reuse the prefix. For R requests of P
+   tokens sharing a fraction s: `total prefill ≈ N·P + (R−N)·(1−s)·P`. The A1 case — R = 7,
+   N = 3, s = 0.86 — is `3·P + 4·0.14·P ≈ 3.6·P` (≈ 35k tokens for P ≈ 9.8k), **not**
+   `P + 6·0.14·P ≈ 1.9·P`, and Σ `usage.prompt_tokens` is 68,511 either way. Warming the prefix
+   first does not change the total: one warm slot serves one first-wave request and the other
+   two still prefill cold. No setting beats `parallel × prefix`.
+2. **Hybrid models reuse back to a checkpoint.** On `attention_kind: hybrid` (every Qwen3.5/3.6/3.8
+   here) the recurrent state cannot be rolled back to an arbitrary token, so reuse rolls back to
+   the newest *context checkpoint* at or before the point of divergence — and if none exists the
+   prompt is processed from scratch. Checkpoints sit at the start of user messages at least
+   `--checkpoint-min-step` (8192) tokens apart, at the start of the **last** user message, and near
+   the end of the prompt. So the part that differs per request must **begin a user message**. A
+   template with `{chapter}` in the middle of the shared bible message diverges before the last
+   checkpoint and loses most of the prefix.
+
+**The recipe.**
+
+- Shared material first, in the same bytes every time; the per-request instruction as the final
+  user message (`[system: bible][user: bible][user: "Chapter i: …"]`).
+- Keep the model resident (`ttl_s: 0` for a job queue) and do not interleave dissimilar prompts
+  from other clients: a slot that serves another prompt drops the prefix (the host cache recovers
+  it once, on the next similar request).
+- Send all R requests at once — the queue routes the tail to warm slots — or send N at a time if
+  first-chapter latency matters; either way keep `requests_deferred` on `/api/status` in view.
+- Accept that the first `parallel` cold prefills are the price of concurrency, and size `parallel`
+  for the generation side (`benchmark_parallel`, D37), not for the prefill side.
+- Verify with `timings.cache_n`, never `usage.prompt_tokens`.
+
+**How to measure.** Per response: `timings.cache_n` and `prompt_n`. Per child: `prompt_cache` on
+`/api/status`. End to end: `scripts/measure_prefix_cache.py --model <id> --concurrency 3` on an
+idle rig — serial vs 3-way concurrent, `cache_n`/`prompt_n` per request, achieved batch from the
+child's decode counter. It refuses to run while a GPU lease is held, while requests are active or
+while a benchmark runs (`--yes` overrides only that), never loads a model, and `--diverge
+mid-message` demonstrates the checkpoint cliff on a hybrid model.
+
+**A2, honestly — "parallel slots give no aggregate throughput gain, expected?"** No parallel
+measurement exists for this model on this placement (`/parallel-observations` and `/benchmarks`
+are empty; `recommended_parallel_basis` is null), so the server cannot say "expected". D17's model
+says it is *not*: decode reads the 22.7 GB of weights once per step plus each busy slot's KV; this
+hybrid caches 16 of 65 layers at 4 KV heads × 256 → ≈ 64 KiB/token at f16 (≈ 34 KiB at q8_0), so
+at 3–10k tokens per slot the KV term is under 1 GB per slot and the knee is far above 3 slots.
+Aggregate tokens/s *should* rise with slots and per-stream *should* fall slowly; a flat aggregate is
+anomalous. Two candidate causes, both testable in one `benchmark_parallel` run: `spec_type: auto`
+resolves to `draft-mtp` on this GGUF (`nextn_predict_layers: 1`, and auto keeps drafting on up to 4
+slots — D38), and the +34 % single-stream win MTP buys is exactly the bandwidth slack batching
+would otherwise harvest, so at 3 streams the verify batches and rejected drafts are pure extra
+compute; and the Gated-DeltaNet recurrent kernels may cost per sequence rather than amortise. Run
+`benchmark_parallel` at the client's context with `spec_type` `auto` vs `none` and compare
+`achieved_batch` and the aggregate at 1/2/3 slots; if `none` wins at ≥ 2 slots, set `spec_type:
+none` on the model (or lower `SPEC_AUTO_MAX_SLOTS`) for concurrent workloads. What batching can
+give in any case: aggregate up, per-stream down, no change to a single 7-chapter request, and no
+sharing of prefill across slots.
+
 ---
 
 ## Three real models, whole tables
@@ -207,7 +290,14 @@ curl -s "http://<rig>:1234/api/models/<url-encoded-id>/settings"
 - **Match your concurrency to `max_parallel`.** Beyond it llama.cpp queues rather than refusing, so
   extra streams show up as latency, not errors — visible only in `requests_deferred` on
   `/api/status`.
+- **Concurrent requests that share a prefix do not share the prefill.** See §4 for the arithmetic,
+  the user-message-boundary rule on hybrid models, and which fields prove a cache hit.
 - **A rejection is always actionable.** The error names the binding constraint and the largest
   context that would fit, so retrying at the suggested size succeeds rather than guessing.
+- **A prompt bigger than the loaded slot is a `400 context_exceeded`, not a 502.** The engine's
+  refusal is mapped, not buried: `error.studioforge.ctx_per_slot` is the number the request had to
+  fit inside, `prompt_tokens` is present only when the engine measured it (b10689 does), and the
+  engine's own words ride along as `upstream_message`. Shorten, or load at a larger `ctx_size` —
+  the server never silently truncates (D53).
 - **RoPE scaling is never applied.** A tier above the model's trained window is not offered at all;
   serving beyond it degrades quality quietly, which is worse than a smaller window (D14).

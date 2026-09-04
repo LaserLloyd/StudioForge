@@ -857,3 +857,29 @@ async def test_persist_on_a_preset_refuses_and_names_the_base_model() -> None:
     # The same call without persist still loads, on the base's instance.
     instance = await manager.load_recommended(PERSONA, 16384)
     assert instance.model_id == MODEL
+
+
+async def test_a_lease_makes_this_507_say_gpu_leased_too() -> None:
+    """This path builds its own 507, so it has to carry the D53 code itself.
+
+    Otherwise the same lease would read as a shortfall or as a promise
+    depending on which endpoint the caller happened to use.
+    """
+    from studioforge.core.leases import LeaseBook
+
+    book = LeaseBook()
+    manager, supervisor = make_manager(n_ctx_train=262144)
+    manager.leases = book
+    manager.planner.leases = book
+    lease = book.acquire([0, 1, 2, 3], holder="crucibleforge", model_ids=["someone/else"])
+
+    with pytest.raises(InsufficientVramError) as excinfo:
+        await manager.load_recommended(MODEL, 262144)
+
+    error = excinfo.value
+    assert error.status_code == 507
+    assert error.code == "gpu_leased"
+    assert error.details["lease"]["id"] == lease.id
+    assert error.details["lease"]["holder_family"] == "crucibleforge"
+    assert error.details["retry_after_s"] == error.details["lease"]["retry_after_s"]
+    assert supervisor.starts == 0

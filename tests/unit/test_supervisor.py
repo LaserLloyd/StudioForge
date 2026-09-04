@@ -1239,6 +1239,36 @@ async def test_a_child_records_the_engine_it_was_actually_launched_with(
         await supervisor.aclose()
 
 
+async def test_effective_is_stamped_on_the_instance_at_spawn(
+    config: Config, tmp_path: Path, fake_binary: Path
+) -> None:
+    """D54: the resolved launch settings and the redacted argv ride on the
+    InstanceInfo from the moment the argv exists, so every instance view --
+    /api/status, /introspect, MCP -- says what the child really runs with."""
+    supervisor = fake_sup(config, fake_binary)
+    record = make_record(tmp_path)
+    try:
+        info = await supervisor.start(record, make_plan(parallel=2))
+        assert info.effective is not None
+        assert info.effective.parallel == 2
+        assert info.effective.ctx_per_slot == 8192 and info.effective.ctx_total == 16384
+        assert info.effective.cache_reuse == 256, "the inherited default, from the argv"
+        assert info.effective.sources["cache_reuse"] == "argv"
+        assert info.effective.cont_batching is True
+        assert info.effective.summary.startswith("prefix cache on (reuse 256")
+        assert info.launch_args is not None
+        assert info.launch_args[0] == fake_binary.name, "basename, never the path"
+        assert info.launch_args[info.launch_args.index("--model") + 1] == record.path.name
+        assert not any(Path(token).is_absolute() for token in info.launch_args)
+        assert "--parallel" in info.launch_args
+        # The same block reaches a plain dump, which is what the routes send.
+        dumped = info.model_dump(mode="json")
+        assert dumped["effective"]["cache_reuse"] == 256
+        assert dumped["launch_args"] == info.launch_args
+    finally:
+        await supervisor.aclose()
+
+
 async def test_a_pinned_model_keeps_both_the_pin_and_the_build(
     config: Config, tmp_path: Path, fake_binary: Path
 ) -> None:

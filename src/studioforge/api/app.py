@@ -910,11 +910,14 @@ def _install_error_handlers(app: FastAPI) -> None:
         # wait instead of leaving it to guess a backoff (and hammer us).
         if exc.status_code == 503:
             headers["Retry-After"] = str(exc.details.get("retry_after_s", 5))
-        # 429 is the credential lockout. Same reasoning: the wait is a fact the
-        # server knows, so it goes in the header every HTTP client already
-        # understands, not only in the JSON body.
-        elif exc.status_code == 429 and exc.details.get("retry_after_s"):
-            headers["Retry-After"] = str(exc.details["retry_after_s"])
+        # Any other status that KNOWS the wait says so in the header every HTTP
+        # client already understands, not only in the JSON body: 429 is the
+        # credential lockout, and a 507 refused by a GPU lease (D53) carries the
+        # lease's own countdown. A 507 that is a genuine shortfall has no
+        # retry_after_s and gets no header -- "come back later" is bad advice
+        # when nothing is going to change.
+        elif exc.details.get("retry_after_s"):
+            headers["Retry-After"] = str(int(exc.details["retry_after_s"]))
         return JSONResponse(exc.to_payload(), status_code=exc.status_code, headers=headers)
 
     from fastapi.exceptions import RequestValidationError

@@ -4122,3 +4122,354 @@ failure path. One stale count the sweep missed (`docs/OPENCLAW-SETUP.md`'s "conf
 29 tools" verification step) was corrected to 30, and the header-read docstring's "few
 milliseconds" was corrected to the measured 35-90 ms cold. Sugar-tag parity between the MCP
 schema and `SUGAR_TAGS` is now pinned on both surfaces.
+
+---
+
+## D53 -- A lease refusal is a promise, not a shortfall
+
+**Problem.** Four reports from the client side, all the same shape: the server knows something and
+does not say it in a form a program can use.
+
+1. While a CrucibleForge lease held all four cards, `POST /v1/chat/completions` answered
+   `HTTP 507: "Cannot load '<model>' entirely in VRAM: needs 0.00 GiB, 0.00 GiB usable. the
+   requested placement names CUDA [0, 1], which is leased to someone else..."`. The prose is right;
+   the numbers are a lie of arithmetic -- nothing was ever estimated, because the cards were never
+   on offer -- and they read as a sizing bug in the one message whose job is saying whose fault it
+   is not. Worse, there was **no machine-readable discriminator**: the story drafter
+   substring-matched the word `"leased"`, which breaks the moment the wording improves.
+2. `GET /api/leases` returned `idle_s` and `expires_at`; `GET /api/status` did not.
+   `GpuLease.idle_s` and `.expires_at` are `@property`, so `ServerStatus.model_dump()` silently
+   dropped them -- and `sfctl status` renders its Idle and "Expires in" columns from `/api/status`,
+   so both were permanently `-`. Consumers could not tell a live lease from a stale record.
+3. CrucibleForge leases as `crucibleforge` for a run and **`crucibleforge-judge`** for the judge
+   phase, so a consumer doing exact holder matching saw *no lease at all* for the entire judging
+   window. That was a real outage class on the client side.
+4. A prompt larger than the loaded slot was forwarded to llama-server, which 400s; `_forward`
+   wrapped that into `HTTP 502 upstream_error` -- a server-fault status for a request-shaped
+   problem, with the actual limit buried in engine prose. A failover client could not tell "this
+   model cannot hold this prompt" (route elsewhere, or shorten) from "the engine fell over" (retry,
+   alert), and only one of those is worth a retry.
+
+**Decision. Keep every status code; add the facts.**
+
+**`gpu_leased`, at 507.** `LoadRejected` gains `reason_code: str | None` and `leases: list[dict]`.
+`_vram_error` passes `code=rejected.reason_code or None` into `InsufficientVramError` -- the D48
+`priority_hold` mechanism, where a per-raise code overrides the class default and `None` leaves it
+alone -- and puts `lease`, `leases` and `retry_after_s` in the details. The status stays **507** on
+purpose: ClawForge2 and the drafter already branch on it, and changing a status to carry
+information a body can carry breaks working clients for nothing. `api/app.py` now sets
+`Retry-After` for *any* status whose details know the wait, which subsumes the old 429-only branch
+and gives the leased 507 a header every HTTP client already understands. A genuine shortfall has no
+`retry_after_s` and still gets no header -- "come back later" is bad advice when nothing is going
+to change.
+
+**The zeros are gone, conditioned on the numbers and not on the code.** `LoadRejected.message()`
+omits the "needs X GiB, Y usable" clause when both byte counts are zero, which fixes the
+forced-clash refusal *and* the `allowed_devices`-wiped one with the same change. The
+`"Cannot load ... entirely in VRAM:"` prefix and the word "leased" inside `reason` are untouched,
+because existing substring matchers must keep working through the transition. The third
+lease-shaped refusal -- leases removed every usable card -- *did* run a real estimate, so it still
+reports `0.00 GiB usable`; that is honest rather than a bug, because there genuinely is none.
+
+**`gpu_leased` only when the lease is the whole cause.** `_note_leases` stamps the code and attaches
+the lease records only when the leases took **every** card this load could have used: the
+`device_override` set when the model has one (it outranks `allowed_devices` and
+`planner.excluded_devices` alike, and a clash with a lease was already refused before planning),
+else the live cards narrowed by the model's `allowed_devices` if it has one and by
+`planner.excluded_devices` if it does not. A lease standing on some other card while a model genuinely does not fit is context, not
+cause: calling that `gpu_leased` would send a client away to wait for a release that will not change
+the answer. The prose still names the lease in the suggestions either way. When no lease is involved
+and `allowed_devices` matches nothing usable, the code is `allowed_devices_unavailable`; a lease
+outranks it, because it is the specific and waitable cause.
+
+**Streaming gets the refusal before the 200.** A streaming request loads *inside* the SSE body, so a
+lease refusal arrived as an error frame in an HTTP 200 -- invisible to exactly the client a lease
+refusal is written for. `manager.lease_check()` runs beside the D46 `admission_check`, deliberately
+conservative: it refuses only where the answer is certain regardless of what the planner would have
+done -- the model is **not already resident**, and either its `device_override` is wholly inside the
+blocked set, or every card the probe reports is. A model already serving is never refused; a lease
+taking the last card says nothing about a model already sitting on it, and refusing its traffic
+would turn a display improvement into an outage. Everything less certain falls through to the
+in-stream backstop, which now carries `code` and `details` in the frame, so `gpu_leased` and its
+lease records survive that path too.
+
+**`retry_after_s` is a re-ask interval, not a countdown.** `lease_view` reports
+`min(expires_at - now, 300)`, capped: the honest full answer is `expires_at`, but a client that
+sleeps two hours on one number is a client that never notices an early release. A lease held until
+released (`idle_ttl_s = None`) has no clock at all, so the error falls back to a documented
+`LEASE_OPEN_ENDED_RETRY_S = 60` -- "no advice" reads as "never retry", which is worse than a short
+interval.
+
+**One lease projection, everywhere.** `lease_view` gains `state` (`active` | `idle` after 300 s
+quiet | `expiring` within 300 s of the sweep, expiry outranking idleness), `holder_family`, `kind`
+and `retry_after_s`; `GET /api/status` now goes through it instead of dumping the model. The parity
+is pinned by set-equality of the two endpoints' keys rather than by a field list, so the next
+derived field cannot drift apart the same way. `holder_family` is everything before the first `-`,
+lowercased: one rule, no registry, and both CrucibleForge phases answer `crucibleforge`.
+
+**`holder_family` and `kind` are exposure, not policy, and the docstrings say so loudly.**
+`LeaseBook.blocked_for` keys on `model_ids` and never on the holder, and nothing in the book or the
+manager matches on either new field. `kind` (`benchmark` | `render` | `agent` | `other`) is derived
+from `holder_family` in one function, so the REST view, the MCP view and a 507's lease records
+cannot drift into three answers. It exists because "stand down entirely" (a benchmark owns four
+cards for an hour) and "wait ninety seconds" (someone is rendering one picture) are opposite answers
+that a holder string could not tell apart.
+
+**`context_exceeded`: map, do not precheck.** A 400 from the engine that is the "prompt larger
+than the slot" refusal becomes a StudioForge `BadRequestError` with `code="context_exceeded"`,
+carrying `model_id`, `ctx_per_slot`, `loaded_context_length` and the engine's own words, on both
+the streaming and the non-streaming path (the engine answers a streaming request's first error as
+a plain non-stream 400 -- b10689 server-context.cpp:4354 -- so the stream branch sees the same
+status). The discriminator is the engine's own: b10689 types both refusals
+`exceed_context_size_error` (server-common.cpp `format_error_response`, HTTP 400) and adds
+`n_prompt_tokens` / `n_ctx` to the body (server-task.cpp `server_task_result_error::to_json`).
+When the type is present no prose is consulted; for engines that predate it, the exact phrases of
+the same check are matched (`exceeds the available context`, `larger than the max context`,
+`context size has been exceeded`, `context size`, `context window`, `n_ctx`) -- **not** a bare
+`exceed`, which would also catch a sampler-parameter 400 and send a client off to shorten a prompt
+that was never the problem. A *true* precheck needs a tokenize round-trip on every request; the
+mapping is free and equally actionable. **`prompt_tokens` is present only when the engine measured
+it** (`n_prompt_tokens`, relayed as-is, with the engine's `n_ctx` as `engine_n_ctx`) and absent
+rather than guessed otherwise -- this server does not report a number nobody measured. A real
+precheck behind `gateway.precheck_context` remains available as a follow-up if the round-trip is
+ever judged worth it. A 500 that mentions context is still `upstream_error`: that is the engine
+failing, not the prompt being long (the "too large to process, increase the physical batch size"
+refusal is typed `ERROR_TYPE_SERVER` and stays a 500).
+
+**sfctl says when it does not match the server.** `with_client` -- the one place every
+server-touching command opens a client -- costs one unauthenticated `/health` GET and warns on
+stderr, **once per process**, when the two versions differ. Not fatal, and suppressed under
+`--json` (stdout is a parsing contract there, and a caller asking for machine output asked for
+quiet). Version comparison is a hand-rolled tuple parse (`1.26-08-31` and its PEP 440 twin
+`1.26.8.31` both read `(1, 26, 8, 31)`, the same reading `core/updater.py::_version_key` does
+server-side); `packaging` was **not** added, because the format is minted by this repo and the
+companion's stated virtue is installing anywhere on a thin dependency list. Junk on either side is
+silence: a version check must never be why a working command looks broken. It warns on *any*
+inequality, not only a major one -- the 2026-08-26 doc's own item recurred at a three-day skew.
+
+**What was NOT taken, and why.**
+
+* **No status-code change.** `gpu_leased` is a 507, not a 409 or a 503. Every existing client
+  branches on 507 for "no room", and a new status would break them in order to say something the
+  body now says better.
+* **No `priority` or `kind` field stored on `GpuLease`, and no preemption.** The A6 2.1 ask was
+  lease priority classes; what shipped is the *descriptive* half only, derived rather than stored.
+  Shipping an enforceable-looking `priority` that silently preempts nothing is the D47-class
+  "reports success" hazard, and a real preemption ladder (a release protocol, `preempted_by`
+  bookkeeping, an appeal path for the holder) is a far larger change than the reporting gap the
+  clients actually complained about. The book stays strictly first-come-first-served (D43).
+* **No `server.require_key_for_inference`.** It would be a fourth axis on top of
+  `api_key` x `mcp.pin` x D32-locality, and a half-key that protects inference but leaves
+  `/api/status` open is exactly the partial guarantee D47 exists to stop shipping. D32's own
+  rationale is that residency and inference stay open for LM Studio parity. The operator's choice is
+  binary and already implemented; what was missing was the *documentation* of the split, now in
+  `OPENCLAW-SETUP.md` and `LIMITATIONS.md`, naming `GET /api/status.clients` as the attribution
+  surface until a key is set.
+* **No change to `LeaseBook.blocked_for` matching.** See above: `holder_family` is for clients.
+* **Deferred: quiet windows (2.2) and warm-swap / prompt-cache preservation (2.5).** The first is a
+  new persisted registry plus grant-time checking; the second is `--slot-save-path` plumbing plus a
+  disk budget. Both are well over 150 lines of genuinely new mechanism, and neither is what the
+  reports asked for. `kind` gives clients most of 2.2's practical value in the meantime.
+* **A6 2.7 (watchdog PIN) needed no code.** `watchdog/server.py` already enforces bearer key **or**
+  `X-MCP-Pin`/`X-StudioForge-Pin`, constant-time, with `?pin=` refused (D44) and the shared lockout;
+  it was re-verified against the code and recorded in `docs/RUNBOOK.md` so the "was not re-tested"
+  note stops being true.
+
+**Tests.** `tests/unit/test_leases.py` (`holder_family` collapsing the judge suffix; `kind` derived,
+with `blocked_for` explicitly unchanged by it; the three `state` bands on an injected clock,
+including a TTL-less lease that can go idle but never expiring; `retry_after_s` capped, and `None`
+without a TTL; all three lease-shaped refusals answering `gpu_leased` with the lease id and no
+invented zeros; `allowed_devices_unavailable` when no lease is why; **the false positive that
+matters** -- an unrelated lease on a card this load never wanted leaves `reason_code` `None`;
+`lease_check` refusing only the certain cases and never a resident model),
+`tests/unit/test_busy_loads.py` (`_vram_error` yielding `gpu_leased` at 507 with
+`lease`/`leases`/`retry_after_s`, the open-ended fallback, and an ordinary refusal still
+`insufficient_vram`), `tests/unit/test_load_recommended.py` (the second, hand-built 507 carrying the
+same code), `tests/unit/test_catalog_routes.py` (`/api/status` and `/api/leases` key set-equality),
+`tests/unit/test_request_priority.py` (a streaming lease refusal as a real 507 with `Retry-After`
+and the lease detail; a resident model never blocked by the precheck),
+`tests/unit/test_gateway_lifecycle.py` (llama.cpp's wording becoming a 400 `context_exceeded` with
+`ctx_per_slot` and no invented `prompt_tokens`; the typed b10689 refusal recognised on its `type`
+alone with the engine-measured count relayed; a 400 that merely says "exceeds" left alone while the
+older untyped wordings still map; an unrelated 400 and a 500 staying `upstream_error`; the
+streaming twin; and, back in `test_leases.py`, a forced placement that does not fit on its own card
+never blamed on leases standing elsewhere), and `tests/unit/test_companion.py` (both version spellings comparing equal; a
+stale sfctl warning once without changing the exit code; a matched pair silent; `--json` quiet and
+still parsing; an unusable `/health` changing nothing).
+
+## D54 -- What the child was really launched with, and whether its prompt cache is working
+
+**Problem (SPEC A1/A2, 2026-09-04).** A client read the per-model settings of the 27B story model
+-- `cache_reuse: null, cont_batching: null, kv_unified: null` -- as "prefix caching is off", measured
+seven concurrent chapter requests at 68,511 `usage.prompt_tokens` against 11,529 for one request,
+and asked for the cache to be "enabled", with the verify criterion "prompt tokens toward ~20-25k".
+Then it asked whether a flat aggregate at `parallel: 3` was expected, "likely a consequence of
+`cont_batching: null`".
+
+Both readings were wrong, and nothing on the server could show that they were. `null` means
+*inherit*; the child was launched with `--cache-reuse 256 --cache-ram 32603
+--slot-prompt-similarity 0.3 --no-kv-unified`, continuous batching is llama.cpp's default, and
+per-request `cache_prompt` defaults to true. But the real argv lived only on the private
+`_Instance.argv` and in the child's log file; `InstanceInfo` carried `cache_ram_mib` (D50) and
+`speculative` (D38) and nothing else about caching; `/props` does not report the cache flags; the
+GUI's command-line panel is a *preview* built without engine features. A reader who wanted to know
+what a resident child was really doing had `settings`, and `settings` says `null`.
+
+And `usage.prompt_tokens` cannot show a cache hit: it is `task->n_tokens()`, the *size* of the
+prompt. The A1 verify criterion could never be met by any setting.
+
+**Evidence, b10689 sources** (tag `57291f264`, matching `engines/b10689/engine.json`):
+
+- `usage.prompt_tokens` = `slot.task->n_tokens()` (server-context.cpp:2106 -> server-task.cpp:368).
+  The work done is `timings.prompt_n`; the work saved is `timings.cache_n` (server-common.cpp:67-73),
+  attached to every non-streamed response (server-task.cpp:408) and to the **final streamed chunk**
+  (:517) with no request flag. `usage.prompt_tokens_details.cached_tokens` (server-task.cpp:370)
+  reaches a stream only with `stream_options.include_usage` (:502; default false, server-task.h:52).
+  The gateway forwards all of it untouched: non-stream `_forward` returns `response.json()`
+  verbatim apart from `_merge_reasoning`, and `_stream_upstream` yields `aiter_raw()` chunks
+  byte-for-byte.
+- `/metrics` exports `llamacpp:prompt_tokens_total` ("processed, **excluding cached tokens**") and
+  `llamacpp:prompt_tokens_cached_total` ("reused from the cache") (server-task.cpp:1524-1533). The
+  collector scraped the first for tok/s deltas and never read the second.
+- **No cross-slot prefix sharing.** `get_available_slot` (server-context.cpp:1536-1650) routes a
+  request to the idle non-empty slot with the best longest-common-prefix ratio above
+  `slot_prompt_similarity` (:1573-1579), else LRU; empty slots are skipped by the similarity pass
+  (:1568). Reuse in `update_slots` is `n_past = LCP(slot.prompt.tokens, input)` (:3192) -- the
+  slot's *own* previous prompt. At `--parallel 3`, seven simultaneous requests put three on empty
+  slots (full prefill each) and defer four (`llamacpp:requests_deferred`), which then land on warm
+  slots. Total prefill is ~`3·P + 4·0.14·P ≈ 3.6·P`, not `P + 6·0.14·P ≈ 1.9·P`. Warming first does
+  not change it: one warm slot serves one first-wave request. The host cache
+  (`server_prompt_cache::load`, server-task.cpp:1793-1868) can seed a *different* slot, but the
+  entry is consumed on load (:1861-1862) -- one extra reuse per saved copy, not sharing.
+- **Hybrid checkpoint quantisation.** For a model whose memory cannot be partially removed
+  (`llama_memory_hybrid`, this `qwen35` 27B), reuse rolls back to the newest checkpoint with
+  `pos_min < divergence` (server-context.cpp:3323-3349), truncating `n_past` to it; with none it
+  forces full re-processing ("likely due to SWA or hybrid/recurrent memory", :3351-3356).
+  Checkpoints (max `--ctx-checkpoints 32`) are created at the first batch, at user-message starts
+  >= `--checkpoint-min-step` (8192) tokens apart (:3521-3531), at the start of the **last** user
+  message, and 4 + n_ubatch and 4 tokens before the end (:3535-3549). The per-request difference
+  must therefore *begin a user message*; a `{chapter}` placeholder inside the shared message loses
+  the prefix.
+- `--cache-reuse` is second-order for this workload: the chunk pass (:3220-3256) recovers >= 256
+  identical tokens *after* the divergence; the shared prefix is recovered by the plain LCP path,
+  which needs no flag. `llama_memory_hybrid::get_can_shift` returns the attention cache's answer
+  (llama-memory-hybrid.cpp:133-135), so the pass runs on this model.
+- Engine defaults, `common/common.h`: `cont_batching` **true** (:568), `kv_unified` false ("enabled
+  if slots auto", :573), `n_cache_reuse` 0 (:626), `cache_prompt` true (:627), `cache_idle_slots`
+  true and requires cache-ram (:628; the server clears it at server-context.cpp:1420-1423 when
+  `cache_ram_mib == 0`), `n_ctx_checkpoints` 32 (:629), `checkpoint_min_step` 8192 (:631),
+  `cache_ram_mib` 8192 (:632), `slot_prompt_similarity` 0.10 (:694).
+- **One real bug.** `_optional_args` emitted `--cont-batching` only for `settings.cont_batching is
+  True` and had no path to `--no-cont-batching`, so `cont_batching: false` -- the "off" position of
+  the GUI's tri-state toggle -- changed nothing. b10689 and b10425 both offer `-nocb,
+  --no-cont-batching` (help.txt:461). Same class as the `--defrag-thold` finding in D17.
+- **A2.** `/parallel-observations` and `/benchmarks` are empty for this model and
+  `recommended_parallel_basis` is null, so "expected" cannot be claimed. D17's bandwidth model
+  (weights 22.7 GB read once per step, KV per busy slot ~64 KiB/token f16 on 16 of 65 layers)
+  puts the knee far above 3 slots, so a flat aggregate is anomalous. The GGUF carries
+  `nextn_predict_layers: 1`, `spec_type: auto` resolves to `draft-mtp` up to `SPEC_AUTO_MAX_SLOTS`
+  = 4 (D38), and MTP's +34 % single-stream win (D38 §2) is the same bandwidth slack batching
+  would harvest. That is a hypothesis with a test, not a finding.
+
+**Decision.** Additive, nullable, no renames.
+
+1. `types.EffectiveLaunch` and `InstanceInfo.effective` -- `cache_prompt`, `cache_reuse`,
+   `cache_ram_mib`, `cache_idle_slots`, `cont_batching`, `kv_unified`, `slot_prompt_similarity`,
+   `parallel`, `ctx_per_slot`, `ctx_total`, `batch_size`, `ubatch_size` (clamped to the batch as
+   the engine does), `ctx_checkpoints`, `checkpoint_min_step`, `spec_type`, `flash_attn`, a
+   `sources` map (`argv` | `engine_default`), `inert` (saved settings the child could not see) and
+   a one-line `summary`. Computed by the pure `supervisor.effective_launch(argv, features, plan,
+   settings)` from the **final argv** -- last occurrence wins, every llama.cpp alias accepted
+   (`-nocb`, `-sps`, `-cram`, `-kvu`...), so `extra_flags` are in the answer -- with the engine's
+   parsed defaults filled in (`EngineFeatures` gains `cont_batching_default`,
+   `cache_prompt_default`, `cache_idle_slots`, `checkpoint_min_step_default`,
+   `slot_prompt_similarity_default`, read from the help in the `_default_int` style; a
+   pre-D54 `features.json` falls back to the common.h constants, never to False -- and
+   `cache_idle_slots`, absent as a key in every cached file on the rig, is read from the flag list
+   the old file *did* write, because `--cache-idle-slots` being advertised is the fact). An unknown
+   engine fills the common.h constants and marks them `engine_default` -- D38's "advertises
+   nothing" fallback applied to reporting. Stamped in `_spawn` right after `inst.argv = argv`,
+   beside `InstanceInfo.launch_args` = `redact_argv(argv)`: every absolute path reduced to its
+   basename and the value after `--api-key` / `--api-key-file` / `--ssl-key-file` /
+   `--hf-token` (`-hft`, the Hugging Face credential llama-server takes on the command line;
+   any of which `extra_flags` could carry) replaced. `build_command` stays the single source of
+   the argv. Surfaces: `/api/status loaded[]` and `/introspect.instance` (InstanceInfo dumps), the
+   `GET /api/models` row (`effective`, null when not loaded -- the closest thing to the requested
+   per-model GET; no new route for one field), the `GET /v1/models` `studioforge` block (D41;
+   the compact subset, on loaded rows only, so an OpenAI client sees it on the row it already
+   fetches), and MCP `_compact_instance` (`compact()`: the
+   cache/batching/KV subset plus `summary` and `inert`), which lights `server_status`,
+   `model_info`, `load_model` and `load_recommended` in one edit.
+2. `prompt_cache` per instance on `/api/status loaded[]` and MCP `server_status`:
+   `{processed_total, cached_total, hit_ratio, since: "child_start", sampled_at}` from the
+   existing `/metrics` sweep -- `throughput.CACHE_COUNTERS` are stored beside the gauges in
+   `_throughput_gauges`, `throughput.prompt_cache_block` renders them. **`null` when the engine
+   has no `prompt_tokens_cached_total`** (pre-b10689) or before the first sweep, never a fake
+   zero: a block of zeros reads as "the cache never hits", the exact misreading this ends. The
+   sample also records the instance's `started_at`, and the block is `null` when that does not
+   match the instance being described: the sweep drops the gauges when it sees a model not
+   ready, but a crash relaunch faster than one sweep never shows it one, and `since:
+   "child_start"` must mean *this* child. Zero hot-path cost.
+3. `cont_batching: false` emits `--no-cont-batching` when the engine advertises it; otherwise the
+   load logs `setting_inert` (model, setting, flag, `engine_known`) -- the D47 load-time-warning
+   precedent -- and `effective.inert` lists `cont_batching` while `effective.cont_batching` shows
+   what the child actually does (on).
+4. Docs: `OPENCLAW-LONG-CONTEXT.md` §4 (what is on, why `usage.prompt_tokens` never moves and the
+   truthful signals, the two hard limits with the 3.6·P arithmetic, the user-message-boundary
+   rule, the recipe, how to measure, and the honest A2 answer with the `spec_type: none`
+   hypothesis and its `benchmark_parallel` test); `ENGINE-FEATURES.md` gains a prompt-prefix-reuse
+   section and two corrections (the `cache_ram_mib` grant is on the instance, not a bare
+   `GET /api/models` row; a hit is `timings.cache_n` rising, not "a much smaller `prompt_n`");
+   `OPENCLAW.md` links §4. `scripts/measure_prefix_cache.py`: stand-alone (httpx only), serial vs
+   N-way concurrent, `--diverge user-boundary|mid-message`, per-request `cache_n`/`prompt_n` and
+   per-phase `achieved_batch` from the child's decode counter; refuses under a lease, beside
+   active requests or a running benchmark (`--yes` overrides only that), never loads a model,
+   refuses `--concurrency` above the instance's slots.
+
+**SPEC A1's reply, in facts.** Prefix caching has been on since D17/D38. The verify criterion is
+Σ `timings.cache_n` (or `prompt_tokens_cached_total`) rising to ≈ `(R − parallel)·0.86·P` with
+Σ `usage.prompt_tokens` staying at 68,511. The remaining client-side lever is the user-message
+boundary rule for hybrid models. No setting beats `parallel × prefix`.
+
+**Not taken.**
+
+- *Per-request SSE parsing* for `last_cache_n` / rolling hit counts on `mark_request_end`.
+  Non-stream is free (`data.get("timings")` after `response.json()`), but a stream costs a third
+  substring scan per `aiter_raw` chunk plus a 4 KiB carry-over and one `json.loads` of the final
+  event, on the hottest path in the server, and yields nothing on a mid-stream disconnect. The
+  child's own counters answer "is the cache working" for free; per-request attribution becomes
+  worth it only when the question is "which *client* is missing its cache" (`clients_snapshot`
+  already keys on `X-SF-Client`). Designed, deferred, recorded here so it is not re-derived.
+- *Flipping any default* (`cache_reuse`, `checkpoint_min_step`, `parallel`, `spec_type`,
+  `SPEC_AUTO_MAX_SLOTS`). Every candidate in the A1/A2 brief either does nothing for this workload
+  (higher `cache_reuse`, `kv_unified`) or is a hypothesis without a measurement (`spec_type: none`
+  at >= 2 slots, a lower `checkpoint_min_step` for mid-message divergence). Measure first --
+  `benchmark_parallel` auto vs none, `measure_prefix_cache.py --diverge mid-message` -- then
+  decide per model; a quality-first server does not trade a measured +34 % on a guess.
+- *`kv_unified: true` for this model.* Changes pool shape, not caching, and buys a mid-generation
+  500 for two concurrent long requests (D38 §4).
+- *A `GET /api/models/{id}` route.* One field does not justify a route; `effective` rides the
+  existing row.
+- *Per-request attribution of a stale `prompt_cache`.* The block carries the start stamp the
+  sample was taken under and is `null` when it does not match the instance's own -- a crash
+  relaunch faster than one sweep must not serve the dead child's lifetime totals as the new
+  one's -- but it does not try to say *which* requests missed; see the SSE-parsing entry above.
+
+**Tests.** `test_supervisor_features.py` (engine defaults when nothing is passed; reuse 256 from a
+null setting; last occurrence and aliases via `extra_flags`; cont_batching default/`-nocb`;
+`--no-cont-batching` emitted where advertised, `setting_inert` + `inert` where not;
+`cache_idle_slots` off at `--cache-ram 0` / None on an engine without the flag / common.h on an
+unknown one; ubatch clamp; spec_type/flash_attn from argv; api-key and path redaction incl. the
+`=` spelling), `test_supervisor.py` (stamped at spawn, basenames only, survives `model_dump`),
+`test_engine_features.py` (the five new defaults parsed from the verbatim b10425 help; a pre-D54
+`features.json` keeps the engine defaults), `test_throughput.py` (cached counter parsed;
+`prompt_cache_block` ratio; null without the counter, undefined ratio at zero),
+`test_catalog_routes.py` (`prompt_cache` on status from the collector, null without the counter
+and before the first sweep; `effective` on status and the models row, null when cold),
+`test_mcp.py` (compact `effective` on the instance row; `prompt_cache` on `server_status`),
+`test_docs.py` (the three docs name the real signals and surfaces), and the new
+`test_measure_prefix_cache.py` (arguments, every refusal branch and the `--yes` boundary,
+deterministic non-repeating prose, both divergence shapes, row extraction, the 3.6·P phase
+arithmetic with `achieved_batch`, the report). The b10425 help excerpt gained the verbatim
+`--cont-batching`, `--cache-prompt`, `--cache-idle-slots`, `--checkpoint-min-step` and
+`--slot-prompt-similarity` entries from `engines/b10425/help.txt`.

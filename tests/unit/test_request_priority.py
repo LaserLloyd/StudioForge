@@ -207,3 +207,67 @@ def test_a_request_tier_does_not_re_tier_the_instance_it_shares(
     assert response.status_code == 200, response.text
     assert instance.priority == 3
     assert app.state.manager._model_priority == {}
+
+
+# ---------------------------------------------------------------------------
+# A lease refusal reaches a streaming client as a real 507 (D53)
+# ---------------------------------------------------------------------------
+
+
+def test_a_streaming_request_meets_a_lease_as_a_507_not_an_sse_frame(
+    app: Any, upstream: list[dict[str, Any]]
+) -> None:
+    """The refusal has to arrive BEFORE the 200 or nobody sees it.
+
+    A streaming request loads inside the SSE body, so a lease refusal used to
+    be an error frame inside an HTTP 200 -- invisible to exactly the client a
+    lease refusal is written for, which branches on the status code.
+    """
+    app.state.supervisor = FakeSupervisor([])
+    app.state.manager.supervisor = app.state.supervisor
+    lease = app.state.manager.leases.acquire(
+        [0], holder="crucibleforge-judge", reason="8-stream benchmark"
+    )
+
+    with TestClient(app) as http:
+        response = http.post(
+            "/v1/chat/completions",
+            json={"model": MODEL_ID, "messages": MESSAGES, "stream": True},
+        )
+
+    assert response.status_code == 507, response.text
+    error = response.json()["error"]
+    assert error["code"] == "gpu_leased"
+    assert "leased" in error["message"], "the word existing clients match on survives"
+    assert "0.00 GiB" not in error["message"]
+    detail = error["studioforge"]
+    assert detail["lease"]["id"] == lease.id
+    assert detail["lease"]["holder_family"] == "crucibleforge"
+    # The wait is a fact the server knows, so it goes in the header every HTTP
+    # client already understands -- 507 never carried one before.
+    assert response.headers["Retry-After"] == str(int(detail["retry_after_s"]))
+    assert upstream == []
+
+
+def test_a_model_already_serving_is_never_refused_by_the_lease_precheck(
+    app: Any, upstream: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The precheck gates a *load*, not a request.
+
+    A lease taking the last card says nothing about a model already resident on
+    it -- refusing its traffic would turn a display improvement into an outage.
+    """
+
+    async def fake_stream(*_args: Any, **_kwargs: Any) -> Any:
+        yield b"data: [DONE]\n\n"
+
+    monkeypatch.setattr(openai_routes, "_stream_with_jit_load", fake_stream)
+    app.state.manager.leases.acquire([0], holder="crucibleforge", reason="benchmark")
+
+    with TestClient(app) as http:
+        response = http.post(
+            "/v1/chat/completions",
+            json={"model": MODEL_ID, "messages": MESSAGES, "stream": True},
+        )
+
+    assert response.status_code == 200, response.text
