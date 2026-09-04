@@ -74,7 +74,7 @@ Do this first. Every later step assumes it, and it is the single most common thi
 curl -s -m 8 http://<rig-ip>:1234/health
 ```
 
-Expected: `{"status":"ok","version":"1.26-08-31",...}` — the version comes from this repository's
+Expected: `{"status":"ok","version":"1.26-09-04",...}` — the version comes from this repository's
 `studioforge/__init__.py`. A different string means you are talking to another build, and these
 instructions may not match it.
 
@@ -311,9 +311,23 @@ loads it at server startup, so the first agent request of the day does not pay t
 
 ## Recommended — turning on a real API key
 
-Right now inference is open to anything on your tailnet. The PIN protects the MCP control plane
-only; `POST /v1/chat/completions` needs no credential. On a private tailnet that may be an
-acceptable trade, but closing it is two steps.
+Right now inference is open to anything on your tailnet. With `server.api_key` unset the split is
+exactly this, and it is worth knowing precisely:
+
+* **Open, no credential:** `POST /v1/chat/completions` and `/v1/completions`, `GET /v1/models`,
+  `GET /api/status`, `GET /api/leases`, load/unload/restart residency, and both benchmarks.
+* **Gated since 2026-08-26 (D32):** every *box change* — `PATCH`/`PUT /api/settings`,
+  `POST`/`DELETE /api/leases`, `POST /api/pin`, config writes, and every mutating MCP call. Those
+  need a loopback, non-cross-site caller or the `X-MCP-Pin` header.
+
+So the write half is closed and the read/inference half is not. Until a key is set,
+`GET /api/status` → `clients` (the trailing-hour rollup of who sent inference, by `X-SF-Client`
+label or peer IP) is the whole attribution story — it is how you find an unidentified tailnet
+client starving a lease.
+
+There is deliberately no middle setting. A flag that protected inference but left `/api/status`
+open would be a partial guarantee, and this project does not ship those; the operator's choice is
+binary and it is `server.api_key`. Closing it is two steps.
 
 **On the rig**, set the key in `config.yaml` and restart:
 
