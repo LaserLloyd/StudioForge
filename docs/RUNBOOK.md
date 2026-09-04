@@ -261,6 +261,30 @@ No code change was needed.
   count separately, so neither door can lock the other.
 * Vision requests never fetch an image from loopback, link-local, private, ULA or CGNAT space
   (`100.64.0.0/10`, the tailnet) unless `gateway.allow_private_image_hosts` is on.
+* **A model a GPU lease holds is not a stranger's to unload** (D55). `POST /api/models/{id}/unload`,
+  `unload-all` and `/restart` answer `409 lease_conflict` naming the lease when it names the model or
+  the model sits on its cards, unless the caller is the holder (`X-SF-Client` matching the lease's
+  `holder_family`) or an admin (this machine, the PIN, or a key-bearing request). The panel and
+  `sfctl unload` are the operator's and pass. Release the lease (`DELETE /api/leases/{id}`) or wait
+  for it to idle out; the sweep's own unloads are never refused.
+* **What an open install shows a remote reader is shaped, not closed** (D55). `GET /api/logs`,
+  `/api/logs/models/{id}` and `/api/vram/holders` answer a caller that is not an admin with paths
+  reduced to basenames and every foreign command line removed, and say `redacted: true`; the same
+  request from the box, or with the PIN/key, is verbatim. The panel's Logs tab is local-only on an
+  open install. The child's launch line is redacted wherever it is written, so a key in
+  `extra_flags` never reaches a log. An unhandled 500 hands the caller `ref=<8 hex>`; grep the
+  server log for that reference to find the exception text.
+* **The watchdog fails closed** (D55). With neither `server.api_key` nor a PIN configured, `:1235`
+  accepts management requests (and `POST /restart`) only from the machine it runs on -- a LAN peer
+  gets `403 remote_admin_requires_credential`. `GET /health` stays open for liveness, but a remote
+  poller with no credential sees the verdict fields only (`redacted: true`); send the PIN or key to
+  see `config_path` and the children. `kill_model` refuses an ambiguous name (`ambiguous_model`)
+  rather than killing every match.
+* The control panel refuses to be framed (`X-Frame-Options: DENY`, `frame-ancestors 'none'`) and its
+  socket.io control channel refuses a foreign `Origin` over long-polling as well as WebSocket (D55).
+  A `403 cross_site_control_channel` in the log is a page on another site trying to drive the panel,
+  or a reverse proxy rewriting `Host`. The panel's session cookie is signed with a random secret
+  persisted at `<data_dir>/gui_secret`; delete the file to invalidate every session.
 
 ## Where the logs are
 

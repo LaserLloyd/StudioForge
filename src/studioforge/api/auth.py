@@ -138,6 +138,13 @@ _ADMIN_MUTATION_PREFIXES: tuple[str, ...] = (
     "/api/vram/reclaim",
     "/api/downloads",
     "/api/leases",
+    # D55: creating one persists a registry row carrying a ``system_prompt``
+    # that the gateway then applies to every request routed to that id, and the
+    # id appears in ``/v1/models``. Deleting one was already gated by
+    # ``_ADMIN_DELETE_PREFIXES``; planting one was not, so an open install could
+    # be given a restart-surviving system-prompt backdoor over any base model by
+    # anyone who could reach the port. Creation is the box change here.
+    "/api/virtual-models",
 )
 #: Deletions of things on disk / in the registry: same rule, DELETE only.
 _ADMIN_DELETE_PREFIXES: tuple[str, ...] = (
@@ -287,6 +294,33 @@ REMOTE_ADMIN_ACTION_NOTE = (
     "the server remotely with a real credential. The rest of this route stays open: the same "
     "request without that field is accepted."
 )
+
+
+def is_admin_caller(request: Any, config: Config) -> bool:
+    """D32's "may change the box" test, as a boolean rather than a refusal (D55).
+
+    Same three acceptances as :func:`require_admin_action`, in the same order:
+    ``server.api_key`` configured (the middleware already authenticated this
+    request), a caller on this machine that is not a cross-site browser page,
+    or the MCP pairing PIN.
+
+    Used where the answer *shapes* a response rather than refusing it -- how
+    much of a log or a process listing this caller may see, whether a
+    lease-held model may be unloaded. Deliberately records nothing in the
+    credential lockout: these callers are not attempting a credential, they are
+    being measured, and counting a read against the operator's own address
+    would lock them out of a server nobody was attacking.
+    """
+    if config.server.api_key:
+        return True
+    if is_local_request(request) and not cross_site_browser_request(request):
+        return True
+    mcp_config = getattr(config, "mcp", None)
+    pin = getattr(mcp_config, "pin", None) if mcp_config else None
+    if not pin:
+        return False
+    candidate = extract_pin(request) or extract_key(request)
+    return bool(candidate and _matches(candidate, str(pin)))
 
 
 def require_admin_action(request: Request, config: Config, action: str) -> None:

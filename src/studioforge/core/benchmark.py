@@ -58,7 +58,7 @@ import httpx
 
 from studioforge.core.gpu import fastest_gpu_order
 from studioforge.core.planner import BUSY_RETRY_AFTER_S
-from studioforge.core.priority import PRIORITY_CHAT
+from studioforge.core.priority import PRIORITY_AGENT, PRIORITY_CHAT
 from studioforge.core.supervisor import SPLIT_MODE_TENSOR, tensor_split_model_blockers
 from studioforge.errors import BadRequestError, ModelBusyError, ModelLoadError
 from studioforge.logging import get_logger
@@ -72,6 +72,22 @@ log = get_logger(__name__)
 
 DEFAULT_CTX_SIZE = 4096
 DEFAULT_MAX_TOKENS = 128
+
+
+def benchmark_lease_priority(manager: Any) -> int:
+    """The D46 class this server's own benchmark leases carry (D56).
+
+    ``benchmark.lease_priority`` (default 2, a dispatched agent's work): a
+    benchmark may ask a background render tenant that registered a vacate
+    endpoint to leave its cards, never the chat model's claim, and never
+    another benchmark's. A manager without a config (a test double) gets the
+    shipped default.
+    """
+    config = getattr(manager, "config", None)
+    section = getattr(config, "benchmark", None)
+    value = getattr(section, "lease_priority", None)
+    return int(value) if isinstance(value, int) and not isinstance(value, bool) else PRIORITY_AGENT
+
 
 #: Fixed prompt so two runs are comparable. Long enough (a few hundred tokens)
 #: that prompt processing is actually measurable -- a one-line prompt gives a
@@ -763,11 +779,15 @@ class Benchmarker:
             # done (D43): an idle resident on them is unloaded, a busy one
             # fails the mode by name, and nothing else may load there meanwhile
             # -- so the number measured is the card's, not the neighbours'.
+            # Class 2 by default (benchmark.lease_priority, D56): dispatched
+            # work that may ASK a background render tenant to vacate the
+            # cards, and never displaces the chat model's claim.
             lease = await self.manager.acquire_lease(
                 mode.devices,
                 holder="benchmark",
                 model_ids=[record.id],
                 reason=f"benchmark {mode.key}",
+                priority=benchmark_lease_priority(self.manager),
             )
             steered = record.model_copy(update={"settings": base_settings})
             record.settings = self._settings_for(steered, mode)

@@ -721,6 +721,39 @@ class GatewayConfig(BaseModel):
     deep_probe_max_tokens: PositiveInt = 8
 
 
+class LeasesConfig(BaseModel):
+    """GPU-lease vacating (D56): a better class may ASK a tenant to leave."""
+
+    #: How long a holder has, after the vacate request, to release its lease
+    #: before the asker's answer degrades from ``409 lease_vacating`` back to
+    #: today's plain ``409 lease_conflict``. Long enough for a render to
+    #: finish and a ComfyUI ``/free`` to land; short enough that a dead holder
+    #: costs a benchmark three minutes, not an afternoon.
+    vacate_timeout_s: PositiveFloat = 180.0
+    #: The re-ask interval handed to a requester (``retry_after_s`` and the
+    #: ``Retry-After`` header) while the holder is vacating.
+    vacate_retry_after_s: PositiveFloat = 15.0
+    #: Per-request HTTP timeout for the one vacate POST to the holder.
+    vacate_callback_timeout_s: PositiveFloat = 10.0
+
+
+class BenchmarkConfig(BaseModel):
+    #: The D46 class this server's OWN benchmark leases carry (D56). 2 = a
+    #: dispatched agent's work: a benchmark may ask a background (class 3)
+    #: render tenant that registered a vacate endpoint to leave its cards,
+    #: never the chat model's claim (class 1) and never another benchmark's
+    #: (equal class is a plain conflict). 3 makes benchmarks the polite tenant
+    #: they were before D56 -- they ask nobody.
+    lease_priority: int = 2
+
+    @field_validator("lease_priority")
+    @classmethod
+    def _check_lease_priority(cls, v: int) -> int:
+        if isinstance(v, bool) or v not in (1, 2, 3):
+            raise ValueError("benchmark.lease_priority must be 1, 2 or 3 (the D46 tiers)")
+        return v
+
+
 class HfConfig(BaseModel):
     token: str | None = None
     cache_dir: Path | None = None
@@ -795,6 +828,8 @@ class Config(BaseSettings):
     engine: EngineConfig = Field(default_factory=EngineConfig)
     planner: PlannerConfig = Field(default_factory=PlannerConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
+    leases: LeasesConfig = Field(default_factory=LeasesConfig)
+    benchmark: BenchmarkConfig = Field(default_factory=BenchmarkConfig)
     hf: HfConfig = Field(default_factory=HfConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     update: UpdateConfig = Field(default_factory=UpdateConfig)

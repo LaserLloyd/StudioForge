@@ -8,6 +8,7 @@ here -- it stays on the OpenAI endpoints.
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from typing import Any
 
@@ -18,6 +19,7 @@ from fastapi.responses import JSONResponse
 from studioforge import __version__
 from studioforge.api.auth import (
     PIN_WITHHELD_NOTE,
+    is_admin_caller,
     may_reveal_pin,
     redact_config_dict,
     require_admin_action,
@@ -33,7 +35,7 @@ from studioforge.core.benchmark import (
     available_modes,
 )
 from studioforge.core.diskspace import disk_report
-from studioforge.core.leases import lease_view
+from studioforge.core.leases import holder_family, lease_view
 from studioforge.core.manager import validate_load_args
 from studioforge.core.model_gate import (
     GateRequirement,
@@ -69,6 +71,40 @@ BENCHMARK_JOB_HISTORY = 20
 
 def _state(request: Request) -> Any:
     return request.app.state
+
+
+def may_unload_lease_held(request: Request, state: Any, model_ids: Any) -> bool:
+    """Whether this caller may unload models a standing GPU lease holds (D55).
+
+    Residency stays open under D32 -- load and unload from anywhere on the LAN
+    is the LM Studio parity the product is built on -- so this is deliberately
+    *not* a route-level gate: it is asked only once a lease is actually in the
+    way, and it answers for the two callers who legitimately are.
+
+    * **The holder.** ``X-SF-Client`` is the label the gateway already
+      attributes inference by, matched on the lease's ``holder_family`` so
+      ``crucibleforge`` and ``crucibleforge-judge`` are one client. It is
+      self-declared and is **not** a credential -- it cannot be, on an open
+      install -- so this only stops the accident (a stranger's ``unload-all``
+      sweeping up a benchmark), never a caller who knows the holder's name.
+      That is the same trade the ``client`` tag makes everywhere else, and the
+      credential in §7(a) of the audit is what upgrades it.
+    * **An admin.** D32's own test: a caller on this machine, the MCP pairing
+      PIN, or an install with ``server.api_key`` set (where the middleware has
+      already authenticated this request).
+
+    Returns ``False`` when no lease is in the way at all -- there is nothing to
+    waive, and the manager will not raise.
+    """
+    held = state.manager.leases_holding(list(model_ids))
+    if not held:
+        return False
+    headers = getattr(request, "headers", None)
+    label = (headers.get("x-sf-client") if headers is not None else None) or ""
+    label = label.strip()
+    if label and all(holder_family(label) == holder_family(lease.holder) for lease in held):
+        return True
+    return is_admin_caller(request, state.config)
 
 
 # ---------------------------------------------------------------------------
@@ -258,12 +294,52 @@ async def vram_holders(request: Request) -> dict[str, Any]:
     state = _state(request)
     from studioforge.core.vram_holders import holders_view
 
-    return await run_in_threadpool(
+    view = await run_in_threadpool(
         holders_view,
         state.probe,
         state.config.engines_dir,
         own_pids=_own_child_pids(state),
     )
+    if is_admin_caller(request, state.config):
+        return view
+    return _public_holders(view)
+
+
+def _public_holders(view: dict[str, Any]) -> dict[str, Any]:
+    """The holders view with every foreign command line taken out (D55).
+
+    This route answers "who has my VRAM", and it answered it by publishing
+    ``parent_cmdline`` verbatim -- for *every* process on the box, not only
+    ours. On this rig that meant the operator's username, the ComfyUI install's
+    full launch flags and any co-tenant's arguments went to anyone who could
+    reach the port; a ``docker run -e TOKEN=...`` parent would have gone with
+    them. Nothing on this path redacts, and nothing branched on the peer.
+
+    The shape is unchanged, so no client breaks: ``parent_cmdline`` becomes
+    ``None``, ``exe`` and ``engines_dir`` are reduced to their basenames, and
+    ``detail`` (another instance's ``--alias``/``--port``) is dropped. The
+    numbers, the pids and the classification -- everything the question is
+    actually about -- are untouched. An admin caller (loopback, the PIN, or a
+    key-bearing request) still gets today's payload verbatim.
+    """
+    from studioforge.core.supervisor import _basename
+
+    holders = []
+    for row in view.get("holders") or []:
+        row = dict(row)
+        row["parent_cmdline"] = None
+        row["detail"] = None
+        if row.get("exe"):
+            row["exe"] = _basename(str(row["exe"]))
+        if row.get("parent_name"):
+            row["parent_name"] = _basename(str(row["parent_name"]))
+        holders.append(row)
+    return {
+        **view,
+        "holders": holders,
+        "engines_dir": _basename(str(view.get("engines_dir") or "")),
+        "redacted": True,
+    }
 
 
 @router.post("/vram/reclaim")
@@ -303,9 +379,17 @@ async def vram_reclaim(request: Request, dry_run: bool = Body(False, embed=True)
 
 @router.get("/leases")
 async def list_leases(request: Request) -> dict[str, Any]:
-    """Every standing GPU lease: which cards, held by whom, for which models."""
+    """Every standing GPU lease: which cards, held by whom, for which models.
+
+    Each row carries ``priority`` (the D46 class of the claim), ``state``
+    (``vacating`` while the holder has been asked to leave, D56),
+    ``vacate_registered`` and ``vacate_deadline``. The holder's ``vacate_url``
+    itself is shown only to a caller the D32 gate trusts with the box (this
+    machine, or a credentialed one); the token is never shown to anyone.
+    """
     state = _state(request)
-    leases = [lease_view(lease) for lease in state.manager.leases.all()]
+    reveal = may_reveal_pin(request, state.config)
+    leases = [lease_view(lease, reveal_vacate_url=reveal) for lease in state.manager.leases.all()]
     return {"leases": leases, "count": len(leases)}
 
 
@@ -314,10 +398,13 @@ async def create_lease(
     request: Request,
     devices: list[int] = Body(...),
     model_ids: list[str] | None = Body(None),
-    holder: str = Body("api"),
+    holder: str | None = Body(None),
     reason: str = Body(""),
     idle_ttl_s: float | None = Body(3600.0),
     force: bool = Body(False),
+    priority: int | None = Body(None),
+    vacate_url: str | None = Body(None),
+    vacate_token: str | None = Body(None),
 ) -> dict[str, Any]:
     """Give CUDA ``devices`` to ``model_ids`` -- or, with none, to something outside this server.
 
@@ -329,17 +416,34 @@ async def create_lease(
     unless ``force``. ``idle_ttl_s`` (default 3600) is how long the lease
     survives without activity before the server releases it; ``null`` holds
     it until ``DELETE``.
+
+    ``holder`` defaults to the ``X-SF-Client`` header when one is sent, else
+    ``"api"``. ``priority`` is the D46 class of the claim (1 chat, 2 dispatched
+    agent, 3 background -- the default). ``vacate_url`` / ``vacate_token``
+    register where a *better* class may ask this holder to leave (D56): the
+    server POSTs ``{lease_id, devices, requester, requester_priority,
+    deadline_s, deadline_at}`` there with the token in ``X-SF-Vacate-Token``,
+    and the asker is answered ``409 lease_vacating`` (``retry_after_s``,
+    ``Retry-After``) until this lease is released or ``leases.vacate_timeout_s``
+    passes. A card already leased by an equal or better class, or by a holder
+    that registered no URL, is a plain ``409 lease_conflict`` -- also with
+    ``Retry-After`` now. ``force`` never overrides a standing lease.
     """
     state = _state(request)
+    client_label = (request.headers.get("x-sf-client") or "").strip()
     lease = await state.manager.acquire_lease(
         devices,
-        holder=holder,
+        holder=(holder or "").strip() or client_label or "api",
         model_ids=model_ids or [],
         reason=reason,
         idle_ttl_s=idle_ttl_s,
         force=force,
+        priority=priority,
+        vacate_url=vacate_url,
+        vacate_token=vacate_token,
     )
-    return lease_view(lease)
+    # The registrant just sent the URL: echoing it back tells it what was stored.
+    return lease_view(lease, reveal_vacate_url=True)
 
 
 @router.delete("/leases/{lease_id}")
@@ -761,8 +865,11 @@ async def load_recommended(
 
 @router.post("/models/{model_id:path}/unload")
 async def unload_model(model_id: str, request: Request) -> dict[str, Any]:
+    """Stop the child serving this model. Open, except against a GPU lease (D55)."""
     state = _state(request)
-    unloaded = await state.manager.unload(model_id)
+    unloaded = await state.manager.unload(
+        model_id, force=may_unload_lease_held(request, state, [model_id])
+    )
     return {"model_id": model_id, "unloaded": unloaded}
 
 
@@ -1409,13 +1516,62 @@ async def set_config(request: Request, updates: dict[str, Any] = Body(...)) -> d
 # ---------------------------------------------------------------------------
 
 
+#: An absolute path inside a line of log prose. Two branches, both deliberately
+#: narrow: a Windows drive/UNC path, and a POSIX path under one of the roots a
+#: filesystem path actually starts with. The POSIX branch is root-anchored
+#: rather than "any ``/a/b``" so that URL paths, route names and JSON pointers
+#: in log text -- ``/api/models/vendor/Some-Model`` -- are left alone. Redacting
+#: those would turn a readable log into a puzzle and protect nothing.
+_ABS_PATH_RE = re.compile(
+    r"(?:[A-Za-z]:[\\/]|\\\\[^\\/\s]+[\\/])[^\s\"'<>|]*"
+    r"|/(?:home|root|Users|usr|opt|var|etc|mnt|media|srv|tmp)/[^\s\"'<>|]*"
+)
+
+
+def _redact_paths(text: str) -> str:
+    """Every absolute path in ``text`` reduced to its basename (D55).
+
+    The same reduction :func:`studioforge.core.supervisor.redact_argv` applies
+    to a launch line, applied to log prose for a caller who is not an admin.
+    The line stays readable -- ``model=Qwen3-30B-Q5_K_M.gguf`` still answers
+    every question a log answers -- while the username, the drive layout and
+    the data-dir path stop going out to anyone who can reach the port.
+    """
+    from studioforge.core.supervisor import _basename
+
+    return _ABS_PATH_RE.sub(lambda m: _basename(m.group(0)) or m.group(0), text)
+
+
+def _redact_log_entry(entry: Any) -> Any:
+    """``_redact_paths`` over every string in one ring-buffer row."""
+    if isinstance(entry, str):
+        return _redact_paths(entry)
+    if isinstance(entry, dict):
+        return {key: _redact_log_entry(value) for key, value in entry.items()}
+    if isinstance(entry, list):
+        return [_redact_log_entry(value) for value in entry]
+    return entry
+
+
 @router.get("/logs")
 async def get_logs(
     request: Request,
     n: int = Query(200, le=5000),
     level: str | None = Query(None),
 ) -> dict[str, Any]:
-    return {"lines": RING_BUFFER.tail(n, level)}
+    """The server's own log ring buffer.
+
+    Open, because a log is how a client finds out why its load failed -- but
+    **path-redacted for a caller who is not an admin** (D55). Absolute paths in
+    a log line name the operator's username and the whole disk layout, and this
+    route had no credential in front of it at all. ``redacted: true`` says which
+    answer this is, so a client is never guessing.
+    """
+    state = _state(request)
+    lines: Any = RING_BUFFER.tail(n, level)
+    if is_admin_caller(request, state.config):
+        return {"lines": lines, "redacted": False}
+    return {"lines": [_redact_log_entry(entry) for entry in lines], "redacted": True}
 
 
 @router.get("/logs/models/{model_id:path}")
@@ -1423,17 +1579,27 @@ async def get_model_log(
     model_id: str, request: Request, n: int = Query(200, le=5000)
 ) -> dict[str, Any]:
     """Per-model llama-server stderr, which is where load failures explain
-    themselves."""
+    themselves.
+
+    Same rule as ``GET /api/logs`` (D55): the lines and the log's own ``path``
+    are reduced to basenames for a caller who is not an admin. The route stays
+    open because "why did my load fail" is a question any client on an open
+    install is entitled to ask -- it is the *layout* that was never theirs.
+    """
     state = _state(request)
     record = state.registry.resolve(model_id)
     resolved = record.id if record else model_id
     # tail_log reads the whole log file (it can be tens of MB after a long
     # session); keep that off the event loop.
     lines = await asyncio.to_thread(state.supervisor.tail_log, resolved, n)
+    path = str(state.supervisor.log_path(resolved) or "")
+    if is_admin_caller(request, state.config):
+        return {"model_id": resolved, "path": path, "lines": lines, "redacted": False}
     return {
         "model_id": resolved,
-        "path": str(state.supervisor.log_path(resolved) or ""),
-        "lines": lines,
+        "path": _redact_paths(path),
+        "lines": [_redact_paths(line) for line in lines],
+        "redacted": True,
     }
 
 
@@ -1444,9 +1610,14 @@ async def get_model_log(
 
 @router.post("/models/unload-all")
 async def unload_all(request: Request) -> dict[str, Any]:
-    """Unload every resident model, freeing all VRAM."""
+    """Unload every resident model, freeing all VRAM.
+
+    Refused with 409 ``lease_conflict`` when a standing GPU lease holds one of
+    them and the caller is neither the holder nor an admin (D55).
+    """
     state = _state(request)
-    unloaded = await state.manager.unload_all()
+    resident = [i.model_id for i in state.supervisor.list()]
+    unloaded = await state.manager.unload_all(force=may_unload_lease_held(request, state, resident))
     log.info("unloaded all models", count=len(unloaded))
     return {"unloaded": unloaded, "count": len(unloaded)}
 
@@ -1520,16 +1691,26 @@ async def openclaw_setup(request: Request) -> JSONResponse:
                 if reveal or not (config.mcp.pin_required and config.mcp.pin)
                 else PIN_WITHHELD_NOTE
             ),
+            # The first line is the D52 gate, not the catalog: this list is
+            # read by the agent itself, and "start with list_models" taught the
+            # pre-gate loop -- load something, every time. Asking whether what
+            # is already resident will do is the cheapest call on the box and
+            # the only one that can end the sequence immediately.
             "next_steps": [
-                "`sfctl mcp` merges the app's 20 management tools with the "
-                "watchdog's 10 recovery tools into one stdio tool list (30).",
-                "Start with list_models: it returns the catalog newest-download-first, "
-                "one options row per context size, exactly one marked recommended.",
-                "Pass that row's load_args verbatim to load_model, then send prompts "
-                f"to http://{host}:{config.server.port}/v1/chat/completions.",
+                'Ask check_loaded_model(min_params="20b", vision=true) FIRST. answer "yes" '
+                "-> send the work to /v1 with the model id it returns and load nothing.",
+                'answer "no" -> list_models, take the recommended row, load_model(**load_args) '
+                "(or load_recommended(model_id, ctx_size)) with priority=2 for a dispatched agent.",
+                f"Send prompts to http://{host}:{config.server.port}/v1/chat/completions with "
+                "X-SF-Client: <your agent name> and priority in the body (omitted = background).",
+                "507 gpu_leased: read error.studioforge.lease.kind -- benchmark means stand down, "
+                "render/agent means wait retry_after_s. 400 context_exceeded: shorten the prompt "
+                "or reload at a larger ctx_size.",
                 "New model: search_models -> repo_details(repo_id) -> download_model.",
                 "VRAM missing: server_status names every holder; reclaim_orphan_engines "
                 "(watchdog) kills leaked engine processes and nothing else.",
+                "`sfctl mcp` merges the app's 20 management tools with the "
+                "watchdog's 10 recovery tools into one stdio tool list (30).",
             ],
         }
     )

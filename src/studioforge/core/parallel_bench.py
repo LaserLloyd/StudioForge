@@ -52,6 +52,7 @@ import httpx
 from studioforge.core import parallel as parallel_mod
 from studioforge.core import placements as placements_mod
 from studioforge.core import throughput
+from studioforge.core.benchmark import benchmark_lease_priority
 from studioforge.errors import BadRequestError, ModelBusyError, ModelLoadError
 from studioforge.logging import get_logger
 from studioforge.types import InstanceInfo, KvCacheType, LoadPlan, ModelRecord
@@ -531,6 +532,8 @@ class ParallelBenchmarker:
             holder="benchmark:parallel",
             model_ids=[record.id],
             reason="parallel benchmark",
+            # Same class as the placement benchmark's leases (D56).
+            priority=benchmark_lease_priority(self.manager),
         )
         try:
             reuse = was_loaded and _plan_serves(resident, report)

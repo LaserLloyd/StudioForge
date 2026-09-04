@@ -657,6 +657,25 @@ def test_cli_openclaw_setup_hides_key_by_default(live_server: ServerHandle) -> N
     assert API_KEY in revealed.output  # opt-in only
 
 
+def test_openclaw_setup_next_steps_open_with_the_gate(live_server: ServerHandle) -> None:
+    """`next_steps` is read by the agent, not only by the operator -- the
+    docstring on the route says so -- and it opened with "Start with
+    list_models", the pre-D52 loop where every session loads something. The
+    first line has to be the question that can end the sequence without a load,
+    and the list has to name the two refusals an agent meets in the wild."""
+    payload = json.loads(_invoke(live_server, "openclaw-setup", "--json").output)
+    steps = payload["next_steps"]
+    assert "check_loaded_model" in steps[0]
+    assert "FIRST" in steps[0]
+    joined = " ".join(steps)
+    assert "X-SF-Client" in joined
+    assert "priority" in joined
+    assert "gpu_leased" in joined and "stand down" in joined
+    assert "context_exceeded" in joined
+    # Whatever else moves, the tool count stays a fact rather than a guess.
+    assert "20 management tools" in joined
+
+
 def test_redactor_masks_an_mcp_pin() -> None:
     """The PIN is a credential, and it is NOT called `api_key`.
 
@@ -874,12 +893,12 @@ def test_redact_tree_masks_secret_looking_keys() -> None:
 class McpUpstream:
     """A real MCP server over streamable HTTP, in a background thread."""
 
-    def __init__(self, name: str, tools: dict[str, str]) -> None:
+    def __init__(self, name: str, tools: dict[str, str], instructions: str | None = None) -> None:
         from mcp.server.mcpserver import MCPServer
 
         self.port = free_port()
         self.url = f"http://127.0.0.1:{self.port}/mcp"
-        server: Any = MCPServer(name)
+        server: Any = MCPServer(name, instructions=instructions)
         for tool_name, description in tools.items():
             self._register(server, tool_name, description)
         self._server = server
@@ -925,6 +944,8 @@ MANAGEMENT_TOOLS = {
     "list_models": "List models (management).",
     "get_config": "Read server config (management).",
 }
+#: Stands in for the real server's INSTRUCTIONS, which the proxy forwards.
+MANAGEMENT_INSTRUCTIONS = "QUICK RECIPES from the fake management server."
 WATCHDOG_TOOLS = {
     "get_config": "Read watchdog config.",
     "health": "Watchdog health diagnosis.",
@@ -934,7 +955,7 @@ WATCHDOG_TOOLS = {
 
 @pytest.fixture(scope="module")
 def fake_management() -> Iterator[McpUpstream]:
-    upstream = McpUpstream("fake-management", MANAGEMENT_TOOLS)
+    upstream = McpUpstream("fake-management", MANAGEMENT_TOOLS, MANAGEMENT_INSTRUCTIONS)
     upstream.start()
     try:
         yield upstream
@@ -1141,6 +1162,75 @@ def test_proxy_instructions_teach_the_gate_before_a_load() -> None:
     assert 'check_loaded_model(min_params="20b", vision=true)' in text
     assert "BEFORE YOU CHOOSE OR LOAD ANYTHING" in text
     assert text.index("check_loaded_model") < text.index("START WITH `list_models`")
+
+
+def test_proxy_instructions_branch_on_the_code() -> None:
+    """The proxy's text is the one an OpenClaw agent actually reads, and until
+    now it taught nothing about being refused: no `gpu_leased`, no lease kind,
+    no `context_exceeded`, no identity. An agent that treats a lease refusal
+    like a VRAM shortfall either gives up on a wait or polls through somebody
+    else's benchmark."""
+    proxy = McpProxy(ServerProfile(name="rig", url="http://rig:1234"))
+    text = proxy.instructions()
+    for needle in (
+        "gpu_leased",
+        "context_exceeded",
+        "priority_hold",
+        "insufficient_vram",
+        "X-SF-Client",
+    ):
+        assert needle in text, needle
+    # The kinds are the whole point of branching on the lease, not on the code.
+    assert "stand down" in text
+    assert "retry_after_s" in text
+    # Refusals are taught before the catalog: an agent that stops reading after
+    # the gate still knows what to do with a 507.
+    assert text.index("BRANCH ON error.code") < text.index("START WITH `list_models`")
+
+
+def test_proxy_forwards_the_servers_own_instructions() -> None:
+    """`sfctl mcp` built its own 2.6k-char string and forwarded none of the
+    server's 9.9k one, so every recipe, the loading ladder and the lease
+    paragraph in `management.INSTRUCTIONS` were invisible on the exact path
+    OpenClaw connects by. Forwarded behind a divider, never merged."""
+    from studioforge_companion.mcp_proxy import UPSTREAM_DIVIDER
+
+    proxy = McpProxy(ServerProfile(name="rig", url="http://rig:1234"))
+    own = proxy.instructions()
+    assert UPSTREAM_DIVIDER not in own
+
+    merged = proxy.instructions("UPSTREAM SAYS: load_recommended is the one you want.")
+    assert UPSTREAM_DIVIDER in merged
+    assert "UPSTREAM SAYS" in merged
+    assert merged.startswith(own)
+    # Every pin the proxy owns survives the merge.
+    for needle in ("BEFORE YOU CHOOSE OR LOAD ANYTHING", "restart_server", RECOVERY_PREFIX):
+        assert needle in merged, needle
+
+    # An upstream that answered with nothing is not a divider with a blank
+    # section under it.
+    assert proxy.instructions(None) == own
+    assert proxy.instructions("   ") == own
+
+
+async def test_upstream_instructions_are_fetched_and_a_down_server_is_silent(
+    fake_management: McpUpstream,
+) -> None:
+    """Best-effort: guidance must never fail the handshake it rides on."""
+    from studioforge_companion.mcp_proxy import UPSTREAM_DIVIDER
+
+    proxy = _proxy(fake_management.url, "http://127.0.0.1:1/mcp")
+    text = await proxy.management.instructions()
+    assert text is not None
+    assert MANAGEMENT_INSTRUCTIONS in text
+    served = proxy.build_server(text)
+    assert served.instructions is not None
+    assert UPSTREAM_DIVIDER in served.instructions
+    assert MANAGEMENT_INSTRUCTIONS in served.instructions
+
+    dead = Upstream(label="management", url="http://127.0.0.1:1/mcp", is_watchdog=False)
+    assert await dead.instructions() is None
+    assert UPSTREAM_DIVIDER not in proxy.build_server(None).instructions  # type: ignore[operator]
 
 
 def _result_text(result: Any) -> str:

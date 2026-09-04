@@ -1977,7 +1977,9 @@ def leases_list(json_out: bool = JSON_OPTION) -> None:
     if not standing:
         STATE.console.print("no GPU leases standing")
         return
-    table = _table("Lease", "GPUs", "Holder", "For", "Reason", "Idle", "Expires in")
+    table = _table(
+        "Lease", "GPUs", "Holder", "Prio", "State", "For", "Reason", "Idle", "Expires in"
+    )
     for lease in standing:
         model_ids = lease.get("model_ids") or []
         expires = lease.get("expires_at")
@@ -1985,6 +1987,9 @@ def leases_list(json_out: bool = JSON_OPTION) -> None:
             str(lease.get("id")),
             ",".join(str(d) for d in lease.get("devices") or []),
             str(lease.get("holder") or "?"),
+            # Pre-D56 servers send neither: "-" rather than a made-up class.
+            str(lease.get("priority") or "-"),
+            str(lease.get("state") or "-"),
             ", ".join(model_ids) if model_ids else "nothing may load",
             str(lease.get("reason") or ""),
             fmt_duration(lease.get("idle_s")),

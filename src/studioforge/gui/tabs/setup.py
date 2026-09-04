@@ -38,6 +38,7 @@ from nicegui import ui
 
 from studioforge.gui import state as st
 from studioforge.gui.tabs import (
+    REMOTE_VIEWER_NOTE,
     GuiContext,
     admin_control,
     apply_config_updates,
@@ -496,7 +497,7 @@ async def _run_action(ctx: GuiContext, action: str, refresh: Any) -> None:
     elif action == "enable-autostart":
         await _set_autostart(ctx, True, refresh)
     elif action == "open-data-dir":
-        _open_path(ctx.config.data_dir)
+        _open_path(ctx, ctx.config.data_dir)
     elif action == "reprobe":
         ui.notify("re-probed", type="positive")
         refresh()
@@ -1302,13 +1303,17 @@ def _startup_body(ctx: GuiContext, refresh: Any) -> None:
 
     with ui.row().classes("gap-2 flex-wrap"):
         ui.button(
-            "Open data dir", icon="folder_open", on_click=lambda: _open_path(ctx.config.data_dir)
+            "Open data dir",
+            icon="folder_open",
+            on_click=lambda: _open_path(ctx, ctx.config.data_dir),
         ).props("outline dense").tooltip(
             "Opens a file manager on the machine running StudioForge, not on the machine you "
             "are browsing from."
         )
         ui.button(
-            "Open logs", icon="description", on_click=lambda: _open_path(ctx.config.logs_dir)
+            "Open logs",
+            icon="description",
+            on_click=lambda: _open_path(ctx, ctx.config.logs_dir),
         ).props("outline dense")
         ui.button(
             "Restart server", icon="power_settings_new", on_click=lambda: _restart_dialog(ctx)
@@ -1321,11 +1326,27 @@ def _checkout_dir() -> Any:
     return _checkout_data_dir()
 
 
-def _open_path(path: Any) -> None:
-    """Open a directory on the machine running the server. Never raises."""
+def _open_path(ctx: GuiContext, path: Any) -> None:
+    """Open a directory on the machine running the server. Never raises.
+
+    D55: this runs ``os.startfile`` / ``xdg-open`` **on the operator's own
+    desktop** and creates the directory if it is missing, which is a change to
+    the box by any reading -- so it takes the same D32 rule every other
+    box-changing control here takes. Before, a remote viewer on an open install
+    could pop Explorer windows on the rig from the far side of the tailnet.
+    """
     import subprocess
     import sys
 
+    if not viewer_may_change_box(ctx):
+        # Refused in place rather than raised: this function's contract is
+        # "never raises", and it is wired straight to a click handler.
+        ui.notify(
+            "Opening a folder on the server's desktop: " + REMOTE_VIEWER_NOTE,
+            type="negative",
+            multi_line=True,
+        )
+        return
     try:
         target = Path(path)
         target.mkdir(parents=True, exist_ok=True)

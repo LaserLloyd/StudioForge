@@ -1074,10 +1074,33 @@ class GpuLease(BaseModel):
     created_at: float
     last_activity_at: float
     idle_ttl_s: float | None = 3600.0
+    #: The D46 tier of the CLAIM (D56): 1 chat, 2 dispatched agent, 3
+    #: background -- the default, so a lease that never said behaves exactly
+    #: as before the field existed. A strictly better class may ASK a lease
+    #: that registered ``vacate_url`` to leave; it never takes the cards.
+    priority: int = 3
+    #: Holder-registered endpoint the server POSTs to when a better class
+    #: wants these cards. ``None`` = this holder cannot be asked.
+    vacate_url: str | None = None
+    #: Bearer the holder minted, sent back only in the vacate request's
+    #: ``X-SF-Vacate-Token`` header. Excluded from every dump and repr on
+    #: purpose: a token in ``/api/leases`` is a token on the LAN.
+    vacate_token: str | None = Field(default=None, exclude=True, repr=False)
+    #: Set when a vacate was sent; the window ends at ``vacate_deadline``.
+    vacate_requested_at: float | None = None
+    vacate_requested_by: str | None = None
+    vacate_deadline: float | None = None
 
     @property
     def idle_s(self) -> float:
         return max(0.0, time.time() - self.last_activity_at)
+
+    def vacating(self, now: float | None = None) -> bool:
+        """Inside an open vacate window: asked to leave, deadline not yet passed."""
+        if self.vacate_deadline is None:
+            return False
+        stamp = time.time() if now is None else now
+        return stamp < self.vacate_deadline
 
     @property
     def expires_at(self) -> float | None:

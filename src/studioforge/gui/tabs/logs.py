@@ -4,6 +4,15 @@ Two sources, because they answer different questions. The ring buffer is what
 StudioForge did; a model's log is what ``llama-server`` said -- and a load
 failure explains itself there and nowhere else, which is why per-model logs are
 reachable even for a model that is no longer running.
+
+**Local viewers only (D55).** Both sources are prose written for the operator:
+absolute paths, the data-dir layout, the model library's on-disk names, and
+whatever a child wrote to stderr. That is the operator's own business and not a
+remote viewer's, so this tab follows the D32 rule the box-changing controls
+follow -- a browser on this machine, or an install with ``server.api_key`` set
+(where reaching the panel at all took the key). The refusal is rendered in
+place, and the refresh path checks again: a disabled widget is one websocket
+frame from enabled, and this tab's whole content is the thing being withheld.
 """
 
 from __future__ import annotations
@@ -13,7 +22,14 @@ from typing import Any
 from nicegui import ui
 
 from studioforge.gui import state as st
-from studioforge.gui.tabs import GuiContext, element_alive, run_blocking
+from studioforge.gui.tabs import (
+    REMOTE_VIEWER_NOTE,
+    GuiContext,
+    element_alive,
+    require_local_admin,
+    run_blocking,
+    viewer_may_change_box,
+)
 
 SERVER_SOURCE = "StudioForge server"
 LEVELS = ("ALL", "DEBUG", "INFO", "WARNING", "ERROR")
@@ -21,6 +37,15 @@ LINE_CHOICES = (100, 200, 500, 1000, 2000)
 
 
 def render(ctx: GuiContext) -> None:
+    if not viewer_may_change_box(ctx):
+        with ui.column().classes("w-full gap-2 p-2"):
+            ui.label("Logs are not shown to a remote viewer").classes("text-base")
+            ui.label(
+                "The server log and each model's llama-server output carry absolute "
+                "paths and this box's layout, so " + REMOTE_VIEWER_NOTE
+            ).classes("text-sm opacity-70 max-w-3xl")
+        return
+
     model_ids: list[str] = []
     try:
         if ctx.registry is not None:
@@ -64,6 +89,10 @@ def render(ctx: GuiContext) -> None:
         stale.set_text("")
 
     async def _refresh_once() -> None:
+        # Checked again here, not only in ``render``: the controls above live in
+        # a page a websocket can re-enable, and this is the function that
+        # actually reads the files.
+        require_local_admin(ctx, "reading the server and model logs")
         # D50: a timer body that awaits file I/O, so the page can be rebuilt
         # underneath it mid-tick. Checked on entry (cheap, and this is also
         # reached from the source/level pickers) and again after the awaits,

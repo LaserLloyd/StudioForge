@@ -157,6 +157,20 @@ a training run). Both default empty. Two caveats:
 * A per-model `device_override` outranks `excluded_devices` (with a warning). `reserved_mb` applies
   even to a forced placement.
 
+A GPU lease (`POST /api/leases`, `reserve_gpus`) is the stronger tool, and it has two limits of its
+own:
+
+* It is never taken away. A better-class claim (`priority` 1 or 2 against a 3, D56) may **ask** a
+  holder that registered a `vacate_url` to leave -- one POST, `409 lease_vacating` with a re-ask
+  interval to the asker, a plain `409 lease_conflict` again after `leases.vacate_timeout_s` -- but
+  the holder releases or it does not; nothing here frees another program's VRAM. A holder that
+  registered no URL (a benchmark client, this server's own benchmarks) is never asked, and `force`
+  never overrides a standing lease.
+* It guards its own models from a deliberate unload (D55: `409 lease_conflict` unless the caller is
+  the holder or an admin), but the holder's name is `X-SF-Client`, a label and not a credential --
+  the guard stops the accident, not a caller who knows the name. `server.api_key` is what makes it
+  a rule.
+
 ## Who is holding the VRAM: what can and cannot be answered
 
 `GET /api/vram/holders`, the Dashboard's "VRAM holders" panel and `/api/status.vram_processes` name

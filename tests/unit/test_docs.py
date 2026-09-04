@@ -22,6 +22,7 @@ if str(COMPANION_SRC) not in sys.path:
 DOC_FILES = [
     REPO_ROOT / "README.md",
     REPO_ROOT / "docs" / "OPENCLAW.md",
+    REPO_ROOT / "docs" / "OPENCLAW-RIG.md",
     REPO_ROOT / "docs" / "LIMITATIONS.md",
     REPO_ROOT / "docs" / "COMPARISON.md",
 ]
@@ -238,6 +239,195 @@ def test_the_prefix_cache_doc_names_the_real_signals() -> None:
     assert "`spec_type` `auto` vs `none`" in text and "benchmark_parallel" in text
     assert "scripts/measure_prefix_cache.py" in text
     assert (REPO_ROOT / "scripts" / "measure_prefix_cache.py").is_file()
+
+
+# ---------------------------------------------------------------------------
+# OPENCLAW-RIG.md: the whole-rig page an agent reads before touching either
+# service. It is the one doc that names things in ANOTHER repository, so it
+# needs a guard on both halves: our own tool and code names are checked against
+# the code, and ClawForge2's are pinned as literals that a human re-checks.
+# ---------------------------------------------------------------------------
+
+RIG_DOC = REPO_ROOT / "docs" / "OPENCLAW-RIG.md"
+
+#: StudioForge tool names the rig page tells an agent to call. Checked against
+#: the live tool table, so renaming a tool fails here instead of stranding the
+#: reader on a name that no longer exists.
+_RIG_MANAGEMENT_TOOLS = (
+    "check_loaded_model",
+    "server_status",
+    "list_models",
+    "load_recommended",
+    "reserve_gpus",
+    "release_gpus",
+    "test_model",
+    "benchmark_parallel",
+)
+#: Watchdog tools the page names. They live in the sidecar, and the proxy's
+#: unprefixed allowlist is the authority on their exposed spelling.
+_RIG_WATCHDOG_TOOLS = ("restart_server", "reclaim_orphan_engines")
+
+#: ClawForge2 error codes quoted in the failure table. ClawForge2 is a separate
+#: repository, so this stays a literal: it is the list a human re-checks against
+#: `clawforge2/core/errors.py::ALL_CODES` when that build changes. Everything
+#: here must appear in the page; a code the page stops teaching is either a
+#: deliberate trim (update this tuple) or a hole in the table.
+_CLAWFORGE2_CODES = (
+    "gpu_leased",
+    "client_quota",
+    "insufficient_vram",
+    "insufficient_compute_cap",
+    "backend_unavailable",
+    "stalled",
+    "cancelled",
+    "workflow_not_found",
+    "unknown_shot",
+    "unknown_detector",
+    "invalid_priority",
+    "invalid_detail",
+    "invalid_scope",
+    "missing_client",
+    "empty_prompt",
+    "job_not_found",
+    "ambiguous_last",
+    "captioner_unavailable",
+    "not_privileged",
+    "egress_blocked",
+    "fetch_failed",
+    "adopted_backend",
+    "restart_no_op",
+)
+#: ClawForge2 `can_render_reason` values the page tells an agent to branch on.
+_CLAWFORGE2_CAN_RENDER_REASONS = (
+    "cards_leased",
+    "circuit_open",
+    "backoff",
+    "unmanaged_backend_down",
+    "comfyui_path_invalid",
+    "port_taken",
+    "no_suitable_gpu",
+)
+
+
+def _studioforge_error_codes() -> set[str]:
+    """Every error code this build can raise, read out of the source.
+
+    Two spellings exist: a class attribute on an exception in ``errors.py``,
+    and a per-raise ``code="..."`` override (D48/D53 added several). Both are
+    scanned, because the codes an agent meets come from both.
+    """
+    codes: set[str] = set()
+    src = REPO_ROOT / "src" / "studioforge"
+    for path in src.rglob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        codes.update(re.findall(r'\bcode\s*[=:]\s*"([a-z][a-z0-9_]+)"', text))
+        codes.update(re.findall(r'\breason_code\s*[=:]\s*"([a-z][a-z0-9_]+)"', text))
+    return codes
+
+
+def test_the_rig_page_only_names_tools_that_exist() -> None:
+    import asyncio
+
+    from studioforge_companion.mcp_proxy import WATCHDOG_UNPREFIXED
+
+    from studioforge.mcp.management import build_management_mcp
+
+    class _State:
+        config = None
+        registry = None
+        supervisor = None
+        manager = None
+        engine_manager = None
+        downloader = None
+
+    text = RIG_DOC.read_text(encoding="utf-8")
+    real = {tool.name for tool in asyncio.run(build_management_mcp(_State()).list_tools())}
+    for name in _RIG_MANAGEMENT_TOOLS:
+        assert name in real, f"the rig page names {name}, which is not a management tool"
+        assert f"`{name}" in text, f"{name} dropped out of the rig page"
+    for name in _RIG_WATCHDOG_TOOLS:
+        assert name in WATCHDOG_UNPREFIXED, f"{name} is no longer an unprefixed watchdog tool"
+        assert name in text, f"{name} dropped out of the rig page"
+    # The counts are facts, and the page states them twice (the table and the
+    # agent-facing block). 20 management + 10 recovery = the 30 sfctl merges.
+    assert f"the app's {len(real)} management tools" in text
+    assert f"`studioforge` ({len(real) + 10} tools)" in text
+
+
+def test_the_rig_pages_failure_table_uses_real_codes() -> None:
+    """Half the page is a table telling an agent to branch on a code. A code
+    that has been renamed, or that never existed, sends it down a branch it can
+    never take -- and the StudioForge half of the table can be checked against
+    the code that raises it."""
+    text = RIG_DOC.read_text(encoding="utf-8")
+    real = _studioforge_error_codes()
+    for code in (
+        "gpu_leased",
+        "insufficient_vram",
+        "allowed_devices_unavailable",
+        "priority_hold",
+        "model_busy",
+        "benchmark_busy",
+        "model_benchmarking",
+        "context_exceeded",
+        "model_not_found",
+        "lease_conflict",
+        "remote_admin_requires_credential",
+        "model_load_failed",
+        "upstream_error",
+        "invalid_api_key",
+        "invalid_mcp_pin",
+    ):
+        assert code in real, f"the rig page teaches `{code}`, which nothing raises any more"
+        assert f"`{code}`" in text, f"`{code}` dropped out of the rig page's failure table"
+    # D56's vacate refusal: documented beside `lease_conflict` because an agent
+    # meets both from the same call.
+    assert "`lease_vacating`" in text
+
+    for code in _CLAWFORGE2_CODES:
+        assert f"`{code}`" in text, f"ClawForge2's `{code}` is missing from the failure table"
+    for reason in _CLAWFORGE2_CAN_RENDER_REASONS:
+        assert f"`{reason}`" in text, f"`can_render_reason: {reason}` is not covered"
+
+
+def test_the_rig_page_teaches_the_cross_service_rules() -> None:
+    """The four things that are true of the rig and of neither service alone:
+    one identity string, two different priority defaults, what a lease `kind`
+    obliges you to do, and that a stale MCP session is a 404 to re-initialise
+    through rather than an error to retry."""
+    text = RIG_DOC.read_text(encoding="utf-8")
+    assert "X-SF-Client" in text and 'client="openclaw-<agent>"' in text
+    assert "**3 — background**" in text and "**2 — normal**" in text
+    for kind in ("`benchmark`", "`render`", "`agent`", "`other`"):
+        assert kind in text, kind
+    assert "stand down" in text
+    assert "Session not found" in text and "initialize" in text
+    assert "`lease_vacating`" in text and "vacate_url" in text
+    # `foreign: null` is not `[]`, and the difference decides whether an agent
+    # stops working. It was the easiest thing to leave out.
+    assert "null" in text and "leases.foreign" in text
+
+
+def test_the_rig_page_keeps_the_rig_anonymous() -> None:
+    """It is a published page in a public repository: every host is a
+    placeholder, never this rig's tailnet name or address."""
+    text = RIG_DOC.read_text(encoding="utf-8")
+    assert "<rig-host>" in text
+    assert not re.search(r"\b\d{1,3}(\.\d{1,3}){3}\b", text.replace("127.0.0.1", "")), (
+        "the rig page carries a literal IP address"
+    )
+
+
+def test_the_rig_page_is_linked_from_the_family() -> None:
+    """An unlinked page is an unread page."""
+    for path in (
+        REPO_ROOT / "README.md",
+        REPO_ROOT / "docs" / "OPENCLAW.md",
+        REPO_ROOT / "docs" / "OPENCLAW-SETUP.md",
+    ):
+        assert "OPENCLAW-RIG.md" in path.read_text(encoding="utf-8"), (
+            f"{path.name} does not link it"
+        )
 
 
 def test_openclaw_links_the_prefix_cache_section() -> None:

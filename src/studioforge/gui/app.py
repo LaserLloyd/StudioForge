@@ -150,13 +150,44 @@ def _host_only(value: str) -> str:
     return text.rsplit(":", 1)[0] if ":" in text else text
 
 
-def _same_origin_websocket(scope: Any) -> bool:
-    """False only for a browser upgrade whose Origin names a different host.
+#: Where NiceGUI mounts its socket.io control channel. It is **not** only a
+#: WebSocket: socket.io opens with HTTP long-polling and upgrades afterwards,
+#: so the same control channel is reachable as ordinary ``GET``/``POST``
+#: requests under this prefix -- which is how the D32 origin gate was
+#: bypassable by transport selection until D55 (a cross-site page that simply
+#: never upgraded drove the panel over polling, and NiceGUI's own
+#: ``cors_allowed_origins='*'`` echoed the attacker's Origin back with
+#: credentials allowed).
+NICEGUI_SOCKET_PREFIX = "/_nicegui_ws/"
+
+#: Sent on every GUI response. The panel is never a legitimate frame: with the
+#: viewer's peer address deciding what they may do (D32), an iframe of
+#: ``http://127.0.0.1:8080/`` on any page the operator visits renders a panel
+#: whose viewer IP is loopback -- so every admin control, up to and including
+#: the PIN reveal, is one clickjacked click away. ``frame-ancestors`` is the
+#: modern spelling and ``X-Frame-Options`` the one older browsers obey; both
+#: are sent because they disagree about nothing here.
+#:
+#: Deliberately *only* ``frame-ancestors``. A ``default-src``/``script-src``
+#: policy would also be worth having, but NiceGUI's page is built from inline
+#: bootstrap script, inline styles and Quasar's own bundles, and a CSP that
+#: breaks the panel is worse than no CSP: it would take the operator's only
+#: recovery surface down at exactly the moment they need it. Adding one is a
+#: browser-verified change, not a header-set change.
+_FRAME_HEADERS: tuple[tuple[bytes, bytes], ...] = (
+    (b"x-frame-options", b"DENY"),
+    (b"content-security-policy", b"frame-ancestors 'none'"),
+)
+
+
+def _same_origin_scope(scope: Any) -> bool:
+    """False only for a browser request whose Origin names a different host.
 
     Non-browser clients send no Origin and pass; a browser always sends one on
-    a WebSocket handshake. Ports are deliberately not compared: the panel is
-    reached through the same host:port it was served from, so the host alone
-    settles same-site, and a proxy that only rewrites the port stays usable.
+    a WebSocket handshake and on any cross-origin fetch. Ports are deliberately
+    not compared: the panel is reached through the same host:port it was served
+    from, so the host alone settles same-site, and a proxy that only rewrites
+    the port stays usable.
     """
     headers = Headers(scope=scope)
     origin = headers.get("origin")
@@ -176,6 +207,48 @@ def _same_origin_websocket(scope: Any) -> bool:
     return origin_host == _host_only(host)
 
 
+def _with_frame_headers(send: Any) -> Any:
+    """Wrap an ASGI ``send`` so every response start carries :data:`_FRAME_HEADERS`."""
+
+    async def wrapped(message: Any) -> None:
+        if message.get("type") == "http.response.start":
+            existing = {name.lower() for name, _ in message.get("headers") or ()}
+            message = dict(message)
+            message["headers"] = [
+                *(message.get("headers") or ()),
+                *((name, value) for name, value in _FRAME_HEADERS if name not in existing),
+            ]
+        await send(message)
+
+    return wrapped
+
+
+def _cross_site_refusal() -> Any:
+    """The 403 for a cross-site request to the control channel.
+
+    A plain ASGI response with **no** ``Access-Control-Allow-Origin`` header:
+    the refusal must not be readable by the page that made it, or the answer
+    itself becomes a probe. NiceGUI's socket.io would have echoed the caller's
+    Origin here, which is the half of the bypass that made it useful.
+    """
+    return JSONResponse(
+        {
+            "error": {
+                "message": (
+                    "Refused: this is the control panel's own control channel and the "
+                    "request's Origin is not the host it was served from. If a reverse "
+                    "proxy rewrites Host, forward the original one "
+                    "(proxy_set_header Host $host)."
+                ),
+                "type": "invalid_request_error",
+                "code": "cross_site_control_channel",
+                "param": None,
+            }
+        },
+        status_code=403,
+    )
+
+
 class GuiAuthGate:
     """Raw ASGI gate so websockets are covered, not just page loads.
 
@@ -189,31 +262,53 @@ class GuiAuthGate:
         self.config = config
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
-        if scope.get("type") == "websocket" and not _same_origin_websocket(scope):
+        kind = scope.get("type")
+        path = scope.get("path", "/") or "/"
+        control_channel = kind == "websocket" or (
+            kind == "http" and path.startswith(NICEGUI_SOCKET_PREFIX)
+        )
+        if control_channel and not _same_origin_scope(scope):
             # A WebSocket handshake is not subject to the same-origin policy,
             # and NiceGUI's socket.io accepts any Origin -- so a page on any
             # website the operator visits could open the control channel to
             # http://<lan-ip>:8080 and press its buttons. With no API key set
             # there is no cookie to be missing, so this check is the only
             # thing between "someone on my LAN" and "any site I browse".
+            #
+            # D55: socket.io's *first* transport is HTTP long-polling, not a
+            # WebSocket, so keying this on ``type == "websocket"`` left the
+            # whole channel open to a cross-site page that simply never
+            # upgraded -- verified against the live panel, which answered
+            # ``GET /_nicegui_ws/socket.io/?transport=polling`` with
+            # ``access-control-allow-origin: https://evil.example`` and a
+            # session cookie. The gate is now the path, not the transport.
             log.warning(
-                "gui websocket refused: Origin does not match Host (cross-site upgrade)",
+                "gui control channel refused: Origin does not match Host (cross-site)",
                 origin=Headers(scope=scope).get("origin"),
                 host=Headers(scope=scope).get("host"),
+                transport=kind,
                 hint=(
                     "a reverse proxy that rewrites the Host header must forward the "
                     "original one (proxy_set_header Host $host)"
                 ),
             )
-            await receive()
-            await send({"type": "websocket.close", "code": 1008})
+            if kind == "websocket":
+                await receive()
+                await send({"type": "websocket.close", "code": 1008})
+                return
+            await _cross_site_refusal()(scope, receive, send)
             return
+        if kind == "http":
+            # Every GUI response carries the frame headers, including NiceGUI's
+            # own -- which is why this wraps ``send`` rather than living in a
+            # response-returning middleware: the page, its assets and the
+            # polling transport all come out of NiceGUI's mount, below us.
+            send = _with_frame_headers(send)
         expected = self.config.server.api_key
-        if not expected or scope.get("type") not in ("http", "websocket"):
+        if not expected or kind not in ("http", "websocket"):
             await self.app(scope, receive, send)
             return
 
-        path = scope.get("path", "/")
         headers = Headers(scope=scope)
         if path in _OPEN_PATHS or scope.get("method") == "OPTIONS":
             await self.app(scope, receive, send)
@@ -456,6 +551,53 @@ def _register_pages() -> None:
 # ---------------------------------------------------------------------------
 
 
+#: Where the panel's session-signing key lives, under the data dir.
+GUI_SECRET_FILE = "gui_secret"
+
+
+def _storage_secret(config: Config) -> str:
+    """The key Starlette signs the panel's session cookie with (D55).
+
+    It used to be ``sha256("studioforge-gui::" + data_dir)`` -- derived from a
+    value the watchdog publishes: un-credentialed ``:1235/health`` returns
+    ``config_path``, whose parent *is* the data dir, so anyone who could reach
+    the recovery sidecar could compute the signing key and forge a session
+    cookie. Today that cookie carries only tab preferences, which is why this
+    was a latent finding rather than a live one -- but a signing key nobody can
+    keep secret is not a signing key, and every future use of
+    ``app.storage.user`` would inherit the flaw.
+
+    So: 32 random bytes, written once to ``<data_dir>/gui_secret`` with
+    owner-only permissions where the platform has them, and read back on every
+    later start so sessions survive a restart. Any failure to read or write
+    falls back to a per-process random secret -- sessions do not survive that
+    restart, which is a cosmetic loss, and the key is still not guessable.
+    """
+    import os
+    import secrets
+
+    path = config.data_dir / GUI_SECRET_FILE
+    try:
+        existing = path.read_text(encoding="utf-8").strip()
+        if len(existing) >= 32:
+            return existing
+    except OSError:
+        pass
+    value = secrets.token_hex(32)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(value, encoding="utf-8")
+        if os.name != "nt":
+            path.chmod(0o600)
+    except OSError as exc:
+        log.warning(
+            "could not persist the GUI session secret; panel sessions will not survive a restart",
+            path=str(path),
+            error=str(exc),
+        )
+    return value
+
+
 def create_gui_app(config: Config, *, api_state: Any) -> FastAPI:
     """Build the GUI's FastAPI app. Never starts a server.
 
@@ -484,12 +626,9 @@ def create_gui_app(config: Config, *, api_state: Any) -> FastAPI:
             dark=True,
             reconnect_timeout=10.0,
             show_welcome_message=False,
-            # Storage is keyed per browser session; the secret is derived from
-            # the data dir so it survives a restart without being guessable
-            # from the outside.
-            storage_secret=hashlib.sha256(
-                f"studioforge-gui::{config.data_dir}".encode()
-            ).hexdigest(),
+            # Storage is keyed per browser session; the secret is random and
+            # persisted so it survives a restart (see _storage_secret).
+            storage_secret=_storage_secret(config),
         )
         _NICEGUI_MOUNTED = True
     else:

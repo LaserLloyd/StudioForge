@@ -56,6 +56,7 @@ from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from typing import Any
 
+import anyio
 import mcp.types as types
 from mcp import Client
 
@@ -157,6 +158,16 @@ MANAGEMENT_FALLBACK_TOOLS: tuple[tuple[str, str], ...] = (
 )
 
 
+#: Ceiling on the one fetch that happens before the agent has a tool list.
+INSTRUCTIONS_FETCH_TIMEOUT_S = 5.0
+
+#: Separates this proxy's own guidance from the management server's, which is
+#: forwarded verbatim behind it. Two strings, not one merged one: the server's
+#: INSTRUCTIONS are edited on the rig and shipped with the server, and silently
+#: rewriting them here is how the two drift apart. The divider is what tells an
+#: agent that the text below it describes the server rather than this bridge.
+UPSTREAM_DIVIDER = "--- Advice from the StudioForge server itself ---"
+
 #: Upper bound on a failure description. A misbehaving upstream can return a
 #: multi-kilobyte validation dump, and pasting that into a tool result or a
 #: terminal buries the one fact that matters.
@@ -216,6 +227,8 @@ class Upstream:
     _tools: list[types.Tool] | None = field(default=None, init=False, repr=False)
     _fetched_at: float = field(default=0.0, init=False, repr=False)
     _last_error: str | None = field(default=None, init=False, repr=False)
+    _instructions: str | None = field(default=None, init=False, repr=False)
+    _instructions_at: float = field(default=0.0, init=False, repr=False)
 
     @property
     def last_error(self) -> str | None:
@@ -265,6 +278,40 @@ class Upstream:
         self._fetched_at = now
         self._last_error = None
         return self._tools
+
+    async def instructions(self, *, refresh: bool = False) -> str | None:
+        """The upstream's own ``instructions`` from ``initialize``, or ``None``.
+
+        Best-effort by design: this is guidance, not a capability, so an
+        upstream that is down or silent must never fail the handshake the agent
+        is trying to complete. Cached on the same clocks as
+        :meth:`list_tools` -- a server whose INSTRUCTIONS changed with a
+        restart shows up in the next session, not minutes later.
+        """
+        now = time.monotonic()
+        age = now - self._instructions_at
+        if not refresh and self._instructions_at and age < TOOL_CACHE_TTL_S:
+            return self._instructions
+        failed_recently = self._instructions is None and age < TOOL_FAILURE_TTL_S
+        if not refresh and self._instructions_at and failed_recently:
+            return None
+        # Hard-bounded, unlike every other call here. This one runs before the
+        # agent's tool list exists, so a host that black-holes packets would
+        # otherwise hold the whole session behind the transport's 30s connect
+        # timeout -- to fetch text. A silent upstream simply loses its
+        # paragraphs.
+        text: str | None = None
+        try:
+            with anyio.move_on_after(INSTRUCTIONS_FETCH_TIMEOUT_S):
+                async with self._session() as client:
+                    text = client.instructions
+        except Exception:  # noqa: BLE001 - guidance is never load-bearing
+            self._instructions = None
+            self._instructions_at = now
+            return None
+        self._instructions = text or None
+        self._instructions_at = now
+        return self._instructions
 
     async def call(self, name: str, arguments: dict[str, Any] | None) -> types.CallToolResult:
         """Forward one call, verbatim in and verbatim out."""
@@ -326,7 +373,10 @@ class McpProxy:
             note = (
                 "NOTE: the main StudioForge server is not answering right now "
                 "(%s). Calling this tool will fail until it is back -- use "
-                "`restart_server` (watchdog) first." % (self.management.last_error or "unreachable")
+                "`restart_server` (watchdog) first. `check_loaded_model` is not "
+                "in this list, so the load gate cannot be answered while the "
+                "server is down: bring it back, then ask."
+                % (self.management.last_error or "unreachable")
             )
             for name, description in MANAGEMENT_FALLBACK_TOOLS:
                 tool = types.Tool(
@@ -405,13 +455,22 @@ class McpProxy:
 
     # -- serving -----------------------------------------------------------
 
-    def instructions(self) -> str:
-        """Explain the merged namespace to the agent reading it."""
+    def instructions(self, upstream: str | None = None) -> str:
+        """Explain the merged namespace to the agent reading it.
+
+        ``upstream`` is the management server's own ``instructions`` string
+        (see :meth:`Upstream.instructions`). It is appended rather than
+        substituted: the proxy's own text is the only place the merged
+        namespace, the ``recovery_`` rule and the "the watchdog still answers"
+        contract are explained, and the server knows nothing about any of them.
+        Everything the server teaches that this text cannot -- the recipes, the
+        placement story, the loading ladder -- rides along behind a divider.
+        """
         recovery_prefixed = ", ".join(
             f"`{RECOVERY_PREFIX}{n}`" for n in ("health", "get_config", "set_config")
         )
         unprefixed = ", ".join(f"`{n}`" for n in sorted(WATCHDOG_UNPREFIXED))
-        return (
+        own = (
             f"Control plane for the StudioForge LLM server at {self.profile.url}.\n\n"
             # D52: the gate has to be taught HERE too, not only in the management
             # server's own INSTRUCTIONS -- this stdio proxy builds its own string,
@@ -426,6 +485,23 @@ class McpProxy:
             "to POST /v1/chat/completions with the `model` id it returns and load "
             'nothing; "no" -> `reason` names the gap, then pick and load a model as '
             'below, or fall back to another provider. A bar it cannot verify is a "no".\n\n'
+            # The refusal branch and the identity line: everything below this
+            # point is about choosing a model, and neither of these is. An
+            # agent that reads only the first screen of a merged tool list has
+            # to come away knowing that a 507 is not always "too big" and that
+            # it must say who it is.
+            "WHEN A LOAD OR A /v1 REQUEST IS REFUSED, BRANCH ON error.code, NOT THE PROSE: "
+            "507 gpu_leased = the cards are leased to someone else -- read "
+            "error.studioforge.lease.kind: `benchmark` owns the cards for the run, stand "
+            "down (no loads, no polling); `render`/`agent` wait retry_after_s and re-ask. "
+            "507 insufficient_vram = does not fit, read suggestions, never retry unchanged. "
+            "503 priority_hold / model_busy = wait Retry-After. 400 context_exceeded = your "
+            "prompt is larger than the slot (error.studioforge.ctx_per_slot): shorten or "
+            "load_recommended larger. `server_status().leases[]` shows every lease with "
+            "kind and retry_after_s before you meet it.\n\n"
+            "IDENTIFY YOURSELF: X-SF-Client: <your agent name> on every /v1 request, the "
+            "same name as your ClawForge `client` tag; send `priority` (1 a person is "
+            "waiting, 2 a dispatched agent, 3/omitted background) in the chat body.\n\n"
             "START WITH `list_models` -- it returns the model catalog newest-download-first; "
             "every model has `options` rows (one per context size) with `fits`, `devices`, "
             "`max_parallel`, estimated and measured tokens/sec, and a `load_args` object. "
@@ -454,14 +530,21 @@ class McpProxy:
             "reports the main server unreachable, call `restart_server`, then retry.\n\n"
             "If VRAM is missing, `server_status` says who holds it: `vram_orphan_count` above "
             "zero means leaked llama-server processes with nothing waiting on them, and "
-            "`reclaim_orphan_engines` kills exactly those (never somebody's live child)."
+            "`reclaim_orphan_engines` kills exactly those (never somebody's live child).\n\n"
+            "The whole rig -- this server plus the image service that shares its GPUs, the "
+            "lease etiquette, the identity and priority rules -- is one page: "
+            "docs/OPENCLAW-RIG.md in the StudioForge repository."
         )
+        text = (upstream or "").strip()
+        if not text:
+            return own
+        return f"{own}\n\n{UPSTREAM_DIVIDER}\n\n{text}"
 
-    def build_server(self) -> Server[Any]:
+    def build_server(self, upstream_instructions: str | None = None) -> Server[Any]:
         return Server(
             PROXY_NAME,
             version=PROXY_VERSION,
-            instructions=self.instructions(),
+            instructions=self.instructions(upstream_instructions),
             on_list_tools=self.on_list_tools,
             on_call_tool=self.on_call_tool,
         )
@@ -470,7 +553,11 @@ class McpProxy:
         """Run the proxy on stdin/stdout, the transport OpenClaw registers."""
         from mcp import stdio_server
 
-        server = self.build_server()
+        # One best-effort fetch at start: `instructions` is handed to the
+        # client in the `initialize` result, so there is no later moment to
+        # deliver it. A down server costs one short connect attempt and the
+        # proxy serves its own text, exactly as it did before.
+        server = self.build_server(await self.management.instructions())
         async with stdio_server() as (read_stream, write_stream):
             await server.run(read_stream, write_stream, server.create_initialization_options())
 

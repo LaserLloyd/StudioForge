@@ -979,6 +979,32 @@ async def test_instructions_teach_the_gate_before_a_load(state: State) -> None:
     assert "BEFORE YOU CHOOSE OR LOAD ANYTHING" in server.instructions
 
 
+async def test_instructions_teach_the_refusal_codes_and_the_identity(state: State) -> None:
+    """D46/D48/D53/D54 shipped four things an agent meets in the wild and the
+    INSTRUCTIONS never named: a 507 that is a lease rather than a shortfall
+    (and the `kind` that decides between standing down and waiting seconds), a
+    400 that is a slot rather than a fault, the identity header the whole
+    attribution story rests on, and the fact that a null `settings` value means
+    *inherit*. All four are branch points; prose about loading is not."""
+    server = build_management_mcp(state)
+    text = server.instructions or ""
+    for needle in (
+        "gpu_leased",
+        "context_exceeded",
+        "lease_conflict",
+        "lease_vacating",
+        "X-SF-Client",
+        "effective.summary",
+        "prompt_cache.hit_ratio",
+    ):
+        assert needle in text, needle
+    # The two answers a lease kind can have, in the imperative.
+    assert "stand down" in text
+    assert "retry_after_s" in text
+    # And the recipe block points at where they are all visible in advance.
+    assert "server_status()  -> leases[].kind" in text
+
+
 # ---------------------------------------------------------------------------
 # delete_model confirmation gate
 # ---------------------------------------------------------------------------

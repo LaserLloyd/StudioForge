@@ -1507,6 +1507,18 @@ class Watchdog:
                 "model_not_running",
                 running_aliases=sorted(known),
             )
+        if len(matches) > 1:
+            # D55: the substring fallback exists so a truncated id still works
+            # "when there is exactly one candidate" -- but nothing enforced that
+            # clause, so `kill_model("Qwen")` killed every Qwen on the box. A
+            # kill is not the place to guess which one was meant.
+            names = sorted(str(child.alias or child.pid) for child in matches)
+            return _error(
+                f"'{model_name}' matches {len(matches)} running children ({', '.join(names)}) "
+                f"and a kill is not guessed at. Name one of them exactly.",
+                "ambiguous_model",
+                matches=names,
+            )
         before = self._vram_snapshot()
         killed: list[dict[str, Any]] = []
         for child in matches:
@@ -2291,12 +2303,21 @@ def wrap_asgi(
             return
         path = scope.get("path", "")
         method = scope.get("method", "GET")
+        expected_key, expected_pin = credentials() if credentials else (api_key, None)
+        local_peer = _peer_is_loopback(scope)
         if path.rstrip("/") in ("/health", "/healthz") and method == "GET":
             result = await watchdog.health()
             status = 200 if result.get("status") in ("up", "degraded") else 503
+            # D55: the full verdict names ``config_path`` (absolute, so the
+            # operator's username and the whole data-dir layout), the main
+            # server's own /health, and every child's pid, alias and port -- to
+            # anyone who could reach 0.0.0.0:1235 with no credential at all.
+            # Liveness stays open, because that is what /health is for; the
+            # detail now takes the same proof every other route here takes.
+            if not local_peer and not _credential_ok(scope, expected_key, expected_pin):
+                result = _public_health(result)
             await _send_json(send, status, result)
             return
-        expected_key, expected_pin = credentials() if credentials else (api_key, None)
         restart_route = path.rstrip("/") == "/restart" and method == "POST"
         # Enforce whenever EITHER credential exists. Gating on the key alone
         # left this surface wide open in the default install, where
@@ -2378,6 +2399,42 @@ def wrap_asgi(
                     },
                 )
                 return
+        elif not local_peer:
+            # D55: the gate used to be `if expected_key or expected_pin:` --
+            # i.e. with NEITHER credential configured it fell through with no
+            # check at all, and every destructive tool on this surface
+            # (nuke_all_models, kill_model, restart_server, set_config,
+            # rollback_update) plus POST /restart became anonymous on
+            # 0.0.0.0:1235. That state is one click away: the Setup tab offers
+            # "clear the PIN" on an install with no api_key. The main API never
+            # opens that far -- api/auth.py holds a box change to loopback-or-PIN
+            # even with nothing configured -- and the recovery sidecar must not
+            # be the one surface that does. Fails CLOSED: no credential means
+            # this machine only.
+            log.warning(
+                "watchdog request refused: no credential is configured and the caller "
+                "is not on this machine (path=%s)",
+                path,
+            )
+            await _send_json(
+                send,
+                403,
+                {
+                    "error": {
+                        "message": (
+                            "This watchdog has no credential configured, so it accepts "
+                            "management requests only from the machine it runs on. Set "
+                            "server.api_key, or set an MCP pairing PIN (control panel -> "
+                            "Setup -> Network & access), and send it as "
+                            "'Authorization: Bearer <credential>' or 'X-MCP-Pin'. "
+                            "GET /health stays open."
+                        ),
+                        "type": "invalid_request_error",
+                        "code": "remote_admin_requires_credential",
+                    }
+                },
+            )
+            return
 
         # Plain HTTP restart, deliberately *not* routed through MCP. The main
         # app hands off to us when it cannot restart itself, and a JSON-RPC
@@ -2454,6 +2511,77 @@ def _pin_in_query(scope: dict[str, Any]) -> bool:
         if key == "pin" and val.strip():
             return True
     return False
+
+
+def _peer_host(scope: dict[str, Any]) -> str | None:
+    client = scope.get("client")
+    if not client:
+        return None
+    host = client[0] if isinstance(client, list | tuple) else client
+    return str(host) if host is not None else None
+
+
+def _peer_is_loopback(scope: dict[str, Any]) -> bool:
+    """A caller on this machine, or an in-process call with no peer at all.
+
+    Mirrors ``studioforge.api.auth.is_local_request`` deliberately: the two
+    surfaces must not disagree about what "this machine" means. A hostname that
+    is not an IP literal is *not* local -- fail closed, this is the surface with
+    the destructive tools on it.
+    """
+    import ipaddress
+
+    host = _peer_host(scope)
+    if not host:
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _credential_ok(
+    scope: dict[str, Any], expected_key: str | None, expected_pin: str | None
+) -> bool:
+    """Whether this request carries a credential the watchdog accepts.
+
+    Read-only: unlike the gate below it records nothing in the lockout, because
+    it answers "how much of /health may this caller see" rather than "may this
+    caller in". Counting a health poller's empty request as a failed attempt
+    would lock an address out of a surface nobody was attacking.
+    """
+    provided = _bearer_from_headers(scope.get("headers") or [])
+    pin_carrier = _pin_from_request(scope)
+    if expected_key and provided and _constant_time_eq(provided, expected_key):
+        return True
+    return bool(
+        expected_pin
+        and any(
+            candidate is not None and _constant_time_eq(candidate, expected_pin)
+            for candidate in (provided, pin_carrier)
+        )
+    )
+
+
+#: What an un-credentialed remote caller sees of ``/health``: the verdict and
+#: nothing that describes the box. Liveness is the question /health exists to
+#: answer, and every one of these fields is derived, not descriptive.
+_PUBLIC_HEALTH_KEYS: tuple[str, ...] = (
+    "ok",
+    "status",
+    "summary",
+    "children_total",
+    "children_unhealthy",
+    "watchdog_uptime_s",
+    "restart_in_progress",
+)
+
+
+def _public_health(result: dict[str, Any]) -> dict[str, Any]:
+    """``result`` reduced to :data:`_PUBLIC_HEALTH_KEYS`, marked ``redacted``."""
+    public = {key: result[key] for key in _PUBLIC_HEALTH_KEYS if key in result}
+    public["redacted"] = True
+    return public
 
 
 def _peer_key(scope: dict[str, Any]) -> str | None:

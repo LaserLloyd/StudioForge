@@ -35,6 +35,52 @@ idle models on those cards are unloaded, nothing else can load there, and a mode
 *busy* on those cards fails that one mode by name instead of polluting its number. You do not
 have to reserve anything yourself. `server_status().leases` shows the lease while it runs.
 
+### Vacating tenants (D56) — when another tenant holds the cards
+
+A card already leased is **never taken**: a standing lease is a promise (D43), and `force`
+does not touch it. What a benchmark *can* do is **ask** a worse-class tenant to leave.
+
+* **Send `priority: 2`.** Every lease carries the D46 class of its claim — 1 active chat, 2
+  dispatched agent, 3 background (the default). This server's own benchmarks lease at
+  `benchmark.lease_priority` (default 2). An outside benchmark client (CrucibleForge) sends
+  `"priority": 2` on `POST /api/leases` (or `reserve_gpus(priority=2)`); a lease that sends
+  nothing is class 3 and asks nobody. Render tenants (ClawForge2) lease at class 3 and register a
+  `vacate_url`.
+* **What `409 lease_vacating` means.** Every lease in your way is a worse class that registered a
+  vacate endpoint, and the server has just POSTed it one vacate request. Nothing is yours yet.
+  The body carries `error.studioforge.vacate` (`state: "vacating"`, the lease ids, `deadline`)
+  and `retry_after_s` (15); the `Retry-After` header says the same.
+* **Re-ask every `retry_after_s`.** Send the *same* request again. Inside the window the answer
+  stays `lease_vacating` (no second POST is sent to the holder); the moment the holder releases,
+  the same request is granted. Do not send `force` — it changes nothing here.
+* **When the deadline passes** (`leases.vacate_timeout_s`, default 180 s) without a release,
+  the answer becomes today's plain `409 lease_conflict` with `vacate.state: "timed_out"` and
+  `vacate.reask_at`: the holder ignored the ask and is not asked again until that time. Stop
+  polling and escalate.
+* **Plain `409 lease_conflict`** on the first ask means nobody can be asked: an equal or better
+  class holds the cards (another benchmark, the chat model's claim), or the holder registered no
+  vacate endpoint. `Retry-After` carries the holder's own countdown; wait for its `expires_at`,
+  or lease other cards.
+
+**Runbook when the tenant cannot vacate.** An *adopted* ComfyUI (one ClawForge2 found running
+rather than launched) is never killed or re-pinned by ClawForge2; the most it can do is
+`/free` — unload models and free memory — which leaves the CUDA context (~0.3–0.5 GB) on the
+card. If `lease_vacating` times out, or the tenant is a ClawForge2 build without the vacate
+route:
+
+1. Quiesce it by hand: `comfy_control(action="free_vram")` on ClawForge2's MCP, the tray's
+   "Unload models (free VRAM)", or `POST :8700/ui/api/control {"action": "free_vram"}`. Check
+   `GET /api/vram/holders`: ComfyUI's `per_gpu_bytes` on the card should be small.
+2. Release its lease: `release_gpus(lease_id=...)` / `sfctl leases release <id>` /
+   `DELETE /api/leases/<id>` — or wait for its idle TTL. **Then take the benchmark lease at
+   once**: any render submitted in the gap re-leases the card lazily.
+3. Stop new renders for the run's duration ("Stop server" on the ClawForge2 tray) — the
+   adopted ComfyUI stays up at its residual footprint, which is acceptable.
+4. Run the benchmark; the residual VRAM is simply absent from what the planner can use, and a
+   placement that needed it fails that mode by name.
+5. Resume: start the ClawForge2 server again, or do nothing — its next render re-leases the card
+   through its own adopt path once the benchmark's lease is gone.
+
 ---
 
 ## 1. Placement benchmark
@@ -157,6 +203,9 @@ reserve_gpus(devices=[...winner devices...], model_id=...)         # optional: l
 | --- | --- | --- |
 | `503 benchmark_busy` | another benchmark running | wait; `server_status().busy` |
 | `503` with `retry_after_s` | a model is serving / loading / a test is running | wait that long, check again |
+| `409 lease_vacating` | a worse-class tenant holds the cards and has been asked to leave (D56) | re-ask every `retry_after_s`; granted once it releases |
+| `409 lease_conflict` with `vacate.state: "timed_out"` | the tenant ignored the ask for `leases.vacate_timeout_s` | stop polling; the runbook above |
+| `409 lease_conflict`, no `vacate` block | an equal/better-class lease, or a holder with no vacate endpoint | wait for its `expires_at` (`Retry-After`), or lease other cards |
 | one mode has `error` naming a lease or "serving" | a neighbour was busy on those cards | rerun that mode later |
 | `applicable: false` | the model does not fit that placement | not an error; skip |
 | numbers wildly below `list_models` estimates | `ctx_size` mismatch, or `max_tokens` too small | match the catalog row's `ctx_per_slot`; use ≥128 tokens |

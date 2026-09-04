@@ -131,6 +131,14 @@ async def restart_model(model_id: str, request: Request) -> dict[str, Any]:
     record = state.registry.resolve(model_id)
     if record is None:
         raise ModelNotFoundError(model_id, known=state.registry.known_ids())
+    # D55: a forced reload stops the child and respawns it, which drops every
+    # in-flight request -- the same disturbance an unload is, so the same lease
+    # rule. Checked here rather than in ``load`` because the lease's *own*
+    # loads (the grant forcing the owner onto its cards) go through there too.
+    from studioforge.api.mgmt_routes import may_unload_lease_held
+
+    if not may_unload_lease_held(request, state, [record.id]):
+        state.manager.require_lease_clear([record.id], f"to restart '{record.id}'")
     instance = await state.manager.load(
         record.id, force=True, source="api:/api/models/{id}/restart"
     )

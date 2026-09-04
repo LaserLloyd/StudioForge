@@ -444,7 +444,9 @@ def api_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
         logging={"level": "ERROR"},
     )
     app = create_app(config, start_background=False)
-    with TestClient(app) as client:
+    # A loopback peer: D55 put POST /api/virtual-models behind the D32 admin
+    # gate, and TestClient's default peer ("testclient") is not this machine.
+    with TestClient(app, client=("127.0.0.1", 50000)) as client:
         yield client
     reset_probe()
 

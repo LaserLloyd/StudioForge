@@ -954,14 +954,28 @@ def _install_error_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(Exception)
     async def _unhandled(_request: Request, exc: Exception) -> JSONResponse:
-        log.exception("unhandled error", error=str(exc))
+        # D55: the body used to be f"Internal server error: {exc}". An unhandled
+        # exception's text is written for the operator, not for a caller -- it
+        # carries absolute paths, SQL, httpx URLs -- and on an open install
+        # every route that can 500 handed it to anyone who could reach the port.
+        # The caller now gets a reference; the full text stays in the log, where
+        # the same reference makes it findable in one grep. The `openai` client
+        # only ever reads `type` and `code`, so nothing downstream changes.
+        import uuid
+
+        ref = uuid.uuid4().hex[:8]
+        log.exception("unhandled error", error=str(exc), ref=ref)
         return JSONResponse(
             {
                 "error": {
-                    "message": f"Internal server error: {exc}",
+                    "message": (
+                        f"Internal server error. Quote ref={ref} -- the full detail is in "
+                        f"the server log (GET /api/logs, or the control panel's Logs tab)."
+                    ),
                     "type": "server_error",
                     "code": "internal_error",
                     "param": None,
+                    "studioforge": {"ref": ref},
                 }
             },
             status_code=500,

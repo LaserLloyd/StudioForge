@@ -24,6 +24,9 @@ _SECRET_KEYS = {
     "authorization",
     "password",
     "secret",
+    # A lease holder's vacate bearer (D56): never logged, whatever the shape.
+    "vacate_token",
+    "x-sf-vacate-token",
 }
 _REDACTED = "***REDACTED***"
 

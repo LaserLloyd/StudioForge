@@ -285,8 +285,11 @@ curl -s "http://<rig>:1234/api/models/<url-encoded-id>/settings"
   genuinely long prompt then takes minutes to process. That is prompt processing, not a hang.
 - **Streaming is strongly preferred above ~64k of prompt.** Non-streaming requests are bounded by
   `server.request_timeout_s` (900s), which a very large prefill can exceed.
-- **Keep the model resident.** Idle TTL is 900s here; after an unload the next request re-processes
-  the whole transcript. For a primary agent model, pin it (`ttl_s: 0`) so it is never evicted.
+- **Keep the model resident.** The idle TTL is `models.default_ttl_s` — read it from `get_config`
+  rather than trusting a number written down here, and note that a per-model `settings.ttl_s` and
+  a per-load tier override it (a pinned model has no TTL at all). After an unload the next request
+  re-processes the whole transcript. For a primary agent model, pin it (`ttl_s: 0`) so it is never
+  evicted.
 - **Match your concurrency to `max_parallel`.** Beyond it llama.cpp queues rather than refusing, so
   extra streams show up as latency, not errors — visible only in `requests_deferred` on
   `/api/status`.

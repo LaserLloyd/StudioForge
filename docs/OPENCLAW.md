@@ -6,7 +6,10 @@ is the section to read if you are the agent; everything else is tuning and troub
 > Looking for a step-by-step install for a two-machine (rig → agent box) deployment, with
 > verification at each step? See [OPENCLAW-SETUP.md](OPENCLAW-SETUP.md) — every hostname and
 > address on it is a placeholder to substitute. This page is the shorter reference.
-> For the formulas behind the catalog's columns see [CATALOG.md](CATALOG.md), and for
+> If this rig also runs the ClawForge2 image service on the same GPUs, read
+> [OPENCLAW-RIG.md](OPENCLAW-RIG.md) as well — one page for an agent that uses both, covering the
+> identity string, the priority tiers, the lease etiquette and one failure-code table for both
+> services. For the formulas behind the catalog's columns see [CATALOG.md](CATALOG.md), and for
 > what long context costs on real models see [OPENCLAW-LONG-CONTEXT.md](OPENCLAW-LONG-CONTEXT.md)
 > — its §4 is the one to read before sending concurrent requests that share a long prefix: what
 > the prompt cache reuses, what it cannot, and which response fields prove a hit.
@@ -271,6 +274,34 @@ below it — and nothing about a request is remembered afterwards.
 POST http://<host>:1234/v1/chat/completions
 ```
 
+**Say who you are, and say it the same way everywhere.** Every `/v1` request should carry
+`X-SF-Client: <your agent name>` — that header is what `GET /api/status` → `clients` and
+`server_status` attribute traffic by, and without it an agent is a peer IP. OpenClaw sends static
+extra headers per provider (`models.providers.<id>.headers`; check the key names against your
+OpenClaw version, they have moved before):
+
+```json
+{
+  "models": {
+    "providers": {
+      "studioforge": {
+        "baseUrl": "http://<rig-host>:1234/v1",
+        "api": "openai-completions",
+        "headers": { "X-SF-Client": "openclaw-<agent>" }
+      }
+    }
+  }
+}
+```
+
+Use **one identity string per agent** and reuse it as the image service's `client` tag and as the
+`holder` of any lease that agent takes — see [OPENCLAW-RIG.md](OPENCLAW-RIG.md#identity-one-string-per-agent).
+
+**And say what the work is:** send `"priority": 2` in the body of every dispatched-agent request.
+Omitted means **3, background**, which a chat-tier or agent-tier load can hold off with a
+`503 priority_hold`; `1` is for the turn a person is waiting on. The value is validated — anything
+that is not 1, 2 or 3 is a `400`.
+
 Naming an unloaded model **just-in-time loads it** with planner defaults. That is the caveat worth
 knowing: a JIT load takes the planner's own choice of context, not the catalog row you were
 reading. If you need a specific window or slot count, call `load_model` first — a model that is
@@ -413,6 +444,16 @@ speculation trades spare compute for latency and a saturated batch has none to s
 `priority_hold` is `{model_id, priority}` while a chat- or agent-tier load is holding worse-tier
 traffic off, and `null` otherwise. It is the reason behind any `priority_hold` 503 you have just
 been given.
+
+Each loaded row also carries `effective` and `prompt_cache`. `effective` is what the child was
+*actually launched with* (`effective.summary` is the one-line form) — read it rather than
+`settings`, where a `null` means **inherit the default**, not "off"; `prompt_cache.hit_ratio` says
+whether prefix reuse is actually happening, and is `null` until something has been sampled. Both
+are the subject of [OPENCLAW-LONG-CONTEXT.md §4](OPENCLAW-LONG-CONTEXT.md).
+
+`leases` is the standing lease book, the same records as `GET /api/leases`: every entry with its
+`state`, `kind`, `holder_family` and `retry_after_s`. Read it *before* a load rather than meeting
+`gpu_leased` after one — a `kind: "benchmark"` lease means the cards are owned for the run.
 
 `connection_info` is what to call when the network moves: it returns every address this server
 answers on, tailnet first (those survive network changes), with the OpenAI base URL alongside.
@@ -719,14 +760,26 @@ hiding a failure, and never a `200` for a route that does not exist.
 | --- | --- | --- | --- |
 | Unknown model | 404 | `model_not_found` | no |
 | Image sent to a text-only model | 400 | `model_not_multimodal` | no |
+| Prompt larger than the loaded slot | 400 | `context_exceeded` | no — shorten, or reload at a larger `ctx_size` |
 | Model too big for VRAM | 507 | `insufficient_vram` | no — read `suggestions` |
+| This model's `allowed_devices` names no usable card | 507 | `allowed_devices_unavailable` | no — an operator setting |
+| **The cards are leased to someone else** | 507 | `gpu_leased` | **it depends on the lease `kind`** — `benchmark` means stand down, anything else means wait `retry_after_s` |
 | Engine failed to start | 502 | `model_load_failed` | no — message carries the stderr tail |
-| Busy / transient | 503 | varies | **yes**, honour `Retry-After` |
+| Busy / transient | 503 | `model_busy`, `benchmark_busy`, `model_benchmarking` | **yes**, honour `Retry-After` |
 | Held by a higher-tier load | 503 | `priority_hold` | yes — honour `Retry-After` |
+| `reserve_gpus` overlaps a standing lease | 409 | `lease_conflict` | no — read `server_status().leases`; never force |
+| …and that holder has been asked to stand down | 409 | `lease_vacating` | yes — wait `retry_after_s` and ask again |
+| Box change from off-rig with no PIN or key | 403 | `remote_admin_requires_credential` | no — the operator's call |
 
-A `507` carries the numbers *and* what to do about it under `error.studioforge.suggestions` —
-fewer slots at the same window (`max_parallel_that_fits`, when an explicit `parallel` was the
-problem), a smaller context that would fit, a cheaper KV cache type, or a smaller quant.
+The two 507s are not the same refusal and must not be treated as one. A `507 insufficient_vram`
+carries the numbers *and* what to do about them under `error.studioforge.suggestions` — fewer slots
+at the same window (`max_parallel_that_fits`, when an explicit `parallel` was the problem), a
+smaller context that would fit, a cheaper KV cache type, or a smaller quant; retrying it unchanged
+cannot succeed. A `507 gpu_leased` never got as far as arithmetic and carries no suggestions: it
+has `error.studioforge.lease` (`kind`, `holder_family`, `retry_after_s`, `expires_at`) and a
+`Retry-After` header instead, and `kind` is the branch — see
+[the whole-rig page](OPENCLAW-RIG.md#leases-who-stands-down-for-whom) for the etiquette both
+services share.
 
 **Loads are one at a time.** Two agents asking for two cold models at once do not race for the
 same VRAM: the second load plans after the first has actually allocated, and either fits beside it

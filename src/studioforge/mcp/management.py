@@ -101,6 +101,7 @@ QUICK RECIPES -- copy these exact calls; every argument name is literal:
   stop keeping it loaded        pin_model(model_id="<id>", pinned=false)
   give a model its own GPU(s)   reserve_gpus(devices=[0], model_id="<id>")
   release that reservation      release_gpus(lease_id="<lease id>")
+  who is holding the cards?     server_status()  -> leases[].kind
   does it actually work?        test_model(model_id="<id>")
 Model ids come from list_models -- copy the `id` field exactly, slashes and
 all. The argument is always called model_id, never model or name.
@@ -213,6 +214,38 @@ details.retry_after_s the wait -- a wait, not a failure, so honour the number
 rather than retrying at once. server_status sees it coming: busy.priority_hold
 is that same standing hold (or null) BEFORE you meet it, so read it beside
 active_requests / loading / testing.
+
+A 507 IS NOT ALWAYS "TOO BIG". Read error.code before deciding anything:
+insufficient_vram means the model genuinely does not fit (read
+error.studioforge.suggestions and max_ctx_that_fits; never retry unchanged);
+gpu_leased means the cards are LEASED to someone else -- read
+error.studioforge.lease: kind "benchmark" is a sweep that owns the cards for
+the run, so stand down (no loads, no polling loop -- do the work elsewhere or
+later); kind "render" or "agent" is somebody's picture or model, so wait
+retry_after_s (a re-ask interval, capped at 300) and ask again;
+holder_family says who. server_status().leases[] shows every lease with
+state, kind and retry_after_s BEFORE you meet the refusal. reserve_gpus
+answers 409 lease_conflict when a standing lease already covers the cards --
+never force it -- and 409 lease_vacating when that holder has been asked to
+stand down and has not finished yet, which is a wait: honour retry_after_s
+and ask again. reserve_gpus takes the same tier vocabulary as a load
+(priority 1/2/3); a claim only ever displaces a strictly worse class, and a
+lease is never taken away from its holder. A 400 context_exceeded means your
+prompt is larger than the loaded slot (error.studioforge.ctx_per_slot):
+shorten it, or load_recommended at a larger ctx_size; the server never
+truncates, so retrying unchanged cannot succeed.
+
+SAY WHO YOU ARE AND WHAT THE WORK IS. Send X-SF-Client: <your agent name> on
+every /v1 request (server_status and GET /api/status.clients attribute traffic
+by it) and use the same name as your ClawForge `client` tag and as the holder
+of any lease you take. Put `priority` in the chat body: 1 a person is waiting
+on this turn, 2 a dispatched agent, 3 or omitted background -- omitted is
+background and a tier-1/2 load holds it off with 503 priority_hold.
+
+DO NOT READ settings TO LEARN WHETHER THE PROMPT CACHE IS ON: null means
+inherit, not off. Read `effective.summary` on a server_status loaded row for
+what the child was really launched with, `prompt_cache.hit_ratio` for whether
+hits are happening (null until sampled), and timings.cache_n on a response.
 
 Every loaded row carries `priority`, the tier that load was made at (1 the
 model a person is chatting with, 2 a dispatched agent, 3 background), which is
@@ -1226,11 +1259,21 @@ def build_management_mcp(state: Any) -> MCPServer:
         itself is not changed -- use ``pin_model`` with ``pinned=false`` to
         remove it.
 
+        A model held by a standing GPU lease (D43) is unloaded without
+        complaint here: this tool is behind the PIN, so its caller is the
+        operator. The open HTTP route refuses the same unload (D55).
+
         Returns:
             ``{"ok": true, "unloaded": true}``, or ``unloaded: false`` when the
             model was not running (which is not an error).
         """
-        unloaded = await state.manager.unload(model_id)
+        # ``force``: reaching an MCP tool at all means the caller cleared the
+        # D32/PIN gate (every streamable-HTTP call is a POST, and check_request
+        # holds those to loopback-or-PIN with no key set), so this caller is an
+        # admin by the same test the unload route applies. Without it the D55
+        # lease guard would refuse the operator's own `sfctl unload` of a
+        # benchmark's model, which is exactly the person entitled to do it.
+        unloaded = await state.manager.unload(model_id, force=True)
         return {"ok": True, "model_id": model_id, "unloaded": unloaded}
 
     @_guard
@@ -1284,6 +1327,10 @@ def build_management_mcp(state: Any) -> MCPServer:
         reason: str = "",
         idle_ttl_s: float | None = 3600.0,
         force: bool = False,
+        holder: str | None = None,
+        priority: int | None = None,
+        vacate_url: str | None = None,
+        vacate_token: str | None = None,
     ) -> dict[str, Any]:
         """Reserve specific GPUs for one model, or for something outside this server.
 
@@ -1302,6 +1349,17 @@ def build_management_mcp(state: Any) -> MCPServer:
         model mid-request refuses the call (retry when idle); a pinned idle
         resident refuses unless ``force=true``.
 
+        **A card already leased is a conflict, never a takeover** -- but a
+        strictly better ``priority`` may ASK the holder to leave (D56). If
+        every lease in the way is a worse class that registered a vacate
+        endpoint, the server sends it one vacate request and answers
+        ``lease_vacating`` with ``retry_after_s``: re-call this tool on that
+        interval; it succeeds once the holder releases, and degrades to a
+        plain ``lease_conflict`` if the holder has not released within
+        ``leases.vacate_timeout_s`` (default 180 s). Send ``priority=2`` for
+        dispatched work that should be able to ask a background render tenant
+        to vacate; ``force`` never overrides a standing lease.
+
         Args:
             devices: CUDA indices, e.g. ``[0]`` or ``[0, 1]`` -- exactly the
                 cards the model should run on. ``server_status`` lists them.
@@ -1311,21 +1369,38 @@ def build_management_mcp(state: Any) -> MCPServer:
             idle_ttl_s: Seconds of idleness after which the server releases
                 the lease by itself (default 3600). ``null`` = until released.
             force: Evict a *pinned* idle resident from the cards.
+            holder: Who is holding them -- say who you are, the same name you
+                send as ``X-SF-Client``. Defaults to ``"mcp"``, which other
+                tenants read as "an agent" and cannot tell apart from the
+                next agent.
+            priority: The D46 class of the CLAIM: 1 active chat, 2 dispatched
+                agent, 3 background (the default; asks nobody to leave).
+            vacate_url: Where a better class may ask *you* to leave: the
+                server POSTs ``{lease_id, devices, requester,
+                requester_priority, deadline_s, deadline_at}`` there. http(s)
+                only; never this server's own address.
+            vacate_token: Sent back in ``X-SF-Vacate-Token`` on that POST so
+                your endpoint can trust it. Never shown anywhere.
 
         Returns:
             ``{"ok": true, "lease": {id, devices, holder, model_ids, reason,
-            created_at, last_activity_at, idle_ttl_s, idle_s, expires_at}}``.
+            created_at, last_activity_at, idle_ttl_s, idle_s, expires_at,
+            priority, state, vacate_registered, vacate_deadline}}``.
             Keep ``lease.id`` -- ``release_gpus`` needs it.
         """
         lease = await state.manager.acquire_lease(
             devices,
-            holder="mcp",
+            holder=(holder or "").strip() or "mcp",
             model_ids=[model_id] if model_id else [],
             reason=reason,
             idle_ttl_s=idle_ttl_s,
             force=force,
+            priority=priority,
+            vacate_url=vacate_url,
+            vacate_token=vacate_token,
         )
-        return {"ok": True, "lease": lease_view(lease)}
+        # The MCP plane is PIN-gated (D32): the registrant may see its own URL.
+        return {"ok": True, "lease": lease_view(lease, reveal_vacate_url=True)}
 
     @_guard
     async def release_gpus(lease_id: str) -> dict[str, Any]:
@@ -1337,7 +1412,10 @@ def build_management_mcp(state: Any) -> MCPServer:
         only model allowed there, and goes back to the ordinary idle TTL and
         eviction rules (unless it is pinned). Leases also end by themselves
         once idle for their ``idle_ttl_s``, so this is the early exit, not the
-        only one.
+        only one. If your lease shows ``state: "vacating"`` a better class
+        has asked for the cards (D56): finish or stop the work on them and
+        release here -- that is the only way a vacate completes; nothing
+        takes the lease from you.
 
         Args:
             lease_id: The lease to release.
@@ -1797,7 +1875,11 @@ def build_management_mcp(state: Any) -> MCPServer:
             ``reason`` says why drafting is off), the active llama.cpp engine
             tag, the total number of models in the library, queue depth, what
             the server is busy with, active downloads, engine-process
-            attribution and whether the server is draining. Each loaded row
+            attribution and whether the server is draining. ``leases[]`` rows
+            carry ``kind``/``holder_family`` (D53) plus ``priority`` (the D46
+            class of the claim), ``state`` -- ``vacating`` means a better
+            class has asked that holder to leave (D56) -- and
+            ``vacate_registered``/``vacate_deadline``. Each loaded row
             also carries ``effective`` (the prompt-cache / batching / KV
             settings the child was really launched with -- a ``null``
             per-model setting means inherit, not off) and ``prompt_cache``

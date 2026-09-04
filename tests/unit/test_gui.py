@@ -357,6 +357,11 @@ def test_require_local_admin_is_the_one_rule_every_box_changing_action_uses(
         "server.py": ["install_engine", "activate_engine", "smoke_engine", "_register_protocol"],
         "setup.py": ["_set_autostart", "_restart_dialog"],
         "download.py": ["_enqueue", "_control"],
+        # D55: the Logs tab is prose written for the operator (absolute paths,
+        # the data-dir layout); ``render`` refuses a remote viewer in place and
+        # its nested ``_refresh_once`` -- the function that reads the files --
+        # calls the guard again.
+        "logs.py": ["render"],
     }
     for filename, functions in guarded.items():
         source = (root / filename).read_text(encoding="utf-8")
@@ -3327,15 +3332,15 @@ def test_log_line_text_does_not_double_prefix_a_rendered_structlog_line() -> Non
         ("http://evil.example.com", None, True),  # no Host to compare against
     ],
 )
-def test_same_origin_websocket_rule(origin: str | None, host: str | None, same: bool) -> None:
-    from studioforge.gui.app import _same_origin_websocket
+def test_same_origin_scope_rule(origin: str | None, host: str | None, same: bool) -> None:
+    from studioforge.gui.app import _same_origin_scope
 
     raw = []
     if origin is not None:
         raw.append((b"origin", origin.encode()))
     if host is not None:
         raw.append((b"host", host.encode()))
-    assert _same_origin_websocket({"type": "websocket", "headers": raw}) is same
+    assert _same_origin_scope({"type": "websocket", "headers": raw}) is same
 
 
 async def test_the_gate_closes_a_cross_site_websocket_even_without_a_key(config: Config) -> None:

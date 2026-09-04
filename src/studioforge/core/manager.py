@@ -24,6 +24,12 @@ from studioforge.core.leases import (
     LEASE_OPEN_ENDED_RETRY_S,
     LeaseBook,
     lease_view,
+    send_vacate_request,
+    vacate_reaskable,
+    vacate_request_body,
+    vacate_url_target,
+    vacate_url_targets_self,
+    validate_vacate_url,
 )
 from studioforge.core.planner import BUSY_RETRY_AFTER_S, OBSERVATION_NOTE_PER_PID_DEVICE, Planner
 from studioforge.core.priority import PRIORITY_BACKGROUND, PriorityLock, normalise_priority
@@ -331,6 +337,12 @@ class ModelManager:
         #: granted here is honoured there; a manager built without one (tests)
         #: keeps a private, empty book.
         self.leases = leases if leases is not None else LeaseBook()
+        #: In-flight vacate POSTs (D56), held so the loop cannot collect them;
+        #: each is bounded by ``leases.vacate_callback_timeout_s``. The sender
+        #: is an attribute so a test can swap in a recorder.
+        self._vacate_tasks: set[asyncio.Task[None]] = set()
+        self._vacate_sender: Any = send_vacate_request
+        self._own_addresses: list[str] | None = None
         self._started_at = time.time()
         self._locks: dict[str, asyncio.Lock] = {}
         self._locks_guard = asyncio.Lock()
@@ -2717,7 +2729,69 @@ class ModelManager:
 
     # -- unloading --------------------------------------------------------
 
-    async def unload(self, name: str, *, deliberate: bool = True) -> bool:
+    def leases_holding(self, model_ids: Sequence[str]) -> list[GpuLease]:
+        """Standing leases that an unload of ``model_ids`` would take apart (D55).
+
+        A lease is the promise that these cards belong to this work for now
+        (D43) -- but until D55 that promise was enforced only by the *planner*:
+        nothing could be placed onto a leased card, and anything already there
+        could still be taken away by ``POST /api/models/unload-all``. On an open
+        install that is an unauthenticated way to kill an eight-stream benchmark
+        from the far side of the tailnet, which is the most plausible mechanism
+        behind the 2026-08-26 "something starved the benchmark for four hours".
+
+        Two ways a model is held, both reported:
+
+        * the lease **names** it (``model_ids``) -- it is the owner the lease was
+          taken out for, and unloading it is exactly what the lease forbids;
+        * the model is **resident on leased cards** without being named -- a
+          squatter the grant did not catch, whose teardown still disturbs the
+          holder's cards mid-run.
+
+        Returns the leases, newest-last, with no duplicates. Empty means the
+        unload is nobody's business but the caller's, which is the overwhelmingly
+        common case: with no lease standing this costs one empty-dict check.
+        """
+        if not len(self.leases):
+            return []
+        found: dict[str, GpuLease] = {}
+        for name in model_ids:
+            record = self.registry.resolve(name)
+            model_id = record.id if record is not None else name
+            owning = self.leases.for_model(model_id)
+            if owning is not None:
+                found[owning.id] = owning
+                continue
+            instance = self.supervisor.get(model_id)
+            devices = list(instance.plan.devices) if instance and instance.plan else []
+            for lease in self.leases.conflicts(devices):
+                found[lease.id] = lease
+        return list(found.values())
+
+    def require_lease_clear(self, model_ids: Sequence[str], what: str) -> None:
+        """Raise :class:`LeaseConflictError` if a standing lease holds any of ``model_ids``.
+
+        The refusal names every lease in the way and how it ends, the way every
+        other D53 lease refusal does, so a client that hits it can wait for the
+        right thing instead of retrying blind.
+        """
+        held = self.leases_holding(model_ids)
+        if not held:
+            return
+        names = "; ".join(
+            f"lease {lease.id} ({lease.holder}) holds CUDA {sorted(lease.devices)}"
+            for lease in held
+        )
+        raise LeaseConflictError(
+            f"Refusing {what}: {names}. A lease means those cards belong to that work until "
+            f"it is released or idles out (D43). Release the lease first "
+            f"(DELETE /api/leases/{{id}}), identify yourself as the holder (X-SF-Client), or "
+            f"send an admin credential -- this server accepts a caller on this machine or "
+            f"the MCP pairing PIN when server.api_key is unset.",
+            details={"leases": [lease_view(lease) for lease in held]},
+        )
+
+    async def unload(self, name: str, *, deliberate: bool = True, force: bool = False) -> bool:
         """Stop the child serving ``name``; a deliberate unload sticks (D41).
 
         The stopped id is marked so the pin reconciler leaves it down: whoever
@@ -2730,7 +2804,16 @@ class ModelManager:
         Those stop without the mark, like the lease eviction and the TTL sweep
         do, so a pinned model that was benchmarked or tested is brought back
         by the reconciler instead of staying down until a restart.
+
+        ``force=True`` waives the D55 lease guard: a deliberate unload of a
+        model a standing lease holds is refused with 409 ``lease_conflict``
+        unless the caller proved it is the holder or an admin. Housekeeping
+        (``deliberate=False``) is never guarded -- it only ever puts back what
+        it took, and the lease grant's own eviction runs through the supervisor,
+        not through here.
         """
+        if deliberate and not force:
+            self.require_lease_clear([name], f"to unload '{name}'")
         record = self.registry.resolve(name)
         model_id = record.id if record is not None else name
         if deliberate:
@@ -2744,9 +2827,18 @@ class ModelManager:
         await self.supervisor.stop(model_id)
         return True
 
-    async def unload_all(self) -> list[str]:
-        """Stop every child. Pinned ones stay down until loaded or re-pinned (D41)."""
+    async def unload_all(self, *, force: bool = False) -> list[str]:
+        """Stop every child. Pinned ones stay down until loaded or re-pinned (D41).
+
+        Refused wholesale (409 ``lease_conflict``) when *any* resident is held by
+        a standing GPU lease and ``force`` is not set (D55): "free all the VRAM"
+        is never worth silently taking a benchmark's cards out from under it, and
+        a partial unload-all would be a worse answer than a refusal that names
+        the lease.
+        """
         ids = [i.model_id for i in self.supervisor.list()]
+        if not force:
+            self.require_lease_clear(ids, "to unload every model")
         self._pin_suppressed.update(ids)
         self._restore_entries.clear()
         await self.supervisor.stop_all()
@@ -2763,6 +2855,9 @@ class ModelManager:
         reason: str = "",
         idle_ttl_s: float | None = DEFAULT_IDLE_TTL_S,
         force: bool = False,
+        priority: int | None = None,
+        vacate_url: str | None = None,
+        vacate_token: str | None = None,
     ) -> GpuLease:
         """Give ``devices`` to ``model_ids`` (or to nobody) until released or idle.
 
@@ -2772,13 +2867,30 @@ class ModelManager:
         *pinned* idle resident refuses too unless ``force`` is set, because a
         pin is a standing wish; with ``force`` it is evicted and the pin
         reconciler brings it back on other cards if they fit, or on these once
-        the lease ends. A chat- or agent-tier idle resident (D46) refuses the
-        same way: a lease grant does not outrank the tiers without ``force``.
-        A card already leased is a conflict, never a takeover.
+        the lease ends. An idle resident of a *better* tier than this claim
+        (D46) refuses the same way: a lease grant does not outrank the tiers
+        without ``force``. A card already leased is a conflict, never a
+        takeover -- but a strictly better ``priority`` may ASK a holder that
+        registered a ``vacate_url`` to leave (D56): one POST, the lease is
+        marked ``vacating``, and the answer is 409 ``lease_vacating`` with a
+        re-ask interval until the holder releases or the window lapses.
         """
         wanted = sorted({int(d) for d in devices})
         if not wanted:
             raise BadRequestError("a lease must name at least one CUDA device", param="devices")
+        tier = normalise_priority(priority)
+        if tier is None:
+            tier = PRIORITY_BACKGROUND
+        if vacate_url is not None:
+            vacate_url = validate_vacate_url(vacate_url)
+            if await self._vacate_url_is_ours(vacate_url):
+                host, port = vacate_url_target(vacate_url)
+                raise BadRequestError(
+                    f"vacate_url points at this StudioForge's own listener ({host}:{port}); a "
+                    f"vacate request is POSTed from this box with no credential, so a URL onto "
+                    f"its own routes is refused. Register the HOLDER's endpoint.",
+                    param="vacate_url",
+                )
         known = self._known_devices()
         if known is not None:
             unknown = [d for d in wanted if d not in known]
@@ -2794,9 +2906,11 @@ class ModelManager:
             serving_id = self.serving_record(record).id
             if serving_id not in owners:
                 owners.append(serving_id)
-        if self.leases.conflicts(wanted):
-            # Let the book phrase the conflict: it names the lease in the way.
-            self.leases.acquire(wanted, holder=holder, model_ids=owners)
+        clash = self.leases.conflicts(wanted)
+        if clash:
+            # Ask a worse-class holder to leave (D56) or let the book phrase
+            # today's conflict -- either way this raises.
+            self._vacate_or_conflict(wanted, clash, holder=holder, priority=tier)
         if self._loading:
             raise ModelBusyError(
                 f"a model load is in flight ({', '.join(sorted(self._loading))}) and may "
@@ -2816,11 +2930,13 @@ class ModelManager:
                 busy.append(instance)
             elif instance.ttl_s == 0 and not force:
                 pinned.append(instance)
-            elif instance.priority < PRIORITY_BACKGROUND and not force:
-                # A chat/agent-tier resident is a standing claim the way a pin
-                # is (D46): "background can never displace it" must hold for
-                # the lease plane too, or reserve_gpus is an end-run around
-                # the tier rule. force works exactly as it does for a pin.
+            elif instance.priority < tier and not force:
+                # A better-tier resident is a standing claim the way a pin is
+                # (D46): "a load may displace only equal-or-worse tiers" must
+                # hold for the lease plane too, or reserve_gpus is an end-run
+                # around the tier rule. The claim's own class (D56) is what it
+                # is measured against -- the default class 3 keeps the pre-D56
+                # rule to the byte. force works exactly as it does for a pin.
                 tiered.append(instance)
             else:
                 victims.append(instance)
@@ -2849,10 +2965,10 @@ class ModelManager:
             names = ", ".join(f"{i.model_id} (priority {i.priority})" for i in tiered)
             raise LeaseConflictError(
                 f"higher-priority model(s) {names} are resident on CUDA {wanted}; a lease "
-                f"grant does not outrank the chat or agent tier (D46). Pass force=true to "
-                f"evict them anyway, or lease other cards",
+                f"grant at priority {tier} does not outrank a better tier (D46). Pass "
+                f"force=true to evict them anyway, or lease other cards",
                 param="force",
-                details={"priority_models": [i.model_id for i in tiered]},
+                details={"priority_models": [i.model_id for i in tiered], "priority": tier},
             )
         # Book first, evict second. The planner reads the book, and every
         # supervisor.stop() below yields to the event loop for the length of a
@@ -2865,7 +2981,14 @@ class ModelManager:
         # atomic step; a failed eviction takes the entry back out because every
         # caller only ever releases a lease it was handed.
         lease = self.leases.acquire(
-            wanted, holder=holder, model_ids=owners, reason=reason, idle_ttl_s=idle_ttl_s
+            wanted,
+            holder=holder,
+            model_ids=owners,
+            reason=reason,
+            idle_ttl_s=idle_ttl_s,
+            priority=tier,
+            vacate_url=vacate_url,
+            vacate_token=vacate_token,
         )
         try:
             for victim in victims:
@@ -2903,6 +3026,12 @@ class ModelManager:
             # lease standing that nobody holds a handle to.
             self.leases.release(lease.id)
             raise
+        # The host:port only -- a path or query is the holder's business, and
+        # the token never reaches a log line at all (D6, D56).
+        vacate_target = None
+        if vacate_url:
+            vacate_host, vacate_port = vacate_url_target(vacate_url)
+            vacate_target = f"{vacate_host}:{vacate_port}"
         log.info(
             "gpu lease acquired",
             lease_id=lease.id,
@@ -2911,8 +3040,135 @@ class ModelManager:
             model_ids=owners,
             idle_ttl_s=idle_ttl_s,
             reason=reason or None,
+            priority=tier,
+            vacate_target=vacate_target,
         )
         return lease
+
+    def _vacate_or_conflict(
+        self, wanted: list[int], clash: list[GpuLease], *, holder: str, priority: int
+    ) -> None:
+        """A better class may ask a worse-class holder to leave; nobody is made to (D56).
+
+        Always raises. ``lease_vacating`` (409, ``retry_after_s``) when EVERY
+        clashing lease is strictly worse than ``priority`` and registered a
+        ``vacate_url``; the request is POSTed once per lease per window and
+        the requester re-asks on the interval it was given. Otherwise -- an
+        equal or better class in the way, a holder that cannot be asked, or a
+        window that lapsed without a release -- the book's plain
+        ``lease_conflict``, exactly as before. ``force`` never enters here: a
+        standing lease is never overridden, vacating or not. Nothing awaits
+        between the scan and the stamps, so two askers cannot both send.
+        """
+        now = time.time()
+        askable = [lease for lease in clash if lease.priority > priority and lease.vacate_url]
+        if len(askable) != len(clash):
+            raise self.leases.conflict_error(wanted, clash, now=now)
+        window_s = float(self.config.leases.vacate_timeout_s)
+        sent: list[str] = []
+        for lease in askable:
+            if not vacate_reaskable(lease, now):
+                continue  # in flight (dedupe) or inside the post-lapse quiet period
+            self.leases.mark_vacating(lease.id, requested_by=holder, deadline_s=window_s, now=now)
+            body = vacate_request_body(
+                lease, requester=holder, requester_priority=priority, deadline_s=window_s
+            )
+            self._spawn_vacate(lease, body)
+            sent.append(lease.id)
+        vacating = [lease for lease in askable if lease.vacating(now)]
+        if len(vacating) != len(askable):
+            # At least one holder let its window lapse and is not to be
+            # nagged yet: the honest answer is today's conflict, with
+            # details.vacate saying "asked, and refused".
+            raise self.leases.conflict_error(wanted, clash, now=now)
+        deadline = min(lease.vacate_deadline or now for lease in vacating)
+        retry_after = max(
+            1, int(min(float(self.config.leases.vacate_retry_after_s), max(1.0, deadline - now)))
+        )
+        names = "; ".join(
+            f"lease {lease.id} ({lease.holder}, priority {lease.priority}) holds "
+            f"CUDA {sorted(set(lease.devices) & set(wanted))}"
+            for lease in vacating
+        )
+        raise LeaseConflictError(
+            f"CUDA {wanted} is leased by a worse class and the holder has been asked to "
+            f"vacate: {names}. Re-ask in {retry_after}s; the cards are yours once the holder "
+            f"releases, or the answer becomes lease_conflict at the deadline.",
+            code="lease_vacating",
+            param="devices",
+            details={
+                "leases": [lease_view(lease, now=now) for lease in clash],
+                "vacate": {
+                    "state": "vacating",
+                    "leases": [lease.id for lease in vacating],
+                    "requested": sent,
+                    "requester": holder,
+                    "requester_priority": priority,
+                    "deadline": deadline,
+                },
+                "retry_after_s": retry_after,
+            },
+        )
+
+    def _spawn_vacate(self, lease: GpuLease, body: dict[str, Any]) -> None:
+        """Fire the vacate POST without parking the acquire behind it."""
+        task = asyncio.create_task(
+            self._send_vacate(lease, body), name=f"studioforge-vacate-{lease.id}"
+        )
+        self._vacate_tasks.add(task)
+        task.add_done_callback(self._vacate_tasks.discard)
+
+    async def _send_vacate(self, lease: GpuLease, body: dict[str, Any]) -> None:
+        host, port = vacate_url_target(lease.vacate_url or "")
+        target = f"{host}:{port}"
+        log.info(
+            "gpu lease vacate requested",
+            lease_id=lease.id,
+            holder=lease.holder,
+            devices=list(lease.devices),
+            requester=body.get("requester"),
+            requester_priority=body.get("requester_priority"),
+            deadline_s=body.get("deadline_s"),
+            target=target,
+        )
+        try:
+            delivered, status = await self._vacate_sender(
+                lease, body, timeout_s=float(self.config.leases.vacate_callback_timeout_s)
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the sender promised not to raise; belt and braces
+            delivered, status = False, type(exc).__name__
+        if delivered:
+            log.info("gpu lease vacate delivered", lease_id=lease.id, target=target, status=status)
+        else:
+            # Never str(exc): a header h11 disliked is quoted back verbatim.
+            log.warning(
+                "gpu lease vacate not delivered; the window still runs and then degrades to "
+                "lease_conflict",
+                lease_id=lease.id,
+                holder=lease.holder,
+                target=target,
+                status=status,
+            )
+
+    async def _vacate_url_is_ours(self, url: str) -> bool:
+        """Whether a ``vacate_url`` lands on this server's own listeners (D56)."""
+        own_ports = {self.config.server.port, self.config.gui.port, self.config.watchdog.port}
+        _host, port = vacate_url_target(url)
+        if port not in own_ports:
+            return False  # the common case, decided without any I/O
+        if self._own_addresses is None:
+            try:
+                from studioforge.core.netinfo import local_addresses
+
+                found = await asyncio.to_thread(local_addresses)
+                self._own_addresses = [entry.ip for entry in found]
+            except Exception:  # noqa: BLE001 - loopback is still refused without this
+                self._own_addresses = []
+        return await vacate_url_targets_self(
+            url, own_ports=own_ports, own_addresses=self._own_addresses
+        )
 
     def release_lease(self, lease_id: str) -> GpuLease:
         lease = self.leases.release(lease_id)
@@ -2921,6 +3177,8 @@ class ModelManager:
             lease_id=lease.id,
             devices=list(lease.devices),
             holder=lease.holder,
+            # A release inside the window is the vacate protocol working.
+            vacated_for=lease.vacate_requested_by if lease.vacate_deadline else None,
         )
         return lease
 
@@ -2954,6 +3212,7 @@ class ModelManager:
                 devices=list(lease.devices),
                 model_ids=list(lease.model_ids),
                 idle_ttl_s=lease.idle_ttl_s,
+                vacate_pending_for=lease.vacate_requested_by if lease.vacating() else None,
             )
 
     def _apply_lease_profile(self, record: ModelRecord) -> tuple[ModelRecord, bool]:

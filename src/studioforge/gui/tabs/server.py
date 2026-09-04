@@ -588,7 +588,7 @@ def _config_widget(field: st.ConfigField, value: Any) -> Any:
 async def _unload_all(ctx: GuiContext) -> None:
     with busy(message="Unloading every model…"):
         try:
-            unloaded = await ctx.manager.unload_all()
+            unloaded = await ctx.manager.unload_all(force=viewer_may_change_box(ctx))
         except Exception as exc:  # noqa: BLE001
             notify_error(exc, what="unload all")
             return

@@ -202,8 +202,17 @@ def redact_argv(argv: Sequence[str]) -> list[str]:
     Every absolute path -- the binary, ``--model``, ``--mmproj``, ``--lora``,
     ``--chat-template-file``, anything from ``extra_flags`` -- is reduced to
     its basename, and the value after a key-carrying flag is replaced by
-    ``"<redacted>"``. The full command line stays where it always was, in the
-    child's log file, which is not served over HTTP.
+    ``"<redacted>"``.
+
+    **This is now the only form the argv is ever written in (D55).** The
+    docstring used to say the full command line stayed in the child's log file,
+    "which is not served over HTTP" -- it was, by ``GET /api/logs/models/{id}``
+    and, through the app ring buffer, by ``GET /api/logs``, both of which had no
+    credential in front of them on an open install. Rather than gate two reads
+    that are genuinely useful, the argv is redacted at every point it is
+    recorded: the child log header, the ``model_spawn`` log line, and the
+    ``ModelLoadError`` details. A secret an operator put in ``extra_flags`` is
+    covered too, which the value-registration log scrubber never was.
     """
     out: list[str] = []
     redact_next = False
@@ -1891,7 +1900,12 @@ class Supervisor:
         # did (26 of them).
         full_argv = [*_pdeathsig_prefix(), *self._launch_prefix, *argv]
         inst.open_log()
-        inst.write_log(f"=== studioforge launch: {' '.join(full_argv)}")
+        # Redacted, not raw: this file is served by GET /api/logs/models/{id}
+        # (D55). The header still names every flag and every basename, which is
+        # what makes a failed launch diagnosable; what it no longer names is the
+        # operator's username, the disk layout and anything key-shaped that
+        # reached extra_flags.
+        inst.write_log(f"=== studioforge launch: {' '.join(redact_argv(full_argv))}")
 
         kwargs: dict[str, Any] = {}
         # Start suspended when there is a job to put the child in, so the window
@@ -1924,7 +1938,10 @@ class Supervisor:
             model_id=inst.record.id,
             port=inst.port,
             source=inst.info.loaded_by,
-            argv=" ".join(argv),
+            # The ring buffer behind GET /api/logs. Same reason as the child
+            # log header above (D55); ``inst.info.launch_args`` is the very
+            # same redaction, already computed.
+            argv=" ".join(inst.info.launch_args or redact_argv(argv)),
         )
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -1937,7 +1954,7 @@ class Supervisor:
         except OSError as exc:
             raise ModelLoadError(
                 f"Could not launch llama-server for '{inst.record.id}': {exc}",
-                details={"argv": argv},
+                details={"argv": redact_argv(argv)},
             ) from exc
 
         if self._job is not None:

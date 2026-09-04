@@ -32,6 +32,7 @@ from studioforge.gui.tabs import (
     panel_guard,
     require_local_admin,
     run_blocking,
+    viewer_may_change_box,
 )
 
 _KV_TYPES = ("", "f32", "f16", "bf16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0")
@@ -531,7 +532,7 @@ def _benchmark(ctx: GuiContext, record: Any) -> None:
 async def _unload(ctx: GuiContext, record: Any, table: Any) -> None:
     with busy(message=f"Unloading {record.id}…"):
         try:
-            await ctx.manager.unload(record.id)
+            await ctx.manager.unload(record.id, force=viewer_may_change_box(ctx))
         except Exception as exc:  # noqa: BLE001
             notify_error(exc, what="unload")
             return

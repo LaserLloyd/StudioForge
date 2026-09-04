@@ -4473,3 +4473,239 @@ deterministic non-repeating prose, both divergence shapes, row extraction, the 3
 arithmetic with `achieved_batch`, the report). The b10425 help excerpt gained the verbatim
 `--cont-batching`, `--cache-prompt`, `--cache-idle-slots`, `--checkpoint-min-step` and
 `--slot-prompt-similarity` entries from `engines/b10425/help.txt`.
+
+## D55 -- The open install is open for inference, not for the operator's desk
+
+**Problem.** The 2026-09-04 hardening audit read both services the way a peer on the tailnet sees
+them. On an open install (`server.api_key` unset -- the shipped default, and this rig's) the D32
+line was drawn in the wrong place seven times over, ranked by reach:
+
+1. The control panel's origin gate keyed on `scope["type"] == "websocket"`. NiceGUI's socket.io
+   control channel *opens* over HTTP long-polling at `/_nicegui_ws/` and upgrades afterwards, so a
+   page on any website the operator visited could drive the panel over polling and never upgrade.
+   Reproduced live: `GET /_nicegui_ws/socket.io/?transport=polling` with `Origin:
+   https://evil.example` answered 200, `access-control-allow-origin: https://evil.example` and a
+   session cookie -- NiceGUI's own `cors_allowed_origins='*'` echoing the attacker back. And `GET /`
+   carried no `X-Frame-Options`, so an iframe of `http://127.0.0.1:8080/` rendered a panel whose
+   viewer IP was loopback: every admin control, the PIN reveal included, one clickjacked click away.
+2. A lease (D43) was enforced by the planner only. Nothing could be *placed* on a leased card, but
+   `POST /api/models/unload-all` from anyone who could reach the port took the benchmark's models
+   out from under a standing lease -- the most plausible mechanism behind the 2026-08-26 "something
+   starved the benchmark for four hours".
+3. The child's launch line was written unredacted to the child log and to the ring buffer, and
+   both are served by `GET /api/logs*` with no credential. `redact_argv`'s own docstring promised
+   the full line stayed "in the child's log file, which is not served over HTTP". It was.
+4. `POST /api/virtual-models` was open while `DELETE` of the same row was gated: a persistent,
+   restart-surviving `system_prompt` over any base model, plantable by anyone, selectable by name
+   from `/v1/models`.
+5. The watchdog's gate was `if expected_key or expected_pin:`. Clear the PIN on an install with no
+   key -- the Setup tab offers exactly that -- and `nuke_all_models`, `kill_model`, `set_config`,
+   `restart_server` and `POST /restart` were anonymous on `0.0.0.0:1235`. The main API never opens
+   that far; the recovery sidecar must not be the one surface that does.
+6. The panel's Logs tab had no gate at all, the un-credentialed `:1235/health` returned
+   `config_path` (absolute: the username and the whole data-dir layout) plus every child's pid and
+   port, and `GET /api/vram/holders` published every co-tenant's `parent_cmdline` verbatim -- a
+   `docker run -e TOKEN=...` parent would have gone out with it.
+7. Smaller, same family: an unhandled 500 returned `str(exc)` (paths, SQL, httpx URLs); the panel's
+   session-signing key was `sha256("studioforge-gui::" + data_dir)` and the data dir is what
+   `:1235/health` publishes; `_open_path` opened Explorer on the rig for a remote viewer; and
+   `kill_model("Qwen")` killed every Qwen despite a docstring that said "when it is unambiguous".
+
+**Decision. Residency stays open (D32: LM Studio parity is the product); everything that
+*describes* or *changes* the operator's box takes the D32 test; a lease guards its own models.**
+
+1. **The control channel is gated by path, not transport.** `GuiAuthGate` runs the origin check
+   for any WebSocket *and* any HTTP scope under `/_nicegui_ws/`. A foreign Origin gets a plain 403
+   `cross_site_control_channel` with **no** `Access-Control-Allow-Origin` -- the refusal must not be
+   readable by the page that made it, or the answer is a probe. Every GUI response carries
+   `X-Frame-Options: DENY` and `Content-Security-Policy: frame-ancestors 'none'`, wrapped around
+   `send` so NiceGUI's own responses get them too. Deliberately *only* `frame-ancestors`: a
+   `script-src` policy against NiceGUI's inline bootstrap and Quasar bundles would take the
+   operator's recovery surface down at exactly the moment it is needed, and is a browser-verified
+   change, not a header-set one. `storage_secret` is 32 random bytes persisted once to
+   `<data_dir>/gui_secret` (owner-only where the platform has it); a write failure falls back to a
+   per-process secret, which costs sessions a restart and nothing else.
+2. **A lease guards its models.** `ModelManager.leases_holding(model_ids)` reports the standing
+   leases an unload would take apart: the lease that *names* the model, and any lease whose cards
+   it is resident on (a squatter the grant did not catch). `unload` and `unload_all` refuse with
+   409 `lease_conflict` in the D53 shape -- every lease in the way, how it ends, the three ways
+   past it -- unless `force=True`; `unload_all` refuses wholesale, because a partial "free all the
+   VRAM" is a worse answer than a refusal that names the lease. Housekeeping (`deliberate=False`:
+   the TTL sweep, a benchmark's own teardown, the D46 restore) is never guarded -- it only ever puts
+   back what it took -- and the grant's own eviction runs through the supervisor, not `unload`, so
+   D43 and D56 are untouched. On the routes `may_unload_lease_held` waives the guard for **the
+   holder** -- `X-SF-Client` matched on `holder_family`, so `crucibleforge-judge` is `crucibleforge`;
+   self-declared and therefore not a credential: it stops the accident, never a caller who knows
+   the holder's name, which is the same trade the `client` tag makes everywhere and what the
+   credential in the audit's §7(a) upgrades -- and for **an admin**, `is_admin_caller`: D32 as a
+   boolean (key configured, a loopback peer that is not a cross-site page, or the PIN), recording
+   nothing in the credential lockout because these callers are being measured, not attempting a
+   credential. `POST /api/models/{id}/restart` (a forced reload that drops every in-flight request)
+   takes the same rule; the panel passes `force=viewer_may_change_box(ctx)`; the PIN-gated MCP
+   `unload_model` passes `force=True` because reaching it at all cleared the gate. A model no lease
+   holds unloads from the LAN exactly as before.
+3. **The argv is redacted at every point it is written.** The child-log header, the `model_spawn`
+   ring-buffer line and `ModelLoadError.details.argv` all go through `redact_argv`, which existed
+   for `launch_args` and is now the only form. Basenames keep a failed launch diagnosable; a key an
+   operator put in `extra_flags` is covered where the value-registration scrubber never was.
+4. **Reads shape their answer by who is asking, rather than closing.** `GET /api/logs` and
+   `/api/logs/models/{id}` stay open -- "why did my load fail" is a question any client on an open
+   install may ask -- but for a non-admin every absolute path is reduced to its basename
+   (`_redact_paths`: Windows drive/UNC paths and root-anchored POSIX paths only, so `/api/...` route
+   names inside log prose survive) and the reply says `redacted: true`. `GET /api/vram/holders`
+   drops `parent_cmdline` and `detail` and basenames `exe`, `parent_name` and `engines_dir` for a
+   non-admin, keeping the numbers, pids and classification the question is about. The panel's Logs
+   tab is `require_local_admin` on `render()` *and* on `_refresh_once()` -- a disabled widget is one
+   websocket frame from enabled, and that function is the one that reads the files. `_open_path`
+   refuses a remote viewer in place (its contract is "never raises").
+5. **`POST /api/virtual-models` joins `_ADMIN_MUTATION_PREFIXES`.** Creating one is the box change;
+   the GUI creates them in-process, which has no peer and is local.
+6. **The watchdog fails closed.** With neither credential configured, a non-loopback peer gets 403
+   `remote_admin_requires_credential` on everything but `GET /health`; `_peer_is_loopback` mirrors
+   `api.auth.is_local_request` (no peer = in-process = trusted; a hostname that is not an IP literal
+   is not local) so the two surfaces cannot disagree about "this machine". `/health` stays open for
+   liveness, but a remote poller with no credential sees `_PUBLIC_HEALTH_KEYS` only -- `ok`,
+   `status`, `summary`, `children_total`, `children_unhealthy`, `watchdog_uptime_s`,
+   `restart_in_progress`, all derived, none descriptive -- plus `redacted: true`; `_credential_ok`
+   reads the key or PIN without touching the lockout. `kill_model` with more than one substring
+   match answers `ambiguous_model` naming them and kills nothing.
+7. **A 500 names a reference.** `internal_error` with "Quote ref=<8 hex>" and `studioforge.ref`;
+   the full exception text goes to the log under the same `ref`, one grep away. The `openai` client
+   reads `type` and `code` only, so nothing downstream changes.
+
+**Not done here, on purpose -- operator decisions (audit §7/§8).** Setting real credentials on both
+services (five clients change; the order that avoids an outage is in the audit); loopback-only
+binds (neither service multi-binds; needs a tunnel or a proxy); the firewall rules (written, not
+run); gating `/api/benchmark*` (breaks CrucibleForge until the credential lands); per-peer slot
+caps on `/v1` (changes the LM Studio parity); defaulting `watchdog.host`/`gui.host` to `127.0.0.1`
+(removes remote admin); whether `unload-all` should exist on an open install; `redact()`'s
+first-4/last-2 mask (fix before setting a key); `register_secret(mcp.pin)`; length caps on lease
+`reason`/`holder`; an MCP session idle timeout.
+
+**Surfaces.** `gui.app.GuiAuthGate` (path-keyed origin check, `_FRAME_HEADERS`, 403
+`cross_site_control_channel`), `<data_dir>/gui_secret`; `ModelManager.leases_holding`,
+`require_lease_clear`, `unload(force=)`, `unload_all(force=)`; `api.auth.is_admin_caller`,
+`_ADMIN_MUTATION_PREFIXES += "/api/virtual-models"`; `mgmt_routes.may_unload_lease_held`,
+`_redact_paths`, `_public_holders`, `redacted` on `GET /api/logs`, `/api/logs/models/{id}` and
+`/api/vram/holders`; the lease rule on `POST /api/models/{id}/restart`; the redacted child-log
+header, `model_spawn` line and `ModelLoadError.details.argv`; `internal_error` + `studioforge.ref`;
+watchdog `_peer_is_loopback`, `_credential_ok`, `_public_health`, `ambiguous_model`; the panel's
+Logs tab and `_open_path` gates, `unload(force=viewer_may_change_box)` on the three unload buttons.
+
+**Tests.** `tests/unit/test_hardening_d55.py`: the polling refusal carries no ACAO and same-origin,
+Origin-less and ordinary-page requests pass; the frame headers on every response, never doubled;
+the random persisted secret; unload refused / forced / housekeeping, the squatter, unload-all
+wholesale, the grant's own eviction and the D56 release path unaffected, the routes for a stranger,
+the holder (family rule) and an admin, an unleased model unchanged; the child-log header and spawn
+line, the failed-launch details; `_redact_paths`, both log routes and `/vram/holders` for a LAN
+reader versus an admin; the 500 reference; the watchdog fail-closed for LAN / loopback /
+in-process, the public `/health` with and without the PIN, `_public_health`, the ambiguous kill;
+the Logs tab's refusal and its refresh guard, `_open_path`; the MCP unload waiving the guard.
+`test_api_hardening.py` (`POST /api/virtual-models` is an admin mutation), `test_virtual_presets.py`
+(a loopback peer), `test_gui.py` (`_same_origin_scope`; `logs.py::render` joins the guarded list).
+
+## D56 -- Vacate: a better class may ask a tenant to leave, never make it
+
+**Problem.** Two tenants share the four cards with a benchmark client, and the lease book is
+strictly first-come-first-served (D43). On 2026-09-04 that produced the shape the interaction
+research named Hole A/C: a CrucibleForge run wanting `[0,1,2,3]` met ClawForge2's standing render
+lease on `[2]` and had exactly two answers -- `409 lease_conflict` with no `Retry-After`, or
+`force`, which does not touch a standing lease at all (D43 item 3). The best case was "wait for
+the render tenant to idle out (600 s + sweep), provided no render arrives in between", and a
+trickle of renders holds the card indefinitely. Nothing could *ask* the tenant to leave, and
+StudioForge cannot free the tenant's VRAM itself: ComfyUI's process is `foreign` and D23 promises
+foreign holders are never killed from here. Only ClawForge2 can tell ComfyUI to `/free`, and only
+it knows whether a render is mid-flight.
+
+Two smaller defects rode along: the `409 lease_conflict` carried `retry_after_s` only inside its
+per-lease rows, so the API layer's header rule (D53: "any status whose details know the wait")
+never fired; and `holder_family` split on `-` alone, so this server's own `benchmark:parallel`
+lease read as kind `other` -- inverting the "stand down" advice a client derives from `kind`
+(SF-2/CF-1 in the OpenClaw review).
+
+**Decision. The book still never takes a lease away. It gains one verb: ask.**
+
+1. **A lease carries the D46 class of its claim.** `GpuLease.priority` (1 chat, 2 dispatched
+   agent, 3 background) -- the same three tiers a load carries, so "a lease outranks a lease
+   only as a load outranks a load". Omitted means 3, and a lease that never said behaves to the
+   byte as before: the conflict branch is entered with nothing askable and falls straight
+   through to today's 409. D53 declined a stored `priority` because it would have been
+   descriptive only; here it *is* the preemption class, so storing it is honest (D47).
+2. **A holder may register where to be asked.** `vacate_url` (http(s), no credentials, never
+   this server's own listener -- the same self-target refusal ClawForge2's job callbacks make,
+   with `127.1`-style literals, `localhost`, IPv4-mapped IPv6 and names that resolve to loopback
+   all caught) and `vacate_token`, a bearer the *holder* minted. The token is excluded at the
+   model (`Field(exclude=True, repr=False)`), popped from every view, keyed into the D6 redaction
+   processor as `vacate_token`/`x-sf-vacate-token`, and validated to printable ASCII so h11 can
+   never quote it back into an exception text. The URL travels as `vacate_registered: bool` to
+   everyone and as itself only to a caller `may_reveal_pin` already trusts (this machine, or a
+   credentialed one) and to the registrant's own `POST /api/leases` / `reserve_gpus` reply.
+3. **The grant asks, once, and does not wait.** In `manager.acquire_lease`, when every lease in
+   the way is a strictly worse class *and* registered a URL, the server stamps each lease
+   `vacating` (`vacate_requested_at`, `vacate_requested_by`, `vacate_deadline = now +
+   leases.vacate_timeout_s`), spawns one POST per lease -- `{lease_id, devices, requester,
+   requester_priority, deadline_s, deadline_at}` with `X-SF-Vacate-Token` and `X-SF-Lease-Id`,
+   10 s timeout, no redirects, `trust_env=False`, a process-cached SSL context built off the
+   loop (the ClawForge2 callbacks lesson: a fresh `SSLContext` per client is 250 ms of blocking
+   work) -- and answers **`409 lease_vacating`** with `retry_after_s` (15) and a `Retry-After`
+   header. The requester re-asks; inside the window nothing is re-sent (dedupe per lease, from
+   any better-class asker); when the holder `DELETE`s its lease (or the sweep expires it) the
+   next identical request is granted and evicts idle residents exactly as today (D36/D43).
+   Nothing between the scan and the stamps awaits, so two askers cannot both send.
+4. **The window lapses honestly.** Past `vacate_deadline` with no release the lease stays and the
+   answer is today's `409 lease_conflict`, now with `details.vacate = {state: "timed_out",
+   leases, reask_at}` so "never asked" and "asked, and refused" are distinguishable. The holder
+   is not nagged: it may be asked again only after a quiet period equal to the window it ignored
+   (one POST per two windows while someone keeps asking), which also covers a holder that
+   restarted mid-window and re-adopted its lease. A touch does not cancel a vacate; release or
+   expiry does.
+5. **What never changes.** `force` still evicts pinned/tiered *residents* only and never overrides
+   a standing lease, vacating or not. A holder without a URL -- a CrucibleForge run, this
+   server's own benchmarks -- is never asked, so a running benchmark cannot be pre-empted by
+   anyone. **A JIT model load never vacates anything**: the planner still sees leased cards as
+   absent and places elsewhere or refuses `gpu_leased` (D53); only a lease *acquire* may ask.
+   A mixed clash (one askable lease, one not) asks nobody -- an ask that cannot yield the cards
+   is noise.
+6. **The tiers, once more, on the lease plane.** The resident rule in the grant now measures an
+   idle resident against the *claim's* class: a class-2 lease may displace an idle tier-2
+   resident and refuses an idle tier-1 one (exactly D46's "equal-or-worse"); the default class 3
+   keeps the pre-D56 rule (`< PRIORITY_BACKGROUND`) to the byte. This server's own benchmark
+   leases carry `benchmark.lease_priority` (default 2): a benchmark is dispatched work, so it may
+   ask a background render tenant to vacate and may displace an idle agent-tier resident, but it
+   never touches the chat model's claim and never another benchmark's (equal class is a plain
+   conflict; benchmarks are serialised anyway). Set it to 3 to make benchmarks ask nobody.
+7. **The two rides.** `409 lease_conflict` gains a top-level `retry_after_s` (the shortest of the
+   clashing rows' advice, open-ended rows counting `LEASE_OPEN_ENDED_RETRY_S`) and so a
+   `Retry-After` header for free. `holder_family` splits on the first of `-` or `:`, so
+   `benchmark:parallel` -> `benchmark` -> kind `benchmark`. `POST /api/leases` takes `holder`
+   from `X-SF-Client` when the body has none (else `"api"`, unchanged); `reserve_gpus` gains a
+   `holder` argument and keeps `"mcp"` as the documented default.
+
+**Surfaces.** `GpuLease.{priority, vacate_url, vacate_token, vacate_requested_at,
+vacate_requested_by, vacate_deadline}`; `lease_view` adds `priority`, `vacate_registered`,
+`vacate_deadline`, `vacate_requested_at`, `vacate_requested_by`, and `state: "vacating"` (which
+outranks `expiring`); `POST /api/leases` and MCP `reserve_gpus` accept `priority`, `vacate_url`,
+`vacate_token`, `holder`; `release_gpus`/`server_status` docstrings; `sfctl leases list` gains
+Prio and State columns; config `leases.{vacate_timeout_s: 180, vacate_retry_after_s: 15,
+vacate_callback_timeout_s: 10}` and `benchmark.lease_priority: 2`; `docs/BENCHMARKING.md`
+"Vacating tenants" with the runbook for a tenant that cannot vacate (an adopted ComfyUI can only
+`/free`).
+
+**Tests.** `tests/unit/test_lease_vacate.py` (the default is byte-identical; the token is absent
+from `model_dump`, `model_dump_json`, both views, `repr`/`str`, `ServerStatus`, every REST/MCP
+reply and a structlog capture sweep; URL shape and self-target refusals including exotic
+literals and a resolving name; one POST + `lease_vacating` + `Retry-After: 15`; dedupe across
+askers; release and sweep-expiry grant the next ask; the lapse degrades to `lease_conflict`
+with `timed_out`, the quiet period, then one more ask; equal/worse class, URL-less holder and a
+mixed clash send nothing; `force` overrides no standing lease; a dead holder costs the window
+and one warning line; the D46 resident rule at class 2 vs 3; the outbound request's body,
+headers, no-redirect and class-name-only errors under `httpx.MockTransport`; REST `Retry-After`
+on both 409s and the remote/loopback URL visibility; MCP schema and defaults; the placement
+benchmark leasing at class 2; `benchmark:parallel` family/kind). `tests/unit/test_leases.py`
+untouched and green.
+
+**Not done here, on purpose.** The holder side -- ClawForge2's `POST /ui/api/vacate`, its drain
+and `/free`, `can_render: vacating` -- is the ClawForge2 change (research Q2 §2.2). A blocking
+`wait: true` on the acquire was declined (D29: never park a request behind another tenant's
+teardown; the client already re-asks). Foreign VRAM on a granted card is still not reported by
+the grant (research Q3 #15).
