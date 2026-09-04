@@ -158,6 +158,58 @@ def test_lease_state_moves_through_active_idle_and_expiring() -> None:
     assert lease_state(forever, start + 10**6) == "idle"
 
 
+def test_lease_state_bands_are_relative_to_a_short_ttl() -> None:
+    """W1 of the 2026-09-04 live review: with the thresholds absolute, a fresh
+    300 s lease read ``expiring`` from its first second and ClawForge2's 600 s
+    render lease read ``expiring`` for half its life. The bands are now
+    ``min(absolute, fraction of the TTL)``: half the TTL to ``idle``, the
+    last quarter ``expiring``, and the long lease keeps its 300 s numbers."""
+    from studioforge.core.leases import (
+        LEASE_EXPIRING_FRACTION,
+        LEASE_EXPIRING_WITHIN_S,
+        LEASE_IDLE_FRACTION,
+        lease_expiring_within_s,
+        lease_idle_after_s,
+    )
+
+    book = LeaseBook()
+    start = 1_000_000.0
+    short = book.acquire([0], holder="api", idle_ttl_s=300.0, now=start)
+    render = book.acquire([1], holder="clawforge2", idle_ttl_s=600.0, now=start)
+    long = book.acquire([2], holder="crucibleforge", idle_ttl_s=7200.0, now=start)
+    forever = book.acquire([3], holder="api", idle_ttl_s=None, now=start)
+
+    assert (LEASE_IDLE_FRACTION, LEASE_EXPIRING_FRACTION) == (0.5, 0.25)
+    assert (lease_idle_after_s(short), lease_expiring_within_s(short)) == (150.0, 75.0)
+    assert (lease_idle_after_s(render), lease_expiring_within_s(render)) == (300.0, 150.0)
+    assert (lease_idle_after_s(long), lease_expiring_within_s(long)) == (300.0, 300.0)
+    assert (lease_idle_after_s(forever), lease_expiring_within_s(forever)) == (
+        LEASE_IDLE_AFTER_S,
+        LEASE_EXPIRING_WITHIN_S,
+    )
+
+    # A fresh lease is active, whatever its TTL -- the live wart.
+    for lease in (short, render, long, forever):
+        assert lease_state(lease, start) == "active", lease.idle_ttl_s
+    # 300 s: active for 150, idle to 225, expiring for the last 75.
+    assert lease_state(short, start + 149) == "active"
+    assert lease_state(short, start + 150) == "idle"
+    assert lease_state(short, start + 224) == "idle"
+    assert lease_state(short, start + 226) == "expiring"
+    # 600 s: active for 300, idle to 450, expiring for the last 150.
+    assert lease_state(render, start + 299) == "active"
+    assert lease_state(render, start + 300) == "idle"
+    assert lease_state(render, start + 449) == "idle"
+    assert lease_state(render, start + 451) == "expiring"
+    # 7200 s: unchanged from D53 -- idle at 300, expiring inside the last 300.
+    assert lease_state(long, start + 300) == "idle"
+    assert lease_state(long, start + 6899) == "idle"
+    assert lease_state(long, start + 6901) == "expiring"
+    # A touch inside the expiring band moves the expiry, so it is active again.
+    book.touch(short.id, at=start + 250)
+    assert lease_state(short, start + 251) == "active"
+
+
 def test_lease_view_retry_advice_is_capped_and_absent_without_a_ttl() -> None:
     book = LeaseBook()
     now = time.time()

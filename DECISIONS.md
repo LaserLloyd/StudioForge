@@ -4207,6 +4207,19 @@ is pinned by set-equality of the two endpoints' keys rather than by a field list
 derived field cannot drift apart the same way. `holder_family` is everything before the first `-`,
 lowercased: one rule, no registry, and both CrucibleForge phases answer `crucibleforge`.
 
+**Amended 2026-09-04 (round 2): the `state` bands are relative to the lease's own TTL.** The two
+thresholds above were absolute, and the live vacate test showed what that does to a short lease: a
+fresh `idle_ttl_s: 300` lease reported `expiring` from its first second, and ClawForge2's 600 s
+render lease would read `expiring` for half its life -- the one word a waiting client reads, turned
+into noise. Now `idle` begins at `min(300 s, idle_ttl_s / 2)` of quiet and `expiring` covers the
+last `min(300 s, idle_ttl_s / 4)` (`lease_idle_after_s`, `lease_expiring_within_s`;
+`LEASE_IDLE_FRACTION = 0.5`, `LEASE_EXPIRING_FRACTION = 0.25`). A 300 s lease is therefore `active`
+for 150 s, `idle` to 225 s and `expiring` for the last 75 s; a 600 s one 300 / 450 / 600; anything
+an hour or longer keeps the D53 numbers to the second, and a TTL-less lease still goes `idle` at
+300 s and is never `expiring`. Precedence is unchanged (`vacating` > `expiring` > `idle` >
+`active`, D56). `retry_after_s` is untouched. `holder_family` now also splits on `:` (D56 item 7).
+Pinned in `tests/unit/test_leases.py::test_lease_state_bands_are_relative_to_a_short_ttl`.
+
 **`holder_family` and `kind` are exposure, not policy, and the docstrings say so loudly.**
 `LeaseBook.blocked_for` keys on `model_ids` and never on the holder, and nothing in the book or the
 manager matches on either new field. `kind` (`benchmark` | `render` | `agent` | `other`) is derived
@@ -4533,14 +4546,27 @@ line was drawn in the wrong place seven times over, ranked by reach:
    VRAM" is a worse answer than a refusal that names the lease. Housekeeping (`deliberate=False`:
    the TTL sweep, a benchmark's own teardown, the D46 restore) is never guarded -- it only ever puts
    back what it took -- and the grant's own eviction runs through the supervisor, not `unload`, so
-   D43 and D56 are untouched. On the routes `may_unload_lease_held` waives the guard for **the
-   holder** -- `X-SF-Client` matched on `holder_family`, so `crucibleforge-judge` is `crucibleforge`;
-   self-declared and therefore not a credential: it stops the accident, never a caller who knows
-   the holder's name, which is the same trade the `client` tag makes everywhere and what the
-   credential in the audit's §7(a) upgrades -- and for **an admin**, `is_admin_caller`: D32 as a
-   boolean (key configured, a loopback peer that is not a cross-site page, or the PIN), recording
-   nothing in the credential lockout because these callers are being measured, not attempting a
-   credential. `POST /api/models/{id}/restart` (a forced reload that drops every in-flight request)
+   D43 and D56 are untouched. On the routes `may_unload_lease_held` waives the guard for **an
+   admin**, `is_admin_caller`: D32 as a boolean (key configured, a loopback peer that is not a
+   cross-site page, or the PIN), recording nothing in the credential lockout because these callers
+   are being measured, not attempting a credential -- and for **the holder, with proof**.
+   *Amended 2026-09-04 (round 2).* The first cut accepted `X-SF-Client` matched on `holder_family`
+   on its own, calling it "a label, not a credential: it stops the accident". The round-2 review
+   read that as what it was -- the hole the guard exists to close, re-opened by a header any LAN
+   peer can send -- so the label now needs one of two proofs, per lease in the way: the request
+   comes from the **peer address the lease was registered from** (`GpuLease.holder_peer`, stamped
+   by `POST /api/leases` from `request.client.host`, excluded from every dump and view; a source
+   address is not forgeable over a TCP connection the way a header is), or it carries the lease's
+   own **`vacate_token`** in `X-SF-Vacate-Token` (a secret only the holder and this server know,
+   compared constant-time). CrucibleForge -- which takes its lease from another box with the PIN
+   and unloads its subject from that same box -- passes on the first proof with the label it already
+   sends; a third host that merely spells `crucibleforge` gets the 409. A lease taken over MCP has
+   no peer and no token; its holder is the operator by the PIN gate, an admin under the first rule.
+   The family rule (`crucibleforge-judge` is `crucibleforge`) still decides *which* leases the
+   label may speak for; it no longer decides *whether* the speaker is the holder. Behind a reverse
+   proxy the peer is the proxy -- the documented limit of every peer check here -- and
+   `server.api_key` is the answer, as before.
+   `POST /api/models/{id}/restart` (a forced reload that drops every in-flight request)
    takes the same rule; the panel passes `force=viewer_may_change_box(ctx)`; the PIN-gated MCP
    `unload_model` passes `force=True` because reaching it at all cleared the gate. A model no lease
    holds unloads from the LAN exactly as before.
@@ -4659,6 +4685,25 @@ lease read as kind `other` -- inverting the "stand down" advice a client derives
    (one POST per two windows while someone keeps asking), which also covers a holder that
    restarted mid-window and re-adopted its lease. A touch does not cancel a vacate; release or
    expiry does.
+   *Amended 2026-09-04 (round 2): a holder that never heard the ask does not get a window.* The
+   first cut ran the full window whatever became of the POST, so an asker facing a dead holder
+   (connection refused, a timeout, a redirect, a 404 from a build without the route) was told
+   `lease_vacating` -- "re-ask in 15 s" -- for 180 s of a release that could not come. Now the
+   result of the one POST is recorded on the lease (`vacate_delivery`: `pending` -> `delivered` on
+   any 2xx, else `failed`; `vacate_delivery_status`: the HTTP code or the exception's class name,
+   never its text) and a failure **collapses the window on the spot**: `vacate_deadline` is pulled
+   in to now, the lease stops reading `vacating`, and the asker's next re-ask is today's `409
+   lease_conflict` with `details.vacate = {state: "undeliverable", leases, undeliverable: [ids],
+   reask_at}` -- so "asked and ignored" (`timed_out`) and "asked and never heard"
+   (`undeliverable`) are different words, and the asker can go elsewhere or wait for the holder's
+   own `expires_at` at once. The quiet period after a failed delivery is one window from the
+   failure (`vacate_reask_at`, now stamped explicitly by the book rather than derived from the
+   deadline, so a collapsed deadline cannot shrink it): a dead holder costs one failed connect per
+   window while someone keeps asking, and one that was merely restarting is asked again on the
+   same clock a lapse would have given it. A release or sweep while the POST is in flight marks
+   nothing -- the lease is gone and the protocol worked. A `lease_vacating` answered *while* the
+   POST is still in flight is still honest: nothing is known yet, and the 15 s re-ask is exactly
+   the interval at which the answer can change.
 5. **What never changes.** `force` still evicts pinned/tiered *residents* only and never overrides
    a standing lease, vacating or not. A holder without a URL -- a CrucibleForge run, this
    server's own benchmarks -- is never asked, so a running benchmark cannot be pre-empted by
@@ -4682,9 +4727,14 @@ lease read as kind `other` -- inverting the "stand down" advice a client derives
    `holder` argument and keeps `"mcp"` as the documented default.
 
 **Surfaces.** `GpuLease.{priority, vacate_url, vacate_token, vacate_requested_at,
-vacate_requested_by, vacate_deadline}`; `lease_view` adds `priority`, `vacate_registered`,
-`vacate_deadline`, `vacate_requested_at`, `vacate_requested_by`, and `state: "vacating"` (which
-outranks `expiring`); `POST /api/leases` and MCP `reserve_gpus` accept `priority`, `vacate_url`,
+vacate_requested_by, vacate_deadline, vacate_reask_at, vacate_delivery, vacate_delivery_status}`
+(the last three from the round-2 amendment; `holder_peer` is D55's); `lease_view` adds `priority`,
+`vacate_registered`, `vacate_deadline`, `vacate_requested_at`, `vacate_requested_by`,
+`vacate_reask_at`, `vacate_delivery`, `vacate_delivery_status`, and `state: "vacating"` (which
+outranks `expiring`); `LeaseBook.mark_vacate_delivery`; `details.vacate.state` is one of
+`vacating` / `timed_out` / `undeliverable`; `GET /api/leases` reveals `vacate_url` to
+`is_admin_caller` (loopback, the PIN, a key -- round 2 unified it with D55's test) and never to
+anyone else on any projection; `POST /api/leases` and MCP `reserve_gpus` accept `priority`, `vacate_url`,
 `vacate_token`, `holder`; `release_gpus`/`server_status` docstrings; `sfctl leases list` gains
 Prio and State columns; config `leases.{vacate_timeout_s: 180, vacate_retry_after_s: 15,
 vacate_callback_timeout_s: 10}` and `benchmark.lease_priority: 2`; `docs/BENCHMARKING.md`
@@ -4709,3 +4759,57 @@ and `/free`, `can_render: vacating` -- is the ClawForge2 change (research Q2 §2
 `wait: true` on the acquire was declined (D29: never park a request behind another tenant's
 teardown; the client already re-asks). Foreign VRAM on a granted card is still not reported by
 the grant (research Q3 #15).
+
+**Round-2 tests (2026-09-04).** `test_lease_vacate.py`: a delivered ask is recorded and keeps its
+window; a failed one (`ConnectError`, `404`, `302`, `ReadTimeout`) collapses it, the next re-ask is
+`lease_conflict` / `undeliverable` with `reask_at` one window out, one POST per quiet window, then
+one more ask; a release while the POST is in flight marks nothing; a JIT load at every tier meets
+`gpu_leased` with the lease's vacate clocks untouched and `_vacate_or_conflict` has one caller;
+`holder_peer` stored and never dumped; the URL withheld from a remote reader on every projection,
+revealed to loopback and to the PIN, the token nowhere. `test_hardening_d55.py`: the label-only
+spoof from a LAN peer is a 409; the registering peer with the label, a third host with the lease's
+token, and the PIN each pass; the peer never leaks. `test_leases.py`: the relative state bands.
+`test_docs.py`: `lease_vacating` is checked against the code that raises it, and the three
+`vacate.state` words on the rig page are checked against the source. `test_companion.py`: the
+instructions fetch outlives a black-holing host by its own bound only, and the forwarded text is
+capped (D57). The live flow is scripted in `scripts/verify_rig_improvements_live.py
+--probe-vacate`.
+
+## D57 -- The proxy forwards the server's own guidance, bounded
+
+**Problem.** OpenClaw registers `sfctl mcp`, a stdio proxy that merges the management server's
+tools with the watchdog's. The proxy built its own ~2.6k-character `instructions` string and
+forwarded none of the server's ~12k one, so every recipe, the loading ladder, the lease etiquette
+and the D48/D53/D56 refusal codes in `management.INSTRUCTIONS` were invisible on the exact path
+OpenClaw connects by (OpenClaw review SF-1). The fix landed with the D55/D56 round without a
+decision number; it is one, twice over: forwarding costs ~3k tokens of context per session, and a
+fetch that runs *before* the agent has a tool list is on the handshake's critical path.
+
+**Decision.** `Upstream.instructions()` reads `Client.instructions` after `initialize` and
+`McpProxy.instructions(upstream)` **appends** it behind `UPSTREAM_DIVIDER` ("--- Advice from the
+StudioForge server itself ---") rather than merging or rewriting: the server's text ships with the
+server, and silently editing it in the proxy is how the two drift. Three bounds make it safe to
+put on the handshake:
+
+1. **Time.** The fetch is capped at `INSTRUCTIONS_FETCH_TIMEOUT_S = 5` by the proxy's own
+   `anyio.move_on_after`, not by the transport's 30 s connect timeout -- a refused connection fails
+   fast, a host that black-holes packets does not, and this runs before the agent can do anything
+   else. A silent or down server loses its paragraphs and nothing more; the failure is remembered
+   for `TOOL_FAILURE_TTL_S` so the next handshake does not pay the bound again.
+2. **Size.** `bound_upstream_instructions` cuts the forwarded text at
+   `UPSTREAM_INSTRUCTIONS_MAX_CHARS = 24,000` -- twice the measured 12,099 of today's INSTRUCTIONS,
+   so the real text always fits and a server answering with a megabyte (a bug, or not our server)
+   cannot turn the handshake into a context bomb. The cut lands on a line boundary and ends with
+   `UPSTREAM_TRUNCATED_MARK`, so the agent knows it read a prefix. A test fails the day the real
+   INSTRUCTIONS outgrow the cap, so raising it is a deliberate act.
+3. **Never load-bearing.** Any exception, an empty string or whitespace yields the proxy's own text
+   exactly as before; `build_server()` without an argument is the pre-D57 proxy to the byte.
+
+**Not done.** Caching the server's text across sessions (a restart with new INSTRUCTIONS would
+serve stale advice); dropping the proxy's own paragraphs in favour of the server's (the merged
+namespace, the `recovery_` prefix and "the watchdog still answers" exist only in the proxy's).
+
+**Tests.** `tests/unit/test_companion.py`: `test_proxy_forwards_the_servers_own_instructions`,
+`test_upstream_instructions_are_fetched_and_a_down_server_is_silent`,
+`test_the_instructions_fetch_is_bounded_when_the_server_black_holes`,
+`test_the_forwarded_instructions_are_bounded_in_size`.

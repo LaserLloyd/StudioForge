@@ -72,10 +72,20 @@ _VACATE_TOKEN_RE = re.compile(r"[\x21-\x7e]+")
 #: ``"active"``. A held-but-quiet lease is the shape a crashed holder leaves
 #: behind, and until now nothing said so out loud: a consumer saw the same
 #: record for a benchmark generating flat out and for one whose process died
-#: an hour ago.
+#: an hour ago. A CAP: a short lease goes idle at :data:`LEASE_IDLE_FRACTION`
+#: of its TTL instead (see :func:`lease_idle_after_s`).
 LEASE_IDLE_AFTER_S = 300.0
-#: How close to the sweep's release counts as ``"expiring"``.
+#: How close to the sweep's release counts as ``"expiring"``. Also a cap: a
+#: short lease is ``expiring`` for its last :data:`LEASE_EXPIRING_FRACTION`
+#: only (see :func:`lease_expiring_within_s`). Absolute, this made a fresh
+#: 300 s lease ``expiring`` from its first second and a 600 s render lease
+#: ``expiring`` for half its life -- seen live on 2026-09-04 -- which turned
+#: the one word a waiting client reads into noise.
 LEASE_EXPIRING_WITHIN_S = 300.0
+#: The share of a lease's TTL after which it is ``idle`` (cap: the absolute).
+LEASE_IDLE_FRACTION = 0.5
+#: The share of a lease's TTL that counts as ``expiring`` (cap: the absolute).
+LEASE_EXPIRING_FRACTION = 0.25
 #: Cap on the retry advice. The honest full answer is ``expires_at``; a client
 #: that sleeps two hours on one number is a client that never notices an early
 #: release, so the advice is "come back and re-ask", not "wait it out".
@@ -133,6 +143,7 @@ class LeaseBook:
         priority: int = PRIORITY_BACKGROUND,
         vacate_url: str | None = None,
         vacate_token: str | None = None,
+        holder_peer: str | None = None,
         now: float | None = None,
     ) -> GpuLease:
         """Record a lease, or raise :class:`LeaseConflictError` if a card is taken.
@@ -140,6 +151,8 @@ class LeaseBook:
         The conflict is always the plain ``lease_conflict`` here: whether a
         better class may *ask* the holder to leave is the manager's call
         (:meth:`ModelManager.acquire_lease`), made before this is reached.
+        ``holder_peer`` is the address the lease was registered from over
+        HTTP (D55) -- stored, never shown.
         """
         wanted = sorted({int(d) for d in devices})
         if not wanted:
@@ -171,6 +184,7 @@ class LeaseBook:
             priority=priority,
             vacate_url=url,
             vacate_token=token,
+            holder_peer=(holder_peer or "").strip() or None,
         )
         self._leases[lease.id] = lease
         return lease
@@ -206,10 +220,15 @@ class LeaseBook:
         ]
         if timed_out:
             # A vacate was asked and the window closed without a release: say so,
-            # so the requester can tell "never asked" from "asked, and refused".
+            # so the requester can tell "never asked" from "asked, and refused"
+            # -- and "asked, and the holder never heard" (``undeliverable``: the
+            # POST failed and the window was collapsed on the spot), which is
+            # the case where waiting for a release is waiting for nothing.
+            undeliverable = [lease.id for lease in timed_out if lease.vacate_delivery == "failed"]
             details["vacate"] = {
-                "state": "timed_out",
+                "state": "undeliverable" if len(undeliverable) == len(timed_out) else "timed_out",
                 "leases": [lease.id for lease in timed_out],
+                "undeliverable": undeliverable,
                 "reask_at": min(
                     stamp_at
                     for stamp_at in (_vacate_reask_at(lease) for lease in timed_out)
@@ -234,6 +253,49 @@ class LeaseBook:
         lease.vacate_requested_at = stamp
         lease.vacate_requested_by = requested_by
         lease.vacate_deadline = stamp + deadline_s
+        # A quiet period equal to the window follows a lapse: bounded on both
+        # sides, so a requester that keeps re-asking costs the holder one POST
+        # per two windows, and a holder that restarted mid-window (ClawForge2
+        # re-adopts its lease) is asked again rather than never.
+        lease.vacate_reask_at = stamp + 2 * deadline_s
+        lease.vacate_delivery = "pending"
+        lease.vacate_delivery_status = None
+        return lease
+
+    def mark_vacate_delivery(
+        self,
+        lease_id: str,
+        *,
+        delivered: bool,
+        status: str,
+        quiet_s: float,
+        now: float | None = None,
+    ) -> GpuLease | None:
+        """Record what became of the vacate POST; a failure ends the window now.
+
+        ``None`` when the lease is already gone (released or swept while the
+        POST was in flight -- the protocol worked, there is nothing to mark).
+        On a failure the deadline is pulled in to ``now``: the asker's next
+        re-ask is answered ``lease_conflict`` with ``vacate.state:
+        "undeliverable"`` instead of ``lease_vacating`` for the rest of a
+        window the holder never heard about. The holder may be asked again
+        after ``quiet_s`` (the window length) -- a dead holder costs one
+        failed connect per window while someone keeps asking, and a holder
+        that was merely restarting gets the next ask on the same clock a
+        lapse would have given it.
+        """
+        lease = self._leases.get(lease_id)
+        if lease is None or lease.vacate_deadline is None:
+            return None
+        stamp = time.time() if now is None else now
+        lease.vacate_delivery_status = status
+        if delivered:
+            lease.vacate_delivery = "delivered"
+            return lease
+        lease.vacate_delivery = "failed"
+        if stamp < lease.vacate_deadline:
+            lease.vacate_deadline = stamp
+        lease.vacate_reask_at = stamp + max(0.0, quiet_s)
         return lease
 
     def release(self, lease_id: str) -> GpuLease:
@@ -311,14 +373,42 @@ def lease_kind(holder: str) -> str:
     return LEASE_KINDS.get(holder_family(holder), "other")
 
 
+def lease_idle_after_s(lease: GpuLease) -> float:
+    """Idle seconds after which this lease reads ``idle``: relative to its TTL.
+
+    ``min(LEASE_IDLE_AFTER_S, idle_ttl_s * LEASE_IDLE_FRACTION)``: 300 s for
+    anything an hour long, half the TTL for a short one, 300 s for a lease
+    with no TTL. The three bands then exist for every TTL, in order.
+    """
+    if lease.idle_ttl_s is None:
+        return LEASE_IDLE_AFTER_S
+    return min(LEASE_IDLE_AFTER_S, float(lease.idle_ttl_s) * LEASE_IDLE_FRACTION)
+
+
+def lease_expiring_within_s(lease: GpuLease) -> float:
+    """Seconds before the sweep during which this lease reads ``expiring``.
+
+    ``min(LEASE_EXPIRING_WITHIN_S, idle_ttl_s * LEASE_EXPIRING_FRACTION)``:
+    the last five minutes of a long lease, the last quarter of a short one.
+    Absolute, the threshold made a fresh 300 s lease ``expiring`` at birth
+    and a 600 s one ``expiring`` for half its life.
+    """
+    if lease.idle_ttl_s is None:
+        return LEASE_EXPIRING_WITHIN_S
+    return min(LEASE_EXPIRING_WITHIN_S, float(lease.idle_ttl_s) * LEASE_EXPIRING_FRACTION)
+
+
 def lease_state(lease: GpuLease, now: float | None = None) -> str:
     """``vacating`` | ``expiring`` | ``idle`` | ``active``, in that order of precedence.
 
     A lease inside an open vacate window (D56) is ``vacating`` whatever its
     clocks say: that it has been asked to leave is the fact a waiting client
-    needs most. Next, a lease inside :data:`LEASE_EXPIRING_WITHIN_S` of the
+    needs most. Next, a lease inside :func:`lease_expiring_within_s` of the
     sweep is ``expiring`` even if it is being touched; a lease with no TTL is
-    never ``expiring``.
+    never ``expiring``. Then ``idle`` past :func:`lease_idle_after_s`. Both
+    thresholds are relative to the lease's own TTL (capped at the absolutes),
+    so a 300 s lease is ``active`` for its first half, ``idle`` for the next
+    quarter and ``expiring`` for the last -- not ``expiring`` from birth.
 
     ``now`` is read once and every comparison uses it, so a caller can inject
     a clock and get a consistent answer rather than one derived half from the
@@ -328,10 +418,10 @@ def lease_state(lease: GpuLease, now: float | None = None) -> str:
     if lease.vacating(stamp):
         return "vacating"
     expires = lease.expires_at
-    if expires is not None and expires - stamp <= LEASE_EXPIRING_WITHIN_S:
+    if expires is not None and expires - stamp <= lease_expiring_within_s(lease):
         return "expiring"
     idle = max(0.0, stamp - lease.last_activity_at)
-    return "idle" if idle >= LEASE_IDLE_AFTER_S else "active"
+    return "idle" if idle >= lease_idle_after_s(lease) else "active"
 
 
 def lease_view(
@@ -344,16 +434,18 @@ def lease_view(
     here (D53) rather than dumping the model, or it gets a record that cannot
     answer "is this lease still alive?".
 
-    Two fields never travel by default (D56): ``vacate_token`` is excluded at
-    the model and asserted absent here anyway, and ``vacate_url`` is replaced
-    by ``vacate_registered`` -- a holder's private endpoint is not something
-    every LAN reader of ``GET /api/leases`` needs. Pass ``reveal_vacate_url``
-    only for a caller the D32 gate already trusts with the box.
+    Three fields never travel by default: ``vacate_token`` (D56) and
+    ``holder_peer`` (D55) are excluded at the model and asserted absent here
+    anyway, and ``vacate_url`` is replaced by ``vacate_registered`` -- a
+    holder's private endpoint is not something every LAN reader of
+    ``GET /api/leases`` needs. Pass ``reveal_vacate_url`` only for a caller
+    the D32 gate already trusts with the box.
     """
     stamp = time.time() if now is None else now
     expires = lease.expires_at
     data = lease.model_dump(mode="json")
     data.pop("vacate_token", None)
+    data.pop("holder_peer", None)
     url = data.pop("vacate_url", None)
     if reveal_vacate_url:
         data["vacate_url"] = url
@@ -379,15 +471,18 @@ def lease_view(
 
 
 def _vacate_reask_at(lease: GpuLease) -> float | None:
-    """When a holder that let a vacate window lapse may be asked again.
+    """When a holder whose vacate window closed may be asked again.
 
-    A quiet period equal to the window it ignored: bounded on both sides, so
-    a requester that keeps re-asking costs the holder one POST per two
-    windows, and a holder that restarted mid-window (ClawForge2 re-adopts its
-    lease) is asked again rather than never.
+    The book stamps it (:meth:`LeaseBook.mark_vacating`, a quiet period equal
+    to the window after the deadline; :meth:`LeaseBook.mark_vacate_delivery`,
+    a full window after a failed delivery collapsed the deadline). The
+    fallback derives it from the clocks for a record stamped before the field
+    existed.
     """
     if lease.vacate_deadline is None:
         return None
+    if lease.vacate_reask_at is not None:
+        return lease.vacate_reask_at
     window = lease.vacate_deadline - (lease.vacate_requested_at or lease.vacate_deadline)
     return lease.vacate_deadline + max(0.0, window)
 

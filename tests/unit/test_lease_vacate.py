@@ -67,15 +67,16 @@ HOLDER_URL = "http://127.0.0.1:8700/ui/api/vacate"
 class Recorder:
     """A vacate sender that records instead of POSTing."""
 
-    def __init__(self, *, delivered: bool = True) -> None:
+    def __init__(self, *, delivered: bool = True, status: str | None = None) -> None:
         self.calls: list[tuple[GpuLease, dict[str, Any], float]] = []
         self.delivered = delivered
+        self.status = status or ("200" if delivered else "ConnectError")
 
     async def __call__(
         self, lease: GpuLease, body: dict[str, Any], *, timeout_s: float
     ) -> tuple[bool, str]:
         self.calls.append((lease, dict(body), timeout_s))
-        return self.delivered, "200" if self.delivered else "ConnectError"
+        return self.delivered, self.status
 
 
 def _rig() -> tuple[Any, Any, Recorder]:
@@ -361,10 +362,12 @@ async def test_a_lapsed_window_degrades_to_todays_conflict_then_may_be_asked_aga
     await _settle()
     assert len(recorder.calls) == 1
 
-    # The deadline passes and the holder never released.
+    # The deadline passes and the holder never released (the clocks are moved
+    # back together, the way time moving forward would leave them).
     now = time.time()
     tenant.vacate_requested_at = now - 181
     tenant.vacate_deadline = now - 1
+    tenant.vacate_reask_at = tenant.vacate_deadline + 180
     with pytest.raises(LeaseConflictError) as excinfo:
         await manager.acquire_lease([2], holder="crucibleforge", priority=PRIORITY_AGENT)
     err = excinfo.value
@@ -372,6 +375,7 @@ async def test_a_lapsed_window_degrades_to_todays_conflict_then_may_be_asked_aga
     assert err.details["retry_after_s"] >= 1
     assert err.details["vacate"]["state"] == "timed_out"
     assert err.details["vacate"]["leases"] == [tenant.id]
+    assert err.details["vacate"]["undeliverable"] == [], "it was delivered; the holder ignored it"
     assert err.details["vacate"]["reask_at"] == pytest.approx(now - 1 + 180, abs=2.0)
     assert err.details["leases"][0]["state"] != "vacating"
     assert manager.leases.get(tenant.id) is tenant, "the lease stays"
@@ -381,6 +385,7 @@ async def test_a_lapsed_window_degrades_to_todays_conflict_then_may_be_asked_aga
     # A quiet period as long as the window it ignored, then one more ask.
     tenant.vacate_requested_at = now - 400
     tenant.vacate_deadline = now - 220
+    tenant.vacate_reask_at = now - 40
     with pytest.raises(LeaseConflictError) as excinfo:
         await manager.acquire_lease([2], holder="crucibleforge", priority=PRIORITY_AGENT)
     assert excinfo.value.code == "lease_vacating"
@@ -454,22 +459,139 @@ async def test_force_never_overrides_a_standing_lease_vacating_or_not() -> None:
     assert len(recorder.calls) == 1
 
 
-async def test_a_dead_holder_costs_the_window_and_nothing_else(
-    monkeypatch: pytest.MonkeyPatch,
+async def test_a_delivered_vacate_is_recorded_on_the_lease() -> None:
+    manager, _supervisor, recorder = _rig()
+    tenant = await manager.acquire_lease([2], holder="clawforge2", vacate_url=HOLDER_URL)
+    assert tenant.vacate_delivery is None, "never asked"
+    with pytest.raises(LeaseConflictError):
+        await manager.acquire_lease([2], holder="crucibleforge", priority=2)
+    assert tenant.vacate_delivery == "pending", "spawned, not yet answered"
+    await _settle()
+    assert (tenant.vacate_delivery, tenant.vacate_delivery_status) == ("delivered", "200")
+    assert tenant.vacating(), "a delivered ask keeps its whole window"
+    view = lease_view(tenant)
+    assert view["vacate_delivery"] == "delivered" and view["vacate_delivery_status"] == "200"
+    assert view["vacate_reask_at"] == pytest.approx(tenant.vacate_deadline + 180, abs=1.0)
+    assert len(recorder.calls) == 1
+
+
+@pytest.mark.parametrize("status", ["ConnectError", "404", "302", "ReadTimeout"])
+async def test_a_dead_holder_collapses_the_window_and_the_next_ask_is_undeliverable(
+    monkeypatch: pytest.MonkeyPatch, status: str
 ) -> None:
+    """Before: a holder that never heard cost the asker the WHOLE window of
+    ``lease_vacating`` -- 180 s of "re-ask in 15 s" for a release that could
+    not come. Now the failed POST closes the window on the spot and the next
+    re-ask is today's ``lease_conflict`` with ``vacate.state: "undeliverable"``,
+    so the asker can go elsewhere (or wait for the holder's own expiry) at
+    once. The holder is re-askable after one quiet window, not two."""
     manager, _supervisor, _ = _rig()
-    recorder = Recorder(delivered=False)
+    recorder = Recorder(delivered=False, status=status)
     manager._vacate_sender = recorder
     logged = LogRecorder()
     monkeypatch.setattr(manager_mod, "log", logged)
     tenant = await manager.acquire_lease([2], holder="clawforge2", vacate_url=HOLDER_URL)
     with pytest.raises(LeaseConflictError) as excinfo:
         await manager.acquire_lease([2], holder="crucibleforge", priority=2)
+    assert excinfo.value.code == "lease_vacating", "the POST is in flight: the answer is honest"
     await _settle()
-    assert excinfo.value.code == "lease_vacating"
-    assert tenant.vacating(), "the window runs regardless; it degrades at the deadline"
-    assert any("vacate not delivered" in event for event, _ in logged.events)
+    failed_at = time.time()
     assert len(recorder.calls) == 1
+    assert not tenant.vacating(), "the window collapsed the moment delivery failed"
+    assert (tenant.vacate_delivery, tenant.vacate_delivery_status) == ("failed", status)
+    assert tenant.vacate_reask_at == pytest.approx(failed_at + 180, abs=2.0)
+    assert lease_state(tenant) != "vacating"
+    assert any("vacate not delivered" in event for event, _ in logged.events)
+
+    # The asker's next re-ask: no more waiting, and it says why.
+    with pytest.raises(LeaseConflictError) as again:
+        await manager.acquire_lease([2], holder="crucibleforge", priority=2)
+    err = again.value
+    assert err.code == "lease_conflict"
+    assert err.details["vacate"]["state"] == "undeliverable"
+    assert err.details["vacate"]["leases"] == [tenant.id]
+    assert err.details["vacate"]["undeliverable"] == [tenant.id]
+    assert err.details["vacate"]["reask_at"] == pytest.approx(failed_at + 180, abs=2.0)
+    assert err.details["retry_after_s"] >= 1
+    assert err.details["leases"][0]["vacate_delivery"] == "failed"
+    await _settle()
+    assert len(recorder.calls) == 1, "one failed POST per quiet window, not per re-ask"
+    assert manager.leases.get(tenant.id) is tenant, "the lease stays; nothing was taken"
+
+    # The quiet window passes (the holder may have come back): one more ask.
+    tenant.vacate_reask_at = time.time() - 1
+    with pytest.raises(LeaseConflictError) as third:
+        await manager.acquire_lease([2], holder="crucibleforge", priority=2)
+    assert third.value.code == "lease_vacating"
+    await _settle()
+    assert len(recorder.calls) == 2
+
+
+async def test_a_release_while_the_post_is_in_flight_marks_nothing() -> None:
+    """The holder answered by releasing before the POST even returned: the
+    lease is gone, the protocol worked, and the late result has nothing to
+    stamp -- no exception, no resurrected record."""
+    manager, _supervisor, _ = _rig()
+    gate = asyncio.Event()
+
+    async def slow(lease: GpuLease, body: dict[str, Any], *, timeout_s: float) -> tuple[bool, str]:
+        await gate.wait()
+        return False, "ConnectError"
+
+    manager._vacate_sender = slow
+    tenant = await manager.acquire_lease([2], holder="clawforge2", vacate_url=HOLDER_URL)
+    with pytest.raises(LeaseConflictError):
+        await manager.acquire_lease([2], holder="crucibleforge", priority=2)
+    manager.release_lease(tenant.id)
+    gate.set()
+    await _settle()
+    assert len(manager.leases) == 0
+    assert (
+        manager.leases.mark_vacate_delivery(tenant.id, delivered=False, status="x", quiet_s=1.0)
+        is None
+    )
+    granted = await manager.acquire_lease([2], holder="crucibleforge", priority=2)
+    assert granted.devices == [2]
+
+
+def test_a_jit_load_never_vacates_only_a_lease_acquire_does() -> None:
+    """D56 item 5, pinned two ways: the planner refuses a load onto a leased
+    card (D53 ``gpu_leased``) without touching the lease's vacate clocks --
+    whatever the load's tier -- and ``_vacate_or_conflict`` has exactly one
+    caller in the manager, ``acquire_lease``."""
+    import inspect
+
+    from tests.unit.test_leases import make_planner
+    from tests.unit.test_leases import make_record as planner_record
+
+    book = LeaseBook()
+    tenant = book.acquire([0, 1, 2, 3], holder="clawforge2", vacate_url=HOLDER_URL)
+    planner = make_planner(book)
+    for priority in (PRIORITY_CHAT, PRIORITY_AGENT, PRIORITY_BACKGROUND):
+        record = planner_record("mine/model", priority=priority)
+        result = planner.plan_load(record)
+        assert getattr(result, "reason_code", None) == "gpu_leased", result
+    assert tenant.vacate_deadline is None and tenant.vacate_delivery is None
+    assert lease_state(tenant) == "active"
+
+    source = inspect.getsource(manager_mod.ModelManager)
+    callers = [line for line in source.splitlines() if "self._vacate_or_conflict(" in line]
+    assert len(callers) == 1
+    acquire = inspect.getsource(manager_mod.ModelManager.acquire_lease)
+    assert "self._vacate_or_conflict(" in acquire
+    assert "_vacate_or_conflict" not in inspect.getsource(manager_mod.ModelManager.load)
+
+
+def test_holder_peer_is_stored_and_never_shown() -> None:
+    book = LeaseBook()
+    lease = book.acquire([0], holder="crucibleforge", holder_peer="192.168.1.9")
+    assert lease.holder_peer == "192.168.1.9"
+    assert "192.168.1.9" not in json.dumps(lease.model_dump(mode="json"))
+    assert "192.168.1.9" not in lease.model_dump_json()
+    assert "192.168.1.9" not in json.dumps(lease_view(lease, reveal_vacate_url=True))
+    assert "192.168.1.9" not in repr(lease)
+    assert "holder_peer" not in lease_view(lease)
+    assert book.acquire([1], holder="api", holder_peer="  ").holder_peer is None
 
 
 async def test_the_token_never_reaches_a_log_line(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -650,13 +772,29 @@ def test_post_leases_accepts_the_new_fields_and_both_409s_carry_retry_after(app:
 
 
 def test_a_remote_reader_sees_registered_but_not_the_url(app: Any) -> None:
-    app.state.manager.leases.acquire([0], holder="clawforge2", vacate_url=HOLDER_URL)
-    with TestClient(app, client=("10.0.0.7", 50000)) as http:
-        row = http.get("/api/leases").json()["leases"][0]
-        assert row["vacate_registered"] is True
-        assert "vacate_url" not in row and "vacate_token" not in row
-        status_row = http.get("/api/status").json()["leases"][0]
-        assert "vacate_url" not in status_row and "vacate_token" not in status_row
+    """W2 of the 2026-09-04 live review: the URL is withheld from an
+    unprivileged reader on every projection, shown to an admin (loopback, the
+    PIN, a key) on ``/api/leases`` only, and the token appears nowhere."""
+    app.state.config.mcp.pin = "24681357"
+    app.state.manager.leases.acquire(
+        [0], holder="clawforge2", vacate_url=HOLDER_URL, vacate_token=TOKEN
+    )
+    http = TestClient(app, client=("10.0.0.7", 50000))
+    row = http.get("/api/leases").json()["leases"][0]
+    assert row["vacate_registered"] is True
+    assert "vacate_url" not in row and "vacate_token" not in row
+    status_row = http.get("/api/status").json()["leases"][0]
+    assert "vacate_url" not in status_row and "vacate_token" not in status_row
+    # The PIN is the D32 credential: it reveals, exactly as loopback does.
+    with_pin = http.get("/api/leases", headers={"X-MCP-Pin": "24681357"}).json()["leases"][0]
+    assert with_pin["vacate_url"] == HOLDER_URL
+    assert TOKEN not in json.dumps(with_pin)
+    wrong = http.get("/api/leases", headers={"X-MCP-Pin": "00000000"}).json()["leases"][0]
+    assert "vacate_url" not in wrong
+    local = TestClient(app, client=("127.0.0.1", 50000))
+    assert local.get("/api/leases").json()["leases"][0]["vacate_url"] == HOLDER_URL
+    for path in ("/api/leases", "/api/status"):
+        assert TOKEN not in local.get(path).text
 
 
 def test_post_leases_holder_defaults_to_x_sf_client(app: Any) -> None:

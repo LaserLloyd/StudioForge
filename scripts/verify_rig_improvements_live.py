@@ -11,10 +11,24 @@ server reports, so the request can never trigger a load, touch a card or add
 a token to somebody's benchmark: it is refused before the planner runs
 (``manager.lease_check``, D53). httpx only, no repo imports.
 
+The second opt-in probe, ``--probe-vacate``, proves the D56 vacate protocol
+end to end against a SPARE card: it starts a one-shot HTTP listener on
+loopback, takes a class-3 scratch tenant lease on the card with that listener
+as its ``vacate_url``, asks for the same card at class 2, and checks the whole
+exchange -- ``409 lease_vacating`` + ``Retry-After: 15``, the POST that lands
+on the listener (``X-SF-Vacate-Token``, ``X-SF-Lease-Id``, the six body
+fields), the lease reading ``vacating`` / ``delivered``, the dedupe on a
+re-ask, and the grant after the tenant releases. It refuses to run unless a
+card is free of every lease AND every resident model (a lease grant evicts
+idle residents, D36), never sends ``force``, names no ``model_ids`` so nothing
+is steered, and releases both of its leases in a ``finally``. ``POST
+/api/leases`` is D32-gated, so this needs a loopback caller or the PIN.
+
 Usage::
 
     python scripts/verify_rig_improvements_live.py [--base http://127.0.0.1:1234]
                                                   [--probe-507] [--model <id>]
+                                                  [--probe-vacate] [--pin <pin>]
 
 Exit 0 when every check passes, 1 otherwise. Run it from the rig itself:
 ``/api/mcp/info`` reveals the PIN to a loopback caller only (D32/D44).
@@ -24,14 +38,34 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+import secrets
 import sys
+import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
 EXPECTED_TOOL_COUNT = 20
 LEASE_KEYS = ("state", "holder_family", "kind", "idle_s", "expires_at", "retry_after_s")
-LEASE_STATES = {"active", "idle", "expiring"}
+LEASE_STATES = {"active", "idle", "expiring", "vacating"}
 LEASE_KINDS = {"benchmark", "render", "agent", "other"}
+#: Holders the vacate probe uses; anything it leaves behind is released on exit.
+PROBE_TENANT = "verify-vacate-tenant"
+PROBE_ASKER = "verify-vacate-bench"
+VACATE_BODY_KEYS = {
+    "lease_id",
+    "devices",
+    "requester",
+    "requester_priority",
+    "deadline_s",
+    "deadline_at",
+}
+
+
+def holder_family(holder: str) -> str:
+    """The server's rule (D53/D56): everything before the first ``-`` or ``:``."""
+    return re.split(r"[-:]", holder or "", maxsplit=1)[0].strip().lower() or (holder or "")
 
 
 @dataclass
@@ -115,7 +149,7 @@ def check_status(client: Any, base: str, report: Report) -> dict[str, Any]:
             if lease.get("kind") not in LEASE_KINDS:
                 problems.append(f"{lease.get('id')}: kind={lease.get('kind')!r}")
             holder = str(lease.get("holder") or "")
-            if lease.get("holder_family") != holder.split("-", 1)[0].strip().lower():
+            if lease.get("holder_family") != holder_family(holder):
                 problems.append(f"{lease.get('id')}: holder_family={lease.get('holder_family')!r}")
             retry = lease.get("retry_after_s")
             if lease.get("expires_at") is not None and not (
@@ -294,6 +328,313 @@ def probe_507(
 
 
 # ---------------------------------------------------------------------------
+# The vacate probe (opt-in): a scratch tenant on a spare card, asked to leave
+# ---------------------------------------------------------------------------
+
+
+class VacateListener:
+    """A one-shot loopback HTTP server that records every POST it receives."""
+
+    def __init__(self) -> None:
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        hits: list[dict[str, Any]] = []
+        self.hits = hits
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802 - http.server's spelling
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length).decode("utf-8", "replace")
+                try:
+                    body: Any = json.loads(raw)
+                except json.JSONDecodeError:
+                    body = {"raw": raw}
+                hits.append(
+                    {
+                        "path": self.path,
+                        "token": self.headers.get("X-SF-Vacate-Token"),
+                        "lease_id": self.headers.get("X-SF-Lease-Id"),
+                        "content_type": self.headers.get("Content-Type"),
+                        "body": body,
+                    }
+                )
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"vacating": true}')
+
+            def log_message(self, *_args: Any) -> None:  # silence http.server
+                return
+
+        self._server = HTTPServer(("127.0.0.1", 0), Handler)
+        self.port = int(self._server.server_address[1])
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+
+    def wait_for_hit(self, timeout_s: float) -> dict[str, Any] | None:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if self.hits:
+                return self.hits[0]
+            time.sleep(0.1)
+        return None
+
+
+def _error_of(response: Any) -> dict[str, Any]:
+    try:
+        body = response.json()
+    except Exception:  # noqa: BLE001
+        return {}
+    return body.get("error", {}) if isinstance(body, dict) else {}
+
+
+def _spare_card(status: dict[str, Any], leases: list[dict[str, Any]]) -> tuple[int | None, str]:
+    """A GPU no lease covers and no model is resident on, else why there is none."""
+    gpu_indices = sorted(int(g.get("index")) for g in status.get("gpus", []) if "index" in g)
+    leased: set[int] = set()
+    for lease in leases:
+        leased.update(int(d) for d in lease.get("devices", []))
+    resident: set[int] = set()
+    for row in status.get("loaded", []):
+        plan = row.get("plan") or {}
+        resident.update(int(d) for d in (plan.get("devices") or row.get("devices") or []))
+    free = [i for i in gpu_indices if i not in leased and i not in resident]
+    if not gpu_indices:
+        return None, "the server reports no GPUs"
+    if not free:
+        return None, (
+            f"no spare card: GPUs {gpu_indices}, leased {sorted(leased)}, "
+            f"resident {sorted(resident)} -- the probe never leases a card something is on"
+        )
+    # The highest index: on this rig the 3090s, the cards a benchmark wants least.
+    return free[-1], f"GPUs {gpu_indices}, leased {sorted(leased)}, resident {sorted(resident)}"
+
+
+def _release_probe_leases(client: Any, base: str, headers: dict[str, str]) -> list[str]:
+    """Release every lease this probe's holders still hold. Never raises."""
+    released: list[str] = []
+    try:
+        leases = _get(client, f"{base}/api/leases").get("leases", [])
+    except Exception:  # noqa: BLE001
+        return released
+    for lease in leases:
+        if lease.get("holder") in (PROBE_TENANT, PROBE_ASKER):
+            try:
+                client.delete(f"{base}/api/leases/{lease['id']}", headers=headers)
+                released.append(str(lease["id"]))
+            except Exception:  # noqa: BLE001
+                continue
+    return released
+
+
+def probe_vacate(
+    client: Any, base: str, status: dict[str, Any], pin: str | None, report: Report
+) -> None:
+    """The D56 exchange, end to end, against a spare card. Cleans up after itself."""
+    name = "vacate: tenant asked, 409 lease_vacating, POST delivered, release -> grant"
+    headers = {"X-MCP-Pin": pin} if pin else {}
+    try:
+        leases = _get(client, f"{base}/api/leases").get("leases", [])
+    except Exception as exc:  # noqa: BLE001
+        report.add(name, False, f"/api/leases: {exc}")
+        return
+    card, why = _spare_card(status, leases)
+    if card is None:
+        report.add(name, True, f"skipped: {why}")
+        return
+
+    listener = VacateListener()
+    listener.start()
+    token = "vt-" + secrets.token_hex(12)
+    vacate_url = f"http://127.0.0.1:{listener.port}/vacate"
+    problems: list[str] = []
+    steps: list[str] = []
+    tenant_id: str | None = None
+    asker_id: str | None = None
+    try:
+        # 1. the scratch tenant registers where it may be asked
+        created = client.post(
+            f"{base}/api/leases",
+            json={
+                "devices": [card],
+                "holder": PROBE_TENANT,
+                "reason": "verify_rig_improvements_live --probe-vacate (scratch tenant)",
+                "idle_ttl_s": 300,
+                "priority": 3,
+                "vacate_url": vacate_url,
+                "vacate_token": token,
+            },
+            headers=headers,
+        )
+        if created.status_code != 200:
+            error = _error_of(created)
+            hint = (
+                " -- POST /api/leases is D32-gated: run this on the rig, or pass --pin"
+                if created.status_code == 403
+                else ""
+            )
+            report.add(
+                name,
+                False,
+                f"tenant lease refused: HTTP {created.status_code} {error.get('code')}{hint}",
+            )
+            return
+        tenant = created.json()
+        tenant_id = str(tenant["id"])
+        steps.append(f"tenant {tenant_id} on CUDA {card}")
+        if tenant.get("state") != "active":
+            problems.append(f"a fresh 300 s lease reads state={tenant.get('state')!r} (W1)")
+        if tenant.get("vacate_registered") is not True or tenant.get("vacate_url") != vacate_url:
+            problems.append("the registrant was not shown its own vacate_url")
+        if tenant.get("priority") != 3:
+            problems.append(f"tenant priority={tenant.get('priority')!r}")
+        if token in created.text:
+            problems.append("the vacate_token was echoed in the create reply")
+
+        # 2. a class-2 asker wants the card
+        ask_body = {
+            "devices": [card],
+            "holder": PROBE_ASKER,
+            "reason": "verify_rig_improvements_live --probe-vacate (asker)",
+            "idle_ttl_s": 300,
+            "priority": 2,
+        }
+        asked = client.post(f"{base}/api/leases", json=ask_body, headers=headers)
+        error = _error_of(asked)
+        vacate = (error.get("studioforge") or {}).get("vacate") or {}
+        if asked.status_code == 200:
+            asker_id = str(asked.json()["id"])
+            problems.append("the asker was granted at once: the tenant was never asked")
+        elif asked.status_code != 409 or error.get("code") != "lease_vacating":
+            problems.append(f"ask: HTTP {asked.status_code} {error.get('code')!r}")
+        else:
+            steps.append("409 lease_vacating")
+            if asked.headers.get("Retry-After") != "15":
+                problems.append(f"Retry-After={asked.headers.get('Retry-After')!r}, not 15")
+            if vacate.get("state") != "vacating" or vacate.get("requested") != [tenant_id]:
+                problems.append(f"vacate block {vacate!r}")
+            if (error.get("studioforge") or {}).get("retry_after_s") != 15:
+                problems.append("retry_after_s != 15")
+            rows = (error.get("studioforge") or {}).get("leases") or []
+            if not rows or rows[0].get("state") != "vacating":
+                problems.append("the 409's lease row is not state=vacating")
+            if token in asked.text:
+                problems.append("the vacate_token appeared in the 409")
+        print("\n--- 409 envelope ---")
+        print(f"HTTP {asked.status_code}  Retry-After: {asked.headers.get('Retry-After')}")
+        print(json.dumps(_error_of(asked), indent=2)[:3000])
+        print("--- end envelope ---\n")
+
+        # 3. the POST lands on the listener
+        hit = listener.wait_for_hit(12.0)
+        if hit is None:
+            problems.append("no vacate POST reached the listener within 12 s")
+        else:
+            steps.append("POST delivered")
+            if hit.get("token") != token:
+                problems.append("X-SF-Vacate-Token did not match the registered token")
+            if hit.get("lease_id") != tenant_id:
+                problems.append(f"X-SF-Lease-Id={hit.get('lease_id')!r}")
+            body = hit.get("body") or {}
+            missing = sorted(VACATE_BODY_KEYS - set(body))
+            if missing:
+                problems.append(f"vacate body lacks {missing}")
+            if body.get("lease_id") != tenant_id or body.get("devices") != [card]:
+                problems.append(
+                    f"vacate body names {body.get('lease_id')!r} {body.get('devices')!r}"
+                )
+            if body.get("requester") != PROBE_ASKER or body.get("requester_priority") != 2:
+                problems.append("vacate body requester/priority wrong")
+            print("--- vacate POST as received ---")
+            print(
+                json.dumps(
+                    {
+                        **hit,
+                        "token": "<matches>" if hit.get("token") == token else hit.get("token"),
+                    },
+                    indent=2,
+                )
+            )
+            print("--- end ---\n")
+
+        # 4. the book says vacating / delivered, and a re-ask sends nothing new
+        delivered = None
+        for _ in range(20):
+            row = next(
+                (
+                    r
+                    for r in _get(client, f"{base}/api/leases").get("leases", [])
+                    if r.get("id") == tenant_id
+                ),
+                None,
+            )
+            delivered = (row or {}).get("vacate_delivery")
+            if delivered == "delivered":
+                break
+            time.sleep(0.25)
+        if row is None:
+            problems.append("the tenant lease vanished")
+        else:
+            if row.get("state") != "vacating":
+                problems.append(f"/api/leases row state={row.get('state')!r}, not vacating")
+            if delivered != "delivered":
+                problems.append(
+                    f"vacate_delivery={delivered!r} (status {row.get('vacate_delivery_status')!r})"
+                )
+            steps.append(f"row: state={row.get('state')} delivery={delivered}")
+        again = client.post(f"{base}/api/leases", json=ask_body, headers=headers)
+        again_error = _error_of(again)
+        again_vacate = (again_error.get("studioforge") or {}).get("vacate") or {}
+        if again.status_code == 200:
+            asker_id = str(again.json()["id"])
+            problems.append("the re-ask was granted while the tenant still held the card")
+        elif again_error.get("code") != "lease_vacating" or again_vacate.get("requested") != []:
+            requested = again_vacate.get("requested")
+            problems.append(
+                f"re-ask: {again.status_code} {again_error.get('code')!r} requested={requested!r}"
+            )
+        elif len(listener.hits) != 1:
+            problems.append(f"{len(listener.hits)} POSTs reached the listener; expected exactly 1")
+        else:
+            steps.append("re-ask deduped")
+
+        # 5. the tenant releases; the same ask is granted
+        released = client.delete(f"{base}/api/leases/{tenant_id}", headers=headers)
+        if released.status_code != 200:
+            problems.append(f"tenant release: HTTP {released.status_code}")
+        else:
+            tenant_id = None
+            granted = client.post(f"{base}/api/leases", json=ask_body, headers=headers)
+            if granted.status_code != 200:
+                code = _error_of(granted).get("code")
+                problems.append(f"post-release ask: HTTP {granted.status_code} {code!r}")
+            else:
+                asker_id = str(granted.json()["id"])
+                steps.append(f"granted {asker_id} at priority {granted.json().get('priority')}")
+                if (
+                    granted.json().get("priority") != 2
+                    or granted.json().get("holder") != PROBE_ASKER
+                ):
+                    problems.append("the grant's holder/priority are wrong")
+    finally:
+        if asker_id:
+            client.delete(f"{base}/api/leases/{asker_id}", headers=headers)
+        if tenant_id:
+            client.delete(f"{base}/api/leases/{tenant_id}", headers=headers)
+        leftovers = _release_probe_leases(client, base, headers)
+        listener.stop()
+        if leftovers:
+            problems.append(f"leftover probe leases released on exit: {leftovers}")
+    report.add(name, not problems, "; ".join(problems) if problems else " -> ".join(steps))
+
+
+# ---------------------------------------------------------------------------
 # MCP: raw streamable-HTTP handshake
 # ---------------------------------------------------------------------------
 
@@ -452,6 +793,19 @@ def main(argv: list[str] | None = None) -> int:
         "lease covers every GPU; expect 507 gpu_leased + Retry-After (off by default)",
     )
     parser.add_argument("--model", default=None, help="model id for --probe-507 (auto-picked)")
+    parser.add_argument(
+        "--probe-vacate",
+        action="store_true",
+        help="take a scratch class-3 lease on a SPARE card (no lease, no resident model) with a "
+        "loopback listener as its vacate_url, ask for the card at class 2, and check the D56 "
+        "exchange end to end; both leases are released on exit (off by default)",
+    )
+    parser.add_argument(
+        "--pin",
+        default=None,
+        help="MCP pairing PIN, sent as X-MCP-Pin on the vacate probe's lease calls when not "
+        "running from the rig itself",
+    )
     parser.add_argument("--timeout", type=float, default=15.0)
     args = parser.parse_args(argv)
 
@@ -475,6 +829,14 @@ def main(argv: list[str] | None = None) -> int:
                 "POST /v1/chat/completions -> 507 gpu_leased",
                 True,
                 "not run (pass --probe-507 to send the one refused request)",
+            )
+        if args.probe_vacate:
+            probe_vacate(client, base, status, args.pin, report)
+        else:
+            report.add(
+                "vacate: tenant asked, 409 lease_vacating, POST delivered, release -> grant",
+                True,
+                "not run (pass --probe-vacate to exercise D56 against a spare card)",
             )
         check_mcp(client, base, report)
 

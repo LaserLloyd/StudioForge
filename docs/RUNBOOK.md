@@ -263,10 +263,13 @@ No code change was needed.
   (`100.64.0.0/10`, the tailnet) unless `gateway.allow_private_image_hosts` is on.
 * **A model a GPU lease holds is not a stranger's to unload** (D55). `POST /api/models/{id}/unload`,
   `unload-all` and `/restart` answer `409 lease_conflict` naming the lease when it names the model or
-  the model sits on its cards, unless the caller is the holder (`X-SF-Client` matching the lease's
-  `holder_family`) or an admin (this machine, the PIN, or a key-bearing request). The panel and
-  `sfctl unload` are the operator's and pass. Release the lease (`DELETE /api/leases/{id}`) or wait
-  for it to idle out; the sweep's own unloads are never refused.
+  the model sits on its cards, unless the caller is an admin (this machine, the PIN, or a key-bearing
+  request) or the holder with proof: `X-SF-Client` matching the lease's `holder_family` **and** either
+  the request comes from the address the lease was registered from, or it carries the lease's own
+  `vacate_token` in `X-SF-Vacate-Token`. The label alone is not enough -- a LAN peer that merely
+  spells the holder's name is a stranger. The panel and `sfctl unload` are the operator's and pass.
+  Release the lease (`DELETE /api/leases/{id}`) or wait for it to idle out; the sweep's own unloads
+  are never refused.
 * **What an open install shows a remote reader is shaped, not closed** (D55). `GET /api/logs`,
   `/api/logs/models/{id}` and `/api/vram/holders` answer a caller that is not an admin with paths
   reduced to basenames and every foreign command line removed, and say `redacted: true`; the same

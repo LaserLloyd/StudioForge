@@ -2785,9 +2785,10 @@ class ModelManager:
         raise LeaseConflictError(
             f"Refusing {what}: {names}. A lease means those cards belong to that work until "
             f"it is released or idles out (D43). Release the lease first "
-            f"(DELETE /api/leases/{{id}}), identify yourself as the holder (X-SF-Client), or "
-            f"send an admin credential -- this server accepts a caller on this machine or "
-            f"the MCP pairing PIN when server.api_key is unset.",
+            f"(DELETE /api/leases/{{id}}), identify yourself as the holder (X-SF-Client, from "
+            f"the address the lease was registered from or with its vacate_token in "
+            f"X-SF-Vacate-Token), or send an admin credential -- this server accepts a caller "
+            f"on this machine or the MCP pairing PIN when server.api_key is unset.",
             details={"leases": [lease_view(lease) for lease in held]},
         )
 
@@ -2858,6 +2859,7 @@ class ModelManager:
         priority: int | None = None,
         vacate_url: str | None = None,
         vacate_token: str | None = None,
+        holder_peer: str | None = None,
     ) -> GpuLease:
         """Give ``devices`` to ``model_ids`` (or to nobody) until released or idle.
 
@@ -2989,6 +2991,7 @@ class ModelManager:
             priority=tier,
             vacate_url=vacate_url,
             vacate_token=vacate_token,
+            holder_peer=holder_peer,
         )
         try:
             for victim in victims:
@@ -3139,17 +3142,26 @@ class ModelManager:
             raise
         except Exception as exc:  # noqa: BLE001 - the sender promised not to raise; belt and braces
             delivered, status = False, type(exc).__name__
+        # Mark the lease only if it is still the one in the book: a release or
+        # a sweep while the POST was in flight means the protocol worked.
+        marked = self.leases.mark_vacate_delivery(
+            lease.id,
+            delivered=delivered,
+            status=status,
+            quiet_s=float(self.config.leases.vacate_timeout_s),
+        )
         if delivered:
             log.info("gpu lease vacate delivered", lease_id=lease.id, target=target, status=status)
         else:
             # Never str(exc): a header h11 disliked is quoted back verbatim.
             log.warning(
-                "gpu lease vacate not delivered; the window still runs and then degrades to "
-                "lease_conflict",
+                "gpu lease vacate not delivered; the window is closed and the next re-ask is "
+                "answered lease_conflict (vacate.state undeliverable)",
                 lease_id=lease.id,
                 holder=lease.holder,
                 target=target,
                 status=status,
+                reask_at=marked.vacate_reask_at if marked is not None else None,
             )
 
     async def _vacate_url_is_ours(self, url: str) -> bool:

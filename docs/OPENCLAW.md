@@ -410,8 +410,8 @@ something you did, and it never evicts or interrupts anything.
 | key | meaning |
 | --- | --- |
 | `idle_s`, `expires_at` | the clocks. `expires_at` is `null` for a lease held until released |
-| `state` | `active`, `idle` (nothing has touched it for 5 min), or `expiring` (the sweep is within 5 min of releasing it). Expiry outranks idleness |
-| `holder_family` | everything before the first `-` in `holder`, lowercased. CrucibleForge leases as `crucibleforge` for a run and `crucibleforge-judge` for the judge phase; both answer `crucibleforge`, so match on this rather than on the exact holder |
+| `state` | `active`; `idle` (quiet for half its TTL, at most 5 min); `expiring` (inside the last quarter of its TTL, at most 5 min — so a long lease is `expiring` for its last 5 min, a 600 s one for its last 150 s); or `vacating` (a better class has asked the holder to leave, D56). Vacating outranks expiry, expiry outranks idleness |
+| `holder_family` | everything before the first `-` or `:` in `holder`, lowercased. CrucibleForge leases as `crucibleforge` for a run and `crucibleforge-judge` for the judge phase; both answer `crucibleforge`, and this server's own `benchmark:parallel` answers `benchmark` — match on this rather than on the exact holder |
 | `kind` | `benchmark`, `render`, `agent` or `other`, derived from `holder_family`. **Descriptive, never enforced** — the book is strictly first-come-first-served, and nothing preempts on this |
 | `retry_after_s` | how long to wait before asking again, capped at 300 s. `null` when there is no expiry. Capped on purpose: an early release is common, and a client asleep for two hours would never notice one |
 

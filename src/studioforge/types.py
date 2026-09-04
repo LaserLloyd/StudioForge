@@ -1090,6 +1090,26 @@ class GpuLease(BaseModel):
     vacate_requested_at: float | None = None
     vacate_requested_by: str | None = None
     vacate_deadline: float | None = None
+    #: When the holder may be asked again after a window that lapsed, or one
+    #: that could not be delivered (D56): stamped by the book, never derived
+    #: from the deadline alone, because an undeliverable ask collapses the
+    #: deadline to "now" and the quiet period must still be a full window.
+    vacate_reask_at: float | None = None
+    #: What became of the one vacate POST: ``None`` (never asked), ``pending``
+    #: (spawned, no answer yet), ``delivered`` (any 2xx) or ``failed`` (a
+    #: transport error, a timeout, a redirect or a non-2xx). A failed delivery
+    #: ends the window at once: the asker is told ``undeliverable`` on its next
+    #: re-ask instead of waiting the whole window for a holder that never heard.
+    vacate_delivery: str | None = None
+    #: The HTTP status or the exception's CLASS NAME behind ``vacate_delivery``.
+    #: Never the exception text, which can quote the header (D6).
+    vacate_delivery_status: str | None = None
+    #: The peer address the lease was registered from over HTTP, when it was
+    #: (D55). Proof of holdership for the open unload routes: the caller that
+    #: took the lease is the caller that may take its models down. Excluded
+    #: from every dump -- a LAN peer's address is nobody else's business and
+    #: not part of the lease contract.
+    holder_peer: str | None = Field(default=None, exclude=True, repr=False)
 
     @property
     def idle_s(self) -> float:

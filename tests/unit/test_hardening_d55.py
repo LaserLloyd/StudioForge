@@ -358,15 +358,78 @@ def test_the_open_unload_routes_refuse_a_stranger_but_not_the_holder_or_an_admin
     assert stranger.post(f"/api/models/{MODEL_ID}/restart").status_code == 409
     assert supervisor.get(MODEL_ID) is not None, "nothing was taken apart"
 
-    # The holder says who it is; the family rule makes the judge phase one client.
-    holder = stranger.post(
+    # The label alone is NOT the holder (round-2 review): the lease was taken
+    # from this machine, so a LAN peer that merely spells the holder's name
+    # is still a stranger -- the first cut of D55 let it through.
+    spoof = stranger.post(
         f"/api/models/{MODEL_ID}/unload", headers={"X-SF-Client": "crucibleforge-judge"}
     )
-    assert holder.status_code == 200 and holder.json()["unloaded"] is True
+    assert spoof.status_code == 409 and supervisor.get(MODEL_ID) is not None
+    assert "X-SF-Vacate-Token" in spoof.json()["error"]["message"]
 
-    supervisor._instances = [_resident(MODEL_ID, [0])]
     admin = TestClient(app, client=LOOPBACK)
     assert admin.post("/api/models/unload-all").json()["unloaded"] == [MODEL_ID]
+
+
+def test_the_holder_waiver_needs_the_registering_peer_or_the_leases_own_token(
+    app: Any,
+) -> None:
+    """The remote holder (CrucibleForge on another box, sending the PIN to
+    take the lease) may still unload its own benchmark model from the open
+    route -- from the address it leased from, or with the ``vacate_token`` it
+    registered. A third host with the same label, and nothing else, may not:
+    the family rule makes ``crucibleforge-judge`` one client, not one
+    credential."""
+    supervisor = _install(app, [])
+    app.state.config.mcp.pin = PIN
+    benchbox = TestClient(app, client=("10.9.0.2", 5000))
+    lease = benchbox.post(
+        "/api/leases",
+        json={
+            "devices": [0],
+            "holder": "crucibleforge",
+            "model_ids": [MODEL_ID],
+            "vacate_url": HOLDER_URL,
+            "vacate_token": "cf-secret-0123456789",  # scrub-ok: fixture bearer
+        },
+        headers={"X-MCP-Pin": PIN},
+    ).json()
+    assert lease["holder"] == "crucibleforge", lease
+    record = app.state.manager.leases.get(lease["id"])
+    assert record.holder_peer == "10.9.0.2"
+
+    # A third host with the label: refused, nothing taken apart.
+    supervisor._instances = [_resident(MODEL_ID, [0])]
+    elsewhere = TestClient(app, client=("10.9.0.3", 5000))
+    label_only = {"X-SF-Client": "crucibleforge-judge"}
+    assert elsewhere.post(f"/api/models/{MODEL_ID}/unload", headers=label_only).status_code == 409
+    assert elsewhere.post("/api/models/unload-all", headers=label_only).status_code == 409
+    assert elsewhere.post(f"/api/models/{MODEL_ID}/restart", headers=label_only).status_code == 409
+    # ...and no label at all, from the registering peer, is not the holder either.
+    assert benchbox.post(f"/api/models/{MODEL_ID}/unload").status_code == 409
+    assert supervisor.get(MODEL_ID) is not None
+
+    # The registering peer with the label: the holder.
+    ok = benchbox.post(f"/api/models/{MODEL_ID}/unload", headers=label_only)
+    assert ok.status_code == 200 and ok.json()["unloaded"] is True
+
+    # A third host presenting the lease's own token: proof enough.
+    supervisor._instances = [_resident(MODEL_ID, [0])]
+    wrong_token = {**label_only, "X-SF-Vacate-Token": "not-it"}
+    assert elsewhere.post(f"/api/models/{MODEL_ID}/unload", headers=wrong_token).status_code == 409
+    right_token = {**label_only, "X-SF-Vacate-Token": "cf-secret-0123456789"}  # scrub-ok: fixture
+    assert elsewhere.post(f"/api/models/{MODEL_ID}/unload", headers=right_token).status_code == 200
+
+    # The PIN alone is the admin rule, label or not.
+    supervisor._instances = [_resident(MODEL_ID, [0])]
+    with_pin = elsewhere.post(f"/api/models/{MODEL_ID}/unload", headers={"X-MCP-Pin": PIN})
+    assert with_pin.status_code == 200
+
+    # The peer never leaks: not in the book's views, not in the refusal.
+    supervisor._instances = [_resident(MODEL_ID, [0])]
+    refused = elsewhere.post(f"/api/models/{MODEL_ID}/unload", headers=label_only)
+    assert "10.9.0.2" not in refused.text
+    assert "10.9.0.2" not in benchbox.get("/api/leases", headers={"X-MCP-Pin": PIN}).text
 
 
 def test_an_unleased_model_unloads_from_the_lan_exactly_as_before(app: Any) -> None:

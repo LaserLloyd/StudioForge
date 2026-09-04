@@ -161,12 +161,41 @@ MANAGEMENT_FALLBACK_TOOLS: tuple[tuple[str, str], ...] = (
 #: Ceiling on the one fetch that happens before the agent has a tool list.
 INSTRUCTIONS_FETCH_TIMEOUT_S = 5.0
 
+#: Ceiling on the forwarded text. The management server's INSTRUCTIONS are
+#: ~12k characters today (measured 2026-09-04: 12,099) and ride into every
+#: session's context; a server that answered with a megabyte -- a bug, or
+#: not our server at all -- must not turn the handshake into a context bomb.
+#: Cut at a line boundary with a marker, so the agent knows it read a prefix.
+UPSTREAM_INSTRUCTIONS_MAX_CHARS = 24_000
+UPSTREAM_TRUNCATED_MARK = (
+    "[... the server's guidance was cut here: it exceeded the proxy's limit ...]"
+)
+
 #: Separates this proxy's own guidance from the management server's, which is
 #: forwarded verbatim behind it. Two strings, not one merged one: the server's
 #: INSTRUCTIONS are edited on the rig and shipped with the server, and silently
 #: rewriting them here is how the two drift apart. The divider is what tells an
 #: agent that the text below it describes the server rather than this bridge.
 UPSTREAM_DIVIDER = "--- Advice from the StudioForge server itself ---"
+
+
+def bound_upstream_instructions(text: str | None) -> str:
+    """The upstream's guidance, stripped and capped at :data:`UPSTREAM_INSTRUCTIONS_MAX_CHARS`.
+
+    Cut at the last line break inside the budget so a sentence is never split
+    mid-word, and ended with :data:`UPSTREAM_TRUNCATED_MARK` so the reader
+    knows it has a prefix. Empty in, empty out.
+    """
+    stripped = (text or "").strip()
+    if len(stripped) <= UPSTREAM_INSTRUCTIONS_MAX_CHARS:
+        return stripped
+    budget = UPSTREAM_INSTRUCTIONS_MAX_CHARS - len(UPSTREAM_TRUNCATED_MARK) - 2
+    head = stripped[:budget]
+    cut = head.rfind("\n")
+    if cut > budget // 2:
+        head = head[:cut]
+    return f"{head.rstrip()}\n\n{UPSTREAM_TRUNCATED_MARK}"
+
 
 #: Upper bound on a failure description. A misbehaving upstream can return a
 #: multi-kilobyte validation dump, and pasting that into a tool result or a
@@ -535,7 +564,7 @@ class McpProxy:
             "lease etiquette, the identity and priority rules -- is one page: "
             "docs/OPENCLAW-RIG.md in the StudioForge repository."
         )
-        text = (upstream or "").strip()
+        text = bound_upstream_instructions(upstream)
         if not text:
             return own
         return f"{own}\n\n{UPSTREAM_DIVIDER}\n\n{text}"

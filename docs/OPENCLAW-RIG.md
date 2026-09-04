@@ -131,7 +131,9 @@ the value is validated: anything that is not 1, 2 or 3 is a `400`.
 A **lease** is how one tenant tells the others to keep off a card. StudioForge owns the book; every
 holder reads the same records (`server_status().leases`, `GET /api/leases`,
 `comfy_status().leases`), and every record carries `state`, `holder`, `holder_family`, `kind`,
-`expires_at` and `retry_after_s`.
+`expires_at` and `retry_after_s`. `state` is `active`, `idle` (quiet for half its TTL, at most
+5 min), `expiring` (inside the last quarter of its TTL, at most 5 min) or `vacating` (asked to
+leave, D56); `holder_family` is everything before the first `-` or `:` in `holder`, lowercased.
 
 Who takes them: CrucibleForge for a benchmark run; StudioForge's own sweeps
 (`test_model`, `benchmark_parallel`) for their duration; ClawForge2 for the card ComfyUI is pinned
@@ -172,11 +174,17 @@ few hundred megabytes stay behind and are reported rather than pretended away. I
 passes with no release, the answer degrades to today's plain `409 lease_conflict` and it becomes an
 operator problem. **For an agent, both 409s mean the same thing: do not force, do not loop.**
 `lease_vacating` is a wait — re-send the same request every `retry_after_s` until it is granted
-or the answer becomes `lease_conflict` with `error.studioforge.vacate.state: "timed_out"`, which
-says the holder ignored the ask; `vacate.reask_at` says when it may be asked again. A plain
-`lease_conflict` on the *first* ask means nobody could be asked: an equal or better class holds
-the cards, or the holder registered no `vacate_url`. `lease_conflict` is a no —
-read `server_status().leases` and decide whether the work belongs on this rig at all.
+or the answer becomes `lease_conflict` with an `error.studioforge.vacate` block. Its `state` is one
+of three words: `"vacating"` only ever rides on `lease_vacating` (the ask is out, the window is
+open); `"timed_out"` says the holder heard the ask and ignored it for the whole window;
+`"undeliverable"` says the holder never heard it — the POST failed, and the window was closed on
+the spot so you are not left re-asking for a release that cannot come. In both closing cases
+`vacate.reask_at` says when the holder may be asked again (one quiet window later), and each lease
+row carries `vacate_delivery` (`delivered` / `failed`) and `vacate_delivery_status` (the HTTP code
+or the error class) so you can see which case you are in. A plain `lease_conflict` on the *first*
+ask means nobody could be asked: an equal or better class holds the cards, or the holder registered
+no `vacate_url`. `lease_conflict` is a no — read `server_status().leases` and decide whether the
+work belongs on this rig at all.
 
 ## 7. What to read first, and what it costs
 
@@ -250,7 +258,7 @@ Branch on the **code**, never on the prose. StudioForge puts it in the OpenAI er
 | SF | 400 | `invalid_config` / a rejected `priority` | the request is malformed | fix the body |
 | SF | 404 | `model_not_found` | unknown id or alias | fix the id (`list_models`) |
 | SF | 409 | `lease_conflict` | `reserve_gpus` overlaps a standing lease | read `server_status().leases`; do not force |
-| SF | 409 | `lease_vacating` | that holder has been asked to stand down and has not finished | re-send every `retry_after_s`; stop when it becomes `lease_conflict` (`vacate.state: "timed_out"`) |
+| SF | 409 | `lease_vacating` | that holder has been asked to stand down and has not finished | re-send every `retry_after_s`; stop when it becomes `lease_conflict` (`vacate.state: "timed_out"` — it ignored the ask; `"undeliverable"` — it never heard it) |
 | SF | 403 | `remote_admin_requires_credential` | a box change from off-rig without the PIN or key | the operator's call; do not retry |
 | SF | 502 | `model_load_failed` / `upstream_error` | the engine failed to start, or faulted | report (the stderr tail is in the message); `restart_server` only if `/health` is wedged |
 | SF | 401 | `invalid_api_key` / `invalid_mcp_pin` | credential | operator |

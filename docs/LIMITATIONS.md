@@ -167,9 +167,11 @@ own:
   registered no URL (a benchmark client, this server's own benchmarks) is never asked, and `force`
   never overrides a standing lease.
 * It guards its own models from a deliberate unload (D55: `409 lease_conflict` unless the caller is
-  the holder or an admin), but the holder's name is `X-SF-Client`, a label and not a credential --
-  the guard stops the accident, not a caller who knows the name. `server.api_key` is what makes it
-  a rule.
+  an admin or the holder). "The holder" is `X-SF-Client` matching the lease's `holder_family` **plus
+  proof**: the request comes from the address the lease was registered from, or carries the lease's
+  own `vacate_token` in `X-SF-Vacate-Token`. A peer address is what it is behind a reverse proxy
+  (the proxy's), so put a proxied install behind `server.api_key`, which makes every caller an
+  admin by the middleware and the proof moot.
 
 ## Who is holding the VRAM: what can and cannot be answered
 

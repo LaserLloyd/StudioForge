@@ -19,6 +19,7 @@ from fastapi.responses import JSONResponse
 from studioforge import __version__
 from studioforge.api.auth import (
     PIN_WITHHELD_NOTE,
+    _matches,
     is_admin_caller,
     may_reveal_pin,
     redact_config_dict,
@@ -35,7 +36,7 @@ from studioforge.core.benchmark import (
     available_modes,
 )
 from studioforge.core.diskspace import disk_report
-from studioforge.core.leases import holder_family, lease_view
+from studioforge.core.leases import VACATE_TOKEN_HEADER, holder_family, lease_view
 from studioforge.core.manager import validate_load_args
 from studioforge.core.model_gate import (
     GateRequirement,
@@ -81,17 +82,24 @@ def may_unload_lease_held(request: Request, state: Any, model_ids: Any) -> bool:
     *not* a route-level gate: it is asked only once a lease is actually in the
     way, and it answers for the two callers who legitimately are.
 
-    * **The holder.** ``X-SF-Client`` is the label the gateway already
-      attributes inference by, matched on the lease's ``holder_family`` so
-      ``crucibleforge`` and ``crucibleforge-judge`` are one client. It is
-      self-declared and is **not** a credential -- it cannot be, on an open
-      install -- so this only stops the accident (a stranger's ``unload-all``
-      sweeping up a benchmark), never a caller who knows the holder's name.
-      That is the same trade the ``client`` tag makes everywhere else, and the
-      credential in §7(a) of the audit is what upgrades it.
     * **An admin.** D32's own test: a caller on this machine, the MCP pairing
       PIN, or an install with ``server.api_key`` set (where the middleware has
       already authenticated this request).
+    * **The holder, with proof.** ``X-SF-Client`` is the label the gateway
+      already attributes inference by, matched on the lease's ``holder_family``
+      so ``crucibleforge`` and ``crucibleforge-judge`` are one client. It is
+      self-declared, so on its own it is not a credential: the first cut of
+      D55 accepted the label alone, which meant any LAN peer that could spell
+      ``crucibleforge`` could take a benchmark's models down -- the hole the
+      guard exists to close, re-opened by a header. The label now has to come
+      with one of two proofs, per lease in the way: the request arrives from
+      the **same peer address the lease was registered from** (the caller that
+      took the lease is the caller that may take its models down; a source
+      address is not forgeable over a TCP connection the way a header is), or
+      it carries the lease's own **``vacate_token``** in ``X-SF-Vacate-Token``
+      (a secret only the holder and this server know). A lease taken from the
+      MCP plane has no peer and no token, and its holder is the operator by
+      the PIN gate -- an admin under the first rule.
 
     Returns ``False`` when no lease is in the way at all -- there is nothing to
     waive, and the manager will not raise.
@@ -99,12 +107,24 @@ def may_unload_lease_held(request: Request, state: Any, model_ids: Any) -> bool:
     held = state.manager.leases_holding(list(model_ids))
     if not held:
         return False
-    headers = getattr(request, "headers", None)
-    label = (headers.get("x-sf-client") if headers is not None else None) or ""
-    label = label.strip()
-    if label and all(holder_family(label) == holder_family(lease.holder) for lease in held):
+    if is_admin_caller(request, state.config):
         return True
-    return is_admin_caller(request, state.config)
+    headers = getattr(request, "headers", None)
+    label = ((headers.get("x-sf-client") if headers is not None else None) or "").strip()
+    if not label or any(holder_family(label) != holder_family(lease.holder) for lease in held):
+        return False
+    presented = ((headers.get(VACATE_TOKEN_HEADER) if headers is not None else None) or "").strip()
+    peer = str(getattr(getattr(request, "client", None), "host", None) or "")
+    return all(_holder_proof(lease, peer=peer, presented=presented) for lease in held)
+
+
+def _holder_proof(lease: Any, *, peer: str, presented: str) -> bool:
+    """One lease's proof of holdership: the registering peer, or its own token."""
+    registered = getattr(lease, "holder_peer", None)
+    if registered and peer and registered == peer:
+        return True
+    token = getattr(lease, "vacate_token", None)
+    return bool(token and presented and _matches(presented, str(token)))
 
 
 # ---------------------------------------------------------------------------
@@ -384,11 +404,12 @@ async def list_leases(request: Request) -> dict[str, Any]:
     Each row carries ``priority`` (the D46 class of the claim), ``state``
     (``vacating`` while the holder has been asked to leave, D56),
     ``vacate_registered`` and ``vacate_deadline``. The holder's ``vacate_url``
-    itself is shown only to a caller the D32 gate trusts with the box (this
-    machine, or a credentialed one); the token is never shown to anyone.
+    itself is shown only to an admin caller (D32 as ``is_admin_caller``: this
+    machine, the MCP PIN, or a key-bearing request); the token is never shown
+    to anyone.
     """
     state = _state(request)
-    reveal = may_reveal_pin(request, state.config)
+    reveal = is_admin_caller(request, state.config)
     leases = [lease_view(lease, reveal_vacate_url=reveal) for lease in state.manager.leases.all()]
     return {"leases": leases, "count": len(leases)}
 
@@ -431,6 +452,9 @@ async def create_lease(
     """
     state = _state(request)
     client_label = (request.headers.get("x-sf-client") or "").strip()
+    # The registering peer is the holder's proof on the open unload routes
+    # (D55, ``may_unload_lease_held``): stored on the lease, never shown.
+    peer = str(getattr(getattr(request, "client", None), "host", None) or "") or None
     lease = await state.manager.acquire_lease(
         devices,
         holder=(holder or "").strip() or client_label or "api",
@@ -441,6 +465,7 @@ async def create_lease(
         priority=priority,
         vacate_url=vacate_url,
         vacate_token=vacate_token,
+        holder_peer=peer,
     )
     # The registrant just sent the URL: echoing it back tells it what was stored.
     return lease_view(lease, reveal_vacate_url=True)

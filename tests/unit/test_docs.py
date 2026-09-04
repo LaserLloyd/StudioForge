@@ -372,6 +372,10 @@ def test_the_rig_pages_failure_table_uses_real_codes() -> None:
         "context_exceeded",
         "model_not_found",
         "lease_conflict",
+        # D56's vacate refusal: documented beside `lease_conflict` because an
+        # agent meets both from the same call. Raised with a per-raise
+        # ``code="lease_vacating"`` in the manager, which the scan sees.
+        "lease_vacating",
         "remote_admin_requires_credential",
         "model_load_failed",
         "upstream_error",
@@ -380,9 +384,17 @@ def test_the_rig_pages_failure_table_uses_real_codes() -> None:
     ):
         assert code in real, f"the rig page teaches `{code}`, which nothing raises any more"
         assert f"`{code}`" in text, f"`{code}` dropped out of the rig page's failure table"
-    # D56's vacate refusal: documented beside `lease_conflict` because an agent
-    # meets both from the same call.
-    assert "`lease_vacating`" in text
+    # The three `vacate.state` values the page tells an agent to branch on are
+    # the three the book emits (D56): checked against the source, not memory.
+    book = (REPO_ROOT / "src" / "studioforge" / "core" / "leases.py").read_text(encoding="utf-8")
+    manager = (REPO_ROOT / "src" / "studioforge" / "core" / "manager.py").read_text(
+        encoding="utf-8"
+    )
+    for state in ("vacating", "timed_out", "undeliverable"):
+        assert f'"{state}"' in book or f'"{state}"' in manager, state
+        assert f'`vacate.state: "{state}"`' in text or f'"{state}"' in text, (
+            f"vacate.state {state!r} is not taught on the rig page"
+        )
 
     for code in _CLAWFORGE2_CODES:
         assert f"`{code}`" in text, f"ClawForge2's `{code}` is missing from the failure table"

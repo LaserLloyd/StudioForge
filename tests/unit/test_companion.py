@@ -1233,6 +1233,71 @@ async def test_upstream_instructions_are_fetched_and_a_down_server_is_silent(
     assert UPSTREAM_DIVIDER not in proxy.build_server(None).instructions  # type: ignore[operator]
 
 
+async def test_the_instructions_fetch_is_bounded_when_the_server_black_holes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refused connection fails fast; a host that swallows packets does not,
+    and this fetch runs before the agent has a tool list. The bound is the
+    proxy's own, not the transport's 30 s connect timeout."""
+    import time as time_mod
+    from contextlib import asynccontextmanager
+
+    import anyio
+    from studioforge_companion import mcp_proxy as proxy_mod
+
+    @asynccontextmanager
+    async def hang(self: Any) -> Any:
+        await anyio.sleep(30)
+        yield None  # pragma: no cover - the bound fires first
+
+    monkeypatch.setattr(proxy_mod, "INSTRUCTIONS_FETCH_TIMEOUT_S", 0.3)
+    monkeypatch.setattr(Upstream, "_session", hang)
+    upstream = Upstream(label="management", url="http://127.0.0.1:1/mcp", is_watchdog=False)
+    started = time_mod.monotonic()
+    assert await upstream.instructions() is None
+    assert time_mod.monotonic() - started < 2.0, "the fetch outlived its bound"
+    # A failure is remembered for the failure TTL, so the next handshake does
+    # not pay the bound a second time.
+    started = time_mod.monotonic()
+    assert await upstream.instructions() is None
+    assert time_mod.monotonic() - started < 0.1
+
+
+def test_the_forwarded_instructions_are_bounded_in_size() -> None:
+    """The server's text is ~12k characters (measured 2026-09-04: 12,099) and
+    is forwarded whole; a server answering with far more is cut at a line
+    boundary under the cap, with a marker, and the proxy's own text is never
+    the part that goes."""
+    from studioforge_companion.mcp_proxy import (
+        UPSTREAM_INSTRUCTIONS_MAX_CHARS,
+        UPSTREAM_TRUNCATED_MARK,
+        bound_upstream_instructions,
+    )
+
+    from studioforge.mcp.management import INSTRUCTIONS
+
+    assert len(INSTRUCTIONS) < UPSTREAM_INSTRUCTIONS_MAX_CHARS, (
+        f"the real INSTRUCTIONS ({len(INSTRUCTIONS)} chars) no longer fit under the cap; "
+        f"raise UPSTREAM_INSTRUCTIONS_MAX_CHARS deliberately or trim the server's text"
+    )
+    assert bound_upstream_instructions(INSTRUCTIONS) == INSTRUCTIONS.strip()
+    assert bound_upstream_instructions(None) == "" and bound_upstream_instructions("  ") == ""
+
+    flood = "\n".join(f"line {n}: " + "x" * 90 for n in range(2000))
+    assert len(flood) > UPSTREAM_INSTRUCTIONS_MAX_CHARS
+    cut = bound_upstream_instructions(flood)
+    assert len(cut) <= UPSTREAM_INSTRUCTIONS_MAX_CHARS
+    assert cut.endswith(UPSTREAM_TRUNCATED_MARK)
+    body = cut[: -len(UPSTREAM_TRUNCATED_MARK)].rstrip()
+    assert body.endswith("x" * 90), "cut at a line boundary, never mid-line"
+
+    proxy = McpProxy(ServerProfile(name="rig", url="http://rig:1234"))
+    own = proxy.instructions()
+    merged = proxy.instructions(flood)
+    assert merged.startswith(own) and merged.endswith(UPSTREAM_TRUNCATED_MARK)
+    assert len(merged) <= len(own) + UPSTREAM_INSTRUCTIONS_MAX_CHARS + 64
+
+
 def _result_text(result: Any) -> str:
     from studioforge_companion.mcp_proxy import result_text
 

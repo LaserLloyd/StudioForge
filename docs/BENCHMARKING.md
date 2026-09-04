@@ -57,6 +57,13 @@ does not touch it. What a benchmark *can* do is **ask** a worse-class tenant to 
   the answer becomes today's plain `409 lease_conflict` with `vacate.state: "timed_out"` and
   `vacate.reask_at`: the holder ignored the ask and is not asked again until that time. Stop
   polling and escalate.
+* **When the holder never heard the ask** — the POST failed (connection refused, a timeout, a
+  redirect, a 404 from a build without the route) — the window is closed at once and your next
+  re-ask is `409 lease_conflict` with `vacate.state: "undeliverable"`, `vacate.undeliverable`
+  naming the lease and `vacate.reask_at` one window out. You are not left re-asking for 180 s;
+  each lease row says what happened (`vacate_delivery: "failed"`, `vacate_delivery_status`: the
+  code or the error class). Wait for the holder's own `expires_at`, lease other cards, or the
+  runbook below.
 * **Plain `409 lease_conflict`** on the first ask means nobody can be asked: an equal or better
   class holds the cards (another benchmark, the chat model's claim), or the holder registered no
   vacate endpoint. `Retry-After` carries the holder's own countdown; wait for its `expires_at`,
@@ -205,6 +212,7 @@ reserve_gpus(devices=[...winner devices...], model_id=...)         # optional: l
 | `503` with `retry_after_s` | a model is serving / loading / a test is running | wait that long, check again |
 | `409 lease_vacating` | a worse-class tenant holds the cards and has been asked to leave (D56) | re-ask every `retry_after_s`; granted once it releases |
 | `409 lease_conflict` with `vacate.state: "timed_out"` | the tenant ignored the ask for `leases.vacate_timeout_s` | stop polling; the runbook above |
+| `409 lease_conflict` with `vacate.state: "undeliverable"` | the tenant's `vacate_url` did not answer 2xx (`vacate_delivery_status` says how) | the tenant is down or has no vacate route; wait for its `expires_at`, or the runbook above |
 | `409 lease_conflict`, no `vacate` block | an equal/better-class lease, or a holder with no vacate endpoint | wait for its `expires_at` (`Retry-After`), or lease other cards |
 | one mode has `error` naming a lease or "serving" | a neighbour was busy on those cards | rerun that mode later |
 | `applicable: false` | the model does not fit that placement | not an error; skip |
