@@ -74,7 +74,7 @@ Do this first. Every later step assumes it, and it is the single most common thi
 curl -s -m 8 http://<rig-ip>:1234/health
 ```
 
-Expected: `{"status":"ok","version":"1.26-09-04",...}` — the version comes from this repository's
+Expected: `{"status":"ok","version":"1.26-09-04-2",...}` — the version comes from this repository's
 `studioforge/__init__.py`. A different string means you are talking to another build, and these
 instructions may not match it.
 
@@ -107,6 +107,31 @@ properly, see *Turning on a real API key* below.)
 
 Put those two lines in whatever OpenClaw reads at startup — your shell profile, a systemd unit's
 `Environment=`, or OpenClaw's own env config — so they survive a reboot.
+
+**Give the agent an identity while you are here.** `GET /api/status` → `clients` attributes
+inference by the `X-SF-Client` header and falls back to the peer IP when there is none, so an
+unlabelled agent is an IP address in every report and every "who is starving the rig" question.
+OpenClaw sends static extra headers per provider — `models.providers.<id>.headers` in its config
+(verify the key names against your OpenClaw version):
+
+```json
+{
+  "models": {
+    "providers": {
+      "studioforge": {
+        "baseUrl": "http://<rig-ip>:1234/v1",
+        "api": "openai-completions",
+        "headers": { "X-SF-Client": "openclaw-<agent>" }
+      }
+    }
+  }
+}
+```
+
+Pick **one identity string per agent** and reuse it everywhere: as this header, as the `client`
+tag on the image service if this rig runs one, and as the `holder` of any GPU lease that agent
+takes. One string means one row in every rollup instead of three unrelated ones — see
+[OPENCLAW-RIG.md](OPENCLAW-RIG.md).
 
 **Verify:**
 
@@ -261,8 +286,9 @@ session.
 There is no inference tool, deliberately: generation goes over `POST /v1/chat/completions`, which
 streams. The three sequences the agent actually runs are in
 [OPENCLAW.md](OPENCLAW.md#the-loop-an-agent-actually-runs) — choosing and loading a model
-(`list_models` → `load_model`), getting a new one (`search_models` → `repo_details` →
-`download_model`), and getting VRAM back (`server_status` → `reclaim_orphan_engines`).
+(`check_loaded_model` → `list_models` → `load_model`; the gate comes first, and a "yes" means no
+load at all), getting a new one (`search_models` → `repo_details` → `download_model`), and getting
+VRAM back (`server_status` → `reclaim_orphan_engines`).
 
 `connection_info` is what to call when the network moves: it hands back the current LAN and
 Tailscale addresses for direct connection.

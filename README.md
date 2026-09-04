@@ -9,15 +9,15 @@ planner, a web control panel, a system tray, and an MCP control plane for agents
 LM Studio as the backend for [OpenClaw](docs/OPENCLAW.md) — it listens on LM Studio's port, so
 switching is a host change, not a rewrite.
 
-**Status:** v1.26-09-04. Windows is the reference platform and runs it daily; Linux is supported (CI
+**Status:** v1.26-09-04-2. Windows is the reference platform and runs it daily; Linux is supported (CI
 runs both) and less battle-tested. Questions and bug reports: [Contact](#contact).
 
 **On versions.** StudioForge is calendar-versioned: a major, then the release date. The display
-version lives in `src/studioforge/__init__.py` — `1.26-09-04` — and is what `GET /api/version`,
+version lives in `src/studioforge/__init__.py` — `1.26-09-04-2` — and is what `GET /api/version`,
 `GET /health`, the MCP `server_status` tool and `sfctl status` report. PEP 440 has no way to spell
-a hyphenated date, so both `pyproject.toml` files carry the same date as `1.26.9.4`, which is what
+a hyphenated date, so both `pyproject.toml` files carry the same date as `1.26.9.4.2`, which is what
 `pip`/`uv` see in the wheel metadata; the `sfctl` companion ships from the same release and carries
-the same version, and release tags are `v1.26-09-04`. Check what a server is actually running with
+the same version, and release tags are `v1.26-09-04-2`. Check what a server is actually running with
 `curl -s <host>/api/version`.
 
 ---
@@ -255,7 +255,9 @@ That gives the agent 30 tools: the server's 20 management tools plus the watchdo
 tools, so it still holds `restart_server` when the main server is wedged. The step-by-step
 two-machine install with a check after each step is
 [`docs/OPENCLAW-SETUP.md`](docs/OPENCLAW-SETUP.md); the loop an agent actually runs is
-[`docs/OPENCLAW.md`](docs/OPENCLAW.md).
+[`docs/OPENCLAW.md`](docs/OPENCLAW.md). If an image service shares the same GPUs,
+[`docs/OPENCLAW-RIG.md`](docs/OPENCLAW-RIG.md) is the whole-rig page: one identity string, one set
+of priority tiers, the lease etiquette and one failure-code table for both services.
 
 ---
 
@@ -349,6 +351,7 @@ The same from a terminal, on any platform: `studioforge serve --open`, `studiofo
 - [`docs/SETUP.md`](docs/SETUP.md) — first run, tab by tab; GPUs, engine, network, downloads; headless
 - [`docs/OPENCLAW-SETUP.md`](docs/OPENCLAW-SETUP.md) — two-machine install, verified step by step
 - [`docs/OPENCLAW.md`](docs/OPENCLAW.md) — the tool list and the loop an agent runs; pins and leases
+- [`docs/OPENCLAW-RIG.md`](docs/OPENCLAW-RIG.md) — the whole rig for one agent: identity, priority, leases, every failure code
 - [`docs/CATALOG.md`](docs/CATALOG.md) — the model catalog an agent picks from, every column explained
 - [`docs/BENCHMARKING.md`](docs/BENCHMARKING.md) — the benchmarking playbook
 - [`docs/OPENCLAW-LONG-CONTEXT.md`](docs/OPENCLAW-LONG-CONTEXT.md) — what a long window really costs
