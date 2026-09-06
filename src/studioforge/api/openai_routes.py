@@ -31,11 +31,12 @@ from studioforge.core.priority import normalise_priority
 from studioforge.errors import (
     BadRequestError,
     ModelNotFoundError,
+    NoLoadedModelError,
     StudioForgeError,
     UpstreamError,
 )
 from studioforge.logging import get_logger
-from studioforge.types import ModelRecord
+from studioforge.types import InstanceInfo, ModelRecord
 
 log = get_logger(__name__)
 
@@ -220,7 +221,7 @@ async def chat_completions(request: Request) -> Any:
     """
     state = _app_state(request)
     body = await _json_body(request)
-    model_name = _require_model(body, state.config)
+    model_name = _resolve_loaded_alias(state, _require_model(body, state.config))
 
     # Resolve WITHOUT loading, so validation can happen up front.
     record = _resolve_or_404(state, model_name)
@@ -384,7 +385,7 @@ async def completions(request: Request) -> Any:
     """
     state = _app_state(request)
     body = await _json_body(request)
-    model_name = _require_model(body, state.config)
+    model_name = _resolve_loaded_alias(state, _require_model(body, state.config))
     record = _resolve_or_404(state, model_name)
     payload = dict(body)
     payload["model"] = record.id
@@ -411,7 +412,7 @@ async def embeddings(request: Request) -> Any:
     settings instead."""
     state = _app_state(request)
     body = await _json_body(request)
-    model_name = _require_model(body, state.config)
+    model_name = _resolve_loaded_alias(state, _require_model(body, state.config))
     # Resolve without loading: a guaranteed-400 request must never trigger a
     # multi-minute load that could also evict resident models first.
     record = _resolve_or_404(state, model_name)
@@ -442,7 +443,8 @@ async def rerank(request: Request) -> Any:
     ignores it -- so set a standing tier in the model's settings instead."""
     state = _app_state(request)
     body = await _json_body(request)
-    record = _resolve_or_404(state, _require_model(body, state.config))
+    model_name = _resolve_loaded_alias(state, _require_model(body, state.config))
+    record = _resolve_or_404(state, model_name)
     payload = dict(body)
     payload["model"] = record.id
     serving = state.manager.serving_record(record)
@@ -458,7 +460,8 @@ async def tokenize(request: Request) -> Any:
     ignores it -- so set a standing tier in the model's settings instead."""
     state = _app_state(request)
     body = await _json_body(request)
-    record = _resolve_or_404(state, _require_model(body, state.config))
+    model_name = _resolve_loaded_alias(state, _require_model(body, state.config))
+    record = _resolve_or_404(state, model_name)
     serving = state.manager.serving_record(record)
     _note_client(state, request, serving.id)
     await state.manager.ensure_loaded(serving.id, source="jit:/v1/tokenize")
@@ -512,6 +515,68 @@ def _require_model(body: dict[str, Any], config: Any = None) -> str:
             code="no_default_model",
         )
     return name
+
+
+#: Second alias, resolved against LIVE server state rather than the static
+#: config default above -- so it is a separate step, applied AFTER
+#: :func:`_require_model` and BEFORE :func:`_resolve_or_404` at every call
+#: site, not a member of :data:`DEFAULT_MODEL_ALIASES` (which only ever needs
+#: ``config``). Case-insensitive, like the aliases above.
+LOADED_MODEL_ALIAS = "loaded"
+
+
+def _largest_ready_free_instance(state: Any) -> InstanceInfo | None:
+    """The resident instance :func:`_resolve_loaded_alias` should pick.
+
+    Candidates are instances the supervisor reports as ``state == "ready"``
+    (a "loading" one has no proven capacity yet, and "stopped"/"failed"/
+    "unloading" cannot serve at all) with a free slot -- ``active_requests <
+    plan.parallel``, the same inequality the D46 admission/hold machinery
+    uses elsewhere in this module. Among those, "largest" is the model's own
+    parameter count (``ModelRecord.meta.param_count``, read via the registry
+    exactly like :func:`_serving_id`/:func:`_decorate_openai_entry` already
+    do), falling back to ``0`` when unmeasured so a record with no GGUF
+    metadata never outranks one that has it. Ties -- including two unmeasured
+    records -- break on the load's context total (``LoadPlan.ctx_total``,
+    i.e. ``ctx_per_slot * parallel``: what actually reached ``--ctx-size``),
+    the other number :func:`_decorate_openai_entry` already surfaces for a
+    resident instance. Returns ``None`` when no instance qualifies.
+    """
+    best: InstanceInfo | None = None
+    best_key: tuple[int, int] = (-1, -1)
+    for instance in state.supervisor.list():
+        if instance.state != "ready" or instance.plan is None:
+            continue
+        if instance.active_requests >= instance.plan.parallel:
+            continue  # resident, but no free slot
+        record = state.registry.get(instance.model_id)
+        param_count = record.meta.param_count if record is not None and record.meta else None
+        key = (param_count or 0, instance.plan.ctx_total)
+        if key > best_key:
+            best_key, best = key, instance
+    return best
+
+
+def _resolve_loaded_alias(state: Any, name: str) -> str:
+    """Turn the ``loaded`` alias (plan item 2.7) into a real model id.
+
+    Anything else passes through unchanged, including every name
+    :func:`_require_model` already resolved -- this only ever recognises the
+    literal word ``loaded``, case-insensitively, exactly like the aliases in
+    :data:`DEFAULT_MODEL_ALIASES` are matched. Deliberately request-side only:
+    it never touches the registry's alias table, so ``GET /v1/models`` is
+    never asked to carry a synthetic ``loaded`` entry.
+    """
+    if name.strip().lower() != LOADED_MODEL_ALIAS:
+        return name
+    instance = _largest_ready_free_instance(state)
+    if instance is None:
+        raise NoLoadedModelError(
+            "'loaded' means 'the largest resident model with a free slot', but "
+            "nothing is currently loaded and ready, or every ready resident is "
+            "already at its slot cap. Load a model first, or name one explicitly."
+        )
+    return instance.model_id
 
 
 def _normalize_sampler_aliases(payload: dict[str, Any]) -> None:

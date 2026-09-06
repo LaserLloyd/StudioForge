@@ -116,6 +116,23 @@ class ModelBusyError(StudioForgeError):
     code = "model_busy"
 
 
+class NoLoadedModelError(StudioForgeError):
+    """The ``loaded`` model alias (D57 / plan item 2.7) has nothing to pick:
+    no instance is resident and ready, or every ready resident is already at
+    its slot cap (``active_requests >= plan.parallel``).
+
+    Shaped like the other transient 503s (``model_busy``, ``priority_hold``)
+    on purpose: the global error handler already attaches ``Retry-After``
+    (falling back to 5s) for any 503, and there is no more specific number to
+    give here than that generic backoff -- unlike ``priority_hold``, nothing
+    is actually loading, so there is no ETA to report.
+    """
+
+    status_code = 503
+    error_type = "server_error"
+    code = "no_loaded_model"
+
+
 class LeaseConflictError(StudioForgeError):
     """The devices are held by an existing GPU lease, or by a pinned resident (D43)."""
 
