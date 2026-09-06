@@ -27,6 +27,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from studioforge.api.vision import prepare_messages
+from studioforge.core.model_gate import approx_params_b
 from studioforge.core.priority import normalise_priority
 from studioforge.errors import (
     BadRequestError,
@@ -530,28 +531,40 @@ def _largest_ready_free_instance(state: Any) -> InstanceInfo | None:
 
     Candidates are instances the supervisor reports as ``state == "ready"``
     (a "loading" one has no proven capacity yet, and "stopped"/"failed"/
-    "unloading" cannot serve at all) with a free slot -- ``active_requests <
-    plan.parallel``, the same inequality the D46 admission/hold machinery
-    uses elsewhere in this module. Among those, "largest" is the model's own
-    parameter count (``ModelRecord.meta.param_count``, read via the registry
-    exactly like :func:`_serving_id`/:func:`_decorate_openai_entry` already
-    do), falling back to ``0`` when unmeasured so a record with no GGUF
-    metadata never outranks one that has it. Ties -- including two unmeasured
-    records -- break on the load's context total (``LoadPlan.ctx_total``,
-    i.e. ``ctx_per_slot * parallel``: what actually reached ``--ctx-size``),
-    the other number :func:`_decorate_openai_entry` already surfaces for a
-    resident instance. Returns ``None`` when no instance qualifies.
+    "unloading" cannot serve at all), minus embedding-kind records (D52: an
+    embedding model is loaded and healthy and completely unable to serve a
+    chat request, so counting it would hand ``loaded`` to a caller whose very
+    next call then fails in the engine -- same ``getattr(record, "kind",
+    "chat") == "embedding"`` test :func:`~studioforge.core.model_gate.gate_answer`
+    already applies), with a free slot -- ``active_requests < plan.parallel``,
+    the same inequality the D46 admission/hold machinery uses elsewhere in
+    this module.
+
+    Among those, "largest" is :func:`~studioforge.core.model_gate.approx_params_b`
+    -- D52's own sizing (metadata, then the model id's name tokens, then an
+    estimate from file size), reused rather than re-derived here so the gate,
+    the catalog and this alias can never report a different "biggest
+    resident" for the same rig. Passing ``record or instance.model_id`` is
+    what that function's own contract asks for: a resident whose registry row
+    has gone missing must still be sizeable from its name, not silently
+    scored as unmeasured. Ties -- including two unsized residents -- break on
+    the load's context total (``LoadPlan.ctx_total``, i.e. ``ctx_per_slot *
+    parallel``: what actually reached ``--ctx-size``), the other number
+    :func:`_decorate_openai_entry` already surfaces for a resident instance.
+    Returns ``None`` when no instance qualifies.
     """
     best: InstanceInfo | None = None
-    best_key: tuple[int, int] = (-1, -1)
+    best_key: tuple[float, int] = (-1.0, -1)
     for instance in state.supervisor.list():
         if instance.state != "ready" or instance.plan is None:
             continue
         if instance.active_requests >= instance.plan.parallel:
             continue  # resident, but no free slot
         record = state.registry.get(instance.model_id)
-        param_count = record.meta.param_count if record is not None and record.meta else None
-        key = (param_count or 0, instance.plan.ctx_total)
+        if getattr(record, "kind", "chat") == "embedding":
+            continue  # D52: an embedder can never serve a chat request
+        total_b, _active_b, _source = approx_params_b(record or instance.model_id)
+        key = (total_b or 0.0, instance.plan.ctx_total)
         if key > best_key:
             best_key, best = key, instance
     return best

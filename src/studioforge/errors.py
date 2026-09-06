@@ -117,7 +117,8 @@ class ModelBusyError(StudioForgeError):
 
 
 class NoLoadedModelError(StudioForgeError):
-    """The ``loaded`` model alias (D57 / plan item 2.7) has nothing to pick:
+    """The ``loaded`` model alias (plan item 2.7; sizing/selection reuses
+    D52's ``approx_params_b`` and embedding exclusion) has nothing to pick:
     no instance is resident and ready, or every ready resident is already at
     its slot cap (``active_requests >= plan.parallel``).
 

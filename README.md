@@ -65,7 +65,8 @@ are the ones you ask for.
 ### How a request flows
 
 1. A client `POST`s to `/v1/chat/completions` naming a model — or `local-model`, which resolves to
-   `models.default_model`.
+   `models.default_model` (so do `default`/`auto`/`current`), or `loaded`, which resolves instead
+   to whichever resident model is currently largest with a free slot.
 2. The gateway looks the model up in the registry. If a backend is already serving it, the request
    is proxied straight through, streaming intact.
 3. Otherwise the VRAM planner chooses a placement: which GPUs, what context (walking a ladder down

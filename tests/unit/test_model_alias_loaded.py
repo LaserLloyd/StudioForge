@@ -1,12 +1,16 @@
-"""The ``loaded`` model alias (plan item 2.7 / D57).
+"""The ``loaded`` model alias (plan item 2.7).
 
 ``auto``/``current``/``default``/``local-model`` all resolve to the static
 ``models.default_model`` (``_require_model``, config only). ``loaded`` is a
 second, separate alias resolved against LIVE server state instead: the
 largest resident (``state == "ready"``) instance that still has a free slot
-(``active_requests < plan.parallel``). It is applied as its own step
-(``_resolve_loaded_alias``), right after ``_require_model`` and before
-``_resolve_or_404``, at every one of the five call sites in
+(``active_requests < plan.parallel``), excluding embedding-kind residents
+(D52: an embedder cannot serve a chat request) and sized by
+``studioforge.core.model_gate.approx_params_b`` -- D52's own sizing, reused
+rather than re-derived so the gate, the catalog and this alias can never
+report a different "biggest resident" for the same rig. It is applied as its
+own step (``_resolve_loaded_alias``), right after ``_require_model`` and
+before ``_resolve_or_404``, at every one of the five call sites in
 ``openai_routes.py`` -- so both the streaming and non-streaming halves of
 ``/v1/chat/completions`` resolve it, because they share that same call site
 above the branch, and it never touches the registry's alias table, so
@@ -37,17 +41,25 @@ from studioforge.api.openai_routes import (
 )
 from studioforge.config import Config
 from studioforge.errors import NoLoadedModelError
-from studioforge.types import GgufMeta, InstanceInfo, InstanceState, LoadPlan, ModelRecord
+from studioforge.types import (
+    GgufMeta,
+    InstanceInfo,
+    InstanceState,
+    LoadPlan,
+    ModelKind,
+    ModelRecord,
+)
 from tests.unit.test_catalog_routes import FakeProbe, FakeRegistry, FakeSupervisor
 
 MESSAGES = [{"role": "user", "content": "hello"}]
 
 
-def _record(model_id: str, param_count: int | None) -> ModelRecord:
+def _record(model_id: str, param_count: int | None, *, kind: ModelKind = "chat") -> ModelRecord:
     return ModelRecord(
         id=model_id,
         name=model_id.rsplit("/", 1)[-1],
         path=Path(f"/models/{model_id.replace('/', '_')}.gguf"),
+        kind=kind,
         meta=GgufMeta(param_count=param_count),
     )
 
@@ -175,9 +187,11 @@ class TestLargestReadyFreeInstance:
         assert instance.model_id == "v/b"
 
     def test_a_measured_model_always_outranks_an_unmeasured_one(self) -> None:
-        """Even a small measured model must beat a huge but stale/unscanned
-        record whose param_count could not be read -- 0 never wins."""
-        registry = FakeRegistry([_record("v/measured", 1_000_000), _record("v/unmeasured", None)])
+        """Even a small measured model (300M -> 0.3B, comfortably above the
+        rounding floor at one decimal place) must beat a huge but
+        stale/unscanned record whose param_count could not be read -- 0
+        never wins."""
+        registry = FakeRegistry([_record("v/measured", 300_000_000), _record("v/unmeasured", None)])
         supervisor = FakeSupervisor(
             [
                 _instance("v/measured", plan=_plan("v/measured", ctx_size=2048)),
@@ -189,12 +203,53 @@ class TestLargestReadyFreeInstance:
         assert instance.model_id == "v/measured"
 
     def test_an_instance_missing_from_the_registry_does_not_crash(self) -> None:
-        """A child mid-shutdown can outlive its registry row; this must
-        compete as unmeasured (0), never raise."""
+        """A child mid-shutdown can outlive its registry row; a name with no
+        size token in it must still compete as unmeasured (0), never raise."""
         supervisor = FakeSupervisor([_instance("v/ghost")])
         instance = _largest_ready_free_instance(FakeState(FakeRegistry([]), supervisor))
         assert instance is not None
         assert instance.model_id == "v/ghost"
+
+    def test_a_missing_registry_row_is_still_sized_by_its_own_name(self) -> None:
+        """D52's whole point for accepting a bare id string: a resident whose
+        registry row has gone missing must still be sizeable from its model
+        id (approx_params_b's "name" tier), not silently scored as 0 the way
+        the pre-review implementation did -- so a name-sized 27B ghost must
+        beat a small model that IS present in the registry."""
+        registry = FakeRegistry([_record("vendor/small-1B-instruct", 1_000_000_000)])
+        supervisor = FakeSupervisor(
+            [
+                _instance("vendor/small-1B-instruct"),
+                _instance("vendor/ghost-27B-instruct"),  # no registry row at all
+            ]
+        )
+        instance = _largest_ready_free_instance(FakeState(registry, supervisor))
+        assert instance is not None
+        assert instance.model_id == "vendor/ghost-27B-instruct"
+
+    def test_embedding_kind_residents_are_never_candidates(self) -> None:
+        """D52: an embedding model is loaded and healthy and completely
+        unable to serve a chat request, so it must lose even to a much
+        smaller chat model -- exactly the exclusion gate_answer() applies."""
+        registry = FakeRegistry(
+            [
+                _record("vendor/tiny-embedder", 137_000_000, kind="embedding"),
+                _record("vendor/small-chat", 1_000_000_000),
+            ]
+        )
+        supervisor = FakeSupervisor(
+            [_instance("vendor/tiny-embedder"), _instance("vendor/small-chat")]
+        )
+        instance = _largest_ready_free_instance(FakeState(registry, supervisor))
+        assert instance is not None
+        assert instance.model_id == "vendor/small-chat"
+
+    def test_an_only_resident_embedder_yields_no_candidate(self) -> None:
+        """The exact regression the review named: a resident embedder must
+        never win by default just because nothing else is loaded."""
+        registry = FakeRegistry([_record("vendor/embedder", 137_000_000, kind="embedding")])
+        supervisor = FakeSupervisor([_instance("vendor/embedder")])
+        assert _largest_ready_free_instance(FakeState(registry, supervisor)) is None
 
 
 # ---------------------------------------------------------------------------
@@ -354,6 +409,22 @@ def test_no_loaded_model_when_every_resident_is_full_is_503(app: Any) -> None:
     )
     app.state.supervisor = full
     app.state.manager.supervisor = full
+    with TestClient(app) as http:
+        response = http.post("/v1/chat/completions", json={"model": "loaded", "messages": MESSAGES})
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "no_loaded_model"
+
+
+def test_an_only_resident_embedder_is_not_handed_to_a_chat_request(app: Any) -> None:
+    """The review's exact scenario: MailForge-style, an embedding model is
+    the only resident on the rig. `loaded` must 503, never hand a chat
+    request an embedder it cannot serve."""
+    embedder = Registry([_record("vendor/embedder", 137_000_000, kind="embedding")])
+    app.state.registry = embedder
+    app.state.manager.registry = embedder
+    only_embedder = SupervisorWithBaseUrl([_instance("vendor/embedder")])
+    app.state.supervisor = only_embedder
+    app.state.manager.supervisor = only_embedder
     with TestClient(app) as http:
         response = http.post("/v1/chat/completions", json={"model": "loaded", "messages": MESSAGES})
     assert response.status_code == 503

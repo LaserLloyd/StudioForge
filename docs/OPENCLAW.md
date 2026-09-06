@@ -704,6 +704,9 @@ With that set:
 * A request naming `local-model`, `default`, `auto`, or `current` resolves to the default. (LM
   Studio clients send the literal string `local-model` as a fallback; 404-ing it would break them
   for no reason.)
+* A request naming `loaded` resolves instead to the largest currently-resident model with a free
+  slot — live server state, not this static default, and it works whether or not `default_model`
+  is set — falling back to a 503 `no_loaded_model` if nothing qualifies.
 * `preload_default_model: true` loads it at **startup**, so the first real request is a warm one
   rather than a multi-minute cold load.
 

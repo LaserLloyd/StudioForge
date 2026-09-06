@@ -97,6 +97,10 @@ Set **Default model** (and optionally **Preload that default at startup**) and a
 omits `model` — or names `local-model`, `default`, `auto`, `current` — is served by it. The field
 becomes a dropdown of the models actually in your registry once a scan has run.
 
+A request naming `loaded` instead resolves to whichever resident model is currently largest with a
+free slot — live server state, no default model required — falling back to a 503
+`no_loaded_model` if nothing qualifies.
+
 ---
 
 ## 4. GPUs & memory
