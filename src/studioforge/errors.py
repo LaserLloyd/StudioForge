@@ -117,21 +117,33 @@ class ModelBusyError(StudioForgeError):
 
 
 class NoLoadedModelError(StudioForgeError):
-    """The ``loaded`` model alias (plan item 2.7; sizing/selection reuses
-    D52's ``approx_params_b`` and embedding exclusion) has nothing to pick:
-    no instance is resident and ready, or every ready resident is already at
-    its slot cap (``active_requests >= plan.parallel``).
+    """The ``loaded`` model alias (D58) has nothing of the requested kind to pick.
 
-    Shaped like the other transient 503s (``model_busy``, ``priority_hold``)
-    on purpose: the global error handler already attaches ``Retry-After``
-    (falling back to 5s) for any 503, and there is no more specific number to
-    give here than that generic backoff -- unlike ``priority_hold``, nothing
-    is actually loading, so there is no ETA to report.
+    A 404, not a 503. The only way :func:`~studioforge.api.openai_routes.
+    _largest_ready_instance` comes up empty is that no resident, ready
+    instance's record matches the route's ``want`` -- and that is not
+    transient. Nothing about it changes on its own; it changes only when an
+    operator loads a model of that kind, which may be minutes or may be
+    never. A 503 would make the error handler attach a ``Retry-After``
+    (the ``StudioForgeError`` handler gives every 503 one, defaulting to 5s
+    absent a more specific ``retry_after_s``), and re-sending the request after
+    that wait would fail exactly the same way -- "come back later" is bad
+    advice when nothing is going to change on its own. 404 with
+    ``invalid_request_error`` says instead what is true: the request, as
+    given, names something that does not currently exist.
     """
 
-    status_code = 503
-    error_type = "server_error"
+    status_code = 404
+    error_type = "invalid_request_error"
     code = "no_loaded_model"
+
+    def __init__(self, kind: str) -> None:
+        msg = (
+            "'loaded' means 'the largest model already resident that can serve "
+            f"this request', but no {kind} model is currently loaded and ready. "
+            "Load one, or name a model explicitly."
+        )
+        super().__init__(msg, param="model")
 
 
 class LeaseConflictError(StudioForgeError):

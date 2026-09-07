@@ -1,27 +1,55 @@
-"""The ``loaded`` model alias (plan item 2.7).
+"""The ``loaded`` model alias (D58).
 
 ``auto``/``current``/``default``/``local-model`` all resolve to the static
 ``models.default_model`` (``_require_model``, config only). ``loaded`` is a
-second, separate alias resolved against LIVE server state instead: the
-largest resident (``state == "ready"``) instance that still has a free slot
-(``active_requests < plan.parallel``), excluding embedding-kind residents
-(D52: an embedder cannot serve a chat request) and sized by
-``studioforge.core.model_gate.approx_params_b`` -- D52's own sizing, reused
-rather than re-derived so the gate, the catalog and this alias can never
-report a different "biggest resident" for the same rig. It is applied as its
-own step (``_resolve_loaded_alias``), right after ``_require_model`` and
-before ``_resolve_or_404``, at every one of the five call sites in
-``openai_routes.py`` -- so both the streaming and non-streaming halves of
-``/v1/chat/completions`` resolve it, because they share that same call site
-above the branch, and it never touches the registry's alias table, so
-``GET /v1/models`` is never asked to carry a synthetic ``loaded`` entry.
+second, separate alias resolved against LIVE server state instead:
+
+    the largest model currently resident and ready that can serve THIS
+    ROUTE'S KIND of request.
+
+Route-kind awareness is the core of D58 (post-review fix-on-top of an earlier
+design that only excluded embedders outright): ``want`` -- ``"chat"``,
+``"embedding"`` or ``"rerank"`` -- is a required keyword-only argument on both
+``_largest_ready_instance`` and ``_resolve_loaded_alias``, threaded through
+from each of the five call sites in ``openai_routes.py``, so that
+``/v1/embeddings`` naming ``loaded`` can never land on a chat model (the D-1
+bug: it used to reach one and then 400 at the ``not_an_embedding_model``
+guard) and ``/v1/chat/completions`` can never land on an embedder or a
+reranker.
+
+Two other things changed from the earlier design, both load-bearing here:
+
+* the free-slot / active-request criterion is GONE (D58 DEC-2) -- a resident
+  already at its own parallel cap is still a valid, still-preferred candidate,
+  because nothing downstream actually queues on it being "free"; naming the
+  model explicitly would just queue, and ``loaded`` silently downgrading to a
+  smaller free model would defeat the whole point of the alias;
+* an instance whose registry row has gone missing is NO LONGER a candidate
+  at all (D58 DEC-1, filter step 3) -- the previous design sized it from its
+  bare id and still picked it, but ``_resolve_or_404`` resolves through the
+  very same registry dict, so a selected ghost would 404 downstream anyway;
+  skipping it here means that failure never happens, and the caller sees the
+  one clean ``no_loaded_model`` 404 instead.
+
+The failure itself changed shape too (D58 DEC-3): nothing about "nothing of
+this kind is resident" is transient, so it is a 404
+(``invalid_request_error`` / ``no_loaded_model``, ``param="model"``), never a
+503, and carries no ``Retry-After``.
+
+It is applied as its own step (``_resolve_loaded_alias``), right after
+``_require_model`` and before ``_resolve_or_404``, at every one of the five
+call sites in ``openai_routes.py`` -- so both the streaming and non-streaming
+halves of ``/v1/chat/completions`` resolve it, because they share that same
+call site above the branch, and it never touches the registry's alias table,
+so ``GET /v1/models`` is never asked to carry a synthetic ``loaded`` entry.
 
 First section below unit-tests the resolution helpers directly (no app, no
-HTTP -- fast, precise coverage of the ranking and tie-break rules). Second
-section drives the real FastAPI app through ``TestClient`` with a stubbed
-upstream, exactly like ``test_request_priority.py``, to prove the alias
-resolves through the actual route wiring (both chat-completions branches,
-the 503 shape, `/v1/models` non-pollution, and that `default` still works).
+HTTP -- fast, precise coverage of the filter, the ranking/tie-break rules,
+and the kind predicate). Second section drives the real FastAPI app through
+``TestClient`` with a stubbed upstream, exactly like ``test_request_priority.py``,
+to prove the alias resolves through the actual route wiring: all five routes
+pass the right ``want``, both chat-completions branches, the 404 shape,
+`/v1/models` non-pollution, and that `default` still works.
 """
 
 from __future__ import annotations
@@ -36,7 +64,7 @@ from studioforge.api import openai_routes
 from studioforge.api.app import build_state, create_app
 from studioforge.api.openai_routes import (
     LOADED_MODEL_ALIAS,
-    _largest_ready_free_instance,
+    _largest_ready_instance,
     _resolve_loaded_alias,
 )
 from studioforge.config import Config
@@ -46,6 +74,7 @@ from studioforge.types import (
     InstanceInfo,
     InstanceState,
     LoadPlan,
+    ModelCapabilities,
     ModelKind,
     ModelRecord,
 )
@@ -54,12 +83,19 @@ from tests.unit.test_catalog_routes import FakeProbe, FakeRegistry, FakeSupervis
 MESSAGES = [{"role": "user", "content": "hello"}]
 
 
-def _record(model_id: str, param_count: int | None, *, kind: ModelKind = "chat") -> ModelRecord:
+def _record(
+    model_id: str,
+    param_count: int | None,
+    *,
+    kind: ModelKind = "chat",
+    capabilities: ModelCapabilities | None = None,
+) -> ModelRecord:
     return ModelRecord(
         id=model_id,
         name=model_id.rsplit("/", 1)[-1],
         path=Path(f"/models/{model_id.replace('/', '_')}.gguf"),
         kind=kind,
+        capabilities=capabilities if capabilities is not None else ModelCapabilities(),
         meta=GgufMeta(param_count=param_count),
     )
 
@@ -99,8 +135,8 @@ class Registry(FakeRegistry):
 
 
 class FakeState:
-    """The two attributes ``_largest_ready_free_instance`` reads -- nothing
-    else, so a test that reaches past them is a test with the wrong fixture."""
+    """The two attributes the helpers read -- nothing else, so a test that
+    reaches past them is a test with the wrong fixture."""
 
     def __init__(self, registry: FakeRegistry, supervisor: FakeSupervisor) -> None:
         self.registry = registry
@@ -115,21 +151,25 @@ class SupervisorWithBaseUrl(FakeSupervisor):
 
 
 # ---------------------------------------------------------------------------
-# _largest_ready_free_instance -- pure unit tests, no app
+# _largest_ready_instance -- pure unit tests, no app
 # ---------------------------------------------------------------------------
 
 
-class TestLargestReadyFreeInstance:
+class TestLargestReadyInstance:
     def test_two_residents_the_larger_by_param_count_is_chosen(self) -> None:
         registry = FakeRegistry(
             [_record("v/small", 8_000_000_000), _record("v/big", 27_000_000_000)]
         )
         supervisor = FakeSupervisor([_instance("v/small"), _instance("v/big")])
-        instance = _largest_ready_free_instance(FakeState(registry, supervisor))
+        instance = _largest_ready_instance(FakeState(registry, supervisor), want="chat")
         assert instance is not None
         assert instance.model_id == "v/big"
 
-    def test_the_largest_full_is_skipped_for_the_next_one_down(self) -> None:
+    def test_a_saturated_larger_resident_still_outranks_a_free_smaller_one(self) -> None:
+        """D58 DEC-2: the free-slot criterion is gone. A 27B pinned at its own
+        parallel cap must still beat an 8B sitting idle -- silently handing the
+        caller the smaller model on no signal at all is exactly what the
+        removed criterion used to do, and it defeats the point of the alias."""
         registry = FakeRegistry(
             [_record("v/small", 8_000_000_000), _record("v/big", 27_000_000_000)]
         )
@@ -139,21 +179,29 @@ class TestLargestReadyFreeInstance:
                 _instance("v/big", plan=_plan("v/big", parallel=2), active_requests=2),
             ]
         )
-        instance = _largest_ready_free_instance(FakeState(registry, supervisor))
+        instance = _largest_ready_instance(FakeState(registry, supervisor), want="chat")
         assert instance is not None
-        assert instance.model_id == "v/small", (
-            "the big one has no free slot (2 active == parallel 2)"
+        assert instance.model_id == "v/big", (
+            "saturated (2 active == parallel 2) is no longer disqualifying"
         )
+
+    def test_every_resident_at_its_cap_is_still_a_valid_candidate_set(self) -> None:
+        """The old design returned None here (both 'full'); D58 has no notion
+        of full any more, so the larger one is simply picked."""
+        registry = FakeRegistry([_record("v/a", 1_000_000_000), _record("v/b", 2_000_000_000)])
+        supervisor = FakeSupervisor(
+            [
+                _instance("v/a", plan=_plan("v/a", parallel=1), active_requests=1),
+                _instance("v/b", plan=_plan("v/b", parallel=1), active_requests=1),
+            ]
+        )
+        instance = _largest_ready_instance(FakeState(registry, supervisor), want="chat")
+        assert instance is not None
+        assert instance.model_id == "v/b"
 
     def test_no_resident_instances_returns_none(self) -> None:
-        assert _largest_ready_free_instance(FakeState(FakeRegistry([]), FakeSupervisor([]))) is None
-
-    def test_every_resident_full_returns_none(self) -> None:
-        registry = FakeRegistry([_record("v/a", 1)])
-        supervisor = FakeSupervisor(
-            [_instance("v/a", plan=_plan("v/a", parallel=1), active_requests=1)]
-        )
-        assert _largest_ready_free_instance(FakeState(registry, supervisor)) is None
+        state = FakeState(FakeRegistry([]), FakeSupervisor([]))
+        assert _largest_ready_instance(state, want="chat") is None
 
     @pytest.mark.parametrize("bad_state", ["loading", "stopped", "failed", "unloading"])
     def test_non_ready_instances_are_never_candidates(self, bad_state: InstanceState) -> None:
@@ -163,14 +211,15 @@ class TestLargestReadyFreeInstance:
         supervisor = FakeSupervisor(
             [_instance("v/small", state="ready"), _instance("v/big", state=bad_state)]
         )
-        instance = _largest_ready_free_instance(FakeState(registry, supervisor))
+        instance = _largest_ready_instance(FakeState(registry, supervisor), want="chat")
         assert instance is not None
         assert instance.model_id == "v/small"
 
     def test_an_instance_with_no_plan_is_never_a_candidate(self) -> None:
         registry = FakeRegistry([_record("v/a", 1)])
         supervisor = FakeSupervisor([InstanceInfo(model_id="v/a", state="ready", plan=None)])
-        assert _largest_ready_free_instance(FakeState(registry, supervisor)) is None
+        state = FakeState(registry, supervisor)
+        assert _largest_ready_instance(state, want="chat") is None
 
     def test_unmeasured_param_count_ties_break_on_context_total(self) -> None:
         """Two records with no GGUF metadata both score 0 on param_count, so
@@ -182,7 +231,7 @@ class TestLargestReadyFreeInstance:
                 _instance("v/b", plan=_plan("v/b", parallel=2, ctx_size=8192)),  # ctx_total 16384
             ]
         )
-        instance = _largest_ready_free_instance(FakeState(registry, supervisor))
+        instance = _largest_ready_instance(FakeState(registry, supervisor), want="chat")
         assert instance is not None
         assert instance.model_id == "v/b"
 
@@ -198,24 +247,33 @@ class TestLargestReadyFreeInstance:
                 _instance("v/unmeasured", plan=_plan("v/unmeasured", ctx_size=999_999)),
             ]
         )
-        instance = _largest_ready_free_instance(FakeState(registry, supervisor))
+        instance = _largest_ready_instance(FakeState(registry, supervisor), want="chat")
         assert instance is not None
         assert instance.model_id == "v/measured"
 
-    def test_an_instance_missing_from_the_registry_does_not_crash(self) -> None:
-        """A child mid-shutdown can outlive its registry row; a name with no
-        size token in it must still compete as unmeasured (0), never raise."""
-        supervisor = FakeSupervisor([_instance("v/ghost")])
-        instance = _largest_ready_free_instance(FakeState(FakeRegistry([]), supervisor))
+    def test_ranking_uses_the_records_metadata_not_a_name_guess_from_the_bare_id(self) -> None:
+        """D58 DEC-1: filter step 3 guarantees a record is always present, and
+        the ranker is handed that record -- not the bare id string -- so a
+        genuine metadata param_count wins even when the id itself would parse
+        to a bigger (wrong) guess via ``approx_params_b``'s name tier."""
+        registry = FakeRegistry(
+            [
+                _record("vendor/misnamed-27B-instruct", 3_000_000_000),  # id says 27B, meta says 3B
+                _record("vendor/small-1B-instruct", 8_000_000_000),  # id says 1B, meta says 8B
+            ]
+        )
+        supervisor = FakeSupervisor(
+            [_instance("vendor/misnamed-27B-instruct"), _instance("vendor/small-1B-instruct")]
+        )
+        instance = _largest_ready_instance(FakeState(registry, supervisor), want="chat")
         assert instance is not None
-        assert instance.model_id == "v/ghost"
+        assert instance.model_id == "vendor/small-1B-instruct"
 
-    def test_a_missing_registry_row_is_still_sized_by_its_own_name(self) -> None:
-        """D52's whole point for accepting a bare id string: a resident whose
-        registry row has gone missing must still be sizeable from its model
-        id (approx_params_b's "name" tier), not silently scored as 0 the way
-        the pre-review implementation did -- so a name-sized 27B ghost must
-        beat a small model that IS present in the registry."""
+    def test_an_instance_missing_from_the_registry_is_skipped_not_sized_by_its_name(self) -> None:
+        """D58 DEC-1 reverses the earlier design: no registry row means not a
+        candidate at all, because ``_resolve_or_404`` resolves through that
+        same dict and would 404 on a selected ghost. So a properly-registered
+        1B must beat a 27B-named ghost with no row, not lose to it."""
         registry = FakeRegistry([_record("vendor/small-1B-instruct", 1_000_000_000)])
         supervisor = FakeSupervisor(
             [
@@ -223,14 +281,18 @@ class TestLargestReadyFreeInstance:
                 _instance("vendor/ghost-27B-instruct"),  # no registry row at all
             ]
         )
-        instance = _largest_ready_free_instance(FakeState(registry, supervisor))
+        instance = _largest_ready_instance(FakeState(registry, supervisor), want="chat")
         assert instance is not None
-        assert instance.model_id == "vendor/ghost-27B-instruct"
+        assert instance.model_id == "vendor/small-1B-instruct"
 
-    def test_embedding_kind_residents_are_never_candidates(self) -> None:
-        """D52: an embedding model is loaded and healthy and completely
-        unable to serve a chat request, so it must lose even to a much
-        smaller chat model -- exactly the exclusion gate_answer() applies."""
+    def test_when_every_resident_is_missing_from_the_registry_there_is_no_candidate(self) -> None:
+        supervisor = FakeSupervisor([_instance("v/ghost-a"), _instance("v/ghost-b")])
+        state = FakeState(FakeRegistry([]), supervisor)
+        assert _largest_ready_instance(state, want="chat") is None
+
+    # -- route-kind awareness (D58 DEC-1, the core of the fix) --------------
+
+    def test_want_chat_never_selects_an_embedding_kind_record(self) -> None:
         registry = FakeRegistry(
             [
                 _record("vendor/tiny-embedder", 137_000_000, kind="embedding"),
@@ -240,16 +302,116 @@ class TestLargestReadyFreeInstance:
         supervisor = FakeSupervisor(
             [_instance("vendor/tiny-embedder"), _instance("vendor/small-chat")]
         )
-        instance = _largest_ready_free_instance(FakeState(registry, supervisor))
+        instance = _largest_ready_instance(FakeState(registry, supervisor), want="chat")
         assert instance is not None
         assert instance.model_id == "vendor/small-chat"
 
-    def test_an_only_resident_embedder_yields_no_candidate(self) -> None:
-        """The exact regression the review named: a resident embedder must
-        never win by default just because nothing else is loaded."""
+    def test_want_chat_never_selects_a_rerank_kind_record(self) -> None:
+        registry = FakeRegistry(
+            [
+                _record("vendor/tiny-reranker", 137_000_000, kind="rerank"),
+                _record("vendor/small-chat", 1_000_000_000),
+            ]
+        )
+        supervisor = FakeSupervisor(
+            [_instance("vendor/tiny-reranker"), _instance("vendor/small-chat")]
+        )
+        instance = _largest_ready_instance(FakeState(registry, supervisor), want="chat")
+        assert instance is not None
+        assert instance.model_id == "vendor/small-chat"
+
+    def test_want_embedding_selects_an_embedding_kind_record(self) -> None:
+        """The D-1 regression itself, at the helper level: a bigger chat
+        model resident alongside a smaller embedder must NOT win when the
+        caller wants an embedding model."""
+        registry = FakeRegistry(
+            [
+                _record("vendor/big-chat", 27_000_000_000),
+                _record("vendor/embedder", 137_000_000, kind="embedding"),
+            ]
+        )
+        supervisor = FakeSupervisor(
+            [_instance("vendor/big-chat"), _instance("vendor/embedder")]
+        )
+        instance = _largest_ready_instance(FakeState(registry, supervisor), want="embedding")
+        assert instance is not None
+        assert instance.model_id == "vendor/embedder"
+
+    def test_want_embedding_also_honours_the_capability_flag_on_a_different_kind(self) -> None:
+        """DEC-1's predicate is ``kind == "embedding" or capabilities.embedding``
+        -- exactly the negation of the existing ``not_an_embedding_model``
+        guard -- so a record whose ``kind`` is ``"chat"`` but whose
+        capabilities flag embedding support must still qualify."""
+        registry = FakeRegistry(
+            [
+                _record(
+                    "vendor/multi-purpose",
+                    5_000_000_000,
+                    capabilities=ModelCapabilities(embedding=True),
+                )
+            ]
+        )
+        supervisor = FakeSupervisor([_instance("vendor/multi-purpose")])
+        instance = _largest_ready_instance(FakeState(registry, supervisor), want="embedding")
+        assert instance is not None
+        assert instance.model_id == "vendor/multi-purpose"
+
+    def test_want_rerank_selects_only_a_rerank_kind_record(self) -> None:
+        registry = FakeRegistry(
+            [
+                _record("vendor/big-chat", 27_000_000_000),
+                _record("vendor/embedder", 8_000_000_000, kind="embedding"),
+                _record("vendor/reranker", 137_000_000, kind="rerank"),
+            ]
+        )
+        supervisor = FakeSupervisor(
+            [
+                _instance("vendor/big-chat"),
+                _instance("vendor/embedder"),
+                _instance("vendor/reranker"),
+            ]
+        )
+        instance = _largest_ready_instance(FakeState(registry, supervisor), want="rerank")
+        assert instance is not None
+        assert instance.model_id == "vendor/reranker"
+
+    @pytest.mark.parametrize(
+        ("want", "resident_kinds"),
+        [
+            ("chat", ["embedding", "rerank"]),
+            ("embedding", ["chat", "rerank"]),
+            ("rerank", ["chat", "embedding"]),
+        ],
+    )
+    def test_each_want_yields_no_candidate_when_only_other_kinds_are_resident(
+        self, want: str, resident_kinds: list[ModelKind]
+    ) -> None:
+        """The D-1 bug in miniature: models ARE resident and ready, just none
+        of the kind this route needs -- must be None, never a wrong-kind pick."""
+        registry = FakeRegistry(
+            [
+                _record(f"vendor/{kind}-model", 27_000_000_000, kind=kind)  # type: ignore[arg-type]
+                for kind in resident_kinds
+            ]
+        )
+        supervisor = FakeSupervisor(
+            [_instance(f"vendor/{kind}-model") for kind in resident_kinds]
+        )
+        assert _largest_ready_instance(FakeState(registry, supervisor), want=want) is None
+
+    def test_an_only_resident_embedder_yields_no_chat_candidate(self) -> None:
+        """The exact regression the earlier review named: a resident embedder
+        must never win a chat request by default just because nothing else is
+        loaded."""
         registry = FakeRegistry([_record("vendor/embedder", 137_000_000, kind="embedding")])
         supervisor = FakeSupervisor([_instance("vendor/embedder")])
-        assert _largest_ready_free_instance(FakeState(registry, supervisor)) is None
+        state = FakeState(registry, supervisor)
+        assert _largest_ready_instance(state, want="chat") is None
+
+    def test_want_is_a_required_keyword_only_argument(self) -> None:
+        state = FakeState(FakeRegistry([]), FakeSupervisor([]))
+        with pytest.raises(TypeError):
+            _largest_ready_instance(state)  # type: ignore[call-arg]
 
 
 # ---------------------------------------------------------------------------
@@ -264,21 +426,67 @@ class TestResolveLoadedAlias:
     def test_names_other_than_loaded_pass_through_unchanged(self) -> None:
         state = FakeState(FakeRegistry([]), FakeSupervisor([]))
         for name in ("vendor/model-Q4_K_M", "auto", "default", "current", "local-model", ""):
-            assert _resolve_loaded_alias(state, name) == name
+            assert _resolve_loaded_alias(state, name, want="chat") == name
 
     @pytest.mark.parametrize("spelling", ["loaded", "LOADED", "Loaded", "  loaded  ", "LoAdEd"])
     def test_case_and_whitespace_insensitive(self, spelling: str) -> None:
         registry = FakeRegistry([_record("v/a", 1)])
         supervisor = FakeSupervisor([_instance("v/a")])
-        assert _resolve_loaded_alias(FakeState(registry, supervisor), spelling) == "v/a"
+        state = FakeState(registry, supervisor)
+        assert _resolve_loaded_alias(state, spelling, want="chat") == "v/a"
 
     def test_raises_no_loaded_model_with_the_right_shape_when_nothing_qualifies(self) -> None:
         state = FakeState(FakeRegistry([]), FakeSupervisor([]))
         with pytest.raises(NoLoadedModelError) as exc_info:
-            _resolve_loaded_alias(state, "loaded")
-        assert exc_info.value.status_code == 503
+            _resolve_loaded_alias(state, "loaded", want="chat")
+        assert exc_info.value.status_code == 404
         assert exc_info.value.code == "no_loaded_model"
-        assert exc_info.value.error_type == "server_error"
+        assert exc_info.value.error_type == "invalid_request_error"
+        assert exc_info.value.param == "model"
+        assert exc_info.value.details.get("retry_after_s") is None, (
+            "D58 DEC-3: not transient, must carry no Retry-After hint"
+        )
+
+    @pytest.mark.parametrize("want", ["chat", "embedding", "rerank"])
+    def test_the_404_message_names_the_kind_and_the_remedy(self, want: str) -> None:
+        state = FakeState(FakeRegistry([]), FakeSupervisor([]))
+        with pytest.raises(NoLoadedModelError) as exc_info:
+            _resolve_loaded_alias(state, "loaded", want=want)
+        message = str(exc_info.value)
+        assert want in message
+        assert "loaded" in message
+        assert "explicit" in message.lower() or "name a model" in message.lower()
+
+    def test_each_want_gets_its_own_404_even_when_other_kinds_are_resident(self) -> None:
+        """The D-1 bug at the alias-resolution level: an embedder is resident
+        and ready, but a chat caller must still get the clean 404, never the
+        embedder."""
+        registry = FakeRegistry([_record("vendor/embedder", 137_000_000, kind="embedding")])
+        supervisor = FakeSupervisor([_instance("vendor/embedder")])
+        state = FakeState(registry, supervisor)
+        with pytest.raises(NoLoadedModelError):
+            _resolve_loaded_alias(state, "loaded", want="chat")
+        # But the same state resolves fine for the kind that IS resident.
+        assert _resolve_loaded_alias(state, "loaded", want="embedding") == "vendor/embedder"
+
+    def test_skipping_a_registry_less_ghost_avoids_a_confusing_downstream_404(self) -> None:
+        """If a ghost instance with no registry row were wrongly selected,
+        ``_resolve_loaded_alias`` would hand back an id that
+        ``_resolve_or_404`` -- which resolves through that very same registry
+        dict -- would then 404 on as ``model_not_found``, a confusing error
+        for someone who only ever asked for ``loaded``. Filtering the ghost
+        out here means the caller sees the ONE clean ``no_loaded_model``
+        failure instead."""
+        supervisor = FakeSupervisor([_instance("vendor/ghost")])
+        state = FakeState(FakeRegistry([]), supervisor)
+        with pytest.raises(NoLoadedModelError) as exc_info:
+            _resolve_loaded_alias(state, "loaded", want="chat")
+        assert exc_info.value.code == "no_loaded_model"
+
+    def test_want_is_a_required_keyword_only_argument(self) -> None:
+        state = FakeState(FakeRegistry([]), FakeSupervisor([]))
+        with pytest.raises(TypeError):
+            _resolve_loaded_alias(state, "loaded")  # type: ignore[call-arg]
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +496,8 @@ class TestResolveLoadedAlias:
 
 SMALL_ID = "vendor/small-Q4_K_M"
 BIG_ID = "vendor/big-Q5_K_M"
+EMBED_ID = "vendor/embedder-Q8_0"
+RERANK_ID = "vendor/reranker-Q8_0"
 
 
 @pytest.fixture()
@@ -307,12 +517,25 @@ def app(tmp_path: Path) -> Any:
     built.state.probe = FakeProbe()
     built.state.planner.probe = FakeProbe()
     built.state.manager.registry = built.state.registry
-    # Both residents ready with a free slot: these tests are about which one
-    # gets PICKED, not about a load.
+    # Both residents ready: these tests are about which one gets PICKED, not
+    # about a load. Note D58 DEC-2: no free-slot bias, so active_requests is
+    # irrelevant here and left at the default of 0.
     supervisor = SupervisorWithBaseUrl([_instance(SMALL_ID), _instance(BIG_ID)])
     built.state.supervisor = supervisor
     built.state.manager.supervisor = supervisor
     return built
+
+
+def _set_residents(app: Any, records: list[ModelRecord], instances: list[InstanceInfo]) -> None:
+    """Swap the whole resident picture -- registry rows and running instances
+    -- keeping the manager's own references in sync, same wiring as the
+    ``app`` fixture above."""
+    registry = Registry(records)
+    supervisor = SupervisorWithBaseUrl(instances)
+    app.state.registry = registry
+    app.state.manager.registry = registry
+    app.state.supervisor = supervisor
+    app.state.manager.supervisor = supervisor
 
 
 @pytest.fixture()
@@ -387,20 +610,11 @@ def test_default_alias_still_works_unaffected_by_the_new_one(
     assert upstream[0]["model"] == SMALL_ID
 
 
-def test_no_loaded_model_when_nothing_is_resident_is_503(app: Any) -> None:
-    empty = SupervisorWithBaseUrl([])
-    app.state.supervisor = empty
-    app.state.manager.supervisor = empty
-    with TestClient(app) as http:
-        response = http.post("/v1/chat/completions", json={"model": "loaded", "messages": MESSAGES})
-    assert response.status_code == 503
-    body = response.json()
-    assert body["error"]["code"] == "no_loaded_model"
-    assert body["error"]["type"] == "server_error"
-    assert response.headers.get("Retry-After")
-
-
-def test_no_loaded_model_when_every_resident_is_full_is_503(app: Any) -> None:
+def test_a_saturated_largest_resident_is_still_returned_by_loaded_over_http(
+    app: Any, upstream: list[dict[str, Any]]
+) -> None:
+    """D58 DEC-2, end to end: both residents pinned at their own parallel cap
+    must still yield the LARGER one, not a 404 and not a silent downgrade."""
     full = SupervisorWithBaseUrl(
         [
             _instance(SMALL_ID, plan=_plan(SMALL_ID, parallel=1), active_requests=1),
@@ -411,14 +625,30 @@ def test_no_loaded_model_when_every_resident_is_full_is_503(app: Any) -> None:
     app.state.manager.supervisor = full
     with TestClient(app) as http:
         response = http.post("/v1/chat/completions", json={"model": "loaded", "messages": MESSAGES})
-    assert response.status_code == 503
-    assert response.json()["error"]["code"] == "no_loaded_model"
+    assert response.status_code == 200, response.text
+    assert upstream[0]["model"] == BIG_ID
+
+
+def test_no_loaded_model_when_nothing_is_resident_is_a_404(app: Any) -> None:
+    empty = SupervisorWithBaseUrl([])
+    app.state.supervisor = empty
+    app.state.manager.supervisor = empty
+    with TestClient(app) as http:
+        response = http.post("/v1/chat/completions", json={"model": "loaded", "messages": MESSAGES})
+    assert response.status_code == 404, response.text
+    body = response.json()
+    assert body["error"]["code"] == "no_loaded_model"
+    assert body["error"]["type"] == "invalid_request_error"
+    assert body["error"]["param"] == "model"
+    assert "Retry-After" not in response.headers, (
+        "D58 DEC-3: this is not transient -- nothing changes until someone loads a model"
+    )
 
 
 def test_an_only_resident_embedder_is_not_handed_to_a_chat_request(app: Any) -> None:
-    """The review's exact scenario: MailForge-style, an embedding model is
-    the only resident on the rig. `loaded` must 503, never hand a chat
-    request an embedder it cannot serve."""
+    """The earlier review's exact scenario: an embedding model is the only
+    resident on the rig. `loaded` must 404, never hand a chat request an
+    embedder it cannot serve."""
     embedder = Registry([_record("vendor/embedder", 137_000_000, kind="embedding")])
     app.state.registry = embedder
     app.state.manager.registry = embedder
@@ -427,15 +657,140 @@ def test_an_only_resident_embedder_is_not_handed_to_a_chat_request(app: Any) -> 
     app.state.manager.supervisor = only_embedder
     with TestClient(app) as http:
         response = http.post("/v1/chat/completions", json={"model": "loaded", "messages": MESSAGES})
-    assert response.status_code == 503
+    assert response.status_code == 404, response.text
     assert response.json()["error"]["code"] == "no_loaded_model"
 
 
 def test_v1_models_is_not_polluted_with_a_synthetic_loaded_entry(app: Any) -> None:
-    """Aliases are request-side (plan item 2.7): the catalogue must list only
-    the two real models, never a 'loaded' row."""
+    """Aliases are request-side: the catalogue must list only the two real
+    models, never a 'loaded' row."""
     with TestClient(app) as http:
         data = http.get("/v1/models").json()["data"]
     ids = {m["id"] for m in data}
     assert ids == {SMALL_ID, BIG_ID}
     assert LOADED_MODEL_ALIAS not in ids
+
+
+# ---------------------------------------------------------------------------
+# Route wiring: each of the five call sites passes the right `want` (D58
+# DEC-4). This is the HTTP-level proof of the route-kind awareness that
+# TestLargestReadyInstance and TestResolveLoadedAlias already cover at the
+# helper level.
+# ---------------------------------------------------------------------------
+
+
+def test_v1_completions_resolves_loaded_to_the_largest_chat_model(
+    app: Any, upstream: list[dict[str, Any]]
+) -> None:
+    with TestClient(app) as http:
+        response = http.post("/v1/completions", json={"model": "loaded", "prompt": "hello"})
+    assert response.status_code == 200, response.text
+    assert upstream[0]["model"] == BIG_ID
+
+
+def test_v1_tokenize_resolves_loaded_to_the_same_model_as_chat_completions(
+    app: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DEC-4: `/v1/tokenize` is `want="chat"` for consistency, not capability
+    -- a client tokenizes to budget for the model it is about to chat with, so
+    `loaded` there must resolve to the SAME model as `/v1/chat/completions`.
+    `/tokenize`'s handler forwards the body verbatim (never rewrites
+    `payload["model"]`), so the record actually resolved is read off the
+    `_forward` call instead of the payload."""
+    seen: dict[str, Any] = {}
+
+    async def fake_forward(
+        state: Any, record: Any, path: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        seen["record_id"] = record.id
+        seen["path"] = path
+        return {"tokens": [1, 2, 3]}
+
+    monkeypatch.setattr(openai_routes, "_forward", fake_forward)
+    with TestClient(app) as http:
+        response = http.post("/v1/tokenize", json={"model": "loaded", "content": "hello"})
+    assert response.status_code == 200, response.text
+    assert seen.get("record_id") == BIG_ID
+
+
+def test_v1_embeddings_with_loaded_reaches_an_embedding_model_not_a_chat_model(
+    app: Any, upstream: list[dict[str, Any]]
+) -> None:
+    """The D-1 bug, reproduced exactly: under the earlier design `loaded` on
+    `/v1/embeddings` picked the larger CHAT model and died at the
+    `not_an_embedding_model` guard in the embeddings route. A smaller embedder
+    resident alongside a much bigger chat model must win here."""
+    _set_residents(
+        app,
+        [_record(BIG_ID, 27_000_000_000), _record(EMBED_ID, 137_000_000, kind="embedding")],
+        [_instance(BIG_ID), _instance(EMBED_ID)],
+    )
+    with TestClient(app) as http:
+        response = http.post("/v1/embeddings", json={"model": "loaded", "input": "hello"})
+    assert response.status_code == 200, response.text
+    assert upstream[0]["model"] == EMBED_ID
+
+
+def test_v1_rerank_with_loaded_reaches_only_a_rerank_model(
+    app: Any, upstream: list[dict[str, Any]]
+) -> None:
+    _set_residents(
+        app,
+        [
+            _record(BIG_ID, 27_000_000_000),
+            _record(EMBED_ID, 8_000_000_000, kind="embedding"),
+            _record(RERANK_ID, 137_000_000, kind="rerank"),
+        ],
+        [_instance(BIG_ID), _instance(EMBED_ID), _instance(RERANK_ID)],
+    )
+    with TestClient(app) as http:
+        response = http.post(
+            "/v1/rerank",
+            json={"model": "loaded", "query": "q", "documents": ["a", "b"]},
+        )
+    assert response.status_code == 200, response.text
+    assert upstream[0]["model"] == RERANK_ID
+
+
+def test_v1_embeddings_404s_as_no_loaded_model_when_only_a_chat_model_is_resident(
+    app: Any,
+) -> None:
+    """Must be the clean `no_loaded_model` 404 -- never the old
+    `not_an_embedding_model` 400, which would mean it wrongly resolved to the
+    chat model first."""
+    with TestClient(app) as http:
+        response = http.post("/v1/embeddings", json={"model": "loaded", "input": "hello"})
+    assert response.status_code == 404, response.text
+    assert response.json()["error"]["code"] == "no_loaded_model"
+
+
+def test_v1_rerank_404s_as_no_loaded_model_when_no_rerank_model_is_resident(app: Any) -> None:
+    _set_residents(
+        app,
+        [_record(BIG_ID, 27_000_000_000), _record(EMBED_ID, 8_000_000_000, kind="embedding")],
+        [_instance(BIG_ID), _instance(EMBED_ID)],
+    )
+    with TestClient(app) as http:
+        response = http.post(
+            "/v1/rerank",
+            json={"model": "loaded", "query": "q", "documents": ["a", "b"]},
+        )
+    assert response.status_code == 404, response.text
+    assert response.json()["error"]["code"] == "no_loaded_model"
+
+
+def test_v1_chat_completions_404s_as_no_loaded_model_when_only_non_chat_kinds_are_resident(
+    app: Any,
+) -> None:
+    _set_residents(
+        app,
+        [
+            _record(EMBED_ID, 8_000_000_000, kind="embedding"),
+            _record(RERANK_ID, 27_000_000_000, kind="rerank"),
+        ],
+        [_instance(EMBED_ID), _instance(RERANK_ID)],
+    )
+    with TestClient(app) as http:
+        response = http.post("/v1/chat/completions", json={"model": "loaded", "messages": MESSAGES})
+    assert response.status_code == 404, response.text
+    assert response.json()["error"]["code"] == "no_loaded_model"

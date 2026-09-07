@@ -222,7 +222,7 @@ async def chat_completions(request: Request) -> Any:
     """
     state = _app_state(request)
     body = await _json_body(request)
-    model_name = _resolve_loaded_alias(state, _require_model(body, state.config))
+    model_name = _resolve_loaded_alias(state, _require_model(body, state.config), want="chat")
 
     # Resolve WITHOUT loading, so validation can happen up front.
     record = _resolve_or_404(state, model_name)
@@ -386,7 +386,7 @@ async def completions(request: Request) -> Any:
     """
     state = _app_state(request)
     body = await _json_body(request)
-    model_name = _resolve_loaded_alias(state, _require_model(body, state.config))
+    model_name = _resolve_loaded_alias(state, _require_model(body, state.config), want="chat")
     record = _resolve_or_404(state, model_name)
     payload = dict(body)
     payload["model"] = record.id
@@ -413,7 +413,7 @@ async def embeddings(request: Request) -> Any:
     settings instead."""
     state = _app_state(request)
     body = await _json_body(request)
-    model_name = _resolve_loaded_alias(state, _require_model(body, state.config))
+    model_name = _resolve_loaded_alias(state, _require_model(body, state.config), want="embedding")
     # Resolve without loading: a guaranteed-400 request must never trigger a
     # multi-minute load that could also evict resident models first.
     record = _resolve_or_404(state, model_name)
@@ -444,7 +444,7 @@ async def rerank(request: Request) -> Any:
     ignores it -- so set a standing tier in the model's settings instead."""
     state = _app_state(request)
     body = await _json_body(request)
-    model_name = _resolve_loaded_alias(state, _require_model(body, state.config))
+    model_name = _resolve_loaded_alias(state, _require_model(body, state.config), want="rerank")
     record = _resolve_or_404(state, model_name)
     payload = dict(body)
     payload["model"] = record.id
@@ -461,7 +461,7 @@ async def tokenize(request: Request) -> Any:
     ignores it -- so set a standing tier in the model's settings instead."""
     state = _app_state(request)
     body = await _json_body(request)
-    model_name = _resolve_loaded_alias(state, _require_model(body, state.config))
+    model_name = _resolve_loaded_alias(state, _require_model(body, state.config), want="chat")
     record = _resolve_or_404(state, model_name)
     serving = state.manager.serving_record(record)
     _note_client(state, request, serving.id)
@@ -526,30 +526,41 @@ def _require_model(body: dict[str, Any], config: Any = None) -> str:
 LOADED_MODEL_ALIAS = "loaded"
 
 
-def _largest_ready_free_instance(state: Any) -> InstanceInfo | None:
-    """The resident instance :func:`_resolve_loaded_alias` should pick.
+def _largest_ready_instance(state: Any, *, want: str) -> InstanceInfo | None:
+    """The resident instance :func:`_resolve_loaded_alias` should pick for ``want``.
 
-    Candidates are instances the supervisor reports as ``state == "ready"``
-    (a "loading" one has no proven capacity yet, and "stopped"/"failed"/
-    "unloading" cannot serve at all), minus embedding-kind records (D52: an
-    embedding model is loaded and healthy and completely unable to serve a
-    chat request, so counting it would hand ``loaded`` to a caller whose very
-    next call then fails in the engine -- same ``getattr(record, "kind",
-    "chat") == "embedding"`` test :func:`~studioforge.core.model_gate.gate_answer`
-    already applies), with a free slot -- ``active_requests < plan.parallel``,
-    the same inequality the D46 admission/hold machinery uses elsewhere in
-    this module.
+    Candidates, in order:
 
-    Among those, "largest" is :func:`~studioforge.core.model_gate.approx_params_b`
-    -- D52's own sizing (metadata, then the model id's name tokens, then an
-    estimate from file size), reused rather than re-derived here so the gate,
-    the catalog and this alias can never report a different "biggest
-    resident" for the same rig. Passing ``record or instance.model_id`` is
-    what that function's own contract asks for: a resident whose registry row
-    has gone missing must still be sizeable from its name, not silently
-    scored as unmeasured. Ties -- including two unsized residents -- break on
-    the load's context total (``LoadPlan.ctx_total``, i.e. ``ctx_per_slot *
-    parallel``: what actually reached ``--ctx-size``), the other number
+    1. The supervisor reports ``state == "ready"`` (a "loading" instance has
+       no proven capacity yet, and "stopped"/"failed"/"unloading" cannot serve
+       at all).
+    2. ``instance.plan is not None`` -- a plan is what makes ``ctx_total``
+       below meaningful, and every ready instance has one.
+    3. ``state.registry.get(instance.model_id)`` returns a record. An instance
+       with no registry row is excluded here rather than picked and 404'd
+       later: :func:`_resolve_or_404` goes through ``registry.resolve``, which
+       reads the same dict ``registry.get`` just missed and only adds an alias
+       lookup an instance id can never hit -- so returning such an instance's
+       id would fail the very next call.
+    4. The record's kind matches what ``want`` needs: ``"chat"`` requires
+       ``record.kind == "chat"``; ``"embedding"`` requires
+       ``record.kind == "embedding" or record.capabilities.embedding`` --
+       exactly the negation of the guard the embeddings route applies to a
+       *named* model at :func:`embeddings` (D52), here selecting instead of
+       rejecting; ``"rerank"`` requires ``record.kind == "rerank"``. Any other
+       ``want`` matches nothing -- every call site below passes one of the
+       three above.
+
+    Among the survivors, "largest" is
+    :func:`~studioforge.core.model_gate.approx_params_b` -- D52's own sizing
+    (metadata, then the model id's name tokens, then an estimate from file
+    size), reused rather than re-derived here so the gate, the catalog and
+    this alias can never report a different "biggest resident" for the same
+    rig. The record is passed, never ``instance.model_id``: filter step 3
+    already guarantees one exists, so there is no "unsized because the
+    registry row is missing" case to fall back from. Ties break on the load's
+    context total (``LoadPlan.ctx_total``, i.e. ``ctx_per_slot * parallel``:
+    what actually reached ``--ctx-size``), the other number
     :func:`_decorate_openai_entry` already surfaces for a resident instance.
     Returns ``None`` when no instance qualifies.
     """
@@ -558,20 +569,29 @@ def _largest_ready_free_instance(state: Any) -> InstanceInfo | None:
     for instance in state.supervisor.list():
         if instance.state != "ready" or instance.plan is None:
             continue
-        if instance.active_requests >= instance.plan.parallel:
-            continue  # resident, but no free slot
         record = state.registry.get(instance.model_id)
-        if getattr(record, "kind", "chat") == "embedding":
-            continue  # D52: an embedder can never serve a chat request
-        total_b, _active_b, _source = approx_params_b(record or instance.model_id)
+        if record is None:
+            continue
+        if want == "chat":
+            if record.kind != "chat":
+                continue
+        elif want == "embedding":
+            if record.kind != "embedding" and not record.capabilities.embedding:
+                continue
+        elif want == "rerank":
+            if record.kind != "rerank":
+                continue
+        else:
+            continue
+        total_b, _active_b, _source = approx_params_b(record)
         key = (total_b or 0.0, instance.plan.ctx_total)
         if key > best_key:
             best_key, best = key, instance
     return best
 
 
-def _resolve_loaded_alias(state: Any, name: str) -> str:
-    """Turn the ``loaded`` alias (plan item 2.7) into a real model id.
+def _resolve_loaded_alias(state: Any, name: str, *, want: str) -> str:
+    """Turn the ``loaded`` alias (D58) into a real model id of the right kind.
 
     Anything else passes through unchanged, including every name
     :func:`_require_model` already resolved -- this only ever recognises the
@@ -579,16 +599,17 @@ def _resolve_loaded_alias(state: Any, name: str) -> str:
     :data:`DEFAULT_MODEL_ALIASES` are matched. Deliberately request-side only:
     it never touches the registry's alias table, so ``GET /v1/models`` is
     never asked to carry a synthetic ``loaded`` entry.
+
+    ``want`` is required, not defaulted: it says which kind of instance
+    :func:`_largest_ready_instance` may return, and a route that forgot to
+    pass it should fail to import, not silently accept whatever the caller
+    happens to be resident.
     """
     if name.strip().lower() != LOADED_MODEL_ALIAS:
         return name
-    instance = _largest_ready_free_instance(state)
+    instance = _largest_ready_instance(state, want=want)
     if instance is None:
-        raise NoLoadedModelError(
-            "'loaded' means 'the largest resident model with a free slot', but "
-            "nothing is currently loaded and ready, or every ready resident is "
-            "already at its slot cap. Load a model first, or name one explicitly."
-        )
+        raise NoLoadedModelError(want)
     return instance.model_id
 
 
