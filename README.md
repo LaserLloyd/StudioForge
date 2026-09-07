@@ -68,8 +68,8 @@ are the ones you ask for.
    `models.default_model` (so do `default`/`auto`/`current`), or `loaded`, which resolves instead
    to the largest model already resident that can serve this route's kind of request (a chat model,
    here — `/v1/embeddings` and `/v1/rerank` resolve `loaded` against their own kind). It is a live
-   read of the supervisor, not the static default, and it 404s naming the remedy if nothing of that
-   kind is loaded. See [`docs/OPENCLAW.md`](docs/OPENCLAW.md#zero-config-inference-a-default-model)
+   read of the supervisor, not the static default. Nothing of that kind resident is a 404 naming
+   the remedy; one of that kind still loading is a 503 with a `Retry-After`. See [`docs/OPENCLAW.md`](docs/OPENCLAW.md#zero-config-inference-a-default-model)
    for the full contract.
 2. The gateway looks the model up in the registry. If a backend is already serving it, the request
    is proxied straight through, streaming intact.

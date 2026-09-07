@@ -710,8 +710,11 @@ With that set:
   want a chat model; `/v1/embeddings` wants an embedding model; `/v1/rerank` wants a rerank model —
   `loaded` never hands a chat request an embedder just because the embedder is what's resident.
   Nothing qualifying is a 404 `no_loaded_model` naming the kind and the remedy (load one, or name a
-  model explicitly), not a retry-safe 503: nothing about "no such model is resident" changes on its
-  own, so there is no wait worth telling a caller to make (D58).
+  model explicitly) — deliberately not a retry-safe 503, because nothing about "no such model is
+  resident" changes on its own. The one exception is a genuine wait: if nothing of that kind is
+  ready but one is still **loading**, you get a 503 `model_busy` with `retry_after_s` and
+  `details.loading` naming it, because then somebody is already doing the thing the 404 would have
+  told you to do (D58).
 * `preload_default_model: true` loads it at **startup**, so the first real request is a warm one
   rather than a multi-minute cold load.
 

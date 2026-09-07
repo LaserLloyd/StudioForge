@@ -4843,9 +4843,9 @@ not change.
    rerank-kind resident (`ModelKind = Literal["chat", "embedding", "rerank"]` in `types.py`) was
    never excluded from a chat request at all, so `loaded` on `/v1/chat/completions` could just as
    easily hand a caller a reranker. Kind-matching per route closes both: `_largest_ready_instance`
-   takes `want` as a required keyword (no default, so a route that forgets to pass it fails to
-   import rather than silently accepting whatever is resident) and every call site names its kind
-   explicitly.
+   takes `want` as a required keyword-only argument (no default, so a route that forgets to pass it
+   raises `TypeError` at call time -- a missing keyword-only argument, not an import error -- rather
+   than silently accepting whatever is resident) and every call site names its kind explicitly.
 2. **The free-slot criterion is removed.** The previous version skipped any resident already at
    `active_requests >= plan.parallel`. Its own justification does not hold up: there is no
    `active_requests < plan.parallel` inequality anywhere in `openai_routes.py` to be consistent
@@ -4862,18 +4862,39 @@ not change.
    explicitly would have -- an explicit name just queues behind the D46 hold. Dropping the check
    makes `loaded` deterministic: residency decides the answer, not a request that happened to land
    a moment earlier.
-3. **The failure is a 404, not a 503.** With the free-slot criterion gone, the only remaining
-   failure is "nothing resident can serve this kind," which is not transient -- nothing about it
-   changes until an operator or a client loads a model. `docs/OPENCLAW-RIG.md`'s error table
-   enumerates the codes that mean "wait and retry unchanged" as a **closed list**, and every 503
-   this server raises gets a `Retry-After` header stamped on it by the global
-   `StudioForgeError` handler in `api/app.py`; that handler's own comment states the principle
-   directly -- "'come back later' is bad advice when nothing is going to change". A 503 outside the
-   closed list would tell an agent to retry forever something that will never resolve itself, so
-   `NoLoadedModelError` is a 404 `invalid_request_error` / `no_loaded_model`, `param="model"`, and
-   deliberately carries no `retry_after_s`. The message names both the kind and the remedy: "'loaded'
-   means 'the largest model already resident that can serve this request', but no `<kind>` model is
-   currently loaded and ready. Load one, or name a model explicitly."
+3. **The failure splits into two shapes, honestly.** An earlier version of this section argued the
+   failure is never transient. A follow-up audit found that premise false in one window, and this is
+   the corrected account. With the free-slot criterion gone, what remains when
+   `_largest_ready_instance` comes up empty is not one failure but two, depending on whether a load
+   of the wanted kind is in flight:
+   - **Nothing of the wanted kind is resident, and nothing of that kind is loading either.** Nothing
+     about this changes until an operator or a client loads a model, so it is not transient, and it
+     stays a 404: `NoLoadedModelError`, `invalid_request_error` / `no_loaded_model`, `param="model"`,
+     deliberately carrying no `retry_after_s`. `docs/OPENCLAW-RIG.md`'s error table enumerates the
+     codes that mean "wait and retry unchanged" as a **closed list**, and a 503 outside it would tell
+     an agent to retry forever something that will never resolve itself -- so this case must not be a
+     503. The message names both the kind and the remedy: "'loaded' means 'the largest model already
+     resident that can serve this request', but no `<kind>` model is currently loaded and ready. Load
+     one, or name a model explicitly."
+   - **Nothing of the wanted kind is ready, but one is `loading`.** `InstanceState` in `types.py`
+     includes `"loading"`, and a JIT load of the wanted kind can take minutes --
+     `_stream_with_jit_load`'s own keep-alive comments exist because a cold load is that slow. For
+     that window "nothing is loaded" genuinely is transient: it becomes true or false on its own
+     within minutes, and "load one, or name a model explicitly" is the wrong thing to tell a caller
+     about a model somebody is already loading. `_resolve_loaded_alias` now checks
+     `_loading_instance_for` before giving up, and raises `ModelBusyError` instead of the 404 when it
+     finds a `loading` instance whose record matches `want`: 503, code `model_busy`,
+     `details={"loading": <model_id>, "retry_after_s": BUSY_RETRY_AFTER_S}`. Every 503 this server
+     raises gets a `Retry-After` header stamped on it by the global `StudioForgeError` handler in
+     `api/app.py`, so this case gets the header the 404 case must not.
+
+   `model_busy` is reused here rather than a new code invented for the occasion, and that choice is
+   deliberate: `docs/OPENCLAW-RIG.md`'s retry-safe closed list already contains `model_busy`, and
+   `manager.py` already raises it elsewhere for an in-flight load, so this fix adds no new code to the
+   OpenClaw error contract at all -- an agent that already knows to retry `model_busy` handles this
+   window correctly with no update on its side. Inventing a new code would have meant either widening
+   that closed list (a contract change for every consumer, not just this one) or leaving the new case
+   unlisted and therefore, by the list's own rule, not safe to retry blindly.
 
 **Left honest, not fixed here.**
 - `/v1/rerank` needs `extra_flags: --reranking` set by the operator today. There is no
@@ -4894,13 +4915,20 @@ not change.
   enumerates `/v1/models` and loads each one in turn.
 
 **Provenance.** The alias arrived as two patches from the bluefin box, shipped in
-`rig-update-2026-09-06.zip`, built and tested there against `6a7c89c`; this rig was four commits
-ahead at `aa642da` by the time they landed. Adopted, with the selection, failure-mode and
-free-slot fixes above.
+`rig-update-2026-09-06.zip`, claimed to have been "built and tested" there against `6a7c89c`. A
+follow-up audit found that claim provably wrong: the patches' own pre-image blob for
+`openai_routes.py` is `bfef2d7`, and that blob is the one actually present at `4393cb2` -- the
+v1.26-08-31 line -- not at `6a7c89c`, whose `openai_routes.py` blob is `459de77`. So the patches were
+*generated* against the v1.26-08-31 line, and only *claimed* to have been tested at `6a7c89c`. This
+rig was, separately and correctly, four commits ahead at `aa642da` by the time they landed. Adopted,
+with the selection, failure-mode and free-slot fixes above.
 
 **Tests.** `tests/unit/test_model_alias_loaded.py` covers per-kind selection on all five routes
 (chat/completions/tokenize share a chat pick; embeddings and rerank pick their own kind and never
 each other's or chat's), largest-wins with the context-total tie-break, that a busy resident is
 still selected (no free-slot skip), the 404 `no_loaded_model` shape with no `Retry-After` header
-when nothing of the wanted kind is resident, case-insensitivity, and that `GET /v1/models` never
-carries a synthetic `loaded` entry.
+when nothing of the wanted kind is resident OR loading, case-insensitivity, and that `GET /v1/models`
+never carries a synthetic `loaded` entry -- plus, for the `model_busy` fix above: the 503 shape with
+its `Retry-After` header and `details.loading` when nothing is ready but the wanted kind is loading,
+that a `loading` instance of a *different* kind never rescues the request (still the 404), and that a
+ready candidate always wins over a loading one, at both the helper level and over HTTP.

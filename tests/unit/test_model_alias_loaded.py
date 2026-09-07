@@ -36,6 +36,20 @@ this kind is resident" is transient, so it is a 404
 (``invalid_request_error`` / ``no_loaded_model``, ``param="model"``), never a
 503, and carries no ``Retry-After``.
 
+A follow-up audit found that premise is FALSE in one window (D58, the
+``model_busy`` fix): ``InstanceState`` includes ``"loading"``, and a JIT load
+of the wanted kind can be minutes away from ready. ``_resolve_loaded_alias``
+now checks ``_loading_instance_for`` before giving up, and raises
+``ModelBusyError`` (503, code ``model_busy``, ``details={"loading": <id>,
+"retry_after_s": BUSY_RETRY_AFTER_S}``) instead of the 404 when such a load is
+in flight -- reusing ``model_busy`` rather than inventing a code because it is
+already in OPENCLAW-RIG.md's retry-safe closed list. The 404 survives exactly
+when nothing of the wanted kind is either ready OR loading. A ready candidate
+still always wins over a loading one (``_largest_ready_instance`` is tried
+first, unconditionally), and a loading instance of the WRONG kind never
+rescues a request that needed a different one -- ``_loading_instance_for``
+applies ``_serves_want`` exactly like the ready-instance filter does.
+
 It is applied as its own step (``_resolve_loaded_alias``), right after
 ``_require_model`` and before ``_resolve_or_404``, at every one of the five
 call sites in ``openai_routes.py`` -- so both the streaming and non-streaming
@@ -65,10 +79,13 @@ from studioforge.api.app import build_state, create_app
 from studioforge.api.openai_routes import (
     LOADED_MODEL_ALIAS,
     _largest_ready_instance,
+    _loading_instance_for,
     _resolve_loaded_alias,
+    _serves_want,
 )
 from studioforge.config import Config
-from studioforge.errors import NoLoadedModelError
+from studioforge.core.planner import BUSY_RETRY_AFTER_S
+from studioforge.errors import ModelBusyError, NoLoadedModelError
 from studioforge.types import (
     GgufMeta,
     InstanceInfo,
@@ -415,6 +432,111 @@ class TestLargestReadyInstance:
 
 
 # ---------------------------------------------------------------------------
+# _serves_want -- pure unit tests, no app
+# ---------------------------------------------------------------------------
+
+
+class TestServesWant:
+    """`_serves_want` (D58) directly -- the kind predicate both
+    `_largest_ready_instance` and `_loading_instance_for` delegate to,
+    isolated here from residency/state entirely."""
+
+    def test_none_record_is_never_a_match_for_any_want(self) -> None:
+        for want in ("chat", "embedding", "rerank", "video"):
+            assert _serves_want(None, want) is False
+
+    def test_want_chat_matches_only_kind_chat(self) -> None:
+        assert _serves_want(_record("v/a", 1, kind="chat"), "chat") is True
+        assert _serves_want(_record("v/a", 1, kind="embedding"), "chat") is False
+        assert _serves_want(_record("v/a", 1, kind="rerank"), "chat") is False
+
+    def test_want_embedding_matches_kind_embedding(self) -> None:
+        assert _serves_want(_record("v/a", 1, kind="embedding"), "embedding") is True
+
+    def test_want_embedding_also_honours_the_capability_flag_on_another_kind(self) -> None:
+        """Exactly the negation of the `not_an_embedding_model` guard the
+        `embeddings` route applies to a client-named model (D52): a
+        chat-kind record whose `capabilities.embedding` is set still serves
+        an embedding want."""
+        record = _record("v/a", 1, kind="chat", capabilities=ModelCapabilities(embedding=True))
+        assert _serves_want(record, "embedding") is True
+
+    def test_want_embedding_rejects_a_plain_chat_record_without_the_capability(self) -> None:
+        assert _serves_want(_record("v/a", 1, kind="chat"), "embedding") is False
+
+    def test_want_rerank_matches_only_kind_rerank(self) -> None:
+        assert _serves_want(_record("v/a", 1, kind="rerank"), "rerank") is True
+        assert _serves_want(_record("v/a", 1, kind="chat"), "rerank") is False
+        assert _serves_want(_record("v/a", 1, kind="embedding"), "rerank") is False
+
+    def test_an_unrecognised_want_matches_no_record_of_any_kind(self) -> None:
+        for kind in ("chat", "embedding", "rerank"):
+            assert _serves_want(_record("v/a", 1, kind=kind), "video") is False  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# _loading_instance_for -- pure unit tests, no app
+# ---------------------------------------------------------------------------
+
+
+class TestLoadingInstanceFor:
+    """`_loading_instance_for` (D58, the audit's `model_busy` fix) -- the one
+    place `state == "loading"` is read as a signal instead of being filtered
+    out, exactly as `_largest_ready_instance` filters it (its step 1 treats
+    "loading" the same as stopped/failed/unloading: no proven capacity yet)."""
+
+    def test_a_loading_instance_of_the_wanted_kind_is_found(self) -> None:
+        registry = FakeRegistry([_record("v/a", 1)])
+        supervisor = FakeSupervisor([_instance("v/a", state="loading")])
+        found = _loading_instance_for(FakeState(registry, supervisor), want="chat")
+        assert found is not None
+        assert found.model_id == "v/a"
+
+    def test_a_loading_instance_of_a_different_kind_is_not_found(self) -> None:
+        """The core of the audit's second required case: an embedder mid-load
+        must not answer a chat want."""
+        registry = FakeRegistry([_record("v/embedder", 1, kind="embedding")])
+        supervisor = FakeSupervisor([_instance("v/embedder", state="loading")])
+        assert _loading_instance_for(FakeState(registry, supervisor), want="chat") is None
+
+    def test_a_ready_instance_is_not_a_loading_candidate(self) -> None:
+        registry = FakeRegistry([_record("v/a", 1)])
+        supervisor = FakeSupervisor([_instance("v/a", state="ready")])
+        assert _loading_instance_for(FakeState(registry, supervisor), want="chat") is None
+
+    @pytest.mark.parametrize("bad_state", ["stopped", "failed", "unloading"])
+    def test_every_other_non_loading_state_is_not_a_candidate_either(
+        self, bad_state: InstanceState
+    ) -> None:
+        registry = FakeRegistry([_record("v/a", 1)])
+        supervisor = FakeSupervisor([_instance("v/a", state=bad_state)])
+        assert _loading_instance_for(FakeState(registry, supervisor), want="chat") is None
+
+    def test_a_loading_instance_with_no_registry_row_is_not_found(self) -> None:
+        """Same D58 DEC-1 reasoning as `_largest_ready_instance`'s ghost
+        filter: a loading instance whose record has gone missing cannot be
+        named to a caller, busy or otherwise."""
+        supervisor = FakeSupervisor([_instance("v/ghost", state="loading")])
+        state = FakeState(FakeRegistry([]), supervisor)
+        assert _loading_instance_for(state, want="chat") is None
+
+    def test_no_instances_at_all_returns_none(self) -> None:
+        state = FakeState(FakeRegistry([]), FakeSupervisor([]))
+        assert _loading_instance_for(state, want="chat") is None
+
+    def test_any_one_matching_loading_instance_among_several_suffices(self) -> None:
+        """Only existence matters here -- the 503 names ONE loading model, not
+        a ranked "biggest loading" pick, so any qualifying instance is fine."""
+        registry = FakeRegistry([_record("v/a", 1), _record("v/b", 2)])
+        supervisor = FakeSupervisor(
+            [_instance("v/a", state="loading"), _instance("v/b", state="loading")]
+        )
+        found = _loading_instance_for(FakeState(registry, supervisor), want="chat")
+        assert found is not None
+        assert found.model_id in {"v/a", "v/b"}
+
+
+# ---------------------------------------------------------------------------
 # _resolve_loaded_alias -- pure unit tests, no app
 # ---------------------------------------------------------------------------
 
@@ -487,6 +609,58 @@ class TestResolveLoadedAlias:
         state = FakeState(FakeRegistry([]), FakeSupervisor([]))
         with pytest.raises(TypeError):
             _resolve_loaded_alias(state, "loaded")  # type: ignore[call-arg]
+
+    # -- the audit's `model_busy` fix -----------------------------------
+
+    def test_raises_model_busy_when_nothing_ready_but_the_wanted_kind_is_loading(self) -> None:
+        """Required case 1, at the helper level: nothing ready but a
+        `loading` instance of the wanted kind -- 503 `model_busy`, and
+        `details.loading` names the loading model."""
+        registry = FakeRegistry([_record("v/a", 1)])
+        supervisor = FakeSupervisor([_instance("v/a", state="loading")])
+        state = FakeState(registry, supervisor)
+        with pytest.raises(ModelBusyError) as exc_info:
+            _resolve_loaded_alias(state, "loaded", want="chat")
+        assert exc_info.value.status_code == 503
+        assert exc_info.value.code == "model_busy"
+        assert exc_info.value.details["loading"] == "v/a"
+        assert exc_info.value.details["retry_after_s"] == BUSY_RETRY_AFTER_S
+
+    def test_a_loading_instance_of_a_different_kind_does_not_rescue_the_request(self) -> None:
+        """Required case 2: an embedding model loading while a chat `loaded`
+        request arrives must still be the 404 `no_loaded_model`, not a 503 --
+        a load of the wrong kind is no reason to make this caller wait."""
+        registry = FakeRegistry([_record("v/embedder", 1, kind="embedding")])
+        supervisor = FakeSupervisor([_instance("v/embedder", state="loading")])
+        state = FakeState(registry, supervisor)
+        with pytest.raises(NoLoadedModelError) as exc_info:
+            _resolve_loaded_alias(state, "loaded", want="chat")
+        assert exc_info.value.code == "no_loaded_model"
+
+    def test_a_ready_candidate_always_wins_over_a_loading_one(self) -> None:
+        """Required case 3: a load in flight for a much bigger model must
+        never turn a servable request into a 503 -- `_largest_ready_instance`
+        is tried first, unconditionally, so `_loading_instance_for` is never
+        even consulted while a ready candidate exists."""
+        registry = FakeRegistry([_record("v/ready", 1), _record("v/loading", 999_000_000_000)])
+        supervisor = FakeSupervisor(
+            [
+                _instance("v/ready", state="ready"),
+                _instance("v/loading", state="loading"),
+            ]
+        )
+        state = FakeState(registry, supervisor)
+        assert _resolve_loaded_alias(state, "loaded", want="chat") == "v/ready"
+
+    def test_model_busy_message_names_the_loading_model_and_the_remedy(self) -> None:
+        registry = FakeRegistry([_record("v/a", 1)])
+        supervisor = FakeSupervisor([_instance("v/a", state="loading")])
+        state = FakeState(registry, supervisor)
+        with pytest.raises(ModelBusyError) as exc_info:
+            _resolve_loaded_alias(state, "loaded", want="chat")
+        message = str(exc_info.value)
+        assert "v/a" in message
+        assert "loaded" in message
 
 
 # ---------------------------------------------------------------------------
@@ -794,3 +968,89 @@ def test_v1_chat_completions_404s_as_no_loaded_model_when_only_non_chat_kinds_ar
         response = http.post("/v1/chat/completions", json={"model": "loaded", "messages": MESSAGES})
     assert response.status_code == 404, response.text
     assert response.json()["error"]["code"] == "no_loaded_model"
+
+
+# ---------------------------------------------------------------------------
+# The audit's `model_busy` fix, over HTTP: nothing about "nothing of the
+# wanted kind is resident" is transient when something of that kind is
+# already mid-JIT-load (`InstanceState` includes "loading", and that can take
+# minutes) -- `loaded` must 503 `model_busy`, not 404, for that window. These
+# are the HTTP-level proof of TestLoadingInstanceFor and the model_busy cases
+# in TestResolveLoadedAlias above.
+# ---------------------------------------------------------------------------
+
+
+def test_loaded_alias_returns_503_model_busy_when_nothing_ready_but_the_wanted_kind_is_loading(
+    app: Any,
+) -> None:
+    """Required case 1: nothing ready but a `loading` instance of the wanted
+    kind -- 503, code `model_busy`, a `Retry-After` header, and
+    `details.loading` naming the loading model."""
+    loading_only = SupervisorWithBaseUrl([_instance(BIG_ID, state="loading")])
+    app.state.supervisor = loading_only
+    app.state.manager.supervisor = loading_only
+    with TestClient(app) as http:
+        response = http.post("/v1/chat/completions", json={"model": "loaded", "messages": MESSAGES})
+    assert response.status_code == 503, response.text
+    body = response.json()
+    assert body["error"]["code"] == "model_busy"
+    assert body["error"]["type"] == "server_error"
+    assert body["error"]["studioforge"]["loading"] == BIG_ID
+    assert "Retry-After" in response.headers
+
+
+def test_loaded_alias_loading_instance_of_a_different_kind_still_404s_over_http(
+    app: Any,
+) -> None:
+    """Required case 2, over HTTP: an embedding model loading while a chat
+    `loaded` request arrives must still be the 404 `no_loaded_model`, never a
+    503 -- the wrong-kind load is no reason to make this caller wait."""
+    _set_residents(
+        app,
+        [_record(EMBED_ID, 8_000_000_000, kind="embedding")],
+        [_instance(EMBED_ID, state="loading")],
+    )
+    with TestClient(app) as http:
+        response = http.post("/v1/chat/completions", json={"model": "loaded", "messages": MESSAGES})
+    assert response.status_code == 404, response.text
+    body = response.json()
+    assert body["error"]["code"] == "no_loaded_model"
+    assert "Retry-After" not in response.headers
+
+
+def test_loaded_alias_prefers_a_ready_model_over_one_still_loading_over_http(
+    app: Any, upstream: list[dict[str, Any]]
+) -> None:
+    """Required case 3, over HTTP: a load in flight for the BIGGER model must
+    not turn a servable request into a 503 -- the smaller ready resident still
+    wins, exactly as it does with no load in flight at all."""
+    mixed = SupervisorWithBaseUrl(
+        [_instance(SMALL_ID, state="ready"), _instance(BIG_ID, state="loading")]
+    )
+    app.state.supervisor = mixed
+    app.state.manager.supervisor = mixed
+    with TestClient(app) as http:
+        response = http.post("/v1/chat/completions", json={"model": "loaded", "messages": MESSAGES})
+    assert response.status_code == 200, response.text
+    assert upstream[0]["model"] == SMALL_ID
+
+
+def test_loaded_alias_model_busy_over_http_on_the_embeddings_route_too(
+    app: Any,
+) -> None:
+    """Not just `/v1/chat/completions`: `/v1/embeddings` threads the same
+    `want` through to the same `_resolve_loaded_alias` call site, so an
+    embedding model mid-load must busy an embeddings `loaded` request the
+    same way."""
+    _set_residents(
+        app,
+        [_record(EMBED_ID, 8_000_000_000, kind="embedding")],
+        [_instance(EMBED_ID, state="loading")],
+    )
+    with TestClient(app) as http:
+        response = http.post("/v1/embeddings", json={"model": "loaded", "input": "hello"})
+    assert response.status_code == 503, response.text
+    body = response.json()
+    assert body["error"]["code"] == "model_busy"
+    assert body["error"]["studioforge"]["loading"] == EMBED_ID
+    assert "Retry-After" in response.headers

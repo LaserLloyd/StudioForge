@@ -101,8 +101,9 @@ A request naming `loaded` instead resolves to the largest resident model that ca
 route's kind* of request — live server state, no default model required. Chat/completions and
 tokenize want a chat model, `/v1/embeddings` wants an embedding model, `/v1/rerank` wants a rerank
 model; `loaded` picks per route, never a resident of the wrong kind. Nothing qualifying is a 404
-`no_loaded_model` naming the kind and the remedy — load a model, or name one explicitly — not a
-503, because nothing about it is transient (D58).
+`no_loaded_model` naming the kind and the remedy — load a model, or name one explicitly — rather
+than a 503, because nothing about it is transient. If one of that kind is still loading, that *is*
+transient and you get a 503 `model_busy` with a `Retry-After` instead (D58).
 
 ---
 

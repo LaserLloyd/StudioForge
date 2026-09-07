@@ -28,9 +28,11 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from studioforge.api.vision import prepare_messages
 from studioforge.core.model_gate import approx_params_b
+from studioforge.core.planner import BUSY_RETRY_AFTER_S
 from studioforge.core.priority import normalise_priority
 from studioforge.errors import (
     BadRequestError,
+    ModelBusyError,
     ModelNotFoundError,
     NoLoadedModelError,
     StudioForgeError,
@@ -526,6 +528,46 @@ def _require_model(body: dict[str, Any], config: Any = None) -> str:
 LOADED_MODEL_ALIAS = "loaded"
 
 
+def _serves_want(record: ModelRecord | None, want: str) -> bool:
+    """Can ``record`` serve a ``want``-kind request?
+
+    ``None`` -- an instance whose registry row has gone missing -- is never a
+    yes: :func:`_resolve_or_404` goes through ``registry.resolve``, which reads
+    the same dict ``registry.get`` just missed and only adds an alias lookup an
+    instance id can never hit, so naming such a record would fail the very next
+    call. ``"embedding"`` accepts ``capabilities.embedding`` as well as the kind
+    itself, exactly the negation of the guard :func:`embeddings` applies to a
+    model a client named itself (D52). An unrecognised ``want`` matches nothing:
+    every call site passes one of the three below, and a fourth one arriving
+    later should select no model rather than any model.
+    """
+    if record is None:
+        return False
+    if want == "chat":
+        return record.kind == "chat"
+    if want == "embedding":
+        return record.kind == "embedding" or record.capabilities.embedding
+    if want == "rerank":
+        return record.kind == "rerank"
+    return False
+
+
+def _loading_instance_for(state: Any, *, want: str) -> InstanceInfo | None:
+    """A ``want``-kind instance the supervisor is in the middle of loading.
+
+    The one case where "nothing is resident" IS transient (D58): a JIT load
+    started by some other request can take minutes, and for that window a
+    ``loaded`` caller should be told to wait rather than told to load a model
+    somebody is already loading.
+    """
+    for instance in state.supervisor.list():
+        if instance.state != "loading":
+            continue
+        if _serves_want(state.registry.get(instance.model_id), want):
+            return instance
+    return None
+
+
 def _largest_ready_instance(state: Any, *, want: str) -> InstanceInfo | None:
     """The resident instance :func:`_resolve_loaded_alias` should pick for ``want``.
 
@@ -570,18 +612,7 @@ def _largest_ready_instance(state: Any, *, want: str) -> InstanceInfo | None:
         if instance.state != "ready" or instance.plan is None:
             continue
         record = state.registry.get(instance.model_id)
-        if record is None:
-            continue
-        if want == "chat":
-            if record.kind != "chat":
-                continue
-        elif want == "embedding":
-            if record.kind != "embedding" and not record.capabilities.embedding:
-                continue
-        elif want == "rerank":
-            if record.kind != "rerank":
-                continue
-        else:
+        if record is None or not _serves_want(record, want):
             continue
         total_b, _active_b, _source = approx_params_b(record)
         key = (total_b or 0.0, instance.plan.ctx_total)
@@ -609,6 +640,19 @@ def _resolve_loaded_alias(state: Any, name: str, *, want: str) -> str:
         return name
     instance = _largest_ready_instance(state, want=want)
     if instance is None:
+        loading = _loading_instance_for(state, want=want)
+        if loading is not None:
+            # Transient after all: a load of the right kind is already in
+            # flight, so this is the "wait" that `no_loaded_model` is careful
+            # not to claim. `model_busy` is already in the retry-safe set
+            # OPENCLAW-RIG.md enumerates, and the manager raises it for an
+            # in-flight load too, so no new code enters that contract.
+            raise ModelBusyError(
+                f"'loaded' wants the largest resident {want} model, and "
+                f"'{loading.model_id}' is still loading. Retry shortly, or name "
+                f"a model explicitly.",
+                details={"loading": loading.model_id, "retry_after_s": BUSY_RETRY_AFTER_S},
+            )
         raise NoLoadedModelError(want)
     return instance.model_id
 
