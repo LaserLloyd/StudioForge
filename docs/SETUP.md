@@ -97,9 +97,12 @@ Set **Default model** (and optionally **Preload that default at startup**) and a
 omits `model` — or names `local-model`, `default`, `auto`, `current` — is served by it. The field
 becomes a dropdown of the models actually in your registry once a scan has run.
 
-A request naming `loaded` instead resolves to whichever resident model is currently largest with a
-free slot — live server state, no default model required — falling back to a 503
-`no_loaded_model` if nothing qualifies.
+A request naming `loaded` instead resolves to the largest resident model that can serve *this
+route's kind* of request — live server state, no default model required. Chat/completions and
+tokenize want a chat model, `/v1/embeddings` wants an embedding model, `/v1/rerank` wants a rerank
+model; `loaded` picks per route, never a resident of the wrong kind. Nothing qualifying is a 404
+`no_loaded_model` naming the kind and the remedy — load a model, or name one explicitly — not a
+503, because nothing about it is transient (D58).
 
 ---
 

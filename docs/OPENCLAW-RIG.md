@@ -257,6 +257,7 @@ Branch on the **code**, never on the prose. StudioForge puts it in the OpenAI er
 | SF | 400 | `context_exceeded` | prompt larger than the loaded slot (`ctx_per_slot`; `prompt_tokens` when measured). Nothing is ever truncated | shorten, or `load_recommended` at a larger `ctx_size` |
 | SF | 400 | `invalid_config` / a rejected `priority` | the request is malformed | fix the body |
 | SF | 404 | `model_not_found` | unknown id or alias | fix the id (`list_models`) |
+| SF | 404 | `no_loaded_model` | you named `loaded` and no resident model of that route's kind is `ready` | load a model, or name one explicitly |
 | SF | 409 | `lease_conflict` | `reserve_gpus` overlaps a standing lease | read `server_status().leases`; do not force |
 | SF | 409 | `lease_vacating` | that holder has been asked to stand down and has not finished | re-send every `retry_after_s`; stop when it becomes `lease_conflict` (`vacate.state: "timed_out"` — it ignored the ask; `"undeliverable"` — it never heard it) |
 | SF | 403 | `remote_admin_requires_credential` | a box change from off-rig without the PIN or key | the operator's call; do not retry |

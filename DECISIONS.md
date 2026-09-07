@@ -4813,3 +4813,94 @@ namespace, the `recovery_` prefix and "the watchdog still answers" exist only in
 `test_upstream_instructions_are_fetched_and_a_down_server_is_silent`,
 `test_the_instructions_fetch_is_bounded_when_the_server_black_holes`,
 `test_the_forwarded_instructions_are_bounded_in_size`.
+
+## D58 -- `loaded`: the largest resident model that can serve this route's kind
+
+**Problem.** `local-model`/`default`/`auto`/`current` all resolve to `models.default_model` -- a
+config value, fixed until someone edits `config.yaml` and restarts, or calls the setter. That is
+the right answer for "I don't care, give me the house model," but it is the wrong answer for "give
+me whatever is already warm," which is a different question an agent asks constantly: a chat bot
+mid-conversation, or a client that just wants to avoid a cold load, cannot know what happens to be
+resident right now without fetching `/v1/models` and guessing which entry is the big one -- the
+same problem D52 solved for "is what's loaded good enough," asked here as "what's loaded, give me
+it." `loaded` answers that second question directly: it resolves against live supervisor state,
+not config, so the same request can name a different model an hour later with no edit to anything.
+
+**Decision.** `loaded` = the largest model currently resident and ready that can serve this route's
+kind of request. Deterministic: the same request gets the same model for as long as residency does
+not change.
+
+1. **Selection is route-kind-aware.** Candidates are `ready` instances with a plan and a registry
+   record whose `kind` (or, for embeddings, `capabilities.embedding`) matches what the route wants:
+   chat for `/v1/chat/completions`, `/v1/completions` and `/v1/tokenize` (tokenize is chat *for
+   consistency, not capability* -- a client tokenizes to budget for the model it is about to chat
+   with, so `loaded` there must name the same model `loaded` would on `/v1/chat/completions`),
+   embedding for `/v1/embeddings`, rerank for `/v1/rerank`. This replaces a version that excluded
+   only embedders and left everything else -- chat and rerank alike -- eligible for every route.
+   Two concrete bugs that shipped as a result: `loaded` on `/v1/embeddings` could resolve to a chat
+   model and then die at the embeddings route's own `not_an_embedding_model` guard
+   (`openai_routes.py`) -- dead on that route by construction, not by bad luck. And a
+   rerank-kind resident (`ModelKind = Literal["chat", "embedding", "rerank"]` in `types.py`) was
+   never excluded from a chat request at all, so `loaded` on `/v1/chat/completions` could just as
+   easily hand a caller a reranker. Kind-matching per route closes both: `_largest_ready_instance`
+   takes `want` as a required keyword (no default, so a route that forgets to pass it fails to
+   import rather than silently accepting whatever is resident) and every call site names its kind
+   explicitly.
+2. **The free-slot criterion is removed.** The previous version skipped any resident already at
+   `active_requests >= plan.parallel`. Its own justification does not hold up: there is no
+   `active_requests < plan.parallel` inequality anywhere in `openai_routes.py` to be consistent
+   with, and D46 -- the module that actually gates traffic by tier -- holds its key on tiers, not
+   slot counts (`manager.py`'s `_refuse_if_held`), and its own docstring says traffic for a loading
+   model *queues* rather than being refused. Worse, the reading is stale by construction:
+   `active_requests` is incremented by `state.supervisor.mark_request_start` in `_forward`
+   and, for a streaming response, only once `StreamingResponse` first iterates the generator
+   that calls it (`_stream_upstream`) -- both *after*
+   `loaded` has already resolved, so the count a concurrent burst of `loaded` callers sees is
+   whatever it was before any of them started, not what it becomes once they land. And it silently
+   downgraded quality: a busy 27B next to a free 8B would hand the caller the 8B with no signal at
+   all, defeating the alias's entire purpose, and doing so more aggressively than naming the 27B
+   explicitly would have -- an explicit name just queues behind the D46 hold. Dropping the check
+   makes `loaded` deterministic: residency decides the answer, not a request that happened to land
+   a moment earlier.
+3. **The failure is a 404, not a 503.** With the free-slot criterion gone, the only remaining
+   failure is "nothing resident can serve this kind," which is not transient -- nothing about it
+   changes until an operator or a client loads a model. `docs/OPENCLAW-RIG.md`'s error table
+   enumerates the codes that mean "wait and retry unchanged" as a **closed list**, and every 503
+   this server raises gets a `Retry-After` header stamped on it by the global
+   `StudioForgeError` handler in `api/app.py`; that handler's own comment states the principle
+   directly -- "'come back later' is bad advice when nothing is going to change". A 503 outside the
+   closed list would tell an agent to retry forever something that will never resolve itself, so
+   `NoLoadedModelError` is a 404 `invalid_request_error` / `no_loaded_model`, `param="model"`, and
+   deliberately carries no `retry_after_s`. The message names both the kind and the remedy: "'loaded'
+   means 'the largest model already resident that can serve this request', but no `<kind>` model is
+   currently loaded and ready. Load one, or name a model explicitly."
+
+**Left honest, not fixed here.**
+- `/v1/rerank` needs `extra_flags: --reranking` set by the operator today. There is no
+  `ModelCapabilities.rerank` in `types.py`, and the supervisor appends no rerank flag when it
+  launches a child (its argv builder appends `--embedding` for embedders and nothing equivalent
+  for rerankers), so `loaded` on `/v1/rerank` picks the right *kind* of resident but
+  llama-server may still answer 501 unless that flag was set at load time.
+- A preset-only virtual model is served by its base record, so `loaded` can return the base id with
+  the preset silently not applied -- the same fact every other alias already lives with, just now
+  reachable from a name nobody typed.
+- A resident inside an open D56 vacate window is still `ready` and still a candidate; `loaded` may
+  hand it out moments before it is unloaded, degrading to the normal upstream-error path rather than
+  a special one.
+- `default_model: loaded` combined with `preload_default_model: true` is unsupported: boot would try
+  to load the literal string `loaded`, which is not a model id.
+- `loaded` is deliberately **not** listed in `GET /v1/models` -- it is request-side only (it never
+  touches the registry's alias table), because a synthetic catalogue entry breaks any client that
+  enumerates `/v1/models` and loads each one in turn.
+
+**Provenance.** The alias arrived as two patches from the bluefin box, shipped in
+`rig-update-2026-09-06.zip`, built and tested there against `6a7c89c`; this rig was four commits
+ahead at `aa642da` by the time they landed. Adopted, with the selection, failure-mode and
+free-slot fixes above.
+
+**Tests.** `tests/unit/test_model_alias_loaded.py` covers per-kind selection on all five routes
+(chat/completions/tokenize share a chat pick; embeddings and rerank pick their own kind and never
+each other's or chat's), largest-wins with the context-total tie-break, that a busy resident is
+still selected (no free-slot skip), the 404 `no_loaded_model` shape with no `Retry-After` header
+when nothing of the wanted kind is resident, case-insensitivity, and that `GET /v1/models` never
+carries a synthetic `loaded` entry.

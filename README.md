@@ -66,7 +66,11 @@ are the ones you ask for.
 
 1. A client `POST`s to `/v1/chat/completions` naming a model — or `local-model`, which resolves to
    `models.default_model` (so do `default`/`auto`/`current`), or `loaded`, which resolves instead
-   to whichever resident model is currently largest with a free slot.
+   to the largest model already resident that can serve this route's kind of request (a chat model,
+   here — `/v1/embeddings` and `/v1/rerank` resolve `loaded` against their own kind). It is a live
+   read of the supervisor, not the static default, and it 404s naming the remedy if nothing of that
+   kind is loaded. See [`docs/OPENCLAW.md`](docs/OPENCLAW.md#zero-config-inference-a-default-model)
+   for the full contract.
 2. The gateway looks the model up in the registry. If a backend is already serving it, the request
    is proxied straight through, streaming intact.
 3. Otherwise the VRAM planner chooses a placement: which GPUs, what context (walking a ladder down

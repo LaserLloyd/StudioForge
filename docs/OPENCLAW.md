@@ -704,9 +704,14 @@ With that set:
 * A request naming `local-model`, `default`, `auto`, or `current` resolves to the default. (LM
   Studio clients send the literal string `local-model` as a fallback; 404-ing it would break them
   for no reason.)
-* A request naming `loaded` resolves instead to the largest currently-resident model with a free
-  slot — live server state, not this static default, and it works whether or not `default_model`
-  is set — falling back to a 503 `no_loaded_model` if nothing qualifies.
+* A request naming `loaded` resolves instead to the largest currently-resident model that can serve
+  *this route's kind* of request — live server state, not this static default, and it works whether
+  or not `default_model` is set. `/v1/chat/completions`, `/v1/completions` and `/v1/tokenize` all
+  want a chat model; `/v1/embeddings` wants an embedding model; `/v1/rerank` wants a rerank model —
+  `loaded` never hands a chat request an embedder just because the embedder is what's resident.
+  Nothing qualifying is a 404 `no_loaded_model` naming the kind and the remedy (load one, or name a
+  model explicitly), not a retry-safe 503: nothing about "no such model is resident" changes on its
+  own, so there is no wait worth telling a caller to make (D58).
 * `preload_default_model: true` loads it at **startup**, so the first real request is a warm one
   rather than a multi-minute cold load.
 
