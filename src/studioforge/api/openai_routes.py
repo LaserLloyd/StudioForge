@@ -681,7 +681,8 @@ def _pop_ttl(payload: dict[str, Any]) -> int | None:
     rounds to it -- is the wire form of **pinned** everywhere (the sweeper
     never idle-unloads it, the planner excludes it from every eviction ladder,
     a lease refuses it), and pinning is a box change behind the D32 gate. A
-    request may shorten or lengthen the idle timer; it may not pin, which is
+    request may shorten the idle timer, or lengthen it up to its tier's
+    ceiling (:func:`_apply_ttl_override`, D61); it may not pin, which is
     the mirror of D41 item 4: it may not unpin either. Returning ``None``
     rather than clamping keeps to what the docs promise ("the idle timer
     resets to it") instead of inventing a remote "unload as soon as idle".
@@ -731,7 +732,25 @@ def _apply_ttl_override(state: Any, model_id: str, ttl_s: int | None) -> None:
         # unpin a model the owner pinned. The request still works; only its
         # idle-timer wish is ignored.
         return
-    instance.ttl_s = ttl_s
+    applied = ttl_s
+    # A request may shorten its model's idle timer, never out-live its tier
+    # (D61): the tier map's price is the ceiling. Before this, V13's background
+    # work sent ``ttl: 3600`` with no priority and a tier-3 JIT load kept an
+    # hour of idle timer against the policy's ten minutes. A state with no
+    # manager (the stream tests) is the uncapped pre-D61 path.
+    cap_for = getattr(getattr(state, "manager", None), "request_ttl_cap", None)
+    if callable(cap_for):
+        cap = cap_for(model_id)
+        if cap is not None and ttl_s > cap:
+            applied = int(cap)
+            log.debug(
+                "request ttl capped at its tier's idle timeout",
+                model_id=model_id,
+                tier=instance.priority,
+                asked=ttl_s,
+                applied=applied,
+            )
+    instance.ttl_s = applied
 
 
 def _validate_tools(payload: dict[str, Any]) -> None:

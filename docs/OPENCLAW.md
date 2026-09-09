@@ -785,10 +785,12 @@ for that model resets to it:
 {"model": "...", "messages": [...], "ttl": 1800}
 ```
 
-`ttl` is consumed by StudioForge and never forwarded to the engine. It can shorten or lengthen
-the idle timer only: `0` is the wire form of *pinned*, and pinning is a box change, so a request
-carrying `ttl: 0` (or a negative value) is served with no override rather than pinning the model
-— use `pin_model` for that.
+`ttl` is consumed by StudioForge and never forwarded to the engine. It can shorten the idle timer,
+and lengthen it only up to what the model's tier allows (`models.ttl_by_priority`, D61): a tier-3
+request asking `ttl: 3600` gets the tier's 600 s, so name a `priority` if you need the longer
+timer a better tier is priced at. A model with its own saved `ttl_s` is not capped. `0` is the wire
+form of *pinned*, and pinning is a box change, so a request carrying `ttl: 0` (or a negative
+value) is served with no override rather than pinning the model — use `pin_model` for that.
 
 ---
 

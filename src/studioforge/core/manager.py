@@ -3687,6 +3687,36 @@ class ModelManager:
                 return int(ttl)
         return self.config.models.default_ttl_s
 
+    def request_ttl_cap(self, model_id: str) -> int | None:
+        """The longest idle timer a request may set on this model; ``None`` = no cap (D61).
+
+        A request's ``ttl`` may shorten its model's idle timer and never
+        lengthen it past its tier's: ``models.ttl_by_priority`` prices the
+        tier the instance is serving at, and that price is the ceiling. No
+        cap when the map is empty (the pre-D60 world, where the request's
+        number was the only opinion), when the map does not price the tier,
+        when the model carries its own ``settings.ttl_s`` (the owner's
+        opinion, which outranks the tier's in :meth:`ttl_for` too), when it
+        is pinned, or when the tier is priced ``0`` -- never-idle-unload is
+        not a ceiling, and the instance is stamped ``0`` and protected on the
+        write side anyway.
+
+        Live consequence this closes: on 2026-09-10 a background turn sent
+        ``ttl: 3600`` with no priority; the model was JIT-loaded at tier 3 and
+        got an hour of idle timer instead of the policy's ten minutes.
+        """
+        record = self.registry.resolve(model_id)
+        instance = self.supervisor.get(record.id) if record else None
+        if record is None or instance is None:
+            return None
+        if record.settings.pinned or record.settings.ttl_s is not None:
+            return None
+        by_tier = self.config.models.ttl_by_priority
+        if not by_tier or by_tier.get(int(instance.priority)) is None:
+            return None
+        cap = self.ttl_for(record, priority=instance.priority)
+        return cap if cap > 0 else None
+
     async def _ttl_loop(self) -> None:
         interval = self.config.gateway.ttl_sweep_interval_s
         while True:
