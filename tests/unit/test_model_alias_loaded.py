@@ -347,9 +347,7 @@ class TestLargestReadyInstance:
                 _record("vendor/embedder", 137_000_000, kind="embedding"),
             ]
         )
-        supervisor = FakeSupervisor(
-            [_instance("vendor/big-chat"), _instance("vendor/embedder")]
-        )
+        supervisor = FakeSupervisor([_instance("vendor/big-chat"), _instance("vendor/embedder")])
         instance = _largest_ready_instance(FakeState(registry, supervisor), want="embedding")
         assert instance is not None
         assert instance.model_id == "vendor/embedder"
@@ -411,9 +409,7 @@ class TestLargestReadyInstance:
                 for kind in resident_kinds
             ]
         )
-        supervisor = FakeSupervisor(
-            [_instance(f"vendor/{kind}-model") for kind in resident_kinds]
-        )
+        supervisor = FakeSupervisor([_instance(f"vendor/{kind}-model") for kind in resident_kinds])
         assert _largest_ready_instance(FakeState(registry, supervisor), want=want) is None
 
     def test_an_only_resident_embedder_yields_no_chat_candidate(self) -> None:
