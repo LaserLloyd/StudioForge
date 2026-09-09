@@ -126,6 +126,19 @@ every `bNNNN` build release as a prerelease, the filter dropped all of them, and
 reported "already on the newest release" while 120 newer builds existed. The prerelease flag is no
 longer a filter, and the counts exist so the same failure cannot be silent twice.
 
+**"Check for update" recommends an older build than the newest one, or says the stable channel
+could not be read.** Both are the update channel (D62). `engine.update_channel` ships as `stable`:
+the check recommends the build upstream's newest `vX.Y.Z` version release points at through its
+`nightly-tag.txt` (`v0.4.0` → `b10809`) and reports the newest installable build beside it — *"set
+engine.update_channel to 'latest' to be offered it"* is the panel's wording, and the Install
+button, `engine --update` and `recommended_tag` all follow the channel. *"The stable channel could
+not be read: …"* names the step that failed — GitHub unreachable, the rate limit below,
+`releases/latest` not a `vX.Y.Z` release, no `nightly-tag.txt` asset, a pointer that is not a
+`bNNNN` tag — and the channel then recommends **nothing** rather than quietly offering the newest
+build; it retries after a minute (a good answer is cached for 15 minutes, and `GET /api/engine`
+carries `stable` / `stable_error` between checks). Switch the channel on the Setup tab's engine card
+or in `config.yaml` to be offered the newest build regardless.
+
 **`GitHub's API rate limit is exhausted`** — unauthenticated calls get 60 per hour per IP and one
 update check spends about six. The message names the reset time. Set `GITHUB_TOKEN` or `GH_TOKEN` to
 a personal access token (no scopes needed for a public repository) and restart; that raises it to

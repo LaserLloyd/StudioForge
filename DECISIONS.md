@@ -5204,3 +5204,122 @@ resident to re-tier.
 `test_rebalance_previews_inside_the_loads_allowed_devices_bound` in `test_gateway_lifecycle.py`,
 plus the hardening lane's `test_gpu_only_policy.py` / `test_unload_reporting.py` and the updated
 supervisor, engine, watchdog, tray and benchmark suites.
+
+## D62 -- The engine's stable channel, and a child that cannot be remapped
+
+**Status.** Landed on 2026-09-10 in two code commits on `lane/s2`, on top of D60's pair and the
+bench lint commit: `a96811e` (the child's environment and the policy table) and `0de91e6` (the
+stable channel), with `tests/unit` green (3453 passed, 28 skipped), ruff and mypy clean; this entry
+and the OPENCLAW / RUNBOOK notes follow in a third. The live server still runs b10689 under the
+pre-D62 code. b10809 -- the build the stable channel names today -- is already installed and
+smoke-tested under `engines/` beside it and is not active; moving to it is one `engine --update`
+(or the panel's Install and activate) away and is the operator's call, not this entry's.
+
+**Context.** Two findings of the 2026-09-09 review round (D60) that belong to the engine manager,
+and the one recommendation of `Projects/docs/BACKEND_SURVEY.md` (its rec. 4) that is not a backend
+change.
+
+1. *Review finding 5.* `child_environment` passed every `CUDA_*` variable through "by design". But
+   the planner addresses cards as `--device CUDAn` ordinals of the **full** enumeration
+   (`core/gpu.py`, nvidia-smi order), so a parent carrying `CUDA_VISIBLE_DEVICES=2,3` would put a
+   child's `CUDA0` on the third physical card while the plan, the VRAM accounting and every log line
+   said the first -- and D60's `launch_policy_violations` had nothing to report, because the argv
+   was exactly what StudioForge composed. `CUDA_DEVICE_ORDER` moves the same ordinals the other way.
+2. *Review finding 9.* D60's policy table listed `--lazy-mode` as a b10689 spelling. It is not.
+   Checked against the cached `--help` of both installed builds on 2026-09-10: b10689 declares
+   `--tensor-read-lazy MODE` (env `LLAMA_ARG_TENSOR_READ_LAZY`); b10809 declares
+   `-lzm, --lazy-mode MODE` (env `LLAMA_ARG_LAZY_MODE`), the same description word for word, and no
+   longer lists the old name. Nothing else in the policy surface differs between the two builds, so
+   `--lazy-mode` does exist on b10809 -- as the *only* spelling -- and did not exist on b10689.
+3. *Survey rec. 4.* The updater had one channel: the newest `bNNNN` build with an asset this box
+   can install, which since D49 means whatever merged in the last few hours. Upstream publishes two
+   kinds of release (fetched 2026-09-09): a `bNNNN` build for nearly every merge, every one flagged
+   prerelease (D49-1 exempts the tag scheme), and every few weeks a `vX.Y.Z` *version* release --
+   not prerelease -- whose only asset is `nightly-tag.txt`, a one-line pointer to the build it
+   blesses: `v0.4.0/nightly-tag.txt` -> `b10809`, `v0.3.0/nightly-tag.txt` -> `b10621`, served from
+   `https://github.com/ggml-org/llama.cpp/releases/download/<vtag>/nightly-tag.txt`. D49 filters
+   those version tags out of the build list because they ship no engine, which is right, and left
+   the one signal upstream gives about which build it stands behind unread.
+
+**Decision.**
+
+1. `CUDA_VISIBLE_DEVICES` and `CUDA_DEVICE_ORDER` join the names `child_environment` strips (beside
+   `LLAMA_ARG_*`, `LLAMA_LOG_*`, `LLAMA_API_KEY` and `MTMD_BACKEND_DEVICE`); the spawn and the
+   smoke test log them under `child_env_stripped` as before. Every other `CUDA_*`, `GGML_*` and
+   `PATH` still pass through. A variable that renumbers the cards cannot mean anything correct
+   against `--device CUDAn` ordinals; `planner.excluded_devices` is the supported way to keep a
+   card off the planner.
+2. `warn_remapping_environment()` runs from `EngineManager.__init__` -- the first thing on every
+   path that can spawn a child, the server's `build_state` and the engine CLI alike -- and logs
+   `child_env_remap_ignored` once per process per name, with the value, when StudioForge's own
+   environment carries either. An operator who set one expected it to do something, and the place
+   to say what it did instead is boot, not the fortieth launch.
+3. `POLICY_FAMILIES` carries every spelling either build declares: `-lzm` joins the
+   `--tensor-read-lazy` / `--lazy-mode` family, so the refusal never depends on which engine is
+   active, and ENGINE-FEATURES.md names which build declares which spelling instead of claiming
+   "every b10689 spelling".
+4. `EngineManager.stable_release()` (async) reads the channel: GitHub's `releases/latest` -- defined
+   as the newest non-prerelease, non-draft release, which is the version release precisely because
+   every build carries the flag; one request, no paging -- must be a `vX.Y.Z` tag carrying
+   `nightly-tag.txt`, and the pointer must be a `bNNNN` tag under 4 KiB. It answers
+   `{version, tag, published_at}` or `None`, with `last_stable_error` naming the step that failed,
+   and never raises: `GET /api/engine` reads it. Cached on the manager for `STABLE_RELEASE_TTL_S`
+   (15 minutes; version releases are weeks apart) and a failure for `STABLE_RELEASE_RETRY_S` (60 s),
+   under a 15 s lookup timeout; one WARNING per distinct reason (`engine.stable.unavailable`), the
+   repeat at DEBUG. A build tag at `releases/latest` -- upstream stops flagging builds prerelease --
+   is a failure with a reason, not a channel that quietly turned into `latest`, which is the one
+   thing the operator opted out of.
+5. `engine.update_channel: Literal["stable", "latest"] = "stable"`, validated by the config model,
+   on the Setup tab's engine card next to **Check for update**, in `config.example.yaml` and
+   `docs/SETUP.md`. Stable by default because the build upstream blessed is what an unattended box
+   should move to on its own; `latest` is the pre-D62 behaviour, one line away.
+6. `check_update()` is additive. `current`, `latest`, `latest_variant`, `update_available`,
+   `recent`, `skipped`, `filtered` and `filter_summary` keep their pre-D62 meaning on both channels;
+   `update_channel`, `stable`, `stable_variant`, `stable_error`, `recommended_tag`,
+   `recommended_variant` and `update_recommended` ride beside them. The stable tag is probed for an
+   installable asset the way `latest` is (`_installable_variant`: one GitHub call per tag, reused
+   when the newest-build loop already covered it; the source fallback only when the release itself
+   exists, because a source build clones by tag; otherwise a `skipped` entry naming the driver), and
+   `update_recommended` compares build numbers, so the recommendation is never a downgrade and never
+   a no-op (D49-2). On `stable`, an unreadable channel recommends nothing.
+7. Every surface reads the channel. `GET /api/engine` adds `update_channel`, `stable`,
+   `stable_error` and `stable_installed` through the cache (`null` from a manager without the
+   method, so the Dashboard's timer cannot 500); `/api/capabilities?check_update=true` carries the
+   whole verdict; `studioforge engine --check` prints `stable channel:` and
+   `engine.update_channel: <channel> -> recommended:` under the `active:` / `newest installable:`
+   line, `--update` installs, smoke-tests and activates the recommendation in D49-4's order, and
+   `capabilities --check-update` prints `stable` and `channel` rows; the panel's update row reads
+   channel-first (`engine_update_line`) and its Install button installs `engine_install_target`.
+   `describe_stable_channel` is the one renderer of the stable phrase, for the reason
+   `describe_release_filter` exists (D49-3): three surfaces wording one fact three ways is how they
+   come to disagree about it.
+
+**Consequences.** On this rig the check now answers "stable channel: b10809 (v0.4.0, cuda-13.3)"
+and recommends b10809 over whatever merged overnight; the newest build is still named on the same
+line, with "set engine.update_channel to 'latest' to be offered it" when it is newer, and an
+operator on `latest` sees the stable build beside the offer -- the channel changes the button's
+target, never what is shown. A pre-D62 caller reads exactly what it used to, with one nuance:
+`update_available` on the stable channel still means "a newer build exists", which is no longer
+"you should install it"; anything that acts on the flag should act on `update_recommended`
+(`sfctl`'s `engine-check` reads `GET /api/engine` and does not print the stable build yet -- a
+`packages/` change, not made here). The status route costs GitHub at most two reads per quarter
+hour and an update check one extra asset probe when the stable build is not the newest one, inside
+the unauthenticated 60/hour budget the RUNBOOK describes. An operator who hid a card from
+StudioForge with `CUDA_VISIBLE_DEVICES` now gets one WARNING at boot and must use
+`planner.excluded_devices`; the behaviour change is deliberate and announced. Left honest: the
+channel is read from `releases/latest`, which leans on upstream continuing to flag every build
+release prerelease -- if that stops, the channel fails closed with a reason (pinned by a test) and
+the fix is to page for the newest `vX.Y.Z` release, for which the regex and the pointer parse
+already exist; the cache is process-local like every other cache on the manager; and the NiceGUI
+rows are covered only through their pure renderers.
+
+**Tests.** `tests/unit/test_engine_stable_channel.py` (21 tests: the pointer followed and the
+version tags still filtered from the build list; a 404, a network failure, a build tag at
+`releases/latest`, a non-build pointer and a missing asset each `None` with a reason and one
+warning; the cache, the refresh and the shorter retry; both channels' verdicts with every pre-D62
+key untouched; the never-a-downgrade rule; the no-asset and missing-release fallbacks; the probe
+count; `GET /api/engine` through the cache and from a stub; the config key; the renderer, the panel
+line, the Install target and `engine --check`), the D62 additions to `test_gpu_only_policy.py`
+(`-lzm` in the table, both CUDA names stripped from the spawn and the smoke test, the
+once-per-process boot warning), and a mock client on the two `engine_status` tests in
+`test_engine.py` so the route never reaches GitHub from a test.
