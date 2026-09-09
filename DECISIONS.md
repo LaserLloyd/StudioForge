@@ -5204,3 +5204,149 @@ resident to re-tier.
 `test_rebalance_previews_inside_the_loads_allowed_devices_bound` in `test_gateway_lifecycle.py`,
 plus the hardening lane's `test_gpu_only_policy.py` / `test_unload_reporting.py` and the updated
 supervisor, engine, watchdog, tray and benchmark suites.
+
+## D61 -- Leases survive a restart, a request may not out-live its tier, and `gpu_only` is a field
+
+**Status.** Landed in three commits on 2026-09-10 (findings 1, 2 and 4 of the 2026-09-09 review
+round): the lease mirror and restore, the request-TTL cap, and the computed field, with the whole
+`tests/unit` suite green (3472 passed), ruff and mypy clean. The live server was still running
+the pre-D61 code at commit time; the restart is the deploy step, and migration 008 runs on that
+first start. Nothing here changes a wire shape except by addition: every lease projection gains
+`restored_at`, every full `effective` dump gains `gpu_only`.
+
+**Context.** Three things went wrong on the morning of 2026-09-10, all downstream of one restart.
+At 03:32 a `POST /api/restart/server` emptied the in-memory lease book -- D43 kept it in memory on
+purpose, on the theory that a lease describes a live situation and a restart is a clean slate --
+and with it the lease ClawForge2 held on CUDA 2, the card ComfyUI renders on. At 03:45 a tier-3
+`load_recommended` from a third tenant (`transforge`) placed a 30B model on CUDA [2, 3], exactly
+where the lease would have refused it. At 04:55 ClawChat V13's background work sent `ttl: 3600`
+with no `priority`; its JIT load landed a 27B on the same pair, and because a request's `ttl` could
+lengthen the idle timer without limit, the instance kept an hour of idle timer where the D60 policy
+prices tier 3 at 600 s. Every re-ask by the image gateway since answered `503 busy`, because a lease
+never interrupts a stream (D36): the holder that had done everything right was locked out of its
+own card by a restart it did not ask for, for as long as a background tenant's number said. The
+review's fourth finding was smaller and older: `EffectiveLaunch.gpu_only` was a bare `@property`,
+so `compact()` (MCP, `/v1/models`) named it while `model_dump()` -- what `GET /api/status`,
+`GET /api/models` and `introspect` return for `effective` -- dropped it, against what
+ENGINE-FEATURES.md documents.
+
+**Decision.**
+
+1. *The book is mirrored to the registry and restored at start.* Migration 008 adds `gpu_leases`
+   (`id` primary key, `devices_json`, `holder`, `model_ids_json`, `reason`, `created_at`,
+   `last_activity_at`, `idle_ttl_s`, `priority`, `vacate_url`, `vacate_token`, `holder_peer`,
+   `updated_at`); `Database.save_lease` upserts on `id` and never moves `created_at`,
+   `delete_lease` and `clear_leases` drop rows, `list_leases` answers oldest first and skips a row
+   whose JSON will not parse with its id logged, so one torn row cannot cost the restore every
+   other lease on the box. `LeaseBook` takes a `LeaseStore` (`put`/`delete`/`load`;
+   `DatabaseLeaseStore` is the one over the registry, and `lease_store_for(db)` duck-types it so a
+   stub database in a test keeps an unmirrored book that is the pre-D61 book to the byte) and
+   writes through: acquire, release and every vacate mark at once; touches on a coalescing clock
+   -- a touch is mirrored only when `TOUCH_PERSIST_INTERVAL_S` (5 s) has passed since the row was
+   last written, so a keep-alive every second is one write per five and a clock that did not move
+   is no write at all, and a restore can see a `last_activity_at` at most 5 s older than the
+   holder's last touch. A store failure warns once per `op:ExceptionName` until the next success
+   and never refuses or loses a lease: the in-memory book stays authoritative, and the row is
+   retried by the next touch. The vacate token and the holder peer ARE stored, though D55/D56
+   exclude them from every API dump: the token is what lets this server POST a vacate request to
+   the holder after a restart, the peer is the proof of holdership the open unload routes check,
+   and the registry file (`registry.sqlite3`) is local to the box -- it sits in the data dir
+   beside the model settings and the download queue, so a token there is no more exposed than the
+   process memory it lived in before. The vacate window (`vacate_requested_at` through
+   `vacate_delivery_status`) and `restored_at` are deliberately not stored: a restart ends any ask
+   in flight.
+
+   `LeaseBook.restore()` reads the rows oldest first and, per row: one already standing in the
+   book is left alone (a second restore is a no-op); one idle past its `idle_ttl_s` is dropped and
+   its row deleted -- the sweep would have released it had the server stayed up, and the TTL still
+   bounds a holder that died while the server was down; one held by this server's own benchmark
+   (`OWN_HOLDER_FAMILIES = {"benchmark"}`; `crucibleforge` is a separate process and is not in it)
+   is dropped, because its holder did not survive the process; one whose cards a lease granted
+   since start already holds is dropped with the holders named -- the boot runs in the background
+   after the bind (D33), so a lease granted in the seconds before the restore is the running
+   server's and wins over the row. Everything else comes back with its clocks, its
+   `vacate_url`/`vacate_token` and `holder_peer`, the vacate window cleared (a better class asking
+   again re-runs D56 from scratch) and `restored_at` stamped -- now on every lease view, `null`
+   for a lease the running server granted. The coalescing clock starts from the restore, so the
+   first keep-alive is not an immediate rewrite of a row that just came back. A store that cannot
+   be read is a warning and an empty book, never a boot failure.
+
+   `ModelManager` binds a `DatabaseLeaseStore` over its database onto the shared book at
+   construction (the app builds the book before the manager so the planner can share it; the
+   manager is the one holding the database), and `start()` calls `_restore_leases()` before the
+   TTL sweeper and the pinned autoload, so nothing that expires a lease or must honour one runs
+   ahead of it. The manager adds the one check only it can make: a restored lease naming a CUDA
+   device this box does not have (`_known_devices()`) is released with a warning, because the
+   planner could never honour it and a holder re-asking would be told the same; a probe that
+   cannot answer keeps every restored lease. The restore never raises -- a failure is a traceback
+   and the pre-D61 empty book. `stop()` leaves the rows in place, which is the whole point.
+
+2. *A request may shorten its model's idle timer, never out-live its tier.*
+   `ModelManager.request_ttl_cap(model_id)` prices the tier the instance is serving at through
+   `ttl_for` and answers that as the ceiling -- or `None`, no cap, when `models.ttl_by_priority`
+   is empty (the pre-D60 world, where the request's number was the only opinion), when the map
+   does not price the tier, when the model carries its own `settings.ttl_s` (the owner's opinion,
+   which outranks the tier's in `ttl_for` too), when it is pinned (pinning is a box change; a
+   request may neither pin nor unpin, D41), or when the tier is priced `0` -- never-idle-unload is
+   not a ceiling, and the instance is stamped `0` and protected on the write side anyway.
+   `_apply_ttl_override` in the OpenAI routes caps the request's `ttl` at it and logs the cap at
+   DEBUG with model, tier, asked and applied; a request may still shorten below it, asking exactly
+   the cap is not a cap, and a state without a manager keeps the uncapped path. So the 04:55 turn
+   would have got 600 s, and a caller that needs the longer timer names the `priority` that is
+   priced for it: the tier system answers, not the request's number.
+
+3. *`EffectiveLaunch.gpu_only` is a pydantic `@computed_field`.* Derived from `policy_violations`
+   on every dump and never read as input -- a dump fed back to the constructor round-trips, the key
+   ignored as any extra is. `compact()` is unchanged to the key. `GET /api/status`,
+   `GET /api/models` and `introspect` now carry what ENGINE-FEATURES.md said they did.
+
+**Consequences.**
+
+- A restart is no longer a clean slate for leases, and the failure mode inverts: the risk is now a
+  stale lease surviving a restart rather than a live one being forgotten. The idle TTL is the bound
+  on that -- a holder that died while the server was down is released when its `idle_ttl_s` runs
+  out, exactly as if the server had stayed up, and an open-ended lease (`idle_ttl_s: null`)
+  survives until released, as it always did while the server ran. A holder keeps touching and keeps
+  its `lease_id` across a StudioForge restart; the id is the same. `restored_at` says which leases
+  the running server did not grant itself.
+- The vacate token lives in `registry.sqlite3`. Anyone who can read the data dir could POST a
+  vacate to a holder; anyone who can read the data dir can already read `config.yaml` and the model
+  settings, so this is no new trust boundary -- but the file is not something to copy off the box.
+- One small write per lease per sweep, not per request: the sweep's touches reach the registry on
+  the book's coalescing clock, and the registry is SQLite in WAL mode, so a lease with a resident
+  model costs at most one upsert per 5 s.
+- A background request cannot buy an hour of GPU with a number any more. A client that used `ttl`
+  to keep a model warm past its tier gets the tier's price and must name a `priority`; SETUP.md and
+  OPENCLAW.md say so. An operator who wants the old behaviour clears `models.ttl_by_priority` to
+  `{}`.
+- Every full `effective` dump gains a `gpu_only` key; `compact()` readers see nothing new.
+
+**Left honest.** The mirror cannot tell a live holder from a dead one; only the clocks can, and that
+is unchanged from a running server -- a holder that died while the server was down holds its card
+until its TTL, an open-ended one until someone releases it. `request_ttl_cap` prices the tier the
+instance is *serving* at (D48's only-upwards rule has already applied), so a request that names a
+better `priority` raises the cap with the tier; it does not re-tier the instance itself, which stays
+`_resolve_priority`'s job. Nothing persists the vacate window: a restart in the middle of a D56 ask
+forgets the ask, and the next better-class ask starts the protocol over. The deploy restart is the
+last one that forgets: the running pre-D61 process holds its book in memory only, and migration 008
+creates the table on the new process's first start, so whatever stands at that restart is lost one
+final time and its holders re-ask then -- the protection starts with the first lease granted after
+it.
+
+**Tests.** `tests/unit/test_lease_persistence.py` (migration 008 and the accessors; every field
+including token and peer written on acquire; release and the sweep's expiry delete the row; vacate
+marks written through; touches coalesced on the 5 s clock and a failed write retried by the next
+touch; a fresh book from the same store restores byte for byte; restore idempotent; expired rows,
+this server's own benchmark leases and rows a newer lease conflicts with dropped; restore without a
+store is the pre-D61 book; a store that raises never breaks the book and is heard again after it
+recovers; `lease_store_for` duck-typed; the manager binds a store over a real database and leaves
+stubs alone; unknown devices dropped at start and a probe that cannot answer keeps every restored
+lease; the restore never raises; `start()` restores and the sweep releases an idle restored lease;
+`stop()` leaves the rows and the next start restores them), `tests/unit/test_request_ttl_cap.py` (a
+background request cannot out-live its tier; a request may shorten below the cap; asking exactly the
+cap is not a cap; every shipped tier is its own ceiling; a model's own `ttl_s`, a pin, an empty map,
+an unpriced tier and a tier priced `0` are uncapped; an unknown or unloaded model and a state without
+a manager are the uncapped path), `tests/unit/test_effective_launch_gpu_only_field.py` (the dump
+carries the field in both modes, derived on every dump, never read as input, `compact()` unchanged to
+the key, nested through `InstanceInfo` the way `introspect` and `/api/status` reach it) and the
+`/api/status` + `/api/models` row test in `test_catalog_routes.py`.
