@@ -10,12 +10,15 @@ engine's help -- so ``--device none``, ``--cpu-moe``, ``--n-cpu-ffn 48``,
 where llama.cpp's last-wins rule made them beat our own flags, and the child
 inherited every ``LLAMA_ARG_*`` variable on top. These tests pin the repair:
 
-* one table (``engine.POLICY_FAMILIES``) with every b10689 spelling;
+* one table (``engine.POLICY_FAMILIES``) with every b10689 spelling -- and the
+  one rename b10809 made (``--tensor-read-lazy`` -> ``-lzm``/``--lazy-mode``);
 * refused at save time (``validate_extra_flags``) BEFORE the existence check;
 * refused again at launch (``Supervisor.build_command``) over the saved flags
   and over the final argv, so a stale row cannot launch;
 * ``--n-gpu-layers 999 --fit off`` are the LAST tokens of every argv;
-* the child's environment is stripped of ``LLAMA_ARG_*``;
+* the child's environment is stripped of ``LLAMA_ARG_*`` and of the two
+  card-renumbering variables ``CUDA_VISIBLE_DEVICES`` / ``CUDA_DEVICE_ORDER``
+  (D62), and the manager says so once per process at start-up;
 * ``effective_launch`` says ``GPU-only`` or names the violation;
 * ``--mlock``/``--no-mmap`` map onto ``--load-mode`` where the engine has it.
 """
@@ -301,12 +304,16 @@ class _Recorder:
         ("--no-host", "--no-host", "offload"),
         ("--tensor-read-lazy", "--tensor-read-lazy", "offload"),
         ("--lazy-mode", "--tensor-read-lazy", "offload"),
+        ("-lzm", "--tensor-read-lazy", "offload"),  # b10809's spelling of the same flag
         ("--rpc", "--rpc", "offload"),
     ],
 )
-def test_every_b10689_spelling_is_in_the_one_table(
+def test_every_b10689_and_b10809_spelling_is_in_the_one_table(
     spelling: str, canonical: str, kind: str
 ) -> None:
+    """b10809 renamed ``--tensor-read-lazy`` to ``-lzm, --lazy-mode`` and dropped
+    the old name (checked against both builds' ``--help`` on 2026-09-10, D62);
+    the table carries every spelling either build declares."""
     family = POLICY_FLAGS[spelling]
     assert family.canonical == canonical
     assert family.kind == kind
@@ -557,10 +564,14 @@ def test_the_final_argv_check_is_a_second_net_behind_the_token_check(
 
 
 def test_child_environment_strips_the_llama_arg_surface_and_keeps_the_rest() -> None:
+    """The offload surface and the two card-renumbering variables go; the DLL
+    search path and every other ``CUDA_*`` / ``GGML_*`` setting stay (D62)."""
     parent = {
         "PATH": "/usr/bin",
         "SYSTEMROOT": "C:/Windows",
-        "CUDA_VISIBLE_DEVICES": "0,1",
+        "CUDA_LAUNCH_BLOCKING": "1",  # a CUDA setting that renumbers nothing
+        "CUDA_VISIBLE_DEVICES": "0,1",  # would make the child's CUDA0 a different card
+        "cuda_device_order": "PCI_BUS_ID",  # same, the other way round
         "GGML_CUDA_FORCE_MMQ": "1",
         "SF_DATA_DIR": "/tmp/sf",
         "LLAMA_ARG_N_CPU_MOE": "4",
@@ -574,12 +585,14 @@ def test_child_environment_strips_the_llama_arg_surface_and_keeps_the_rest() -> 
     assert set(env) == {
         "PATH",
         "SYSTEMROOT",
-        "CUDA_VISIBLE_DEVICES",
+        "CUDA_LAUNCH_BLOCKING",
         "GGML_CUDA_FORCE_MMQ",
         "SF_DATA_DIR",
     }
     assert stripped == sorted(
         [
+            "CUDA_VISIBLE_DEVICES",
+            "cuda_device_order",
             "LLAMA_ARG_N_CPU_MOE",
             "llama_arg_device",
             "LLAMA_ARG_FIT",
@@ -601,6 +614,7 @@ async def test_a_spawned_child_does_not_inherit_llama_arg_variables(
     and its removal logged."""
     monkeypatch.setenv("LLAMA_ARG_N_CPU_MOE", "4")
     monkeypatch.setenv("LLAMA_ARG_DEVICE", "none")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2,3")  # D62: would renumber the child
     seen: dict[str, Any] = {}
     real = asyncio.create_subprocess_exec
 
@@ -625,9 +639,14 @@ async def test_a_spawned_child_does_not_inherit_llama_arg_variables(
     env = seen["env"]
     assert env is not None, "the child was spawned with the inherited environment"
     assert "LLAMA_ARG_N_CPU_MOE" not in env and "LLAMA_ARG_DEVICE" not in env
+    assert "CUDA_VISIBLE_DEVICES" not in env
     assert "PATH" in env
     stripped = [f for e, f in recorder.warnings if e == "child_env_stripped"]
-    assert stripped and {"LLAMA_ARG_N_CPU_MOE", "LLAMA_ARG_DEVICE"} <= set(stripped[0]["names"])
+    assert stripped and {
+        "LLAMA_ARG_N_CPU_MOE",
+        "LLAMA_ARG_DEVICE",
+        "CUDA_VISIBLE_DEVICES",
+    } <= set(stripped[0]["names"])
     assert stripped[0]["model_id"] == record.id
 
 
@@ -646,6 +665,47 @@ async def test_the_engine_smoke_test_spawns_with_the_same_sanitised_environment(
     assert ok is False and "could not launch" in detail
     assert seen["env"] is not None and "LLAMA_ARG_CPU_MOE" not in seen["env"]
     assert "PATH" in seen["env"]
+
+
+def test_the_manager_warns_once_per_process_that_a_renumbering_variable_is_ignored(
+    config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D62: an operator who set ``CUDA_VISIBLE_DEVICES`` for the whole box
+    expected it to do something. It does nothing to a child, and that is said
+    once at start-up, with the value, not on every launch and not never."""
+    recorder = _Recorder()
+    monkeypatch.setattr(engine_module, "log", recorder)
+    monkeypatch.setattr(engine_module, "_REMAP_WARNED", set())
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2,3")
+    monkeypatch.setenv("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+
+    EngineManager(config)
+    EngineManager(config)  # a second manager in the same process adds nothing
+
+    warned = [f for e, f in recorder.warnings if e == "child_env_remap_ignored"]
+    assert sorted(w["name"] for w in warned) == ["CUDA_DEVICE_ORDER", "CUDA_VISIBLE_DEVICES"]
+    by_name = {w["name"]: w for w in warned}
+    assert by_name["CUDA_VISIBLE_DEVICES"]["value"] == "2,3"
+    assert "2,3" in by_name["CUDA_VISIBLE_DEVICES"]["detail"]
+    assert "will NOT inherit it" in by_name["CUDA_VISIBLE_DEVICES"]["detail"]
+    assert "planner.excluded_devices" in by_name["CUDA_DEVICE_ORDER"]["detail"]
+    # The decision is readable without the log, and is case-insensitive.
+    assert engine_module.warn_remapping_environment({"cuda_visible_devices": "0"}) == [
+        "CUDA_VISIBLE_DEVICES"
+    ]
+    assert engine_module.warn_remapping_environment({"CUDA_LAUNCH_BLOCKING": "1"}) == []
+
+
+def test_a_clean_environment_is_silent_at_start_up(
+    config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorder = _Recorder()
+    monkeypatch.setattr(engine_module, "log", recorder)
+    monkeypatch.setattr(engine_module, "_REMAP_WARNED", set())
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.delenv("CUDA_DEVICE_ORDER", raising=False)
+    EngineManager(config)
+    assert not [f for e, f in recorder.warnings if e == "child_env_remap_ignored"]
 
 
 # ---------------------------------------------------------------------------

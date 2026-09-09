@@ -310,8 +310,12 @@ is off.
 ## GPU-only policy
 
 StudioForge never runs any part of a model on the CPU (CONTRIBUTING.md, "Things that are
-deliberate"). The policy is one table, `POLICY_FAMILIES` in `core/engine.py`, every b10689
-spelling of every flag in two families:
+deliberate"). The policy is one table, `POLICY_FAMILIES` in `core/engine.py`: every spelling of
+every flag that b10689 (the active build) or b10809 (the stable channel's build, D62) declares,
+in two families. Checked against both builds' `--help` on 2026-09-10, the two differ in exactly
+one spelling: b10689 calls the lazy tensor-read flag `--tensor-read-lazy`, b10809 renamed it
+`-lzm`/`--lazy-mode` (env `LLAMA_ARG_LAZY_MODE`) and no longer lists the old name. The table
+carries all three, so the refusal does not depend on which engine is active.
 
 * **Managed** — the manager assigns these per launch and an operator value would break the
   system or the policy: `--model`/`-m`, `--model-url`/`-mu`, `--port`, `--host`, `--alias`/`-a`,
@@ -328,7 +332,8 @@ spelling of every flag in two families:
   `--override-tensor-draft`/`-otd`/`--spec-draft-override-tensor`, `--cpu-moe`/`-cmoe`,
   `--n-cpu-moe`/`-ncmoe`, `--n-cpu-ffn`/`-ncffn`, `--spec-draft-cpu-moe`/`-cmoed`/`--cpu-moe-draft`,
   `--spec-draft-n-cpu-moe`/`-ncmoed`/`--n-cpu-moe-draft`/`--spec-draft-ncmoe`,
-  `--op-offload`/`--no-op-offload`, `--no-host`, `--tensor-read-lazy`, `--rpc`.
+  `--op-offload`/`--no-op-offload`, `--no-host`, `--tensor-read-lazy`/`--lazy-mode`/`-lzm`,
+  `--rpc`.
 
 Thread-affinity flags (`--threads`/`-t`, `--cpu-mask`, `--cpu-range`, `--cpu-strict`, `--numa`)
 are not offload — they place the host threads llama-server always has — and stay allowed in
@@ -350,8 +355,16 @@ The table is enforced at **two points**, from the same code:
 
 The child's **environment** is sanitised on the same principle: b10689 reads an `LLAMA_ARG_*`
 variable for nearly every flag, so every `LLAMA_ARG_*`, `LLAMA_LOG_*`, `LLAMA_API_KEY` and
-`MTMD_BACKEND_DEVICE` is stripped before the spawn (the names stripped are logged at WARNING);
-`CUDA_*`, `GGML_*` and `PATH` pass through.
+`MTMD_BACKEND_DEVICE` is stripped before the spawn (the names stripped are logged at WARNING).
+`CUDA_VISIBLE_DEVICES` and `CUDA_DEVICE_ORDER` are stripped too (D62), for a different reason:
+they are not offload flags, they re-number the cards a process sees. The planner addresses cards
+as `--device CUDAn` ordinals of the full enumeration (nvidia-smi order), so a child that
+inherited either would put `CUDA0` on a different physical card than the one planned — with no
+policy violation to report, because the argv was exactly what StudioForge composed. When
+StudioForge's own environment carries either variable, the engine manager logs one WARNING at
+start-up (`child_env_remap_ignored`, naming the value) saying the child will not inherit it, and
+points at `planner.excluded_devices` as the supported way to keep a card off the planner. Every
+other `CUDA_*` variable, `GGML_*` and `PATH` pass through.
 
 What actually launched is reported per instance in `effective` (D54): `n_gpu_layers`, `fit`,
 `device`, `split_mode`, `load_mode`, `kv_offload`, `gpu_only` and `policy_violations`, and the

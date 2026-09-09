@@ -96,7 +96,7 @@ FlagKind = Literal["managed", "offload"]
 
 @dataclass(frozen=True)
 class FlagFamily:
-    """One llama-server option, every spelling b10689 accepts for it."""
+    """One llama-server option, every spelling b10689 or b10809 accepts for it."""
 
     canonical: str
     spellings: tuple[str, ...]
@@ -118,8 +118,12 @@ def _offload(canonical: str, *aliases: str, why: str, takes_value: bool = True) 
 
 
 #: THE GPU-only policy table (2026-09-09 review). Every spelling is from the
-#: b10689 ``--help``; short aliases matter because ``extra_flags`` is typed by
-#: hand and ``-ncffn`` is as legal as ``--n-cpu-ffn``.
+#: b10689 ``--help``, plus the one rename b10809 -- the stable channel's build
+#: on 2026-09-10 (D62) -- made to it: ``--tensor-read-lazy`` became
+#: ``-lzm, --lazy-mode`` and the old spelling is gone from its help. Both
+#: builds' spellings are here so the refusal never depends on which engine is
+#: active; short aliases matter because ``extra_flags`` is typed by hand and
+#: ``-ncffn`` is as legal as ``--n-cpu-ffn``.
 #:
 #: Enforced twice, from this one table: at save time by
 #: :meth:`EngineManager.validate_extra_flags` (a form error), and at launch by
@@ -250,8 +254,11 @@ POLICY_FAMILIES: tuple[FlagFamily, ...] = (
         takes_value=False,
     ),
     _offload(
+        # b10689 spells it --tensor-read-lazy; b10809 renamed it -lzm/--lazy-mode
+        # (LLAMA_ARG_LAZY_MODE) and no longer lists the old name.
         "--tensor-read-lazy",
         "--lazy-mode",
+        "-lzm",
         why="would serve tensor rows from disk on demand instead of from VRAM",
     ),
     _offload("--rpc", why="would ship work to a remote backend"),
@@ -319,8 +326,23 @@ def refuse_policy_flags(tokens: Iterable[str]) -> list[str]:
 #: ``LLAMA_LOG_*`` would redirect the output the supervisor pumps into the
 #: per-model log. ``MTMD_BACKEND_DEVICE`` is ``--mmproj-device``'s variable
 #: (not under the ``LLAMA_ARG_`` prefix); ``none`` there runs vision on the CPU.
+#:
+#: The two CUDA variables are a different hazard (D62). They are not offload
+#: flags: they re-number the cards a process sees. The planner addresses
+#: cards as ``--device CUDAn`` ordinals of the FULL enumeration
+#: (``core/gpu.py``, nvidia-smi order), so a child that inherited
+#: ``CUDA_VISIBLE_DEVICES=2,3`` would put its ``CUDA0`` on the third physical
+#: card while the plan, the VRAM accounting and every log line said the first
+#: -- and ``launch_policy_violations`` would have nothing to report, because
+#: the argv was exactly what StudioForge composed. ``CUDA_DEVICE_ORDER`` moves
+#: the same ordinals the other way. Neither can mean anything correct here;
+#: ``planner.excluded_devices`` is the supported way to keep a card off the
+#: planner. :func:`warn_remapping_environment` says so once at start-up.
 _CHILD_ENV_PREFIXES: tuple[str, ...] = ("LLAMA_ARG_", "LLAMA_LOG_")
-_CHILD_ENV_NAMES: frozenset[str] = frozenset({"LLAMA_API_KEY", "MTMD_BACKEND_DEVICE"})
+_CHILD_ENV_REMAP_NAMES: frozenset[str] = frozenset({"CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER"})
+_CHILD_ENV_NAMES: frozenset[str] = (
+    frozenset({"LLAMA_API_KEY", "MTMD_BACKEND_DEVICE"}) | _CHILD_ENV_REMAP_NAMES
+)
 
 
 def child_environment(
@@ -328,10 +350,14 @@ def child_environment(
 ) -> tuple[dict[str, str], list[str]]:
     """``(environment for a llama-server child, names that were stripped)``.
 
-    Everything else -- ``PATH``, ``CUDA_*``, ``GGML_*``, ``SF_*`` -- passes
-    through untouched: the child needs its DLL search path and its CUDA
-    settings, and none of those can move a layer off the GPU. Names are
-    matched case-insensitively because Windows environment names are.
+    Stripped: the ``LLAMA_ARG_*`` / ``LLAMA_LOG_*`` surface, ``LLAMA_API_KEY``,
+    ``MTMD_BACKEND_DEVICE``, and the two card-renumbering variables
+    ``CUDA_VISIBLE_DEVICES`` / ``CUDA_DEVICE_ORDER`` (D62). Everything else --
+    ``PATH``, every other ``CUDA_*``, ``GGML_*``, ``SF_*`` -- passes through
+    untouched: the child needs its DLL search path and its CUDA settings, and
+    none of those can move a layer off the GPU or a layer onto a different
+    card. Names are matched case-insensitively because Windows environment
+    names are.
     """
     source = os.environ if environ is None else environ
     env: dict[str, str] = {}
@@ -343,6 +369,51 @@ def child_environment(
             continue
         env[key] = value
     return env, sorted(stripped)
+
+
+#: The card-renumbering names this process has already warned about. The
+#: warning is a boot-time fact about OUR environment, not a per-launch one, so
+#: it is said once per process however many managers or launches follow.
+_REMAP_WARNED: set[str] = set()
+
+
+def warn_remapping_environment(environ: Mapping[str, str] | None = None) -> list[str]:
+    """Warn, once per process, that a card-renumbering variable will not reach a child.
+
+    ``CUDA_VISIBLE_DEVICES`` and ``CUDA_DEVICE_ORDER`` in StudioForge's own
+    environment are stripped by :func:`child_environment` (D62), so a child
+    cannot be silently renumbered against the planner's ``--device CUDAn``
+    ordinals -- but an operator who set one expected it to do something, and
+    the place to say what it did instead is the first thing the engine manager
+    does, not the fortieth launch. Logged at WARNING with the name and the
+    value, the same way a launch reports ``child_env_stripped``.
+
+    Returns the names found (upper-cased, sorted), warned about or not, so a
+    caller can test the decision without reading the log.
+    """
+    source = os.environ if environ is None else environ
+    found: list[str] = []
+    for key, value in source.items():
+        upper = key.upper()
+        if upper not in _CHILD_ENV_REMAP_NAMES:
+            continue
+        found.append(upper)
+        if upper in _REMAP_WARNED:
+            continue
+        _REMAP_WARNED.add(upper)
+        log.warning(
+            "child_env_remap_ignored",
+            name=key,
+            value=value,
+            detail=(
+                f"{key}={value!r} is set in StudioForge's own environment and a llama-server "
+                "child will NOT inherit it: the planner addresses cards as --device CUDAn "
+                "ordinals of the full enumeration (nvidia-smi order), and a child that saw "
+                "this variable would put CUDA0 on a different physical card than the one "
+                "planned. To keep a card away from the planner, set planner.excluded_devices"
+            ),
+        )
+    return sorted(found)
 
 
 #: Removed-flag hints used as a *fallback* when the engine's own ``--help``
@@ -1314,6 +1385,11 @@ class EngineManager:
         self._install_locks: dict[str, asyncio.Lock] = {}
         self.os_token = self._detect_os_token()
         self.arch_token = _norm_arch(platform.machine() or "x86_64")
+        # Once per process (D62): a CUDA_VISIBLE_DEVICES / CUDA_DEVICE_ORDER in
+        # our own environment is stripped from every child, and this is the
+        # first thing that runs on every path that can spawn one -- the server's
+        # build_state and the engine CLI alike.
+        warn_remapping_environment()
 
     def _install_lock(self, tag: str) -> asyncio.Lock:
         lock = self._install_locks.get(tag)
