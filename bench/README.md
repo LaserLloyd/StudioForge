@@ -78,7 +78,9 @@ message and `error.studioforge` details are printed verbatim) · **3** completed
    benchmark, an empty load queue and **no GPU lease on the target devices** other than one that
    **names the model under test** (a loopback caller would be waived past the D55 lease guard on
    unload, so the harness refuses any other lease; a lease taken for the bench model is recorded
-   as `own_lease` and is the quietest rig a baseline can have). The
+   as `own_lease` and is the quietest rig a baseline can have; name its holder something other
+   than `benchmark`/`crucibleforge`, which the server reads as its own in-process benchmark and
+   drops when it restores leases after a restart, D61). The
    resident instances are snapshotted (model, `plan`, `priority`) for the restore.
 2. **Validity, pre-load** — `GET /api/vram/holders` (D23) and `GET /api/gpus` are recorded.
 3. **Load** — if the model is resident at exactly the requested shape it is reused; if resident
