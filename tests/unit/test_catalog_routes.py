@@ -417,12 +417,14 @@ def test_status_and_models_rows_carry_effective_for_loaded_models_and_null_other
         row = status["loaded"][0]
         assert row["effective"]["cache_reuse"] == 256
         assert row["effective"]["sources"] == {"cache_reuse": "argv"}
+        assert row["effective"]["gpu_only"] is True, "a field of the dump, not only compact() (D61)"
         assert row["launch_args"][0] == "llama-server.exe"
 
         model_row = next(m for m in models["models"] if m["id"] == MODEL_ID)
         assert model_row["settings"]["cache_reuse"] is None, "the saved setting: inherit"
         assert model_row["effective"]["cache_reuse"] == 256, "what the child runs with"
         assert model_row["effective"]["summary"].startswith("prefix cache on")
+        assert model_row["effective"]["gpu_only"] is True
 
         loaded(app, InstanceInfo(model_id="other/model", state="ready"))
         cold = http.get("/api/models").json()

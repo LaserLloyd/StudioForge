@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, computed_field, field_validator
 
 from studioforge.config import FlashAttn, KvCacheType, SplitMode
 
@@ -992,9 +992,20 @@ class EffectiveLaunch(BaseModel):
     #: 131072, partitioned KV, spec draft-mtp".
     summary: str = ""
 
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def gpu_only(self) -> bool:
-        """True when nothing in the final argv or environment offloads to CPU."""
+        """True when nothing in the final argv or environment offloads to CPU.
+
+        A computed field, not a bare property (D61; the 2026-09-09 review's
+        finding 4): ``model_dump()`` is what ``GET /api/status``,
+        ``GET /api/models`` and ``introspect`` return for ``effective``, and a
+        bare property is invisible to it -- so the surfaces ENGINE-FEATURES.md
+        documents as carrying ``gpu_only`` carried only ``policy_violations``,
+        and only ``compact()`` (MCP, ``/v1/models``) had the one-word answer.
+        Derived on every dump, never read as input: a dump fed back to the
+        constructor is ignored on this key, as any extra key is.
+        """
         return not self.policy_violations
 
     def compact(self) -> dict[str, Any]:
