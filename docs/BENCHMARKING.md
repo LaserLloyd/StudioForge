@@ -76,7 +76,7 @@ card. If `lease_vacating` times out, or the tenant is a ClawForge2 build without
 route:
 
 1. Quiesce it by hand: `comfy_control(action="free_vram")` on ClawForge2's MCP, the tray's
-   "Unload models (free VRAM)", or `POST :8700/ui/api/control {"action": "free_vram"}`. Check
+   "Unload all models (free VRAM)", or `POST :8700/ui/api/control {"action": "free_vram"}`. Check
    `GET /api/vram/holders`: ComfyUI's `per_gpu_bytes` on the card should be small.
 2. Release its lease: `release_gpus(lease_id=...)` / `sfctl leases release <id>` /
    `DELETE /api/leases/<id>` — or wait for its idle TTL. **Then take the benchmark lease at

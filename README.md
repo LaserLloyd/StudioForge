@@ -279,7 +279,7 @@ Every number in the panel is the *actual* one the engine reports — context, sl
 On Windows, the tray starts the server, restarts it if it crashes, and keeps the everyday actions
 one right-click away:
 
-<p align="center"><img src="docs/images/tray-menu.png" alt="The system tray menu: open the control panel, unload models, restart engines or the server, copy the MCP URL and PIN, start at login" width="420"></p>
+<p align="center"><img src="docs/images/tray-menu.png" alt="The system tray menu: open the control panel, start, stop or restart the server, unload all models, restart engines, copy the MCP URL and PIN, start at login" width="420"></p>
 
 ## The companion: `sfctl`
 

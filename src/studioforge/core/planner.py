@@ -1254,6 +1254,15 @@ class Planner:
             # sprawl onto cards its owner never meant for it. An explicit
             # device_override outranks it, the same way it outranks
             # planner.excluded_devices (explicit beats policy).
+            #
+            # Two things arrive here and the wording below belongs to neither
+            # in particular: the model's own saved setting, and a one-shot
+            # ``allowed_devices`` on this load request, which the manager
+            # narrows and stamps onto a throwaway copy of the record (D59).
+            # Same set, same rules, so the messages say "allowed_devices"
+            # rather than "the model's" -- naming a saved setting the caller
+            # may not have written is the kind of small lie that sends someone
+            # editing the wrong thing.
             allowed_set = {int(d) for d in allowed}
             live = gpus_view if gpus_view is not None else list(self.probe.list_gpus())
             gpus_view = [g for g in live if g.index in allowed_set]
@@ -1262,13 +1271,13 @@ class Planner:
                     LoadRejected(
                         model_id=record.id,
                         reason=(
-                            f"the model's allowed_devices {sorted(allowed_set)} matches no "
+                            f"allowed_devices {sorted(allowed_set)} matches no "
                             f"usable GPU right now (leases or planner.excluded_devices may "
                             f"have taken them)"
                         ),
                         suggestions=[
-                            "widen or clear the model's allowed_devices setting, or free "
-                            "one of the cards it names"
+                            "widen or clear allowed_devices -- the model's setting, or "
+                            "this request's own -- or free one of the cards it names"
                         ],
                         # Only when no lease is involved: _note_leases stamps
                         # ``gpu_leased`` over this when one of the cards
@@ -1330,7 +1339,7 @@ class Planner:
             if allowed is not None and not forced:
                 result.notes.append(
                     f"placement restricted to CUDA {sorted({int(d) for d in allowed})} "
-                    f"by the model's allowed_devices setting"
+                    f"by allowed_devices"
                 )
             self._grade_placement(result, gpus_view)
         # The cards this load could have used, for the gpu_leased verdict: a

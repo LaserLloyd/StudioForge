@@ -1045,29 +1045,32 @@ class TrayApp:
             # The one always-visible line: state, resident models, free VRAM.
             item(lambda _i: self.status_line(), None, enabled=False),
             sep,
-            # default=True is what a LEFT click on the icon invokes.
+            # default=True is what a LEFT click on the icon invokes. pystray does
+            # not honour `enabled` for the default action -- it maps WM_LBUTTONUP
+            # straight to the icon call -- so this item stays ungated.
             item("Open control panel", self._on_open_control_panel, default=True),
-            item("Open API docs", self._on_open_api_docs),
-            item("Open logs folder", self._on_open_logs),
-            item("Open models folder", self._on_open_models),
             sep,
+            item("Start server", self._on_start, enabled=lambda _i: self.state in DOWN_STATES),
+            item("Stop server", self._on_stop, enabled=lambda _i: self.state in LIVE_STATES),
+            item(
+                "Restart server",
+                self._on_restart_server,
+                enabled=lambda _i: self.state in LIVE_STATES,
+            ),
             item(
                 "Unload all models (free VRAM)",
                 self._on_unload_all,
                 enabled=lambda _i: self.state == STATE_RUNNING,
             ),
+            sep,
+            item("Open API docs", self._on_open_api_docs),
+            item("Open logs folder", self._on_open_logs),
+            item("Open models folder", self._on_open_models),
+            sep,
             item(
                 "Restart engines (reload models, API stays up)",
                 self._on_restart_engines,
                 enabled=lambda _i: self.state == STATE_RUNNING,
-            ),
-            sep,
-            item("Start server", self._on_start, enabled=lambda _i: self.state in DOWN_STATES),
-            item("Stop server", self._on_stop, enabled=lambda _i: self.state in LIVE_STATES),
-            item(
-                "Restart server (whole process)",
-                self._on_restart_server,
-                enabled=lambda _i: self.state in LIVE_STATES,
             ),
             sep,
             item("Copy MCP URL", self._on_copy_mcp_url),

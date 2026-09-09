@@ -219,6 +219,22 @@ evicted.
 You often do not need this call at all — see the next step — so reach for it to pre-warm a model,
 or to load one at a specific context size and slot count.
 
+**`devices` places, `allowed_devices` bounds.** `devices` is a *forced* placement: exactly those
+cards, all of them, and more than one becomes a split. It is what a `placements[]` row's
+`load_args` carries, and it is right when you are replaying a row this server computed. It is the
+wrong tool when what you actually know is which card to **stay off** — one another program is
+rendering on, say — because forcing a set takes the placement decision away from the planner, which
+makes it better than you can. For that, pass `allowed_devices: [1, 2, 3]`: the planner still ranks
+the cards, sizes the context, picks the split and refuses honestly, inside the set you named.
+
+It is one-shot, like `devices` — nothing is saved, so the next load without it is unbounded again —
+and it only ever **narrows**. A card the model's saved settings, `planner.excluded_devices` or
+somebody's lease has closed stays closed however you ask; asking for one does not open it. Sending
+both `devices` and `allowed_devices` is a `400` (the second would decide nothing), and so is an
+empty list: if you computed "every card except that one" and got nothing, the answer is *nowhere*,
+and this server will not read it as *anywhere*. When nothing in the set fits, you get the ordinary
+507 — `allowed_devices_unavailable`, or `gpu_leased` when a lease is why.
+
 **Say what the load is for.** `priority` tiers it: `1` the model a person is actively chatting
 with, `2` a model a dispatched agent will use, `3` — or omitted — background work. A tier-1/2 load
 is planned as if the idle worse-tier residents were already gone, so it gets the placement an idle
@@ -392,7 +408,12 @@ reserve_gpus(devices=[3], reason="ComfyUI render")           # nothing loads her
 release_gpus(lease_id="...")                                  # early exit; idle_ttl_s (60 min) is the default one
 ```
 
-While it stands nobody else is planned onto those cards; the named model is loaded onto exactly
+A lease is the strong form: it holds the cards against *everyone*, until released. When you only
+need **one load** kept off a card — and cannot hold a lease, because the card is ambiguous between
+two identical GPUs or because you do not own it — pass `allowed_devices` to that load instead. It
+binds nothing but the call that carries it, and it cannot take a card away from anybody.
+
+While a lease stands nobody else is planned onto those cards; the named model is loaded onto exactly
 them, sized for as many slots as its context allows, in the split mode its own benchmark measured
 fastest there (tensor split is never assumed -- it measured *slower* than layer split on the
 reference rig, so benchmark first if you want it considered). Idle residents on the cards are
@@ -487,6 +508,7 @@ Everything else about the call is optional:
 | `prefer_mode` | Try this hardware mode first (`"dual_3090"`), instead of the headline order. |
 | `kv_min` | The lowest KV cache quality this load may accept — `"f16"`, `"q8_0"` or `"q4_0"`. A floor on the quality-first ladder, not a choice: `"f16"` means "do not quantize the cache to reach this window at all", and a window that would need a worse cache is refused rather than reached quietly at lower quality. |
 | `max_slots` | Ceiling on the slot count this load may choose (>= 1). The server's own number is what the placement *could* sustain; if you know only three bots will ever talk to it, cap it here and the KV cache for the slots you will not use is never priced into the fit — which often buys a larger window instead. Below 1 is a `400` naming the parameter. |
+| `allowed_devices` | The CUDA indices this walk may use, for this call only — `[1, 2, 3]` to keep off card 0. A bound, not a placement: the server still walks the placements over those cards, still picks the KV cache type and the slot count, and still refuses with the same structured error if the window does not fit on any of them. `prefer_mode` then names one of the modes over *those* cards. Never saved (`persist` included), and it only narrows — a card a saved setting, an exclusion or a lease forbids stays forbidden. Empty list is a `400`. |
 | `persist` | Write the profile this call resolved into the model's saved settings (below). |
 | `priority` | The load's tier, exactly as on `load_model`: `1` chat, `2` agent, `3` or omitted background. |
 
@@ -630,7 +652,7 @@ different:
 | --- | --- | --- |
 | `insufficient_vram` | the model genuinely does not fit | load smaller, or a shorter context — `error.studioforge.max_ctx_that_fits` says how short |
 | `gpu_leased` | the cards are leased to someone else (D43/D53) | wait. `Retry-After` and `error.studioforge.lease.retry_after_s` say how long; `.lease.holder_family` says who |
-| `allowed_devices_unavailable` | this model's `allowed_devices` names no usable card, and no lease is why | widen or clear the setting |
+| `allowed_devices_unavailable` | an `allowed_devices` — the model's saved setting, or the one you sent with this load — names no usable card, and no lease is why | widen or clear it. If you did not send one, it is an operator setting |
 
 A 507 with `busy_models` and a `retry_after_s` is a box that is *busy*, not full: those models
 would have freed the VRAM but are mid-request, and a load never interrupts a stream (D36).
@@ -773,7 +795,7 @@ hiding a failure, and never a `200` for a route that does not exist.
 | Image sent to a text-only model | 400 | `model_not_multimodal` | no |
 | Prompt larger than the loaded slot | 400 | `context_exceeded` | no — shorten, or reload at a larger `ctx_size` |
 | Model too big for VRAM | 507 | `insufficient_vram` | no — read `suggestions` |
-| This model's `allowed_devices` names no usable card | 507 | `allowed_devices_unavailable` | no — an operator setting |
+| An `allowed_devices` — saved, or sent with the load — names no usable card | 507 | `allowed_devices_unavailable` | no — widen the one you sent, or report the setting |
 | **The cards are leased to someone else** | 507 | `gpu_leased` | **it depends on the lease `kind`** — `benchmark` means stand down, anything else means wait `retry_after_s` |
 | Engine failed to start | 502 | `model_load_failed` | no — message carries the stderr tail |
 | Busy / transient | 503 | `model_busy`, `benchmark_busy`, `model_benchmarking` | **yes**, honour `Retry-After` |

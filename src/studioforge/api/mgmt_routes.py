@@ -734,6 +734,15 @@ async def load_model(
     kv_cache_type_v: str | None = Body(None),
     parallel: int | None = Body(None),
     devices: list[int] | None = Body(None),
+    allowed_devices: list[int] | None = Body(
+        None,
+        description=(
+            "The CUDA indices the planner may choose among for this load only -- a bound, "
+            "not a placement. Mutually exclusive with 'devices'. Never persisted, and it "
+            "only ever narrows: a card a saved setting, an exclusion or a lease forbids "
+            "stays forbidden."
+        ),
+    ),
     force: bool = Body(False),
     priority: int | None = Body(None),
 ) -> dict[str, Any]:
@@ -743,6 +752,27 @@ async def load_model(
     catalog's per-hardware-mode ``load_args`` carry one -- and never touches the
     model's saved settings. A CUDA index this box does not have is a 400 naming
     the parameter, not a planner refusal that reads like a VRAM problem.
+
+    ``allowed_devices`` is the other one-shot, and the distinction is the whole
+    of D59: ``devices`` says *use exactly these cards, all of them* -- more than
+    one becomes a split -- while ``allowed_devices`` says *choose among these*
+    and leaves the ranking, the split and the arithmetic to the planner. A
+    tenant that needs a load kept off the card ComfyUI renders on wants the
+    second; forcing the first made it pick placements this server picks better.
+    Sending both is a 400: one would have decided nothing.
+
+    It **narrows and never widens**. The request's set is intersected with the
+    model's saved ``settings.allowed_devices``; ``planner.excluded_devices`` and
+    standing GPU leases (D43) still remove cards afterwards; and a saved
+    ``settings.device_override`` still outranks every allow-list, so a request
+    excluding a card the override names is a 400 rather than a silent placement
+    onto exactly the card it asked to avoid. Nothing is persisted -- the next
+    load without the field is the model's own business again. An empty list is a
+    400, not a no-op: "every card except that one", computed to nothing, means
+    *nowhere*, and treating it as *anywhere* would place the load on the one
+    card the caller was avoiding. When the set is real but nothing in it fits,
+    the answer is the ordinary honest 507 -- ``allowed_devices_unavailable``, or
+    ``gpu_leased`` when a lease is why (D53).
 
     ``priority`` is the load's tier (D46): 1 the active chat model, 2 a
     dispatched agent, 3 (or omitted) background. A tier-1/2 load takes the
@@ -766,6 +796,7 @@ async def load_model(
         kv_cache_type_v=kv_cache_type_v,
         parallel=parallel,
         devices=devices,
+        allowed_devices=allowed_devices,
         force=force,
         source="api:/api/models/{id}/load",
         priority=priority,
@@ -795,6 +826,14 @@ async def load_recommended(
         description=(
             "Ceiling on the slot count this load may choose (>= 1). Omitted, the "
             "estimator's own recommendation stands."
+        ),
+    ),
+    allowed_devices: list[int] | None = Body(
+        None,
+        description=(
+            "The CUDA indices this walk may use, for this call only. The server still "
+            "chooses among them and still refuses honestly when nothing fits. Never "
+            "persisted, and it only ever narrows."
         ),
     ),
     persist: bool = Body(
@@ -833,6 +872,20 @@ async def load_recommended(
     otherwise). The cap applies before the descent loop, so the winning plan is
     really planned at the capped count rather than planned larger and launched
     smaller.
+
+    ``allowed_devices`` bounds the walk to those CUDA indices, for this call
+    only (D59). It is a bound, not a placement: the mode walk still chooses
+    within it, still applies the quality-first KV rule, and still returns the
+    same structured 507 when nothing in the set reaches the window. It is
+    applied where ``planner.excluded_devices`` is -- to the card list the
+    hardware modes are built from -- so the modes offered are the real ones over
+    the permitted cards and ``prefer_mode`` names one of those; a mode outside
+    the set is unreachable rather than merely unpreferred. Narrows only: it is
+    intersected with the model's saved ``settings.allowed_devices``, contradicts
+    a saved ``settings.device_override`` with a 400 rather than quietly
+    overruling it, and never widens past a lease or an exclusion. An empty list
+    is a 400. Nothing about it is persisted, ``persist: true`` included -- a
+    placement is a one-shot load argument (D36), and so is a bound on one.
 
     ``persist`` writes the *resolved* profile -- context per slot, both KV
     cache types, the slot count and the tier -- into the model's saved settings
@@ -881,6 +934,7 @@ async def load_recommended(
         prefer_modes=[prefer_mode] if prefer_mode else None,
         kv_min=kv_min,
         max_slots=max_slots,
+        allowed_devices=allowed_devices,
         persist=persist,
         source="api:/api/models/{id}/load-recommended",
         priority=priority,

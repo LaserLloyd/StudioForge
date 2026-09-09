@@ -142,6 +142,16 @@ this server (ComfyUI, a training job): nothing is loaded there until it is
 released. Benchmarks take their own leases automatically, so a running
 benchmark's cards are off-limits. server_status lists every lease.
 
+TO KEEP ONE LOAD OFF A CARD WITHOUT TAKING A LEASE: pass
+allowed_devices=[1,2,3] to load_model or load_recommended. It is a bound, not a
+placement -- the server still chooses among the cards you named, and still
+refuses honestly if the model does not fit on any of them. That is the
+difference from devices=[1,2,3], which forces exactly those cards and splits
+across all of them. Reach for allowed_devices when what you know is which card
+to stay off; reach for devices when you are replaying a placements[] row. Never
+both, and never an empty list. It is not saved and it never widens: a card an
+operator setting or a lease forbids stays forbidden however you ask.
+
 TWO WAYS TO LOAD, and the first is usually the one you want.
 
 If what you know is the CONTEXT you need, say so and stop:
@@ -1025,6 +1035,7 @@ def build_management_mcp(state: Any) -> MCPServer:
         kv_cache_type_v: str | None = None,
         parallel: int | None = None,
         devices: list[int] | None = None,
+        allowed_devices: list[int] | None = None,
         force: bool = False,
         priority: int | None = None,
     ) -> dict[str, Any]:
@@ -1062,7 +1073,9 @@ def build_management_mcp(state: Any) -> MCPServer:
         Placement is normally the planner's decision against live free VRAM,
         and the catalog's ``devices`` column tells you what it will choose. To
         pick the hardware yourself, pass ``devices`` -- which is what a
-        ``placements[]`` row's ``load_args`` does.
+        ``placements[]`` row's ``load_args`` does. To keep the load OFF a card
+        without picking one yourself, pass ``allowed_devices``: the planner
+        still chooses, inside the set you name. Never pass both.
 
         Args:
             model_id: Model id or alias.
@@ -1089,7 +1102,25 @@ def build_management_mcp(state: Any) -> MCPServer:
                 it does not change the model's saved settings, so the next load
                 without it goes back to the planner's choice. Take it from a
                 ``placements[]`` row's ``load_args``; naming an index this box
-                does not have is rejected immediately.
+                does not have is rejected immediately. This is a FORCED
+                placement: exactly these cards, all of them, and more than one
+                becomes a split.
+            allowed_devices: CUDA indices the planner may CHOOSE AMONG for this
+                load only. Use this, not ``devices``, when what you know is
+                which card to stay off -- one another program is rendering on,
+                say. The planner still ranks the cards, sizes the context and
+                picks the split; you have only bounded where it may look, so
+                you keep every placement decision this server makes better than
+                you can. Not persisted, so the next load without it is
+                unbounded again. It only narrows: a card the model's own
+                settings, an operator exclusion or a GPU lease forbids stays
+                forbidden, and asking for one does not unlock it. Passing both
+                this and ``devices`` is an error -- the second would decide
+                nothing. An empty list is an error too, not "no restriction":
+                if you computed "every card except X" and got nothing, the
+                answer is "nowhere", and this server will not read it as
+                "anywhere". If nothing in the set fits, the refusal says so
+                with the numbers and names the lease when a lease is why.
             force: Reload even if the model is already running (use after
                 changing its settings).
             priority: The load's tier: 1 for the model a person is actively
@@ -1115,6 +1146,7 @@ def build_management_mcp(state: Any) -> MCPServer:
             kv_cache_type_v=kv_cache_type_v,
             parallel=parallel,
             devices=devices,
+            allowed_devices=allowed_devices,
             force=force,
             source="mcp:load_model",
             priority=priority,
@@ -1133,6 +1165,7 @@ def build_management_mcp(state: Any) -> MCPServer:
         kv_min: str | None = None,
         priority: int | None = None,
         max_slots: int | None = None,
+        allowed_devices: list[int] | None = None,
         persist: bool = False,
     ) -> dict[str, Any]:
         """**The easy way to load.** Say the model and the context you need.
@@ -1189,6 +1222,17 @@ def build_management_mcp(state: Any) -> MCPServer:
                 cache for the slots you will not use is never priced into the
                 fit, which often buys a larger window instead. Omitted, the
                 recommendation stands.
+            allowed_devices: CUDA indices this call may use, for this call
+                only. A bound on the search, not a placement: the server still
+                walks the placements over the cards you named, still picks the
+                KV cache type and the slot count, and still refuses with the
+                same structured error if the window does not fit on any of
+                them. Use it when what you know is which card to stay off --
+                one another program is rendering on, say -- rather than which
+                to use. ``prefer_mode`` then names one of the modes over those
+                cards. It only narrows: a card the model's own settings, an
+                operator exclusion or a GPU lease forbids stays forbidden. It
+                is never saved, ``persist=true`` included.
             persist: Write the profile this call resolves -- context per slot,
                 both KV cache types, the slot count and the tier -- into the
                 model's saved settings, so a later plain load (including the
@@ -1232,6 +1276,7 @@ def build_management_mcp(state: Any) -> MCPServer:
             prefer_modes=[prefer_mode] if prefer_mode else None,
             kv_min=kv_min,
             max_slots=max_slots,
+            allowed_devices=allowed_devices,
             persist=persist,
             source="mcp:load_recommended",
             priority=priority,

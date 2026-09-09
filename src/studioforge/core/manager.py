@@ -176,6 +176,7 @@ def validate_load_args(
     kv_cache_type: Any,
     kv_cache_type_v: Any = None,
     devices: Sequence[int] | None = None,
+    allowed_devices: Any = None,
     known_devices: Sequence[int] | None = None,
 ) -> None:
     """Raise :class:`BadRequestError` for a load argument no load could use.
@@ -188,7 +189,10 @@ def validate_load_args(
     ``devices`` is checked against ``known_devices`` -- the CUDA indices the
     probe actually reports -- so ``devices: [7]`` on a four-card box is a 400
     naming the parameter rather than a planner refusal several frames deeper
-    that reads like a VRAM problem.
+    that reads like a VRAM problem. ``allowed_devices`` (D59) is checked the
+    same way and against the same list, and the two are mutually exclusive:
+    one forces a placement, the other bounds one, so a request carrying both
+    would have had its ``allowed_devices`` silently ignored.
     """
     if ctx_size is not None and not (1 <= int(ctx_size) <= MAX_REQUEST_CTX):
         raise BadRequestError(
@@ -208,6 +212,16 @@ def validate_load_args(
                 f"{param} must be one of {', '.join(KV_CACHE_TYPES)} (got {value!r})",
                 param=param,
             )
+    if devices is not None and allowed_devices is not None:
+        raise BadRequestError(
+            "devices and allowed_devices cannot both be given. devices is a forced "
+            "placement -- use exactly these cards, all of them -- while allowed_devices "
+            "is a set the planner chooses within, so a request carrying both means the "
+            "allow-list decides nothing. Pass devices to place the load yourself, or "
+            "allowed_devices to let the planner place it inside a bound.",
+            param="allowed_devices",
+        )
+    _validate_allowed_devices(allowed_devices, known_devices)
     if devices is None:
         return
     indices = list(devices)
@@ -228,6 +242,55 @@ def validate_load_args(
                 f"devices names CUDA index/indices {unknown}, which this machine does not "
                 f"have (it has {sorted(known_devices)})",
                 param="devices",
+            )
+
+
+def _validate_allowed_devices(value: Any, known_devices: Sequence[int] | None) -> None:
+    """The shape checks for a one-shot ``allowed_devices`` (D59).
+
+    An empty list is a 400 rather than a silent no-op, and that is the whole
+    point of the parameter: the caller that sends one has computed "every card
+    except ComfyUI's" and got nothing back, and treating that as "no
+    constraint" would place the load on precisely the card it was told to
+    avoid -- the failure D59 exists to stop, arrived at by the code meant to
+    prevent it. Repeats, unlike in ``devices``, are collapsed rather than
+    refused: this is a set, and a repeated member of a set is unambiguous,
+    where a repeated index in a tensor split is not.
+    """
+    if value is None:
+        return
+    if not isinstance(value, (list, tuple)):
+        raise BadRequestError(
+            f"allowed_devices must be a list of CUDA indices or null (got {type(value).__name__})",
+            param="allowed_devices",
+        )
+    entries = list(value)
+    for entry in entries:
+        if isinstance(entry, bool) or not isinstance(entry, int):
+            raise BadRequestError(
+                f"allowed_devices entries must be CUDA indices (got {entry!r})",
+                param="allowed_devices",
+            )
+        if entry < 0:
+            raise BadRequestError(
+                f"allowed_devices entries must be CUDA indices >= 0 (got {entry})",
+                param="allowed_devices",
+            )
+    if not entries:
+        raise BadRequestError(
+            "allowed_devices must name at least one CUDA index; omit it (or send null) "
+            "to leave the placement entirely to the planner. An empty list is refused "
+            "rather than ignored, because a caller that computed 'every card except "
+            "one' and got nothing back means 'nowhere is allowed', not 'anywhere is'.",
+            param="allowed_devices",
+        )
+    if known_devices is not None:
+        unknown = sorted(set(entries) - set(known_devices))
+        if unknown:
+            raise BadRequestError(
+                f"allowed_devices names CUDA index/indices {unknown}, which this machine "
+                f"does not have (it has {sorted(known_devices)})",
+                param="allowed_devices",
             )
 
 
@@ -861,6 +924,7 @@ class ModelManager:
         kv_cache_type_v: Any = None,
         parallel: int | None = None,
         devices: Sequence[int] | None = None,
+        allowed_devices: Sequence[int] | None = None,
         force: bool = False,
         source: str = "api",
         evict_busy: bool | None = None,
@@ -891,6 +955,18 @@ class ModelManager:
         -- the persisted settings are never touched, so the next load without
         it goes back to letting the planner choose. ``kv_cache_type_v``
         likewise, for the ladder's asymmetric rung (q8_0 K with a q4_0 V).
+
+        ``allowed_devices`` is the other half of that pair (D59) and the two
+        are mutually exclusive: ``devices`` says *use exactly these cards*,
+        ``allowed_devices`` says *choose among these* and leaves the ranking,
+        the split and the arithmetic to the planner. It is applied onto the
+        same throwaway copy, as ``settings.allowed_devices``, so the existing
+        soft-restriction path plans it and nothing is persisted. It only ever
+        narrows: :meth:`_effective_allowed_devices` intersects it with the
+        model's own ``allowed_devices``, a ``device_override`` it contradicts
+        is a 400 rather than a silent win, and ``planner.excluded_devices`` and
+        standing leases (D43) still remove cards afterwards -- naming a card
+        never buys access to it.
 
         ``evict_busy`` is whether the eviction ladder may stop a model that is
         serving a request (D36). ``None`` (the default) follows ``force``: a
@@ -946,6 +1022,7 @@ class ModelManager:
             kv_cache_type=kv_cache_type,
             kv_cache_type_v=kv_cache_type_v,
             devices=list(devices) if devices is not None else None,
+            allowed_devices=list(allowed_devices) if allowed_devices is not None else None,
             known_devices=self._known_devices(),
         )
         await self._await_boot()
@@ -958,6 +1035,18 @@ class ModelManager:
                 update={
                     "settings": record.settings.model_copy(
                         update={"device_override": [int(d) for d in devices]}
+                    )
+                }
+            )
+        narrowed = self._effective_allowed_devices(record, allowed_devices)
+        if narrowed is not None:
+            # Same copy-not-mutate rule as ``devices`` above (D36/D59): the
+            # registry row is never touched, so the next load without the
+            # argument goes back to whatever the model itself says.
+            record = record.model_copy(
+                update={
+                    "settings": record.settings.model_copy(
+                        update={"allowed_devices": sorted(narrowed)}
                     )
                 }
             )
@@ -1023,6 +1112,7 @@ class ModelManager:
                         kv_cache_type_v=kv_cache_type_v,
                         parallel=parallel,
                         devices=devices,
+                        allowed_devices=allowed_devices,
                     ):
                         if normalise_priority(priority) is not None:
                             # The reload folds; the tier the caller stated does
@@ -1087,6 +1177,70 @@ class ModelManager:
             return None
         return str(tag) if tag else None
 
+    def _effective_allowed_devices(
+        self, record: ModelRecord, allowed_devices: Sequence[int] | None
+    ) -> frozenset[int] | None:
+        """What a one-shot ``allowed_devices`` really leaves to choose among (D59).
+
+        ``None`` when the request named none -- the whole feature is off, and
+        every caller below this line behaves exactly as it did before.
+
+        Otherwise the rule is *narrow, never widen*, and it is a rule rather
+        than a preference: this parameter exists so a tenant can keep a load
+        off a card, and a one-shot that could open a card some persisted
+        setting had closed would be a way for any client to overrule the
+        operator by asking nicely. So the persisted ``allowed_devices`` is
+        intersected, and the two contradictions are refused with the numbers
+        instead of resolved in either direction -- a ``device_override``
+        outranks every allow-list (planner.py, D53's forced-set reasoning), so
+        a request that excludes a card the override names cannot be honoured at
+        all, and silently honouring the override would put the load on exactly
+        the card the caller asked it to avoid. ``planner.excluded_devices`` and
+        standing leases are *not* consulted here: they narrow further, later,
+        in the planner, and a set emptied by them is a 507 with the lease named
+        (D43/D53), not a 400 -- it is a fact about right now, not about the
+        request.
+        """
+        if allowed_devices is None:
+            return None
+        asked = {int(d) for d in allowed_devices}
+        forced = {int(d) for d in record.settings.device_override or ()}
+        outside = sorted(forced - asked)
+        if outside:
+            raise BadRequestError(
+                f"'{record.id}' pins settings.device_override to CUDA {sorted(forced)}, and "
+                f"this request's allowed_devices {sorted(asked)} excludes CUDA {outside}. A "
+                f"device_override outranks every allow-list, so both cannot hold -- and "
+                f"honouring the override quietly would place this load on exactly the card "
+                f"the request asked it to avoid. Widen allowed_devices, or clear the model's "
+                f"device_override.",
+                param="allowed_devices",
+                details={
+                    "device_override": sorted(forced),
+                    "allowed_devices": sorted(asked),
+                    "excluded_by_request": outside,
+                },
+            )
+        persisted = record.settings.allowed_devices
+        if persisted is None:
+            return frozenset(asked)
+        narrowed = asked & {int(d) for d in persisted}
+        if not narrowed:
+            raise BadRequestError(
+                f"'{record.id}' restricts settings.allowed_devices to CUDA "
+                f"{sorted(int(d) for d in persisted)}, and this request's allowed_devices "
+                f"{sorted(asked)} shares no card with it. A one-shot allowed_devices narrows "
+                f"the model's own setting, never widens it, so there is nothing left to "
+                f"choose among. Ask for a card the model is allowed to use, or widen the "
+                f"model's setting.",
+                param="allowed_devices",
+                details={
+                    "settings_allowed_devices": sorted(int(d) for d in persisted),
+                    "allowed_devices": sorted(asked),
+                },
+            )
+        return frozenset(narrowed)
+
     def _reload_already_done(
         self,
         instance: InstanceInfo,
@@ -1097,6 +1251,7 @@ class ModelManager:
         kv_cache_type_v: Any,
         parallel: int | None,
         devices: Sequence[int] | None,
+        allowed_devices: Sequence[int] | None = None,
     ) -> bool:
         """Did somebody already do the forced reload this call queued for? (D50)
 
@@ -1121,9 +1276,12 @@ class ModelManager:
         * The instance must be ``ready``. A ``failed`` or ``unloading`` child
           has not been reloaded, it has died, and that still needs fixing.
         * No explicit tuning argument may be present. ``ctx_size``,
-          ``kv_cache_type``, ``kv_cache_type_v``, ``parallel`` and ``devices``
-          each make this load a different shape from the one that just ran, so
-          it is not a duplicate of anything. That test also excludes, for free,
+          ``kv_cache_type``, ``kv_cache_type_v``, ``parallel``, ``devices`` and
+          ``allowed_devices`` (D59) each make this load a different shape from
+          the one that just ran, so it is not a duplicate of anything. The last
+          one is in the list because the resident it would fold onto may be
+          sitting on exactly the card the request asked to keep off.
+          That test also excludes, for free,
           every internal caller that replays a placement -- the D42 rebalancer
           and the D46 restore both pass ``devices`` -- so a fold can never
           quietly cancel a move.
@@ -1144,7 +1302,15 @@ class ModelManager:
         if instance.state != "ready" or instance.spawn_seq <= seq_before:
             return False
         if any(
-            arg is not None for arg in (ctx_size, kv_cache_type, kv_cache_type_v, parallel, devices)
+            arg is not None
+            for arg in (
+                ctx_size,
+                kv_cache_type,
+                kv_cache_type_v,
+                parallel,
+                devices,
+                allowed_devices,
+            )
         ):
             return False
         active = self._active_engine_tag()
@@ -1245,6 +1411,7 @@ class ModelManager:
         prefer_modes: Sequence[str] | None = None,
         kv_min: str | None = None,
         max_slots: int | None = None,
+        allowed_devices: Sequence[int] | None = None,
         persist: bool = False,
         source: str = "api",
         priority: int | None = None,
@@ -1292,6 +1459,20 @@ class ModelManager:
                 the count the descent loop then verifies, so the winning plan
                 really is planned at the capped slots rather than planned
                 larger and launched smaller.
+            allowed_devices: the cards this walk may use, for this call only
+                (D59). Not a placement -- the mode walk still chooses, and
+                still refuses honestly when nothing fits. It is applied where
+                ``planner.excluded_devices`` is applied, as a narrowing of the
+                card set :func:`placements.hardware_modes` builds the modes
+                from, because every mode is planned as a ``device_override``
+                copy of the record and an override is the one thing that beats
+                an allow-list -- the same reason WP22 had to filter exclusions
+                there rather than later. So the modes offered are the real ones
+                over the permitted cards, ``prefer_mode`` names one of those,
+                and a card outside the set is unreachable rather than merely
+                unpreferred. Narrows only: it is intersected with the model's
+                own ``settings.allowed_devices`` and contradicts a
+                ``device_override`` loudly, exactly as in :meth:`load`.
             persist: write the *resolved* profile -- context per slot, both KV
                 cache types and the slot count -- into the model's saved
                 settings once the load succeeds, so the next plain load (a JIT
@@ -1320,7 +1501,13 @@ class ModelManager:
         from studioforge.core import catalog as catalog_mod
         from studioforge.core import placements as placements_mod
 
-        validate_load_args(ctx_size=ctx_size, parallel=None, kv_cache_type=None)
+        validate_load_args(
+            ctx_size=ctx_size,
+            parallel=None,
+            kv_cache_type=None,
+            allowed_devices=list(allowed_devices) if allowed_devices is not None else None,
+            known_devices=self._known_devices(),
+        )
         if max_slots is not None and int(max_slots) < 1:
             raise BadRequestError(
                 f"max_slots must be at least 1 slot (got {max_slots}); omit it to let "
@@ -1332,6 +1519,11 @@ class ModelManager:
         if requested is None:
             raise ModelNotFoundError(name, known=self.registry.known_ids())
         record = self.serving_record(requested)
+        # Before anything expensive, for the same reason ``persist`` is checked
+        # here: a contradiction between this call and the model's saved
+        # settings is knowable immediately, and a 400 the caller could have had
+        # at once is worse the later it arrives (D59).
+        narrowed = self._effective_allowed_devices(record, allowed_devices)
         if persist:
             # Checked before the load rather than after it: this walk can take
             # minutes, and a refusal the caller could have had immediately is
@@ -1363,7 +1555,7 @@ class ModelManager:
                 details={"n_ctx_train": trained, "requested_ctx": int(ctx_size)},
             )
 
-        modes = self._modes_for_recommendation(prefer_modes)
+        modes = self._modes_for_recommendation(prefer_modes, allowed=narrowed)
         observations = self.parallel_observations(record.id)
 
         # A model that is already resident is about to be RELOADED at the new
@@ -1406,6 +1598,14 @@ class ModelManager:
                 # own profile. An over-cap resident falls through to a real
                 # reload, which is what max_slots asked for.
                 and (max_slots is None or int(plan_now.parallel) <= int(max_slots))
+                # ...and standing on cards this call is allowed to use (D59).
+                # Without this the shortcut answered "already loaded at that
+                # context" with an instance sitting on exactly the card the
+                # request asked it to keep off -- the one outcome the
+                # parameter exists to prevent, reached by the fastest path
+                # through the function. A resident outside the set falls
+                # through to the mode walk, which relocates it.
+                and (narrowed is None or set(plan_now.devices) <= narrowed)
             ):
                 # Already exactly that. Reloading would cost a cold start and
                 # a window of "loading" for every client, to arrive where we are.
@@ -1516,31 +1716,61 @@ class ModelManager:
             if hold:
                 self._priority_holds.pop(record.id, None)
 
-    def _modes_for_recommendation(self, prefer_modes: Sequence[str] | None) -> list[Any]:
-        """The hardware modes to walk, in the order to walk them."""
+    def _modes_for_recommendation(
+        self, prefer_modes: Sequence[str] | None, *, allowed: frozenset[int] | None = None
+    ) -> list[Any]:
+        """The hardware modes to walk, in the order to walk them.
+
+        ``allowed`` is a one-shot ``allowed_devices`` already narrowed by
+        :meth:`_effective_allowed_devices` (D59). It joins
+        ``planner.excluded_devices`` as a card the mode builder never sees,
+        rather than a filter over the modes it produced, so the walk is offered
+        real modes over the permitted cards -- ``[1, 2, 3]`` on this rig yields
+        the 3090 pair and the three-card set, not "the 5090 pair, minus one".
+        The reason it has to happen here is WP22's: every mode is planned
+        through a ``device_override`` copy of the record, and an override is
+        precisely the thing that outranks an allow-list, so a card left in the
+        mode list is a card this load can still land on.
+        """
         from studioforge.core import placements as placements_mod
 
-        modes = placements_mod.hardware_modes(
-            self.planner.probe.list_gpus(), excluded=self.config.planner.excluded_devices
-        )
+        gpus = list(self.planner.probe.list_gpus())
+        excluded = set(self.config.planner.excluded_devices)
+        if allowed is not None:
+            excluded |= {g.index for g in gpus} - allowed
+        modes = placements_mod.hardware_modes(gpus, excluded=excluded)
         if not modes:
-            raise InsufficientVramError(
-                "no usable GPU was found, and this server is GPU-only",
-                details={
-                    "suggestions": [
-                        "check the driver and `nvidia-smi`",
-                        "planner.excluded_devices may be reserving every card",
-                    ]
-                },
-            )
+            suggestions = [
+                "check the driver and `nvidia-smi`",
+                "planner.excluded_devices may be reserving every card",
+            ]
+            message = "no usable GPU was found, and this server is GPU-only"
+            if allowed is not None:
+                suggestions.insert(
+                    0,
+                    f"this call's allowed_devices ({sorted(allowed)}) leaves no card "
+                    f"this server may place on -- widen it, or clear the exclusion "
+                    f"standing on the cards it names",
+                )
+                message = (
+                    f"no usable GPU is left once this call's allowed_devices "
+                    f"({sorted(allowed)}) and planner.excluded_devices are both applied, "
+                    f"and this server is GPU-only"
+                )
+            raise InsufficientVramError(message, details={"suggestions": suggestions})
         if prefer_modes is None:
             return modes
         by_key = {m.key: m for m in modes}
         unknown = [key for key in prefer_modes if key not in by_key]
         if unknown:
+            narrowed_note = (
+                f" (narrowed to CUDA {sorted(allowed)} by this call's allowed_devices)"
+                if allowed is not None
+                else ""
+            )
             raise BadRequestError(
-                f"unknown hardware mode(s): {', '.join(unknown)}; this box has: "
-                + ", ".join(by_key),
+                f"unknown hardware mode(s): {', '.join(unknown)}; this box has"
+                f"{narrowed_note}: " + ", ".join(by_key),
                 param="prefer_modes",
             )
         return [by_key[key] for key in prefer_modes]

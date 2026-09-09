@@ -251,7 +251,7 @@ Branch on the **code**, never on the prose. StudioForge puts it in the OpenAI er
 | SF | 507 | `gpu_leased` | cards leased to someone else; `error.studioforge.lease` has `kind`, `holder_family`, `retry_after_s`, `expires_at`, plus a `Retry-After` header | `kind: benchmark` → **stand down**; otherwise wait `retry_after_s` and re-ask |
 | SF | 507 | `insufficient_vram` | it genuinely does not fit; `suggestions`, `max_ctx_that_fits`, `max_parallel_that_fits` | load smaller / shorter context / cheaper KV. Never retry unchanged |
 | SF | 507 + `busy_models` | `insufficient_vram` | busy, not full — those models would free the VRAM but are mid-request | wait `retry_after_s` |
-| SF | 507 | `allowed_devices_unavailable` | the model's `allowed_devices` names no usable card, and no lease is why | an operator setting; report |
+| SF | 507 | `allowed_devices_unavailable` | an `allowed_devices` — the model's saved setting, or the one this request sent — names no usable card, and no lease is why | if you sent one, widen it; otherwise an operator setting, so report |
 | SF | 503 | `priority_hold` | a tier-1/2 load is in flight; `details.priority_hold` names it | honour `Retry-After`, resend at your true tier |
 | SF | 503 | `model_busy` / `benchmark_busy` / `model_benchmarking` | serving, benchmarking or smoke-testing | wait `retry_after_s` |
 | SF | 400 | `context_exceeded` | prompt larger than the loaded slot (`ctx_per_slot`; `prompt_tokens` when measured). Nothing is ever truncated | shorten, or `load_recommended` at a larger `ctx_size` |

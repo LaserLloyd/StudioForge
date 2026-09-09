@@ -246,7 +246,7 @@ def test_the_two_restarts_are_labelled_distinguishably(app: TrayApp) -> None:
     server = item_named(app, "Restart server").text
     assert engines != server
     assert "API stays up" in engines
-    assert "whole process" in server
+    assert server == "Restart server"
 
 
 def test_status_line_is_the_first_item_and_disabled(app: TrayApp) -> None:

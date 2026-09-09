@@ -4932,3 +4932,148 @@ never carries a synthetic `loaded` entry -- plus, for the `model_busy` fix above
 its `Retry-After` header and `details.loading` when nothing is ready but the wanted kind is loading,
 that a `loading` instance of a *different* kind never rescues the request (still the 404), and that a
 ready candidate always wins over a loading one, at both the helper level and over HTTP.
+
+## D59 -- `devices` places, `allowed_devices` chooses
+
+**Problem.** ComfyUI renders on a fixed card on this rig. When no lease stands on that card, the
+planner and the D42 rebalancer both treat it as free and place models onto it -- correctly, by
+their own rules, and the renders starve. From the log, on the day this was written:
+
+```
+rebalanced model devices=[3, 2] reason='shares GPU[0] with another resident; [2, 3] is free of it'
+```
+
+The lease (D43) is the primary fix and is now enabled. But the tenant wants to keep its *own*
+loads -- a prompt enhancer, a vision captioner, an analysis model -- off that card too, including
+in the windows where no lease can be held: the card is ambiguous between two identical GPUs, or the
+tenant does not own it and must not take it away from everybody to protect one load.
+
+The only lever the load API gave it was `devices`, and `devices` is the wrong primitive. It is a
+**forced placement** -- use exactly these cards, all of them; more than one becomes a split -- and
+it is applied as a `device_override` on a copy of the record (`core/manager.py`, D36), which is the
+one thing that outranks `planner.excluded_devices`, `allowed_devices` and the eviction ladder's
+politeness alike. A tenant that knows only which card to *stay off* had to state which cards to
+*use*, which takes the placement decision away from the component that makes it best and hands back
+a two-card split nobody asked for. The "choose among" semantic already existed -- the planner's
+`settings.allowed_devices`, added with the 2026-08-26 placement policies -- but only as a persisted
+per-model setting: an operator edit, standing until someone undoes it, which is not what a client
+means by "not on that card, for this one load".
+
+**Decision.** A one-shot, per-request `allowed_devices: list[int] | None` on
+`POST /api/models/{id}/load` and `POST /api/models/{id}/load-recommended` (and on the `load_model`
+and `load_recommended` MCP tools), applied exactly where the one-shot `devices` is applied and never
+persisted.
+
+1. **It bounds, it does not place.** `devices` says *use exactly these*; `allowed_devices` says
+   *choose among these* and leaves the ranking, the split, the KV ladder, the compute-cap rule and
+   the arithmetic to the planner, which still refuses honestly when nothing in the set fits. Naming
+   three cards yields a placement on one of them, not a three-way split -- that difference is the
+   whole of this entry. The two are mutually exclusive: a request carrying both is a 400, because
+   the forced placement would win and the allow-list would have decided nothing, and a caller who
+   believes a card is protected when it is not is exactly the failure being fixed.
+2. **On `load`, it lands on a throwaway copy of the record**, as `settings.allowed_devices`, the
+   same way `devices` lands as `device_override` (`manager.py`, `ModelManager.load`). Nothing
+   downstream needed teaching: the planner's existing soft-restriction path (`planner.py`,
+   `plan_load`) narrows the GPU view, plans inside it, notes the restriction on the plan, and
+   produces the same `allowed_devices_unavailable` / `gpu_leased` refusals it already produced
+   (D53). The registry is never touched, so the next load without the field is the model's own
+   business again.
+3. **On `load-recommended`, it lands on the card list the hardware modes are built from**, not on
+   the modes afterwards (`_modes_for_recommendation`, joining `planner.excluded_devices` in the
+   `excluded` set `placements.hardware_modes` takes). That placement is WP22's lesson, not a
+   preference: every mode is planned through a `forced_onto` copy carrying a `device_override`, and
+   an override is precisely what beats an allow-list, so a card left in the mode list is a card the
+   load can still land on. Narrowing the source list instead means the walk is offered the real
+   modes over the permitted cards -- `[1, 2, 3]` on this rig gives the 3090 pair and the three-card
+   set, not "the 5090 pair minus one" -- `prefer_mode` names one of those, and a mode outside the
+   set is unreachable rather than merely unpreferred (naming one is a 400 that says the list was
+   narrowed and by what).
+4. **Precedence: it narrows, it never widens.** A per-request argument that could open a card some
+   standing decision had closed would make every such decision advisory to anyone who can reach the
+   port. So, in order:
+   - a persisted `settings.device_override` still outranks every allow-list, and a request that
+     excludes a card the override names is a **400 naming both** rather than a silent win for
+     either side. Honouring the request overrules the operator; honouring the override quietly
+     places the load on exactly the card the request asked it to avoid -- which is this entry's own
+     bug, arriving through the feature written to prevent it. An override that lies *inside* the
+     requested set is no contradiction at all and simply wins;
+   - the request's set is **intersected** with the model's persisted `settings.allowed_devices`. A
+     disjoint pair is a 400 with both lists, for the same reason;
+   - `planner.excluded_devices` still applies afterwards, because a one-shot bound is not a
+     `device_override` and never acquires its exclusion-beating power. An operator card reserved
+     for other software stays reserved -- and that software is usually the very thing this
+     parameter exists to protect;
+   - standing GPU leases (D43) still remove cards, and a set left empty by one is the ordinary
+     waitable 507 with the lease named (`gpu_leased`, D53), not a 400: it is a fact about right
+     now, not about the request.
+5. **Validation is at the door, not several frames deeper.** Non-list, non-int member, negative
+   index and an index this box does not have are each a 400 naming `allowed_devices` -- the same
+   rule `devices` gets, for the same reason: a planner refusal several frames later reads like a
+   VRAM problem. An empty list is a **400, not a silent no-op**, and that is the single most
+   important line here: a caller computing "every card except ComfyUI's" on a one-card box gets
+   `[]`, and reading that as "no constraint" places the load on precisely the card it was avoiding.
+   *Nowhere* must not be read as *anywhere*. Repeats, unlike in `devices`, are collapsed rather than
+   refused -- this is a set, and a repeated member of a set is unambiguous where a repeated index in
+   a tensor split is not.
+6. **Two shortcuts had to be told about it**, and both were paths that skip the planner entirely:
+   D50's forced-reload coalescing (`_reload_already_done`) now counts `allowed_devices` among the
+   explicit tuning arguments that make a load a different shape, because the resident it would fold
+   onto may be sitting on the card the request asked to keep off; and `load_recommended`'s
+   already-loaded-at-that-context early return now also requires the resident to be standing on
+   cards this call may use, or the fastest path through the function would have been the one that
+   ignored the restriction.
+7. **The planner stopped calling it "the model's setting."** Two sources now arrive at the same
+   field, and the plan note and the refusal used to say "the model's allowed_devices setting" about
+   both -- sending the reader of a one-shot refusal to edit a registry row that says nothing. They
+   say `allowed_devices` now, and the suggestion names both possible sources.
+
+**Left honest, not fixed here.**
+- `load_recommended` still ignores a *persisted* `settings.allowed_devices` when the request sends
+  none: each mode is planned as a `device_override`, which outranks it. That hole predates this
+  change, and closing it would have broken the promise that a request without the new field behaves
+  byte-identically -- a model with a saved allow-list would suddenly walk a different mode list.
+  The one-shot path is correct (it is intersected with the saved set), the plain path is unchanged
+  and still wrong; it wants its own entry and its own regression test.
+- The same is true of a persisted `settings.device_override` on that route: `placements.forced_onto`
+  overwrites it per mode, so the pin is not honoured there either. A one-shot `allowed_devices` that
+  contradicts such an override is still refused, so the refusal is stricter than the placement it
+  guards.
+- `ModelSettings` validates `device_override` and `draft_device_override` entries as `>= 0` but not
+  `allowed_devices`, so a stored negative index still round-trips. Only the request path is checked
+  here -- adding the field to that validator would make an existing stored row fail to load, which
+  is not a change to make in the same commit as a new parameter.
+- `sfctl` exposes neither `devices` nor `allowed_devices` on its load command, so this is REST and
+  MCP only. The GUI has no control for it either, and should not: it edits settings, and this is
+  deliberately not one.
+- The bound lasts exactly one load. A model that is TTL-unloaded and JIT-reloaded comes back
+  wherever the planner puts it, which is correct for a one-shot and is also why a tenant that wants
+  a *standing* restriction still needs the persisted setting or a lease.
+
+**Tests.** `tests/unit/test_allowed_devices_one_shot.py`:
+`test_omitting_allowed_devices_places_exactly_where_it_placed_before` (the no-op guarantee, plan
+notes compared field for field against a cold load on an identical box),
+`test_a_one_shot_narrows_the_set_and_the_planner_still_chooses_within_it`,
+`test_a_one_shot_is_a_choice_not_a_split_across_everything_named` (three named, one used -- the
+`devices` distinction in one assertion), `test_the_one_shot_is_never_written_to_the_registry`,
+`test_the_next_load_without_it_is_unbounded_again`,
+`test_a_one_shot_cannot_widen_a_persisted_allowed_devices`,
+`test_a_one_shot_disjoint_from_the_persisted_set_is_a_400_not_a_guess`,
+`test_a_device_override_still_outranks_and_a_contradiction_is_refused`,
+`test_a_one_shot_does_not_unlock_an_excluded_card`,
+`test_a_one_shot_naming_only_leased_cards_is_an_honest_507`,
+`test_a_set_where_nothing_fits_refuses_with_the_reason_not_a_crash` (the shortfall is still
+`insufficient_vram`, and its arithmetic is over two GPUs rather than the box's four -- the proof
+that the bound reached the estimator), `test_an_empty_allowed_devices_is_refused_rather_than_ignored`,
+`test_allowed_devices_rejects_a_shape_no_load_could_use`,
+`test_a_repeated_index_is_collapsed_because_a_set_is_a_set`,
+`test_devices_and_allowed_devices_together_are_refused`,
+`test_load_recommended_walks_only_the_modes_over_the_permitted_cards`,
+`test_load_recommended_persists_the_profile_without_the_bound`,
+`test_load_recommended_will_not_hand_back_a_resident_outside_the_bound`,
+`test_load_recommended_refuses_when_the_bound_leaves_no_card`,
+`test_load_recommended_names_the_narrowed_modes_when_prefer_mode_is_unknown`,
+`test_load_recommended_without_the_bound_is_unchanged`,
+`test_the_restriction_note_does_not_blame_a_setting_the_caller_never_wrote`. Plus the HTTP wiring,
+where a rename goes unnoticed, in `tests/unit/test_catalog_routes.py`:
+`test_both_load_routes_forward_allowed_devices_to_the_manager` and
+`test_the_load_routes_refuse_a_bad_allowed_devices_in_the_openai_shape`.

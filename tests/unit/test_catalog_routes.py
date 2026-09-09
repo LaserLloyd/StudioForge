@@ -624,6 +624,72 @@ def test_load_recommended_forwards_every_body_knob_to_the_manager(app: Any) -> N
         assert seen["persist"] is False
 
 
+def test_both_load_routes_forward_allowed_devices_to_the_manager(app: Any) -> None:
+    """The same wiring guarantee for D59's one-shot bound, on both load routes.
+
+    A body field that never reaches the manager is the failure mode with no
+    symptom: the load succeeds, on the card the caller asked it to keep off.
+    """
+    seen: dict[str, Any] = {}
+
+    async def capture(model_id: str, *args: Any, **kwargs: Any) -> InstanceInfo:
+        seen.clear()
+        seen.update(model_id=model_id, **kwargs)
+        return InstanceInfo(model_id=model_id, state="ready", port=18100, plan=make_plan())
+
+    app.state.manager.load = capture
+    app.state.manager.load_recommended = capture
+
+    with TestClient(app, client=("127.0.0.1", 50000)) as http:
+        bounded = http.post(f"/api/models/{MODEL_ID}/load", json={"allowed_devices": [1, 2, 3]})
+        assert bounded.status_code == 200, bounded.text
+        assert seen["allowed_devices"] == [1, 2, 3]
+
+        plain = http.post(f"/api/models/{MODEL_ID}/load", json={})
+        assert plain.status_code == 200, plain.text
+        assert seen["allowed_devices"] is None
+
+        recommended = http.post(
+            f"/api/models/{MODEL_ID}/load-recommended",
+            json={"ctx_size": 16384, "allowed_devices": [2, 3]},
+        )
+        assert recommended.status_code == 200, recommended.text
+        assert seen["allowed_devices"] == [2, 3]
+
+        plain_recommended = http.post(
+            f"/api/models/{MODEL_ID}/load-recommended", json={"ctx_size": 16384}
+        )
+        assert plain_recommended.status_code == 200, plain_recommended.text
+        assert seen["allowed_devices"] is None
+
+
+def test_the_load_routes_refuse_a_bad_allowed_devices_in_the_openai_shape(app: Any) -> None:
+    """A 400 naming the parameter, not a planner refusal that reads like VRAM.
+
+    Both refusals travel as the OpenAI envelope every client here parses, with
+    ``param`` set -- the reason ``devices`` is validated at the door too.
+    """
+    with TestClient(app, client=("127.0.0.1", 50000)) as http:
+        empty = http.post(f"/api/models/{MODEL_ID}/load", json={"allowed_devices": []})
+        assert empty.status_code == 400, empty.text
+        assert empty.json()["error"]["param"] == "allowed_devices"
+        assert empty.json()["error"]["type"] == "invalid_request_error"
+
+        both = http.post(
+            f"/api/models/{MODEL_ID}/load",
+            json={"devices": [0], "allowed_devices": [0]},
+        )
+        assert both.status_code == 400, both.text
+        assert both.json()["error"]["param"] == "allowed_devices"
+
+        unknown = http.post(
+            f"/api/models/{MODEL_ID}/load-recommended",
+            json={"ctx_size": 16384, "allowed_devices": [7]},
+        )
+        assert unknown.status_code == 400, unknown.text
+        assert unknown.json()["error"]["param"] == "allowed_devices"
+
+
 # ---------------------------------------------------------------------------
 # GET /api/models: the tier beside the TTL
 # ---------------------------------------------------------------------------
