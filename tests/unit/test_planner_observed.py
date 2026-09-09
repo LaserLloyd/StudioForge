@@ -17,6 +17,7 @@ not merely unlikely to be). The fake probe and record helpers are imported from
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -27,8 +28,11 @@ from studioforge.core.planner import (
     OBS_BAND_MAX,
     OBS_BAND_MIN,
     OBS_SAFETY,
+    OBSERVATION_FORMULA_KEY,
     OBSERVATION_NOTE_PER_PID_DEVICE,
     Planner,
+    formula_observations,
+    formula_terms,
     observed_correction,
     scaled_estimate,
 )
@@ -515,3 +519,54 @@ def test_a_real_load_round_trips_through_the_database(db: Database) -> None:
     second = plan_at(planner)
     assert second.estimate.total_bytes == pytest.approx(measured * OBS_SAFETY, rel=1e-3)
     assert [n for n in second.notes if "estimate corrected" in n]
+
+
+def test_a_corrected_loads_row_feeds_d51_again_and_now_states_its_formula(db: Database) -> None:
+    """The row of a D51-corrected load stays a match for the next plan of the
+    same configuration (its note is untouched) and carries the formula the
+    correction replaced (D63), so the calibrator reads the formula's miss off
+    it rather than the band."""
+    planner = Planner(
+        make_config(),
+        rig_5090x2_3090x2(),
+        observation_sink=lambda row: db.record_load_observation(**row),
+        observation_lookup=db.matching_observation,
+    )
+    first = plan_at(planner)
+    formula = first.estimate
+    planner.observe(
+        model_id=first.model_id,
+        plan=first,
+        actual_bytes=int(formula.total_bytes * 0.613),
+        note=OBSERVATION_NOTE_PER_PID_DEVICE,
+    )
+
+    second = plan_at(planner)
+    assert [n for n in second.notes if "estimate corrected" in n]
+    held = int(second.estimate.total_bytes / OBS_SAFETY) + 64 * MB  # a little more than last time
+    planner.observe(
+        model_id=second.model_id,
+        plan=second,
+        actual_bytes=held,
+        note=OBSERVATION_NOTE_PER_PID_DEVICE,
+    )
+
+    rows = db.load_observations(first.model_id)
+    newest = rows[0]
+    assert newest["actual_bytes"] == held
+    # The formula's numbers, not the corrected total's...
+    assert newest["predicted_bytes"] == formula.total_bytes
+    assert newest["weights_bytes"] == formula.weights_bytes
+    fraction = planner.config.planner.compute_overhead_fraction
+    assert formula_terms(newest) == (formula.total_bytes, formula.weights_bytes, fraction)
+    # ...with what the plan reserved beside them.
+    stored = json.loads(newest["per_gpu_planned"])[OBSERVATION_FORMULA_KEY]
+    assert stored["planned_bytes"] == second.estimate.total_bytes
+    assert stored["corrected"] is True
+    assert len(formula_observations(rows)) == 2
+
+    # D51 still finds the row and spends its measurement on the next plan.
+    match = db.matching_observation(first.model_id, **key_of(second))
+    assert match is not None and match["id"] == newest["id"]
+    third = plan_at(planner)
+    assert third.estimate.total_bytes == pytest.approx(held * OBS_SAFETY, rel=1e-3)

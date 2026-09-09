@@ -9,6 +9,27 @@ degradation this project exists to avoid.
 The estimate is deliberately explicit about being an estimate: every load
 records predicted-vs-actual through :meth:`Planner.observe`, and
 :func:`suggest_overhead_fraction` turns that history into a tuned fudge factor.
+
+Two feedback loops read that history, and they must not be confused (D63):
+
+* **D51, per configuration.** The next plan of the *same* model at the same
+  context, slots, cache types and device count is sized from what it measured
+  last time, plus :data:`OBS_SAFETY`. A plan corrected that way is expected to
+  land about ``1 - 1/OBS_SAFETY`` (9%) under its own estimate on every repeat
+  -- that is the safety band, not an error, and :meth:`Planner.observe` never
+  warns about it.
+* **Calibration, global.** ``compute_overhead_fraction`` is tuned once per
+  process from the FORMULA's misses. So every observation carries the formula
+  estimate the plan started from -- its ``predicted_bytes`` and
+  ``weights_bytes`` are the formula's, and ``per_gpu_planned["formula"]``
+  says so and adds the overhead fraction it was computed with and the total
+  the plan really reserved -- whether or not D51 then moved the plan. The
+  planner's error is always formula-vs-actual; a corrected plan additionally
+  reports corrected-vs-actual as its *margin*. The calibrator can lower the
+  fraction as well as raise it (:func:`suggest_overhead_fraction`, bounded
+  per boot by :data:`CALIBRATION_MAX_STEP_DOWN`), and every row's "need" is
+  absolute (the fraction that would have made the formula meet the
+  measurement), so the same rows give the same answer on every boot.
 """
 
 from __future__ import annotations
@@ -73,12 +94,21 @@ KV_DOWNGRADE_ORDER: tuple[KvCacheType, ...] = ("f16", "q8_0", "q4_0")
 #: sleep this process takes.
 BUSY_RETRY_AFTER_S = 15.0
 
-#: A load whose measured footprint differs from the plan's estimate by more
+#: A load whose measured footprint differs from the FORMULA's estimate by more
 #: than this many percent is a WARNING naming both numbers and the estimate's
 #: breakdown (2026-09-09 review). D51 already corrects the *next* plan of the
 #: same configuration from the measurement; the warning exists because a
 #: persistent miss means a term the formula does not model, and that is a bug
 #: to fix in the formula, not to keep absorbing from history.
+#:
+#: It is the formula's error that is measured, never a corrected plan's (D63):
+#: a plan D51 sized from the last measurement plus :data:`OBS_SAFETY` lands
+#: about 9% under its own total on every repeat by construction, and 12 of 12
+#: repeat loads on the reference rig were "warned" at exactly -9.1% before the
+#: distinction existed. A corrected plan's formula error is still recorded
+#: (:meth:`Planner.last_observation` says ``corrected: true``); the only
+#: warning a corrected plan can earn is the child holding MORE than even the
+#: corrected total by this bar, which is the direction the band exists for.
 PREDICTION_ERROR_WARN_PCT = 5.0
 
 # Context sizes we are willing to suggest as a fallback, descending.
@@ -926,6 +956,16 @@ class Planner:
         #: 37.3 GB (+4.2%)" without a database round trip. See
         #: :meth:`last_observation`.
         self._last_observations: dict[str, dict[str, Any]] = {}
+        #: Every D51 correction this process has spent on an estimate, keyed
+        #: by the configuration it was spent on, with the formula estimate it
+        #: replaced (D63). :meth:`observe` needs the formula back: a plan
+        #: carries only the corrected numbers and a sentence, and measuring
+        #: the child against the corrected total would report D51's own
+        #: safety band as the planner's error on every repeat load. Bounded
+        #: (:data:`_APPLIED_CORRECTIONS_CAP`); a plan whose correction has
+        #: been forgotten is observed as "corrected, formula unknown", never
+        #: as uncorrected.
+        self._applied_corrections: dict[_CorrectionKey, AppliedCorrection] = {}
 
     def last_observation(self, model_id: str) -> dict[str, Any] | None:
         """The most recent predicted-vs-actual VRAM record for ``model_id``.
@@ -2512,7 +2552,66 @@ class Planner:
         )
         if correction is None:
             return estimate
-        return scaled_estimate(estimate, correction.factor)
+        corrected = scaled_estimate(estimate, correction.factor)
+        # Remembered for :meth:`observe` (D63): the plan will carry only the
+        # corrected numbers, and the formula they replaced is what the
+        # planner's error and the calibrator are measured against.
+        self._remember_applied(
+            _correction_key(record.id, ctx, slots, kv_k, kv_v, n_devices),
+            AppliedCorrection(correction=correction, formula=estimate, corrected=corrected),
+        )
+        return corrected
+
+    def _remember_applied(self, key: _CorrectionKey, applied: AppliedCorrection) -> None:
+        """Keep the newest correction per configuration, bounded (D63).
+
+        Re-inserting moves a key to the newest position, so what is evicted
+        first is the configuration this process planned longest ago.
+        """
+        store = self._applied_corrections
+        store.pop(key, None)
+        store[key] = applied
+        while len(store) > _APPLIED_CORRECTIONS_CAP:
+            store.pop(next(iter(store)))
+
+    def _correction_spent_on(self, model_id: str, plan: LoadPlan) -> AppliedCorrection | None:
+        """The correction whose corrected estimate IS this plan's estimate (D63).
+
+        Looked up by the plan's own configuration and then *verified* term by
+        term against the plan's estimate, so a plan whose numbers came from
+        anywhere else -- a stored plan adopted after a restart, a configuration
+        this process planned under a different row, an estimate something
+        mutated on the way to the child -- can never borrow another plan's
+        formula. The slot count is allowed to differ: the auto-parallel sizer
+        can hand back the estimate it was given, corrected at the requested
+        count, under the count it finally chose (the same fallback the plan's
+        note takes in :meth:`_try_devices`).
+        """
+        estimate = plan.estimate
+        for candidate in dict.fromkeys((model_id, plan.model_id)):
+            exact = self._applied_corrections.get(
+                _correction_key(
+                    candidate,
+                    plan.ctx_size,
+                    plan.parallel,
+                    plan.kv_cache_type,
+                    plan.kv_cache_type_v,
+                    len(plan.devices),
+                )
+            )
+            if exact is not None and exact.corrected == estimate:
+                return exact
+            for key, applied in self._applied_corrections.items():
+                same_shape = (
+                    key[0] == candidate
+                    and key[1] == int(plan.ctx_size)
+                    and key[3] == str(plan.kv_cache_type)
+                    and key[4] == str(plan.kv_cache_type_v)
+                    and key[5] == len(plan.devices)
+                )
+                if same_shape and applied.corrected == estimate:
+                    return applied
+        return None
 
     def _observed_correction(
         self,
@@ -2546,7 +2645,7 @@ class Planner:
             return None
         if not self.config.planner.observed_correction:
             return None
-        key = (record.id, int(ctx), int(slots), str(kv_k), str(kv_v), int(n_devices))
+        key = _correction_key(record.id, ctx, slots, kv_k, kv_v, n_devices)
         if key in memo.rows:
             return memo.rows[key]
         try:
@@ -2615,7 +2714,7 @@ class Planner:
         memo = self._obs_memo
         if memo is None:
             return None
-        return memo.rows.get((model_id, int(ctx), int(slots), str(kv_k), str(kv_v), int(n_devices)))
+        return memo.rows.get(_correction_key(model_id, ctx, slots, kv_k, kv_v, n_devices))
 
     def _try_devices(
         self,
@@ -3537,15 +3636,31 @@ class Planner:
         """
         current = float(self.config.planner.compute_overhead_fraction)
         tuned = calibrated_overhead_fraction(observations, current=current)
+        clean = clean_observations(observations)
+        formula_rows = formula_observations(observations)
         if tuned is None:
+            log.debug(
+                "compute overhead fraction left as configured",
+                current=round(current, 4),
+                rows=len(clean),
+                formula_rows=len(formula_rows),
+                min_rows=CALIBRATION_MIN_ROWS,
+            )
             return None
         self.config.planner.compute_overhead_fraction = tuned
         log.info(
             "calibrated compute overhead fraction from load history",
             previous=round(current, 4),
             tuned=round(tuned, 4),
+            direction="down" if tuned < current else "up",
+            rows=len(clean),
+            formula_rows=len(formula_rows),
             clamp=[OVERHEAD_FRACTION_MIN, OVERHEAD_FRACTION_MAX],
-            rows=len(clean_observations(observations)),
+            max_step_down=CALIBRATION_MAX_STEP_DOWN,
+            detail=(
+                "in memory only, once per process: config.yaml is the anchor, and the "
+                "next boot calibrates from its value again (D18, D63)"
+            ),
         )
         return tuned
 
@@ -3564,6 +3679,32 @@ class Planner:
         Logged at INFO with the ratio, and forwarded to the observation sink
         (the SQLite table) when one is wired in.
 
+        A plan has up to two estimates, and this is where they are kept apart
+        (D63). The *formula* estimate is what the planner computed from GGUF
+        geometry and ``compute_overhead_fraction``; the *planned* total is
+        what the plan reserved, which D51 may have sized from the last
+        measurement of the same configuration plus :data:`OBS_SAFETY`. The
+        planner's error -- ``error_pct``, the bar, the warning -- is always
+        formula-vs-actual. A corrected plan reports actual-vs-planned as its
+        ``margin_pct``; a margin near ``-9%`` is the band working as designed
+        and is never warned about, while a child holding more than the
+        corrected total by the bar is, because that is the direction the band
+        exists to cover. A corrected plan whose correction this process cannot
+        account for (:meth:`_correction_spent_on`) is recorded with the formula
+        unknown rather than with the corrected total dressed up as it.
+
+        The stored row's ``note`` is the caller's provenance marker, untouched,
+        so D51's match rule (which keys on that literal) reads the row back
+        unchanged. Its ``predicted_bytes`` and ``weights_bytes`` are the
+        FORMULA's -- what the columns meant before D51 started reserving a
+        corrected total -- and the row says so by carrying the formula under
+        ``per_gpu_planned[OBSERVATION_FORMULA_KEY]`` (see :func:`formula_terms`),
+        with ``planned_bytes`` beside it for what the plan really reserved. A
+        row without that key is a legacy row whose ``predicted_bytes`` may be a
+        corrected total, which is why the calibrator reads it only in the
+        direction that cannot be the band; a plan whose formula is unknown is
+        stored exactly as a legacy row.
+
         ``per_gpu_actual`` is what the child really holds on each of the plan's
         devices (D39's per-adapter measurement). It is stored beside the plan's
         own ``per_gpu_bytes`` (D40) and compared here: a device that ended up
@@ -3572,15 +3713,37 @@ class Planner:
         the delta a tight placement OOMs on -- and it was invisible while the
         observation was one total.
         """
-        predicted = plan.estimate.total_bytes
-        ratio = (actual_bytes / predicted) if predicted else 0.0
+        planned = plan.estimate.total_bytes
+        applied = self._correction_spent_on(model_id, plan)
+        corrected = applied is not None or any(
+            n.startswith(CORRECTION_NOTE_PREFIX) for n in plan.notes
+        )
+        formula: VramEstimate | None
+        if applied is not None:
+            formula = applied.formula
+        elif corrected:
+            formula = None
+        else:
+            formula = plan.estimate
+        fraction = float(self.config.planner.compute_overhead_fraction)
+        predicted = formula.total_bytes if formula is not None else None
         error_pct = ((actual_bytes - predicted) / predicted * 100.0) if predicted else None
+        margin_pct = ((actual_bytes - planned) / planned * 100.0) if corrected and planned else None
+        reference = predicted if predicted else planned
+        ratio = (actual_bytes / reference) if reference else 0.0
         log.info(
             "load observation",
             model_id=model_id,
-            predicted_mb=round(predicted / MB),
+            predicted_mb=round(predicted / MB) if predicted is not None else None,
+            planned_mb=round(planned / MB),
             actual_mb=round(actual_bytes / MB),
             ratio=round(ratio, 3),
+            error_pct=round(error_pct, 1) if error_pct is not None else None,
+            corrected=corrected,
+            margin_pct=round(margin_pct, 1) if margin_pct is not None else None,
+            correction_factor=(
+                round(applied.correction.factor, 3) if applied is not None else None
+            ),
             ctx=plan.ctx_size,
             devices=plan.devices,
             per_device_mb=(
@@ -3605,12 +3768,14 @@ class Planner:
                     "means the charge is too small for this model"
                 ),
             )
-        within_bar = error_pct is not None and abs(error_pct) <= PREDICTION_ERROR_WARN_PCT
-        if error_pct is not None and not within_bar:
+        within_bar: bool | None = (
+            abs(error_pct) <= PREDICTION_ERROR_WARN_PCT if error_pct is not None else None
+        )
+        if not corrected and error_pct is not None and not within_bar:
             log.warning(
                 "vram prediction error exceeds the bar",
                 model_id=model_id,
-                predicted_mb=round(predicted / MB),
+                predicted_mb=round(predicted / MB) if predicted is not None else None,
                 actual_mb=round(actual_bytes / MB),
                 error_pct=round(error_pct, 1),
                 bar_pct=PREDICTION_ERROR_WARN_PCT,
@@ -3625,13 +3790,44 @@ class Planner:
                     "a persistent miss is a term the formula does not model"
                 ),
             )
+        elif corrected and margin_pct is not None and margin_pct > PREDICTION_ERROR_WARN_PCT:
+            log.warning(
+                "measured footprint exceeds the corrected estimate",
+                model_id=model_id,
+                planned_mb=round(planned / MB),
+                actual_mb=round(actual_bytes / MB),
+                margin_pct=round(margin_pct, 1),
+                bar_pct=PREDICTION_ERROR_WARN_PCT,
+                formula_mb=round(predicted / MB) if predicted is not None else None,
+                correction_factor=(
+                    round(applied.correction.factor, 3) if applied is not None else None
+                ),
+                ctx=plan.ctx_size,
+                parallel=plan.parallel,
+                kv=f"{plan.kv_cache_type}/{plan.kv_cache_type_v}",
+                devices=plan.devices,
+                detail=(
+                    "D51 sized this plan from the last measurement of this configuration "
+                    f"plus {round((OBS_SAFETY - 1) * 100)}%, and the child holds more than "
+                    "even that: the earlier measurement did not describe this placement "
+                    "(the device set or split moved) or the footprint grew; the next plan "
+                    "of this configuration is corrected from this measurement"
+                ),
+            )
         self._last_observations[model_id] = {
             "model_id": model_id,
-            "predicted_bytes": int(predicted),
+            "predicted_bytes": int(predicted) if predicted is not None else None,
+            "planned_bytes": int(planned),
             "actual_bytes": int(actual_bytes),
             "error_pct": round(error_pct, 2) if error_pct is not None else None,
             "within_bar": within_bar,
             "bar_pct": PREDICTION_ERROR_WARN_PCT,
+            "corrected": corrected,
+            "correction_factor": (
+                round(applied.correction.factor, 4) if applied is not None else None
+            ),
+            "margin_pct": round(margin_pct, 2) if margin_pct is not None else None,
+            "overhead_fraction": fraction,
             "ctx_size": plan.ctx_size,
             "parallel": plan.parallel,
             "kv_cache_type": plan.kv_cache_type,
@@ -3649,6 +3845,28 @@ class Planner:
             "note": note,
         }
         if self._observation_sink is not None:
+            # The plan's per-card shares, plus the formula the plan started
+            # from (D63). The formula rides in this JSON column rather than in
+            # a new column or a new note marker: D51's match rule keys on the
+            # literal note and reads the same row back, and D40 made the
+            # column JSON precisely so a row could grow without a schema
+            # change. Absent when the formula is unknown, so the row then
+            # reads exactly as a legacy one.
+            planned_shares: dict[str, Any] = {
+                str(d): int(b) for d, b in sorted(plan.per_gpu_bytes.items())
+            }
+            if formula is not None:
+                planned_shares[OBSERVATION_FORMULA_KEY] = {
+                    "total_bytes": int(formula.total_bytes),
+                    "weights_bytes": int(formula.weights_bytes),
+                    "compute_bytes": int(formula.compute_bytes),
+                    "planned_bytes": int(planned),
+                    "overhead_fraction": fraction,
+                    "corrected": corrected,
+                    "factor": (
+                        round(applied.correction.factor, 6) if applied is not None else None
+                    ),
+                }
             self._observation_sink(
                 {
                     "model_id": model_id,
@@ -3663,14 +3881,23 @@ class Planner:
                     # safely describe the placement that asks for it.
                     "kv_cache_type_v": plan.kv_cache_type_v,
                     "devices": ",".join(str(d) for d in plan.devices),
-                    "predicted_bytes": predicted,
+                    # The FORMULA's total and weights whenever the formula is
+                    # known -- what these columns meant under D18, before D51
+                    # started reserving a corrected total -- so actual over
+                    # predicted in this table is the formula's error again and
+                    # never the band. The block above says which it is; a plan
+                    # whose formula is unknown stores what it reserved, exactly
+                    # as a legacy row does.
+                    "predicted_bytes": int(predicted) if predicted is not None else int(planned),
                     "actual_bytes": actual_bytes,
-                    "weights_bytes": plan.estimate.weights_bytes,
+                    "weights_bytes": (
+                        int(formula.weights_bytes)
+                        if formula is not None
+                        else int(plan.estimate.weights_bytes)
+                    ),
                     "ok": 1 if ok else 0,
                     "note": note,
-                    "per_gpu_planned": json.dumps(
-                        {str(d): int(b) for d, b in sorted(plan.per_gpu_bytes.items())}
-                    ),
+                    "per_gpu_planned": json.dumps(planned_shares),
                     "per_gpu_actual": (
                         json.dumps({str(d): int(b) for d, b in sorted(per_gpu_actual.items())})
                         if per_gpu_actual
@@ -3739,6 +3966,13 @@ OBS_BAND_MIN = 0.60
 OBS_BAND_MAX = 1.30
 
 
+#: How every D51 correction note begins. :meth:`Planner.observe` reads it
+#: back off the plan (D63): a plan carrying this sentence was sized from a
+#: measurement, whether or not this process still remembers which one, and
+#: must never be measured against as if its total were the formula's.
+CORRECTION_NOTE_PREFIX = "estimate corrected x"
+
+
 @dataclass(frozen=True)
 class ObservedCorrection:
     """A measured footprint the planner has decided to trust, and by how much.
@@ -3754,6 +3988,41 @@ class ObservedCorrection:
     formula_bytes: int
     clamped: bool
     note: str
+
+
+@dataclass(frozen=True)
+class AppliedCorrection:
+    """A correction as it was spent on one estimate (D63).
+
+    ``formula`` is the estimate the formula produced and ``corrected`` is what
+    :func:`scaled_estimate` made of it -- the estimate the plan then carried.
+    :meth:`Planner.observe` matches a plan against ``corrected`` term by term
+    before it will report ``formula`` as the number the child was predicted
+    from.
+    """
+
+    correction: ObservedCorrection
+    formula: VramEstimate
+    corrected: VramEstimate
+
+
+#: ``(model_id, ctx, slots, kv_k, kv_v, n_devices)``: one configuration as
+#: the D51 lookup and :attr:`Planner._applied_corrections` key it.
+_CorrectionKey = tuple[str, int, int, str, str, int]
+
+
+def _correction_key(
+    model_id: str, ctx: int, slots: int, kv_k: str, kv_v: str, n_devices: int
+) -> _CorrectionKey:
+    return (model_id, int(ctx), int(slots), str(kv_k), str(kv_v), int(n_devices))
+
+
+#: How many configurations' corrections a planner remembers for
+#: :meth:`Planner.observe`. One load spends one correction, and a box plans a
+#: few dozen distinct configurations in a long process; the bound exists so a
+#: caller hammering the dry-run route with novel shapes cannot grow the map
+#: without limit, not because anything near it is expected.
+_APPLIED_CORRECTIONS_CAP = 4096
 
 
 def observed_correction(*, formula_bytes: int, observed_bytes: int) -> ObservedCorrection | None:
@@ -3798,7 +4067,7 @@ def observed_correction(*, formula_bytes: int, observed_bytes: int) -> ObservedC
     if abs(factor - 1.0) < 0.005:
         return None
     note = (
-        f"estimate corrected x{factor:.2f} from the last load of this exact "
+        f"{CORRECTION_NOTE_PREFIX}{factor:.2f} from the last load of this exact "
         f"configuration (observed {round(observed_bytes / MB)} MB against a formula "
         f"estimate of {round(formula_bytes / MB)} MB)"
     )
@@ -3885,7 +4154,36 @@ OBSERVATION_NOTE_PER_PID = "per_pid"
 #: VRAM on the plan's devices, measured per device -- PDH per adapter joined to
 #: CUDA ordinals on Windows (D39), NVML per process per GPU on Linux -- and
 #: never the same total counted once per card.
+#:
+#: The marker describes the MEASUREMENT and nothing else. Which estimate the
+#: row's ``predicted_bytes`` is -- the formula's, or the one D51 sized from an
+#: earlier measurement -- is a separate fact: since D63 a row that carries
+#: :data:`OBSERVATION_FORMULA_KEY` stores the formula's, and a row without it
+#: may hold either. ``db.matching_observation`` keys on this literal, so it is
+#: deliberately NOT bumped for that.
 OBSERVATION_NOTE_PER_PID_DEVICE = "per_pid_v2"
+
+#: Key inside the ``per_gpu_planned`` JSON column, beside the per-card shares,
+#: under which :meth:`Planner.observe` stores the formula estimate the plan
+#: started from (D63)::
+#:
+#:     {"0": 20e9, "1": 22e9, "formula": {"total_bytes": ..., "weights_bytes": ...,
+#:      "compute_bytes": ..., "planned_bytes": ..., "overhead_fraction": 0.06,
+#:      "corrected": false, "factor": null}}
+#:
+#: ``total_bytes`` and ``weights_bytes`` are the formula's own terms (for a
+#: D51-corrected plan, the ones the correction replaced) and are what the
+#: row's ``predicted_bytes`` / ``weights_bytes`` columns hold too;
+#: ``planned_bytes`` is what the plan reserved (the corrected total when
+#: ``corrected`` is true, else the same number); ``overhead_fraction`` is the
+#: ``compute_overhead_fraction`` the formula was computed with. Together they
+#: make a row's "need" absolute -- see :func:`suggest_overhead_fraction`. A
+#: row without the key is a legacy row:
+#: its ``predicted_bytes`` may be a corrected total and it cannot say which,
+#: which is exactly why the calibrator reads it only in the direction that
+#: cannot be mistaken for the band. Non-numeric keys in this column are
+#: metadata; the per-card shares are the numeric ones.
+OBSERVATION_FORMULA_KEY = "formula"
 
 #: Bounds the auto-calibrated ``compute_overhead_fraction`` may move between.
 #: Below the floor the compute term stops covering real graph buffers on small
@@ -3896,8 +4194,27 @@ OVERHEAD_FRACTION_MIN = 0.03
 OVERHEAD_FRACTION_MAX = 0.15
 
 #: Clean observations needed before the factor is touched at all. A handful of
-#: loads of one model is not a calibration, it is that model.
+#: loads of one model is not a calibration, it is that model. Lowering needs
+#: this many rows that carry the formula (:data:`OBSERVATION_FORMULA_KEY`);
+#: raising counts legacy rows too, as it always has.
 CALIBRATION_MIN_ROWS = 5
+
+#: When every formula row over-estimated, the fraction comes down to where the
+#: tightest of them would still have had this much of its weights spare (D63).
+#: Two percent of weights is about the run-to-run wobble of one placement --
+#: tensor-split proportions are recomputed from live free VRAM on every load
+#: -- so the worst row the window has seen stays covered, not merely met.
+CALIBRATION_LOWER_MARGIN = 0.02
+
+#: The most the fraction may come DOWN in one calibration (one per process).
+#: Going up covers the worst case at once, as it always has: that is the
+#: direction that prevents an OOM. Coming down is the direction that can
+#: cause one on a first load the window never saw, so a strange week of
+#: small-model loads moves it three points, not to the floor. Calibration
+#: never persists (D18), so the configured value is the anchor: a process
+#: runs at most this far below ``config.yaml``, and the durable move is the
+#: operator's.
+CALIBRATION_MAX_STEP_DOWN = 0.03
 
 
 def clean_observations(
@@ -3913,12 +4230,61 @@ def clean_observations(
     load at a ratio of its device count; D40). Feeding either to the
     calibrator ratchets the overhead fraction to its ceiling and starts
     refusing loads that fit. The marker is the only thing separating them.
+
+    Clean says the *measurement* is honest. Whether the row's
+    ``predicted_bytes`` is the formula's or a D51-corrected total is the other
+    question, answered per row by :func:`formula_terms` (D63).
     """
     return [
         row
         for row in observations
         if str(row.get("note") or "") == OBSERVATION_NOTE_PER_PID_DEVICE and row.get("ok", True)
     ]
+
+
+def formula_terms(row: Mapping[str, object]) -> tuple[int, int, float] | None:
+    """``(formula_total_bytes, formula_weights_bytes, overhead_fraction)`` off a
+    row, or ``None`` for a legacy row that carries no formula (D63).
+
+    Read from ``per_gpu_planned`` (JSON text as the database returns it, or an
+    already-decoded mapping) under :data:`OBSERVATION_FORMULA_KEY`. Anything
+    malformed is ``None`` rather than an exception: a row that cannot state
+    its formula is a legacy row, and a legacy row is not an error.
+    """
+    raw = row.get("per_gpu_planned")
+    data: object
+    if isinstance(raw, (str, bytes)):
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return None
+    else:
+        data = raw
+    if not isinstance(data, Mapping):
+        return None
+    block = data.get(OBSERVATION_FORMULA_KEY)
+    if not isinstance(block, Mapping):
+        return None
+    total = block.get("total_bytes")
+    weights = block.get("weights_bytes")
+    fraction = block.get("overhead_fraction")
+    if isinstance(total, bool) or not isinstance(total, (int, float)):
+        return None
+    if isinstance(weights, bool) or not isinstance(weights, (int, float)):
+        return None
+    if isinstance(fraction, bool) or not isinstance(fraction, (int, float)):
+        return None
+    if total <= 0 or weights <= 0 or fraction < 0:
+        return None
+    return int(total), int(weights), float(fraction)
+
+
+def formula_observations(
+    observations: Sequence[dict[str, object]],
+) -> list[dict[str, object]]:
+    """The clean observations that also state the formula they were planned
+    from -- the only rows that can say which way the FORMULA missed (D63)."""
+    return [row for row in clean_observations(observations) if formula_terms(row) is not None]
 
 
 def calibrated_overhead_fraction(
@@ -3929,16 +4295,34 @@ def calibrated_overhead_fraction(
     ``None`` means "leave it alone": too little clean data, or the suggestion
     is what is already configured. The clamp is applied after
     :func:`suggest_overhead_fraction`, so a wild suggestion from a handful of
-    strange loads costs at most the difference to the nearest bound.
+    strange loads costs at most the difference to the nearest bound -- and a
+    move DOWN is additionally limited to :data:`CALIBRATION_MAX_STEP_DOWN`
+    below ``current`` (D63). Going up is not stepped: it is the direction
+    that prevents an OOM, and it covers the worst case at once as it always
+    has.
     """
     clean = clean_observations(observations)
     if len(clean) < CALIBRATION_MIN_ROWS:
         return None
     suggested = suggest_overhead_fraction(clean, current=current)
     clamped = min(OVERHEAD_FRACTION_MAX, max(OVERHEAD_FRACTION_MIN, suggested))
+    if clamped < current:
+        clamped = max(clamped, current - CALIBRATION_MAX_STEP_DOWN)
+    clamped = round(clamped, 4)
     if abs(clamped - current) < 1e-9:
         return None
     return clamped
+
+
+#: Rows that must agree the fraction is short before it is raised. Three is
+#: the bar D18 set; one model's bad day is not a calibration.
+_RAISE_MIN_ROWS = 3
+
+#: A row is "short" when its need exceeds ``current`` by more than this. A
+#: need is a stored fraction plus a quotient of two byte counts, so a row the
+#: formula met exactly can land a few ulps above the fraction it was computed
+#: with; that is arithmetic, not a shortfall.
+_NEED_EPS = 1e-9
 
 
 def suggest_overhead_fraction(
@@ -3946,29 +4330,77 @@ def suggest_overhead_fraction(
 ) -> float:
     """Suggest a tuned ``compute_overhead_fraction`` from load history.
 
-    Uses the worst (highest) actual/predicted ratio rather than the mean: the
-    factor exists to prevent OOM, so it must cover the bad case, not the
-    typical one. Returns ``current`` unchanged when there is too little data.
+    Worst-case-driven in both directions: the factor exists to prevent OOM, so
+    it is set by the row that needed the most, never by the mean. Each row is
+    read for the fraction that would have made the formula meet what the
+    child really held -- its *need* -- and the two kinds of row are read
+    differently (D63):
+
+    * A row carrying the formula (:func:`formula_terms`) has an exact,
+      absolute need: ``overhead_fraction + (actual - formula_total) /
+      formula_weights``. It counts in both directions, and the same row gives
+      the same need on every boot whatever the fraction has since become.
+    * A legacy row (no formula) has ``predicted_bytes`` that may be a
+      D51-corrected total, so a measurement *below* it can be the band and
+      not the formula; such a row is silent. A measurement *above* it is a
+      real shortfall whichever total it was, read as ``current + shortfall /
+      weights`` -- D18's rule, unchanged.
+
+    **Up**, when at least :data:`_RAISE_MIN_ROWS` rows need more than
+    ``current``: the largest need, rounded up to 0.5%, capped at 0.5 (the
+    clamp to :data:`OVERHEAD_FRACTION_MAX` is the caller's).
+
+    **Down**, only when every row is covered with room to spare: at least
+    :data:`CALIBRATION_MIN_ROWS` formula rows, no legacy shortfall in the
+    window, and the largest need plus :data:`CALIBRATION_LOWER_MARGIN` still
+    below ``current``: that sum, rounded up to 0.5%. The tightest row in the
+    window governs, so a week of tiny models cannot talk the fraction down
+    past what the largest recent load still needed.
+
+    Otherwise ``current`` unchanged -- including one or two shortfalls (not
+    evidence enough to raise, but the worst case is not negative either).
     """
-    ratios: list[float] = []
+    legacy_needs: list[float] = []
+    formula_needs: list[float] = []
     for row in observations:
-        predicted = row.get("predicted_bytes")
         actual = row.get("actual_bytes")
-        weights = row.get("weights_bytes")
-        if not isinstance(predicted, (int, float)) or not isinstance(actual, (int, float)):
+        if not isinstance(actual, (int, float)):
             continue
-        if not isinstance(weights, (int, float)) or weights <= 0 or predicted <= 0:
+        terms = formula_terms(row)
+        if terms is not None:
+            total, weights, fraction = terms
+            formula_needs.append(fraction + (float(actual) - total) / weights)
+            continue
+        predicted = row.get("predicted_bytes")
+        weights_bytes = row.get("weights_bytes")
+        if not isinstance(predicted, (int, float)) or predicted <= 0:
+            continue
+        if not isinstance(weights_bytes, (int, float)) or weights_bytes <= 0:
             continue
         shortfall = float(actual) - float(predicted)
         if shortfall <= 0:
             continue
         # Attribute the whole shortfall to the compute term and express it as
         # the extra fraction-of-weights it would have taken to cover it.
-        ratios.append(shortfall / float(weights))
-    if len(ratios) < 3:
+        legacy_needs.append(current + shortfall / float(weights_bytes))
+    short = legacy_needs + [need for need in formula_needs if need > current + _NEED_EPS]
+    if len(short) >= _RAISE_MIN_ROWS:
+        return min(0.5, _round_up_half_pct(max(short)))
+    if legacy_needs or len(formula_needs) < CALIBRATION_MIN_ROWS:
         return current
-    needed = current + max(ratios)
-    return float(min(0.5, math.ceil(needed * 200) / 200))  # round up to 0.5%
+    target = max(formula_needs) + CALIBRATION_LOWER_MARGIN
+    if target >= current:
+        return current
+    return _round_up_half_pct(target)
+
+
+def _round_up_half_pct(fraction: float) -> float:
+    """``fraction`` rounded UP to the next 0.5%.
+
+    The float noise is rounded off first: ``0.06 - 0.025 + 0.02`` is a hair
+    over ``0.055`` in binary, and a bare ``ceil`` would call that 6%.
+    """
+    return float(math.ceil(round(fraction * 200, 6)) / 200)
 
 
 def _combinations(items: Sequence[int], width: int) -> list[tuple[int, ...]]:

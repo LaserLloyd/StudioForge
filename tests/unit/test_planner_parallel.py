@@ -24,6 +24,7 @@ from studioforge.core.manager import ModelManager
 from studioforge.core.planner import (
     CALIBRATION_MIN_ROWS,
     MAX_PARALLEL_CAP,
+    OBSERVATION_FORMULA_KEY,
     OBSERVATION_NOTE_PER_PID,
     OBSERVATION_NOTE_PER_PID_DEVICE,
     OVERHEAD_FRACTION_MAX,
@@ -822,7 +823,11 @@ def test_the_observation_measures_our_child_not_the_whole_card(
     assert seen[0]["note"] == OBSERVATION_NOTE_PER_PID_DEVICE
     # The per-GPU figure NVML gave is kept per device beside the plan's share.
     assert json.loads(seen[0]["per_gpu_actual"]) == {"0": 9 * GB}
-    assert json.loads(seen[0]["per_gpu_planned"]) == {}
+    planned = json.loads(seen[0]["per_gpu_planned"])
+    # This plan named no per-card shares; the formula the plan started from is
+    # still recorded beside them (D63), which is what the calibrator reads.
+    assert {k: v for k, v in planned.items() if k.isdigit()} == {}
+    assert planned[OBSERVATION_FORMULA_KEY]["total_bytes"] == plan.estimate.total_bytes
 
 
 def test_no_observation_is_recorded_when_nvml_cannot_attribute(
@@ -984,7 +989,11 @@ def test_observe_stores_the_plan_share_and_the_measured_split() -> None:
         per_gpu_actual={0: int(9.5 * GB), 1: int(10.5 * GB)},
     )
     assert len(seen) == 1
-    assert json.loads(seen[0]["per_gpu_planned"]) == {"0": 10 * GB, "1": 9 * GB}
+    planned = json.loads(seen[0]["per_gpu_planned"])
+    # Per-card shares under the numeric keys; the formula rides beside them
+    # under its own key (D63) and is not a card.
+    assert {k: v for k, v in planned.items() if k.isdigit()} == {"0": 10 * GB, "1": 9 * GB}
+    assert planned[OBSERVATION_FORMULA_KEY]["weights_bytes"] == 16 * GB
     assert json.loads(seen[0]["per_gpu_actual"]) == {"0": int(9.5 * GB), "1": int(10.5 * GB)}
     assert seen[0]["note"] == OBSERVATION_NOTE_PER_PID_DEVICE
 
