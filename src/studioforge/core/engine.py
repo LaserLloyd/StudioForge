@@ -515,6 +515,27 @@ SKIP_DRAFT = "draft release (unpublished; its assets 404)"
 SKIP_PRERELEASE = "prerelease that is not a bNNNN build release"
 SKIP_TAG_SCHEME = "tag is not a bNNNN llama.cpp build release"
 
+#: Upstream's second kind of release (D62): a ``vX.Y.Z`` *version* release,
+#: published every few weeks, not flagged prerelease, whose only asset is a
+#: one-line ``nightly-tag.txt`` naming the ``bNNNN`` build it blesses (read
+#: 2026-09-09: ``v0.4.0`` -> ``b10809``, ``v0.3.0`` -> ``b10621``). That pointer
+#: is the stable channel. GitHub's ``releases/latest`` is defined as the newest
+#: non-prerelease, non-draft release, which -- because every build release
+#: carries the prerelease flag (D49-1) -- is that version release, in one
+#: request and without paging through a fortnight of builds to find it.
+VERSION_TAG_RE = re.compile(r"^v\d+\.\d+\.\d+$")
+STABLE_POINTER_ASSET = "nightly-tag.txt"
+#: How long one answer stands on the manager. Version releases are weeks
+#: apart, so a quarter of an hour costs nothing in freshness and keeps a
+#: Dashboard timer polling ``GET /api/engine`` off GitHub's rate limit; a
+#: failure is retried sooner so a transient hiccup does not blank the channel
+#: for the whole TTL.
+STABLE_RELEASE_TTL_S = 15 * 60.0
+STABLE_RELEASE_RETRY_S = 60.0
+#: A status route reads the channel through the cache; a cold read must not
+#: sit on the client's 300 s read timeout for a one-line file.
+STABLE_LOOKUP_TIMEOUT_S = 15.0
+
 _ARCH_ALIASES = {
     "amd64": "x64",
     "x86_64": "x64",
@@ -1371,6 +1392,11 @@ class EngineManager:
         #: list of tags for its half-dozen callers; :meth:`check_update` folds it
         #: into its payload and :func:`describe_release_filter` renders it.
         self.last_release_scan: dict[str, Any] | None = None
+        #: The stable channel's last answer (D62): ``(expires_at, release)`` from
+        #: :meth:`stable_release`, process-local like every other cache here;
+        #: :attr:`last_stable_error` is why the answer is ``None`` when it is.
+        self._stable_cache: tuple[float, dict[str, Any] | None] | None = None
+        self.last_stable_error: str | None = None
         self._flag_cache: dict[str, set[str]] = {}
         self._removed_cache: dict[str, dict[str, str | None]] = {}
         self._help_cache: dict[str, str] = {}
@@ -1586,6 +1612,18 @@ class EngineManager:
         because "no update available" and "every release was filtered out" look
         identical from the outside, and for ten days in August 2026 the second
         one was rendering as the first on every surface (D49-3).
+
+        **The stable channel rides beside it (D62).** ``stable`` is
+        :meth:`stable_release` (``{version, tag, published_at}`` or ``None``,
+        with ``stable_error`` saying why), ``stable_variant`` the asset this box
+        can install for that build (``source`` when only a build from source
+        would, as for ``latest``), and ``update_channel`` / ``recommended_tag``
+        / ``recommended_variant`` / ``update_recommended`` are the channel's
+        verdict: on ``stable`` the blessed build, on ``latest`` the same tag as
+        ``latest``. ``latest`` and ``update_available`` keep their pre-D62
+        meaning on both channels, so a caller that never learned about channels
+        reads exactly what it used to. A stable channel that cannot be read
+        recommends nothing -- never ``latest`` in disguise -- and says why.
         """
         current = self._read_active() or self.config.engine.pinned_tag
         releases = await self.list_releases(limit)
@@ -1595,28 +1633,15 @@ class EngineManager:
 
         gpus = self._gpus()
         driver = self._cuda_driver_version()
+        probed: dict[str, tuple[str | None, str | None, bool]] = {}
         for tag in releases[: max(1, probe_assets)]:
-            try:
-                assets = await self.list_assets(tag)
-                asset = self.select_asset(assets, gpus=gpus, cuda_driver=driver)
-            except EngineError as exc:
-                skipped.append({"tag": tag, "reason": str(exc)})
-                continue
-            if asset is None:
-                variants = self._host_variants(assets)
-                skipped.append(
-                    {
-                        "tag": tag,
-                        "reason": (
-                            f"no asset for {self.os_token}/{self.arch_token} is compatible "
-                            f"with this driver (CUDA {_fmt_version(driver)}); "
-                            f"available variants: {', '.join(variants)}"
-                        ),
-                    }
-                )
+            probed[tag] = await self._installable_variant(tag, gpus=gpus, driver=driver)
+            variant, reason, _missing = probed[tag]
+            if variant is None:
+                skipped.append({"tag": tag, "reason": reason or "no installable asset"})
                 continue
             latest = tag
-            latest_variant = asset.variant
+            latest_variant = variant
             break
 
         if latest is None and releases and self.config.engine.allow_source_build:
@@ -1629,6 +1654,41 @@ class EngineManager:
         current_n = build_number(current)
         latest_n = build_number(latest)
         update_available = latest_n is not None and (current_n is None or latest_n > current_n)
+
+        # D62: the stable channel, probed the same way, and the channel's verdict.
+        channel = self.config.engine.update_channel
+        stable = await self.stable_release()
+        stable_tag = str(stable["tag"]) if stable else None
+        stable_variant: str | None = None
+        if stable_tag is not None:
+            if stable_tag == latest:
+                stable_variant = latest_variant
+            else:
+                # Reuse the loop's probe when it already covered this tag: one
+                # GitHub call, and one ``skipped`` entry, per tag.
+                seen_above = stable_tag in probed
+                if seen_above:
+                    stable_variant, reason, missing = probed[stable_tag]
+                else:
+                    stable_variant, reason, missing = await self._installable_variant(
+                        stable_tag, gpus=gpus, driver=driver
+                    )
+                if stable_variant is None:
+                    if not missing and self.config.engine.allow_source_build:
+                        stable_variant = "source"
+                    elif not seen_above:
+                        skipped.append(
+                            {"tag": stable_tag, "reason": reason or "no installable asset"}
+                        )
+        if channel == "latest":
+            recommended_tag, recommended_variant = latest, latest_variant
+        else:
+            recommended_tag = stable_tag if stable_variant is not None else None
+            recommended_variant = stable_variant
+        recommended_n = build_number(recommended_tag)
+        update_recommended = recommended_n is not None and (
+            current_n is None or recommended_n > current_n
+        )
         scan = dict(self.last_release_scan or {})
         return {
             "checked": True,
@@ -1640,7 +1700,131 @@ class EngineManager:
             "skipped": skipped,
             "filtered": scan,
             "filter_summary": describe_release_filter(scan),
+            "update_channel": channel,
+            "stable": stable,
+            "stable_variant": stable_variant,
+            "stable_error": self.last_stable_error,
+            "recommended_tag": recommended_tag,
+            "recommended_variant": recommended_variant,
+            "update_recommended": update_recommended,
         }
+
+    async def stable_release(self, *, refresh: bool = False) -> dict[str, Any] | None:
+        """The build upstream's newest version release blesses, or ``None`` (D62).
+
+        ``{"version": "v0.4.0", "tag": "b10809", "published_at": ...}``: the
+        newest non-prerelease, non-draft ``vX.Y.Z`` release -- GitHub's
+        ``releases/latest`` is exactly that, see :data:`VERSION_TAG_RE` -- and
+        the ``bNNNN`` its ``nightly-tag.txt`` names. Two GitHub reads, cached on
+        this manager for :data:`STABLE_RELEASE_TTL_S`; a failure is cached for
+        :data:`STABLE_RELEASE_RETRY_S`, logged, recorded in
+        :attr:`last_stable_error` and returned as ``None``. ``GET /api/engine``
+        reads this, and a status call must never raise or hang for a pointer
+        file. ``refresh`` bypasses a still-fresh cache.
+        """
+        now = time.monotonic()
+        if not refresh and self._stable_cache is not None and now < self._stable_cache[0]:
+            cached = self._stable_cache[1]
+            return dict(cached) if cached is not None else None
+        found: dict[str, Any] | None
+        error: str | None
+        try:
+            found, error = await self._read_stable_pointer(), None
+        except EngineError as exc:
+            found, error = None, str(exc)
+        previous = self.last_stable_error
+        self.last_stable_error = error
+        ttl = STABLE_RELEASE_TTL_S if found is not None else STABLE_RELEASE_RETRY_S
+        self._stable_cache = (now + ttl, found)
+        if found is None:
+            # Once per distinct reason: a poller retrying every minute while
+            # GitHub is unreachable is one fact, not sixty warnings an hour.
+            emit = log.debug if error == previous else log.warning
+            emit("engine.stable.unavailable", error=error)
+        else:
+            log.debug("engine.stable", version=found["version"], tag=found["tag"])
+        return dict(found) if found is not None else None
+
+    async def _read_stable_pointer(self) -> dict[str, Any]:
+        """``releases/latest`` -> its ``nightly-tag.txt`` -> the blessed build.
+
+        Every failure is an :class:`EngineError` naming the step, so
+        :meth:`stable_release` can record one reason and the surfaces can print
+        it. A build tag at ``releases/latest`` (upstream stopped flagging builds
+        prerelease) is a failure too: the channel would otherwise quietly turn
+        into ``latest``, which is the one thing the operator opted out of.
+        """
+        repo = self.config.engine.repo
+        timeout = httpx.Timeout(STABLE_LOOKUP_TIMEOUT_S)
+        try:
+            resp = await self.client.get(
+                f"{GITHUB_API}/repos/{repo}/releases/latest", timeout=timeout
+            )
+            _raise_for_rate_limit(resp, "read the stable engine channel")
+            if resp.status_code == 404:
+                raise EngineError(f"{repo} has published no full (non-prerelease) release")
+            resp.raise_for_status()
+            payload = resp.json()
+        except httpx.HTTPError as exc:
+            raise EngineError(f"could not read the stable engine channel: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise EngineError("unexpected response reading the stable engine channel")
+        version = payload.get("tag_name")
+        if not isinstance(version, str) or not VERSION_TAG_RE.match(version):
+            raise EngineError(
+                f"the newest full release of {repo} is {version!r}, not a vX.Y.Z version "
+                f"release carrying a {STABLE_POINTER_ASSET} pointer"
+            )
+        names = {
+            entry.get("name")
+            for entry in _as_iterable(payload.get("assets"))
+            if isinstance(entry, dict)
+        }
+        if STABLE_POINTER_ASSET not in names:
+            raise EngineError(f"{version} carries no {STABLE_POINTER_ASSET} asset naming its build")
+        url = f"https://github.com/{repo}/releases/download/{version}/{STABLE_POINTER_ASSET}"
+        try:
+            pointer = await self.client.get(url, timeout=timeout, headers={"Accept": "text/plain"})
+            pointer.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise EngineError(f"could not read {version}'s {STABLE_POINTER_ASSET}: {exc}") from exc
+        if len(pointer.content) > 4096:
+            raise EngineError(
+                f"{version}'s {STABLE_POINTER_ASSET} is {len(pointer.content)} bytes, "
+                "not a one-line build tag"
+            )
+        lines = [line.strip() for line in pointer.text.splitlines() if line.strip()]
+        tag = lines[0] if lines else ""
+        if not ENGINE_TAG_RE.match(tag):
+            raise EngineError(
+                f"{version}'s {STABLE_POINTER_ASSET} names {tag[:40]!r}, not a bNNNN build tag"
+            )
+        return {"version": version, "tag": tag, "published_at": payload.get("published_at")}
+
+    async def _installable_variant(
+        self, tag: str, *, gpus: Sequence[GpuInfo], driver: tuple[int, int] | None
+    ) -> tuple[str | None, str | None, bool]:
+        """``(variant, reason, missing)`` for one tag: the asset this box can
+        install, or why not. ``missing`` is true when the release itself could
+        not be read -- a source build clones by tag, so that case must not fall
+        back to one the way "no asset fits" may."""
+        try:
+            assets = await self.list_assets(tag)
+            asset = self.select_asset(assets, gpus=gpus, cuda_driver=driver)
+        except EngineError as exc:
+            return None, str(exc), True
+        if asset is None:
+            variants = self._host_variants(assets)
+            return (
+                None,
+                (
+                    f"no asset for {self.os_token}/{self.arch_token} is compatible "
+                    f"with this driver (CUDA {_fmt_version(driver)}); "
+                    f"available variants: {', '.join(variants)}"
+                ),
+                False,
+            )
+        return asset.variant, None, False
 
     async def list_assets(self, tag: str) -> list[EngineAsset]:
         """Release archives for ``tag``, parsed into :class:`EngineAsset`."""
@@ -3356,6 +3540,29 @@ def describe_release_filter(scan: Mapping[str, Any] | None) -> str:
         if parts:
             text += f" ({', '.join(parts)})"
     return text
+
+
+def describe_stable_channel(status: Mapping[str, Any] | None) -> str:
+    """One phrase for the stable channel in a :meth:`EngineManager.check_update`
+    payload (D62): ``"b10809 (v0.4.0, cuda-13.3)"``, ``"b10809 (v0.4.0)"`` when
+    no asset was probed, ``"unavailable: <why>"`` when the pointer could not be
+    read, and ``""`` for a payload from before the channel existed. One renderer
+    for the CLI, the panel and anything else that quotes it, for the reason
+    :func:`describe_release_filter` exists: three surfaces wording one fact
+    three ways is how they come to disagree about it.
+    """
+    if not status:
+        return ""
+    stable = status.get("stable")
+    if isinstance(stable, Mapping) and stable.get("tag"):
+        inside = ", ".join(
+            str(part) for part in (stable.get("version"), status.get("stable_variant")) if part
+        )
+        return f"{stable['tag']} ({inside})" if inside else str(stable["tag"])
+    error = status.get("stable_error")
+    if error:
+        return f"unavailable: {error}"
+    return "unavailable" if "stable" in status else ""
 
 
 def _raise_for_rate_limit(resp: httpx.Response, action: str) -> None:

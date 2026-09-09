@@ -611,7 +611,11 @@ def engine_cmd(
     is already installed, and ``--update`` does both in the only safe order --
     install, smoke-test, and activate only if the test passed.
     """
-    from studioforge.core.engine import EngineManager, describe_release_filter
+    from studioforge.core.engine import (
+        EngineManager,
+        describe_release_filter,
+        describe_stable_channel,
+    )
 
     config = _load(config_path)
     config.ensure_dirs()
@@ -644,20 +648,44 @@ def engine_cmd(
             variant = status.get("latest_variant")
             suffix = f" ({variant})" if variant else ""
             typer.echo(f"active: {current}    newest installable: {latest or 'none'}{suffix}")
+            # D62: the stable channel beside the newest build, and which of the
+            # two this box follows -- the target of --update is the channel's.
+            # A payload from before the channel existed (no ``recommended_tag``
+            # key at all) recommends what it always did: ``latest``. A present
+            # ``None`` is the stable channel saying it has nothing to offer.
+            channel = status.get("update_channel") or "latest"
+            has_verdict = "recommended_tag" in status
+            target = status["recommended_tag"] if has_verdict else latest
+            target_variant = status.get("recommended_variant") if has_verdict else variant
+            target_suffix = f" ({target_variant})" if target_variant else ""
+            recommended = (
+                status["update_recommended"] if has_verdict else status["update_available"]
+            )
+            stable_text = describe_stable_channel(status)
+            if stable_text:
+                typer.echo(f"  stable channel: {stable_text}")
+            typer.echo(
+                f"  engine.update_channel: {channel} -> recommended: "
+                f"{target or 'none'}{target_suffix}"
+            )
             filtered_line = status.get("filter_summary")
             if filtered_line:
                 typer.echo(f"  {filtered_line}")
             for entry in status.get("skipped") or []:
                 typer.echo(f"  skipped {entry['tag']}: {entry['reason']}")
-            if latest is None:
-                typer.echo("no llama.cpp release offers a build this box can install", err=True)
+            if target is None:
+                typer.echo(
+                    f"no llama.cpp release on the {channel} channel offers a build this "
+                    "box can install",
+                    err=True,
+                )
                 raise typer.Exit(1)
-            if not status["update_available"]:
-                typer.echo("already on the newest release")
+            if not recommended:
+                typer.echo(f"already on the newest {channel} release")
                 if not smoke_test:
                     return
             elif check:
-                typer.echo(f"run 'studioforge engine --update' to move to {latest}")
+                typer.echo(f"run 'studioforge engine --update' to move to {target}")
                 return
             else:
                 # Install, smoke-test, and only THEN activate and pin (D49-4).
@@ -665,14 +693,14 @@ def engine_cmd(
                 # the smoke test afterwards, so this branch printed "keeping
                 # b10425" while active.json already said b10488 -- the failed
                 # build was live, and the message said the opposite.
-                typer.echo(f"installing {latest} (not activating it yet) ...")
-                info = await manager.install(latest, activate=False)
+                typer.echo(f"installing {target} (not activating it yet) ...")
+                info = await manager.install(target, activate=False)
                 ok, detail = await manager.smoke_test(info.tag)
                 if not ok:
                     typer.echo(
-                        f"smoke test FAILED for {latest}; keeping {current} active. "
-                        f"{latest} stays installed but unused -- 'studioforge engine "
-                        f"--activate {latest}' would switch to it anyway.\n{detail}"
+                        f"smoke test FAILED for {target}; keeping {current} active. "
+                        f"{target} stays installed but unused -- 'studioforge engine "
+                        f"--activate {target}' would switch to it anyway.\n{detail}"
                     )
                     raise typer.Exit(1)
                 await _activate_and_pin(manager, config, info.tag)
@@ -968,6 +996,7 @@ def capabilities_cmd(
 
     if check_update:
         from studioforge.core.engine import EngineManager as _EM
+        from studioforge.core.engine import describe_stable_channel
 
         async def _check() -> None:
             manager = _EM(config, probe=probe)
@@ -981,12 +1010,23 @@ def capabilities_cmd(
             typer.echo(f"  newest          {latest or 'none installable'}")
             if variant:
                 typer.echo(f"  variant         {variant}")
+            # D62: the stable channel, and the recommendation the channel makes.
+            stable_text = describe_stable_channel(status)
+            if stable_text:
+                typer.echo(f"  stable          {stable_text}")
+            channel = status.get("update_channel") or "latest"
+            has_verdict = "recommended_tag" in status
+            target = status["recommended_tag"] if has_verdict else latest
+            recommended = (
+                status["update_recommended"] if has_verdict else status["update_available"]
+            )
+            typer.echo(f"  channel         {channel} -> recommended {target or 'none'}")
             for entry in status.get("skipped") or []:
                 typer.echo(f"  skipped         {entry['tag']}: {entry['reason']}")
-            if status["update_available"]:
-                typer.echo("  run 'studioforge engine --update' to move to it")
+            if recommended:
+                typer.echo(f"  run 'studioforge engine --update' to move to {target}")
             else:
-                typer.echo("  you are on the newest release")
+                typer.echo(f"  you are on the newest {channel} release")
 
         asyncio.run(_check())
     typer.echo("")

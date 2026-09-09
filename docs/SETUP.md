@@ -175,6 +175,18 @@ see what it had to work with.
 verified by reading the asset list, not by taking whatever tag sorts first — and never calls a
 downgrade an update.
 
+**Two channels (D62).** Upstream publishes two kinds of release: a `bNNNN` build for nearly every
+merge, and every few weeks a `vX.Y.Z` version release whose only asset is `nightly-tag.txt`, a
+one-line pointer to the build it blesses (`v0.4.0` → `b10809`, `v0.3.0` → `b10621`).
+`engine.update_channel` decides which one **Check for update**, the Install button and
+`engine --update` act on: `stable` (the default) recommends the blessed build, `latest` the newest
+`bNNNN` with an asset this box can install. Both are always reported — the panel,
+`engine --check` and `GET /api/engine` name the stable build beside the newest one — and the
+recommendation is never a downgrade. When the pointer cannot be read (offline, rate-limited, or
+upstream has published no version release yet) the stable channel says why and recommends
+nothing, rather than quietly turning into `latest`. The setting lives on this card and in
+`config.yaml`; `/api/capabilities?check_update=true` carries the whole verdict.
+
 **What the release list is filtered by, and what an empty answer means.** Only `bNNNN` build tags
 are offered: a draft release has no downloadable assets, and a version tag (`vX.Y.Z`) is not an
 engine build under any option. GitHub's **prerelease flag is not a filter** — upstream marks

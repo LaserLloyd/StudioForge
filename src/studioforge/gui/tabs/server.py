@@ -1035,12 +1035,14 @@ def paint_engine_update(
     with row:
         ui.label(st.engine_update_line(update)).classes("text-sm")
         if st.engine_update_available(update):
-            latest = str((update or {}).get("latest") or "")
+            # D62: the channel's recommendation, which is ``latest`` only on the
+            # latest channel or on a payload from before channels existed.
+            target = st.engine_install_target(update)
             admin_control(
                 ui.button(
-                    f"Install {latest}",
+                    f"Install {target}",
                     icon="download",
-                    on_click=lambda tag=latest: install_engine(ctx, tag, refresh),
+                    on_click=lambda tag=target: install_engine(ctx, tag, refresh),
                 ).props("outline dense color=primary"),
                 may_change=may_change,
                 what="engine install",

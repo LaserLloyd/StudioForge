@@ -2223,7 +2223,9 @@ async def test_engine_status_reports_drift_only_when_the_pin_and_the_active_buil
     from studioforge.api import mgmt_routes
 
     tmp_config.engine.pinned_tag = TAG
-    mgr = EngineManager(tmp_config, probe=StubProbe(MIXED_GPUS, (13, 3)))
+    # A mock client: the route reads the stable channel (D62) and must not
+    # reach GitHub from a test.
+    mgr = EngineManager(tmp_config, probe=StubProbe(MIXED_GPUS, (13, 3)), client=_github([]))
     _fake_engine(mgr.engines_dir, TAG, 1_000)
     _fake_engine(mgr.engines_dir, "b10549", 2_000)
     _stub_capture(mgr, monkeypatch)
@@ -2251,6 +2253,7 @@ async def test_engine_status_carries_the_install_progress_snapshot(
     """
     from studioforge.api import mgmt_routes
 
+    manager._client = _github([])  # noqa: SLF001 - D62: keep the route off GitHub
     request = _FakeRequest(_engine_state(manager.config, manager))
     assert (await mgmt_routes.engine_status(request))["install_progress"] is None
 

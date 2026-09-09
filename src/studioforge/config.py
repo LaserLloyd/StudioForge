@@ -43,6 +43,7 @@ KvCacheType = Literal["auto", "f32", "f16", "bf16", "q8_0", "q5_1", "q5_0", "q4_
 #: buffers") -- see docs/LIMITATIONS.md.
 SplitMode = Literal["none", "layer", "row", "tensor", "auto"]
 FlashAttn = Literal["on", "off", "auto"]
+EngineUpdateChannel = Literal["stable", "latest"]
 
 #: Ceiling for the automatic host-RAM prompt cache, in MiB. 32 GiB on a 128 GiB
 #: box: big enough to hold many agent prefixes, small enough that the cache can
@@ -349,6 +350,18 @@ class EngineConfig(BaseModel):
     keep_versions: PositiveInt = 3
     allow_source_build: bool = True
     repo: str = "ggml-org/llama.cpp"
+    #: Which upstream release the update check recommends (D62). Upstream
+    #: publishes two kinds of release: a ``bNNNN`` build for nearly every merge
+    #: (every one flagged prerelease, D49-1) and, every few weeks, a ``vX.Y.Z``
+    #: version release whose only asset is ``nightly-tag.txt`` -- a one-line
+    #: pointer to the build it blesses (``v0.4.0`` -> ``b10809``, ``v0.3.0`` ->
+    #: ``b10621``, read 2026-09-09). ``stable`` recommends that build; ``latest``
+    #: recommends the newest build with an asset this box can install, which
+    #: is what the check always did before. Both are always reported; the
+    #: channel only decides which one the Install button and ``engine --update``
+    #: act on. Stable by default because a build upstream blessed is the one an
+    #: unattended box should move to on its own.
+    update_channel: EngineUpdateChannel = "stable"
     smoke_test_timeout_s: PositiveFloat = 180.0
 
     #: ``--cache-ram``: host-RAM prompt cache, in MiB. Costs no VRAM (measured:

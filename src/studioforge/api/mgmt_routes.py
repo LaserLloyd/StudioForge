@@ -1396,21 +1396,39 @@ async def engine_status(request: Request) -> dict[str, Any]:
     ``POST /api/engine/install`` (tag, phase, fraction, done/error) or ``null``
     when no install has run in this process; a ~600 MB download is otherwise a
     blind wait for the caller.
+
+    ``update_channel`` and ``stable`` (D62) put upstream's stable channel beside
+    the inventory: ``stable`` is ``{version, tag, published_at}`` from the
+    manager's cached :meth:`~studioforge.core.engine.EngineManager.stable_release`
+    (``null`` with ``stable_error`` saying why when it cannot be read) and
+    ``stable_installed`` says whether that build is already under
+    ``engines/``. The full recommendation -- which needs the newest build's
+    asset probed as well -- is ``/api/capabilities?check_update=true``.
     """
     state = _state(request)
-    active = state.engine_manager.active()
+    manager = state.engine_manager
+    active = manager.active()
     pinned = state.config.engine.pinned_tag
     active_tag = active.tag if active else None
     drift = {"pinned": pinned, "active": active_tag} if active_tag != pinned else None
+    # Cached on the manager, so a timer polling this costs GitHub nothing between
+    # refreshes; a manager without the method (a stub) reports null, not a 500.
+    read_stable = getattr(manager, "stable_release", None)
+    stable = await read_stable() if read_stable is not None else None
+    stable_tag = str(stable.get("tag") or "") if isinstance(stable, dict) else ""
     return {
         "pinned_tag": pinned,
         "active": active.model_dump(mode="json") if active else None,
-        "installed": [e.model_dump(mode="json") for e in state.engine_manager.installed()],
+        "installed": [e.model_dump(mode="json") for e in manager.installed()],
         "drift": drift,
         # getattr, not attribute access: an engine manager that has never run an
         # install in this process reports nothing rather than making the status
         # card -- polled by the Dashboard on a timer -- fail.
-        "install_progress": getattr(state.engine_manager, "install_progress", None),
+        "install_progress": getattr(manager, "install_progress", None),
+        "update_channel": state.config.engine.update_channel,
+        "stable": stable,
+        "stable_error": getattr(manager, "last_stable_error", None),
+        "stable_installed": bool(stable_tag) and manager.get(stable_tag) is not None,
     }
 
 

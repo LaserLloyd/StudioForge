@@ -41,6 +41,11 @@
 #                           --update` moves this on only after a smoke test.
 #   engine.cuda_variant     "auto" picks the CUDA build matching your driver;
 #                           pin it ("13.3", "12.4") if the guess is wrong.
+#   engine.update_channel   "stable" (default) recommends the build named by
+#                           upstream's newest vX.Y.Z release (its
+#                           nightly-tag.txt, e.g. v0.4.0 -> b10809);
+#                           "latest" the newest bNNNN build this box can
+#                           install. Both are always shown.
 #   planner.excluded_devices  CUDA indices the planner may never touch, for a
 #                           box that also runs ComfyUI or a training job.
 #   planner.reserved_mb     {index: MiB} held back on a card -- the softer
@@ -109,6 +114,11 @@ engine:
   keep_versions: 3
   allow_source_build: true
   repo: ggml-org/llama.cpp
+  # Which release "Check for update" and `engine --update` act on (D62).
+  # "stable": the bNNNN build named by upstream's newest vX.Y.Z version
+  # release (its nightly-tag.txt asset); "latest": the newest bNNNN build
+  # with an asset this box can install. The other channel is still reported.
+  update_channel: stable
   smoke_test_timeout_s: 180.0
   # Host-RAM prompt cache (`--cache-ram`): evicted prompt prefixes are kept in
   # system memory instead of recomputed. Costs no VRAM, changes no output, so

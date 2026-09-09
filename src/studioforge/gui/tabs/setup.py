@@ -88,6 +88,7 @@ COVERED_KEYS: tuple[str, ...] = (
     "planner.excluded_devices",
     "engine.pinned_tag",
     "engine.cuda_variant",
+    "engine.update_channel",
     "engine.allow_source_build",
     "engine.keep_versions",
     "server.host",
@@ -943,6 +944,7 @@ def _engine_body(ctx: GuiContext, refresh: Any) -> None:
             ctx.config.engine.cuda_variant,
         )
     ).classes("text-xs opacity-70")
+    fields.row("engine.update_channel", label="Update channel")
     fields.row("engine.allow_source_build", label="Build from source when no asset fits")
     fields.row("engine.keep_versions", label="Old engine versions to keep")
     _save_button(ctx, fields, refresh)
