@@ -3,7 +3,7 @@
 This is the durable state that must survive both app restarts and app
 self-updates: per-model saved settings, virtual models, LoRA adapters,
 download state, a GGUF-metadata scan cache, planner calibration
-observations, and a small key/value table.
+observations, the standing GPU leases (D61), and a small key/value table.
 
 Design notes:
 
@@ -39,7 +39,7 @@ log = get_logger(__name__)
 
 #: Highest migration version this build of the code ships. ``migrate()``
 #: brings any older database up to this.
-SCHEMA_VERSION: int = 7
+SCHEMA_VERSION: int = 8
 
 #: SQLite's own words for "this file is not a usable database". Only a message
 #: carrying one of these is treated as corruption by ``migrate_with_recovery``;
@@ -1055,6 +1055,76 @@ class Database:
     def latest_benchmark(self, model_id: str) -> dict[str, Any] | None:
         rows = self.list_benchmarks(model_id, limit=1)
         return rows[0] if rows else None
+
+    # ------------------------------------------------------------------
+    # GPU leases (migration 008, D61)
+    # ------------------------------------------------------------------
+
+    def save_lease(self, row: dict[str, Any]) -> None:
+        """Upsert one standing GPU lease, keyed on its id.
+
+        ``devices`` and ``model_ids`` arrive as lists and are stored as JSON
+        text (the module's blob-column rule); ``created_at`` survives a
+        re-write the way an adapter's ``added_at`` does, so a touch cannot
+        move a lease's birth. ``vacate_token`` and ``holder_peer`` are written
+        on purpose -- see ``migrations/008_gpu_leases.sql`` -- and, like every
+        row in this module, never logged.
+        """
+        now = time.time()
+        idle_ttl = row.get("idle_ttl_s")
+        values: dict[str, Any] = {
+            "id": str(row["id"]),
+            "devices_json": json.dumps([int(d) for d in row["devices"]]),
+            "holder": str(row["holder"]),
+            "model_ids_json": json.dumps([str(m) for m in row.get("model_ids") or []]),
+            "reason": str(row.get("reason") or ""),
+            "created_at": float(row.get("created_at") or now),
+            "last_activity_at": float(row.get("last_activity_at") or now),
+            "idle_ttl_s": None if idle_ttl is None else float(idle_ttl),
+            "priority": int(row.get("priority") or 3),
+            "vacate_url": row.get("vacate_url"),
+            "vacate_token": row.get("vacate_token"),
+            "holder_peer": row.get("holder_peer"),
+            "updated_at": float(row.get("updated_at") or now),
+        }
+        columns = list(values)
+        updates = ", ".join(
+            f"{col} = excluded.{col}" for col in columns if col not in ("id", "created_at")
+        )
+        self._write(
+            f"INSERT INTO gpu_leases ({', '.join(columns)}) "
+            f"VALUES ({', '.join('?' * len(columns))}) "
+            f"ON CONFLICT (id) DO UPDATE SET {updates}",
+            [values[col] for col in columns],
+        )
+
+    def delete_lease(self, lease_id: str) -> None:
+        self._write("DELETE FROM gpu_leases WHERE id = ?", (lease_id,))
+
+    def list_leases(self) -> list[dict[str, Any]]:
+        """Every stored lease, oldest first; the JSON columns come back as lists.
+
+        A row whose JSON will not parse is skipped, with its id in the log:
+        one hand-edited or torn row must not cost the restore every other
+        lease on the box.
+        """
+        rows = self.connect().execute("SELECT * FROM gpu_leases ORDER BY created_at, id").fetchall()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            record = _row_to_dict(row)
+            try:
+                record["devices"] = json.loads(record.pop("devices_json"))
+                record["model_ids"] = json.loads(record.pop("model_ids_json"))
+            except (TypeError, ValueError):
+                log.warning("db.lease_row_unreadable", lease_id=record.get("id"))
+                continue
+            out.append(record)
+        return out
+
+    def clear_leases(self) -> int:
+        """Drop every stored lease; returns how many there were."""
+        cursor = self._write("DELETE FROM gpu_leases")
+        return cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
 
     # ------------------------------------------------------------------
     # Key/value

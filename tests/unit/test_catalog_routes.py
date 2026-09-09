@@ -314,7 +314,9 @@ def test_status_and_leases_describe_a_lease_the_same_way(app: Any) -> None:
     assert len(from_status) == 1 and len(from_leases) == 1
     assert from_status[0].keys() == from_leases[0].keys()
     assert from_status[0]["id"] == lease.id
-    assert from_status[0]["idle_s"] == 0
+    # Wall clock: the lease is taken before TestClient boots the lifespan, and
+    # ``idle_s`` rounds, so a boot that takes 500 ms under load reads as 1.
+    assert from_status[0]["idle_s"] <= 1
     assert from_status[0]["expires_at"] is not None
     assert from_status[0]["state"] == "active"
     assert from_status[0]["holder_family"] == "crucibleforge"
@@ -415,12 +417,14 @@ def test_status_and_models_rows_carry_effective_for_loaded_models_and_null_other
         row = status["loaded"][0]
         assert row["effective"]["cache_reuse"] == 256
         assert row["effective"]["sources"] == {"cache_reuse": "argv"}
+        assert row["effective"]["gpu_only"] is True, "a field of the dump, not only compact() (D61)"
         assert row["launch_args"][0] == "llama-server.exe"
 
         model_row = next(m for m in models["models"] if m["id"] == MODEL_ID)
         assert model_row["settings"]["cache_reuse"] is None, "the saved setting: inherit"
         assert model_row["effective"]["cache_reuse"] == 256, "what the child runs with"
         assert model_row["effective"]["summary"].startswith("prefix cache on")
+        assert model_row["effective"]["gpu_only"] is True
 
         loaded(app, InstanceInfo(model_id="other/model", state="ready"))
         cold = http.get("/api/models").json()

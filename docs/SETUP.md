@@ -369,7 +369,11 @@ from the load. The shipped policy is `{1: 900, 2: 900, 3: 600}` with `default_tt
 model and an agent's model idle out after fifteen minutes without a request, background work — and
 every load that named no tier at all, which is a background load (D46) — after ten. Set a tier to
 `0` to never idle-unload it, as `0` means everywhere else; clear the map (`{}`) to give every tier
-`default_ttl_s`. The Setup tab edits the three rows directly.
+`default_ttl_s`. The Setup tab edits the three rows directly. A request-level `ttl` (the LM Studio
+field on `/v1/chat/completions` and `/v1/completions`) may shorten a model's idle timer below its
+tier's price but never lengthen it past it (D61) — a background turn asking `ttl: 3600` at tier 3
+gets the tier's 600 s — except where the tier is unpriced (an empty map, or a tier the map omits),
+the model has its own `settings.ttl_s`, or it is pinned.
 
 The equivalent commands:
 
