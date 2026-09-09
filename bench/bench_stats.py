@@ -88,6 +88,7 @@ def summarize_runs(runs: Sequence[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         entry["prompt_n_median"] = median([r["prompt_n"] for r in kept if r.get("prompt_n")])
         entry["cache_hit_suspected_runs"] = sum(1 for r in kept if r.get("cache_hit_suspected"))
         entry["timings_missing_runs"] = sum(1 for r in kept if r.get("timings_missing"))
+        entry["foreign_holder_runs"] = sum(1 for r in kept if r.get("foreign_holders_seen"))
         summary[key] = entry
     return summary
 

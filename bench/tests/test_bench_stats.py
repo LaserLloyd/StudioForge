@@ -156,3 +156,13 @@ def test_result_filename_and_plan_tuple() -> None:
     plan = {"ctx_size": 262144, "parallel": 1, "devices": [1, 0], "kv_cache_type": "f16", "kv_cache_type_v": "f16"}
     assert bs.plan_tuple(plan) == (262144, 1, (0, 1), "f16", "f16")
     assert bs.plan_tuple(None) is None
+
+
+def test_summarize_runs_counts_foreign_holder_runs() -> None:
+    base = {"prefill_tps": 1.0, "decode_tps": 1.0, "ttft_s": 1.0, "wall_s": 1.0}
+    runs = [
+        {"prompt_length": 1024, "run": 0, "warmup": True, **base, "foreign_holders_seen": [{"pid": 7}]},
+        {"prompt_length": 1024, "run": 1, **base, "foreign_holders_seen": [{"pid": 7}]},
+        {"prompt_length": 1024, "run": 2, **base, "foreign_holders_seen": []},
+    ]
+    assert bs.summarize_runs(runs)["1024"]["foreign_holder_runs"] == 1, "warm-up rows never count"
