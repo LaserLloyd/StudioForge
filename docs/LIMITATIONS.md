@@ -28,6 +28,26 @@ observations. It is applied in memory only — `config.yaml` is never rewritten,
 is undone by a restart. It is *not* re-tuned per load: a planner whose arithmetic shifts under a
 running server is harder to reason about than one that is wrong in a fixed way.
 
+What is measured is the **formula's** error (D63). A repeat load of a configuration is planned from
+its last measurement plus a 10% safety band (D51), so the child lands about 9% under that plan by
+construction; the observation reports that as the plan's *margin* and the formula-vs-actual miss as
+its *error*, and only an uncorrected plan can earn the ">5% prediction error" warning (a corrected
+plan is warned only when the child holds *more* than even the corrected total). Each row in
+`load_observations` stores the formula's `predicted_bytes` / `weights_bytes` and a `formula` block
+inside `per_gpu_planned` (total, weights, the overhead fraction it was computed with, and
+`planned_bytes` for what was actually reserved); a row without the block predates D63 and may hold
+a corrected total, which is why it is read only in the direction that cannot be the band.
+
+The calibrator moves in both directions, worst case first. **Up** as before: three rows the formula
+fell short on, raised to cover the worst of them, rounded up to 0.5%. **Down** only on rows that
+carry the formula: at least 5 of them, none short, no pre-D63 row short either, and then to the
+tightest row's need plus 2% of weights, rounded up to 0.5%, clamped, and at most 0.03 below the
+configured value per boot. Calibration never persists, so `config.yaml` is the anchor: a process
+runs at most 0.03 below the file, and the durable move is the operator's. One global fraction
+cannot be two signs at once -- a model the formula under-estimates even at the ceiling (a 27B at
+262k/q8_0 on the reference rig, by 7% of its weights) keeps it there while that model is in the
+window; D51 corrects such a model per configuration.
+
 The `headroom_fraction` guard (default 10% of total VRAM) exists to absorb the remaining error.
 
 ### Calibration history before 2026-08-17 is contaminated

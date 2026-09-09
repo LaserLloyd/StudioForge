@@ -5204,3 +5204,119 @@ resident to re-tier.
 `test_rebalance_previews_inside_the_loads_allowed_devices_bound` in `test_gateway_lifecycle.py`,
 plus the hardening lane's `test_gpu_only_policy.py` / `test_unload_reporting.py` and the updated
 supervisor, engine, watchdog, tray and benchmark suites.
+
+## D63 -- The planner's error is the formula's error, and the overhead fraction can come down
+
+
+
+**Status.** Landed on 2026-09-10 (lane S4, two commits on `lane/s4`): the planner and its tests in
+the first, this entry and `docs/LIMITATIONS.md` in the second; `tests/unit` green (3464 passed),
+ruff and mypy clean. The live server was running the pre-D63 code at commit time; the restart is
+the deploy step. Nothing in the registry is rewritten: every row written before the restart is a
+"legacy" row to the new calibrator, and the first row that carries the formula is the first load
+after it.
+
+**Context.** Two feedback loops read `load_observations`, and D51 quietly made them read the same
+column two ways. D51 plans a repeat load of a configuration from its last measurement times
+`OBS_SAFETY` (1.10), so the child lands about 9% under that plan on every repeat -- by
+construction. `Planner.observe` scored `actual_bytes` against `plan.estimate.total_bytes`, which
+for such a plan IS the corrected total, so D60's ">5% prediction error" WARNING fired on every
+repeat load at -9.1%: when the defect was found on 2026-09-10 the twelve newest `per_pid_v2` rows
+in the live registry all had actual/predicted = 0.909 to four digits (Dark-Scarlett-27B 54,597 ->
+49,634 MB; Hy-MT2-30B 20,473 -> 18,612; Qwen2.5-VL-7B 5,788 -> 5,262), and at commit time 169 of
+the 200 rows in the calibration window sit at exactly 1/1.10. The stored `predicted_bytes` was that
+corrected total, so history could not separate the formula's error from the band either: a row 9%
+under is the band working, a row 9% under is the formula over-estimating, and nothing in the row
+said which. The two first-ever loads in the window were the only rows that showed the formula's
+real error (SmolVLM-256M 0.839, Qwen3-VL-Embedding-2B 0.897).
+
+The other loop was one-directional. `suggest_overhead_fraction` counted positive shortfalls only
+and returned `current` otherwise, and `calibrated_overhead_fraction` returned `None` when the
+suggestion was what was configured -- so `compute_overhead_fraction`, shipped at 0.06 and pegged to
+its 0.15 ceiling by the pre-D40 double-counted rows, could never come down at boot. D18 promised a
+factor that self-tunes; what shipped was a ratchet.
+
+**Decision.** The planner's error is formula-vs-actual, every observation says which estimate it
+was measured against, and the calibrator can lower the fraction on the rows that can say so.
+
+1. **`observe` knows the formula.** `_safe_estimate` remembers every correction it spends
+   (`AppliedCorrection`: the `ObservedCorrection`, the formula estimate, and the corrected estimate
+   it produced), keyed by the configuration it was spent on, bounded at 4,096 entries, newest kept.
+   `observe` looks the plan's configuration up and then verifies the remembered corrected estimate
+   term by term against the plan's own, so a plan whose numbers came from anywhere else -- one
+   adopted from the registry after a restart, one planned under another row -- can never borrow a
+   formula that is not its own; only the slot count may differ, because the auto-parallel sizer
+   can hand back an estimate corrected at the requested count under the count it chose. A plan
+   that carries D51's note but no remembered correction is observed as *corrected, formula
+   unknown*, never as uncorrected.
+2. **Two numbers, and the warning is the formula's.** `error_pct` is formula-vs-actual and is what
+   the bar applies to; `margin_pct` is actual-vs-planned and exists only for a corrected plan. An
+   uncorrected plan more than `PREDICTION_ERROR_WARN_PCT` off is the D60 warning, unchanged. A
+   corrected plan is never warned for a margin inside the band; it is warned only when the child
+   holds MORE than even the corrected total by the bar ("measured footprint exceeds the corrected
+   estimate"), because that is the direction the band exists to cover. The `load observation` INFO
+   line and `last_observation()` (hence `introspect` / `model_info` `vram_prediction`) carry
+   `predicted_bytes` (the formula's, or `null` when unknown), `planned_bytes`, both percentages,
+   `corrected: true/false`, `correction_factor` and the `overhead_fraction` in force.
+3. **The row says which estimate it holds, and D51 still finds it.** `note` is the caller's
+   provenance marker, untouched: `db.matching_observation` keys on the literal `per_pid_v2`, so a
+   new marker there would have hidden every new row from D51 until `db.py` learned it. Instead
+   `predicted_bytes` / `weights_bytes` are the FORMULA's own again (what the columns meant under
+   D18), and the `per_gpu_planned` JSON -- made JSON by D40 precisely so a row could grow without a
+   migration -- gains a `formula` block beside the per-card shares: `total_bytes`, `weights_bytes`,
+   `compute_bytes`, `planned_bytes` (what the plan reserved), `overhead_fraction` (the fraction the
+   formula was computed with), `corrected`, `factor`. `formula_terms(row)` reads it; a row without
+   it is a legacy row whose `predicted_bytes` may be a corrected total, and it cannot say. When the
+   formula is unknown the row is written exactly as a legacy one. No schema change; `manager.py`
+   and `db.py` untouched.
+4. **A need per row, absolute.** Each formula row is read for the fraction that would have made
+   the formula meet the measurement: `overhead_fraction + (actual - total) / weights`. It is
+   independent of whatever the fraction has since become, so the same rows answer the same on every
+   boot. A legacy row is read only when it was short -- `current + shortfall / weights`, D18's rule
+   -- because a legacy row that came in under its total may be showing the band.
+5. **Up as before; down with a margin, in steps.** Up: three rows short (legacy or formula), raised
+   to the worst of them, rounded up to 0.5%, clamped -- unchanged, and unstepped, because that is
+   the direction that prevents an OOM. Down: at least `CALIBRATION_MIN_ROWS` (5) formula rows, no
+   legacy shortfall in the window, and the tightest formula row's need plus
+   `CALIBRATION_LOWER_MARGIN` (2% of weights, about the run-to-run wobble of one placement) still
+   below `current` -- then that sum, rounded UP to 0.5%, clamped to `[0.03, 0.15]`, and at most
+   `CALIBRATION_MAX_STEP_DOWN` (0.03) below `current` per calibration. Calibration never persists
+   (D18) and `config.yaml` is the anchor, so a process runs at most 0.03 below the file; the durable
+   move is the operator's. `calibrate()` logs previous, tuned, direction, rows and formula rows.
+
+**Consequences.** On the reference rig the next boot changes nothing: the 200-row window holds no
+formula row yet, and ten legacy rows whose child held more than the plan (a Darker-Scarlett
+three-card placement at 1.23, a 1.5B at 1.11) keep the raise branch at the ceiling, which is what
+is configured. Those rows leave the window after ~190 more loads (about four days at the current
+47 a day). After that the fraction comes down only when the tightest formula row in the window is
+over-estimating by more than the margin -- and on this rig it will not be: the one uncorrected
+Dark-Scarlett-27B load in the window (262k, q8_0 KV, the two 5090s; 35,742 MB predicted, 37,260
+held) shows the formula UNDER-estimating by 4.25% of the total, 1,518 MB, 7.0% of its weights, so
+its need is 0.22, above the ceiling, and every corrected repeat of it will now record the same
+formula miss. One global fraction cannot be two signs at once (D51's own point): the fraction stays
+at 0.15 while a 27B like that is in the window, D51 keeps correcting it per configuration, and the
+honest reading of the two over-estimated first loads (SmolVLM-256M at -16% on 99 MB of weights;
+Qwen3-VL-Embedding-2B at -8 to -10%, 2.9-3.9 GB, on 2 GB of weights at 262k) is that they miss on
+terms the fraction does not scale -- the floor and the KV/mmproj side -- so no fraction expresses
+them. The calibrator now reports the formula's miss honestly rather than absorbing it; the missing
+term is a bug in the formula, as D60 said.
+
+What changes immediately is the log: no more -9.1% warnings on repeat loads, one INFO line per load
+with both errors, and a corrected plan that overruns is finally a warning of its own. Rows written
+before the restart stay legacy rows for as long as they are in the window; nothing is migrated,
+nothing is re-read.
+
+**Left honest.** A correction spent by one process and observed by another (a plan adopted after a
+restart) is stored as a legacy row: the formula could travel on `LoadPlan`, but that widens an API
+model for a case D51 already handles on the next load. The need of a row whose compute term sat on
+`compute_overhead_floor_mb` is not linear in the fraction; the worst-case rule means such rows only
+ever lower by the step cap and never past what a larger load in the window still needed.
+`tests/unit/test_model_alias_loaded.py` fails `ruff format --check` at the base commit; it is not
+this lane's file and was left alone.
+
+**Tests.** `tests/unit/test_planner_calibration.py` (new: reading the block, both directions, the
+step, the clamp, the margin, the boundary rounding, the absolute need, the logged move, and the
+reference rig's window), the D63 cases in `tests/unit/test_planner_prediction_error.py` (the band is
+not a warning, an overrun of the corrected total is, 7% off an uncorrected plan is, the stored row's
+formula and note, the unaccounted correction, the altered plan, auto-parallel, the bounded map) and
+the real-database round trip in `tests/unit/test_planner_observed.py`.
