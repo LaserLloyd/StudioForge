@@ -304,8 +304,10 @@ class _StoppableSupervisor(FakeSupervisor):
     async def stop(self, model_id: str, **_kwargs: Any) -> None:
         self._instances = [i for i in self._instances if i.model_id != model_id]
 
-    async def stop_all(self, **_kwargs: Any) -> None:
+    async def stop_all(self, **_kwargs: Any) -> dict[str, BaseException | None]:
+        outcome: dict[str, BaseException | None] = {i.model_id: None for i in self._instances}
         self._instances = []
+        return outcome
 
     def log_path(self, model_id: str) -> Path | None:
         return self.log_dir / "models" / f"{model_id.replace('/', '__')}.log"

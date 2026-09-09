@@ -311,7 +311,7 @@ async def test_a_better_class_sends_one_vacate_and_gets_lease_vacating() -> None
     await _settle()
     assert len(recorder.calls) == 1
     lease, body, timeout_s = recorder.calls[0]
-    assert lease is tenant and timeout_s == 10.0
+    assert lease is tenant and timeout_s == manager.config.leases.vacate_callback_timeout_s == 30.0
     assert body == {
         "lease_id": tenant.id,
         "devices": [2],

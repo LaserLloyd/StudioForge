@@ -1071,17 +1071,45 @@ class Watchdog:
         report, is what catches the case that matters: the app says a model is
         loaded and ready while the child has actually stopped answering. Only
         the child's own port can tell you that.
+
+        A child that does not answer but started less than
+        ``gateway.load_timeout_s`` ago is ``state: "loading"`` (``healthy``
+        null), not unhealthy. A llama-server answers nothing, or 503, for the
+        whole multi-minute cold load of a large model -- the supervisor's own
+        load loop is written around that -- and reporting the box ``degraded``
+        for those minutes, with a summary whose documented remedy is
+        ``restart_server(confirm=true)``, was a false alarm that invited a real
+        outage (audit 2026-09-09, F7). Past the load window the old verdict
+        stands: a process holding VRAM that is not serving.
         """
         timeout = config.watchdog.health_timeout_s
+        load_window = float(config.gateway.load_timeout_s)
+        now = time.time()
         results: list[dict[str, Any]] = []
         for child in find_llama_children(config):
             entry = child.as_dict()
             if child.port is None:
-                entry.update(healthy=None, error="no --port in command line")
+                entry.update(
+                    healthy=None, state="unattributable", error="no --port in command line"
+                )
                 results.append(entry)
                 continue
             ok, error, _ = await self._probe(f"http://127.0.0.1:{child.port}/health", timeout)
-            entry.update(healthy=ok, error=error)
+            if ok:
+                entry.update(healthy=True, state="healthy", error=None)
+            elif child.create_time is not None and (now - child.create_time) < load_window:
+                entry.update(
+                    healthy=None,
+                    state="loading",
+                    error=error,
+                    load_window_s=load_window,
+                    detail=(
+                        "not answering yet, but within the load window; a large model "
+                        "takes minutes to come up. Unhealthy only past gateway.load_timeout_s."
+                    ),
+                )
+            else:
+                entry.update(healthy=False, state="unhealthy", error=error)
             results.append(entry)
         return results
 
@@ -1093,6 +1121,8 @@ class Watchdog:
 
         main_status = str(main["status"])
         unhealthy = [c for c in children if c.get("healthy") is False]
+        # Still inside gateway.load_timeout_s: not a failure, not an alarm.
+        loading = [c for c in children if c.get("state") == "loading"]
         if main_status == "down":
             status: HealthStatus = "down"
         elif main_status == "wedged":
@@ -1103,7 +1133,12 @@ class Watchdog:
             status = "up"
 
         summary = {
-            "up": "Main server and all inference children are healthy.",
+            "up": (
+                f"Main server is healthy; {len(loading)} of {len(children)} llama-server "
+                "children are still loading."
+                if loading
+                else "Main server and all inference children are healthy."
+            ),
             "degraded": (
                 "Partial failure: "
                 + (
@@ -1128,6 +1163,7 @@ class Watchdog:
             "children": children,
             "children_total": len(children),
             "children_unhealthy": len(unhealthy),
+            "children_loading": len(loading),
             "config_path": str(self.config_path),
             "watchdog_uptime_s": round(time.time() - self.started_at, 1),
             "wedged_after_failures": config.watchdog.wedged_after_failures,
@@ -2572,6 +2608,7 @@ _PUBLIC_HEALTH_KEYS: tuple[str, ...] = (
     "summary",
     "children_total",
     "children_unhealthy",
+    "children_loading",
     "watchdog_uptime_s",
     "restart_in_progress",
 )

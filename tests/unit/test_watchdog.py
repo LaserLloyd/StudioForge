@@ -513,8 +513,13 @@ async def test_health_finds_children_and_reports_degraded(harness: Harness) -> N
     """A child that does not answer its own /health is a partial failure.
 
     The fake child never binds its port, which is precisely the state the
-    watchdog must catch: a process holding VRAM that is not serving.
+    watchdog must catch: a process holding VRAM that is not serving. "Not
+    serving" is judged past the load window (``gateway.load_timeout_s``),
+    which is shrunk here so the fresh fake is already past it -- inside the
+    window the same child is ``loading`` (next test).
     """
+    harness.config.gateway.load_timeout_s = 0.001
+    harness.config.save(harness.config_path)
     harness.start_app()
     child_pid = harness.start_child("vendor/Model-Q4_K_M", CHILD_PORT_START + 1)
     server = build_mcp(harness.watchdog())
@@ -522,11 +527,40 @@ async def test_health_finds_children_and_reports_degraded(harness: Harness) -> N
     result = await call(server, "health")
     assert result["status"] == "degraded", result
     assert result["children_total"] == 1
+    assert result["children_unhealthy"] == 1 and result["children_loading"] == 0
     entry = result["children"][0]
     assert entry["pid"] == child_pid
     assert entry["alias"] == "vendor/Model-Q4_K_M"
     assert entry["port"] == CHILD_PORT_START + 1
     assert entry["healthy"] is False
+    assert entry["state"] == "unhealthy"
+
+
+async def test_a_child_inside_its_load_window_is_loading_not_a_partial_failure(
+    harness: Harness,
+) -> None:
+    """A llama-server answers nothing, or 503, for the whole multi-minute cold
+    load of a large model. Reporting the box ``degraded`` for those minutes --
+    with a summary whose documented remedy is ``restart_server(confirm=true)``
+    -- was a false alarm that invited a real outage (audit 2026-09-09, F7).
+    Within ``gateway.load_timeout_s`` of its start such a child is ``loading``,
+    ``healthy`` is null, and the overall verdict stays ``up``.
+    """
+    harness.start_app()
+    child_pid = harness.start_child("vendor/Model-Q4_K_M", CHILD_PORT_START + 1)
+    server = build_mcp(harness.watchdog())
+
+    result = await call(server, "health")
+    assert result["status"] == "up", result
+    assert result["children_total"] == 1
+    assert result["children_loading"] == 1 and result["children_unhealthy"] == 0
+    assert "still loading" in result["summary"]
+    entry = result["children"][0]
+    assert entry["pid"] == child_pid
+    assert entry["state"] == "loading"
+    assert entry["healthy"] is None
+    assert entry["error"], "the probe's own failure is still reported, as context"
+    assert entry["load_window_s"] == harness.config.gateway.load_timeout_s
 
 
 async def test_health_reports_down_when_nothing_is_running(harness: Harness) -> None:

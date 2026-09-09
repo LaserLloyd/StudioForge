@@ -52,7 +52,7 @@ import httpx
 from studioforge.core import parallel as parallel_mod
 from studioforge.core import placements as placements_mod
 from studioforge.core import throughput
-from studioforge.core.benchmark import benchmark_lease_priority
+from studioforge.core.benchmark import acquire_lease_awaiting_vacate, benchmark_lease_priority
 from studioforge.errors import BadRequestError, ModelBusyError, ModelLoadError
 from studioforge.logging import get_logger
 from studioforge.types import InstanceInfo, KvCacheType, LoadPlan, ModelRecord
@@ -526,8 +526,10 @@ class ParallelBenchmarker:
         # The run's cards are this benchmark's alone until it finishes (D43):
         # a slot sweep that a neighbour's load lands on mid-way measures the
         # neighbour. The lease also turns an intruder mid-request into a clear
-        # refusal here rather than a contaminated number later.
-        lease = await self.manager.acquire_lease(
+        # refusal here rather than a contaminated number later. A tenant that
+        # has been asked to vacate is waited for, not counted as a failure.
+        lease = await acquire_lease_awaiting_vacate(
+            self.manager,
             report.devices,
             holder="benchmark:parallel",
             model_ids=[record.id],

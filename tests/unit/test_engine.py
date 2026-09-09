@@ -1276,10 +1276,13 @@ async def test_the_sweep_names_the_model_and_the_flag_the_new_build_rejects(
 
     monkeypatch.setattr(manager, "_capture", fake_capture)
 
+    # ``--ctx-size`` used to be the "clean" flag here; since the 2026-09-09
+    # audit it is managed by the planner and refused in extra flags, so the
+    # clean row carries a flag an operator may genuinely set.
     offenders = await manager.revalidate_extra_flags(
         TAG,
         [
-            _record("vendor/Clean-Q4_K_M", "--ctx-size 8192"),
+            _record("vendor/Clean-Q4_K_M", "--spec-draft-n-max 4"),
             _record("vendor/Stale-Q4_K_M", "--draft-max 4"),
             _record("vendor/Unset-Q4_K_M", ""),
             _record("vendor/None-Q4_K_M", None),
@@ -1304,9 +1307,16 @@ async def test_the_sweep_is_silent_when_every_saved_flag_still_validates(
 
     monkeypatch.setattr(manager, "_capture", fake_capture)
 
+    # Neither ``--ctx-size`` nor ``--flash-attn`` is an operator's flag any
+    # more (both are planned; audit 2026-09-09), so the still-valid rows carry
+    # the two flags SAMPLE_HELP declares that an operator may set.
     assert (
         await manager.revalidate_extra_flags(
-            TAG, [_record("vendor/A", "--ctx-size 4096"), _record("vendor/B", "--flash-attn on")]
+            TAG,
+            [
+                _record("vendor/A", "--spec-draft-n-max 4"),
+                _record("vendor/B", "--spec-draft-type-k q8_0"),
+            ],
         )
         == []
     )
@@ -2298,7 +2308,8 @@ async def test_the_activate_route_switches_pins_sweeps_and_names_the_previous_bu
     _stub_capture(manager, monkeypatch)
     records = [
         _record("vendor/Stale-Q4_K_M", "--draft-max 4"),
-        _record("vendor/Fine-Q4_K_M", "--ctx-size 4096"),
+        # A flag an operator may still set: --ctx-size is managed (2026-09-09).
+        _record("vendor/Fine-Q4_K_M", "--spec-draft-n-max 4"),
     ]
     request = _FakeRequest(_engine_state(manager.config, manager, records))
 

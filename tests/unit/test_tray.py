@@ -407,6 +407,85 @@ def test_restart_engines_posts_to_the_backend_endpoint(app: TrayApp, client: Fak
     assert client.calls == [FakeCall("POST", "/api/restart/backend", None)]
 
 
+@dataclass
+class TimingClient(FakeClient):
+    """A FakeClient that also remembers each POST's timeout, and can be made
+    to block until released -- a server mid-way through a long reload."""
+
+    timeouts: list[float] = field(default_factory=list)
+    #: When set, every POST records itself, flags ``started`` and then waits
+    #: here -- a server mid-way through a long reload.
+    gate: Any = None
+    started: Any = None
+
+    def post(
+        self, path: str, payload: dict[str, Any] | None = None, *, timeout: float = 60.0
+    ) -> ApiResult:
+        self.timeouts.append(timeout)
+        result = super().post(path, payload, timeout=timeout)
+        if self.started is not None:
+            self.started.set()
+        if self.gate is not None:
+            self.gate.wait(5.0)
+        return result
+
+
+def test_the_long_actions_get_budgets_a_real_reload_fits_in(config: Config) -> None:
+    """``/api/restart/backend`` reloads every resident serially, minutes each;
+    unload-all waits out a verified teardown per model. The old 600 s / 180 s
+    budgets timed out in the tray while the server carried on correctly, and
+    the menu reported a failure that invited a second click (audit F10)."""
+    client = TimingClient()
+    app = TrayApp(config, client=client, create_icon=False)
+    app.restart_engines()
+    app.unload_all_models()
+    assert client.timeouts == [tray_app.RESTART_ENGINES_TIMEOUT, tray_app.UNLOAD_ALL_TIMEOUT]
+    assert tray_app.RESTART_ENGINES_TIMEOUT == 1800.0
+    assert tray_app.UNLOAD_ALL_TIMEOUT == 600.0
+
+
+@pytest.mark.parametrize(
+    ("handler", "path", "phrase"),
+    [
+        ("_on_restart_engines", "/api/restart/backend", "already in progress"),
+        ("_on_unload_all", "/api/models/unload-all", "already in progress"),
+    ],
+)
+def test_a_second_click_while_one_is_in_flight_is_a_notification_not_a_request(
+    config: Config, handler: str, path: str, phrase: str
+) -> None:
+    """Two clicks on Restart engines were two full rounds of unload-and-reload
+    (the D50 double-fire shape, from the tray). The second is told to wait;
+    once the first finishes, the action is available again."""
+    import threading
+
+    client = TimingClient(gate=threading.Event(), started=threading.Event())
+    app = TrayApp(config, client=client, create_icon=False)
+    app.state = STATE_RUNNING
+    notes: list[str] = []
+    app._notify = lambda message, title=tray_app.APP_NAME: notes.append(message)  # type: ignore[method-assign]
+
+    click = getattr(app, handler)
+    click()
+    assert client.started.wait(5.0), "the first click never reached the server"
+    click()  # while the first is still waiting on the server
+    assert [n for n in notes if phrase in n], notes
+    assert client.calls == [FakeCall("POST", path, None)], "exactly one request in flight"
+
+    client.gate.set()
+    _join_tray_threads()
+    # The worker's own status poll (GET /api/status) follows the POST; what
+    # must not appear is a second POST.
+    posts = [c for c in client.calls if c.method == "POST"]
+    assert posts == [FakeCall("POST", path, None)]
+
+    # The claim is released with the request, so the next click is a real one.
+    click()
+    _join_tray_threads()
+    posts = [c for c in client.calls if c.method == "POST"]
+    assert posts == [FakeCall("POST", path, None)] * 2
+
+
 def test_restart_server_always_confirms(app: TrayApp, client: FakeClient) -> None:
     """Without confirm the endpoint correctly refuses, which from a menu item
     is indistinguishable from a broken menu item."""

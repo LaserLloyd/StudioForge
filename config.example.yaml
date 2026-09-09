@@ -184,7 +184,7 @@ leases:
   # before the asker gets today's plain `409 lease_conflict` again.
   vacate_timeout_s: 180.0
   vacate_retry_after_s: 15.0
-  vacate_callback_timeout_s: 10.0
+  vacate_callback_timeout_s: 30.0
 benchmark:
   # The D46 class this server's own benchmark leases carry: 2 may ask a
   # background render tenant to vacate; 3 asks nobody (pre-D56 behaviour).

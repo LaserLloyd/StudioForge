@@ -27,7 +27,7 @@ import pytest
 from studioforge.core import parallel_bench
 from studioforge.core.benchmark import Benchmarker
 from studioforge.core.parallel_bench import ParallelBenchmarker, parse_metrics
-from studioforge.errors import BadRequestError, ModelBusyError
+from studioforge.errors import BadRequestError, LeaseConflictError, ModelBusyError
 from studioforge.types import GB, InstanceInfo, LoadPlan
 from tests.unit.test_catalog import NOW, dense_meta, record
 from tests.unit.test_planner import make_config, rig_5090x2_3090x2
@@ -580,3 +580,27 @@ async def test_the_active_engine_is_the_last_resort_for_the_tag(monkeypatch: Any
     monkeypatch.setattr(parallel_bench, "httpx", FakeHttpx(FakeEngine()))
     report = await runner.run(rec, streams=(1,), max_tokens=8)
     assert report.engine_tag == "b10441"
+
+
+async def test_the_sweep_waits_for_a_vacating_tenant_instead_of_failing(monkeypatch: Any) -> None:
+    """Same D56 promise as the placement benchmark (audit 2026-09-09, F5): a
+    ``409 lease_vacating`` is a holder on its way out, re-asked on the
+    server's interval, not a failed run."""
+    runner, manager, rec, _engine = make_runner(monkeypatch=monkeypatch)
+    attempts = {"n": 0}
+    real_acquire = manager.acquire_lease
+
+    async def vacating_twice(devices: Any, **kwargs: Any) -> Any:
+        attempts["n"] += 1
+        if attempts["n"] <= 2:
+            raise LeaseConflictError(
+                "asked to vacate", code="lease_vacating", details={"retry_after_s": 0.01}
+            )
+        return await real_acquire(devices, **kwargs)
+
+    manager.acquire_lease = vacating_twice  # type: ignore[method-assign]
+    report = await runner.run(rec, streams=(1, 2), max_tokens=8)
+
+    assert attempts["n"] == 3
+    assert [level.n_streams for level in report.levels] == [1, 2]
+    assert manager.released == ["lease-1"]

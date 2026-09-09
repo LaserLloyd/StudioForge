@@ -295,6 +295,65 @@ is off.
   already decided placement and context against live free VRAM; letting the engine re-plan around
   us is a silent partial-offload path, and the GPU-only policy exists to make an over-commit fail
   loudly instead (D11).
-* **`--n-gpu-layers` anything but 999**, and anything in the `--cpu-moe` / `--override-tensor`
-  family — same reason.
+* **`--n-gpu-layers` anything but 999**, and anything in the CPU-offload families below — same
+  reason. These are not merely never emitted: they are *refused* wherever an operator could put
+  them (next section).
+* **`--mlock` / `--no-mmap`** on an engine that advertises `--load-mode` — b10689 marks the pair
+  "DEPRECATED in favor of `--load-mode`". `settings.mlock` / `settings.no_mmap` are mapped onto
+  the one flag there (`mmap+mlock`, `none`, or `mlock` for both), the deprecated pair is passed
+  only to an engine that still advertises it, and an engine with neither logs `setting_inert`
+  and lists the setting under `effective.inert`.
 * **The `--draft*` family** — removed in b10425, accepted and ignored. `--spec-*` only.
+
+---
+
+## GPU-only policy
+
+StudioForge never runs any part of a model on the CPU (CONTRIBUTING.md, "Things that are
+deliberate"). The policy is one table, `POLICY_FAMILIES` in `core/engine.py`, every b10689
+spelling of every flag in two families:
+
+* **Managed** — the manager assigns these per launch and an operator value would break the
+  system or the policy: `--model`/`-m`, `--model-url`/`-mu`, `--port`, `--host`, `--alias`/`-a`,
+  `--n-gpu-layers`/`-ngl`/`--gpu-layers`, `--fit`/`-fit`, `--fit-target`/`-fitt`,
+  `--fit-ctx`/`-fitc`, `--device`/`-dev`, `--split-mode`/`-sm`, `--tensor-split`/`-ts`,
+  `--main-gpu`/`-mg`, `--ctx-size`/`-c`, `--parallel`/`-np`, `--load-mode`/`-lm`, `--mlock`,
+  `--mmap`/`--no-mmap`, `--direct-io`/`-dio`/`--no-direct-io`/`-ndio`,
+  `--kv-offload`/`-kvo`/`--no-kv-offload`/`-nkvo`, `--spec-draft-model`/`-md`/`--model-draft`,
+  `--spec-draft-ngl`/`-ngld`/`--gpu-layers-draft`/`--n-gpu-layers-draft`,
+  `--spec-draft-device`/`-devd`/`--device-draft`, `--mmproj-device`/`-mmdev`,
+  `--mmproj-offload`/`--no-mmproj-offload`, `--spec-type`, `--cache-type-k`/`-ctk`,
+  `--cache-type-v`/`-ctv`, `--flash-attn`/`-fa`.
+* **CPU-offload** — no legitimate value on a GPU-only server: `--override-tensor`/`-ot`,
+  `--override-tensor-draft`/`-otd`/`--spec-draft-override-tensor`, `--cpu-moe`/`-cmoe`,
+  `--n-cpu-moe`/`-ncmoe`, `--n-cpu-ffn`/`-ncffn`, `--spec-draft-cpu-moe`/`-cmoed`/`--cpu-moe-draft`,
+  `--spec-draft-n-cpu-moe`/`-ncmoed`/`--n-cpu-moe-draft`/`--spec-draft-ncmoe`,
+  `--op-offload`/`--no-op-offload`, `--no-host`, `--tensor-read-lazy`, `--rpc`.
+
+Thread-affinity flags (`--threads`/`-t`, `--cpu-mask`, `--cpu-range`, `--cpu-strict`, `--numa`)
+are not offload — they place the host threads llama-server always has — and stay allowed in
+`extra_flags`.
+
+The table is enforced at **two points**, from the same code:
+
+1. **Save time.** `PUT`/`PATCH /api/models/{id}/settings`, the GUI's Extra flags box and
+   `POST /api/engine/validate-flags` refuse any token in either family with a sentence naming the
+   family and what the flag would have done here ("`'-ncffn' (--n-cpu-ffn)` is refused: StudioForge
+   is GPU-only; `--n-cpu-ffn` would keep dense FFN weights on the CPU"). The check runs *before*
+   the engine-help existence check, because every offload flag exists in every engine's help.
+2. **Launch time.** `Supervisor.build_command` re-runs the same refusal over the saved
+   `extra_flags` and then checks the *final* argv with `launch_policy_violations` — so a row saved
+   under an older engine, written straight into SQLite, or saved while `help.txt` was stale is a
+   refused load (`ModelLoadError` naming the token), never a silently dropped flag and never a
+   child half on the CPU. `--n-gpu-layers 999 --fit off` are the last tokens of every argv, after
+   `extra_flags`, so llama.cpp's last-occurrence-wins rule can only ever land on them.
+
+The child's **environment** is sanitised on the same principle: b10689 reads an `LLAMA_ARG_*`
+variable for nearly every flag, so every `LLAMA_ARG_*`, `LLAMA_LOG_*`, `LLAMA_API_KEY` and
+`MTMD_BACKEND_DEVICE` is stripped before the spawn (the names stripped are logged at WARNING);
+`CUDA_*`, `GGML_*` and `PATH` pass through.
+
+What actually launched is reported per instance in `effective` (D54): `n_gpu_layers`, `fit`,
+`device`, `split_mode`, `load_mode`, `kv_offload`, `gpu_only` and `policy_violations`, and the
+`summary` line ends with `GPU-only` — or `POLICY VIOLATION: --device none, ...` on a launch that
+somehow got past both checks, which is a bug report.

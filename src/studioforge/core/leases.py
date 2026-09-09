@@ -61,7 +61,7 @@ DEFAULT_VACATE_TIMEOUT_S = 180.0
 #: The re-ask interval handed to a requester while the holder is vacating.
 DEFAULT_VACATE_RETRY_AFTER_S = 15.0
 #: Per-request HTTP timeout for the vacate POST.
-DEFAULT_VACATE_CALLBACK_TIMEOUT_S = 10.0
+DEFAULT_VACATE_CALLBACK_TIMEOUT_S = 30.0
 _VACATE_SCHEMES = ("http", "https")
 _VACATE_DEFAULT_PORTS = {"http": 80, "https": 443}
 #: Printable ASCII, no whitespace: anything else httpx/h11 refuse -- and quote

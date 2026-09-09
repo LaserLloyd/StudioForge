@@ -80,6 +80,15 @@ PORT_HOLDER_GRACE = 120.0
 #: ends in a report and not a spawn loop.
 PORT_CONFLICT_RETRY_DELAY = 5.0
 MAX_PORT_CONFLICT_RESPAWNS = 3
+#: HTTP budgets for the two menu actions that take as long as the models do
+#: (audit 2026-09-09, F10). ``POST /api/restart/backend`` unloads and reloads
+#: EVERY resident serially -- two or three large models at minutes each --
+#: and ``unload-all`` waits out a verified teardown per model, up to a minute
+#: each for a large CUDA context. The old 600 s / 180 s budgets timed out in
+#: the tray while the server carried on correctly, and the menu then reported
+#: a failure that invited a second click, which started a second full round.
+RESTART_ENGINES_TIMEOUT = 1800.0
+UNLOAD_ALL_TIMEOUT = 600.0
 
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 
@@ -557,6 +566,13 @@ class TrayApp:
         self._port_conflict_respawns = 0
         self._log_handle: Any = None
         self._lock = threading.RLock()
+        #: Long-running menu actions currently in flight (``"unload_all"``,
+        #: ``"restart_engines"``). A second click while one runs is a
+        #: notification, not a second request: ``/api/restart/backend``
+        #: restarts everything on every call, so two clicks were two full
+        #: rounds of unload-and-reload (the D50 double-fire shape, from the
+        #: tray). Guarded by ``_lock``.
+        self._inflight: set[str] = set()
         self._stop_event = threading.Event()
         self._supervisor: threading.Thread | None = None
         self.icon: Any = None
@@ -717,7 +733,7 @@ class TrayApp:
 
     def unload_all_models(self) -> ApiResult:
         """``POST /api/models/unload-all`` -- the headline VRAM action."""
-        return self.client.post("/api/models/unload-all", timeout=180.0)
+        return self.client.post("/api/models/unload-all", timeout=UNLOAD_ALL_TIMEOUT)
 
     def restart_engines(self) -> ApiResult:
         """``POST /api/restart/backend`` -- reload the llama-server children.
@@ -725,7 +741,24 @@ class TrayApp:
         Distinct from :meth:`restart_server`: the API stays up throughout, only
         the inference processes are recycled.
         """
-        return self.client.post("/api/restart/backend", timeout=600.0)
+        return self.client.post("/api/restart/backend", timeout=RESTART_ENGINES_TIMEOUT)
+
+    def _claim_action(self, action: str, busy_message: str) -> bool:
+        """Mark ``action`` in flight; ``False`` (and a notification) if it already is.
+
+        Called on the menu thread, before the worker is spawned, so the second
+        click sees the first one's claim rather than racing it.
+        """
+        with self._lock:
+            if action in self._inflight:
+                self._notify(busy_message)
+                return False
+            self._inflight.add(action)
+            return True
+
+    def _release_action(self, action: str) -> None:
+        with self._lock:
+            self._inflight.discard(action)
 
     def mcp_info(self) -> tuple[str, str | None]:
         """``(url, pin)`` from the running server, falling back to the config."""
@@ -1158,30 +1191,48 @@ class TrayApp:
         self._spawn_thread(self.restart_server)
 
     def _on_unload_all(self, _icon: Any = None, _item: Any = None) -> None:
+        if not self._claim_action(
+            "unload_all", "Unload is already in progress; waiting for the server to finish."
+        ):
+            return
+
         def work() -> None:
-            result = self.unload_all_models()
-            if result.ok:
-                count = result.data.get("count", 0)
-                self._notify(f"Unloaded {count} model(s); VRAM freed.")
-            else:
-                self._notify(f"Unload failed: {result.error}")
-            self._poll_status()
-            self._refresh()
+            try:
+                result = self.unload_all_models()
+                if result.ok:
+                    count = result.data.get("count", 0)
+                    self._notify(f"Unloaded {count} model(s); VRAM freed.")
+                else:
+                    self._notify(f"Unload failed: {result.error}")
+                self._poll_status()
+                self._refresh()
+            finally:
+                self._release_action("unload_all")
 
         self._spawn_thread(work)
 
     def _on_restart_engines(self, _icon: Any = None, _item: Any = None) -> None:
+        if not self._claim_action(
+            "restart_engines",
+            "Engine restart is already in progress; a second one would reload every "
+            "model again. Waiting for the first to finish.",
+        ):
+            return
+
         def work() -> None:
-            result = self.restart_engines()
-            if result.ok:
-                count = result.data.get("count", 0)
-                failed = result.data.get("failed") or []
-                suffix = f", {len(failed)} failed" if failed else ""
-                self._notify(f"Reloaded {count} engine process(es){suffix}.")
-            else:
-                self._notify(f"Engine restart failed: {result.error}")
-            self._poll_status()
-            self._refresh()
+            try:
+                result = self.restart_engines()
+                if result.ok:
+                    count = result.data.get("count", 0)
+                    failed = result.data.get("failed") or []
+                    suffix = f", {len(failed)} failed" if failed else ""
+                    self._notify(f"Reloaded {count} engine process(es){suffix}.")
+                else:
+                    self._notify(f"Engine restart failed: {result.error}")
+                self._poll_status()
+                self._refresh()
+            finally:
+                self._release_action("restart_engines")
 
         self._spawn_thread(work)
 

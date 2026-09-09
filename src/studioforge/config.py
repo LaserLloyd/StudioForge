@@ -755,8 +755,13 @@ class LeasesConfig(BaseModel):
     #: The re-ask interval handed to a requester (``retry_after_s`` and the
     #: ``Retry-After`` header) while the holder is vacating.
     vacate_retry_after_s: PositiveFloat = 15.0
-    #: Per-request HTTP timeout for the one vacate POST to the holder.
-    vacate_callback_timeout_s: PositiveFloat = 10.0
+    #: Per-request HTTP timeout for the one vacate POST to the holder -- the
+    #: ACK budget, not the release window (that is ``vacate_timeout_s``). 30 s,
+    #: not 10: a holder that frees VRAM synchronously inside its handler (a
+    #: render finishing, a ComfyUI ``/free``) answered late, and a late answer
+    #: collapsed the whole window to "undeliverable" for 180 s while the holder
+    #: was in fact complying (audit 2026-09-09, F4).
+    vacate_callback_timeout_s: PositiveFloat = 30.0
 
 
 class BenchmarkConfig(BaseModel):

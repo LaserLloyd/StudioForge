@@ -60,7 +60,13 @@ from studioforge.config import (
     grant_cache_ram_mib,
     resolve_cache_ram_mb,
 )
-from studioforge.core.engine import EngineFeatures, probe_engine_features
+from studioforge.core.engine import (
+    EngineFeatures,
+    child_environment,
+    policy_family,
+    probe_engine_features,
+    refuse_policy_flags,
+)
 from studioforge.core.planner import attention_kind, effective_ubatch, is_moe
 from studioforge.errors import ModelLoadError, ModelUnloadError
 from studioforge.logging import get_logger
@@ -167,6 +173,10 @@ _SECRET_VALUE_FLAGS = frozenset(
 #: reads (b10689 ``common/arg.cpp``). Value flags consume the next token;
 #: switch pairs set a boolean. Aliases matter because ``extra_flags`` is
 #: written by hand and ``-nocb`` is as legal as ``--no-cont-batching``.
+#:
+#: The second block is the GPU-only policy's own vocabulary: what the child
+#: was really told about layers, fit, devices and the KV cache, so a launch
+#: that landed half on the CPU is *reported* as such and not only refused.
 _VALUE_FLAG_ALIASES: dict[str, tuple[str, ...]] = {
     "ctx_total": ("-c", "--ctx-size"),
     "parallel": ("-np", "--parallel"),
@@ -179,13 +189,35 @@ _VALUE_FLAG_ALIASES: dict[str, tuple[str, ...]] = {
     "checkpoint_min_step": ("-cms", "--checkpoint-min-step"),
     "spec_type": ("--spec-type",),
     "flash_attn": ("-fa", "--flash-attn"),
+    # --- GPU-only policy ---------------------------------------------------
+    "n_gpu_layers": ("-ngl", "--gpu-layers", "--n-gpu-layers"),
+    "fit": ("-fit", "--fit"),
+    "device": ("-dev", "--device"),
+    "split_mode": ("-sm", "--split-mode"),
+    "load_mode": ("-lm", "--load-mode"),
+    "spec_draft_ngl": ("--spec-draft-ngl", "-ngld", "--gpu-layers-draft", "--n-gpu-layers-draft"),
+    "spec_draft_device": ("--spec-draft-device", "-devd", "--device-draft"),
+    "mmproj_device": ("-mmdev", "--mmproj-device"),
 }
 _SWITCH_ALIASES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "cont_batching": (("-cb", "--cont-batching"), ("-nocb", "--no-cont-batching")),
     "kv_unified": (("-kvu", "--kv-unified"), ("-no-kvu", "--no-kv-unified")),
     "cache_prompt": (("--cache-prompt",), ("--no-cache-prompt",)),
     "cache_idle_slots": (("--cache-idle-slots",), ("--no-cache-idle-slots",)),
+    # --- GPU-only policy ---------------------------------------------------
+    "kv_offload": (("-kvo", "--kv-offload"), ("-nkvo", "--no-kv-offload")),
+    "mmproj_offload": (("--mmproj-offload",), ("--no-mmproj-offload",)),
+    "mlock": (("--mlock",), ()),
+    "mmap": (("--mmap",), ("--no-mmap",)),
 }
+
+#: ``--n-gpu-layers`` / ``--spec-draft-ngl`` values that mean "everything".
+#: ``999`` is what StudioForge passes; ``all`` is b10689's own word for it.
+_ALL_LAYERS_VALUES = frozenset({ALL_GPU_LAYERS, "all"})
+#: ``--load-mode`` values that pin the model in host RAM. Composed by
+#: StudioForge itself for ``settings.mlock`` (see ``_load_mode_args``); a
+#: policy violation only when nothing asked for them.
+_MLOCK_LOAD_MODES = frozenset({"mlock", "mmap+mlock"})
 
 
 def _is_absolute_path(token: str) -> bool:
@@ -252,6 +284,15 @@ def _parse_launch_argv(argv: Sequence[str]) -> tuple[dict[str, str], dict[str, b
     i = 0
     while i < len(tokens):
         token = tokens[i]
+        # ``--flag=value`` is read too. llama.cpp itself does not accept the
+        # spelling, but the policy report must not be blind to a token just
+        # because the engine would be -- a refusal that reads the argv the
+        # way the attacker hopes it does is no refusal.
+        flag, sep, inline = token.partition("=")
+        if sep and flag in value_of:
+            values[value_of[flag]] = inline
+            i += 1
+            continue
         if token in value_of and i + 1 < len(tokens):
             values[value_of[token]] = tokens[i + 1]
             i += 2
@@ -261,6 +302,65 @@ def _parse_launch_argv(argv: Sequence[str]) -> tuple[dict[str, str], dict[str, b
             switches[key] = state
         i += 1
     return values, switches
+
+
+def launch_policy_violations(
+    argv: Sequence[str], settings: ModelSettings | None = None
+) -> list[str]:
+    """Every token of a FINAL argv that contradicts the GPU-only policy.
+
+    Two kinds, named the way they were typed so the report is actionable:
+    every token of a forbidden (``offload``) family that is present at all
+    (``--cpu-moe``, ``--n-cpu-ffn 48``, ``-ot .*=CPU``), and every managed
+    flag whose *last* value -- llama.cpp's last-wins rule -- contradicts what
+    StudioForge always passes: ``--n-gpu-layers`` not ``999``/``all``,
+    ``--fit`` not ``off``, ``--device none``, ``--no-kv-offload``, the same
+    for the draft model and the vision projector, and a ``--load-mode`` that
+    pins the model in host RAM when ``settings.mlock`` did not ask for it.
+
+    Pure, and the same function on both sides of the fence:
+    :meth:`Supervisor.build_command` refuses a launch whose argv returns
+    anything here, and :func:`effective_launch` reports the list on every
+    instance -- so on every launch StudioForge composes itself this is empty,
+    and non-empty is a bug report (:attr:`EffectiveLaunch.policy_violations`).
+    """
+    found: list[str] = []
+    tokens = list(argv[1:])
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        family = policy_family(token) if token.startswith("-") else None
+        if family is not None and family.kind == "offload":
+            base, sep, _inline = token.partition("=")
+            if family.takes_value and not sep and i + 1 < len(tokens):
+                found.append(f"{base} {tokens[i + 1]}")
+                i += 2
+                continue
+            found.append(token)
+        i += 1
+
+    values, switches = _parse_launch_argv(argv)
+
+    def _contradicts(key: str, flag: str, allowed: Callable[[str], bool]) -> None:
+        value = values.get(key)
+        if value is not None and not allowed(value):
+            found.append(f"{flag} {value}")
+
+    _contradicts("n_gpu_layers", "--n-gpu-layers", lambda v: v in _ALL_LAYERS_VALUES)
+    _contradicts("fit", "--fit", lambda v: v == "off")
+    _contradicts("device", "--device", lambda v: v.strip().lower() != "none")
+    _contradicts("spec_draft_ngl", "--spec-draft-ngl", lambda v: v in _ALL_LAYERS_VALUES)
+    _contradicts("spec_draft_device", "--spec-draft-device", lambda v: v.strip().lower() != "none")
+    _contradicts("mmproj_device", "--mmproj-device", lambda v: v.strip().lower() != "none")
+    if switches.get("kv_offload") is False:
+        found.append("--no-kv-offload")
+    if switches.get("mmproj_offload") is False:
+        found.append("--no-mmproj-offload")
+    load_mode = values.get("load_mode")
+    asked_mlock = settings is not None and bool(settings.mlock)
+    if load_mode in _MLOCK_LOAD_MODES and not asked_mlock:
+        found.append(f"--load-mode {load_mode}")
+    return found
 
 
 def _int_or(value: str | None, fallback: int) -> int:
@@ -388,9 +488,42 @@ def effective_launch(
     flash_attn = values.get("flash_attn") or "auto"
     src("flash_attn", "flash_attn" in values)
 
+    # The GPU-only policy, as launched. StudioForge always passes the first
+    # two, so "engine_default" on either means the argv builder was bypassed.
+    n_gpu_layers = values.get("n_gpu_layers")
+    src("n_gpu_layers", "n_gpu_layers" in values)
+    fit = values.get("fit")
+    src("fit", "fit" in values)
+    device = values.get("device")
+    src("device", "device" in values)
+    split_mode = values.get("split_mode")
+    src("split_mode", "split_mode" in values)
+    load_mode = values.get("load_mode")
+    src("load_mode", "load_mode" in values)
+    kv_offload = switches.get("kv_offload", True)
+    src("kv_offload", "kv_offload" in switches)
+    policy_violations = launch_policy_violations(argv, settings)
+
     inert: list[str] = []
     if settings is not None and settings.cont_batching is False and cont_batching:
         inert.append("cont_batching")
+    # mlock is honoured by the deprecated switch or by a load mode that locks;
+    # anything else means the engine advertised neither (see
+    # Supervisor._load_mode_args) and the setting is a wish.
+    if (
+        settings is not None
+        and settings.mlock
+        and not switches.get("mlock")
+        and load_mode not in _MLOCK_LOAD_MODES
+    ):
+        inert.append("mlock")
+    if (
+        settings is not None
+        and settings.no_mmap
+        and switches.get("mmap", True) is not False
+        and load_mode not in ("none", "mlock")
+    ):
+        inert.append("no_mmap")
 
     if cache_prompt:
         cache_bits = [f"reuse {cache_reuse}" if cache_reuse else "chunk reuse off"]
@@ -420,6 +553,11 @@ def effective_launch(
     ]
     if inert:
         parts.append("inert: " + ", ".join(inert))
+    # Last, always: the one word an operator scans a status line for.
+    if policy_violations:
+        parts.append("POLICY VIOLATION: " + ", ".join(policy_violations))
+    else:
+        parts.append("GPU-only")
 
     return EffectiveLaunch(
         cache_prompt=cache_prompt,
@@ -438,6 +576,13 @@ def effective_launch(
         checkpoint_min_step=checkpoint_min_step,
         spec_type=spec_type,
         flash_attn=flash_attn,
+        n_gpu_layers=n_gpu_layers,
+        fit=fit,
+        device=device,
+        split_mode=split_mode,
+        load_mode=load_mode,
+        kv_offload=kv_offload,
+        policy_violations=policy_violations,
         sources=sources,
         inert=inert,
         summary=", ".join(parts),
@@ -452,9 +597,23 @@ ERROR_TAIL_LINES = 30
 
 _HTTP_TIMEOUT = 5.0
 
-# Flags that would move work off the GPU. Asserted against in tests; listed
-# here so the prohibition is documented in one obvious place.
-CPU_OFFLOAD_FLAGS = frozenset({"--cpu-moe", "--n-cpu-moe", "--override-tensor", "-ot", "--cpu"})
+#: How long a killed child may take to actually exit before its unload is
+#: declared unverified (audit 2026-09-09, F1). On Windows ``terminate()`` IS
+#: ``TerminateProcess``, so the whole wait is the CUDA driver tearing down a
+#: 20+ GB context -- tens of seconds for a 27B at 256k -- and the old chain
+#: gave it ~35 s in total before raising ``ModelUnloadError`` for a process
+#: that died seconds later. The wait is patience, not grace: every signal has
+#: already been sent by the time it starts (see ``_linger``).
+UNLOAD_SETTLE_S = 60.0
+#: Poll interval inside that wait.
+UNLOAD_POLL_S = 0.5
+#: Pause between a verified exit and the "after" VRAM sample (F6): the driver
+#: hands memory back a beat after the process is gone, so a sample taken on
+#: the same tick under-reports ``vram_reclaimed_mb`` -- and a plan computed on
+#: it sees VRAM still in use on an empty card. Same value as the watchdog's
+#: ``VRAM_SETTLE_S``; the manager awaits :attr:`Supervisor.vram_settle_s`
+#: before its OOM-retry re-plan and its lease handover for the same reason.
+VRAM_SETTLE_S = 1.2
 
 # ---------------------------------------------------------------------------
 # Interpreter-exit safety net
@@ -544,7 +703,12 @@ class WindowsChildJob:
             self._handle, win32job.JobObjectExtendedLimitInformation, info
         )
         self._closed = False
-        self._warned = False
+        #: Pids whose failed assignment has been logged. Per child, not per
+        #: process: the old once-ever latch meant a box where nesting is
+        #: refused logged one warning at boot and then launched every later
+        #: model unprotected in silence -- the D23 guarantee quietly absent
+        #: (audit 2026-09-09 §2.10).
+        self._warned_pids: set[int] = set()
 
     @property
     def available(self) -> bool:
@@ -553,8 +717,9 @@ class WindowsChildJob:
     def assign(self, pid: int) -> bool:
         """Put ``pid`` in the job. Never raises; ``False`` means "unprotected".
 
-        Only the first failure is logged: on a box where nesting is refused,
-        every single load would otherwise emit the same warning forever.
+        Every failure is logged, once per child: the warning names the pid
+        that is now unprotected, which is the thing an operator has to go and
+        find after a hard kill.
         """
         if not self.available:
             return False
@@ -567,17 +732,17 @@ class WindowsChildJob:
                 with contextlib.suppress(Exception):
                     handle.Close()
         except Exception as exc:  # noqa: BLE001 - the net must not break the load
-            if not self._warned:
-                self._warned = True
+            if pid not in self._warned_pids:
+                self._warned_pids.add(pid)
                 log.warning(
                     "child_job_assign_failed",
                     pid=pid,
                     error=str(exc),
                     detail=(
-                        "llama-server children are not protected by a job object on this "
-                        "box; a hard kill of this process would leave them holding VRAM. "
-                        "Usually means the process is already in a job that refuses "
-                        "nesting (pre-Windows 8, or a job without BREAKAWAY_OK)."
+                        "this llama-server child is not protected by a job object; a hard "
+                        "kill of this process would leave it holding VRAM. Usually means "
+                        "the process is already in a job that refuses nesting (pre-Windows "
+                        "8, or a job without BREAKAWAY_OK)."
                     ),
                 )
             return False
@@ -1267,8 +1432,21 @@ class Supervisor:
         """Build the full argv for one ``llama-server`` child.
 
         Ordering is deliberate: our own flags first, the user's expert
-        ``extra_flags`` last, so a deliberate override actually wins (llama.cpp
-        takes the last occurrence of a repeated option).
+        ``extra_flags`` after them, so a deliberate override actually wins
+        (llama.cpp takes the last occurrence of a repeated option) -- and the
+        two flags the GPU-only policy rests on, ``--n-gpu-layers 999`` and
+        ``--fit off``, come LAST of all, after ``extra_flags``, so last-wins
+        can never be turned against them.
+
+        The policy is enforced here as well as at save time (audit 2026-09-09
+        §3): ``extra_flags`` is refused if it names a managed or CPU-offload
+        family (:data:`studioforge.core.engine.POLICY_FAMILIES`), and the
+        *final* argv is checked with :func:`launch_policy_violations` before
+        it is returned. Save-time validation alone left a row written under
+        an older engine, or straight into SQLite, applied unchecked forever.
+        Raises :class:`ModelLoadError` naming the offending token; nothing is
+        ever silently dropped, because a flag that vanished is the failure
+        mode this module exists to prevent.
 
         See the module docstring for why ``--n-gpu-layers`` is hardcoded, why
         ``--ctx-size`` is multiplied by ``parallel``, and why ``--spec-type`` is
@@ -1301,9 +1479,6 @@ class Supervisor:
             CHILD_HOST,
             "--port",
             str(port),
-            # GPU-only: never conditional, never computed.
-            "--n-gpu-layers",
-            ALL_GPU_LAYERS,
             # TOTAL context across all slots -- see module docstring.
             "--ctx-size",
             str(plan.ctx_size * plan.parallel),
@@ -1318,16 +1493,6 @@ class Supervisor:
         # We proxy everything; the bundled web UI is dead weight, while the
         # introspection endpoints are what the Dashboard and planner feed on.
         argv += ["--no-webui", "--props", "--slots", "--metrics"]
-        # The pinned build ships `--fit` (default ON), which "adjusts unset
-        # arguments to fit in device memory". That is upstream llama.cpp
-        # PR #16653 (merged Dec 2025), not something b10425 introduced -- b10425
-        # is just the build we pinned. StudioForge's planner already decided
-        # placement and context against live free VRAM, so engine-side
-        # auto-adjustment is at best redundant and at worst a silent
-        # partial-offload path -- exactly the degradation the GPU-only policy
-        # exists to prevent. Turn it off and let a genuine over-commit fail
-        # loudly instead. Verified accepted by b10425.
-        argv += ["--fit", "off"]
 
         argv += self._optional_args(record, plan, engine, cache_ram_mib=cache_ram_mib)
         argv += self._concurrency_args(record, plan, engine)
@@ -1349,8 +1514,48 @@ class Supervisor:
 
         if settings.extra_flags.strip():
             # posix=False on Windows so backslash paths survive verbatim.
-            argv += shlex.split(settings.extra_flags, posix=(os.name != "nt"))
+            extra = shlex.split(settings.extra_flags, posix=(os.name != "nt"))
+            # Enforcement point two of the GPU-only policy. The same table the
+            # save-time validator uses, applied to what is about to launch:
+            # this is the check that survives a stale row.
+            refused = refuse_policy_flags(extra)
+            if refused:
+                raise ModelLoadError(
+                    f"'{record.id}' cannot be launched: its saved extra_flags carry "
+                    f"{len(refused)} flag(s) StudioForge refuses -- " + "; ".join(refused),
+                    details={
+                        "model_id": record.id,
+                        "refused": refused,
+                        "extra_flags": redact_argv(extra),
+                    },
+                )
+            argv += extra
 
+        # GPU-only: never conditional, never computed -- and LAST, after the
+        # user's flags, so llama.cpp's last-wins rule can only ever land on
+        # these two. ``--fit`` (default ON since upstream PR #16653, merged
+        # Dec 2025) "adjusts unset arguments to fit in device memory"; the
+        # planner already decided placement and context against live free
+        # VRAM, so engine-side auto-adjustment is at best redundant and at
+        # worst a silent partial-offload path -- exactly the degradation the
+        # GPU-only policy exists to prevent. Off, and a genuine over-commit
+        # fails loudly instead (D11). Verified accepted by b10425.
+        argv += ["--n-gpu-layers", ALL_GPU_LAYERS, "--fit", "off"]
+
+        # The final argv, read the way the child will read it. Anything that
+        # got past the token check above -- there is no such path today, and
+        # this is what keeps it that way -- is refused with its name.
+        violations = launch_policy_violations(argv, settings)
+        if violations:
+            raise ModelLoadError(
+                f"'{record.id}' cannot be launched: the final command line contradicts the "
+                f"GPU-only policy ({', '.join(violations)})",
+                details={
+                    "model_id": record.id,
+                    "policy_violations": violations,
+                    "argv": redact_argv(argv),
+                },
+            )
         return argv
 
     def resolve(
@@ -1549,10 +1754,7 @@ class Supervisor:
         # "working" is how a value quietly stops meaning anything. The field
         # survives on ModelSettings only so old rows and the GUI form keep
         # loading; see types.ModelSettings.defrag_thold.
-        if settings.mlock:
-            args.append("--mlock")
-        if settings.no_mmap:
-            args.append("--no-mmap")
+        args += self._load_mode_args(record, features)
 
         if settings.rope_freq_base is not None:
             args += ["--rope-freq-base", _fmt_float(settings.rope_freq_base)]
@@ -1574,6 +1776,62 @@ class Supervisor:
         if settings.repeat_penalty is not None:
             args += ["--repeat-penalty", _fmt_float(settings.repeat_penalty)]
 
+        return args
+
+    def _load_mode_args(self, record: ModelRecord, features: EngineFeatures) -> list[str]:
+        """``settings.mlock`` / ``settings.no_mmap`` in the active engine's spelling.
+
+        b10689 marks ``--mlock`` and ``--mmap``/``--no-mmap`` "DEPRECATED in
+        favor of ``--load-mode``" -- still accepted today, gone some release
+        soon, and the removed-flag detector keys on a different phrase, so
+        nothing would warn before every load with either setting hard-failed
+        on an unknown argument (audit 2026-09-09, F7). So, D38's rule:
+
+        * an engine that advertises ``--load-mode`` gets the one flag. The
+          old pair mapped onto its modes, faithfully: ``--mlock`` alone kept
+          the default mmap and locked the mapping, which is ``mmap+mlock``;
+          ``--no-mmap`` alone is ``none``; both together read the file into
+          locked memory, which is ``mlock``;
+        * an engine that advertises the deprecated pair gets the pair;
+        * a known engine with neither logs ``setting_inert`` per setting and
+          passes nothing -- a switch the child cannot see must not look
+          honoured; :func:`effective_launch` lists it as inert;
+        * an unknown engine (help unreadable) keeps the pre-gating surface.
+        """
+        settings = record.settings
+        if not (settings.mlock or settings.no_mmap):
+            return []
+        if features.has("--load-mode"):
+            if settings.mlock and settings.no_mmap:
+                mode = "mlock"
+            elif settings.mlock:
+                mode = "mmap+mlock"
+            else:
+                mode = "none"
+            return ["--load-mode", mode]
+        args: list[str] = []
+        for enabled, flag, setting in (
+            (settings.mlock, "--mlock", "mlock"),
+            (settings.no_mmap, "--no-mmap", "no_mmap"),
+        ):
+            if not enabled:
+                continue
+            if not features.known or features.has(flag):
+                args.append(flag)
+                continue
+            log.warning(
+                "setting_inert",
+                model_id=record.id,
+                setting=setting,
+                value=True,
+                flag=flag,
+                engine_known=features.known,
+                detail=(
+                    f"the engine advertises neither {flag} nor --load-mode, so the "
+                    "setting cannot be passed; the instance's `effective` block lists "
+                    "it as inert"
+                ),
+            )
         return args
 
     def ubatch_for(self, record: ModelRecord, slots: int = 1) -> int | None:
@@ -1887,6 +2145,15 @@ class Supervisor:
         # settings, so extra_flags and engine defaults are in the answer too.
         inst.info.effective = effective_launch(argv, features, inst.plan, inst.record.settings)
         inst.info.launch_args = redact_argv(argv)
+        if inst.info.effective.policy_violations:
+            # build_command refuses these, so this cannot fire today; it is
+            # the report's own tripwire for the day the two checks disagree.
+            log.warning(
+                "gpu_only_policy_violation",
+                model_id=inst.record.id,
+                violations=list(inst.info.effective.policy_violations),
+                detail="the child is being launched with flags that contradict the GPU-only policy",
+            )
         # The shim must be the OUTERMOST element, ahead of the launch prefix
         # as well as the engine argv: its body is
         # `os.execv(sys.argv[1], sys.argv[1:])`, so whatever follows it is
@@ -1933,6 +2200,24 @@ class Supervisor:
         # RUNPATH instead: upstream's ubuntu archives carry one, and the
         # source build (engine.build_from_source) bakes the same one in.
         engine_dir = Path(argv[0]).parent
+        # Enforcement point three of the GPU-only policy: the environment.
+        # b10689 reads an ``LLAMA_ARG_*`` variable for nearly every flag, and
+        # for a flag StudioForge never emits -- which is every CPU-offload
+        # flag -- the variable is wholly unopposed by the argv. The child
+        # gets our environment minus that surface (engine.child_environment),
+        # and the names stripped are logged so an operator who set one on
+        # purpose learns why it did nothing.
+        env, stripped = child_environment()
+        if stripped:
+            log.warning(
+                "child_env_stripped",
+                model_id=inst.record.id,
+                names=stripped,
+                detail=(
+                    "llama-server would read these as launch flags; the GPU-only policy "
+                    "is enforced on the argv alone, so they are not passed to the child"
+                ),
+            )
         log.info(
             "model_spawn",
             model_id=inst.record.id,
@@ -1949,6 +2234,7 @@ class Supervisor:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(engine_dir) if engine_dir.is_dir() else None,
+                env=env,
                 **kwargs,
             )
         except OSError as exc:
@@ -2022,7 +2308,17 @@ class Supervisor:
                 raw = await stream.readline()
             except (asyncio.LimitOverrunError, ValueError):
                 continue
-            except Exception:  # pragma: no cover - transport teardown races
+            except Exception as exc:  # noqa: BLE001 - transport teardown races
+                # Said out loud: from here on ``stderr_ring`` stops filling,
+                # so a later failure message degrades to "No output captured"
+                # on precisely the child being debugged (audit 2026-09-09
+                # §2.11). The line says which stream, and why.
+                log.warning(
+                    "child_output_pump_ended",
+                    model_id=inst.record.id,
+                    stream="stderr" if stderr else "stdout",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
                 return
             if not raw:
                 return
@@ -2103,20 +2399,36 @@ class Supervisor:
         than a port clash. ``--alias`` is echoed by ``/props``, so it doubles as
         an identity check. When ``/props`` cannot be read we do not block the
         load; the goal is catching an impostor, not adding a hard dependency.
+
+        Every fail-open branch is logged at WARNING with its reason (audit
+        2026-09-09 §2.4): the fail-open is deliberate, but a squatter that
+        answers ``/health`` and not ``/props`` used to be adopted as a
+        successful load with no line anywhere saying the check never ran.
         """
         base = f"http://{CHILD_HOST}:{inst.port}"
+
+        def fail_open(reason: str) -> bool:
+            log.warning(
+                "child_identity_unchecked",
+                model_id=inst.record.id,
+                port=inst.port,
+                reason=reason,
+                detail="/props could not confirm the alias; the child is adopted unverified",
+            )
+            return True
+
         try:
             resp = await self._client.get(f"{base}/props", timeout=_HTTP_TIMEOUT)
-        except (httpx.HTTPError, OSError):
-            return True
+        except (httpx.HTTPError, OSError) as exc:
+            return fail_open(f"/props unreachable: {type(exc).__name__}: {exc}")
         if resp.status_code != 200:
-            return True
+            return fail_open(f"/props answered HTTP {resp.status_code}")
         try:
             data = resp.json()
         except ValueError:
-            return True
+            return fail_open("/props answered non-JSON")
         if not isinstance(data, dict):
-            return True
+            return fail_open(f"/props answered a JSON {type(data).__name__}, not an object")
         alias = data.get("model_alias")
         expected = self._expected_alias(inst)
         if isinstance(alias, str) and alias != expected:
@@ -2128,6 +2440,12 @@ class Supervisor:
                 foreign_alias=alias,
             )
             return False
+        if not isinstance(alias, str):
+            return fail_open(
+                "/props carries no model_alias string"
+                if alias is None
+                else f"/props model_alias is a {type(alias).__name__}"
+            )
         inst.port_conflict = None
         return True
 
@@ -2303,8 +2621,12 @@ class Supervisor:
                 detail="process still alive after teardown; escalating to a forced tree kill",
             )
             await asyncio.to_thread(kill_process_tree, pid, timeout=5.0, force=True)
-            alive = await asyncio.to_thread(process_is_alive, pid, create_time=inst.create_time)
+            alive = await self._linger(inst, pid)
 
+        if not alive and self._probe is not None:
+            # The sample is what the settle is for; without a probe there is
+            # nothing to sample and nothing to wait for.
+            await self._settle_vram()
         report = UnloadReport(
             model_id=inst.record.id,
             pid=pid,
@@ -2331,6 +2653,57 @@ class Supervisor:
                 detail="process survived SIGTERM and SIGKILL; its VRAM is still held",
             )
         return report
+
+    async def _linger(self, inst: _Instance, pid: int) -> bool:
+        """Whether ``pid`` is still alive after up to :data:`UNLOAD_SETTLE_S`.
+
+        Called only after every signal has been sent -- SIGTERM, SIGKILL, and
+        the escalated tree kill -- so this is patience for a process that is
+        already dying: on Windows a 20+ GB CUDA context takes the driver tens
+        of seconds to tear down after ``TerminateProcess``, and declaring the
+        unload failed in the middle of that (the old ~35 s chain, audit F1)
+        was a spurious ``ModelUnloadError`` on an unload that was working.
+
+        Polls every :data:`UNLOAD_POLL_S`. Stops early when the OS has already
+        reported the exit (``wait_task`` done) yet the liveness check still
+        says "alive": that is not a teardown in progress, it is a pid the
+        check cannot account for, and waiting would only delay the honest
+        answer.
+        """
+        deadline = time.monotonic() + UNLOAD_SETTLE_S
+        started = time.monotonic()
+        while True:
+            alive = await asyncio.to_thread(process_is_alive, pid, create_time=inst.create_time)
+            if not alive:
+                waited = time.monotonic() - started
+                if waited >= UNLOAD_POLL_S:
+                    log.info(
+                        "unload_settled",
+                        model_id=inst.record.id,
+                        pid=pid,
+                        waited_s=round(waited, 1),
+                        detail="the child exited after the forced kill; a slow driver teardown",
+                    )
+                return False
+            wait_task = inst.wait_task
+            if wait_task is not None and wait_task.done():
+                return True
+            if time.monotonic() >= deadline:
+                return True
+            await asyncio.sleep(UNLOAD_POLL_S)
+
+    @property
+    def vram_settle_s(self) -> float:
+        """How long freed VRAM takes to show up in a probe (:data:`VRAM_SETTLE_S`).
+
+        Exposed so the manager can await the same settle before the plans it
+        computes right after an unload -- the OOM-retry re-plan and the lease
+        handover -- instead of reading a card the driver has not handed back.
+        """
+        return VRAM_SETTLE_S
+
+    async def _settle_vram(self) -> None:
+        await asyncio.sleep(self.vram_settle_s)
 
     def unload_report(self, model_id: str) -> UnloadReport | None:
         """Evidence from the last unload of ``model_id``, if there was one."""
@@ -2386,11 +2759,52 @@ class Supervisor:
         self,
         *,
         timeout: float = 15.0,  # noqa: ASYNC109 - per-child SIGTERM grace
-    ) -> None:
-        await asyncio.gather(
-            *(self.stop(model_id, timeout=timeout) for model_id in list(self._instances)),
+    ) -> dict[str, BaseException | None]:
+        """Stop every child, concurrently; report each one's outcome by name.
+
+        Returns ``{model_id: None}`` for a verified unload and
+        ``{model_id: exception}`` for one that failed -- a
+        :class:`~studioforge.errors.ModelUnloadError` for a child that
+        outlived every signal, still in the instance table and still holding
+        its VRAM. Every failure is logged at ERROR here with the model id.
+
+        Never raises for a failed unload: the two callers want different
+        things from one. Process shutdown (``aclose``, the manager's drain)
+        must carry on to the job-object close that is its real safety net,
+        while ``POST /api/models/unload-all`` must turn any survivor into a
+        500 -- so the manager's ``unload_all`` inspects this dict and raises
+        an aggregate ``ModelUnloadError`` naming every survivor. Until it did,
+        ``return_exceptions=True`` here discarded the result unread, and the
+        route answered 200 with a cheerful count for children still alive on
+        the GPUs (audit 2026-09-09 §2.1-2.3, headline finding 1).
+        """
+        ids = list(self._instances)
+        results = await asyncio.gather(
+            *(self.stop(model_id, timeout=timeout) for model_id in ids),
             return_exceptions=True,
         )
+        outcome: dict[str, BaseException | None] = {}
+        for model_id, result in zip(ids, results, strict=True):
+            if not isinstance(result, BaseException):
+                outcome[model_id] = None
+                continue
+            outcome[model_id] = result
+            if isinstance(result, ModelUnloadError):
+                log.error(
+                    "model_unload_failed",
+                    model_id=model_id,
+                    pid=result.details.get("pid"),
+                    error=result.message,
+                    detail="still in the instance table, state failed; its VRAM is still held",
+                )
+            else:
+                log.error(
+                    "model_unload_failed",
+                    model_id=model_id,
+                    error=f"{type(result).__name__}: {result}",
+                    detail="stop() raised something other than ModelUnloadError",
+                )
+        return outcome
 
     async def kill(self, model_id: str) -> bool:
         """Hard-kill the child immediately, without draining requests.

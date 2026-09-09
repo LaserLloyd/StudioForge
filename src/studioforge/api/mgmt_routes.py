@@ -1713,7 +1713,10 @@ async def unload_all(request: Request) -> dict[str, Any]:
     """Unload every resident model, freeing all VRAM.
 
     Refused with 409 ``lease_conflict`` when a standing GPU lease holds one of
-    them and the caller is neither the holder nor an admin (D55).
+    them and the caller is neither the holder nor an admin (D55). Answers 500
+    ``unload_failed`` -- naming every survivor in ``error.studioforge.failed``
+    and what did unload in ``error.studioforge.unloaded`` -- when a child
+    outlived the teardown; it never reports a count for children still alive.
     """
     state = _state(request)
     resident = [i.model_id for i in state.supervisor.list()]

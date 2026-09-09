@@ -47,7 +47,7 @@ from collections import deque
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 import httpx
 import psutil
@@ -75,39 +75,284 @@ HELP_FILE = "help.txt"
 
 ProgressFn = Callable[[str, float], None]
 
-#: Flags the manager owns. A user override here does not merely change a
-#: default, it breaks the system: ``--port``/``--host`` would make the gateway
-#: proxy to nothing, ``--model``/``--alias`` would desync the registry, and
-#: ``--n-gpu-layers`` would silently defeat the GPU-only policy by spilling
-#: layers to CPU. Maps every alias to the canonical name for error messages.
-MANAGED_FLAGS: dict[str, str] = {
-    "-m": "--model",
-    "--model": "--model",
-    "-mu": "--model-url",
-    "--model-url": "--model-url",
-    "--port": "--port",
-    "--host": "--host",
-    "-a": "--alias",
-    "--alias": "--alias",
-    "-ngl": "--n-gpu-layers",
-    "--gpu-layers": "--n-gpu-layers",
-    "--n-gpu-layers": "--n-gpu-layers",
-    # b10425's --fit (default ON) "adjusts unset arguments to fit in device
-    # memory". Allowing it back in via extra flags would reintroduce a silent
-    # partial-offload path, which the GPU-only policy forbids: the planner owns
-    # placement, and an over-commit must fail loudly rather than be shrunk.
-    "-fit": "--fit",
-    "--fit": "--fit",
-    "-fitt": "--fit-target",
-    "--fit-target": "--fit-target",
-    "-fitc": "--fit-ctx",
-    "--fit-ctx": "--fit-ctx",
+#: One class of flag an operator may never set, in two families.
+#:
+#: ``managed``: StudioForge assigns these itself, per launch. A user value here
+#: does not merely change a default, it breaks the system: ``--port``/``--host``
+#: would make the gateway proxy to nothing, ``--model``/``--alias`` would desync
+#: the registry, ``--device none`` would put the whole model on the CPU with
+#: every one of our own flags still in place.
+#:
+#: ``offload``: these move weights, the KV cache or compute off the GPU. None
+#: has a legitimate value on a GPU-only server (CONTRIBUTING.md "GPU-only"): a
+#: model that does not fit is rejected with the arithmetic, never made twenty
+#: times slower.
+#:
+#: Thread-affinity flags (``-t/--threads``, ``--cpu-mask``, ``--cpu-range``,
+#: ``--cpu-strict``, ``--numa``) are NOT offload -- they place the host threads
+#: llama-server always has -- and stay allowed.
+FlagKind = Literal["managed", "offload"]
+
+
+@dataclass(frozen=True)
+class FlagFamily:
+    """One llama-server option, every spelling b10689 accepts for it."""
+
+    canonical: str
+    spellings: tuple[str, ...]
+    kind: FlagKind
+    #: A clause completing "``<canonical>`` ...": what the flag would do here.
+    why: str
+    #: Whether the option consumes the next argv token (``--n-cpu-ffn 48``)
+    #: or is a bare switch (``--cpu-moe``). Only used to name the value in a
+    #: violation report; both kinds are refused the same way.
+    takes_value: bool = True
+
+
+def _managed(canonical: str, *aliases: str, why: str, takes_value: bool = True) -> FlagFamily:
+    return FlagFamily(canonical, (canonical, *aliases), "managed", why, takes_value)
+
+
+def _offload(canonical: str, *aliases: str, why: str, takes_value: bool = True) -> FlagFamily:
+    return FlagFamily(canonical, (canonical, *aliases), "offload", why, takes_value)
+
+
+#: THE GPU-only policy table (2026-09-09 review). Every spelling is from the
+#: b10689 ``--help``; short aliases matter because ``extra_flags`` is typed by
+#: hand and ``-ncffn`` is as legal as ``--n-cpu-ffn``.
+#:
+#: Enforced twice, from this one table: at save time by
+#: :meth:`EngineManager.validate_extra_flags` (a form error), and at launch by
+#: :meth:`studioforge.core.supervisor.Supervisor.build_command` over the final
+#: argv (a refused load) -- so a row written under an older engine, straight
+#: into SQLite, or while ``help.txt`` was stale cannot launch either. The
+#: launched values are reported per instance by
+#: :func:`studioforge.core.supervisor.effective_launch`.
+POLICY_FAMILIES: tuple[FlagFamily, ...] = (
+    # --- managed: the manager assigns these per launch -------------------
+    _managed("--model", "-m", why="is the registry's model file for this instance"),
+    _managed("--model-url", "-mu", why="would download around the registry"),
+    _managed("--port", why="is the loopback port the manager allocated and the gateway proxies to"),
+    _managed("--host", why="is always loopback; the gateway is the sole public surface"),
+    _managed("--alias", "-a", why="is the registry id the gateway routes by"),
+    _managed(
+        "--n-gpu-layers",
+        "-ngl",
+        "--gpu-layers",
+        why="is always 999; any other value spills layers to the CPU",
+    ),
+    _managed(
+        "--fit",
+        "-fit",
+        why="is always off; engine-side auto-fit is a silent partial-offload path (D11)",
+    ),
+    _managed("--fit-target", "-fitt", why="tunes --fit, which is always off (D11)"),
+    _managed("--fit-ctx", "-fitc", why="tunes --fit, which is always off (D11)"),
+    _managed(
+        "--device",
+        "-dev",
+        why="is the planner's placement; 'none' would put the whole model on the CPU",
+    ),
+    _managed("--split-mode", "-sm", why="is resolved per launch (settings.split_mode, D38)"),
+    _managed("--tensor-split", "-ts", why="is the planner's per-card share of the weights"),
+    _managed("--main-gpu", "-mg", why="is the planner's, indexed into its own --device list"),
+    _managed("--ctx-size", "-c", why="is planned against free VRAM as ctx_size x parallel (D4)"),
+    _managed("--parallel", "-np", why="is the planned slot count (D17)"),
+    _managed("--load-mode", "-lm", why="is set from settings.mlock / settings.no_mmap"),
+    _managed("--mlock", why="is settings.mlock", takes_value=False),
+    _managed("--mmap", "--no-mmap", why="is settings.no_mmap", takes_value=False),
+    _managed(
+        "--direct-io",
+        "-dio",
+        "--no-direct-io",
+        "-ndio",
+        why="is a --load-mode alias, and the load mode is managed",
+        takes_value=False,
+    ),
+    _managed(
+        "--kv-offload",
+        "-kvo",
+        "--no-kv-offload",
+        "-nkvo",
+        why="is always on; --no-kv-offload would put the KV cache in host RAM",
+        takes_value=False,
+    ),
+    _managed(
+        "--spec-draft-model",
+        "-md",
+        "--model-draft",
+        why="is the registry's draft link (settings.draft_model_id)",
+    ),
+    _managed(
+        "--spec-draft-ngl",
+        "-ngld",
+        "--gpu-layers-draft",
+        "--n-gpu-layers-draft",
+        why="is always 999; a CPU-resident draft is slower than not drafting",
+    ),
+    _managed(
+        "--spec-draft-device",
+        "-devd",
+        "--device-draft",
+        why="follows the placement (settings.draft_device_override); 'none' is a CPU draft",
+    ),
+    _managed(
+        "--mmproj-device",
+        "-mmdev",
+        why="follows the model's cards; 'none' would run vision encoding on the CPU",
+    ),
+    _managed(
+        "--mmproj-offload",
+        "--no-mmproj-offload",
+        why="is always on; the projector is never left on the CPU",
+        takes_value=False,
+    ),
+    _managed("--spec-type", why="is settings.spec_type, resolved against the engine's list (D38)"),
+    _managed("--cache-type-k", "-ctk", why="is planned against free VRAM (settings.kv_cache_type)"),
+    _managed(
+        "--cache-type-v", "-ctv", why="is planned against free VRAM (settings.kv_cache_type_v)"
+    ),
+    _managed("--flash-attn", "-fa", why="is planned per model (settings.flash_attn)"),
+    # --- offload: would move weights, KV or compute off the GPU ------------
+    _offload("--override-tensor", "-ot", why="would map tensors onto a CPU buffer"),
+    _offload(
+        "--override-tensor-draft",
+        "-otd",
+        "--spec-draft-override-tensor",
+        why="would map the draft model's tensors onto a CPU buffer",
+    ),
+    _offload("--cpu-moe", "-cmoe", why="would keep every MoE expert on the CPU", takes_value=False),
+    _offload("--n-cpu-moe", "-ncmoe", why="would keep the first N layers' experts on the CPU"),
+    _offload("--n-cpu-ffn", "-ncffn", why="would keep dense FFN weights on the CPU"),
+    _offload(
+        "--spec-draft-cpu-moe",
+        "-cmoed",
+        "--cpu-moe-draft",
+        why="would keep the draft model's experts on the CPU",
+        takes_value=False,
+    ),
+    _offload(
+        "--spec-draft-n-cpu-moe",
+        "-ncmoed",
+        "--n-cpu-moe-draft",
+        "--spec-draft-ncmoe",
+        why="would keep the draft model's first N layers' experts on the CPU",
+    ),
+    _offload(
+        "--op-offload",
+        "--no-op-offload",
+        why="decides whether host tensor operations run on the device; here they always do",
+        takes_value=False,
+    ),
+    _offload(
+        "--no-host",
+        why="changes where weights that stay on the host live; here none do",
+        takes_value=False,
+    ),
+    _offload(
+        "--tensor-read-lazy",
+        "--lazy-mode",
+        why="would serve tensor rows from disk on demand instead of from VRAM",
+    ),
+    _offload("--rpc", why="would ship work to a remote backend"),
+)
+
+#: Every spelling -> its family. The lookup the two enforcement points use.
+POLICY_FLAGS: dict[str, FlagFamily] = {
+    spelling: family for family in POLICY_FAMILIES for spelling in family.spellings
 }
+
+
+def policy_family(token: str) -> FlagFamily | None:
+    """The policy family an argv token belongs to, or ``None``.
+
+    ``--flag=value`` spellings are recognised too: llama.cpp does not accept
+    them, but a refusal must not depend on the parser the attacker expects.
+    """
+    return POLICY_FLAGS.get(token.split("=", 1)[0])
+
+
+def policy_refusal(token: str) -> str | None:
+    """Why an operator may not set ``token``, or ``None`` when they may.
+
+    One sentence per token, naming the family and the reason, so a form error
+    and a refused load read the same way: the operator learns what the flag
+    would have done here, not only that it is banned.
+    """
+    family = policy_family(token)
+    if family is None:
+        return None
+    base = token.split("=", 1)[0]
+    alias = "" if base == family.canonical else f" ({family.canonical})"
+    if family.kind == "offload":
+        return (
+            f"'{base}'{alias} is refused: StudioForge is GPU-only; {family.canonical} {family.why}"
+        )
+    return (
+        f"'{base}'{alias} is managed by StudioForge and cannot be set in extra flags: "
+        f"{family.canonical} {family.why}"
+    )
+
+
+def refuse_policy_flags(tokens: Iterable[str]) -> list[str]:
+    """Every refusal for a token list, one message each; ``[]`` means clean.
+
+    Values are skipped by shape (``-1`` is a number, ``-ot`` is a flag), the
+    same rule :meth:`EngineManager.validate_extra_flags` applies.
+    """
+    refused: list[str] = []
+    for token in tokens:
+        base = token.split("=", 1)[0]
+        if not _FLAG_START_RE.match(base) or not re.match(r"^-{1,2}[A-Za-z]", base):
+            continue
+        reason = policy_refusal(base)
+        if reason is not None:
+            refused.append(reason)
+    return refused
+
+
+#: Environment a llama-server child must never inherit. b10689 reads an
+#: ``LLAMA_ARG_*`` variable for nearly every flag -- ``LLAMA_ARG_N_CPU_MOE``,
+#: ``LLAMA_ARG_DEVICE``, ``LLAMA_ARG_KV_OFFLOAD`` -- and for a flag StudioForge
+#: never emits the variable is wholly unopposed by the argv. ``LLAMA_API_KEY``
+#: would put a credential in front of a child only the gateway talks to, and
+#: ``LLAMA_LOG_*`` would redirect the output the supervisor pumps into the
+#: per-model log. ``MTMD_BACKEND_DEVICE`` is ``--mmproj-device``'s variable
+#: (not under the ``LLAMA_ARG_`` prefix); ``none`` there runs vision on the CPU.
+_CHILD_ENV_PREFIXES: tuple[str, ...] = ("LLAMA_ARG_", "LLAMA_LOG_")
+_CHILD_ENV_NAMES: frozenset[str] = frozenset({"LLAMA_API_KEY", "MTMD_BACKEND_DEVICE"})
+
+
+def child_environment(
+    environ: Mapping[str, str] | None = None,
+) -> tuple[dict[str, str], list[str]]:
+    """``(environment for a llama-server child, names that were stripped)``.
+
+    Everything else -- ``PATH``, ``CUDA_*``, ``GGML_*``, ``SF_*`` -- passes
+    through untouched: the child needs its DLL search path and its CUDA
+    settings, and none of those can move a layer off the GPU. Names are
+    matched case-insensitively because Windows environment names are.
+    """
+    source = os.environ if environ is None else environ
+    env: dict[str, str] = {}
+    stripped: list[str] = []
+    for key, value in source.items():
+        upper = key.upper()
+        if upper.startswith(_CHILD_ENV_PREFIXES) or upper in _CHILD_ENV_NAMES:
+            stripped.append(key)
+            continue
+        env[key] = value
+    return env, sorted(stripped)
+
 
 #: Removed-flag hints used as a *fallback* when the engine's own ``--help``
 #: output does not identify the flag as removed. ``b10425`` renamed the whole
 #: speculative-decoding surface; the old spellings are either gone or accepted
 #: and ignored, which looks exactly like speculative decoding doing nothing.
+#: ``--n-gpu-layers-draft`` is deliberately NOT here: it is a live alias of
+#: ``--spec-draft-ngl`` on b10425 and b10689 alike (and managed, above), and
+#: listing it as retired taught this file that a spelling the engine honours
+#: was dead.
 REMOVED_FLAG_HINTS: dict[str, str] = {
     "--draft": "--spec-draft-n-max",
     "--draft-n": "--spec-draft-n-max",
@@ -116,7 +361,6 @@ REMOVED_FLAG_HINTS: dict[str, str] = {
     "--draft-n-min": "--spec-draft-n-min",
     "--cache-type-k-draft": "--spec-draft-type-k",
     "--cache-type-v-draft": "--spec-draft-type-v",
-    "--n-gpu-layers-draft": "--spec-draft-ngl",
 }
 
 _REMOVED_PHRASE = "the argument has been removed"
@@ -128,21 +372,16 @@ _REMOVED_PHRASE = "the argument has been removed"
 _SHELL_METACHARS = frozenset("|&;<>$`\n\r()")
 
 #: Flags whose *values* legitimately contain ``;``, ``|``, ``(`` and ``)``:
-#: sampler chains and tensor-override regexes. Only the truly shell-only
-#: characters stay banned for these.
+#: sampler chains, grammars and templates. Only the truly shell-only
+#: characters stay banned for these. The tensor-override family used to be
+#: here too -- a carve-out that made the one flag family the GPU-only policy
+#: forbids *easier* to get through; it is refused outright now (POLICY_FAMILIES).
 _RELAXED_VALUE_FLAGS = frozenset(
     {
         "--samplers",
         "--sampling-seq",
         "--dry-sequence-breaker",
-        "--override-tensor",
-        "-ot",
-        "--override-tensor-draft",
-        "-otd",
-        "--spec-draft-override-tensor",
         "--override-kv",
-        "--tensor-split",
-        "-ts",
         "--grammar",
         "--chat-template",
         "--logit-bias",
@@ -2588,12 +2827,19 @@ class EngineManager:
         timeout = max(10.0, float(self.config.engine.smoke_test_timeout_s))
         stderr_tail: deque[str] = deque(maxlen=200)
         stdout_tail: deque[str] = deque(maxlen=200)
+        # The same environment rule as a real launch: an inherited
+        # LLAMA_ARG_N_CPU_MOE would make the smoke test "pass" on a build that
+        # then serves every real load half on the CPU.
+        env, stripped = child_environment()
+        if stripped:
+            log.warning("engine.smoke.child_env_stripped", names=stripped)
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 cwd=str(binary.parent),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env=env,
                 **_spawn_kwargs(),
             )
         except OSError as exc:
@@ -2868,14 +3114,12 @@ class EngineManager:
 
             if not _FLAG_START_RE.match(base) or not re.match(r"^-{1,2}[A-Za-z]", base):
                 continue  # a value (including negative numbers like -1)
-            if base in MANAGED_FLAGS:
-                canonical = MANAGED_FLAGS[base]
-                alias = "" if canonical == base else f" ({canonical})"
-                errors.append(
-                    f"'{base}'{alias} is managed by StudioForge and cannot be set in extra "
-                    "flags: the manager assigns the model, alias, port, host and full GPU "
-                    "offload for every instance"
-                )
+            # Policy before existence: a CPU-offload flag EXISTS in every
+            # engine's help, which is exactly why an existence check alone let
+            # ``--cpu-moe`` through for as long as it did (audit 2026-09-09).
+            refusal = policy_refusal(base)
+            if refusal is not None:
+                errors.append(refusal)
             elif base in removed:
                 hint = removed[base]
                 suffix = f"; try {hint}" if hint else ""

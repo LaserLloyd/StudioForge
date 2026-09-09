@@ -25,8 +25,9 @@ from studioforge.core.benchmark import (
     BenchmarkResult,
     available_modes,
 )
+from studioforge.core.leases import DEFAULT_VACATE_RETRY_AFTER_S
 from studioforge.db import SCHEMA_VERSION, Database
-from studioforge.errors import ModelBusyError
+from studioforge.errors import LeaseConflictError, ModelBusyError
 from studioforge.types import (
     GB,
     GgufMeta,
@@ -1108,3 +1109,115 @@ async def test_each_mode_runs_under_its_own_gpu_lease(engine: FakeEngine) -> Non
     assert manager.released == [f"lease-{n}" for n in range(1, len(manager.leased) + 1)], (
         "every lease is released when its mode ends, success or not"
     )
+
+
+# ---------------------------------------------------------------------------
+# D56: a tenant that has been asked to vacate is waited for (audit F5)
+# ---------------------------------------------------------------------------
+
+
+class VacatingManager(StubManager):
+    """A manager whose first ``vacating`` acquires answer ``409 lease_vacating``.
+
+    That is what the real one says while a worse-class holder that
+    registered a vacate endpoint has been asked to leave: re-ask in
+    ``retry_after_s``, the cards are yours once it does (D56).
+    """
+
+    def __init__(self, record: ModelRecord, probe: StubProbe, *, vacating: int) -> None:
+        super().__init__(record, probe)
+        self.vacating = vacating
+        self.attempts = 0
+
+    async def acquire_lease(self, devices: Any, **kwargs: Any) -> Any:
+        self.attempts += 1
+        if self.attempts <= self.vacating:
+            raise LeaseConflictError(
+                "CUDA [0] is leased by a worse class and the holder has been asked to vacate",
+                code="lease_vacating",
+                param="devices",
+                details={"retry_after_s": 0.01, "vacate": {"state": "vacating", "leases": ["L1"]}},
+            )
+        return await super().acquire_lease(devices, **kwargs)
+
+
+async def test_a_vacating_lease_is_re_asked_until_the_holder_leaves(engine: FakeEngine) -> None:
+    """The docs told external callers to re-ask on ``retry_after_s``; nothing
+    inside StudioForge did. The benchmark took the first 409 as a failed mode
+    and released its own lease while ComfyUI freed the cards for nobody."""
+    probe = StubProbe(reference_rig())
+    record = make_record()
+    manager = VacatingManager(record, probe, vacating=2)
+    bench = Benchmarker(manager, probe=probe)
+
+    report = await bench.run(record, modes=["rtx-5090-x1"], max_tokens=8)
+
+    (result,) = report.results
+    assert result.error is None, result.error
+    assert result.generation_tps is not None
+    assert manager.attempts == 3, "two 'vacating' answers, then the lease"
+    assert len(manager.leased) == 1 and manager.released == ["lease-1"]
+
+
+async def test_the_re_ask_stops_when_the_vacate_window_lapses(engine: FakeEngine) -> None:
+    """Bounded by ``leases.vacate_timeout_s``: the window the HOLDER was given.
+    A holder that never leaves costs the benchmark that window, not forever."""
+    probe = StubProbe(reference_rig())
+    record = make_record()
+    manager = VacatingManager(record, probe, vacating=10_000)
+    manager.config = SimpleNamespace(  # type: ignore[attr-defined]
+        leases=SimpleNamespace(vacate_timeout_s=0.05, vacate_retry_after_s=0.01)
+    )
+    bench = Benchmarker(manager, probe=probe)
+
+    report = await bench.run(record, modes=["rtx-5090-x1"], max_tokens=8)
+
+    (result,) = report.results
+    assert result.error is not None and "asked to vacate" in result.error
+    assert 2 <= manager.attempts < 100, "re-asked through the window, then gave up"
+    assert manager.loads == [], "a mode without its lease never loads"
+
+
+async def test_a_plain_lease_conflict_is_not_waited_on() -> None:
+    """Only the one code that promises the cards is worth waiting for."""
+
+    class Refusing:
+        attempts = 0
+
+        async def acquire_lease(self, devices: Any, **kwargs: Any) -> Any:
+            self.attempts += 1
+            raise LeaseConflictError("CUDA [0] is already leased", param="devices")
+
+    manager = Refusing()
+    with pytest.raises(LeaseConflictError) as excinfo:
+        await benchmark_module.acquire_lease_awaiting_vacate(manager, [0], holder="benchmark")
+    assert excinfo.value.code == "lease_conflict" and manager.attempts == 1
+
+
+async def test_the_re_ask_honours_the_servers_interval_and_falls_back_sanely() -> None:
+    waits: list[float] = []
+
+    class Vacating:
+        def __init__(self, details: list[dict[str, Any]]) -> None:
+            self.details = details
+
+        async def acquire_lease(self, devices: Any, **kwargs: Any) -> Any:
+            if self.details:
+                raise LeaseConflictError(
+                    "vacating", code="lease_vacating", details=self.details.pop(0)
+                )
+            return SimpleNamespace(id="lease-ok", devices=list(devices))
+
+    async def fake_sleep(seconds: float) -> None:
+        waits.append(seconds)
+
+    original = benchmark_module.asyncio.sleep
+    benchmark_module.asyncio.sleep = fake_sleep  # type: ignore[assignment]
+    try:
+        manager = Vacating([{"retry_after_s": 7}, {"retry_after_s": "garbage"}, {}])
+        lease = await benchmark_module.acquire_lease_awaiting_vacate(manager, [0], holder="b")
+    finally:
+        benchmark_module.asyncio.sleep = original  # type: ignore[assignment]
+    assert lease.id == "lease-ok"
+    # 7 s as advised, then the shipped retry default when the advice is unusable.
+    assert waits == [7.0, DEFAULT_VACATE_RETRY_AFTER_S, DEFAULT_VACATE_RETRY_AFTER_S]

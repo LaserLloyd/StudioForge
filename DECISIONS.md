@@ -5083,16 +5083,13 @@ where a rename goes unnoticed, in `tests/unit/test_catalog_routes.py`:
 
 
 
-**Status at the commit that carries this entry (2026-09-09, session cut short by quota).** The
-planner (same-generation pools, the bound on the plan, the named shortfall, the 5% warning), the
-dry-run route and MCP tool, the TTL policy, the two closed swallows and the `bench/` harness landed
-in this commit and are green on their suites. The GPU-only hardening, the unload reporting and the
-timing items (Lane D2) were still being written when the session stopped: their edits sit
-UNCOMMITTED in the working tree (`core/supervisor.py`, `core/engine.py`, `watchdog/server.py`,
-`tray/tray_app.py`, `core/benchmark.py`, `core/parallel_bench.py`, `docs/ENGINE-FEATURES.md` and
-their tests, plus `tests/unit/test_gpu_only_policy.py` / `test_unload_reporting.py`) with seven of
-their tests failing at the time of writing. Do not restart the server from this tree until that
-work is finished or stashed. The resume plan is `Projects/docs/SWARM_FOLLOWUP.md`.
+**Status.** Landed in two commits on 2026-09-10: the planner, dry-run, TTL-policy, swallow
+fixes and `bench/` in the first; the GPU-only hardening, unload reporting and timing items
+(Lane D2) in the second, with the whole `tests/unit` suite green (3429 passed), ruff and mypy
+clean. The live server was still running the pre-round code at commit time; the restart is
+the deploy step. A live registry read found no model row with saved `extra_flags`, so the
+stricter save/launch refusal (item 6 of the lane's request file) refuses nothing that exists
+today.
 
 **Context.** A cross-repo regression review (StudioForge, ClawForge2, ClawChat V12→V13) ran on
 2026-09-09 against a build spec whose Phases 3 and 5 asked for a "computed VRAM planner" and "one

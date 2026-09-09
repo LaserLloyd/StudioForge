@@ -29,11 +29,11 @@ import pytest
 
 from studioforge.config import Config
 from studioforge.core import supervisor as supervisor_module
-from studioforge.core.engine import EngineFeatures
+from studioforge.core.engine import POLICY_FLAGS, EngineFeatures
 from studioforge.core.supervisor import (
     ALL_GPU_LAYERS,
-    CPU_OFFLOAD_FLAGS,
     Supervisor,
+    launch_policy_violations,
     safe_log_name,
 )
 from studioforge.errors import ModelLoadError
@@ -178,8 +178,6 @@ def test_minimal_chat_command_is_exact(config: Config, tmp_path: Path) -> None:
         "127.0.0.1",
         "--port",
         "18100",
-        "--n-gpu-layers",
-        "999",
         "--ctx-size",
         "8192",
         "--parallel",
@@ -200,11 +198,6 @@ def test_minimal_chat_command_is_exact(config: Config, tmp_path: Path) -> None:
         "--props",
         "--slots",
         "--metrics",
-        # b10425's --fit defaults to ON and would auto-adjust unset arguments to
-        # fit device memory. The planner already made that decision, so the
-        # engine must not second-guess it (GPU-only: fail loudly, never shrink).
-        "--fit",
-        "off",
         "--cache-reuse",
         "256",
         # llama.cpp's default ('auto') routes a reasoning model's thoughts into
@@ -212,6 +205,15 @@ def test_minimal_chat_command_is_exact(config: Config, tmp_path: Path) -> None:
         # OpenAI client. 'none' keeps them inline. See DECISIONS.md D12.
         "--reasoning-format",
         "none",
+        # The GPU-only policy's two flags come LAST, after extra_flags, so
+        # llama.cpp's last-occurrence-wins rule can only ever land on them
+        # (audit 2026-09-09). b10425's --fit defaults to ON and would
+        # auto-adjust unset arguments to fit device memory; the planner already
+        # made that decision (GPU-only: fail loudly, never shrink).
+        "--n-gpu-layers",
+        "999",
+        "--fit",
+        "off",
     ]
 
 
@@ -592,16 +594,27 @@ def test_draft_kv_types_come_from_the_draft_record(config: Config, tmp_path: Pat
     assert value_after(argv, "--spec-draft-type-v") == "q8_0"
 
 
-def test_extra_flags_are_last_and_shell_split(config: Config, tmp_path: Path) -> None:
+#: What every argv ends with since the 2026-09-09 audit: the two GPU-only
+#: flags, after extra_flags, so an override can never land on them.
+POLICY_TRAILER = ["--n-gpu-layers", "999", "--fit", "off"]
+
+
+def test_extra_flags_are_last_but_for_the_policy_trailer_and_shell_split(
+    config: Config, tmp_path: Path
+) -> None:
+    """extra_flags used to be the very last tokens. They are still the last
+    thing the USER controls -- after every flag of ours they may override --
+    but the policy trailer follows them (updated with the trailer's arrival)."""
     binary = make_binary(tmp_path)
     record = make_record(
         tmp_path, settings=ModelSettings(extra_flags="--cache-reuse 4096 --timeout 900")
     )
     argv = sup(config, binary).build_command(record, make_plan(), port=18100)
-    assert argv[-4:] == ["--cache-reuse", "4096", "--timeout", "900"]
+    assert argv[-4:] == POLICY_TRAILER
+    assert argv[-8:-4] == ["--cache-reuse", "4096", "--timeout", "900"]
     # Our own --cache-reuse is still present but earlier, so the override wins.
     assert argv.count("--cache-reuse") == 2
-    assert argv.index("--cache-reuse") < len(argv) - 4
+    assert argv.index("--cache-reuse") < len(argv) - 8
 
 
 def test_extra_flags_quoting(config: Config, tmp_path: Path) -> None:
@@ -609,15 +622,21 @@ def test_extra_flags_quoting(config: Config, tmp_path: Path) -> None:
         tmp_path, settings=ModelSettings(extra_flags='--chat-template-file "my template.jinja"')
     )
     argv = sup(config, make_binary(tmp_path)).build_command(record, make_plan(), port=18100)
+    assert argv[-4:] == POLICY_TRAILER
     if os.name == "nt":
         # posix=False keeps quotes (and backslash paths) intact on Windows.
-        assert argv[-2:] == ["--chat-template-file", '"my template.jinja"']
+        assert argv[-6:-4] == ["--chat-template-file", '"my template.jinja"']
     else:
-        assert argv[-2:] == ["--chat-template-file", "my template.jinja"]
+        assert argv[-6:-4] == ["--chat-template-file", "my template.jinja"]
 
 
 def test_builder_never_emits_cpu_offload_or_partial_gpu(config: Config, tmp_path: Path) -> None:
-    """Sweep every builder branch: GPU-only must be unreachable to break."""
+    """Sweep every builder branch: GPU-only must be unreachable to break.
+
+    Asserted against the engine's own policy table (the offload families of
+    ``POLICY_FLAGS``) and against ``launch_policy_violations`` -- the dead
+    ``CPU_OFFLOAD_FLAGS`` set this used to read is gone (audit 2026-09-09).
+    """
     binary = make_binary(tmp_path)
     supervisor = sup(config, binary)
     adapter = AdapterRecord(id="a", name="a", path=tmp_path / "a.gguf")
@@ -649,9 +668,12 @@ def test_builder_never_emits_cpu_offload_or_partial_gpu(config: Config, tmp_path
                 record, plan, port=18100, draft=draft, adapters=[(adapter, 0.5)]
             )
             for index, token in enumerate(argv):
-                assert token not in CPU_OFFLOAD_FLAGS, token
+                family = POLICY_FLAGS.get(token)
+                assert family is None or family.kind != "offload", token
                 if token in ("--n-gpu-layers", "-ngl", "--gpu-layers", "--spec-draft-ngl"):
                     assert argv[index + 1] == "999"
+            assert launch_policy_violations(argv, record.settings) == []
+            assert argv[-4:] == POLICY_TRAILER
 
 
 def test_safe_log_name_strips_path_separators() -> None:

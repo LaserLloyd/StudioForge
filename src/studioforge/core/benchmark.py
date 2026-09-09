@@ -57,10 +57,11 @@ from typing import TYPE_CHECKING, Any
 import httpx
 
 from studioforge.core.gpu import fastest_gpu_order
+from studioforge.core.leases import DEFAULT_VACATE_RETRY_AFTER_S, DEFAULT_VACATE_TIMEOUT_S
 from studioforge.core.planner import BUSY_RETRY_AFTER_S
 from studioforge.core.priority import PRIORITY_AGENT, PRIORITY_CHAT
 from studioforge.core.supervisor import SPLIT_MODE_TENSOR, tensor_split_model_blockers
-from studioforge.errors import BadRequestError, ModelBusyError, ModelLoadError
+from studioforge.errors import BadRequestError, LeaseConflictError, ModelBusyError, ModelLoadError
 from studioforge.logging import get_logger
 from studioforge.types import GpuInfo, LoadRejected, ModelRecord, ModelSettings
 
@@ -87,6 +88,78 @@ def benchmark_lease_priority(manager: Any) -> int:
     section = getattr(config, "benchmark", None)
     value = getattr(section, "lease_priority", None)
     return int(value) if isinstance(value, int) and not isinstance(value, bool) else PRIORITY_AGENT
+
+
+#: The vacate re-ask (D56) is bounded by ``leases.vacate_timeout_s`` -- the
+#: window the HOLDER was given -- so a benchmark waits exactly as long as the
+#: server itself keeps answering ``lease_vacating``, and not a moment past it.
+LEASE_VACATING = "lease_vacating"
+
+
+def _vacate_budget(manager: Any) -> tuple[float, float]:
+    """``(window_s, fallback retry_s)`` from the manager's config, or the shipped defaults."""
+    section = getattr(getattr(manager, "config", None), "leases", None)
+    window = getattr(section, "vacate_timeout_s", None)
+    retry = getattr(section, "vacate_retry_after_s", None)
+    window_s = float(window) if isinstance(window, int | float) and window > 0 else None
+    retry_s = float(retry) if isinstance(retry, int | float) and retry > 0 else None
+    return (
+        window_s if window_s is not None else DEFAULT_VACATE_TIMEOUT_S,
+        retry_s if retry_s is not None else DEFAULT_VACATE_RETRY_AFTER_S,
+    )
+
+
+async def acquire_lease_awaiting_vacate(manager: Any, devices: Sequence[int], **kwargs: Any) -> Any:
+    """``manager.acquire_lease`` that re-asks through a ``lease_vacating`` window.
+
+    A better class asking for cards a worse-class tenant holds gets ``409
+    lease_vacating`` with ``retry_after_s`` (D56): the holder has been asked
+    to leave, the cards are the asker's once it does. The docs told external
+    callers to re-ask on that interval; nothing inside StudioForge did. The
+    benchmark took the first 409 as a failed mode, released its own lease,
+    and ComfyUI freed the cards 30-120 s later for nobody (audit 2026-09-09,
+    F5). This loop re-asks every ``retry_after_s`` until the server stops
+    saying "vacating" -- it answers plain ``lease_conflict`` at the holder's
+    deadline -- or ``leases.vacate_timeout_s`` has elapsed locally, whichever
+    is first. Every other error, and a ``lease_conflict``, is raised as
+    before: only the one code that promises the cards is worth waiting on.
+    """
+    window_s, fallback_retry_s = _vacate_budget(manager)
+    started = time.monotonic()
+    asked = 0
+    while True:
+        try:
+            return await manager.acquire_lease(devices, **kwargs)
+        except LeaseConflictError as exc:
+            if exc.code != LEASE_VACATING:
+                raise
+            elapsed = time.monotonic() - started
+            remaining = window_s - elapsed
+            if remaining <= 0:
+                log.warning(
+                    "benchmark.vacate_window_lapsed",
+                    holder=kwargs.get("holder"),
+                    devices=list(devices),
+                    asked=asked,
+                    waited_s=round(elapsed, 1),
+                )
+                raise
+            advised = exc.details.get("retry_after_s")
+            retry_s = fallback_retry_s
+            if isinstance(advised, int | float) and not isinstance(advised, bool) and advised > 0:
+                retry_s = float(advised)
+            wait_s = min(retry_s, remaining)
+            asked += 1
+            log.info(
+                "benchmark.waiting_for_vacate",
+                holder=kwargs.get("holder"),
+                devices=list(devices),
+                retry_after_s=wait_s,
+                asked=asked,
+                window_left_s=round(remaining, 1),
+                leases=(exc.details.get("vacate") or {}).get("leases"),
+            )
+            await asyncio.sleep(wait_s)
 
 
 #: Fixed prompt so two runs are comparable. Long enough (a few hundred tokens)
@@ -781,8 +854,12 @@ class Benchmarker:
             # -- so the number measured is the card's, not the neighbours'.
             # Class 2 by default (benchmark.lease_priority, D56): dispatched
             # work that may ASK a background render tenant to vacate the
-            # cards, and never displaces the chat model's claim.
-            lease = await self.manager.acquire_lease(
+            # cards, and never displaces the chat model's claim. While the
+            # tenant is vacating the ask is repeated on the interval the
+            # server hands back, for as long as the server keeps promising.
+            _emit(on_progress, mode.key, "leasing", position, total)
+            lease = await acquire_lease_awaiting_vacate(
+                self.manager,
                 mode.devices,
                 holder="benchmark",
                 model_ids=[record.id],

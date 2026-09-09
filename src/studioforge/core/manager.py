@@ -43,6 +43,7 @@ from studioforge.errors import (
     ModelBusyError,
     ModelLoadError,
     ModelNotFoundError,
+    ModelUnloadError,
     StudioForgeError,
 )
 from studioforge.logging import get_logger
@@ -2594,6 +2595,12 @@ class ModelManager:
             self._note_displaced(record, victim, priority=priority)
             self._record_eviction(victim, reason="oom-retry", evicted_by=record.id)
             await self.supervisor.stop(victim)
+            # The first plan is protected by _gpus_as_if_gone credit; this
+            # re-plan is not -- the victim is already out of supervisor.list()
+            # -- and it reads live NVML, which hands memory back a beat after
+            # the process is gone. Without the settle a re-plan on an empty
+            # card was a 507 insufficient_vram (audit 2026-09-09, F6).
+            await self._settle_vram()
 
         # Re-plan: free VRAM has changed, so placement and context may too.
         # The caller's explicit overrides (ctx_size/kv/parallel) must survive
@@ -2636,6 +2643,17 @@ class ModelManager:
         )
         log.info("load succeeded on retry", model_id=record.id)
         return instance
+
+    async def _settle_vram(self) -> None:
+        """Give the driver the supervisor's VRAM-settle beat after an eviction.
+
+        A stand-in supervisor without ``vram_settle_s`` (tests, the catalog's
+        throwaway managers) settles nothing: the wait is a courtesy to NVML, not
+        a correctness step anything else depends on.
+        """
+        settle = float(getattr(self.supervisor, "vram_settle_s", 0.0) or 0.0)
+        if settle > 0:
+            await asyncio.sleep(settle)
 
     def _eviction_candidate(self, *, exclude: str, for_priority: int | None = None) -> str | None:
         """Best eviction victim -- worst tier, LRU within it -- or None.
@@ -3066,14 +3084,45 @@ class ModelManager:
         is never worth silently taking a benchmark's cards out from under it, and
         a partial unload-all would be a worse answer than a refusal that names
         the lease.
+
+        Raises :class:`~studioforge.errors.ModelUnloadError` (500 ``unload_failed``)
+        naming every child that outlived the teardown; ``details.unloaded`` lists
+        the ones that did go. Until 2026-09-09 this returned the pre-computed id
+        list unconditionally and the route answered 200 for children still alive.
         """
         ids = [i.model_id for i in self.supervisor.list()]
         if not force:
             self.require_lease_clear(ids, "to unload every model")
         self._pin_suppressed.update(ids)
         self._restore_entries.clear()
-        await self.supervisor.stop_all()
-        return ids
+        results = await self.supervisor.stop_all()
+        unloaded = [model_id for model_id, failure in results.items() if failure is None]
+        failed = {model_id: failure for model_id, failure in results.items() if failure is not None}
+        if failed:
+            # A survivor keeps its CUDA context, i.e. all of its VRAM, and the
+            # supervisor keeps it in the table as ``failed`` so it stays visible.
+            # Reporting the ids we *meant* to unload as unloaded is the lie every
+            # later plan would then be computed against (errors.ModelUnloadError).
+            names = ", ".join(
+                f"{model_id} (pid {getattr(failure, 'details', {}).get('pid')})"
+                for model_id, failure in failed.items()
+            )
+            raise ModelUnloadError(
+                f"unload-all could not verify {len(failed)} of {len(results)} unload(s): "
+                f"{names} still alive, VRAM still held. Kill them manually before loading "
+                "anything else.",
+                details={
+                    "unloaded": unloaded,
+                    "failed": {
+                        model_id: {
+                            "pid": getattr(failure, "details", {}).get("pid"),
+                            "error": getattr(failure, "message", str(failure)),
+                        }
+                        for model_id, failure in failed.items()
+                    },
+                },
+            )
+        return unloaded
 
     # -- GPU leases (D43) --------------------------------------------------
 
@@ -3223,6 +3272,7 @@ class ModelManager:
             vacate_token=vacate_token,
             holder_peer=holder_peer,
         )
+        evicted_any = False
         try:
             for victim in victims:
                 current = self.supervisor.get(victim.model_id)
@@ -3254,11 +3304,17 @@ class ModelManager:
                 )
                 self._record_eviction(victim.model_id, reason="lease", evicted_by=holder)
                 await self.supervisor.stop(victim.model_id)
+                evicted_any = True
         except BaseException:
             # CancelledError included: a cancelled benchmark must not leave a
             # lease standing that nobody holds a handle to.
             self.leases.release(lease.id)
             raise
+        if evicted_any:
+            # The holder starts allocating the moment it has the lease; give the
+            # driver the same beat the supervisor gives its own VRAM sample, or
+            # ClawForge2 allocates into memory that has not been handed back.
+            await self._settle_vram()
         # The host:port only -- a path or query is the holder's business, and
         # the token never reaches a log line at all (D6, D56).
         vacate_target = None

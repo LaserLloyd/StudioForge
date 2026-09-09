@@ -64,8 +64,10 @@ class CountingSupervisor:
     async def stop(self, model_id: str, **_kwargs: Any) -> None:
         self.instances.pop(model_id, None)
 
-    async def stop_all(self, **_kwargs: Any) -> None:
+    async def stop_all(self, **_kwargs: Any) -> dict[str, BaseException | None]:
+        outcome: dict[str, BaseException | None] = dict.fromkeys(self.instances)
         self.instances.clear()
+        return outcome
 
     def tail_log(self, model_id: str, n: int = 200) -> list[str]:
         return []
