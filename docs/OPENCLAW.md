@@ -438,6 +438,15 @@ never moves it. Any *other* idle model may find itself quietly reloaded onto few
 contended cards once a minute on a quiet box — that is housekeeping (`planner.rebalance`), not
 something you did, and it never evicts or interrupts anything.
 
+**A lease survives a restart of StudioForge** (D61). The book is mirrored to the registry, and
+when the server comes back the standing leases come back with it — same `lease_id`, same clocks,
+same `vacate_url`, so keep touching and keep the id. What does not come back: a lease idle past
+its `idle_ttl_s` while the server was down (the sweep would have released it), and the server's
+own benchmark leases (their holder did not survive). A vacate that was in flight at the restart is
+forgotten; a better class asking again starts the protocol over. Before D61 a restart emptied the
+book, and on 2026-09-10 two other tenants' loads landed on the card ClawForge2 had leased for
+ComfyUI — every re-ask since answered `503 busy`, because a lease never interrupts a stream.
+
 **Reading a lease record.** Every lease projection — `GET /api/leases`, `GET /api/status`,
 `server_status.leases`, and the ones attached to a refusal — carries the same keys:
 
@@ -448,6 +457,7 @@ something you did, and it never evicts or interrupts anything.
 | `holder_family` | everything before the first `-` or `:` in `holder`, lowercased. CrucibleForge leases as `crucibleforge` for a run and `crucibleforge-judge` for the judge phase; both answer `crucibleforge`, and this server's own `benchmark:parallel` answers `benchmark` — match on this rather than on the exact holder |
 | `kind` | `benchmark`, `render`, `agent` or `other`, derived from `holder_family`. **Descriptive, never enforced** — the book is strictly first-come-first-served, and nothing preempts on this |
 | `retry_after_s` | how long to wait before asking again, capped at 300 s. `null` when there is no expiry. Capped on purpose: an early release is common, and a client asleep for two hours would never notice one |
+| `restored_at` | when the lease was re-entered from the registry after a restart (D61); `null` for a lease the running server granted. A restored lease's holder has not necessarily been heard from since — the idle clocks say whether it has |
 
 `/api/status` used to dump the stored fields only, so `idle_s` and `expires_at` were missing there
 while `/api/leases` had them — that is fixed (D53), and the two now return the same keys.

@@ -23,6 +23,7 @@ from studioforge.core.leases import (
     DEFAULT_IDLE_TTL_S,
     LEASE_OPEN_ENDED_RETRY_S,
     LeaseBook,
+    lease_store_for,
     lease_view,
     send_vacate_request,
     vacate_reaskable,
@@ -401,6 +402,14 @@ class ModelManager:
         #: granted here is honoured there; a manager built without one (tests)
         #: keeps a private, empty book.
         self.leases = leases if leases is not None else LeaseBook()
+        if self.leases.store is None:
+            # Mirror the book to the registry (D61). The app builds the book
+            # before the manager so the planner can share it, and the manager
+            # is the one holding the database, so the binding happens here.
+            # A stub database (tests) has no lease table and gets no mirror.
+            store = lease_store_for(db)
+            if store is not None:
+                self.leases.bind_store(store)
         #: In-flight vacate POSTs (D56), held so the loop cannot collect them;
         #: each is bounded by ``leases.vacate_callback_timeout_s``. The sender
         #: is an attribute so a test can swap in a recorder.
@@ -508,8 +517,13 @@ class ModelManager:
     # -- lifecycle --------------------------------------------------------
 
     async def start(self) -> None:
-        """Start background work: the TTL sweeper and any pinned auto-loads."""
+        """Start background work: the TTL sweeper and any pinned auto-loads.
+
+        The standing leases come back first (D61), before the sweeper that
+        expires them and the autoload that must honour them.
+        """
         self._calibrate_from_history()
+        self._restore_leases()
         self._ttl_task = asyncio.create_task(self._ttl_loop(), name="studioforge-ttl-sweep")
         if self.config.models.auto_load_pinned or self.config.models.preload_default_model:
             # Held by reference: the event loop keeps only weak refs to tasks,
@@ -3493,10 +3507,65 @@ class ModelManager:
     def touch_lease(self, lease_id: str) -> GpuLease:
         return self.leases.touch(lease_id)
 
+    def _restore_leases(self) -> None:
+        """Re-enter the leases the registry holds from before the restart (D61).
+
+        The book decides what a restart keeps (:meth:`LeaseBook.restore`:
+        not a row idle past its TTL, not this server's own benchmark's); this
+        adds the one check only the manager can make -- a lease naming a CUDA
+        device this box no longer has is released, because the planner could
+        never honour it and a holder re-asking would be told the same. Never
+        raises: a restore that fails leaves an empty book and a traceback,
+        which is exactly the pre-D61 boot plus a reason.
+        """
+        try:
+            restored = self.leases.restore()
+            known = self._known_devices()
+            now = time.time()
+            kept = 0
+            for lease in restored:
+                unknown = [d for d in lease.devices if known is not None and d not in known]
+                if unknown:
+                    self.leases.release(lease.id)
+                    log.warning(
+                        "gpu lease dropped at restore: it names a CUDA device this box does "
+                        "not have",
+                        lease_id=lease.id,
+                        holder=lease.holder,
+                        devices=list(lease.devices),
+                        unknown_devices=unknown,
+                        known_devices=known,
+                    )
+                    continue
+                expires = lease.expires_at
+                log.info(
+                    "gpu lease restored",
+                    lease_id=lease.id,
+                    holder=lease.holder,
+                    devices=list(lease.devices),
+                    model_ids=list(lease.model_ids),
+                    priority=lease.priority,
+                    idle_s=round(max(0.0, now - lease.last_activity_at)),
+                    expires_in=None if expires is None else round(max(0.0, expires - now)),
+                    vacate_registered=bool(lease.vacate_url),
+                )
+                kept += 1
+            log.info(
+                "gpu leases restored from the registry",
+                restored=kept,
+                dropped=len(restored) - kept,
+            )
+        except Exception as exc:  # noqa: BLE001 - a boot never fails on the mirror
+            log.exception(
+                "gpu leases could not be restored; starting with an empty book", error=repr(exc)
+            )
+
     def _expire_leases(self) -> None:
         """Release leases idle past their ttl; an owner's own activity counts as a touch.
 
-        In-memory only: a handful of dict lookups per sweep.
+        A handful of dict lookups per sweep; the touches reach the registry
+        on the book's coalescing clock (D61), so a lease with a resident
+        model costs one small write per sweep, not per request.
         """
         if not len(self.leases):
             return

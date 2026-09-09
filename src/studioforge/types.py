@@ -1168,6 +1168,11 @@ class GpuLease(BaseModel):
     #: The HTTP status or the exception's CLASS NAME behind ``vacate_delivery``.
     #: Never the exception text, which can quote the header (D6).
     vacate_delivery_status: str | None = None
+    #: When this lease was re-entered from the registry after a restart (D61),
+    #: else ``None``. Surfaced so a reader can tell a lease the running server
+    #: granted from one it inherited -- whose holder may not have been heard
+    #: from since the restart, though the idle TTL still bounds that.
+    restored_at: float | None = None
     #: The peer address the lease was registered from over HTTP, when it was
     #: (D55). Proof of holdership for the open unload routes: the caller that
     #: took the lease is the caller that may take its models down. Excluded

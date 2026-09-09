@@ -7,11 +7,20 @@ model) sees the cards as absent and places elsewhere or is refused with the
 lease named. A lease with no models holds the cards for something outside
 this server entirely (a ComfyUI run, a training job).
 
-The book is in-memory on purpose: a lease describes a live situation -- a
-benchmark in progress, a model someone wants warm for the afternoon -- and a
-restart is a clean slate. What keeps it honest is the idle TTL: the sweep
-releases a lease nobody has touched for that long, so a crashed benchmark or
-a forgotten reservation cannot hold a card forever.
+The book lives in memory and is mirrored to the registry (D61). It was
+in-memory only until 2026-09-10, on the theory that a lease describes a live
+situation and a restart is a clean slate; that morning a restart emptied the
+book and two tenants' loads landed on the card ClawForge2 had leased for
+ComfyUI, and every re-ask since answered ``503 busy`` because a lease never
+interrupts a stream (D36). Now every acquire, release and vacate mark is
+written through, touches are written on a coalesced clock, and a restart
+restores the standing leases with their clocks -- a holder that did
+everything right keeps its card. What keeps the book honest is still the
+idle TTL: the sweep releases a lease nobody has touched for that long, a
+row idle past it is dropped at restore rather than re-entered, and this
+server's own benchmark leases -- whose holder cannot outlive the process --
+are never restored at all. So a crashed benchmark, a forgotten reservation
+or a holder that died while the server was down cannot hold a card forever.
 
 Vacating (D56): a lease carries the D46 class of its claim, and a holder may
 register a ``vacate_url``. When a strictly better class asks for the cards,
@@ -31,8 +40,8 @@ import socket
 import ssl
 import time
 import uuid
-from collections.abc import Iterable
-from typing import Any
+from collections.abc import Iterable, Mapping
+from typing import Any, Protocol
 from urllib.parse import urlsplit
 
 import httpx
@@ -46,6 +55,23 @@ log = get_logger(__name__)
 
 #: How long a lease survives with no activity before the sweep releases it.
 DEFAULT_IDLE_TTL_S = 3600.0
+
+# -- persistence (D61) --------------------------------------------------------
+
+#: Touches are coalesced: a keep-alive every second must not become a disk
+#: write every second, so a touch is mirrored only when this long has passed
+#: since the row was last written. Acquire, release and the vacate marks are
+#: always written. The cost of the gap is bounded by it: a restore can see a
+#: ``last_activity_at`` at most this much older than the holder's last touch.
+TOUCH_PERSIST_INTERVAL_S = 5.0
+
+#: Holder families whose leases belong to THIS process: the in-process
+#: benchmarker leases as ``benchmark`` and ``benchmark:parallel``. Such a
+#: holder cannot outlive a restart, so its rows are dropped at restore rather
+#: than held for an hour of idle TTL on behalf of a run that no longer
+#: exists. ``crucibleforge`` is a separate process and is NOT here, whatever
+#: :data:`LEASE_KINDS` calls it.
+OWN_HOLDER_FAMILIES: frozenset[str] = frozenset({"benchmark"})
 
 # -- vacate (D56) -------------------------------------------------------------
 
@@ -112,11 +138,189 @@ LEASE_KINDS: dict[str, str] = {
 }
 
 
-class LeaseBook:
-    """Every standing lease, keyed by id. Single-threaded: lives on the event loop."""
+# ---------------------------------------------------------------------------
+# The mirror (D61)
+# ---------------------------------------------------------------------------
 
-    def __init__(self) -> None:
+
+class LeaseStore(Protocol):
+    """Where the book mirrors itself. ``load`` answers oldest first.
+
+    A store may raise: the book catches, warns once per failure kind and
+    carries on, because the in-memory book is authoritative and a disk
+    hiccup must never refuse or lose a lease.
+    """
+
+    def put(self, lease: GpuLease) -> None: ...
+
+    def delete(self, lease_id: str) -> None: ...
+
+    def load(self) -> list[GpuLease]: ...
+
+
+class LeaseRows(Protocol):
+    """The slice of :class:`studioforge.db.Database` the store adapter needs."""
+
+    def save_lease(self, row: dict[str, Any]) -> None: ...
+
+    def delete_lease(self, lease_id: str) -> None: ...
+
+    def list_leases(self) -> list[dict[str, Any]]: ...
+
+
+def lease_row(lease: GpuLease) -> dict[str, Any]:
+    """The stored shape of a lease: the standing fields, token and peer included.
+
+    The vacate window (``vacate_requested_at`` .. ``vacate_delivery_status``)
+    and ``restored_at`` are deliberately absent: a restart ends any ask in
+    flight, and the next better-class ask re-runs D56 from scratch.
+    """
+    return {
+        "id": lease.id,
+        "devices": list(lease.devices),
+        "holder": lease.holder,
+        "model_ids": list(lease.model_ids),
+        "reason": lease.reason,
+        "created_at": lease.created_at,
+        "last_activity_at": lease.last_activity_at,
+        "idle_ttl_s": lease.idle_ttl_s,
+        "priority": lease.priority,
+        "vacate_url": lease.vacate_url,
+        "vacate_token": lease.vacate_token,
+        "holder_peer": lease.holder_peer,
+        "updated_at": time.time(),
+    }
+
+
+def lease_from_row(row: Mapping[str, Any]) -> GpuLease:
+    """A lease from its stored shape; the model validates what the row claims."""
+    idle_ttl = row.get("idle_ttl_s")
+    return GpuLease(
+        id=str(row["id"]),
+        devices=[int(d) for d in row["devices"]],
+        holder=str(row["holder"]),
+        model_ids=[str(m) for m in row.get("model_ids") or []],
+        reason=str(row.get("reason") or ""),
+        created_at=float(row["created_at"]),
+        last_activity_at=float(row["last_activity_at"]),
+        idle_ttl_s=None if idle_ttl is None else float(idle_ttl),
+        priority=int(row.get("priority") or PRIORITY_BACKGROUND),
+        vacate_url=row.get("vacate_url") or None,
+        vacate_token=row.get("vacate_token") or None,
+        holder_peer=row.get("holder_peer") or None,
+    )
+
+
+class DatabaseLeaseStore:
+    """:class:`LeaseStore` over the registry's ``gpu_leases`` table."""
+
+    def __init__(self, db: LeaseRows) -> None:
+        self._db = db
+
+    def put(self, lease: GpuLease) -> None:
+        self._db.save_lease(lease_row(lease))
+
+    def delete(self, lease_id: str) -> None:
+        self._db.delete_lease(lease_id)
+
+    def load(self) -> list[GpuLease]:
+        out: list[GpuLease] = []
+        for row in self._db.list_leases():
+            try:
+                out.append(lease_from_row(row))
+            except Exception as exc:  # noqa: BLE001 - one bad row must not lose the rest
+                log.warning(
+                    "gpu lease row skipped at restore: unreadable",
+                    lease_id=row.get("id") if isinstance(row, Mapping) else None,
+                    error=type(exc).__name__,
+                )
+        return out
+
+
+def lease_store_for(db: Any) -> DatabaseLeaseStore | None:
+    """A store over ``db`` when it has the lease table's methods, else ``None``.
+
+    Duck-typed so a manager built over a stub database -- most unit tests --
+    keeps an unmirrored book rather than warning on every acquire.
+    """
+    if db is None:
+        return None
+    needed = ("save_lease", "delete_lease", "list_leases")
+    if all(callable(getattr(db, name, None)) for name in needed):
+        return DatabaseLeaseStore(db)
+    return None
+
+
+class LeaseBook:
+    """Every standing lease, keyed by id. Single-threaded: lives on the event loop.
+
+    With a :class:`LeaseStore` the book writes through (D61): every acquire,
+    release and vacate mark at once, touches on the
+    :data:`TOUCH_PERSIST_INTERVAL_S` clock. Without one it is the pre-D61
+    in-memory book to the byte.
+    """
+
+    def __init__(self, store: LeaseStore | None = None) -> None:
         self._leases: dict[str, GpuLease] = {}
+        self._store = store
+        #: lease id -> the clock value the row was last written at, for the
+        #: touch coalescing. Absent for a row whose last write failed, so the
+        #: next touch retries it.
+        self._written_at: dict[str, float] = {}
+        #: Failure kinds (``op:ExceptionName``) already warned about during the
+        #: current run of failures; cleared by the next success so a store
+        #: that comes back and fails again is heard again.
+        self._store_warned: set[str] = set()
+
+    @property
+    def store(self) -> LeaseStore | None:
+        return self._store
+
+    def bind_store(self, store: LeaseStore) -> None:
+        """Attach the mirror to a book built without one.
+
+        The app builds the book before the manager -- the planner shares it
+        -- and the manager is the one holding the database, so the binding
+        happens there rather than at construction. Nothing standing is
+        written retroactively: the book is empty when this is called at
+        boot, and :meth:`restore` follows.
+        """
+        self._store = store
+
+    def _persist(self, lease: GpuLease, *, at: float) -> None:
+        if self._store is None:
+            return
+        try:
+            self._store.put(lease)
+        except Exception as exc:  # noqa: BLE001 - the book is authoritative; disk is a mirror
+            self._store_failed("put", exc)
+            return
+        self._written_at[lease.id] = at
+        self._store_warned.clear()
+
+    def _forget(self, lease_id: str) -> None:
+        self._written_at.pop(lease_id, None)
+        if self._store is None:
+            return
+        try:
+            self._store.delete(lease_id)
+        except Exception as exc:  # noqa: BLE001 - see _persist
+            self._store_failed("delete", exc)
+            return
+        self._store_warned.clear()
+
+    def _store_failed(self, op: str, exc: BaseException) -> None:
+        kind = f"{op}:{type(exc).__name__}"
+        if kind in self._store_warned:
+            log.debug("gpu lease store failed again", op=op, error=repr(exc))
+            return
+        self._store_warned.add(kind)
+        log.warning(
+            "gpu lease store failed; the in-memory book stays authoritative and this lease "
+            "will not survive a restart until a later write succeeds",
+            op=op,
+            error=repr(exc),
+        )
 
     def __len__(self) -> int:
         return len(self._leases)
@@ -187,6 +391,7 @@ class LeaseBook:
             holder_peer=(holder_peer or "").strip() or None,
         )
         self._leases[lease.id] = lease
+        self._persist(lease, at=stamp)
         return lease
 
     @staticmethod
@@ -260,6 +465,7 @@ class LeaseBook:
         lease.vacate_reask_at = stamp + 2 * deadline_s
         lease.vacate_delivery = "pending"
         lease.vacate_delivery_status = None
+        self._persist(lease, at=stamp)
         return lease
 
     def mark_vacate_delivery(
@@ -291,11 +497,13 @@ class LeaseBook:
         lease.vacate_delivery_status = status
         if delivered:
             lease.vacate_delivery = "delivered"
+            self._persist(lease, at=stamp)
             return lease
         lease.vacate_delivery = "failed"
         if stamp < lease.vacate_deadline:
             lease.vacate_deadline = stamp
         lease.vacate_reask_at = stamp + max(0.0, quiet_s)
+        self._persist(lease, at=stamp)
         return lease
 
     def release(self, lease_id: str) -> GpuLease:
@@ -306,16 +514,25 @@ class LeaseBook:
                 f"standing ones",
                 param="lease_id",
             )
+        self._forget(lease.id)
         return lease
 
     def touch(self, lease_id: str, *, at: float | None = None) -> GpuLease:
-        """Refresh a lease's activity clock -- never backwards."""
+        """Refresh a lease's activity clock -- never backwards.
+
+        Mirrored on the :data:`TOUCH_PERSIST_INTERVAL_S` clock: a keep-alive
+        every second is one disk write per five, and a clock that did not
+        move is no write at all.
+        """
         lease = self._leases.get(lease_id)
         if lease is None:
             raise LeaseNotFoundError(f"no lease '{lease_id}'", param="lease_id")
         stamp = time.time() if at is None else at
         if stamp > lease.last_activity_at:
             lease.last_activity_at = stamp
+            written = self._written_at.get(lease.id)
+            if written is None or stamp - written >= TOUCH_PERSIST_INTERVAL_S:
+                self._persist(lease, at=stamp)
         return lease
 
     def blocked_for(self, model_id: str | None) -> frozenset[int]:
@@ -340,6 +557,84 @@ class LeaseBook:
             for lease in self.all()
             if lease.idle_ttl_s is not None and stamp - lease.last_activity_at >= lease.idle_ttl_s
         ]
+
+    def restore(self, now: float | None = None) -> list[GpuLease]:
+        """Re-enter the leases the store holds; the ones a restart should keep (D61).
+
+        Oldest first, and for each row: a lease idle past its ``idle_ttl_s``
+        is dropped and deleted from the store -- the sweep would have released
+        it had the server stayed up; one held by this server's own benchmark
+        (:data:`OWN_HOLDER_FAMILIES`) is dropped the same way, because its
+        holder did not survive the restart; one whose cards a lease already
+        standing in the book holds is dropped too, that lease having been
+        granted by the running server. Everything else comes back with its
+        clocks, its ``vacate_url``/``vacate_token`` and its ``holder_peer``,
+        the vacate window cleared (a new better-class ask re-runs D56 from
+        scratch) and ``restored_at`` stamped. Returns the restored leases.
+
+        A store that cannot be read is a warning and an empty answer, never
+        a boot failure: the server serves without its leases the way it did
+        before D61, and says so.
+        """
+        if self._store is None:
+            return []
+        stamp = time.time() if now is None else now
+        try:
+            rows = self._store.load()
+        except Exception as exc:  # noqa: BLE001 - a mirror that cannot be read is not a boot failure
+            self._store_failed("load", exc)
+            return []
+        restored: list[GpuLease] = []
+        for lease in sorted(rows, key=lambda row: (row.created_at, row.id)):
+            idle = max(0.0, stamp - lease.last_activity_at)
+            if lease.id in self._leases:
+                continue  # already standing: nothing to do
+            if lease.idle_ttl_s is not None and idle >= lease.idle_ttl_s:
+                log.info(
+                    "gpu lease not restored: idle past its ttl while the server was down",
+                    lease_id=lease.id,
+                    holder=lease.holder,
+                    devices=list(lease.devices),
+                    idle_s=round(idle),
+                    idle_ttl_s=lease.idle_ttl_s,
+                )
+                self._forget(lease.id)
+                continue
+            if holder_family(lease.holder) in OWN_HOLDER_FAMILIES:
+                log.info(
+                    "gpu lease not restored: held by this server's own benchmark, which did "
+                    "not survive the restart",
+                    lease_id=lease.id,
+                    holder=lease.holder,
+                    devices=list(lease.devices),
+                )
+                self._forget(lease.id)
+                continue
+            clash = self.conflicts(lease.devices)
+            if clash:
+                log.warning(
+                    "gpu lease not restored: its cards are held by a lease granted since start",
+                    lease_id=lease.id,
+                    holder=lease.holder,
+                    devices=list(lease.devices),
+                    held_by=[other.id for other in clash],
+                )
+                self._forget(lease.id)
+                continue
+            lease.vacate_requested_at = None
+            lease.vacate_requested_by = None
+            lease.vacate_deadline = None
+            lease.vacate_reask_at = None
+            lease.vacate_delivery = None
+            lease.vacate_delivery_status = None
+            lease.restored_at = stamp
+            self._leases[lease.id] = lease
+            # The row on disk is current as of its last write; the coalescing
+            # clock starts from the restore so the first keep-alive is not an
+            # immediate rewrite of a row that just came back.
+            self._written_at[lease.id] = stamp
+            restored.append(lease)
+        return restored
 
 
 def holder_family(holder: str) -> str:
