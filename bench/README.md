@@ -75,8 +75,10 @@ message and `error.studioforge` details are printed verbatim) · **3** completed
 
 1. **Preflight** — `GET /api/health` must be `ok` and not draining, `busy.active_requests` 0, no
    load in progress, no smoke test, no priority hold; `GET /api/status` must show no running
-   benchmark, an empty load queue and **no GPU lease on the target devices** (a loopback caller
-   would be waived past the D55 lease guard on unload, so the harness refuses instead). The
+   benchmark, an empty load queue and **no GPU lease on the target devices** other than one that
+   **names the model under test** (a loopback caller would be waived past the D55 lease guard on
+   unload, so the harness refuses any other lease; a lease taken for the bench model is recorded
+   as `own_lease` and is the quietest rig a baseline can have). The
    resident instances are snapshotted (model, `plan`, `priority`) for the restore.
 2. **Validity, pre-load** — `GET /api/vram/holders` (D23) and `GET /api/gpus` are recorded.
 3. **Load** — if the model is resident at exactly the requested shape it is reused; if resident
@@ -108,6 +110,13 @@ never shared the cards with a run). "On a device" means ≥ 512 MiB there — `p
 with no attribution at all cannot be proven off the cards and counts as on them. Desktop/WDDM
 processes are already collapsed by the server (< 256 MiB) and are recorded as a count, never
 decisive. An invalid file still carries every number; `compare.py` labels its verdict advisory.
+
+Since 2026-09-10 the sampler thread also reads `/api/vram/holders` every 10 s **during** each run;
+any compute holder on the target devices that is not the model under test marks that run
+(`foreign_holders_seen`) and the file invalid (`validity.runs_with_foreign_holders`), because the
+bracketing snapshots cannot see a co-tenant that arrives after the post-load check and leaves
+before the post-run one — which is what the first baseline of that day suffered (a JIT load split
+across CUDA 0, 1 and 3 beside the bench instance for three of its four lengths).
 
 ## The acceptance rule (as amended by the owner)
 

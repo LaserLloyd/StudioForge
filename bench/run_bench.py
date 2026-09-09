@@ -34,6 +34,8 @@ LOAD_TIMEOUT_S = 1800.0
 RUN_TIMEOUT_S = 3600.0
 TOKEN_TOLERANCE = 0.01  # aim 1% under the clamp so the fitted prompt never exceeds it
 GPU_SAMPLE_INTERVAL_S = 0.5
+#: How often the sampler reads /api/vram/holders during a run (a co-tenant check).
+HOLDERS_SAMPLE_INTERVAL_S = 10.0
 
 
 class Refused(Exception):
@@ -143,11 +145,21 @@ def preflight(gw: Gateway, args: argparse.Namespace) -> dict[str, Any]:
         problems.append(f"a server benchmark is running: {status['benchmark']}")
     if status.get("queue_depth"):
         problems.append(f"load queue depth {status['queue_depth']}")
+    own_lease: dict[str, Any] | None = None
     for lease in status.get("leases") or []:
-        if set(lease.get("devices") or []) & set(args.device_list):
-            # A baseline unloads/reloads on these cards; a loopback caller would be
-            # waived past the D55 lease guard, so refuse instead. Smoke touches nothing.
-            (print if args.smoke else problems.append)(f"GPU lease on the target devices: {json.dumps(lease, default=str)}")
+        if not (set(lease.get("devices") or []) & set(args.device_list)):
+            continue
+        if args.model in (lease.get("model_ids") or []):
+            # A lease taken FOR the model under test: the cards are its alone, which is the
+            # quietest rig a baseline can have (the first 2026-09-10 baseline shared the 5090
+            # pair with a JIT load for three of its four lengths). The load is allowed by the
+            # lease and the unload is the loopback holder's own.
+            own_lease = lease
+            print(f"[preflight] target devices leased to the model under test: {lease.get('id')} ({lease.get('holder')}, priority {lease.get('priority')})")
+            continue
+        # A baseline unloads/reloads on these cards; a loopback caller would be
+        # waived past the D55 lease guard, so refuse instead. Smoke touches nothing.
+        (print if args.smoke else problems.append)(f"GPU lease on the target devices: {json.dumps(lease, default=str)}")
     models = gw.get("/api/models")
     row = next((m for m in models.get("models") or [] if m.get("id") == args.model), None)
     if row is None:
@@ -158,7 +170,7 @@ def preflight(gw: Gateway, args: argparse.Namespace) -> dict[str, Any]:
         problems.append("--smoke needs the model already resident and ready; nothing is loaded for it")
     if problems:
         raise Refused("preflight refused:\n  - " + "\n  - ".join(problems))
-    return {"health": health, "status": status, "model_row": row, "residents": residents, "resident_instance": mine}
+    return {"health": health, "status": status, "model_row": row, "residents": residents, "resident_instance": mine, "own_lease": own_lease}
 
 
 def instance_of(gw: Gateway, model: str) -> dict[str, Any] | None:
@@ -242,15 +254,37 @@ def fit_prompts(gw: Gateway, args: argparse.Namespace, ctx: int) -> dict[int, di
 
 
 class VramSampler(threading.Thread):
-    """Polls GET /api/gpus every 0.5 s; keeps the per-device peak used_bytes."""
+    """Polls GET /api/gpus every 0.5 s (per-device peak used_bytes) and GET /api/vram/holders
+    every 10 s (any compute holder on the target devices that is not the model under test).
 
-    def __init__(self, gw: Gateway) -> None:
+    The bracketing snapshots cannot see a co-tenant that arrives after the post-load check
+    and leaves before the post-run one: on 2026-09-10 a JIT load shared the 5090 pair with
+    the bench instance for three of the four prompt lengths and the file was still "valid".
+    """
+
+    def __init__(self, gw: Gateway, devices: list[int] | None = None, own_pids: list[int] | None = None) -> None:
         super().__init__(daemon=True)
         self.client = gw.new_client()
         self.stop_event = threading.Event()
         self.peak: dict[str, int] = {}
         self.samples = 0
         self.error: str | None = None
+        self.devices = [int(d) for d in (devices or [])]
+        self.own_pids = [int(p) for p in (own_pids or [])]
+        self.foreign: dict[str, dict[str, Any]] = {}
+        self.holders_samples = 0
+        self._next_holders = 0.0
+
+    def _sample_holders(self) -> None:
+        if not self.devices or time.monotonic() < self._next_holders:
+            return
+        self._next_holders = time.monotonic() + HOLDERS_SAMPLE_INTERVAL_S
+        result = bs.classify_validity(self.client.get("/api/vram/holders").json(), self.devices, self.own_pids)
+        self.holders_samples += 1
+        for row in result["offending"]:
+            key = str(row.get("pid") or f"{row.get('name')}:{row.get('alias')}")
+            if key not in self.foreign:
+                self.foreign[key] = {**row, "first_seen_at": time.time(), "holders_sample": self.holders_samples}
 
     def run(self) -> None:
         while not self.stop_event.is_set():
@@ -259,13 +293,14 @@ class VramSampler(threading.Thread):
                     key = str(gpu["index"])
                     self.peak[key] = max(self.peak.get(key, 0), int(gpu.get("used_bytes") or 0))
                 self.samples += 1
+                self._sample_holders()
             except (httpx.HTTPError, ValueError, KeyError) as exc:
                 self.error = str(exc)
             self.stop_event.wait(GPU_SAMPLE_INTERVAL_S)
         self.client.close()
 
 
-def run_one(gw: Gateway, args: argparse.Namespace, prompt: dict[str, Any], run: int) -> dict[str, Any]:
+def run_one(gw: Gateway, args: argparse.Namespace, prompt: dict[str, Any], run: int, own_pids: list[int] | None = None) -> dict[str, Any]:
     header = f"[bench run {run} seed {args.seed} len {prompt['requested']}]\n"
     payload = {
         "model": args.model, "prompt": header + prompt["text"], "max_tokens": args.max_tokens,
@@ -273,7 +308,7 @@ def run_one(gw: Gateway, args: argparse.Namespace, prompt: dict[str, Any], run: 
         "stream": True, "stream_options": {"include_usage": True}, "priority": bs.TIER_AGENT,
     }
     row: dict[str, Any] = {"prompt_length": prompt["requested"], "run": run, "warmup": run == 0, "prompt_tokens_fitted": prompt["tokens"]}
-    sampler = VramSampler(gw)
+    sampler = VramSampler(gw, args.device_list, own_pids or [])
     sampler.start()
     started = time.perf_counter()
     ttft: float | None = None
@@ -303,7 +338,8 @@ def run_one(gw: Gateway, args: argparse.Namespace, prompt: dict[str, Any], run: 
         wall = time.perf_counter() - started
         sampler.stop_event.set()
         sampler.join(timeout=5.0)
-    row.update({"wall_s": round(wall, 4), "ttft_s": round(ttft, 4) if ttft is not None else None, "peak_vram_bytes": sampler.peak, "vram_samples": sampler.samples, "usage": usage})
+    row.update({"wall_s": round(wall, 4), "ttft_s": round(ttft, 4) if ttft is not None else None, "peak_vram_bytes": sampler.peak, "vram_samples": sampler.samples, "usage": usage,
+                "foreign_holders_seen": list(sampler.foreign.values()), "holders_samples": sampler.holders_samples})
     if timings is None:
         completion_tokens = int((usage or {}).get("completion_tokens") or 0)
         row.update({"timings_missing": True, "prompt_n": (usage or {}).get("prompt_tokens"), "predicted_n": completion_tokens or None,
@@ -315,7 +351,7 @@ def run_one(gw: Gateway, args: argparse.Namespace, prompt: dict[str, Any], run: 
     expected = prompt["tokens"]
     row["cache_hit_suspected"] = bool((row.get("prompt_n") or 0) < expected * 0.98 or (row.get("cache_n") or 0) > 0)
     peak_gib = {k: round(v / 2**30, 2) for k, v in sorted(sampler.peak.items())}
-    print(f"  run {run}{' (warm-up)' if run == 0 else ''}: prompt_n={row.get('prompt_n')} prefill={row.get('prefill_tps')} tok/s  decode={row.get('decode_tps')} tok/s  ttft={row.get('ttft_s')}s  wall={row['wall_s']}s  peak GiB={peak_gib}{'  CACHE HIT SUSPECTED' if row['cache_hit_suspected'] else ''}")
+    print(f"  run {run}{' (warm-up)' if run == 0 else ''}: prompt_n={row.get('prompt_n')} prefill={row.get('prefill_tps')} tok/s  decode={row.get('decode_tps')} tok/s  ttft={row.get('ttft_s')}s  wall={row['wall_s']}s  peak GiB={peak_gib}{'  CACHE HIT SUSPECTED' if row['cache_hit_suspected'] else ''}{'  FOREIGN HOLDER ON TARGET DEVICES' if sampler.foreign else ''}")
     return row
 
 
@@ -360,7 +396,7 @@ def print_summary(summary: dict[str, Any]) -> None:
     for key in sorted(summary, key=int):
         e = summary[key]
         peak = " ".join(f"{d}:{b / 2**30:.1f}" for d, b in sorted(e.get("peak_vram_bytes", {}).items()))
-        flags = (" CACHE?" if e.get("cache_hit_suspected_runs") else "") + (" NO-TIMINGS" if e.get("timings_missing_runs") else "")
+        flags = (" CACHE?" if e.get("cache_hit_suspected_runs") else "") + (" NO-TIMINGS" if e.get("timings_missing_runs") else "") + (" FOREIGN" if e.get("foreign_holder_runs") else "")
         cells = [_stat(e, m, s) for m, s in (("prefill_tps", "median"), ("prefill_tps", "p95"), ("decode_tps", "median"), ("decode_tps", "p95"), ("ttft_s", "median"), ("ttft_s", "p95"), ("wall_s", "median"))]
         print(f"{key:>7}   {cells[0]:>9} / {cells[1]:<9}   {cells[2]:>8} / {cells[3]:<8}   {cells[4]:>7} / {cells[5]:<7}   {cells[6]:>8}   {peak:<12} {e['prefill_tps']['n']}{flags}")
 
@@ -445,6 +481,7 @@ def main(argv: list[str] | None = None) -> int:
         payload["gpus"] = gw.get("/api/gpus").get("gpus")
         payload["residents_before"] = [{k: r.get(k) for k in ("model_id", "plan", "priority", "pid", "port", "resolved_engine_tag")} for r in residents]
         pids_before = [r["pid"] for r in residents if r.get("model_id") == args.model and r.get("pid")]
+        payload["own_lease"] = pre.get("own_lease")
         checks.append(validity_check(gw, args.device_list, pids_before, "pre-load"))
         if args.smoke:
             load_record = {"performed": False, "reused_resident": True, "wall_s": None, "previous_instance": pre["resident_instance"]}
@@ -464,7 +501,7 @@ def main(argv: list[str] | None = None) -> int:
         for requested in args.length_list:
             print(f"\n== prompt length {requested} ({prompts[requested]['tokens']} tokens), {args.runs} runs ==")
             for run in range(args.runs):
-                runs.append(run_one(gw, args, prompts[requested], run))
+                runs.append(run_one(gw, args, prompts[requested], run, [instance["pid"]] if instance.get("pid") else []))
         checks.append(validity_check(gw, args.device_list, [instance["pid"]] if instance.get("pid") else [], "post-run"))
         payload["prompts"] = {str(k): {kk: vv for kk, vv in v.items() if kk != "text"} for k, v in prompts.items()}
     except Refused as exc:
@@ -489,13 +526,18 @@ def main(argv: list[str] | None = None) -> int:
     # snapshot is context (an idle background model the load displaced never
     # shared the cards with a run).
     decisive = [c for c in checks if c["phase"] in ("post-load", "post-run")]
-    payload["validity"] = {"valid": len(decisive) == 2 and all(c["valid"] for c in decisive), "checks": checks}
+    runs_with_foreign = [f"{r['prompt_length']}/{r['run']}" for r in runs if r.get("foreign_holders_seen")]
+    payload["validity"] = {
+        "valid": len(decisive) == 2 and all(c["valid"] for c in decisive) and not runs_with_foreign,
+        "checks": checks,
+        "runs_with_foreign_holders": runs_with_foreign,
+    }
     path = write_results(Path(args.results_dir), git.get("sha", ""), args, payload)
     print(f"\nresults: {path}")
     if runs:
         print_summary(payload["summary"])
     if not payload["validity"]["valid"]:
-        print("\n*** INVALID: a compute holder that is not the model under test sat on the target devices during the runs (see validity.checks) ***")
+        print(f"\n*** INVALID: a compute holder that is not the model under test sat on the target devices during the runs (see validity.checks; runs {payload['validity']['runs_with_foreign_holders']}) ***")
     if exit_code != EXIT_OK:
         return exit_code
     previous = sorted((p for p in Path(args.results_dir).glob("*.json") if p != path and "-smoke" not in p.name), key=lambda p: p.stat().st_mtime)
