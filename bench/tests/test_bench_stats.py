@@ -30,7 +30,9 @@ def _run(length: int, run: int, prefill: float, decode: float, **extra: object) 
     return row
 
 
-def _summary(prefill: float, decode: float, lengths: tuple[int, ...] = (1024, 131072, 262144)) -> dict:
+def _summary(
+    prefill: float, decode: float, lengths: tuple[int, ...] = (1024, 131072, 262144)
+) -> dict:
     runs = [_run(n, i, prefill, decode) for n in lengths for i in range(6)]
     return bs.summarize_runs(runs)
 
@@ -67,10 +69,17 @@ def test_summarize_runs_discards_warmup_and_errors() -> None:
 
 
 def test_holder_on_devices_prefers_per_gpu_bytes() -> None:
-    ctx_only = {"per_gpu_bytes": {"0": 430 * MIB, "1": 430 * MIB, "2": 20_000 * MIB}, "used_bytes": 21_000 * MIB}
+    ctx_only = {
+        "per_gpu_bytes": {"0": 430 * MIB, "1": 430 * MIB, "2": 20_000 * MIB},
+        "used_bytes": 21_000 * MIB,
+    }
     assert bs.holder_on_devices(ctx_only, [0, 1]) == (False, "per_gpu_bytes")
     assert bs.holder_on_devices(ctx_only, [2]) == (True, "per_gpu_bytes")
-    nvml = {"gpu_indices": [0, 1, 2, 3], "gpu_indices_source": "nvml-context", "used_bytes": 3000 * MIB}
+    nvml = {
+        "gpu_indices": [0, 1, 2, 3],
+        "gpu_indices_source": "nvml-context",
+        "used_bytes": 3000 * MIB,
+    }
     assert bs.holder_on_devices(nvml, [1]) == (True, "nvml-context")
     small = {"gpu_indices": [0], "used_bytes": 100 * MIB}
     assert bs.holder_on_devices(small, [0])[0] is False
@@ -81,10 +90,20 @@ def test_holder_on_devices_prefers_per_gpu_bytes() -> None:
 def test_classify_validity() -> None:
     payload = {
         "holders": [
-            {"pid": 11, "name": "llama-server.exe", "classification": "ours", "used_bytes": 40_000 * MIB,
-             "per_gpu_bytes": {"0": 20_000 * MIB, "1": 20_000 * MIB}},
-            {"pid": 22, "name": "llama-server.exe", "classification": "ours", "used_bytes": 6000 * MIB,
-             "per_gpu_bytes": {"0": 400 * MIB, "2": 6000 * MIB}},
+            {
+                "pid": 11,
+                "name": "llama-server.exe",
+                "classification": "ours",
+                "used_bytes": 40_000 * MIB,
+                "per_gpu_bytes": {"0": 20_000 * MIB, "1": 20_000 * MIB},
+            },
+            {
+                "pid": 22,
+                "name": "llama-server.exe",
+                "classification": "ours",
+                "used_bytes": 6000 * MIB,
+                "per_gpu_bytes": {"0": 400 * MIB, "2": 6000 * MIB},
+            },
         ],
         "desktop_processes_count": 17,
         "desktop_processes_bytes": 900 * MIB,
@@ -94,8 +113,13 @@ def test_classify_validity() -> None:
     assert ok["valid"] is True and ok["own"][0]["pid"] == 11 and ok["offending"] == []
     assert ok["desktop_processes_count"] == 17
     payload["holders"].append(
-        {"pid": 33, "name": "python.exe", "classification": "foreign", "used_bytes": 3000 * MIB,
-         "per_gpu_bytes": {"1": 3000 * MIB}}
+        {
+            "pid": 33,
+            "name": "python.exe",
+            "classification": "foreign",
+            "used_bytes": 3000 * MIB,
+            "per_gpu_bytes": {"1": 3000 * MIB},
+        }
     )
     bad = bs.classify_validity(payload, [0, 1], own_pids=[11])
     assert bad["valid"] is False and [h["pid"] for h in bad["offending"]] == [33]
@@ -107,7 +131,9 @@ def test_verdict_rule() -> None:
     old = _summary(prefill=1000.0, decode=20.0)
     assert bs.verdict(_summary(1000.0, 22.5), old)["verdict"] == "major-bar-met"  # decode +12.5%
     assert bs.verdict(_summary(1120.0, 20.0), old)["verdict"] == "major-bar-met"  # prefill +12%
-    assert bs.verdict(_summary(970.0, 22.5), old)["verdict"] == "regression"  # -3% prefill blocks it
+    assert (
+        bs.verdict(_summary(970.0, 22.5), old)["verdict"] == "regression"
+    )  # -3% prefill blocks it
     assert bs.verdict(_summary(1010.0, 20.4), old)["verdict"] == "keep"  # small win is kept
     assert bs.verdict(_summary(990.0, 19.8), old)["verdict"] == "neutral"  # within tolerance
     assert bs.verdict(_summary(1000.0, 19.0), old)["verdict"] == "regression"  # decode -5%
@@ -131,7 +157,9 @@ def test_build_prompt_is_deterministic_and_prefix_stable() -> None:
     short = bs.build_prompt(200, seed=42)
     long = bs.build_prompt(400, seed=42)
     assert short == bs.build_prompt(200, seed=42)
-    assert long.startswith(short[: len(short) - 3])  # same stream, only the tail punctuation may differ
+    assert long.startswith(
+        short[: len(short) - 3]
+    )  # same stream, only the tail punctuation may differ
     assert len(long.split()) == 400
     assert bs.build_prompt(50, seed=1) != bs.build_prompt(50, seed=2)
     assert bs.build_prompt(10, seed=3, header="[run 1] ").startswith("[run 1] ")
@@ -150,10 +178,22 @@ def test_prompt_sizing_helpers() -> None:
 
 
 def test_result_filename_and_plan_tuple() -> None:
-    assert bs.result_filename("3afb47ef7ff5557a2cfb3cdaad3632998c58629f", None, False) == "3afb47ef7ff5.json"
-    assert bs.result_filename("3afb47ef7ff5557a", "flash attn/on", True) == "3afb47ef7ff5-flash-attn-on-smoke.json"
+    assert (
+        bs.result_filename("3afb47ef7ff5557a2cfb3cdaad3632998c58629f", None, False)
+        == "3afb47ef7ff5.json"
+    )
+    assert (
+        bs.result_filename("3afb47ef7ff5557a", "flash attn/on", True)
+        == "3afb47ef7ff5-flash-attn-on-smoke.json"
+    )
     assert bs.result_filename("", None, False) == "nogit.json"
-    plan = {"ctx_size": 262144, "parallel": 1, "devices": [1, 0], "kv_cache_type": "f16", "kv_cache_type_v": "f16"}
+    plan = {
+        "ctx_size": 262144,
+        "parallel": 1,
+        "devices": [1, 0],
+        "kv_cache_type": "f16",
+        "kv_cache_type_v": "f16",
+    }
     assert bs.plan_tuple(plan) == (262144, 1, (0, 1), "f16", "f16")
     assert bs.plan_tuple(None) is None
 

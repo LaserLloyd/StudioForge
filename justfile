@@ -33,13 +33,13 @@ e2e:
     SF_DATA_DIR="{{data}}" {{python}} scripts/e2e_matrix.py
 
 lint:
-    {{python}} -m ruff check src/ tests/ packages/
-    {{python}} -m ruff format --check src/ tests/ packages/
+    {{python}} -m ruff check src/ tests/ packages/ bench/
+    {{python}} -m ruff format --check src/ tests/ packages/ bench/
     {{python}} -m mypy src/studioforge/core src/studioforge/api src/studioforge/db.py src/studioforge/config.py src/studioforge/types.py
 
 format:
-    {{python}} -m ruff format src/ tests/ packages/
-    {{python}} -m ruff check --fix src/ tests/ packages/
+    {{python}} -m ruff format src/ tests/ packages/ bench/
+    {{python}} -m ruff check --fix src/ tests/ packages/ bench/
 
 # Inventory the model library without starting a server.
 scan:

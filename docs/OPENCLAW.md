@@ -718,11 +718,21 @@ something that is still running, and taking its model away is not recovery.
 build against GitHub and answers `current`, `latest`, `update_available`, `latest_variant` and a
 `skipped` list saying why each rejected tag was rejected.
 
+Since D62 the same answer carries upstream's **stable channel** beside the newest build: `stable`
+(`{version, tag, published_at}` — the build named by the newest `vX.Y.Z` release's
+`nightly-tag.txt`, or `null` with `stable_error` saying why), `stable_variant`, and the verdict of
+`engine.update_channel` (`stable` by default, or `latest`) as `recommended_tag`,
+`recommended_variant` and `update_recommended`. `latest` and `update_available` keep their meaning
+on both channels; `--update` and the panel's Install button move to `recommended_tag`, never to a
+lower build number. `GET /api/engine` names the stable build and whether it is already installed
+(`stable`, `stable_installed`) without probing any asset.
+
 Two things it deliberately does not do. It never offers a tag that is not a `bNNNN` build: on
 2026-08-18 llama.cpp published a prerelease tagged `v0.1.2` with **no assets at all**, and the
 update check duly offered it — the install then failed with "no GPU-capable llama-server build for
 win/x64 at v0.1.2". A `vX.Y.Z` tag ships no engine under any flag, so it is filtered out
-unconditionally rather than hidden behind an option. And it compares **build numbers, not
+unconditionally rather than hidden behind an option (since D62 its `nightly-tag.txt` is *read*, for
+the stable channel, but the tag itself is never offered). And it compares **build numbers, not
 strings**: `latest != current` calls a downgrade an update, and string ordering additionally breaks
 across a digit boundary (`"b10000" < "b9999"`).
 

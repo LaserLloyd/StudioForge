@@ -3550,11 +3550,18 @@ def quant_hardware_notes(report: Mapping[str, Any] | None) -> list[tuple[str, st
 
 
 def engine_update_line(update: Mapping[str, Any] | None) -> str:
-    """One line for the update row, covering all four states it can be in.
+    """One line for the update row, covering every state it can be in.
 
     The variant is named when the check knows it, because "b10488 (cuda-13.3)"
     and "b10488 (source)" are the difference between a two-minute download and a
     half-hour local CUDA compile, and the button looks identical either way.
+
+    A payload carrying ``update_channel`` (D62) is read channel-first: the
+    headline is the channel's recommendation and the other channel is a
+    trailing note, so an operator on ``stable`` is offered the blessed build
+    and still sees the newest one, and an operator on ``latest`` still sees
+    what stable would have given. A payload without it renders exactly as it
+    did before D62.
     """
     payload = _mapping(update)
     if not payload or not payload.get("checked"):
@@ -3562,6 +3569,13 @@ def engine_update_line(update: Mapping[str, Any] | None) -> str:
     error = payload.get("error")
     if error:
         return f"Could not check for a newer engine: {error}"
+    if "update_channel" in payload:
+        return _channel_update_line(payload)
+    return _latest_update_line(payload)
+
+
+def _latest_update_line(payload: Mapping[str, Any]) -> str:
+    """The pre-D62 rendering: the newest installable build against the active one."""
     current = str(payload.get("current") or UNKNOWN)
     latest = payload.get("latest")
     if not latest:
@@ -3577,8 +3591,63 @@ def engine_update_line(update: Mapping[str, Any] | None) -> str:
     return f"Engine {current} is the latest release."
 
 
+def _channel_update_line(payload: Mapping[str, Any]) -> str:
+    """The D62 rendering; see :func:`engine_update_line`."""
+    from studioforge.core.engine import describe_stable_channel
+
+    current = str(payload.get("current") or UNKNOWN)
+    latest = payload.get("latest")
+    stable = _mapping(payload.get("stable"))
+    stable_tag = str(stable.get("tag") or "")
+    stable_text = describe_stable_channel(payload)
+    if str(payload.get("update_channel")) == "latest":
+        line = _latest_update_line(payload)
+        if stable_tag and stable_tag != latest:
+            line += f" Stable channel: {stable_text}."
+        return line
+    if payload.get("update_recommended") and payload.get("recommended_tag"):
+        line = f"Engine {current} — stable {stable_text} is available."
+    elif not stable_tag:
+        why = payload.get("stable_error") or "unknown reason"
+        line = f"Engine {current}. The stable channel could not be read: {why}."
+    elif not payload.get("recommended_tag"):
+        line = (
+            f"Engine {current}. The stable channel's build {stable_text} has no asset "
+            "this box can install."
+        )
+    elif stable_tag == current:
+        line = f"Engine {current} is the stable channel's build ({stable.get('version')})."
+    else:
+        line = f"Engine {current} is ahead of the stable channel, {stable_text}."
+    if latest and latest not in (stable_tag, current):
+        variant = payload.get("latest_variant")
+        newest = f"{latest} ({variant})" if variant else str(latest)
+        line += f" Newest build: {newest}"
+        if payload.get("update_available") and not payload.get("update_recommended"):
+            line += " — set engine.update_channel to 'latest' to be offered it"
+        line += "."
+    elif not latest:
+        note = engine_filter_note(payload)
+        line += " No installable release was found on GitHub" + (f" — {note}." if note else ".")
+    return line
+
+
 def engine_update_available(update: Mapping[str, Any] | None) -> bool:
-    return bool(_mapping(update).get("update_available"))
+    """Whether the row should offer an Install button: the channel's verdict on a
+    D62 payload, the plain newer-build test on an older one."""
+    payload = _mapping(update)
+    if "update_channel" in payload:
+        return bool(payload.get("update_recommended"))
+    return bool(payload.get("update_available"))
+
+
+def engine_install_target(update: Mapping[str, Any] | None) -> str:
+    """The tag the Install button installs: the channel's recommendation (D62),
+    or ``latest`` for a payload from before channels existed."""
+    payload = _mapping(update)
+    if "update_channel" in payload:
+        return str(payload.get("recommended_tag") or "")
+    return str(payload.get("latest") or "")
 
 
 #: Shown next to the update button. Installing an engine does not touch running
@@ -4933,6 +5002,10 @@ CONFIG_FIELD_HELP: Final[Mapping[str, str]] = {
     ),
     "engine.pinned_tag": "The llama.cpp release this install uses unless a newer one is activated.",
     "engine.cuda_variant": "'auto' picks the highest CUDA build this driver can run.",
+    "engine.update_channel": (
+        "'stable' recommends the build upstream's newest vX.Y.Z release points at; "
+        "'latest' the newest bNNNN build this box can install (D62)."
+    ),
     "engine.keep_versions": "How many old engine directories to keep when pruning.",
     "engine.allow_source_build": "Fall back to building llama.cpp when no prebuilt asset fits.",
     "engine.cache_ram_mb": (

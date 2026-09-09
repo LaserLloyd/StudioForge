@@ -176,7 +176,9 @@ def verdict(
     rule. Headlines: median decode tok/s at 256k, and median prefill tok/s at
     >= 128k as the WORST delta over every such bucket present in both files."""
     decode_key = str(DECODE_GATE_LENGTH)
-    decode = delta_pct(_headline(new, "decode_tps", decode_key), _headline(old, "decode_tps", decode_key))
+    decode = delta_pct(
+        _headline(new, "decode_tps", decode_key), _headline(old, "decode_tps", decode_key)
+    )
     prefill_deltas: dict[str, float] = {}
     for key in sorted((k for k in new if k in old and int(k) >= PREFILL_GATE_MIN_LENGTH), key=int):
         delta = delta_pct(_headline(new, "prefill_tps", key), _headline(old, "prefill_tps", key))
@@ -184,7 +186,9 @@ def verdict(
             prefill_deltas[key] = delta
     prefill = min(prefill_deltas.values()) if prefill_deltas else None
     prefill_key = (
-        f">={PREFILL_GATE_MIN_LENGTH} (min over {','.join(prefill_deltas)})" if prefill_deltas else None
+        f">={PREFILL_GATE_MIN_LENGTH} (min over {','.join(prefill_deltas)})"
+        if prefill_deltas
+        else None
     )
     result: dict[str, Any] = {
         "decode_delta_pct": decode,
@@ -204,13 +208,24 @@ def verdict(
     detail = f"decode {decode:+.1f}% at {decode_key}, prefill {prefill:+.1f}% at {prefill_key}"
     if decode < tol or prefill < tol:
         result["verdict"] = "regression"
-        line = f"VERDICT: REGRESSION ({detail}) -- exceeds the {REGRESSION_TOLERANCE_PCT:.0f}% tolerance"
-    elif (decode >= MAJOR_BAR_PCT and prefill >= tol) or (prefill >= MAJOR_BAR_PCT and decode >= tol):
+        line = (
+            f"VERDICT: REGRESSION ({detail}) -- exceeds the "
+            f"{REGRESSION_TOLERANCE_PCT:.0f}% tolerance"
+        )
+    elif (decode >= MAJOR_BAR_PCT and prefill >= tol) or (
+        prefill >= MAJOR_BAR_PCT and decode >= tol
+    ):
         result["verdict"] = "major-bar-met"
-        line = f"VERDICT: MAJOR-RESTRUCTURING BAR MET ({detail}; >= {MAJOR_BAR_PCT:.0f}% with no > {REGRESSION_TOLERANCE_PCT:.0f}% regression)"
+        line = (
+            f"VERDICT: MAJOR-RESTRUCTURING BAR MET ({detail}; >= {MAJOR_BAR_PCT:.0f}% "
+            f"with no > {REGRESSION_TOLERANCE_PCT:.0f}% regression)"
+        )
     elif decode > 0 or prefill > 0:
         result["verdict"] = "keep"
-        line = f"VERDICT: KEEP ({detail}) -- an improvement is kept regardless of size; below the {MAJOR_BAR_PCT:.0f}% bar that gates major restructuring"
+        line = (
+            f"VERDICT: KEEP ({detail}) -- an improvement is kept regardless of size; "
+            f"below the {MAJOR_BAR_PCT:.0f}% bar that gates major restructuring"
+        )
     else:
         result["verdict"] = "neutral"
         line = f"VERDICT: NEUTRAL ({detail}) -- within tolerance, no improvement"
@@ -226,8 +241,10 @@ def verdict(
 # prompts and small utilities
 # --------------------------------------------------------------------------
 
-WORDS: tuple[str, ...] = tuple(
-    """the of and to in that is was for with as his on be at by this had not are but from or have
+#: The vocabulary as a prose block rather than a 160-element literal: the
+#: words are the data, the split is how they are read.
+_WORDS_TEXT = """\
+the of and to in that is was for with as his on be at by this had not are but from or have
     an they which one you were her all she there would their we him been has when who will more no
     if out so said what up its about into than them can only other new some could time these two
     may then do first any my now such like our over man me even most made after also did many
@@ -239,8 +256,9 @@ WORDS: tuple[str, ...] = tuple(
     harbour castle forest winter summer autumn spring engine signal answer question memory village
     teacher doctor farmer sailor painter carpenter merchant walked carried opened closed watched
     listened remembered forgot wrote read built broke found lost quiet bright heavy narrow ancient
-    gentle sudden careful curious distant""".split()
-)
+    gentle sudden careful curious distant"""
+
+WORDS: tuple[str, ...] = tuple(_WORDS_TEXT.split())
 
 
 def build_prompt(n_words: int, seed: int, header: str = "") -> str:
