@@ -673,7 +673,7 @@ def test_openclaw_setup_next_steps_open_with_the_gate(live_server: ServerHandle)
     assert "gpu_leased" in joined and "stand down" in joined
     assert "context_exceeded" in joined
     # Whatever else moves, the tool count stays a fact rather than a guess.
-    assert "20 management tools" in joined
+    assert "21 management tools" in joined
 
 
 def test_redactor_masks_an_mcp_pin() -> None:

@@ -80,7 +80,7 @@ core/
   gpu.py           NVML probe
 gui/           NiceGUI panel; tabs/ is one module per tab (dashboard, models, download,
                benchmark, chat, logs, server, setup)
-mcp/           management-plane MCP server (20 tools)
+mcp/           management-plane MCP server (21 tools)
 tray/          Windows notification-area app
 watchdog/      recovery sidecar: its own process, port and MCP server (10 tools)
 ```

@@ -226,17 +226,24 @@ class ModelsConfig(BaseModel):
     dir: Path | None = None
     extra_dirs: list[Path] = Field(default_factory=list)
     default_ctx: PositiveInt = 8192
-    default_ttl_s: NonNegativeInt = 1800  # 30 min; 0 = pinned/never unload
+    #: Idle countdown for a load that names no tier and has no per-tier entry:
+    #: 10 minutes since the last request against it. A load with no priority
+    #: is a background load (D46), and a background model nobody has asked
+    #: for in ten minutes is VRAM somebody else could use. 0 = never unload.
+    default_ttl_s: NonNegativeInt = 600
     #: Idle TTL per load tier (1 chat / 2 agent / 3 background), consulted
-    #: between a model's own ``settings.ttl_s`` and ``default_ttl_s``: a chat
-    #: model can stay resident for an hour while background work is reaped in
-    #: minutes, without touching either model's saved settings. 0 means never
-    #: unload, as everywhere else. Empty by default -- an empty map gives every
-    #: tier ``default_ttl_s``, exactly the pre-D48 behaviour, so an upgrade
-    #: changes nothing; a populated shipped default would have silently
-    #: shortened background residency on existing installs, and shipped
-    #: defaults do not make policy decisions.
-    ttl_by_priority: dict[int, int] = Field(default_factory=dict)
+    #: between a model's own ``settings.ttl_s`` and ``default_ttl_s``. 0 means
+    #: never unload, as everywhere else.
+    #:
+    #: Shipped policy (2026-09-09): the chat model and an agent's model idle
+    #: out after 15 minutes without a request; background work -- and every
+    #: load that gave no priority at all -- after 10. "Idle" is measured from
+    #: the last inference request against the instance, never from the load.
+    #: Before this the map shipped empty and every tier fell through to a
+    #: 30-minute default, which on a four-card box kept yesterday's 27B warm
+    #: while today's render was refused for VRAM. Set a tier to 0 to pin a
+    #: whole tier; set ``settings.ttl_s`` on one model to price it alone.
+    ttl_by_priority: dict[int, int] = Field(default_factory=lambda: {1: 900, 2: 900, 3: 600})
     # "auto": the planner picks per model rather than forcing one type on the
     # whole library. At long context the KV cache dwarfs the weights, so the
     # right trade differs per model -- a 27B reaches native 262144 on f16 and
@@ -501,6 +508,21 @@ class PlannerConfig(BaseModel):
     image_tokens_default: PositiveInt = 1024
     mmproj_compute_mb: NonNegativeInt = 512
     prefer_single_gpu: bool = True
+    #: Whether a layer split may mix GPU generations (Blackwell with Ampere).
+    #:
+    #: A layer split pipelines the model across its cards, so every token pays
+    #: the slowest card's latency and the sync hop between generations; this
+    #: rig measured a mixed 5090+3090 split at roughly half the speed of a
+    #: same-generation pair (D51's note, D38). ``"fallback"`` (the default)
+    #: tries every same-generation placement -- the 5090 pair, then the 3090
+    #: pair -- before any mixed one, and a mixed placement carries a note
+    #: saying so; ``"never"`` refuses a mixed placement outright, which on a
+    #: 2x32 GB + 2x24 GB box means a 123B model that needs all four cards is
+    #: refused with the reason named; ``"any"`` is the pre-2026-09-09 order
+    #: (compute capability, then free VRAM, mixed pairs before the slower
+    #: pair). A per-model ``device_override`` names its cards and is never
+    #: second-guessed by this setting.
+    mixed_generation_split: Literal["fallback", "never", "any"] = "fallback"
     #: Trust what a configuration MEASURED last time over what the formula
     #: computes for it (D51).
     #:

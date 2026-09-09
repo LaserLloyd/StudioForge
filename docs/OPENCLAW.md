@@ -88,11 +88,11 @@ others — want this shape:
 }
 ```
 
-`sfctl mcp` merges **two** upstream toolsets into one list of 30 tools:
+`sfctl mcp` merges **two** upstream toolsets into one list of 31 tools:
 
 | Tools | Source | Available when the main server is wedged? |
 | --- | --- | --- |
-| `list_models`, `model_options`, `model_info`, `check_loaded_model`, `load_model`, `load_recommended`, `unload_model`, `pin_model`, `reserve_gpus`, `release_gpus`, `test_model`, `benchmark_parallel`, `search_models`, `repo_details`, `download_model`, `delete_model`, `server_status`, `connection_info`, `get_config`, `set_config` | main app | no |
+| `list_models`, `model_options`, `model_info`, `plan_load`, `check_loaded_model`, `load_model`, `load_recommended`, `unload_model`, `pin_model`, `reserve_gpus`, `release_gpus`, `test_model`, `benchmark_parallel`, `search_models`, `repo_details`, `download_model`, `delete_model`, `server_status`, `connection_info`, `get_config`, `set_config` | main app | no |
 | `restart_server`, `kill_model`, `nuke_all_models`, `reclaim_orphan_engines`, `tail_logs`, `gpu_status`, `rollback_update`, `recovery_health`, `recovery_get_config`, `recovery_set_config` | watchdog sidecar | **yes** |
 
 That split is the point: when the main server locks up, OpenClaw still holds working tools to
@@ -332,6 +332,19 @@ than the recommended row offers, or more concurrency than its `max_parallel`.
 The trade-offs are visible rather than guessed: doubling `ctx_per_slot` costs `max_parallel` (by
 how much depends on `attention_kind`), a `kv_cache_type` of `q8_0`/`q4_0` buys context back at some
 quality cost, and a row spread over more devices is usually slower per token than a single-GPU row.
+
+### 5a. `plan_load(model_id, ...)` — the dry run
+
+"What would happen if I loaded X at Y" without loading it. The same planner that decides a real
+load answers against the GPUs as they stand, through the same one-shot `devices` /
+`allowed_devices` copies and at the tier the real load would run at (`priority`, else the model's
+remembered tier), and it never changes the box. A fit names `devices`, `tensor_split`,
+`ctx_size`, `parallel`, the KV cache types, `per_gpu_bytes`, `evict_model_ids` and `notes` — a
+split that spans a 5090 and a 3090 says so (`mixed_generation: true`; such a split runs at the
+3090's pace and is only ever a fallback). A refusal names the shortfall in GiB and the estimate
+term that blew the budget (`shortfall_bytes`, `largest_term`), plus `suggestions`,
+`max_ctx_that_fits` and `max_parallel_that_fits`. `GET /api/models/{id}/plan` is the same answer
+over REST. Cheap enough to ask before every expensive load.
 
 ### 6. `search_models` → `repo_details` → `download_model`
 

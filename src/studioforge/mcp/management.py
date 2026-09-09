@@ -907,7 +907,70 @@ def build_management_mcp(state: Any) -> MCPServer:
             payload["requested"] = detail.get("requested")
             payload["actual"] = detail.get("actual")
             payload["slots"] = detail.get("slots")
+            payload["vram_prediction"] = detail.get("vram_prediction")
         return payload
+
+    @_guard
+    async def plan_load(
+        model_id: str,
+        ctx_size: int | None = None,
+        kv_cache_type: str | None = None,
+        kv_cache_type_v: str | None = None,
+        parallel: int | None = None,
+        devices: list[int] | None = None,
+        allowed_devices: list[int] | None = None,
+        priority: int | None = None,
+    ) -> dict[str, Any]:
+        """Dry-run a load: what WOULD happen if this model were loaded now.
+
+        Nothing is loaded, unloaded or evicted. The same planner that decides
+        a real load answers against the GPUs exactly as they stand, through
+        the same one-shot ``devices`` / ``allowed_devices`` copies a real load
+        makes (D36, D59) and at the tier the real load would run at. Use it
+        before an expensive ``load_model`` to learn where the model would
+        land, what it would displace, how much VRAM each card would hold and
+        which KV cache type and context the ladder would settle on -- or to
+        ask "why not?": a refusal names the shortfall in GiB and the estimate
+        term that blew the budget, plus ``suggestions``, ``max_ctx_that_fits``
+        and ``max_parallel_that_fits``. Cheap enough to call before every
+        load; it never changes the box.
+
+        Args:
+            model_id: Model id or alias, as returned by ``list_models``.
+            ctx_size: Per-slot context to plan for; omitted = the planner's ladder.
+            kv_cache_type: K cache type (``f16``, ``q8_0``, ``q4_0``); omitted = auto.
+            kv_cache_type_v: V cache type; omitted = the same rule as K.
+            parallel: Slot count; omitted = the estimator's answer.
+            devices: Force exactly these CUDA indices, all of them. Mutually
+                exclusive with ``allowed_devices``.
+            allowed_devices: Let the planner choose among these CUDA indices
+                only -- a bound, not a placement (D59).
+            priority: Tier to plan at (1 chat, 2 agent, 3 background); omitted
+                = the model's remembered tier (D46/D48).
+
+        Returns:
+            ``{"ok": true, "plan": {...}}``. ``plan.fits`` says whether the
+            load would land. A fit carries ``devices``, ``tensor_split``,
+            ``ctx_size``, ``parallel``, ``kv_cache_type``, ``per_gpu_bytes``,
+            ``evict_model_ids``, ``estimate_mb`` and ``notes`` (including a
+            ``mixed_generation`` warning when the split spans a 5090 and a
+            3090); a refusal carries ``reason``, ``reason_code``,
+            ``shortfall_bytes``, ``largest_term``, ``suggestions``,
+            ``max_ctx_that_fits`` and ``max_parallel_that_fits``. Always
+            ``dry_run: true``.
+        """
+        preview = await run_in_threadpool(
+            state.manager.plan_preview,
+            model_id,
+            ctx_size=ctx_size,
+            kv_cache_type=kv_cache_type,
+            kv_cache_type_v=kv_cache_type_v,
+            parallel=parallel,
+            devices=devices,
+            allowed_devices=allowed_devices,
+            priority=priority,
+        )
+        return {"ok": True, "plan": preview}
 
     @_guard
     async def check_loaded_model(
@@ -2148,6 +2211,7 @@ def build_management_mcp(state: Any) -> MCPServer:
         list_models,
         model_options,
         model_info,
+        plan_load,
         check_loaded_model,
         load_model,
         load_recommended,

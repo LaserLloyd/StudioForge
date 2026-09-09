@@ -2300,7 +2300,7 @@ def mcp() -> None:
     """Run the stdio MCP server OpenClaw registers.
 
     Merges the main app's 20 management tools with the watchdog's 10 recovery
-    tools into one 30-tool list. Watchdog tools stay available when the main
+    tools into one 31-tool list. Watchdog tools stay available when the main
     server is down, which is the entire reason the two planes are separate.
 
     Watchdog tools are exposed with a 'recovery_' prefix unless they are on the

@@ -285,7 +285,7 @@ def loaded(model_id: str, ttl_s: int | None) -> InstanceInfo:
 def test_effective_ttl_folds_in_the_global_default() -> None:
     """The supervisor only knows the raw setting, which is usually None."""
     record = make_record()
-    manager, supervisor = make_manager([record], default_ttl_s=1800)
+    manager, supervisor = make_manager([record], default_ttl_s=1800, ttl_by_priority={})
     instance = loaded(record.id, None)  # what the supervisor produces
 
     manager.apply_effective_ttl(record, instance)
@@ -352,7 +352,7 @@ def test_refresh_ttl_is_a_noop_for_unloaded_models() -> None:
 )
 def test_ttl_for_matrix(pinned: bool, ttl_s: int | None, default: int, expected: int) -> None:
     record = make_record(pinned=pinned, ttl_s=ttl_s)
-    manager, _ = make_manager([record], default_ttl_s=default)
+    manager, _ = make_manager([record], default_ttl_s=default, ttl_by_priority={})
     assert manager.ttl_for(record) == expected
 
 
@@ -384,14 +384,33 @@ def test_ttl_by_priority_sits_between_the_per_model_ttl_and_the_default(
 
 @pytest.mark.parametrize("tier", [1, 2, 3])
 def test_an_empty_ttl_by_priority_answers_exactly_as_it_did_before(tier: int) -> None:
-    """The shipped default is empty precisely so an upgrade changes nothing:
-    a populated default would have silently dropped background residency on a
-    live rig the first time the server restarted."""
+    """An operator who clears the tier map gets one ``default_ttl_s`` for every
+    tier -- the pre-D48 answer. (The map no longer ships empty: since the
+    2026-09-09 review it ships ``{1: 900, 2: 900, 3: 600}``, so this test sets
+    it empty explicitly.)"""
     record = make_record()
-    manager, _ = make_manager([record], default_ttl_s=1800)
+    manager, _ = make_manager([record], default_ttl_s=1800, ttl_by_priority={})
     assert manager.config.models.ttl_by_priority == {}
     assert manager.ttl_for(record, priority=tier) == 1800
     assert manager.ttl_for(record) == 1800
+
+
+@pytest.mark.parametrize(
+    ("tier", "expected"),
+    [(1, 900), (2, 900), (3, 600)],
+)
+def test_the_shipped_tier_ttls_are_fifteen_fifteen_and_ten_minutes(
+    tier: int, expected: int
+) -> None:
+    """The 2026-09-09 policy: the chat model and an agent's model idle out
+    after 15 minutes without a request, background work -- and every load that
+    named no tier -- after 10. Measured from the last request, never the load."""
+    record = make_record()
+    manager, _ = make_manager([record])
+    assert manager.config.models.ttl_by_priority == {1: 900, 2: 900, 3: 600}
+    assert manager.config.models.default_ttl_s == 600
+    assert manager.ttl_for(record, priority=tier) == expected
+    assert manager.ttl_for(record) == 600, "no tier at all is the background clock"
 
 
 def test_a_tier_ttl_of_zero_keeps_that_tier_resident() -> None:
@@ -447,7 +466,7 @@ async def test_a_re_tier_leaves_a_ttl_override_alone_when_no_tier_map_is_set() -
     so firing it anyway only threw away a per-request ttl override for nothing.
     The tier itself still lands on the instance."""
     record = make_record()
-    manager, supervisor = make_manager([record], default_ttl_s=900)
+    manager, supervisor = make_manager([record], default_ttl_s=900, ttl_by_priority={})
     assert manager.config.models.ttl_by_priority == {}
     instance = loaded(record.id, 60)  # a request-level ttl override standing
     supervisor.instances[record.id] = instance
@@ -466,7 +485,7 @@ async def test_a_re_tier_leaves_a_ttl_override_alone_when_no_tier_map_is_set() -
 
 def test_set_pinned_persists_and_bites_the_resident_instance() -> None:
     record = make_record()
-    manager, supervisor = make_manager([record], default_ttl_s=1800)
+    manager, supervisor = make_manager([record], default_ttl_s=1800, ttl_by_priority={})
     instance = loaded(record.id, 1800)
     supervisor.instances[record.id] = instance
 
@@ -484,7 +503,7 @@ def test_set_pinned_persists_and_bites_the_resident_instance() -> None:
 
 def test_set_pinned_answers_the_effective_ttl_for_unloaded_models() -> None:
     record = make_record()
-    manager, _ = make_manager([record], default_ttl_s=1800)
+    manager, _ = make_manager([record], default_ttl_s=1800, ttl_by_priority={})
     _, effective = manager.set_pinned(record.id, True)
     assert effective == 0
     _, effective = manager.set_pinned(record.id, False)
@@ -814,6 +833,32 @@ def test_rebalance_never_moves_a_forced_placement() -> None:
     manager.planner = StubPlanner(candidate_plan(mover.id, [2, 3]))
 
     assert manager._rebalance_opportunity() is None
+
+
+def test_rebalance_previews_inside_the_loads_allowed_devices_bound() -> None:
+    """D59's bound survives the load (2026-09-09 review). The one-shot record
+    copy is gone by the time the sweep looks, so the bound travels on the
+    plan and the preview is made on a copy that carries it -- previewing the
+    registry's own row offered the card the caller asked the model to avoid,
+    which is the `rebalanced model devices=[3, 2]` line D59 quotes."""
+    manager, supervisor, mover = rebalance_rig()
+    supervisor.instances[mover.id].plan.allowed_devices = [1, 3]
+    seen: list[Any] = []
+
+    class RecordingPlanner(StubPlanner):
+        def plan_load(self, record: Any, **kwargs: Any) -> Any:
+            seen.append(record)
+            return super().plan_load(record, **kwargs)
+
+    manager.planner = RecordingPlanner(candidate_plan(mover.id, [3]))
+    manager._rebalance_opportunity()
+
+    assert seen, "the preview was made"
+    assert seen[0].settings.allowed_devices == [1, 3]
+    stored = manager.registry.get(mover.id)
+    assert stored is not None and stored.settings.allowed_devices is None, (
+        "the registry row is never touched; the bound lives on the plan"
+    )
 
 
 def test_rebalance_prefers_fewer_cards_at_the_same_settings() -> None:

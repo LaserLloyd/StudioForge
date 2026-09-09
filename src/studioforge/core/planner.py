@@ -73,6 +73,14 @@ KV_DOWNGRADE_ORDER: tuple[KvCacheType, ...] = ("f16", "q8_0", "q4_0")
 #: sleep this process takes.
 BUSY_RETRY_AFTER_S = 15.0
 
+#: A load whose measured footprint differs from the plan's estimate by more
+#: than this many percent is a WARNING naming both numbers and the estimate's
+#: breakdown (2026-09-09 review). D51 already corrects the *next* plan of the
+#: same configuration from the measurement; the warning exists because a
+#: persistent miss means a term the formula does not model, and that is a bug
+#: to fix in the formula, not to keep absorbing from history.
+PREDICTION_ERROR_WARN_PCT = 5.0
+
 # Context sizes we are willing to suggest as a fallback, descending.
 _CTX_LADDER = (
     262144,
@@ -913,6 +921,82 @@ class Planner:
         #: D16 removed exactly this class of spam; a new surface must not
         #: reintroduce it. The lines are still emitted at DEBUG.
         self._log_plans = log_plans
+        #: The last predicted-vs-actual observation per model id, kept so a
+        #: status surface can show "the plan said 35.7 GB, the child holds
+        #: 37.3 GB (+4.2%)" without a database round trip. See
+        #: :meth:`last_observation`.
+        self._last_observations: dict[str, dict[str, Any]] = {}
+
+    def last_observation(self, model_id: str) -> dict[str, Any] | None:
+        """The most recent predicted-vs-actual VRAM record for ``model_id``.
+
+        ``None`` until a load of that model has been measured in this process.
+        ``within_bar`` says whether the miss stayed inside
+        :data:`PREDICTION_ERROR_WARN_PCT`.
+        """
+        found = self._last_observations.get(model_id)
+        return dict(found) if found is not None else None
+
+    # -- device generations (mixed Blackwell/Ampere splits) ---------------
+
+    @staticmethod
+    def _generation_of(gpu: GpuInfo) -> tuple[int, int] | str:
+        """What makes two cards "the same generation" for a layer split.
+
+        Compute capability when the probe reports it (12.0 for a 5090, 8.6 for
+        a 3090); the product name otherwise. Two identical cards always share
+        a generation; a 5090 and a 3090 never do.
+        """
+        return gpu.compute_capability or gpu.name
+
+    def _split_candidates(
+        self, pool: Sequence[int], gpu_map: dict[int, GpuInfo], width: int
+    ) -> list[tuple[list[int], bool]]:
+        """``(devices, mixed)`` combinations of ``width`` cards from ``pool``.
+
+        ``mixed`` is True when the cards span more than one generation. The
+        order is ``planner.mixed_generation_split``'s: same-generation
+        combinations first and mixed ones after (``fallback``), mixed ones
+        dropped entirely (``never``), or the plain candidate order (``any`` --
+        the pre-2026-09-09 walk, in which a 5090+3090 pair was tried before
+        the 3090 pair because the candidate order sorts by compute capability
+        and then by free VRAM, and a mixed pair sorts ahead of the slower
+        pair on both keys).
+        """
+        policy = self.config.planner.mixed_generation_split
+        combos: list[tuple[list[int], bool]] = []
+        for combo in _combinations(pool, width):
+            generations = {self._generation_of(gpu_map[d]) for d in combo if d in gpu_map}
+            combos.append((list(combo), len(generations) > 1))
+        if policy == "any":
+            return combos
+        same = [entry for entry in combos if not entry[1]]
+        if policy == "never":
+            return same
+        return same + [entry for entry in combos if entry[1]]
+
+    def _mixed_note(self, devices: Sequence[int], gpu_map: dict[int, GpuInfo]) -> str:
+        names = ", ".join(f"CUDA{d} ({gpu_map[d].name})" for d in devices if d in gpu_map)
+        why = (
+            "no same-generation placement fit"
+            if self.config.planner.mixed_generation_split != "any"
+            else "same-generation placements were not preferred "
+            "(planner.mixed_generation_split: any)"
+        )
+        return (
+            f"mixed-generation split across {names}: a layer split runs at its "
+            f"slowest card's pace plus a sync hop per token, measured here at roughly "
+            f"half the speed of a same-generation pair; {why}. Set "
+            f"planner.mixed_generation_split to 'never' to refuse such a placement."
+        )
+
+    def _pools_span_generations(
+        self, pools: Sequence[tuple[list[int], str | None]], gpu_map: dict[int, GpuInfo]
+    ) -> bool:
+        return any(
+            len({self._generation_of(gpu_map[d]) for d in pool if d in gpu_map}) > 1
+            for pool, _note in pools
+        )
 
     # -- VRAM accounting -------------------------------------------------
 
@@ -2177,12 +2261,15 @@ class Planner:
 
             # Then multi-GPU splits, narrowest first: two cards beat four
             # because each added device adds a CUDA context and more
-            # cross-device traffic.
+            # cross-device traffic. Within one width, same-generation pairs
+            # before mixed ones (planner.mixed_generation_split): the 5090
+            # pair, then the 3090 pair, and only then a 5090+3090 split that
+            # runs at the 3090's pace.
             for width in range(2, len(pool) + 1):
-                for combo in _combinations(pool, width):
+                for combo, mixed in self._split_candidates(pool, gpu_map, width):
                     result = self._try_devices(
                         record,
-                        list(combo),
+                        combo,
                         gpu_map,
                         ctx,
                         slots,
@@ -2199,6 +2286,8 @@ class Planner:
                         result.notes.append(
                             f"split across {width} GPUs: did not fit on any single device"
                         )
+                        if mixed:
+                            result.notes.append(self._mixed_note(combo, gpu_map))
                         if pool_note:
                             result.notes.append(pool_note)
                         return result
@@ -2216,14 +2305,10 @@ class Planner:
                     for dev, amount in self.instance_footprint(instance).items():
                         freed[dev] = freed.get(dev, 0) + amount
                     for pool, pool_note in pools:
-                        for devices in (
-                            *([idx] for idx in pool),
-                            *(
-                                list(combo)
-                                for width in range(2, len(pool) + 1)
-                                for combo in _combinations(pool, width)
-                            ),
-                        ):
+                        candidates: list[tuple[list[int], bool]] = [([idx], False) for idx in pool]
+                        for width in range(2, len(pool) + 1):
+                            candidates.extend(self._split_candidates(pool, gpu_map, width))
+                        for devices, mixed in candidates:
                             result = self._try_devices(
                                 record,
                                 devices,
@@ -2246,9 +2331,19 @@ class Planner:
                                     "first and least-recently-used within one: "
                                     + ", ".join(evicted)
                                 )
+                                if mixed:
+                                    result.notes.append(self._mixed_note(devices, gpu_map))
                                 if pool_note:
                                     result.notes.append(pool_note)
                                 return result
+
+        if self.config.planner.mixed_generation_split == "never" and self._pools_span_generations(
+            pools, gpu_map
+        ):
+            notes.append(
+                "mixed-generation splits were not considered (planner.mixed_generation_split: "
+                "never); a placement spanning both GPU generations needs 'fallback'"
+            )
 
         return self._reject(
             record,
@@ -2309,8 +2404,13 @@ class Planner:
             return None
         base_cc = gpu_map[single.devices[0]].compute_capability or (0, 0)
         for width in range(2, len(pool) + 1):
-            for combo in _combinations(pool, width):
+            for combo, mixed in self._split_candidates(pool, gpu_map, width):
                 if any((gpu_map[d].compute_capability or (0, 0)) < base_cc for d in combo):
+                    continue
+                if mixed:
+                    # Buying slots by dragging a model across generations pays
+                    # the mixed-split tax on every token of every slot; that is
+                    # never the cheap concurrency this method exists to find.
                     continue
                 candidate = self._try_devices(
                     record,
@@ -2592,6 +2692,16 @@ class Planner:
             "parallel_limited_by": bound,
             "ctx_per_slot": ctx,
             "kv_bytes_per_token": per_token,
+            # The bound this placement was chosen within (D59). It travels on
+            # the plan because the record copy that carried it is thrown away
+            # after the load, and the rebalancer (D42) previews from the
+            # registry's own record -- without this it would relocate the
+            # model onto exactly the card the caller asked it to stay off.
+            "allowed_devices": (
+                sorted(int(d) for d in record.settings.allowed_devices)
+                if record.settings.allowed_devices is not None
+                else None
+            ),
         }
 
         # Whatever history moved this estimate travels with the plan (D51). A
@@ -3464,6 +3574,7 @@ class Planner:
         """
         predicted = plan.estimate.total_bytes
         ratio = (actual_bytes / predicted) if predicted else 0.0
+        error_pct = ((actual_bytes - predicted) / predicted * 100.0) if predicted else None
         log.info(
             "load observation",
             model_id=model_id,
@@ -3494,6 +3605,49 @@ class Planner:
                     "means the charge is too small for this model"
                 ),
             )
+        within_bar = error_pct is not None and abs(error_pct) <= PREDICTION_ERROR_WARN_PCT
+        if error_pct is not None and not within_bar:
+            log.warning(
+                "vram prediction error exceeds the bar",
+                model_id=model_id,
+                predicted_mb=round(predicted / MB),
+                actual_mb=round(actual_bytes / MB),
+                error_pct=round(error_pct, 1),
+                bar_pct=PREDICTION_ERROR_WARN_PCT,
+                ctx=plan.ctx_size,
+                parallel=plan.parallel,
+                kv=f"{plan.kv_cache_type}/{plan.kv_cache_type_v}",
+                devices=plan.devices,
+                breakdown_mb=plan.estimate.breakdown_mb(),
+                detail=(
+                    "the formula for this model is off by more than the bar; D51 corrects "
+                    "the next plan of this exact configuration from this measurement, but "
+                    "a persistent miss is a term the formula does not model"
+                ),
+            )
+        self._last_observations[model_id] = {
+            "model_id": model_id,
+            "predicted_bytes": int(predicted),
+            "actual_bytes": int(actual_bytes),
+            "error_pct": round(error_pct, 2) if error_pct is not None else None,
+            "within_bar": within_bar,
+            "bar_pct": PREDICTION_ERROR_WARN_PCT,
+            "ctx_size": plan.ctx_size,
+            "parallel": plan.parallel,
+            "kv_cache_type": plan.kv_cache_type,
+            "kv_cache_type_v": plan.kv_cache_type_v,
+            "devices": list(plan.devices),
+            "per_gpu_planned_mb": {
+                str(d): round(b / MB) for d, b in sorted(plan.per_gpu_bytes.items())
+            },
+            "per_gpu_actual_mb": (
+                {str(d): round(b / MB) for d, b in sorted(per_gpu_actual.items())}
+                if per_gpu_actual
+                else None
+            ),
+            "ok": ok,
+            "note": note,
+        }
         if self._observation_sink is not None:
             self._observation_sink(
                 {

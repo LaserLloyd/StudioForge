@@ -60,6 +60,11 @@ EXPECTED_TOOLS = {
     # is opt-in for the one model the agent actually cares about.
     "model_options",
     "model_info",
+    # The dry-run planner (2026-09-09 review): "what would happen if I loaded
+    # X at Y" answered by the real planner without touching VRAM. A tool of
+    # its own because model_options answers for the catalog's tiers and a
+    # fixed hardware state, not for an arbitrary ctx/kv/slots/devices ask.
+    "plan_load",
     # The routing gate (D52): "is what is already loaded good enough?", asked
     # before anything is chosen or loaded. A tool of its own rather than a field
     # on list_models because the answer depends on the *bar* the caller carries,
@@ -218,7 +223,9 @@ def state(tmp_path: Path) -> Iterator[State]:
 
     config = Config(
         data_dir=tmp_path / "data",
-        models=ModelsConfig(dir=models_root, default_ctx=4096, default_ttl_s=900),
+        models=ModelsConfig(
+            dir=models_root, default_ctx=4096, default_ttl_s=900, ttl_by_priority={}
+        ),
     )
     config.server.api_key = API_KEY
     config.hf.token = HF_TOKEN
@@ -554,6 +561,43 @@ async def test_model_options_rejects_an_unknown_model(state: State) -> None:
     assert result["error"]["code"] == "model_not_found"
 
 
+async def test_plan_load_is_a_dry_run(state: State) -> None:
+    """The dry-run planner answers with the real planner and loads nothing."""
+    server = build_management_mcp(state)
+    result = await call(server, "plan_load", model_id=TINY, ctx_size=4096)
+    assert result["ok"] is True
+    plan = result["plan"]
+    assert plan["dry_run"] is True
+    assert plan["model_id"] == TINY
+    assert "fits" in plan
+    assert plan["priority"] in (1, 2, 3)
+    assert state.supervisor.get(TINY) is None, "a dry run must load nothing"
+    if plan["fits"]:
+        assert plan["devices"]
+        assert "estimate_mb" in plan
+        assert plan["mixed_generation"] is False
+    else:
+        assert "shortfall_bytes" in plan
+        assert "largest_term" in plan
+
+
+async def test_plan_load_refuses_devices_and_allowed_devices_together(state: State) -> None:
+    """The same 400 the load route gives: one forces, the other bounds."""
+    server = build_management_mcp(state)
+    result = await call(server, "plan_load", model_id=TINY, devices=[0], allowed_devices=[0])
+    assert result["ok"] is False
+    assert "allowed_devices" in result["error"]["message"]
+    assert state.supervisor.get(TINY) is None
+
+
+async def test_plan_load_carries_the_bound_it_planned_within(state: State) -> None:
+    server = build_management_mcp(state)
+    result = await call(server, "plan_load", model_id=TINY, allowed_devices=[0])
+    assert result["ok"] is True
+    assert result["plan"]["allowed_devices"] == [0]
+    assert state.supervisor.get(TINY) is None
+
+
 async def test_list_models_filters(state: State) -> None:
     server = build_management_mcp(state)
     embeddings = await call(server, "list_models", kind="embedding")
@@ -689,6 +733,8 @@ def test_a_compact_instance_carries_the_effective_launch_and_its_summary() -> No
     row = _compact_instance(instance)["effective"]
     assert row == {
         "summary": "prefix cache on (reuse 256, host 32603 MiB, routing 0.3)",
+        "gpu_only": True,
+        "policy_violations": [],
         "cache_prompt": True,
         "cache_reuse": 256,
         "cache_ram_mib": 32603,

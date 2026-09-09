@@ -1,0 +1,720 @@
+{
+  "schema": 1,
+  "smoke": true,
+  "label": null,
+  "git": {
+    "sha": "62f6997cf710f9f524cb493470690cd797b1f57f",
+    "dirty": true
+  },
+  "timestamp": "2026-09-09T14:10:42.880411+00:00",
+  "argv": [
+    "--smoke"
+  ],
+  "server": {
+    "url": "http://127.0.0.1:1234",
+    "version": "1.26-09-04-3",
+    "engine": "b10689"
+  },
+  "gpus": [
+    {
+      "index": 0,
+      "name": "NVIDIA GeForce RTX 5090",
+      "total_bytes": 34190917632,
+      "free_bytes": 8887218176,
+      "used_bytes": 25303699456,
+      "utilization_pct": 3.0,
+      "temperature_c": 43.0,
+      "compute_capability": [
+        12,
+        0
+      ]
+    },
+    {
+      "index": 1,
+      "name": "NVIDIA GeForce RTX 5090",
+      "total_bytes": 34190917632,
+      "free_bytes": 5737582592,
+      "used_bytes": 28453335040,
+      "utilization_pct": 0.0,
+      "temperature_c": 43.0,
+      "compute_capability": [
+        12,
+        0
+      ]
+    },
+    {
+      "index": 2,
+      "name": "NVIDIA GeForce RTX 3090",
+      "total_bytes": 25769803776,
+      "free_bytes": 19500015616,
+      "used_bytes": 6269788160,
+      "utilization_pct": 0.0,
+      "temperature_c": 47.0,
+      "compute_capability": [
+        8,
+        6
+      ]
+    },
+    {
+      "index": 3,
+      "name": "NVIDIA GeForce RTX 3090",
+      "total_bytes": 25769803776,
+      "free_bytes": 25217474560,
+      "used_bytes": 552329216,
+      "utilization_pct": 0.0,
+      "temperature_c": 33.0,
+      "compute_capability": [
+        8,
+        6
+      ]
+    }
+  ],
+  "residents_before": [
+    {
+      "model_id": "ReadyArt/Dark-Scarlett-27B-v2.0-GGUF/Dark-Scarlett-27B-v2.0.i1-Q5_K_M_hb16",
+      "plan": {
+        "model_id": "ReadyArt/Dark-Scarlett-27B-v2.0-GGUF/Dark-Scarlett-27B-v2.0.i1-Q5_K_M_hb16",
+        "devices": [
+          0,
+          1
+        ],
+        "tensor_split": [
+          0.5087,
+          0.4913
+        ],
+        "split_mode": "layer",
+        "main_gpu": 0,
+        "ctx_size": 262144,
+        "parallel": 2,
+        "kv_cache_type": "q8_0",
+        "kv_cache_type_v": "q8_0",
+        "flash_attn": "on",
+        "estimate": {
+          "weights_bytes": 27782937213,
+          "kv_bytes": 22731710625,
+          "compute_bytes": 4167440581,
+          "mmproj_bytes": 1139984198,
+          "mmproj_compute_bytes": 657280822,
+          "adapter_bytes": 0,
+          "draft_weights_bytes": 0,
+          "draft_kv_bytes": 0,
+          "cuda_context_bytes": 770250964
+        },
+        "per_gpu_bytes": {
+          "0": 28595237146,
+          "1": 28654367256
+        },
+        "evict_model_ids": [],
+        "notes": [
+          "estimate corrected x1.22 from the last load of this exact configuration (observed 49634 MB against a formula estimate of 44596 MB)",
+          "device placement forced by per-model device_override"
+        ],
+        "max_parallel": 2,
+        "parallel_limited_by": "explicit",
+        "ctx_per_slot": 262144,
+        "kv_bytes_per_token": 35414,
+        "speculative": {
+          "type": "draft-mtp",
+          "draft_n_max": 3,
+          "draft_model_id": null,
+          "reason": "the model carries 1 multi-token-prediction head(s)"
+        },
+        "split_mode_reason": null,
+        "placement_tier": "optimal"
+      },
+      "priority": 1,
+      "pid": 22436,
+      "port": 18100,
+      "resolved_engine_tag": "b10689"
+    }
+  ],
+  "config": {
+    "requested": {
+      "model": "ReadyArt/Dark-Scarlett-27B-v2.0-GGUF/Dark-Scarlett-27B-v2.0.i1-Q5_K_M_hb16",
+      "ctx_size": 262144,
+      "parallel": 1,
+      "devices": [
+        0,
+        1
+      ],
+      "priority": 2,
+      "max_tokens": 64,
+      "runs": 2,
+      "prompt_lengths": [
+        1024
+      ],
+      "seed": 42
+    },
+    "effective": {
+      "cache_prompt": true,
+      "cache_reuse": 256,
+      "cache_ram_mib": 32603,
+      "cache_idle_slots": true,
+      "cont_batching": true,
+      "kv_unified": false,
+      "slot_prompt_similarity": 0.3,
+      "parallel": 2,
+      "ctx_per_slot": 262144,
+      "ctx_total": 524288,
+      "batch_size": 2048,
+      "ubatch_size": 512,
+      "ctx_checkpoints": 32,
+      "checkpoint_min_step": 8192,
+      "spec_type": "draft-mtp",
+      "flash_attn": "on",
+      "sources": {
+        "parallel": "argv",
+        "ctx_total": "argv",
+        "cache_prompt": "engine_default",
+        "cache_reuse": "argv",
+        "cache_ram_mib": "argv",
+        "cache_idle_slots": "engine_default",
+        "cont_batching": "engine_default",
+        "kv_unified": "argv",
+        "slot_prompt_similarity": "argv",
+        "batch_size": "engine_default",
+        "ubatch_size": "engine_default",
+        "ctx_checkpoints": "engine_default",
+        "checkpoint_min_step": "engine_default",
+        "spec_type": "argv",
+        "flash_attn": "argv"
+      },
+      "inert": [],
+      "summary": "prefix cache on (reuse 256, host 32603 MiB, routing 0.3), continuous batching on, 2 slots x 262144, partitioned KV, spec draft-mtp"
+    },
+    "plan": {
+      "model_id": "ReadyArt/Dark-Scarlett-27B-v2.0-GGUF/Dark-Scarlett-27B-v2.0.i1-Q5_K_M_hb16",
+      "devices": [
+        0,
+        1
+      ],
+      "tensor_split": [
+        0.5087,
+        0.4913
+      ],
+      "split_mode": "layer",
+      "main_gpu": 0,
+      "ctx_size": 262144,
+      "parallel": 2,
+      "kv_cache_type": "q8_0",
+      "kv_cache_type_v": "q8_0",
+      "flash_attn": "on",
+      "estimate": {
+        "weights_bytes": 27782937213,
+        "kv_bytes": 22731710625,
+        "compute_bytes": 4167440581,
+        "mmproj_bytes": 1139984198,
+        "mmproj_compute_bytes": 657280822,
+        "adapter_bytes": 0,
+        "draft_weights_bytes": 0,
+        "draft_kv_bytes": 0,
+        "cuda_context_bytes": 770250964
+      },
+      "per_gpu_bytes": {
+        "0": 28595237146,
+        "1": 28654367256
+      },
+      "evict_model_ids": [],
+      "notes": [
+        "estimate corrected x1.22 from the last load of this exact configuration (observed 49634 MB against a formula estimate of 44596 MB)",
+        "device placement forced by per-model device_override"
+      ],
+      "max_parallel": 2,
+      "parallel_limited_by": "explicit",
+      "ctx_per_slot": 262144,
+      "kv_bytes_per_token": 35414,
+      "speculative": {
+        "type": "draft-mtp",
+        "draft_n_max": 3,
+        "draft_model_id": null,
+        "reason": "the model carries 1 multi-token-prediction head(s)"
+      },
+      "split_mode_reason": null,
+      "placement_tier": "optimal"
+    },
+    "launch_args": [
+      "llama-server.exe",
+      "--model",
+      "Dark-Scarlett-27B-v2.0.i1-Q5_K_M_hb16.gguf",
+      "--alias",
+      "ReadyArt/Dark-Scarlett-27B-v2.0-GGUF/Dark-Scarlett-27B-v2.0.i1-Q5_K_M_hb16",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      "18100",
+      "--n-gpu-layers",
+      "999",
+      "--ctx-size",
+      "524288",
+      "--parallel",
+      "2",
+      "--device",
+      "CUDA0,CUDA1",
+      "--tensor-split",
+      "0.5087,0.4913",
+      "--split-mode",
+      "layer",
+      "--main-gpu",
+      "0",
+      "--cache-type-k",
+      "q8_0",
+      "--cache-type-v",
+      "q8_0",
+      "--flash-attn",
+      "on",
+      "--no-webui",
+      "--props",
+      "--slots",
+      "--metrics",
+      "--fit",
+      "off",
+      "--cache-reuse",
+      "256",
+      "--cache-ram",
+      "32603",
+      "--reasoning-format",
+      "deepseek",
+      "--slot-prompt-similarity",
+      "0.3",
+      "--no-kv-unified",
+      "--mmproj",
+      "MMPROJ-Dark-Scarlett-27B-v2.0-BF16.gguf",
+      "--spec-type",
+      "draft-mtp",
+      "--spec-draft-n-max",
+      "3"
+    ],
+    "instance_priority": 1,
+    "resolved_engine_tag": "b10689",
+    "introspect_actual": {
+      "n_ctx": 262144,
+      "total_slots": 2,
+      "model_path": "E:\\LLM\\Models\\ReadyArt\\Dark-Scarlett-27B-v2.0-GGUF\\Dark-Scarlett-27B-v2.0.i1-Q5_K_M_hb16.gguf",
+      "model_alias": "ReadyArt/Dark-Scarlett-27B-v2.0-GGUF/Dark-Scarlett-27B-v2.0.i1-Q5_K_M_hb16",
+      "chat_format": "Content-only",
+      "lora": [],
+      "modalities": {
+        "vision": true,
+        "video": true,
+        "audio": false
+      },
+      "build_info": "b10689-57291f264",
+      "speculative": true
+    },
+    "ctx_per_slot": 262144
+  },
+  "load": {
+    "performed": false,
+    "reused_resident": true,
+    "wall_s": null,
+    "previous_instance": {
+      "model_id": "ReadyArt/Dark-Scarlett-27B-v2.0-GGUF/Dark-Scarlett-27B-v2.0.i1-Q5_K_M_hb16",
+      "state": "ready",
+      "port": 18100,
+      "pid": 22436,
+      "engine_tag": null,
+      "resolved_engine_tag": "b10689",
+      "spawn_seq": 1,
+      "cache_ram_mib": 32603,
+      "effective": {
+        "cache_prompt": true,
+        "cache_reuse": 256,
+        "cache_ram_mib": 32603,
+        "cache_idle_slots": true,
+        "cont_batching": true,
+        "kv_unified": false,
+        "slot_prompt_similarity": 0.3,
+        "parallel": 2,
+        "ctx_per_slot": 262144,
+        "ctx_total": 524288,
+        "batch_size": 2048,
+        "ubatch_size": 512,
+        "ctx_checkpoints": 32,
+        "checkpoint_min_step": 8192,
+        "spec_type": "draft-mtp",
+        "flash_attn": "on",
+        "sources": {
+          "parallel": "argv",
+          "ctx_total": "argv",
+          "cache_prompt": "engine_default",
+          "cache_reuse": "argv",
+          "cache_ram_mib": "argv",
+          "cache_idle_slots": "engine_default",
+          "cont_batching": "engine_default",
+          "kv_unified": "argv",
+          "slot_prompt_similarity": "argv",
+          "batch_size": "engine_default",
+          "ubatch_size": "engine_default",
+          "ctx_checkpoints": "engine_default",
+          "checkpoint_min_step": "engine_default",
+          "spec_type": "argv",
+          "flash_attn": "argv"
+        },
+        "inert": [],
+        "summary": "prefix cache on (reuse 256, host 32603 MiB, routing 0.3), continuous batching on, 2 slots x 262144, partitioned KV, spec draft-mtp"
+      },
+      "launch_args": [
+        "llama-server.exe",
+        "--model",
+        "Dark-Scarlett-27B-v2.0.i1-Q5_K_M_hb16.gguf",
+        "--alias",
+        "ReadyArt/Dark-Scarlett-27B-v2.0-GGUF/Dark-Scarlett-27B-v2.0.i1-Q5_K_M_hb16",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "18100",
+        "--n-gpu-layers",
+        "999",
+        "--ctx-size",
+        "524288",
+        "--parallel",
+        "2",
+        "--device",
+        "CUDA0,CUDA1",
+        "--tensor-split",
+        "0.5087,0.4913",
+        "--split-mode",
+        "layer",
+        "--main-gpu",
+        "0",
+        "--cache-type-k",
+        "q8_0",
+        "--cache-type-v",
+        "q8_0",
+        "--flash-attn",
+        "on",
+        "--no-webui",
+        "--props",
+        "--slots",
+        "--metrics",
+        "--fit",
+        "off",
+        "--cache-reuse",
+        "256",
+        "--cache-ram",
+        "32603",
+        "--reasoning-format",
+        "deepseek",
+        "--slot-prompt-similarity",
+        "0.3",
+        "--no-kv-unified",
+        "--mmproj",
+        "MMPROJ-Dark-Scarlett-27B-v2.0-BF16.gguf",
+        "--spec-type",
+        "draft-mtp",
+        "--spec-draft-n-max",
+        "3"
+      ],
+      "plan": {
+        "model_id": "ReadyArt/Dark-Scarlett-27B-v2.0-GGUF/Dark-Scarlett-27B-v2.0.i1-Q5_K_M_hb16",
+        "devices": [
+          0,
+          1
+        ],
+        "tensor_split": [
+          0.5087,
+          0.4913
+        ],
+        "split_mode": "layer",
+        "main_gpu": 0,
+        "ctx_size": 262144,
+        "parallel": 2,
+        "kv_cache_type": "q8_0",
+        "kv_cache_type_v": "q8_0",
+        "flash_attn": "on",
+        "estimate": {
+          "weights_bytes": 27782937213,
+          "kv_bytes": 22731710625,
+          "compute_bytes": 4167440581,
+          "mmproj_bytes": 1139984198,
+          "mmproj_compute_bytes": 657280822,
+          "adapter_bytes": 0,
+          "draft_weights_bytes": 0,
+          "draft_kv_bytes": 0,
+          "cuda_context_bytes": 770250964
+        },
+        "per_gpu_bytes": {
+          "0": 28595237146,
+          "1": 28654367256
+        },
+        "evict_model_ids": [],
+        "notes": [
+          "estimate corrected x1.22 from the last load of this exact configuration (observed 49634 MB against a formula estimate of 44596 MB)",
+          "device placement forced by per-model device_override"
+        ],
+        "max_parallel": 2,
+        "parallel_limited_by": "explicit",
+        "ctx_per_slot": 262144,
+        "kv_bytes_per_token": 35414,
+        "speculative": {
+          "type": "draft-mtp",
+          "draft_n_max": 3,
+          "draft_model_id": null,
+          "reason": "the model carries 1 multi-token-prediction head(s)"
+        },
+        "split_mode_reason": null,
+        "placement_tier": "optimal"
+      },
+      "started_at": 1788957028.1678307,
+      "last_activity_at": 1788962915.701692,
+      "ttl_s": 3600,
+      "active_requests": 0,
+      "total_requests": 16,
+      "loaded_by": "api:/api/models/{id}/load",
+      "priority": 1,
+      "restarts": 0,
+      "last_error": null,
+      "last_tokens_per_second": 70.87,
+      "speculative": {
+        "type": "draft-mtp",
+        "draft_n_max": 3,
+        "draft_model_id": null,
+        "reason": "the model carries 1 multi-token-prediction head(s)"
+      },
+      "requests_deferred": 0.0,
+      "requests_processing": 0.0,
+      "busy_slots_per_decode": 1.0,
+      "metrics_sampled_at": 1788963033.9703946,
+      "prompt_cache": {
+        "processed_total": 59328,
+        "cached_total": 35034,
+        "hit_ratio": 0.3713,
+        "since": "child_start",
+        "sampled_at": 1788963033.9703946
+      },
+      "max_parallel": 2,
+      "ctx_per_slot": 262144
+    }
+  },
+  "prompts": {
+    "1024": {
+      "requested": 1024,
+      "clamp": 1024,
+      "target": 1013,
+      "words": 868,
+      "tokens": 1011,
+      "method": "tokenize"
+    }
+  },
+  "runs": [
+    {
+      "prompt_length": 1024,
+      "run": 0,
+      "warmup": true,
+      "prompt_tokens_fitted": 1011,
+      "wall_s": 1.5519,
+      "ttft_s": 1.0428,
+      "peak_vram_bytes": {
+        "0": 25303699456,
+        "1": 28468015104,
+        "2": 6269788160,
+        "3": 552329216
+      },
+      "vram_samples": 3,
+      "usage": {
+        "completion_tokens": 64,
+        "prompt_tokens": 1028,
+        "total_tokens": 1092,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "timings_missing": false,
+      "prompt_n": 1028,
+      "cache_n": 0,
+      "predicted_n": 64,
+      "prefill_tps": 1434.5900882105443,
+      "decode_tps": 124.02868803241283,
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 1028,
+        "prompt_ms": 716.581,
+        "prompt_per_token_ms": 0.6970632295719844,
+        "prompt_per_second": 1434.5900882105443,
+        "predicted_n": 64,
+        "predicted_ms": 507.947,
+        "predicted_per_token_ms": 8.062650793650795,
+        "predicted_per_second": 124.02868803241283,
+        "draft_n": 49,
+        "draft_n_accepted": 46
+      },
+      "cache_hit_suspected": false
+    },
+    {
+      "prompt_length": 1024,
+      "run": 1,
+      "warmup": false,
+      "prompt_tokens_fitted": 1011,
+      "wall_s": 0.9594,
+      "ttft_s": 0.4773,
+      "peak_vram_bytes": {
+        "0": 25376542720,
+        "1": 28468015104,
+        "2": 6269788160,
+        "3": 552329216
+      },
+      "vram_samples": 2,
+      "usage": {
+        "completion_tokens": 64,
+        "prompt_tokens": 1028,
+        "total_tokens": 1092,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "timings_missing": false,
+      "prompt_n": 1028,
+      "cache_n": 0,
+      "predicted_n": 64,
+      "prefill_tps": 2518.2006133827176,
+      "decode_tps": 130.82183104879653,
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 1028,
+        "prompt_ms": 408.228,
+        "prompt_per_token_ms": 0.3971089494163424,
+        "prompt_per_second": 2518.2006133827176,
+        "predicted_n": 64,
+        "predicted_ms": 481.571,
+        "predicted_per_token_ms": 7.643984126984128,
+        "predicted_per_second": 130.82183104879653,
+        "draft_n": 47,
+        "draft_n_accepted": 47
+      },
+      "cache_hit_suspected": false
+    }
+  ],
+  "summary": {
+    "1024": {
+      "runs_measured": 1,
+      "runs_total": 2,
+      "prefill_tps": {
+        "median": 2518.2006133827176,
+        "p95": 2518.2006133827176,
+        "n": 1
+      },
+      "decode_tps": {
+        "median": 130.82183104879653,
+        "p95": 130.82183104879653,
+        "n": 1
+      },
+      "ttft_s": {
+        "median": 0.4773,
+        "p95": 0.4773,
+        "n": 1
+      },
+      "wall_s": {
+        "median": 0.9594,
+        "p95": 0.9594,
+        "n": 1
+      },
+      "peak_vram_bytes": {
+        "0": 25376542720,
+        "1": 28468015104,
+        "2": 6269788160,
+        "3": 552329216
+      },
+      "prompt_n_median": 1028.0,
+      "cache_hit_suspected_runs": 0,
+      "timings_missing_runs": 0
+    }
+  },
+  "validity": {
+    "valid": true,
+    "checks": [
+      {
+        "valid": true,
+        "offending": [],
+        "own": [
+          {
+            "pid": 22436,
+            "name": "llama-server.exe",
+            "classification": "ours",
+            "alias": "ReadyArt/Dark-Scarlett-27B-v2.0-GGUF/Dark-Scarlett-27B-v2.0.i1-Q5_K_M_hb16",
+            "port": 18100,
+            "used_bytes": 52097744896,
+            "per_gpu_bytes": {
+              "0": 24079601664,
+              "1": 28018094080,
+              "2": 24576,
+              "3": 24576
+            },
+            "gpu_indices": [
+              0,
+              1
+            ],
+            "attribution": "per_gpu_bytes"
+          }
+        ],
+        "holder_count": 3,
+        "desktop_processes_count": 23,
+        "desktop_processes_bytes": 935227392,
+        "per_gpu_bytes_source": "pdh",
+        "phase": "pre-load",
+        "at": 1788963042.9561996
+      },
+      {
+        "valid": true,
+        "offending": [],
+        "own": [
+          {
+            "pid": 22436,
+            "name": "llama-server.exe",
+            "classification": "ours",
+            "alias": "ReadyArt/Dark-Scarlett-27B-v2.0-GGUF/Dark-Scarlett-27B-v2.0.i1-Q5_K_M_hb16",
+            "port": 18100,
+            "used_bytes": 52097744896,
+            "per_gpu_bytes": {
+              "0": 24079601664,
+              "1": 28018094080,
+              "2": 24576,
+              "3": 24576
+            },
+            "gpu_indices": [
+              0,
+              1
+            ],
+            "attribution": "per_gpu_bytes"
+          }
+        ],
+        "holder_count": 3,
+        "desktop_processes_count": 23,
+        "desktop_processes_bytes": 935227392,
+        "per_gpu_bytes_source": "pdh",
+        "phase": "post-load",
+        "at": 1788963043.013805
+      },
+      {
+        "valid": true,
+        "offending": [],
+        "own": [
+          {
+            "pid": 22436,
+            "name": "llama-server.exe",
+            "classification": "ours",
+            "alias": "ReadyArt/Dark-Scarlett-27B-v2.0-GGUF/Dark-Scarlett-27B-v2.0.i1-Q5_K_M_hb16",
+            "port": 18100,
+            "used_bytes": 52112424960,
+            "per_gpu_bytes": {
+              "0": 24079601664,
+              "1": 28032774144,
+              "2": 24576,
+              "3": 24576
+            },
+            "gpu_indices": [
+              0,
+              1
+            ],
+            "attribution": "per_gpu_bytes"
+          }
+        ],
+        "holder_count": 3,
+        "desktop_processes_count": 23,
+        "desktop_processes_bytes": 1015226368,
+        "per_gpu_bytes_source": "pdh",
+        "phase": "post-run",
+        "at": 1788963045.9621425
+      }
+    ]
+  }
+}

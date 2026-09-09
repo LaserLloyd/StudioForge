@@ -32,7 +32,7 @@ where each language model sits. Both change during a day.
 
 ## 2. Two registrations, two different files
 
-**StudioForge is a stdio bridge.** The companion CLI (`sfctl`) merges the app's 20 management tools
+**StudioForge is a stdio bridge.** The companion CLI (`sfctl`) merges the app's 21 management tools
 and the watchdog's 10 recovery tools into one local stdio MCP server, so OpenClaw launches a
 process rather than opening a socket:
 
@@ -289,7 +289,7 @@ Everything else means *change the request*, *stand down*, or *report*.
 
 ## 10. The short version (this is the part to hand an agent)
 
-> **You are talking to one GPU rig through two servers.** `studioforge` (30 tools) manages the
+> **You are talking to one GPU rig through two servers.** `studioforge` (31 tools) manages the
 > LLM host; text generation is NOT a tool — it is `POST http://<rig-host>:1234/v1/chat/completions`.
 > `clawforge2` (24 tools) makes pictures. They share four GPUs, and a **lease** is how one tenant
 > tells the others to keep off a card.

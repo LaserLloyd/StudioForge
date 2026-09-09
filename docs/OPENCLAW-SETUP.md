@@ -270,7 +270,7 @@ others — want this shape:
 `sfctl mcp` is a **stdio** server — OpenClaw launches it as a child process, and it reads the
 profile you created in Step 4 to find the rig. No ports, no extra credentials in the JSON.
 
-It merges two upstream tool sets into one list of **30 tools**:
+It merges two upstream tool sets into one list of **31 tools**:
 
 | Source | Tools | Works when the main server is wedged? |
 | --- | --- | --- |

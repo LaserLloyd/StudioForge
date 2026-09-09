@@ -682,12 +682,33 @@ async def plan(
     request: Request,
     ctx_size: int | None = Query(None),
     kv_cache_type: str | None = Query(None),
+    kv_cache_type_v: str | None = Query(None),
     parallel: int | None = Query(None),
+    devices: list[int] | None = Query(None),
+    allowed_devices: list[int] | None = Query(None),
+    priority: int | None = Query(None),
 ) -> dict[str, Any]:
-    """Live fit verdict, so the GUI can show it before the user clicks Load."""
+    """The dry-run planner: what would happen if this model were loaded now.
+
+    Nothing is loaded. The same planner that decides a real load answers
+    against the GPUs as they stand, through the same one-shot ``devices`` /
+    ``allowed_devices`` copies the load route makes (D36/D59) and at the tier
+    the load would run at (``priority``, else the model's remembered tier).
+    The GUI's live fit check and the MCP ``plan_load`` tool are this route.
+    Repeat ``devices`` / ``allowed_devices`` per index
+    (``?allowed_devices=2&allowed_devices=3``); sending both is a 400, as on
+    the load route.
+    """
     state = _state(request)
     return state.manager.plan_preview(
-        model_id, ctx_size=ctx_size, kv_cache_type=kv_cache_type, parallel=parallel
+        model_id,
+        ctx_size=ctx_size,
+        kv_cache_type=kv_cache_type,
+        kv_cache_type_v=kv_cache_type_v,
+        parallel=parallel,
+        devices=devices,
+        allowed_devices=allowed_devices,
+        priority=priority,
     )
 
 
@@ -1788,8 +1809,8 @@ async def openclaw_setup(request: Request) -> JSONResponse:
                 "New model: search_models -> repo_details(repo_id) -> download_model.",
                 "VRAM missing: server_status names every holder; reclaim_orphan_engines "
                 "(watchdog) kills leaked engine processes and nothing else.",
-                "`sfctl mcp` merges the app's 20 management tools with the "
-                "watchdog's 10 recovery tools into one stdio tool list (30).",
+                "`sfctl mcp` merges the app's 21 management tools with the "
+                "watchdog's 10 recovery tools into one stdio tool list (31).",
             ],
         }
     )

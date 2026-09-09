@@ -344,8 +344,8 @@ models:
   thinking_default_ctx: 32768
   default_parallel: auto     # or an integer
   default_kv_cache_type: auto
-  default_ttl_s: 1800        # 0 = never idle-unload
-  ttl_by_priority: {}        # per-tier idle timeouts; {} = default_ttl_s for every tier
+  default_ttl_s: 600         # a load that named no tier: 10 min idle; 0 = never idle-unload
+  ttl_by_priority: {1: 900, 2: 900, 3: 600}   # per-tier idle timeouts, since the last request
   default_model: null
 engine:
   pinned_tag: b10425
@@ -360,15 +360,16 @@ logging:
   level: INFO
 ```
 
-**Idle timeouts per tier.** `models.default_ttl_s` is how long *any* idle model stays resident.
-`models.ttl_by_priority` refines it by load tier — `1` the model a person is chatting with, `2` a
-dispatched agent, `3` background (D46's tiers, and since D48 a tier a model keeps across a
-restart) — and is consulted between a model's own `settings.ttl_s` and `default_ttl_s`.
-`{1: 3600, 2: 1800, 3: 900}` is the shape worth starting from: the chat model stays warm for an
-hour, background work is reclaimed in fifteen minutes, and neither needs a per-model override to
-get there. It ships **empty**, which gives every tier `default_ttl_s` — exactly the behaviour
-before it existed, so an upgrade changes nothing until you fill it in. A tier set to `0` never
-idle-unloads, as `0` does everywhere else. The Setup tab edits the three rows directly.
+**Idle timeouts per tier.** `models.default_ttl_s` is how long an idle model stays resident when
+nothing more specific applies. `models.ttl_by_priority` refines it by load tier — `1` the model a
+person is chatting with, `2` a dispatched agent, `3` background (D46's tiers, and since D48 a tier
+a model keeps across a restart) — and is consulted between a model's own `settings.ttl_s` and
+`default_ttl_s`. "Idle" is measured from the last inference request against the instance, never
+from the load. The shipped policy is `{1: 900, 2: 900, 3: 600}` with `default_ttl_s: 600`: the chat
+model and an agent's model idle out after fifteen minutes without a request, background work — and
+every load that named no tier at all, which is a background load (D46) — after ten. Set a tier to
+`0` to never idle-unload it, as `0` means everywhere else; clear the map (`{}`) to give every tier
+`default_ttl_s`. The Setup tab edits the three rows directly.
 
 The equivalent commands:
 

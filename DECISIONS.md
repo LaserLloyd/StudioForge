@@ -5077,3 +5077,133 @@ that the bound reached the estimator), `test_an_empty_allowed_devices_is_refused
 where a rename goes unnoticed, in `tests/unit/test_catalog_routes.py`:
 `test_both_load_routes_forward_allowed_devices_to_the_manager` and
 `test_the_load_routes_refuse_a_bad_allowed_devices_in_the_openai_shape`.
+
+
+## D60 -- The 2026-09-09 review round: the arbiter's clocks, the planner's generations, and a GPU-only policy that is actually enforced
+
+
+
+**Status at the commit that carries this entry (2026-09-09, session cut short by quota).** The
+planner (same-generation pools, the bound on the plan, the named shortfall, the 5% warning), the
+dry-run route and MCP tool, the TTL policy, the two closed swallows and the `bench/` harness landed
+in this commit and are green on their suites. The GPU-only hardening, the unload reporting and the
+timing items (Lane D2) were still being written when the session stopped: their edits sit
+UNCOMMITTED in the working tree (`core/supervisor.py`, `core/engine.py`, `watchdog/server.py`,
+`tray/tray_app.py`, `core/benchmark.py`, `core/parallel_bench.py`, `docs/ENGINE-FEATURES.md` and
+their tests, plus `tests/unit/test_gpu_only_policy.py` / `test_unload_reporting.py`) with seven of
+their tests failing at the time of writing. Do not restart the server from this tree until that
+work is finished or stashed. The resume plan is `Projects/docs/SWARM_FOLLOWUP.md`.
+
+**Context.** A cross-repo regression review (StudioForge, ClawForge2, ClawChat V12→V13) ran on
+2026-09-09 against a build spec whose Phases 3 and 5 asked for a "computed VRAM planner" and "one
+VRAM arbiter". Both already existed here (D14–D19, D36–D43, D46–D48, D51–D56); what the review found
+were gaps between what the decisions promised and what the code enforced, plus two owner-stated
+policies. This entry records what changed and why. The audit that drove it is
+`Projects/docs/FIX_AUDIT.md` (Part A); the survey that ruled out a backend change is
+`Projects/docs/BACKEND_SURVEY.md`.
+
+**The owner's two rules, now shipped defaults.**
+
+1. *A load that names no priority is the lowest tier and idles out 10 minutes after its last
+   request.* `models.default_ttl_s` is now 600 and `models.ttl_by_priority` ships
+   `{1: 900, 2: 900, 3: 600}` -- the chat model and an agent's model after 15 minutes, background
+   (and every untiered load, which D46 makes background) after 10. Idle is measured from the last
+   inference request against the instance, never from the load. Before this the map shipped empty
+   and every tier fell through to a 30-minute default; D48's reason for shipping it empty ("shipped
+   defaults do not make policy decisions") gave way to a policy decision made by the owner. An
+   operator who wants the old behaviour sets the map to `{}`.
+2. *Improvements found along the way are kept regardless of the 10% bar; the bar gates only a
+   backend change.* The survey found no backend change with a sourced ≥10% basis (llama.cpp stays;
+   ExLlamaV3 is closer but lacks DRY and has an open two-GPU Blackwell defect; TRT-LLM/vLLM/SGLang
+   do not install on Windows). The one on-rig ≥10% candidate, `-ub 2048` at low slot counts (D38
+   §5: +18.6% prefill on a 1.5B), is a hypothesis for the new `bench/` harness, not a change.
+
+**Same-generation placements before mixed ones.** `_candidate_order` sorts cards by compute
+capability and then free VRAM, so on this rig a 5090+3090 pair sorted ahead of the 3090 pair on
+both keys and the two-card walk tried the mixed pair first -- a layer split that runs at the 3090's
+pace plus a sync hop per token, measured here at roughly half a same-generation pair (D38, D51's
+note). `planner.mixed_generation_split` now orders the walk: `fallback` (default) tries every
+same-generation combination of a width before any mixed one and stamps a mixed placement with a
+note; `never` drops mixed combinations and says so on the refusal; `any` is the old order. A
+`device_override` is never second-guessed. `_wider_split_for_parallel` never widens across
+generations at all: concurrency bought with the mixed-split tax on every token is not the cheap
+concurrency it exists to find. A 123B model that needs all four cards still loads under
+`fallback`, with the note.
+
+**The bound travels on the plan.** D59's one-shot `allowed_devices` lived on a throwaway record
+copy, so the D42 rebalancer -- previewing from the registry's own row a minute later -- could move
+the model onto exactly the card the caller asked it to avoid (the `rebalanced model devices=[3, 2]`
+line D59 quotes). `LoadPlan.allowed_devices` now carries the bound the placement was chosen within
+and `_rebalance_opportunity` previews on a copy that carries it.
+
+**A refusal names the term.** `LoadRejected.message()` now says "short by X GiB; the largest term is
+the KV cache at Y GiB" -- a caller can act on the term (context knob vs. smaller quant) and cannot
+act on two totals. `largest_term()` is the accessor.
+
+**Prediction error over 5% is a warning, and the last observation is readable.** `Planner.observe`
+already logged predicted-vs-actual at INFO and warned on a per-device overrun over 15% (D40). It
+now also warns when the total misses by more than `PREDICTION_ERROR_WARN_PCT` (5%) with the
+estimate's breakdown, and keeps the last observation per model (`Planner.last_observation`), which
+`introspect` and the MCP `model_info` surface as `vram_prediction`. D51 keeps correcting the next
+plan from the measurement; the warning exists because a persistent miss is a term the formula does
+not model, which is a bug to fix rather than history to absorb.
+
+**The dry run is a tool.** `GET /api/models/{id}/plan` (the GUI's live fit check) now accepts
+`kv_cache_type_v`, `devices`, `allowed_devices` and `priority`, validates them exactly as the load
+route does, plans through the same record copies, and reports `dry_run`, `priority`,
+`allowed_devices`, `shortfall_bytes`, `largest_term`, `mixed_generation` and the last observation.
+The MCP `plan_load` tool is that route; the management server has 21 tools.
+
+**Two swallowed failures, closed.** `_vacate_url_is_ours` cached `[]` for the life of the process
+after one transient failure of the address walk, silently disabling D56's same-host check for every
+later lease; it now warns and retries on the next lease. `_ttl_loop` wrapped five steps in one
+`try`, so a throw in the TTL sweep skipped lease expiry, the pin reconciler, the rebalancer and the
+throughput sample for that iteration -- a persistently failing sweep kept every lease standing
+forever behind one repeating warning whose `str(exc)` was empty for half the exception types. Each
+step now has its own guard and a traceback.
+
+**The GPU-only policy is enforced twice, and the child's environment is its own.** (Lane D2; see
+the hardening section below for the exact surfaces.) The refusal list that named CPU-offload flags
+(`CPU_OFFLOAD_FLAGS`) had no caller; the list that ran (`MANAGED_FLAGS`) named none of them, and
+`validate_extra_flags` was an existence check against the engine's help -- so on b10689 `--device
+none`, `--cpu-moe`, `--n-cpu-moe`, `--n-cpu-ffn`, `-ot`, `--no-kv-offload` and `--load-mode`
+validated clean and were appended last, where llama.cpp's last-wins rule let them beat our own
+flags; the child also inherited every `LLAMA_ARG_*` variable. One family-keyed deny-list is now
+consulted at save time and again over the final argv at build time; the child gets a sanitised
+environment; D54's `effective` launch report parses the policy flags and carries
+`policy_violations` / `gpu_only`; `--mlock`/`--no-mmap` map onto `--load-mode` where the engine has
+it.
+
+**Unload failures are not success.** `Supervisor.stop_all` discarded every `ModelUnloadError` from
+its `gather(..., return_exceptions=True)`, so `POST /api/models/unload-all` answered 200 with a
+cheerful count for children still holding VRAM. The failures now surface.
+
+**Timing.** An unload waits up to `UNLOAD_SETTLE_S` for a slow-but-correct driver teardown before
+it is declared failed; a `VRAM_SETTLE_S` pause precedes the post-unload measurement, the OOM-retry
+re-plan and the lease handover (the watchdog already had one); a child that answers non-200 within
+`gateway.load_timeout_s` of its start is `loading` to the watchdog, not `degraded`; the benchmark
+re-asks a `409 lease_vacating` on its interval instead of failing the mode; the vacate ACK budget
+(`leases.vacate_callback_timeout_s`) defaults to 30 s; the tray's HTTP budgets fit a real reload.
+
+**The benchmark harness.** `bench/` (README, `run_bench.py`, `compare.py`, `bench_stats.py`, tests)
+drives the live REST API only -- StudioForge owns the GPUs, so the harness asks it to load the
+reference model (`Dark-Scarlett-27B-v2.0 Q5_K_M` at 262144 on the 5090 pair) and measures prefill
+and decode from llama-server's own `timings`, TTFT and peak VRAM per device from `/api/gpus`,
+median and p95 over ≥5 runs after a discarded warm-up, and refuses to call a run valid when a
+foreign compute holder sits on the pool. `--smoke` measured the resident instance end to end on
+2026-09-09 (`bench/results/62f6997cf710-smoke.json`); the full 256k baseline is an owner-run job
+because it occupies the chat model for half an hour.
+
+**Left honest.** The full baseline has not been run, so no throughput claim is made anywhere in this
+round. `Planner._gpus_without`, `_thinking_ctx`, `evictable_ids`, `run_stdio` and the other
+callerless definitions the audit listed stay (`Projects/docs/DEFERRED.md`); removing dead code is
+out of this round's scope. D10 still has no unit test. `plan_load` plans at the requested tier
+without the D48 "only upwards" rule a real load applies to a resident, because a preview has no
+resident to re-tier.
+
+**Tests.** `tests/unit/test_planner_generations.py`, `test_planner_prediction_error.py`,
+`test_plan_route.py`, the `plan_load` tests in `test_mcp.py`,
+`test_the_shipped_tier_ttls_are_fifteen_fifteen_and_ten_minutes` and
+`test_rebalance_previews_inside_the_loads_allowed_devices_bound` in `test_gateway_lifecycle.py`,
+plus the hardening lane's `test_gpu_only_policy.py` / `test_unload_reporting.py` and the updated
+supervisor, engine, watchdog, tray and benchmark suites.

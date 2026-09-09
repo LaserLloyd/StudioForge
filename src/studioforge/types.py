@@ -747,6 +747,12 @@ class LoadPlan(BaseModel):
     per_gpu_bytes: dict[int, int] = Field(default_factory=dict)
     evict_model_ids: list[str] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
+    #: The ``allowed_devices`` bound this placement was chosen within (D59):
+    #: the model's persisted setting narrowed by the request's one-shot, or
+    #: ``None`` when nothing bounded it. Kept on the plan because the record
+    #: copy that carried the one-shot is discarded after the load, and the
+    #: rebalancer (D42) must not relocate the model outside it.
+    allowed_devices: list[int] | None = None
 
     # --- concurrency (DECISIONS.md D17) --------------------------------
     #: Slots the estimator judged this placement could sustain. Equal to
@@ -858,6 +864,27 @@ class LoadRejected(BaseModel):
     #: instead of substring-matching prose.
     leases: list[dict[str, Any]] = Field(default_factory=list)
 
+    def largest_term(self) -> tuple[str, int] | None:
+        """The estimate term that dominates the bill, named.
+
+        A refusal has to say *which* number blew the budget, not only that one
+        did: "the KV cache at 41.5 GiB" sends the caller to the context knob,
+        "the model weights at 73 GiB" to a smaller quant. ``None`` when nothing
+        was estimated (a lease refusal, D53).
+        """
+        est = self.estimate
+        terms = [
+            ("model weights", est.weights_bytes),
+            ("KV cache", est.kv_bytes),
+            ("compute buffers", est.compute_bytes),
+            ("vision projector", est.mmproj_bytes + est.mmproj_compute_bytes),
+            ("adapters", est.adapter_bytes),
+            ("draft model", est.draft_weights_bytes + est.draft_kv_bytes),
+            ("CUDA contexts", est.cuda_context_bytes),
+        ]
+        label, size = max(terms, key=lambda term: term[1])
+        return (label, size) if size > 0 else None
+
     def message(self) -> str:
         text = f"Cannot load '{self.model_id}' entirely in VRAM: "
         # A lease refusal has no arithmetic behind it: nothing was estimated,
@@ -867,8 +894,19 @@ class LoadRejected(BaseModel):
         if self.required_bytes or self.available_bytes:
             text += (
                 f"needs {self.required_bytes / GB:.2f} GiB, "
-                f"{self.available_bytes / GB:.2f} GiB usable. "
+                f"{self.available_bytes / GB:.2f} GiB usable"
             )
+            # Name the shortfall and the term that caused it: a caller can act
+            # on "short by 6.3 GiB, the KV cache is 41.5 GiB of it" and cannot
+            # act on two totals.
+            shortfall = self.required_bytes - self.available_bytes
+            term = self.largest_term()
+            if shortfall > 0:
+                text += f" (short by {shortfall / GB:.2f} GiB"
+                if term is not None:
+                    text += f"; the largest term is the {term[0]} at {term[1] / GB:.2f} GiB"
+                text += ")"
+            text += ". "
         text += self.reason
         if self.suggestions:
             text += " Suggestions: " + "; ".join(self.suggestions)
@@ -924,6 +962,25 @@ class EffectiveLaunch(BaseModel):
     checkpoint_min_step: int | None = None
     spec_type: str = "none"
     flash_attn: str = "auto"
+    # --- the GPU-only policy, as launched (2026-09-09 review) ----------------
+    #: ``--n-gpu-layers`` as launched. StudioForge always passes ``999``; any
+    #: other value means an operator flag or an inherited ``LLAMA_ARG_*``
+    #: variable won the argument. ``None`` until the argv has been parsed.
+    n_gpu_layers: str | None = None
+    #: ``--fit`` as launched; StudioForge always passes ``off``.
+    fit: str | None = None
+    #: ``--device`` as launched (``CUDA0,CUDA1``); ``none`` is the whole model
+    #: on the CPU.
+    device: str | None = None
+    split_mode: str | None = None
+    #: ``--load-mode`` when the engine has the flag; ``None`` = engine default.
+    load_mode: str | None = None
+    #: ``--kv-offload``: ``False`` means the KV cache lives in host RAM.
+    kv_offload: bool = True
+    #: Every launched flag (or inherited variable) that contradicts the
+    #: GPU-only policy, named -- ``["--cpu-moe", "--device none"]``. Empty on
+    #: every launch StudioForge composes itself; non-empty is a bug report.
+    policy_violations: list[str] = Field(default_factory=list)
     #: field -> ``"argv"`` | ``"engine_default"``.
     sources: dict[str, str] = Field(default_factory=dict)
     #: Saved settings the child cannot see -- e.g. ``cont_batching: false`` on
@@ -935,10 +992,17 @@ class EffectiveLaunch(BaseModel):
     #: 131072, partitioned KV, spec draft-mtp".
     summary: str = ""
 
+    @property
+    def gpu_only(self) -> bool:
+        """True when nothing in the final argv or environment offloads to CPU."""
+        return not self.policy_violations
+
     def compact(self) -> dict[str, Any]:
         """The subset an agent needs to answer "is the prompt cache on?"."""
         return {
             "summary": self.summary,
+            "gpu_only": self.gpu_only,
+            "policy_violations": list(self.policy_violations),
             "cache_prompt": self.cache_prompt,
             "cache_reuse": self.cache_reuse,
             "cache_ram_mib": self.cache_ram_mib,

@@ -13,7 +13,7 @@ import asyncio
 import contextlib
 import time
 from collections import deque
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -3400,17 +3400,27 @@ class ModelManager:
         _host, port = vacate_url_target(url)
         if port not in own_ports:
             return False  # the common case, decided without any I/O
-        if self._own_addresses is None:
+        own_addresses = self._own_addresses
+        if own_addresses is None:
             try:
                 from studioforge.core.netinfo import local_addresses
 
                 found = await asyncio.to_thread(local_addresses)
-                self._own_addresses = [entry.ip for entry in found]
-            except Exception:  # noqa: BLE001 - loopback is still refused without this
-                self._own_addresses = []
-        return await vacate_url_targets_self(
-            url, own_ports=own_ports, own_addresses=self._own_addresses
-        )
+                own_addresses = [entry.ip for entry in found]
+                self._own_addresses = own_addresses
+            except Exception as exc:  # noqa: BLE001 - loopback is still refused without this
+                # Not cached: one transient failure of the address walk used to
+                # write ``[]`` for the life of the process, silently disabling
+                # the same-host check for every later lease. This call falls
+                # back to the loopback-only rule and the next one asks again.
+                own_addresses = []
+                log.warning(
+                    "could not enumerate this host's addresses for the vacate_url "
+                    "same-host check; loopback is still refused, other own addresses "
+                    "are not, and the walk is retried on the next lease",
+                    error=repr(exc),
+                )
+        return await vacate_url_targets_self(url, own_ports=own_ports, own_addresses=own_addresses)
 
     def release_lease(self, lease_id: str) -> GpuLease:
         lease = self.leases.release(lease_id)
@@ -3555,17 +3565,29 @@ class ModelManager:
     async def _ttl_loop(self) -> None:
         interval = self.config.gateway.ttl_sweep_interval_s
         while True:
-            try:
-                await asyncio.sleep(interval)
-                await self._sweep_ttl()
-                self._expire_leases()
-                self._maybe_reconcile_pinned()
-                self._maybe_rebalance()
-                await self._sample_throughput()
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # pragma: no cover - the sweeper must never die
-                log.warning("ttl sweep failed", error=str(exc))
+            await asyncio.sleep(interval)
+            # One guard per step. A single try around all five meant a throw
+            # inside the TTL sweep skipped lease expiry, the pin reconciler,
+            # the rebalancer and the throughput sample for that iteration --
+            # so a persistently failing sweep kept every lease standing
+            # forever, evidenced by one repeating warning whose ``str(exc)``
+            # was empty for half the exception types that cause it.
+            await self._sweep_step("sweep_ttl", self._sweep_ttl)
+            await self._sweep_step("expire_leases", self._expire_leases)
+            await self._sweep_step("reconcile_pinned", self._maybe_reconcile_pinned)
+            await self._sweep_step("rebalance", self._maybe_rebalance)
+            await self._sweep_step("sample_throughput", self._sample_throughput)
+
+    async def _sweep_step(self, name: str, step: Callable[[], Any]) -> None:
+        """Run one sweep step; a failure is logged with its traceback and skipped."""
+        try:
+            result = step()
+            if asyncio.iscoroutine(result):
+                await result
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the sweeper must never die
+            log.exception("ttl sweep step failed", step=name, error=repr(exc))
 
     async def _sweep_ttl(self) -> None:
         now = time.time()
@@ -3786,6 +3808,20 @@ class ModelManager:
             record = self.registry.get(instance.model_id)
             if record is None or record.settings.device_override is not None:
                 continue
+            if plan.allowed_devices is not None:
+                # The load was bounded by a one-shot ``allowed_devices`` (D59).
+                # The throwaway record copy that carried it is gone, so the
+                # bound lives on the plan; previewing from the registry's own
+                # record would offer the very card the caller asked the model
+                # to stay off -- the `rebalanced model devices=[3, 2]` line
+                # D59's own problem statement quotes.
+                record = record.model_copy(
+                    update={
+                        "settings": record.settings.model_copy(
+                            update={"allowed_devices": list(plan.allowed_devices)}
+                        )
+                    }
+                )
             if self.leases.for_model(instance.model_id) is not None:
                 # A lease owner's placement is forced onto the lease's cards on
                 # a COPY of the record at load time (_apply_lease_profile), so
@@ -4333,35 +4369,93 @@ class ModelManager:
         *,
         ctx_size: int | None = None,
         kv_cache_type: Any = None,
+        kv_cache_type_v: Any = None,
         parallel: int | None = None,
+        devices: Sequence[int] | None = None,
+        allowed_devices: Sequence[int] | None = None,
+        priority: int | None = None,
     ) -> dict[str, Any]:
-        """Fit verdict without loading anything — powers the GUI's live check."""
+        """Fit verdict without loading anything -- the dry-run planner.
+
+        Powers the GUI's live check, ``GET /api/models/{id}/plan`` and the
+        MCP ``plan_load`` tool: "what would happen if I loaded X at Y" answered
+        by the same planner, through the same record copies a real load makes
+        (a one-shot ``devices`` places, a one-shot ``allowed_devices`` bounds,
+        D36/D59) and at the tier the real load would run at, without touching
+        VRAM. Arguments are validated exactly as the load route validates them,
+        so a preview refuses what a load would refuse with the same 400.
+        """
+        validate_load_args(
+            ctx_size=ctx_size,
+            parallel=parallel,
+            kv_cache_type=kv_cache_type,
+            kv_cache_type_v=kv_cache_type_v,
+            devices=devices,
+            allowed_devices=allowed_devices,
+            known_devices=self._known_devices(),
+        )
         record = self.registry.resolve(name)
         if record is None:
             raise ModelNotFoundError(name, known=self.registry.known_ids())
+        if devices is not None:
+            record = record.model_copy(
+                update={
+                    "settings": record.settings.model_copy(
+                        update={"device_override": [int(d) for d in devices]}
+                    )
+                }
+            )
+        narrowed = self._effective_allowed_devices(record, allowed_devices)
+        if narrowed is not None:
+            record = record.model_copy(
+                update={
+                    "settings": record.settings.model_copy(
+                        update={"allowed_devices": sorted(narrowed)}
+                    )
+                }
+            )
+        # The preview must answer for the load the Load button would run, and
+        # that load runs at the model's remembered tier (D46) -- a tier-blind
+        # preview says "does not fit" for a chat model whose real load would
+        # displace background residents and land fine. Read off the SERVING
+        # record, because that is where every load route reads it: a
+        # preset-only persona has no instance and no memo of its own, so
+        # asking under its own id answered background for a preview of a load
+        # that would run at the base's tier. An explicit ``priority`` is
+        # resolved the way the load route resolves it.
+        serving_id = self.serving_record(record).id
+        tier = (
+            self._resolve_tier(serving_id, priority)
+            if priority is not None
+            else self.effective_priority_for(self.serving_record(record))
+        )
         result = self.planner.plan_load(
             record,
             ctx_size=ctx_size,
             kv_cache_type=kv_cache_type,
+            kv_cache_type_v=kv_cache_type_v,
             parallel=parallel,
             loaded=self.supervisor.list(),
             draft=self._draft_for(record),
             adapters=[a for a, _ in self._adapters_for(record)],
-            # The preview must answer for the load the Load button would run,
-            # and that load runs at the model's remembered tier (D46) -- a
-            # tier-blind preview says "does not fit" for a chat model whose
-            # real load would displace background residents and land fine.
-            # Read off the SERVING record, because that is where every load
-            # route reads it: a preset-only persona has no instance and no
-            # memo of its own, so asking under its own id answered background
-            # for a preview of a load that would run at the base's tier.
-            priority=self.effective_priority_for(self.serving_record(record)),
+            priority=tier,
         )
+        common: dict[str, Any] = {
+            "model_id": record.id,
+            "priority": tier,
+            "allowed_devices": sorted(narrowed) if narrowed is not None else None,
+            "dry_run": True,
+        }
         if isinstance(result, LoadRejected):
+            term = result.largest_term()
+            largest_term = {"term": term[0], "bytes": term[1]} if term is not None else None
             return {
                 "fits": False,
-                "model_id": record.id,
+                **common,
                 "reason": result.reason,
+                "reason_code": result.reason_code,
+                "shortfall_bytes": max(0, result.required_bytes - result.available_bytes),
+                "largest_term": largest_term,
                 "message": result.message(),
                 "required_bytes": result.required_bytes,
                 "available_bytes": result.available_bytes,
@@ -4378,20 +4472,35 @@ class ModelManager:
             }
         return {
             "fits": True,
-            "model_id": record.id,
+            **common,
             "devices": result.devices,
             "tensor_split": result.tensor_split,
             "split_mode": result.split_mode,
             "ctx_size": result.ctx_size,
             "parallel": result.parallel,
             "kv_cache_type": result.kv_cache_type,
+            "kv_cache_type_v": result.kv_cache_type_v,
             "flash_attn": result.flash_attn,
             "per_gpu_bytes": result.per_gpu_bytes,
             "evict_model_ids": result.evict_model_ids,
             "notes": result.notes,
             "estimate_mb": result.estimate.breakdown_mb(),
             "single_gpu": result.fits_single_gpu,
+            "mixed_generation": any("mixed-generation split" in n for n in result.notes),
+            "last_observation": self._last_vram_observation(serving_id),
         }
+
+    def _last_vram_observation(self, model_id: str) -> dict[str, Any] | None:
+        """The planner's last predicted-vs-actual record, or ``None``.
+
+        Tolerates a planner stand-in without the accessor (tests, the catalog's
+        throwaway planners): the record is telemetry, never a decision input.
+        """
+        lookup = getattr(self.planner, "last_observation", None)
+        if not callable(lookup):
+            return None
+        found = lookup(model_id)
+        return found if isinstance(found, dict) else None
 
     #: What a caller is told to wait when the server is too busy to smoke-test.
     #: One agent turn, roughly; short enough that a poll is not a stall.
@@ -4672,6 +4781,10 @@ class ModelManager:
             "requested": instance.plan.model_dump(mode="json") if instance.plan else None,
             "actual": actual,
             "activity": slot_activity(slots),
+            # Predicted-vs-actual VRAM for the last measured load of this
+            # model: the plan's total, what the child really holds, and the
+            # error against the 5% bar (2026-09-09 review).
+            "vram_prediction": self._last_vram_observation(model_id),
             "props": props,
             "slots": slots,
         }
