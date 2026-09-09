@@ -314,7 +314,9 @@ def test_status_and_leases_describe_a_lease_the_same_way(app: Any) -> None:
     assert len(from_status) == 1 and len(from_leases) == 1
     assert from_status[0].keys() == from_leases[0].keys()
     assert from_status[0]["id"] == lease.id
-    assert from_status[0]["idle_s"] == 0
+    # Wall clock: the lease is taken before TestClient boots the lifespan, and
+    # ``idle_s`` rounds, so a boot that takes 500 ms under load reads as 1.
+    assert from_status[0]["idle_s"] <= 1
     assert from_status[0]["expires_at"] is not None
     assert from_status[0]["state"] == "active"
     assert from_status[0]["holder_family"] == "crucibleforge"
