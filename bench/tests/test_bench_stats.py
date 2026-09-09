@@ -201,7 +201,13 @@ def test_result_filename_and_plan_tuple() -> None:
 def test_summarize_runs_counts_foreign_holder_runs() -> None:
     base = {"prefill_tps": 1.0, "decode_tps": 1.0, "ttft_s": 1.0, "wall_s": 1.0}
     runs = [
-        {"prompt_length": 1024, "run": 0, "warmup": True, **base, "foreign_holders_seen": [{"pid": 7}]},
+        {
+            "prompt_length": 1024,
+            "run": 0,
+            "warmup": True,
+            **base,
+            "foreign_holders_seen": [{"pid": 7}],
+        },
         {"prompt_length": 1024, "run": 1, **base, "foreign_holders_seen": [{"pid": 7}]},
         {"prompt_length": 1024, "run": 2, **base, "foreign_holders_seen": []},
     ]

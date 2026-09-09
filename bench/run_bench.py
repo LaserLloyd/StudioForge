@@ -34,7 +34,7 @@ LOAD_TIMEOUT_S = 1800.0
 RUN_TIMEOUT_S = 3600.0
 TOKEN_TOLERANCE = 0.01  # aim 1% under the clamp so the fitted prompt never exceeds it
 GPU_SAMPLE_INTERVAL_S = 0.5
-#: How often the sampler reads /api/vram/holders during a run (a co-tenant check).
+#: How often the sampler reads /api/vram/holders during a run (the co-tenant check).
 HOLDERS_SAMPLE_INTERVAL_S = 10.0
 
 
@@ -184,13 +184,14 @@ def preflight(gw: Gateway, args: argparse.Namespace) -> dict[str, Any]:
         if not (set(lease.get("devices") or []) & set(args.device_list)):
             continue
         if args.model in (lease.get("model_ids") or []):
-            # A lease taken FOR the model under test: the cards are its alone, which is the
-            # quietest rig a baseline can have (the first 2026-09-10 baseline shared the 5090
-            # pair with a JIT load for three of its four lengths). The load is allowed by the
-            # lease and the unload is the loopback holder's own.
+            # A lease taken FOR the model under test: the cards are its alone, which is
+            # the quietest rig a baseline can have (the first 2026-09-10 baseline shared
+            # the 5090 pair with a JIT load for three of its four lengths). The load is
+            # allowed by the lease and the unload is the loopback holder's own.
             own_lease = lease
             print(
-                f"[preflight] target devices leased to the model under test: {lease.get('id')} ({lease.get('holder')}, priority {lease.get('priority')})"
+                f"[preflight] target devices leased to the model under test: "
+                f"{lease.get('id')} ({lease.get('holder')}, priority {lease.get('priority')})"
             )
             continue
         # A baseline unloads/reloads on these cards; a loopback caller would be
@@ -236,11 +237,15 @@ def validity_check(
     result["at"] = time.time()
     flag = "valid" if result["valid"] else "INVALID"
     print(
-        f"[validity/{phase}] {flag}: {len(result['own'])} own, {len(result['offending'])} foreign compute holder(s) on {devices}; desktop processes collapsed: {result.get('desktop_processes_count')}"
+        f"[validity/{phase}] {flag}: {len(result['own'])} own, {len(result['offending'])} "
+        f"foreign compute holder(s) on {devices}; desktop processes collapsed: "
+        f"{result.get('desktop_processes_count')}"
     )
     for h in result["offending"]:
         print(
-            f"    offending pid={h['pid']} {h['name']} class={h['classification']} alias={h['alias']} bytes={h['used_bytes']} per_gpu={h['per_gpu_bytes']} via={h['attribution']}"
+            f"    offending pid={h['pid']} {h['name']} class={h['classification']} "
+            f"alias={h['alias']} bytes={h['used_bytes']} per_gpu={h['per_gpu_bytes']} "
+            f"via={h['attribution']}"
         )
     return result
 
@@ -254,7 +259,8 @@ def load_model(
         have = bs.plan_tuple(resident.get("plan")) or ()
         if have[:3] == wanted:
             print(
-                f"[load] already resident at the requested shape (priority {resident.get('priority')}); reusing, no reload"
+                "[load] already resident at the requested shape "
+                f"(priority {resident.get('priority')}); reusing, no reload"
             )
             return {
                 "performed": False,
@@ -263,7 +269,8 @@ def load_model(
                 "previous_instance": resident,
             }
         print(
-            f"[load] resident at a different shape {have} (priority {resident.get('priority')}); unloading it first (no force is ever passed)"
+            f"[load] resident at a different shape {have} (priority {resident.get('priority')}); "
+            "unloading it first (no force is ever passed)"
         )
         gw.post(model_path(args.model, "/unload"), {})
     body = {
@@ -315,7 +322,8 @@ def count_tokens(gw: Gateway, model: str, text: str) -> tuple[int, str]:
     n = int(timings.get("prompt_n") or (probe.get("usage") or {}).get("prompt_tokens") or 0)
     if n <= 0:
         raise Refused(
-            "cannot count tokens: no /v1/tokenize route and the probe completion reported no prompt_n"
+            "cannot count tokens: no /v1/tokenize route and the probe completion "
+            "reported no prompt_n"
         )
     return n, "probe-completion"
 
@@ -326,7 +334,8 @@ def fit_prompts(gw: Gateway, args: argparse.Namespace, ctx: int) -> dict[int, di
     sample_tokens, method = count_tokens(gw, args.model, bs.build_prompt(sample_words, args.seed))
     ratio = sample_tokens / sample_words
     print(
-        f"[prompt] calibration via {method}: {sample_tokens} tokens for {sample_words} words -> {ratio:.3f} tok/word"
+        f"[prompt] calibration via {method}: {sample_tokens} tokens for {sample_words} words "
+        f"-> {ratio:.3f} tok/word"
     )
     prompts: dict[int, dict[str, Any]] = {}
     for requested in args.length_list:
@@ -342,7 +351,8 @@ def fit_prompts(gw: Gateway, args: argparse.Namespace, ctx: int) -> dict[int, di
             words = bs.estimate_words(target, tokens / max(1, words))
         if tokens > clamp:
             raise Refused(
-                f"prompt for {requested} fitted to {tokens} tokens, above the clamp {clamp}; refusing to exceed ctx"
+                f"prompt for {requested} fitted to {tokens} tokens, above the clamp {clamp}; "
+                "refusing to exceed ctx"
             )
         prompts[requested] = {
             "requested": requested,
@@ -367,7 +377,10 @@ class VramSampler(threading.Thread):
     """
 
     def __init__(
-        self, gw: Gateway, devices: list[int] | None = None, own_pids: list[int] | None = None
+        self,
+        gw: Gateway,
+        devices: list[int] | None = None,
+        own_pids: list[int] | None = None,
     ) -> None:
         super().__init__(daemon=True)
         self.client = gw.new_client()
@@ -385,9 +398,8 @@ class VramSampler(threading.Thread):
         if not self.devices or time.monotonic() < self._next_holders:
             return
         self._next_holders = time.monotonic() + HOLDERS_SAMPLE_INTERVAL_S
-        result = bs.classify_validity(
-            self.client.get("/api/vram/holders").json(), self.devices, self.own_pids
-        )
+        payload = self.client.get("/api/vram/holders").json()
+        result = bs.classify_validity(payload, self.devices, self.own_pids)
         self.holders_samples += 1
         for row in result["offending"]:
             key = str(row.get("pid") or f"{row.get('name')}:{row.get('alias')}")
@@ -455,7 +467,8 @@ def run_one(
             if response.status_code >= 400:
                 response.read()
                 raise Refused(
-                    f"POST /v1/completions (run {run}, length {prompt['requested']}) -> {error_text(response)}"
+                    f"POST /v1/completions (run {run}, length {prompt['requested']}) "
+                    f"-> {error_text(response)}"
                 )
             for line in response.iter_lines():
                 if not line.startswith("data:"):
@@ -466,7 +479,8 @@ def run_one(
                 chunk = json.loads(data)
                 if chunk.get("error"):
                     raise Refused(
-                        f"in-stream error (run {run}, length {prompt['requested']}): {json.dumps(chunk['error'])}"
+                        f"in-stream error (run {run}, length {prompt['requested']}): "
+                        f"{json.dumps(chunk['error'])}"
                     )
                 if ttft is None and any(
                     (c.get("text") or (c.get("delta") or {}).get("content"))
@@ -522,8 +536,13 @@ def run_one(
         (row.get("prompt_n") or 0) < expected * 0.98 or (row.get("cache_n") or 0) > 0
     )
     peak_gib = {k: round(v / 2**30, 2) for k, v in sorted(sampler.peak.items())}
+    warm = " (warm-up)" if run == 0 else ""
+    suspect = "  CACHE HIT SUSPECTED" if row["cache_hit_suspected"] else ""
+    foreign = "  FOREIGN HOLDER ON TARGET DEVICES" if sampler.foreign else ""
     print(
-        f"  run {run}{' (warm-up)' if run == 0 else ''}: prompt_n={row.get('prompt_n')} prefill={row.get('prefill_tps')} tok/s  decode={row.get('decode_tps')} tok/s  ttft={row.get('ttft_s')}s  wall={row['wall_s']}s  peak GiB={peak_gib}{'  CACHE HIT SUSPECTED' if row['cache_hit_suspected'] else ''}{'  FOREIGN HOLDER ON TARGET DEVICES' if sampler.foreign else ''}"
+        f"  run {run}{warm}: prompt_n={row.get('prompt_n')} prefill={row.get('prefill_tps')} tok/s"
+        f"  decode={row.get('decode_tps')} tok/s  ttft={row.get('ttft_s')}s"
+        f"  wall={row['wall_s']}s  peak GiB={peak_gib}{suspect}{foreign}"
     )
     return row
 
@@ -600,7 +619,8 @@ def _stat(entry: dict[str, Any], metric: str, stat: str) -> str:
 
 def print_summary(summary: dict[str, Any]) -> None:
     print(
-        "\nlength    prefill tok/s (med / p95)   decode tok/s (med / p95)   TTFT s (med / p95)   wall s (med)   peak GiB   n"
+        "\nlength    prefill tok/s (med / p95)   decode tok/s (med / p95)   "
+        "TTFT s (med / p95)   wall s (med)   peak GiB   n"
     )
     for key in sorted(summary, key=int):
         e = summary[key]
@@ -625,7 +645,9 @@ def print_summary(summary: dict[str, Any]) -> None:
             )
         ]
         print(
-            f"{key:>7}   {cells[0]:>9} / {cells[1]:<9}   {cells[2]:>8} / {cells[3]:<8}   {cells[4]:>7} / {cells[5]:<7}   {cells[6]:>8}   {peak:<12} {e['prefill_tps']['n']}{flags}"
+            f"{key:>7}   {cells[0]:>9} / {cells[1]:<9}   {cells[2]:>8} / {cells[3]:<8}"
+            f"   {cells[4]:>7} / {cells[5]:<7}   {cells[6]:>8}   {peak:<12}"
+            f" {e['prefill_tps']['n']}{flags}"
         )
 
 
@@ -671,14 +693,24 @@ def write_results(
 
 def print_plan(args: argparse.Namespace) -> None:
     lp = model_path(args.model, "/load")
+    load_body = {
+        "ctx_size": args.ctx,
+        "parallel": args.parallel,
+        "devices": args.device_list,
+        "priority": bs.TIER_AGENT,
+    }
     print(f"DRY RUN -- nothing is contacted. Server {args.server}, model {args.model}")
     print(
-        f"config: ctx {args.ctx}, devices {args.device_list}, parallel {args.parallel}, priority {bs.TIER_AGENT} (agent tier), max_tokens {args.max_tokens}, runs {args.runs} (run 0 discarded), seed {args.seed}, smoke {args.smoke}"
+        f"config: ctx {args.ctx}, devices {args.device_list}, parallel {args.parallel}, "
+        f"priority {bs.TIER_AGENT} (agent tier), max_tokens {args.max_tokens}, "
+        f"runs {args.runs} (run 0 discarded), seed {args.seed}, smoke {args.smoke}"
     )
     for requested in args.length_list:
         clamp = bs.clamp_prompt_length(requested, args.ctx, args.max_tokens)
         print(
-            f"  prompt {requested}: clamp {clamp}, target {int(clamp * (1 - TOKEN_TOLERANCE))} tokens, ~{bs.estimate_words(clamp, 1.3)} words at the 1.3 tok/word estimate (calibrated live via POST /v1/tokenize)"
+            f"  prompt {requested}: clamp {clamp}, target {int(clamp * (1 - TOKEN_TOLERANCE))} "
+            f"tokens, ~{bs.estimate_words(clamp, 1.3)} words at the 1.3 tok/word estimate "
+            "(calibrated live via POST /v1/tokenize)"
         )
     steps = [
         "GET /api/health (ready, busy.active_requests == 0, no load in progress)",
@@ -689,19 +721,24 @@ def print_plan(args: argparse.Namespace) -> None:
     if not args.smoke:
         steps += [
             f"POST {model_path(args.model, '/unload')} (only if resident at a different shape)",
-            f"POST {lp} {json.dumps({'ctx_size': args.ctx, 'parallel': args.parallel, 'devices': args.device_list, 'priority': bs.TIER_AGENT})} (timed: load wall)",
+            f"POST {lp} {json.dumps(load_body)} (timed: load wall)",
         ]
     steps += [
-        f"GET {model_path(args.model, '/introspect')} + GET /api/status (effective launch, plan, engine tag)",
+        f"GET {model_path(args.model, '/introspect')} + GET /api/status "
+        "(effective launch, plan, engine tag)",
         "GET /api/vram/holders (validity, post-load)",
         "POST /v1/tokenize x ~1-4 per length (calibration)",
-        f"POST /v1/completions x {args.runs} per length {{stream, cache_prompt false, temperature 0, top_k 1, seed, ignore_eos, max_tokens {args.max_tokens}, priority {bs.TIER_AGENT}}} with GET /api/gpus every {GPU_SAMPLE_INTERVAL_S}s in a thread",
+        f"POST /v1/completions x {args.runs} per length {{stream, cache_prompt false, "
+        f"temperature 0, top_k 1, seed, ignore_eos, max_tokens {args.max_tokens}, "
+        f"priority {bs.TIER_AGENT}}} with GET /api/gpus every {GPU_SAMPLE_INTERVAL_S}s "
+        "in a thread",
         "GET /api/vram/holders (validity, post-run)",
     ]
     if not args.smoke and not args.no_restore:
         steps += [
             f"POST {model_path(args.model, '/unload')}",
-            "POST /api/models/{id}/load for each previously resident model (its plan tuple + priority)",
+            "POST /api/models/{id}/load for each previously resident model "
+            "(its plan tuple + priority)",
         ]
     steps.append(
         f"write {Path(args.results_dir) / bs.result_filename('<sha>', args.label, args.smoke)}"
@@ -749,8 +786,8 @@ def main(argv: list[str] | None = None) -> int:
         pids_before = [
             r["pid"] for r in residents if r.get("model_id") == args.model and r.get("pid")
         ]
-        payload["own_lease"] = pre.get("own_lease")
         checks.append(validity_check(gw, args.device_list, pids_before, "pre-load"))
+        payload["own_lease"] = pre.get("own_lease")
         if args.smoke:
             load_record = {
                 "performed": False,
@@ -798,18 +835,12 @@ def main(argv: list[str] | None = None) -> int:
         prompts = fit_prompts(gw, args, ctx_per_slot)
         for requested in args.length_list:
             print(
-                f"\n== prompt length {requested} ({prompts[requested]['tokens']} tokens), {args.runs} runs =="
+                f"\n== prompt length {requested} ({prompts[requested]['tokens']} tokens), "
+                f"{args.runs} runs =="
             )
             for run in range(args.runs):
-                runs.append(
-                    run_one(
-                        gw,
-                        args,
-                        prompts[requested],
-                        run,
-                        [instance["pid"]] if instance.get("pid") else [],
-                    )
-                )
+                own_pids = [instance["pid"]] if instance.get("pid") else []
+                runs.append(run_one(gw, args, prompts[requested], run, own_pids))
         checks.append(
             validity_check(
                 gw, args.device_list, [instance["pid"]] if instance.get("pid") else [], "post-run"
@@ -854,7 +885,9 @@ def main(argv: list[str] | None = None) -> int:
         print_summary(payload["summary"])
     if not payload["validity"]["valid"]:
         print(
-            f"\n*** INVALID: a compute holder that is not the model under test sat on the target devices during the runs (see validity.checks; runs {payload['validity']['runs_with_foreign_holders']}) ***"
+            "\n*** INVALID: a compute holder that is not the model under test sat on the "
+            "target devices during the runs (see validity.checks; runs "
+            f"{payload['validity']['runs_with_foreign_holders']}) ***"
         )
     if exit_code != EXIT_OK:
         return exit_code
