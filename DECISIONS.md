@@ -5585,3 +5585,88 @@ reference rig's window), the D63 cases in `tests/unit/test_planner_prediction_er
 not a warning, an overrun of the corrected total is, 7% off an uncorrected plan is, the stored row's
 formula and note, the unaccounted correction, the altered plan, auto-parallel, the bounded map) and
 the real-database round trip in `tests/unit/test_planner_observed.py`.
+
+## D64 -- The 2026-09-12 change-request round: a walk that reads the lease book, a dry run that is the same decision, and the failures that were silent
+
+**Status.** Landed on 2026-09-13 as one commit per item on `main`, `tests/unit` green, ruff and
+mypy clean. The live server runs the pre-D64 code until it is restarted; the restart is the
+deploy step and nothing migrates. Every wire change is additive.
+
+**Context.** A change request raised by the ClawChat V14 audit (read-only recon against the live
+rig) plus one live incident the same evening (CR-9). The items and what became of them are below,
+one sub-section each; CR-8 was reviewed and rejected (no change).
+
+### CR-9 -- `load_recommended` plans against the leases, instead of refusing its own choice
+
+**Incident, 2026-09-12 22:29-22:36.** CUDA 1 -- one of the two RTX 5090s -- was leased to
+ClawForge2 for ComfyUI (idle, 620 MiB, 0% utilisation). ClawChat's
+`POST /api/models/{id}/load-recommended` (`{ctx_size: 131072, priority: 1, max_slots: 1}`, no
+devices, no saved `device_override`) logged `loading at the requested context mode=dual_5090
+devices=[0, 1]`, then `load rejected: device leased to another holder devices=[1]`, then a 507
+`gpu_leased` telling the caller to "load without the device override and let the planner place it
+elsewhere". The client retried every 60 s and got the identical placement and refusal eight times,
+for seven minutes of chat outage, while the 3090 pair was free -- and in the same minute a JIT load
+of the embedding model planned around the same lease (`devices [0, 2]`, `placement_tier:
+degraded`, a note naming the lease). It cleared only when the other tenant was vacated by hand.
+
+**Root cause.** `ModelManager.load_recommended` walked the modes through a throwaway
+`Planner(self.config, probe, log_plans=False)` built **without the lease book** (`leases=None`, the
+catalog's "no leases exist" convention). Each mode is planned as a `forced_onto` copy carrying a
+`device_override`, and `plan_load` does refuse an override onto a leased card -- but only through
+`self.leases`, which that planner did not have. So every mode looked lease-free, `dual_5090` won,
+and the real `self.load(devices=[0, 1])` -- planned by the app's planner, which does read the book
+-- refused it. Deterministic inputs, deterministic refusal, no fallback. The CR's reading of
+`planner.py:1338-1341` was right; the book simply was not on the planner the walk used.
+
+**Decision.**
+
+1. *The walk's planner reads the same lease book the real load's planner reads.* A mode that
+   needs a card leased to someone else is refused inside the walk (`gpu_leased`, recorded on the
+   attempt as `leased_devices`) and the next fitting mode wins. D53 is untouched: nothing may load
+   onto a leased card, and a lease is never overridden or vacated by a load (D56 item 5).
+2. *A placement taken around a lease says so.* When modes before the winner were passed over for a
+   lease, the plan's `notes` gain "load-recommended passed over dual_5090 (CUDA [0, 1]) because
+   CUDA [1] is leased to someone else, and took dual_3090 ..." plus the planner's own lease line
+   (holder, reason, lease id, idle TTL, `DELETE /api/leases/{id}`), on the instance the real call
+   returns and on the dry run alike. `placement_tier` and the mixed-generation note come from the
+   planner as before.
+3. *The override advice is for callers who sent an override.* `plan_load` gains
+   `override_chosen_by_server`; the walk sets it, so a mode's refusal reads "the placement on CUDA
+   [0, 1] needs CUDA [1], which is leased ..." with no advice to drop an override. A caller's
+   `devices` or a saved `device_override` still gets the old reason and the advice. The words
+   "leased" and "a lease is not a default to override" stay in both for substring matchers (D53).
+   The per-mode refusal logs at DEBUG (the walk logs its decision; D16).
+4. *When no mode fits, the refusal names the lease -- and is `gpu_leased` only when the lease is the
+   cause.* Each mode the lease took away is re-planned once, on the refusal path only, by a planner
+   with no lease book (`fits_once_lease_released`). The 507 is `gpu_leased` with `lease`, `leases`
+   and the lease's `retry_after_s` when every mode needs a leased card or a leased mode would have
+   fitted without the lease; otherwise it stays `insufficient_vram` with no retry advice and the
+   lease named as context in the suggestions (D53's "a lease beside a genuine shortfall is not a
+   reason to wait"). The byte figures come from the first mode that was actually estimated, so a
+   lease refusal never lends the 507 its zeros; `shortfall_bytes`, `largest_term` and
+   `max_ctx_that_fits` are added to the details (the names `/plan` uses).
+5. *A lease granted between the walk and the load walks again.* The walk now sees leases, so a
+   commit-time `gpu_leased` means a lease arrived in the moments between; the call re-walks once
+   (the planner refuses before any eviction, so nothing is lost) and a second collision is refused
+   as "the placement this call's mode walk chose ... was leased to someone else before the load
+   could begin, twice", without the override advice.
+
+**Left honest.** `hardware_modes` still names `single_5090` as CUDA 0; with CUDA 0 leased the
+single-card mode is refused rather than substituted by CUDA 1 -- the three other modes remain and
+`/plan` / JIT still place freely. The walk never proposes a mixed pair that is not a mode (the JIT
+path's `[0, 2]`); a caller that wants the planner's free choice around a lease uses `/load` with
+`allowed_devices`. The other internal callers that pass a server-chosen `devices` to `load()` (the
+D42 rebalancer, the D46 restore, the benchmarks) still get the caller wording on a lease race; their
+refusals are log lines, not client-facing.
+
+**Tests.** `tests/unit/test_load_recommended_leases.py`: the incident's shape (CUDA 1 of two
+same-generation cards leased) takes the 3090 pair first time and never CUDA 1, while the same call
+without the lease still takes the 5090 pair; the notes name the passed-over mode, the holder, the
+lease id, its TTL and the DELETE route, and a lease no earlier mode needed adds no such note; a
+refusal where only the leased pair reaches the window is `gpu_leased` with the lease, a retry and
+"would fit ... once that lease ends", with "device override" nowhere in the message, suggestions or
+per-mode reasons; a refusal where nothing would fit either way is `insufficient_vram`, no retry,
+the lease still named; all cards leased is `gpu_leased` with no invented shortfall; the planner
+keeps the override advice for a caller-forced placement and drops it for a server-chosen one; a
+lease granted between walk and load re-walks to the next mode, and a second collision is refused as
+the walk's choice. Six of the ten fail with the lease book removed from the walk.

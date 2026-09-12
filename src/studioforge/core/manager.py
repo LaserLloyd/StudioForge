@@ -14,7 +14,7 @@ import contextlib
 import time
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from studioforge.config import Config, KvCacheType
@@ -376,6 +376,99 @@ def measure_child_vram(
     if pdh_total > 0:
         return pdh_total, None
     return 0, None
+
+
+def _validate_recommended_args(
+    *,
+    ctx_size: int,
+    max_slots: int | None,
+    allowed_devices: Sequence[int] | None,
+    known_devices: Sequence[int] | None,
+) -> None:
+    """The 400s ``load_recommended`` and its dry run share (D64)."""
+    validate_load_args(
+        ctx_size=ctx_size,
+        parallel=None,
+        kv_cache_type=None,
+        allowed_devices=list(allowed_devices) if allowed_devices is not None else None,
+        known_devices=known_devices,
+    )
+    if max_slots is not None and int(max_slots) < 1:
+        raise BadRequestError(
+            f"max_slots must be at least 1 slot (got {max_slots}); omit it to let "
+            f"the server size the slot count itself",
+            param="max_slots",
+        )
+
+
+def _estimate_bytes_of(estimate: Any) -> dict[str, int]:
+    """Every term of a :class:`VramEstimate` in bytes, plus ``total`` (D64/CR-5).
+
+    The bytes twin of ``VramEstimate.breakdown_mb()`` -- whose "MB" are MiB,
+    1024 * 1024 bytes -- so a client never has to know which unit a key is in.
+    """
+    data = {key: int(value) for key, value in estimate.model_dump().items()}
+    data["total"] = int(estimate.total_bytes)
+    return data
+
+
+def _estimate_bytes(plan: LoadPlan) -> dict[str, int]:
+    return _estimate_bytes_of(plan.estimate)
+
+
+def _attempt_summary(attempt: Mapping[str, Any]) -> dict[str, Any]:
+    """One mode of a ``load_recommended`` walk, as JSON (D64)."""
+    return {
+        "mode": attempt["mode"],
+        "label": attempt["label"],
+        "devices": list(attempt["devices"]),
+        "fits": bool(attempt["fits"]),
+        "reason": attempt.get("reason"),
+        "largest_ctx_that_fits": attempt.get("max_ctx_that_fits"),
+        "would_evict": list(attempt.get("would_evict") or []),
+        "busy_models": list(attempt.get("busy_models") or []),
+        "leased_devices": attempt.get("leased_devices"),
+        "fits_once_lease_released": attempt.get("fits_once_lease_released"),
+    }
+
+
+@dataclass
+class _RecommendedPrep:
+    """A ``load_recommended`` request resolved and validated, before any planning."""
+
+    record: ModelRecord
+    ctx_size: int
+    narrowed: frozenset[int] | None
+    asked_tier: int | None
+    tier: int
+
+
+@dataclass
+class RecommendedDecision:
+    """What ``load_recommended`` would do right now (D64).
+
+    Exactly one of three: ``refusal`` (the 503/507 the call would raise),
+    ``already_loaded`` (the resident is returned as is), or ``winner`` (the
+    mode walk's chosen attempt). Produced by
+    :meth:`ModelManager._decide_recommended`, the one function both the real
+    call and ``GET /api/models/{id}/plan-recommended`` use.
+    """
+
+    record: ModelRecord
+    ctx_size: int
+    tier: int
+    asked_tier: int | None
+    narrowed: frozenset[int] | None
+    trained: int = 0
+    resident: InstanceInfo | None = None
+    already_loaded: bool = False
+    winner: dict[str, Any] | None = None
+    attempts: list[dict[str, Any]] = field(default_factory=list)
+    #: Modes before the winner that a lease took away.
+    lease_skipped: list[dict[str, Any]] = field(default_factory=list)
+    #: Lease-routing notes for the plan the caller gets back.
+    notes: list[str] = field(default_factory=list)
+    refusal: StudioForgeError | None = None
 
 
 class ModelManager:
@@ -1513,23 +1606,195 @@ class ModelManager:
                 background models must be displaced for it; the recently
                 active ones are reloaded afterwards where they fit.
         """
-        from studioforge.core import catalog as catalog_mod
-        from studioforge.core import placements as placements_mod
-
-        validate_load_args(
+        _validate_recommended_args(
             ctx_size=ctx_size,
-            parallel=None,
-            kv_cache_type=None,
-            allowed_devices=list(allowed_devices) if allowed_devices is not None else None,
+            max_slots=max_slots,
+            allowed_devices=allowed_devices,
             known_devices=self._known_devices(),
         )
-        if max_slots is not None and int(max_slots) < 1:
-            raise BadRequestError(
-                f"max_slots must be at least 1 slot (got {max_slots}); omit it to let "
-                f"the server size the slot count itself",
-                param="max_slots",
-            )
         await self._await_boot()
+        prep = self._recommended_prep(
+            name, ctx_size, allowed_devices=allowed_devices, persist=persist, priority=priority
+        )
+        record = prep.record
+        self._refuse_if_held(record.id, priority=prep.tier)
+        if prep.asked_tier is not None:
+            # Same rule as load(): an explicit tier is remembered, but only
+            # past the admission gate (D46).
+            self._model_priority[record.id] = prep.tier
+
+        hold = prep.tier < PRIORITY_BACKGROUND
+        try:
+            # Two passes, and only a lease granted between the walk and the
+            # load can use the second: the walk plans against the lease book
+            # (D64), so the only way its own choice meets a lease at commit is a
+            # lease acquired in the moments between. Walking again sees it and
+            # takes the next mode -- the fallback the 2026-09-12 incident never
+            # got, where the same refused placement was retried for 7 minutes.
+            for walk_pass in (1, 2):
+                if hold:
+                    # D46: the hold must span the mode walk too, not only the
+                    # final load -- otherwise a worse-tier load can take the D29
+                    # gate while this one is still choosing its placement. The
+                    # inner self.load() re-registers the same key and pops it
+                    # (so a second pass re-arms it); the outer pop is the
+                    # backstop for every refusal path out of the walk.
+                    self._priority_holds[record.id] = prep.tier
+                decision = self._decide_recommended(
+                    prep, prefer_modes=prefer_modes, kv_min=kv_min, max_slots=max_slots
+                )
+                if decision.refusal is not None:
+                    raise decision.refusal
+                resident = decision.resident
+                if decision.already_loaded and resident is not None:
+                    log.info(
+                        "already loaded at the requested context",
+                        model_id=record.id,
+                        ctx_size=int(ctx_size),
+                        devices=resident.plan.devices if resident.plan is not None else None,
+                        source=source,
+                    )
+                    if prep.asked_tier is not None:
+                        # The same re-tier load() does on its ready instance,
+                        # and for the same reason -- so the two explicit load
+                        # routes agree, and so the refresh_ttl inside the
+                        # persist below prices the tier this call just asked
+                        # for rather than the stale one still stamped on the
+                        # child.
+                        self._retier_resident(record, resident, prep.tier)
+                    if persist:
+                        # The caller asked for this profile to become the
+                        # model's own; that it was already resident at it is
+                        # not a reason to skip the write, or
+                        # "load-recommended --persist" would be a no-op
+                        # precisely when it is run twice.
+                        self._persist_load_profile(record, resident, prep.asked_tier)
+                    return resident
+
+                winner = decision.winner
+                assert winner is not None  # a decision is a refusal, a resident or a winner
+                log.info(
+                    "loading at the requested context",
+                    model_id=record.id,
+                    ctx_size=int(ctx_size),
+                    mode=winner["mode"],
+                    devices=winner["devices"],
+                    kv_cache_type=winner["kv_cache_type"],
+                    parallel=winner["parallel"],
+                    evicting=winner["would_evict"],
+                    skipped_for_leases=[a["mode"] for a in decision.lease_skipped],
+                    source=source,
+                )
+                # force=True is the RELOAD half of force (the model may be
+                # resident at another context); evict_busy=False keeps D36's
+                # rule -- a model that is serving is never a candidate, and
+                # this path has no override for that by design.
+                try:
+                    instance = await self.load(
+                        record.id,
+                        ctx_size=int(ctx_size),
+                        kv_cache_type=winner["kv_cache_type"],
+                        kv_cache_type_v=winner["kv_cache_type_v"],
+                        parallel=winner["parallel"],
+                        devices=winner["devices"],
+                        force=True,
+                        source=source,
+                        evict_busy=False,
+                        priority=prep.tier,
+                    )
+                except InsufficientVramError as exc:
+                    if exc.code != "gpu_leased":
+                        raise
+                    if walk_pass == 1:
+                        log.info(
+                            "the walk's placement was leased away before the load began; "
+                            "walking again",
+                            model_id=record.id,
+                            mode=winner["mode"],
+                            devices=winner["devices"],
+                        )
+                        continue
+                    raise self._walk_placement_leased(record, winner, exc) from exc
+                if instance.plan is not None:
+                    # The real load re-plans onto the chosen devices, so it
+                    # knows nothing of the modes the walk passed over; say so
+                    # on the plan the caller gets back, as the dry run does.
+                    for note in decision.notes:
+                        if note not in instance.plan.notes:
+                            instance.plan.notes.append(note)
+                if persist:
+                    # After the load, not before: what gets written is what
+                    # actually launched (instance.plan), never what the walk
+                    # hoped for -- the two differ whenever the planner had to
+                    # step down on the way in.
+                    self._persist_load_profile(record, instance, prep.asked_tier)
+                return instance
+            raise AssertionError("unreachable: the second walk pass returns or raises")
+        finally:
+            if hold:
+                self._priority_holds.pop(record.id, None)
+
+    async def plan_recommended(
+        self,
+        name: str,
+        ctx_size: int,
+        *,
+        prefer_modes: Sequence[str] | None = None,
+        kv_min: str | None = None,
+        max_slots: int | None = None,
+        allowed_devices: Sequence[int] | None = None,
+        priority: int | None = None,
+    ) -> dict[str, Any]:
+        """What :meth:`load_recommended` would do right now, without doing it (D64).
+
+        The decision is :meth:`_decide_recommended` -- the very function the
+        real call walks with -- over the same inputs, validated by the same
+        helpers with the same 400s. Nothing is loaded, evicted, leased, held,
+        re-tiered, remembered or persisted: the D46 admission hold and the
+        per-model tier memo are the real call's side effects and are skipped
+        here, so a dry run never refuses ``priority_hold`` (the real call may,
+        for as long as a better-tier load is in flight).
+
+        The answer is the fit or the refusal the real call would produce:
+        ``fits: true`` with the mode, devices, context, KV types, slot count,
+        ``evict_model_ids``, ``notes`` (the lease a walk routed around
+        included) and ``estimate_bytes``; or ``fits: false`` with
+        ``status_code`` and ``error`` -- exactly the body the real call would
+        have answered with -- plus ``shortfall_bytes``, ``largest_term`` and
+        ``max_ctx_that_fits`` lifted to the top. The estimate is the walk's
+        formula estimate; the real load re-plans onto the chosen devices and
+        may apply a D51 observed correction on top, so the chosen placement is
+        what is guaranteed to agree, not the last megabyte.
+        """
+        _validate_recommended_args(
+            ctx_size=ctx_size,
+            max_slots=max_slots,
+            allowed_devices=allowed_devices,
+            known_devices=self._known_devices(),
+        )
+        await self._await_boot()
+        prep = self._recommended_prep(
+            name, ctx_size, allowed_devices=allowed_devices, persist=False, priority=priority
+        )
+        decision = self._decide_recommended(
+            prep, prefer_modes=prefer_modes, kv_min=kv_min, max_slots=max_slots
+        )
+        return self._render_recommended_decision(decision)
+
+    def _recommended_prep(
+        self,
+        name: str,
+        ctx_size: int,
+        *,
+        allowed_devices: Sequence[int] | None,
+        persist: bool,
+        priority: int | None,
+    ) -> _RecommendedPrep:
+        """Resolve the model and the call's own settings; raise the 400s/404 (D64).
+
+        Pure: shared by the real call and the dry run, so both refuse a bad
+        request with the same error before anything is planned.
+        """
         requested = self.registry.resolve(name)
         if requested is None:
             raise ModelNotFoundError(name, known=self.registry.known_ids())
@@ -1544,13 +1809,43 @@ class ModelManager:
             # minutes, and a refusal the caller could have had immediately is
             # worse the later it arrives.
             self._refuse_unpersistable(requested, record)
-        asked_tier = normalise_priority(priority)
-        tier = self._resolve_tier(record.id, priority)
-        self._refuse_if_held(record.id, priority=tier)
-        if asked_tier is not None:
-            # Same rule as load(): an explicit tier is remembered, but only
-            # past the admission gate (D46).
-            self._model_priority[record.id] = tier
+        return _RecommendedPrep(
+            record=record,
+            ctx_size=int(ctx_size),
+            narrowed=narrowed,
+            asked_tier=normalise_priority(priority),
+            tier=self._resolve_tier(record.id, priority),
+        )
+
+    def _decide_recommended(
+        self,
+        prep: _RecommendedPrep,
+        *,
+        prefer_modes: Sequence[str] | None,
+        kv_min: str | None,
+        max_slots: int | None,
+    ) -> RecommendedDecision:
+        """The ``load_recommended`` decision, with no side effects (D64).
+
+        The one implementation of "which placement would this call take": the
+        real call acts on it and ``GET /api/models/{id}/plan-recommended``
+        reports it, so the two cannot diverge -- the 2026-09-12 incident was
+        exactly two paths answering one question two ways. Request-shaped
+        errors (400, 404, 502) raise; the answers a real call would turn into a
+        503 or a 507 come back as ``refusal`` so a dry run can report them.
+        """
+        from studioforge.core import catalog as catalog_mod
+        from studioforge.core import placements as placements_mod
+
+        record = prep.record
+        ctx_size = prep.ctx_size
+        decision = RecommendedDecision(
+            record=record,
+            ctx_size=ctx_size,
+            tier=prep.tier,
+            asked_tier=prep.asked_tier,
+            narrowed=prep.narrowed,
+        )
         if record.meta is None:
             raise ModelLoadError(
                 f"'{record.id}' has no readable GGUF metadata, so its trained context "
@@ -1561,20 +1856,25 @@ class ModelManager:
             )
 
         trained = int(getattr(record.meta, "n_ctx_train", 0) or 0)
-        if trained > 0 and int(ctx_size) > trained:
+        decision.trained = trained
+        if trained > 0 and ctx_size > trained:
             raise BadRequestError(
                 f"'{record.id}' is trained to {trained} tokens; ask for {trained} or "
                 f"fewer. Serving past the trained window needs RoPE scaling and "
                 f"degrades quality, so this server will not do it silently.",
                 param="ctx_size",
-                details={"n_ctx_train": trained, "requested_ctx": int(ctx_size)},
+                details={"n_ctx_train": trained, "requested_ctx": ctx_size},
             )
 
-        modes = self._modes_for_recommendation(prefer_modes, allowed=narrowed)
+        try:
+            modes = self._modes_for_recommendation(prefer_modes, allowed=prep.narrowed)
+        except InsufficientVramError as exc:
+            decision.refusal = exc
+            return decision
         observations = self.parallel_observations(record.id)
 
         # A model that is already resident is about to be RELOADED at the new
-        # context (the load below is a forced reload), so the walk must see the
+        # context (the load is a forced reload), so the walk must see the
         # machine the way that reload will: with this instance's own footprint
         # credited back (D30's reload_of credit, D36's CreditedProbe -- the same
         # figure). Without the credit the walk planned against VRAM the model
@@ -1585,11 +1885,12 @@ class ModelManager:
         resident = self.supervisor.get(record.id)
         if resident is not None and resident.state != "ready":
             resident = None
+        decision.resident = resident
         if resident is not None:
             if resident.active_requests > 0:
-                raise ModelBusyError(
+                decision.refusal = ModelBusyError(
                     f"'{record.id}' is serving {resident.active_requests} request(s); "
-                    f"loading it at {int(ctx_size)} tokens would interrupt them. Wait for "
+                    f"loading it at {ctx_size} tokens would interrupt them. Wait for "
                     f"the stream(s) to finish, or pass force=true to load_model to do it "
                     f"anyway.",
                     details={
@@ -1598,10 +1899,11 @@ class ModelManager:
                         "loaded_by": resident.loaded_by,
                     },
                 )
+                return decision
             plan_now = resident.plan
             if (
                 plan_now is not None
-                and int(plan_now.ctx_per_slot or plan_now.ctx_size) == int(ctx_size)
+                and int(plan_now.ctx_per_slot or plan_now.ctx_size) == ctx_size
                 and (
                     kv_min is None
                     or _kv_rank(plan_now.kv_cache_type, plan_now.kv_cache_type_v)
@@ -1620,38 +1922,28 @@ class ModelManager:
                 # parameter exists to prevent, reached by the fastest path
                 # through the function. A resident outside the set falls
                 # through to the mode walk, which relocates it.
-                and (narrowed is None or set(plan_now.devices) <= narrowed)
+                and (prep.narrowed is None or set(plan_now.devices) <= prep.narrowed)
             ):
                 # Already exactly that. Reloading would cost a cold start and
                 # a window of "loading" for every client, to arrive where we are.
-                log.info(
-                    "already loaded at the requested context",
-                    model_id=record.id,
-                    ctx_size=int(ctx_size),
-                    devices=plan_now.devices,
-                    source=source,
-                )
-                if asked_tier is not None:
-                    # The same re-tier load() does on its ready instance, and
-                    # for the same reason -- so the two explicit load routes
-                    # agree, and so the refresh_ttl inside the persist below
-                    # prices the tier this call just asked for rather than the
-                    # stale one still stamped on the child.
-                    self._retier_resident(record, resident, tier)
-                if persist:
-                    # The caller asked for this profile to become the model's
-                    # own; that it was already resident at it is not a reason
-                    # to skip the write, or "load-recommended --persist" would
-                    # be a no-op precisely when it is run twice.
-                    self._persist_load_profile(record, resident, asked_tier)
-                return resident
+                decision.already_loaded = True
+                return decision
 
         probe: Any = self.planner.probe
         if resident is not None:
             footprint = Planner.instance_footprint(resident)
             if footprint:
                 probe = catalog_mod.CreditedProbe(self.planner.probe, footprint)
-        planner = Planner(self.config, probe, log_plans=False)
+        # The walk's planner reads the SAME lease book the real load's planner
+        # reads (D64). It used to be built without one, so every mode looked
+        # lease-free: on 2026-09-12 the walk chose dual_5090 while CUDA 1 was
+        # leased to ClawForge2, and the real load -- whose planner does read
+        # the book -- refused that placement with gpu_leased, identically,
+        # every retry, with dual_3090 free the whole time. With the book, a
+        # mode that needs someone else's card is refused inside the walk and
+        # the next fitting mode wins; a lease is still never overridden (D53).
+        leases = getattr(self.planner, "leases", None)
+        planner = Planner(self.config, probe, log_plans=False, leases=leases)
         loaded = [i for i in self.supervisor.list() if i.model_id != record.id]
 
         # A chat/agent load (D46) walks with eviction of worse-tier idle
@@ -1659,77 +1951,196 @@ class ModelManager:
         # displacing background models beats a lesser mode that fits beside
         # them, which is the whole point of the tier. Background keeps the
         # gentler two-round walk -- fit beside everyone first.
-        rounds: tuple[bool, ...] = (True,) if tier < PRIORITY_BACKGROUND else (False, True)
+        rounds: tuple[bool, ...] = (True,) if prep.tier < PRIORITY_BACKGROUND else (False, True)
         attempts: list[dict[str, Any]] = []
-        hold = tier < PRIORITY_BACKGROUND
-        if hold:
-            # D46: the hold must span the mode walk too, not only the final
-            # load -- otherwise a worse-tier load can take the D29 gate while
-            # this one is still choosing its placement. The inner self.load()
-            # re-registers the same key and pops it; the outer pop is the
-            # backstop for every refusal path out of the walk.
-            self._priority_holds[record.id] = tier
-        try:
-            for allow_evict in rounds:
-                attempts = [
-                    self._mode_attempt(
-                        record,
-                        mode,
-                        ctx_size=int(ctx_size),
-                        kv_min=kv_min,
-                        planner=planner,
-                        loaded=loaded,
-                        observations=observations,
-                        allow_evict=allow_evict,
-                        catalog_mod=catalog_mod,
-                        placements_mod=placements_mod,
-                        priority=tier,
-                        max_slots=max_slots,
-                    )
-                    for mode in modes
-                ]
-                winner = next((a for a in attempts if a["fits"]), None)
-                if winner is None:
-                    continue
-                log.info(
-                    "loading at the requested context",
-                    model_id=record.id,
-                    ctx_size=int(ctx_size),
-                    mode=winner["mode"],
-                    devices=winner["devices"],
-                    kv_cache_type=winner["kv_cache_type"],
-                    parallel=winner["parallel"],
-                    evicting=winner["would_evict"],
-                    source=source,
+        for allow_evict in rounds:
+            attempts = [
+                self._mode_attempt(
+                    record,
+                    mode,
+                    ctx_size=ctx_size,
+                    kv_min=kv_min,
+                    planner=planner,
+                    loaded=loaded,
+                    observations=observations,
+                    allow_evict=allow_evict,
+                    catalog_mod=catalog_mod,
+                    placements_mod=placements_mod,
+                    priority=prep.tier,
+                    max_slots=max_slots,
                 )
-                # force=True is the RELOAD half of force (the model may be
-                # resident at another context); evict_busy=False keeps D36's
-                # rule -- a model that is serving is never a candidate, and
-                # this path has no override for that by design.
-                instance = await self.load(
-                    record.id,
-                    ctx_size=int(ctx_size),
-                    kv_cache_type=winner["kv_cache_type"],
-                    kv_cache_type_v=winner["kv_cache_type_v"],
-                    parallel=winner["parallel"],
-                    devices=winner["devices"],
-                    force=True,
-                    source=source,
-                    evict_busy=False,
-                    priority=tier,
-                )
-                if persist:
-                    # After the load, not before: what gets written is what
-                    # actually launched (instance.plan), never what the walk
-                    # hoped for -- the two differ whenever the planner had to
-                    # step down on the way in.
-                    self._persist_load_profile(record, instance, asked_tier)
-                return instance
+                for mode in modes
+            ]
+            winner = next((a for a in attempts if a["fits"]), None)
+            if winner is None:
+                continue
+            decision.attempts = attempts
+            decision.winner = winner
+            before = attempts[: attempts.index(winner)]
+            decision.lease_skipped = [a for a in before if a.get("leased_devices")]
+            decision.notes = self._lease_skip_notes(planner, winner, decision.lease_skipped)
+            return decision
 
-            raise self._recommendation_refused(record, int(ctx_size), attempts, trained=trained)
-        finally:
-            if hold:
-                self._priority_holds.pop(record.id, None)
+        decision.attempts = attempts
+        if any(a.get("leased_devices") for a in attempts):
+            # Would a mode the lease took away have fitted without it? Asked
+            # only on the refusal path, of a planner that reads no lease book,
+            # so the refusal can say whether waiting for the release is what
+            # changes the answer (gpu_leased) or the box is simply too small
+            # either way (insufficient_vram, the lease named as context, D53).
+            free_planner = Planner(self.config, probe, log_plans=False)
+            for attempt in attempts:
+                if not attempt.get("leased_devices"):
+                    continue
+                mode = next(m for m in modes if m.key == attempt["mode"])
+                unleased = self._mode_attempt(
+                    record,
+                    mode,
+                    ctx_size=ctx_size,
+                    kv_min=kv_min,
+                    planner=free_planner,
+                    loaded=loaded,
+                    observations=observations,
+                    allow_evict=rounds[-1],
+                    catalog_mod=catalog_mod,
+                    placements_mod=placements_mod,
+                    priority=prep.tier,
+                    max_slots=max_slots,
+                )
+                attempt["fits_once_lease_released"] = bool(unleased["fits"])
+        decision.refusal = self._recommendation_refused(
+            record, ctx_size, attempts, trained=trained, planner=planner
+        )
+        return decision
+
+    @staticmethod
+    def _lease_skip_notes(
+        planner: Planner, winner: Mapping[str, Any], skipped: Sequence[Mapping[str, Any]]
+    ) -> list[str]:
+        """Say that the placement taken is not the one the walk would have led with (D64).
+
+        The JIT path already writes the lease on its plan; a walk that passes
+        over a better mode because of a lease has to say the same thing, or the
+        caller gets a slower placement with no reason attached. One line naming
+        the modes passed over and the mode taken, then the planner's own lease
+        lines -- holder, lease id and how it ends.
+        """
+        if not skipped:
+            return []
+        leased = sorted({int(d) for a in skipped for d in a.get("leased_devices") or ()})
+        passed = ", ".join(f"{a['mode']} (CUDA {list(a['devices'])})" for a in skipped)
+        notes = [
+            f"load-recommended passed over {passed} because CUDA {leased} "
+            f"{'is' if len(leased) == 1 else 'are'} leased to someone else, and took "
+            f"{winner['mode']} (CUDA {list(winner['devices'])}) instead; a lease is never "
+            f"overridden, so the better placement comes back once it ends"
+        ]
+        notes.extend(planner.lease_lines(leased))
+        return notes
+
+    def _walk_placement_leased(
+        self, record: ModelRecord, winner: Mapping[str, Any], exc: InsufficientVramError
+    ) -> InsufficientVramError:
+        """The commit-time lease refusal, told as what it is (D64).
+
+        Reached only when a lease was granted between the walk and the load
+        twice running. The planner's refusal would say "the requested placement"
+        and advise dropping a device override; this caller sent neither, so the
+        advice is dropped and the placement is named as the walk's.
+        """
+        details = dict(exc.details)
+        details["suggestions"] = [
+            s for s in details.get("suggestions") or [] if "device override" not in s
+        ]
+        details["mode"] = winner["mode"]
+        details["devices"] = list(winner["devices"])
+        return InsufficientVramError(
+            f"Cannot load '{record.id}' entirely in VRAM: the placement this call's mode "
+            f"walk chose ({winner['mode']}, CUDA {list(winner['devices'])}) was leased to "
+            f"someone else before the load could begin, twice; a lease is not a default to "
+            f"override, it is a promise to its holder. " + " ".join(details["suggestions"]),
+            code="gpu_leased",
+            details=details,
+        )
+
+    def _render_recommended_decision(self, decision: RecommendedDecision) -> dict[str, Any]:
+        """The dry run's JSON: the fit, or the refusal body the real call would send (D64)."""
+        common: dict[str, Any] = {
+            "dry_run": True,
+            "model_id": decision.record.id,
+            "requested_ctx": decision.ctx_size,
+            "n_ctx_train": decision.trained or None,
+            "priority": decision.tier,
+            "allowed_devices": (
+                sorted(decision.narrowed) if decision.narrowed is not None else None
+            ),
+            "modes": [_attempt_summary(a) for a in decision.attempts],
+        }
+        if decision.refusal is not None:
+            error = decision.refusal
+            details = error.details
+            return {
+                **common,
+                "fits": False,
+                "status_code": error.status_code,
+                "code": error.code,
+                "message": error.message,
+                "error": error.to_payload()["error"],
+                "retry_after_s": details.get("retry_after_s"),
+                "shortfall_bytes": details.get("shortfall_bytes"),
+                "largest_term": details.get("largest_term"),
+                "max_ctx_that_fits": details.get("max_ctx_that_fits"),
+                "evict_model_ids": [],
+                "notes": [],
+            }
+        resident = decision.resident
+        if decision.already_loaded and resident is not None and resident.plan is not None:
+            standing = resident.plan
+            return {
+                **common,
+                "fits": True,
+                "already_loaded": True,
+                "mode": None,
+                "label": None,
+                "devices": list(standing.devices),
+                "ctx_size": int(standing.ctx_per_slot or standing.ctx_size),
+                "kv_cache_type": standing.kv_cache_type,
+                "kv_cache_type_v": standing.kv_cache_type_v,
+                "parallel": standing.parallel,
+                "recommended_parallel_basis": None,
+                "evict_model_ids": [],
+                "lease_skipped_modes": [],
+                "notes": ["already loaded at the requested context; nothing would be reloaded"],
+                "placement_tier": standing.placement_tier,
+                "per_gpu_bytes": dict(standing.per_gpu_bytes),
+                "estimate_bytes": _estimate_bytes(standing),
+            }
+        winner = decision.winner
+        assert winner is not None
+        walk_plan: LoadPlan | None = winner.get("plan")
+        notes = list(walk_plan.notes) if walk_plan is not None else []
+        for note in decision.notes:
+            if note not in notes:
+                notes.append(note)
+        return {
+            **common,
+            "fits": True,
+            "already_loaded": False,
+            "mode": winner["mode"],
+            "label": winner["label"],
+            "devices": list(winner["devices"]),
+            "ctx_size": winner["ctx_size"],
+            "kv_cache_type": winner["kv_cache_type"],
+            "kv_cache_type_v": winner["kv_cache_type_v"],
+            "parallel": winner["parallel"],
+            "recommended_parallel_basis": winner.get("recommended_parallel_basis"),
+            "evict_model_ids": list(winner["would_evict"]),
+            "lease_skipped_modes": [a["mode"] for a in decision.lease_skipped],
+            "notes": notes,
+            "placement_tier": walk_plan.placement_tier if walk_plan is not None else None,
+            "per_gpu_bytes": dict(walk_plan.per_gpu_bytes) if walk_plan is not None else {},
+            "estimate_bytes": _estimate_bytes(walk_plan) if walk_plan is not None else None,
+        }
 
     def _modes_for_recommendation(
         self, prefer_modes: Sequence[str] | None, *, allowed: frozenset[int] | None = None
@@ -1837,6 +2248,8 @@ class ModelManager:
             adapters=[a for a, _ in self._adapters_for(record)],
             allow_evict=allow_evict,
             priority=priority,
+            # The override is this walk's candidate, not the caller's (D64).
+            override_chosen_by_server=True,
         )
         if not isinstance(result, LoadPlan):
             attempt["reason"] = result.reason
@@ -1844,6 +2257,11 @@ class ModelManager:
             attempt["busy_models"] = list(result.busy_models)
             attempt["vram_holders"] = [h.model_dump() for h in result.vram_holders]
             attempt["rejected"] = result
+            if result.reason_code == "gpu_leased":
+                # Which of this mode's cards a lease holds for someone else:
+                # the walk moves on, and says why it did (D64).
+                held = {int(d) for lease in result.leases for d in lease.get("devices") or ()}
+                attempt["leased_devices"] = sorted(held & set(mode.devices)) or list(mode.devices)
             return attempt
 
         if kv_min is not None and kv_quality_rank(
@@ -1884,6 +2302,7 @@ class ModelManager:
                 # judged in the same world (preemption credit included), or a
                 # tier load's re-check silently walks down to one slot (D46).
                 priority=priority,
+                override_chosen_by_server=True,
             )
             if isinstance(candidate, LoadPlan):
                 plan = candidate
@@ -1900,6 +2319,8 @@ class ModelManager:
             devices=list(plan.devices),
             would_evict=list(plan.evict_model_ids),
             vram_mb=round(plan.estimate.total_bytes / MB),
+            # The walk's own plan, for the dry run's notes and estimate (D64).
+            plan=plan,
         )
         return attempt
 
@@ -1910,6 +2331,7 @@ class ModelManager:
         attempts: Sequence[Mapping[str, Any]],
         *,
         trained: int,
+        planner: Planner | None = None,
     ) -> InsufficientVramError:
         """The structured "no", with the largest context each mode *would* take.
 
@@ -1919,6 +2341,13 @@ class ModelManager:
         stands in the way; a ``retry_after_s`` only when something transient --
         a model that is serving right now -- is the cause, because "try again
         later" is bad advice when nothing is going to change (D36).
+
+        Modes a lease took away (D64) are named with the lease. The refusal is
+        ``gpu_leased`` -- with the lease records and its re-ask interval -- only
+        when the lease is the cause: every mode needs a leased card, or a mode
+        that needs one would have fitted without it. When the modes that avoid
+        the lease are simply too small and the leased ones would be too, the
+        lease is context and the code stays ``insufficient_vram`` (D53).
         """
         busy: list[dict[str, Any]] = []
         for attempt in attempts:
@@ -1946,31 +2375,74 @@ class ModelManager:
                 f"ask for {best_ctx} tokens instead -- that is the largest context "
                 f"that fits on any of these placements right now"
             )
+        leased_attempts = [a for a in attempts if a.get("leased_devices")]
+        leased_devs = sorted({int(d) for a in leased_attempts for d in a["leased_devices"]})
+        others = [a for a in attempts if not a.get("leased_devices")]
+        once_released = [a for a in leased_attempts if a.get("fits_once_lease_released")]
+        lease_is_cause = bool(leased_attempts) and (not others or bool(once_released))
         if busy:
             names = ", ".join(f"{b['model_id']} ({b['active_requests']} in flight)" for b in busy)
             suggestions.append(
                 f"or wait for {names} to finish; a load never interrupts a stream, "
                 f"so this context becomes available when they do"
             )
-        elif not best_ctx:
+        elif not best_ctx and not lease_is_cause:
             suggestions.append(
                 "unload something, or ask for a smaller context: no placement on this "
                 "box reaches the requested window even with eviction allowed"
             )
         if trained:
             suggestions.append(f"this model's trained window is {trained} tokens")
+        asker = planner if planner is not None else self.planner
+        if leased_attempts:
+            named = ", ".join(f"{a['mode']} (CUDA {list(a['devices'])})" for a in leased_attempts)
+            verb = "is" if len(leased_devs) == 1 else "are"
+            if others:
+                lead = (
+                    f"{named} need{'s' if len(leased_attempts) == 1 else ''} CUDA "
+                    f"{leased_devs}, which {verb} leased to someone else, and no placement "
+                    f"that avoids {'it' if len(leased_devs) == 1 else 'them'} reaches "
+                    f"{ctx_size} tokens"
+                )
+            else:
+                lead = (
+                    f"every placement of this box ({named}) needs CUDA {leased_devs}, "
+                    f"which {verb} leased to someone else"
+                )
+            lease_lines = [lead]
+            if once_released:
+                lease_lines.append(
+                    ", ".join(a["mode"] for a in once_released)
+                    + " would fit at this context once that lease ends; a lease is never "
+                    "overridden, so this is a wait, not a shortfall"
+                )
+            lease_lines.extend(asker.lease_lines(leased_devs))
+            suggestions[:0] = lease_lines
 
-        rejected = next(
+        estimated = next((a.get("rejected") for a in others if a.get("rejected") is not None), None)
+        rejected = estimated or next(
             (a.get("rejected") for a in attempts if a.get("rejected") is not None), None
         )
         details: dict[str, Any] = {
             "requested_ctx": ctx_size,
             "n_ctx_train": trained or None,
-            "modes": modes,
+            "modes": [
+                {
+                    **entry,
+                    "leased_devices": attempt.get("leased_devices"),
+                    "fits_once_lease_released": attempt.get("fits_once_lease_released"),
+                }
+                for entry, attempt in zip(modes, attempts, strict=True)
+            ],
             "largest_ctx_that_fits": best_ctx or None,
+            # The same number under the name /plan uses for it (D64), so a
+            # client reads one key from the dry run and from the real refusal.
+            "max_ctx_that_fits": best_ctx or None,
             "busy_models": busy,
             "retry_after_s": BUSY_RETRY_AFTER_S if busy else None,
             "suggestions": suggestions,
+            "shortfall_bytes": None,
+            "largest_term": None,
         }
         code: str | None = None
         if rejected is not None:
@@ -1980,12 +2452,21 @@ class ModelManager:
                 per_gpu_free=rejected.per_gpu_free,
                 vram_holders=[h.model_dump() for h in rejected.vram_holders],
                 estimate_mb=rejected.estimate.breakdown_mb(),
+                estimate_bytes=_estimate_bytes_of(rejected.estimate),
             )
+            if rejected.required_bytes or rejected.available_bytes:
+                # Nothing estimated (a lease refusal) is not a shortfall of 0.
+                details["shortfall_bytes"] = max(
+                    0, rejected.required_bytes - rejected.available_bytes
+                )
+                term = rejected.largest_term()
+                if term is not None:
+                    details["largest_term"] = {"term": term[0], "bytes": term[1]}
             # The same discriminator the ordinary 507 carries (D53): this path
             # builds its own error, so it has to say it too or a lease refusal
             # would look like a shortfall depending on which endpoint asked.
             code = rejected.reason_code or None
-            lease = rejected.leases[0] if rejected.leases else None
+            lease = rejected.leases[0] if rejected.leases and not leased_attempts else None
             if lease is not None:
                 details["lease"] = lease
                 details["leases"] = rejected.leases
@@ -1993,6 +2474,19 @@ class ModelManager:
                     details["retry_after_s"] = (
                         lease.get("retry_after_s") or LEASE_OPEN_ENDED_RETRY_S
                     )
+        if leased_attempts:
+            if lease_is_cause:
+                leases = asker.blocking_leases(leased_devs)
+                code = "gpu_leased"
+                if leases:
+                    details["lease"] = leases[0]
+                    details["leases"] = leases
+                    if details.get("retry_after_s") is None:
+                        details["retry_after_s"] = (
+                            leases[0].get("retry_after_s") or LEASE_OPEN_ENDED_RETRY_S
+                        )
+            elif code == "gpu_leased":
+                code = None
         return InsufficientVramError(
             f"Cannot load '{record.id}' at exactly {ctx_size} tokens per slot on any "
             f"placement of this box. " + " ".join(suggestions),

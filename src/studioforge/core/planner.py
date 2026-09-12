@@ -1294,6 +1294,7 @@ class Planner:
         source: str | None = None,
         parallel_auto: bool = False,
         priority: int = PRIORITY_BACKGROUND,
+        override_chosen_by_server: bool = False,
     ) -> PlanResult:
         """Decide where (and whether) a model can be loaded.
 
@@ -1334,11 +1335,24 @@ class Planner:
         also makes eviction first-class for this load regardless of
         ``planner.on_insufficient`` (an explicit ``allow_evict`` still wins),
         and restricts every eviction ladder to equal-or-lower tiers.
+
+        ``override_chosen_by_server`` says the ``device_override`` on
+        ``record`` is a candidate this server put there -- a
+        ``load_recommended`` mode (:func:`placements.forced_onto`) -- rather
+        than one the caller or the model's saved settings supplied. It changes
+        only the words of a lease refusal: "load without the device override"
+        is advice for a caller who sent one, and addressed to one who did not
+        it cost the 2026-09-12 incident most of its diagnosis time (D64).
         """
         blocked = self._leased_away(record)
         forced = set(record.settings.device_override or ())
         if forced & blocked:
-            return self._leased_rejection(record, sorted(forced & blocked))
+            return self._leased_rejection(
+                record,
+                sorted(forced & blocked),
+                placement=sorted(forced),
+                chosen_by_server=override_chosen_by_server,
+            )
 
         evict_allowed = (
             allow_evict
@@ -1601,22 +1615,61 @@ class Planner:
             result.notes.extend(lines)
         return result
 
-    def _leased_rejection(self, record: ModelRecord, clash: list[int]) -> LoadRejected:
-        """A forced placement onto someone else's leased card is refused, not honoured."""
-        rejection = LoadRejected(
-            model_id=record.id,
-            reason=(
+    def lease_lines(self, devices: Sequence[int]) -> list[str]:
+        """One actionable line per lease holding one of ``devices`` for someone else.
+
+        The public face of the note the planner already writes on a plan that
+        lost cards to a lease, for a caller that needs the same sentence about a
+        placement it chose itself (``load_recommended``'s walk, D64).
+        """
+        return self._lease_lines(frozenset(int(d) for d in devices))
+
+    def blocking_leases(self, devices: Sequence[int]) -> list[dict[str, Any]]:
+        """The ``lease_view`` of every lease holding one of ``devices`` (D53/D64)."""
+        return self._blocking_leases(frozenset(int(d) for d in devices))
+
+    def _leased_rejection(
+        self,
+        record: ModelRecord,
+        clash: list[int],
+        *,
+        placement: list[int] | None = None,
+        chosen_by_server: bool = False,
+    ) -> LoadRejected:
+        """A forced placement onto someone else's leased card is refused, not honoured.
+
+        The "load without the device override" advice is given only when the
+        override was the caller's (or the model's saved setting): a placement
+        this server chose for itself has no override the caller could drop
+        (D64).
+        """
+        if chosen_by_server:
+            reason = (
+                f"the placement on CUDA {placement or clash} needs CUDA {clash}, which is "
+                f"leased to someone else; a lease is not a default to override, it is a "
+                f"promise to its holder"
+            )
+            suggestions = self._lease_lines(frozenset(clash))
+        else:
+            reason = (
                 f"the requested placement names CUDA {clash}, which is leased to someone "
                 f"else; a lease is not a default to override, it is a promise to its holder"
-            ),
-            suggestions=[
+            )
+            suggestions = [
                 *self._lease_lines(frozenset(clash)),
                 "load without the device override and let the planner place it elsewhere",
-            ],
+            ]
+        rejection = LoadRejected(
+            model_id=record.id,
+            reason=reason,
+            suggestions=suggestions,
             reason_code="gpu_leased",
             leases=self._blocking_leases(frozenset(clash)),
         )
-        log.info(
+        # A server-chosen candidate refused here is one mode of a walk that
+        # goes on to the next one -- an INFO line per mode per round would be
+        # the D16 flood; the walk logs its own decision.
+        (log.debug if chosen_by_server else log.info)(
             "load rejected: device leased to another holder",
             model_id=record.id,
             devices=clash,
