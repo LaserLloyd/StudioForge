@@ -823,6 +823,26 @@ returning immediately and emits an SSE keep-alive comment (`: loading <model> (1
 seconds until the model is ready. Your HTTP read timeout never fires on a load that is progressing.
 Comment lines are valid SSE that every compliant parser ignores.
 
+**A cold load that fails mid-stream ends with an error frame, then `[DONE]`.** Once a keep-alive has
+gone out the `200` is committed, so a load that then fails cannot change the status. The stream ends
+with one `data:` event carrying the same envelope the error would have had as an HTTP response, and
+then `data: [DONE]` -- never a bare close:
+
+```
+: loading vendor/model (15s)
+
+data: {"error": {"message": "Cannot load ...", "type": "server_error", "code": "gpu_leased", "param": null, "studioforge": {"lease": {...}, "retry_after_s": 60, ...}, "retry_after_s": 60}}
+
+data: [DONE]
+```
+
+`code` is always present (`model_load_failed` when the error had none). `retry_after_s` sits beside
+`code` whenever the error knows the wait -- a stream has no `Retry-After` header left to carry it --
+and is absent when retrying would not change the answer. OpenAI's own streams report a mid-stream
+failure the same way, so a client that checks each event for an `error` key before `choices`
+handles both. An unexpected internal failure gets `model_load_failed` and a `ref` to quote, never the
+exception text (D55, D64).
+
 **Bad requests fail *before* the stream starts.** Model resolution, image/vision checks, tool and
 `response_format` validation all run against the registry — which needs no load — so a malformed
 request gets a real `4xx` with a JSON body instead of an error frame buried inside a `200` stream.

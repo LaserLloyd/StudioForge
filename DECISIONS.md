@@ -5721,3 +5721,30 @@ the same 400 on both; a tier-1 dry run that would displace an idle neighbour lea
 holds, tier memo, registry and lease book untouched; the route answers 200 and loads nothing,
 forwards all six inputs, refuses a bad one in the OpenAI shape, and appears in `openapi.json` with
 every parameter.
+
+### CR-4 -- the mid-stream JIT failure frame is the HTTP envelope
+
+**Finding.** The request read `jit load failed mid-stream` (162 lines, 08-17 to 09-11) as "the
+stream closes with no error". Not reproducible in HEAD or at any point in that window:
+`_stream_with_jit_load` has emitted `data: {"error": {...}}` and `data: [DONE]` after a failed load
+since the initial import, and D53 added the details. What was wrong was the shape: `type` was
+hard-coded `server_error`, `param` was missing, `retry_after_s` existed only inside the vendor
+`studioforge` block, and the defensive branch for an unexpected exception put the exception's text in
+the frame (the D55 leak class). A client that looks only at `choices` sees a stream that stops, which
+matches the report.
+
+**Decision.** `_sse_error_frame(exc)` renders `exc.to_payload()` -- the envelope the same error has
+as an HTTP response -- as the terminal frame, with `code` defaulted to `model_load_failed`, and lifts
+`retry_after_s` beside `code` when the details know the wait (a stream has no `Retry-After` header;
+the value stays inside `studioforge` too). The unexpected-exception branch logs the traceback under a
+reference and sends `model_load_failed` with `studioforge.ref`, never the text. The `jit load failed
+mid-stream` warning now carries the code. Documented in `docs/OPENCLAW.md` with the frame. OpenAI's
+own streams use the same `data: {"error": ...}` form, so an OpenAI-compatible client needs no
+special case. Other in-stream error frames (upstream failures after the child started streaming)
+are unchanged.
+
+**Tests.** `tests/unit/test_jit_stream_error_frame.py`: after a keep-alive, a leased load ends with a
+frame equal to the error's HTTP envelope plus `retry_after_s`, then `[DONE]`; a failure with no wait
+has no `retry_after_s`; an uncoded error gets `model_load_failed`; an unexpected exception ends in a
+frame with a reference and without its text; over HTTP it is a 200 `text/event-stream` ending in the
+frame and `[DONE]`.

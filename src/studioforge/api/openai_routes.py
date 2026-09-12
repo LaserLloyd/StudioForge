@@ -335,18 +335,34 @@ async def _stream_with_jit_load(
             yield f": loading {record.id} ({waited:.0f}s)\n\n".encode()
         await loader
     except StudioForgeError as exc:
-        log.warning("jit load failed mid-stream", model_id=record.id, error=exc.message)
-        # The backstop for what lease_check could not decide before the 200:
-        # carrying the details means a `gpu_leased` frame still names the lease
-        # and its retry_after_s, the same as the HTTP envelope would have.
-        yield _sse_error(
-            exc.message, code=exc.code or "model_load_failed", details=exc.details or None
+        log.warning(
+            "jit load failed mid-stream",
+            model_id=record.id,
+            error=exc.message,
+            code=exc.code or "model_load_failed",
         )
+        # The backstop for what lease_check could not decide before the 200.
+        # The keep-alives have already committed the status, so the error
+        # travels as the terminal frame -- the HTTP envelope itself, plus a
+        # top-level retry_after_s when the error knows the wait -- and then
+        # [DONE], so a client can tell "the load failed, here is why" from a
+        # dropped socket (D64, CR-4).
+        yield _sse_error_frame(exc, default_code="model_load_failed")
         yield b"data: [DONE]\n\n"
         return
-    except Exception as exc:  # pragma: no cover - defensive
-        log.exception("unexpected jit load failure", model_id=record.id)
-        yield _sse_error(f"failed to load '{record.id}': {exc}", code="model_load_failed")
+    except Exception:  # noqa: BLE001 - a stream must end with a frame, not a cut
+        # D55: an unhandled exception's text is written for the operator, not
+        # for a caller -- it goes to the log under a reference the frame quotes.
+        import uuid
+
+        ref = uuid.uuid4().hex[:8]
+        log.exception("unexpected jit load failure", model_id=record.id, ref=ref)
+        yield _sse_error(
+            f"failed to load '{record.id}': internal error. Quote ref={ref} -- the full "
+            f"detail is in the server log.",
+            code="model_load_failed",
+            details={"ref": ref},
+        )
         yield b"data: [DONE]\n\n"
         return
 
@@ -1029,6 +1045,29 @@ async def _stream_upstream(
         # for. Yielding during a GeneratorExit unwind raises RuntimeError.
         if not sent_done and not closing:
             yield b"data: [DONE]\n\n"
+
+
+def _sse_error_frame(exc: StudioForgeError, *, default_code: str) -> bytes:
+    """A StudioForge error as a terminal SSE ``data:`` frame (D64, CR-4).
+
+    ``{"error": {message, type, code, param, studioforge?, retry_after_s?}}`` --
+    exactly :meth:`StudioForgeError.to_payload`, the body the same error would
+    have had as an HTTP response, so a client parses one shape whether or not
+    it streamed. OpenAI's own streams report a mid-stream failure the same way
+    (``data: {"error": {...}}``). ``retry_after_s`` is lifted beside ``code``
+    when the details know the wait, because a stream has no ``Retry-After``
+    header left to carry it; it stays inside ``studioforge`` too. A missing
+    ``code`` becomes ``default_code`` -- a frame without a code is the one a
+    client cannot branch on.
+    """
+    payload = exc.to_payload()
+    error = payload["error"]
+    if not error.get("code"):
+        error["code"] = default_code
+    retry = (exc.details or {}).get("retry_after_s")
+    if retry is not None:
+        error["retry_after_s"] = retry
+    return f"data: {json.dumps(payload, default=str)}\n\n".encode()
 
 
 def _sse_error(message: str, *, code: str, details: dict[str, Any] | None = None) -> bytes:
