@@ -83,6 +83,13 @@ someone finally measured it.
 Reference decisions by number from code comments and docs (`see DECISIONS.md D17`) rather than
 restating the reasoning in three places.
 
+**Appending a decision? Bump `LATEST_DECISION` in `src/studioforge/core/capabilities.py` in the same
+commit.** `GET /api/capabilities` reports `implemented.decisions` from it so clients can feature-gate
+without parsing `/api/version`, which names the last release rather than the running commit (D64).
+`tests/unit/test_capabilities_implemented.py` compares it with this file's headings and fails until
+they agree. If the change gives clients something new to branch on, add a named entry to
+`SERVER_FEATURES` beside it; identifiers there are additive and never renamed.
+
 ## Things that are deliberate
 
 - **GPU-only.** No CPU offload flags anywhere. A model that does not fit is rejected with the

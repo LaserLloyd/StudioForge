@@ -512,8 +512,14 @@ async def capabilities(request: Request, check_update: bool = False) -> dict[str
 
     Answers "what kinds of model can I actually run?" in one call, for the GUI,
     the CLI and MCP alike.
+
+    ``implemented`` (D64) is what a client feature-gates on: ``decisions`` (every
+    DECISIONS.md number this build includes, ``"D1"`` .. ``latest_decision``) and
+    ``features`` (named behaviours such as ``plan_recommended``, with
+    ``feature_decisions`` naming the decision behind each). Additive, and correct
+    for a server running past its release tag, which ``/api/version`` is not.
     """
-    from studioforge.core.capabilities import build_report
+    from studioforge.core.capabilities import build_report, implemented_report
 
     state = _state(request)
     report = build_report(
@@ -524,6 +530,7 @@ async def capabilities(request: Request, check_update: bool = False) -> dict[str
         probe=state.probe,
     )
     payload = report.to_dict()
+    payload["implemented"] = implemented_report()
 
     payload["update"] = {"checked": False}
     if check_update:

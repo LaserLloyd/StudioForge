@@ -5775,3 +5775,32 @@ was not built.
 WARNING; each of the six retry codes is INFO whatever its status; a 502 fault is still ERROR and a
 400 still INFO; the sets are disjoint and pinned; the real handler logs a 409 `lease_conflict` as one
 WARNING line with its status.
+
+### CR-2 -- clients feature-gate on `/api/capabilities`, not on the version (partial)
+
+**Finding.** `GET /api/version` reported `1.26-09-04-3` on a server running HEAD with D61-D63, and a
+client could only tell by matching route text in `openapi.json`. The version string names the last
+release on purpose -- the four strings move together at a release (RELEASING.md) -- so it was not
+bumped.
+
+**Decision.** `GET /api/capabilities` gains one additive top-level block, `implemented`:
+`latest_decision`, `decisions` (`"D1"` .. `"D64"` -- every DECISIONS.md entry this build includes),
+`features` (named, client-visible behaviours: `load_priority_tiers`, `model_gate`,
+`gpu_leased_code`, `context_exceeded_code`, `lease_vacate`, `loaded_alias`, `allowed_devices`,
+`plan_dry_run`, `mixed_generation_split`, `lease_persistence`, `request_ttl_cap`,
+`engine_stable_channel`, `load_recommended_lease_aware`, `plan_recommended`, `sse_error_frame`,
+`capabilities_implemented`) and `feature_decisions` (which decision
+brought each). The constants are `LATEST_DECISION` and `SERVER_FEATURES` in
+`core/capabilities.py`. Every existing key is unchanged. Identifiers are additive: never renamed or
+removed while the behaviour exists.
+
+**Maintenance.** A decision list that is hand-maintained drifts; this one is checked.
+`tests/unit/test_capabilities_implemented.py` reads the `## D<n>` headings of DECISIONS.md and fails
+until `LATEST_DECISION` agrees -- a regex over a file in the same repository, robust enough to be a
+test. CONTRIBUTING.md's DECISIONS section says to bump it in the same commit and to add a named
+feature when a change gives clients something to branch on; README's version note points clients at
+the block. Named features cannot be checked mechanically and rely on that rule.
+
+**Tests.** `tests/unit/test_capabilities_implemented.py`: the decision list equals the file's
+headings; every named feature is a lowercase identifier pointing at an included decision; this
+round's features are named; the route carries `implemented` with every pre-existing key intact.

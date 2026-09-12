@@ -65,6 +65,60 @@ FEATURE_NOTES: dict[str, str] = {
     ),
 }
 
+#: The newest ``DECISIONS.md`` entry this build includes (D64, CR-2).
+#:
+#: ``/api/version`` names the last *release*, and a server running a commit past
+#: its tag reports the tag -- on 2026-09-12 a live server answered
+#: ``1.26-09-04-3`` while serving D61-D63, and the only way a client could tell
+#: was matching route text in ``openapi.json``. This list is what a client gates
+#: on instead. **Bump it in the same commit that appends a decision**:
+#: ``tests/unit/test_capabilities_implemented.py`` reads the headings of
+#: ``DECISIONS.md`` and fails until the two agree.
+LATEST_DECISION = 64
+
+#: Every decision number this build includes, ``"D1"`` .. ``"D<LATEST_DECISION>"``.
+IMPLEMENTED_DECISIONS: tuple[str, ...] = tuple(f"D{n}" for n in range(1, LATEST_DECISION + 1))
+
+#: Named, client-visible behaviours a client may feature-gate on, each with the
+#: decision that introduced it (D64, CR-2). Additive only: an identifier is never
+#: renamed or removed while the behaviour exists, so ``"x" in features`` stays a
+#: stable test. Add one when a change gives clients something new to branch on.
+SERVER_FEATURES: dict[str, str] = {
+    "load_priority_tiers": "D46",
+    "model_gate": "D52",
+    "gpu_leased_code": "D53",
+    "context_exceeded_code": "D53",
+    "lease_vacate": "D56",
+    "loaded_alias": "D58",
+    "allowed_devices": "D59",
+    "plan_dry_run": "D60",
+    "mixed_generation_split": "D60",
+    "lease_persistence": "D61",
+    "request_ttl_cap": "D61",
+    "engine_stable_channel": "D62",
+    "load_recommended_lease_aware": "D64",
+    "plan_recommended": "D64",
+    "sse_error_frame": "D64",
+    "capabilities_implemented": "D64",
+}
+
+
+def implemented_report() -> dict[str, Any]:
+    """The ``implemented`` block of ``GET /api/capabilities`` (D64, CR-2).
+
+    ``decisions`` -- every DECISIONS.md number this build includes;
+    ``features`` -- the named behaviours, sorted; ``feature_decisions`` -- which
+    decision brought each one. A client gates with ``"D61" in decisions`` or
+    ``"plan_recommended" in features`` and never parses a version string.
+    """
+    return {
+        "latest_decision": f"D{LATEST_DECISION}",
+        "decisions": list(IMPLEMENTED_DECISIONS),
+        "features": sorted(SERVER_FEATURES),
+        "feature_decisions": dict(sorted(SERVER_FEATURES.items())),
+    }
+
+
 #: The optional-feature keys the Setup tab's Engine card shows, in the order it
 #: shows them, with the one-line explanation each needs. Lives here rather than
 #: in the GUI so the CLI's ``studioforge capabilities`` and the card cannot

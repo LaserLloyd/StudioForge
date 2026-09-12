@@ -18,7 +18,10 @@ version lives in `src/studioforge/__init__.py` — `1.26-09-04-3` — and is wha
 a hyphenated date, so both `pyproject.toml` files carry the same date as `1.26.9.4.3`, which is what
 `pip`/`uv` see in the wheel metadata; the `sfctl` companion ships from the same release and carries
 the same version, and release tags are `v1.26-09-04-3`. Check what a server is actually running with
-`curl -s <host>/api/version`.
+`curl -s <host>/api/version`. A server running a commit past its release still reports that release,
+so **feature-gate on `GET /api/capabilities` instead**: its `implemented` block lists every decision
+number the build includes (`"D61" in implemented.decisions`) and named behaviours
+(`"plan_recommended" in implemented.features`), and is never behind the code (DECISIONS.md D64).
 
 ---
 
