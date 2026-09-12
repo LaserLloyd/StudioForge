@@ -1341,6 +1341,9 @@ class Supervisor:
         self._launch_prefix = list(launch_prefix)
         self._instances: dict[str, _Instance] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        # The holder set the last cache_ram_pool_oversubscribed WARNING was
+        # about, or None while the pool is not over-committed (D64, CR-6).
+        self._cache_ram_oversub_warned: tuple[int, frozenset[tuple[str, int]]] | None = None
         self._ports_in_use: set[int] = set()
         self._unload_reports: dict[str, UnloadReport] = {}
         # Kernel-level "children die with me" net (Windows only). Held for the
@@ -1621,25 +1624,42 @@ class Supervisor:
         resolved = resolve_cache_ram_mb(configured)
         if configured != "auto" or resolved is None:
             return resolved
-        held = sum(
-            inst.info.cache_ram_mib or 0
+        holders = frozenset(
+            (model_id, int(inst.info.cache_ram_mib or 0))
             for model_id, inst in self._instances.items()
             if model_id != exclude and (inst.info.cache_ram_mib or 0) > 0
         )
+        held = sum(mib for _, mib in holders)
         grant = grant_cache_ram_mib(resolved, held)
         if held + grant > resolved:
             # The floor won, which means the pool is now an intention rather
             # than a bound. Say so with the numbers: this is the one line that
             # tells an operator staring at a swapping box that the automatic
             # cache is over-committed and the fix is a smaller explicit value.
-            log.warning(
-                "cache_ram_pool_oversubscribed",
-                pool_mib=resolved,
-                held_mib=held,
-                grant_mib=grant,
-                floor_mib=CACHE_RAM_MIN_GRANT_MIB,
-                residents=len(self._instances) - (1 if exclude in self._instances else 0),
-            )
+            #
+            # Once per holder set, not once per spawn (D64, CR-6). D50 accepts
+            # that the first resident onto an empty pool takes all of it, so
+            # with one long-lived chat model holding the pool EVERY other load
+            # meets the floor -- 700 identical WARNINGs in 13 days on the rig,
+            # which is noise that hides the one worth reading. The next WARNING
+            # comes when who holds the pool (or the pool) changes, or after the
+            # pool stopped being over-committed; the repeats stay at DEBUG.
+            key = (int(resolved), holders)
+            fields = {
+                "pool_mib": resolved,
+                "held_mib": held,
+                "grant_mib": grant,
+                "floor_mib": CACHE_RAM_MIN_GRANT_MIB,
+                "residents": len(self._instances) - (1 if exclude in self._instances else 0),
+                "holders": sorted(f"{model_id}={mib}" for model_id, mib in holders),
+            }
+            if key != self._cache_ram_oversub_warned:
+                self._cache_ram_oversub_warned = key
+                log.warning("cache_ram_pool_oversubscribed", **fields)
+            else:
+                log.debug("cache_ram_pool_oversubscribed", repeat=True, **fields)
+        else:
+            self._cache_ram_oversub_warned = None
         return grant
 
     def _optional_args(

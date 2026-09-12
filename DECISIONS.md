@@ -5823,3 +5823,33 @@ docstring (the OpenAPI description), the MCP tool docstring and `docs/OPENCLAW.m
 **Tests.** `tests/unit/test_plan_route.py`: on a fit and a refusal the two breakdowns have the same
 keys and every `estimate_mb` value is its `estimate_bytes` twin over 1024 * 1024; a load 507 carries
 both.
+
+### CR-6 -- `cache_ram_pool_oversubscribed` once per holder set (partial)
+
+**Finding.** 700 WARNINGs from 08-30 to 09-12, `held_mib=pool_mib=32603, residents=1`. Intended:
+D50 (not D38/D54, where the request looked) made `engine.cache_ram_mb: "auto"` a machine-wide pool
+granted first-come, and says in so many words that "the first resident onto an empty pool still
+takes all of it, so the second model on a busy box gets the floor" -- the cheap version, because
+re-granting a live child means restarting it. The warning fired on every spawn while that held,
+which on this rig is every load that is not the resident chat model (roughly the D63 figure of
+~47 loads a day), so the one line worth reading was buried under its own repeats.
+
+**Decision.** The allocation policy is unchanged. The warning is de-duplicated on its state: the
+supervisor remembers the `(pool, {holder: MiB})` it last warned about; the same set again logs the
+event at DEBUG with `repeat=True`, a different set (a second holder, a new grant, a different pool)
+is a new WARNING, and a grant that fits the pool clears the memory so the next over-commit warns
+again. The line gains `holders` (`model_id=MiB`), so the one WARNING says who holds the pool.
+`docs/ENGINE-FEATURES.md` says so.
+
+**Deferred: a per-resident share.** Judged of limited value today and not built. The second resident
+on this rig is usually an embedding model or a short-lived tier-3 load, which gains little from a
+host prompt cache; the case that would benefit is two long-lived chat-class models (parallel 1,
+hybrid attention, where reuse rolls back only to the newest checkpoint), and a fair share there
+means either restarting the first child to shrink its grant or reserving part of the pool up front
+and starving the common single-resident case. Worth revisiting if two chat models become a normal
+configuration; the `holders` field now makes that visible.
+
+**Tests.** `tests/unit/test_supervisor_features.py`: one resident holding the pool and five spawns
+give one WARNING naming the holder and four DEBUG repeats, with every grant still the floor; a new
+holder set warns again, a recovered pool says nothing, and an over-commit after recovery warns again.
+The existing floor/warning test is unchanged and green.

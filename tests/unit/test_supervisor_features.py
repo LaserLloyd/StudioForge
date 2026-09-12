@@ -563,6 +563,66 @@ def test_the_floor_pushing_past_the_pool_is_said_out_loud(
     assert fields["grant_mib"] == CACHE_RAM_MIN_GRANT_MIB
 
 
+def _recording_log(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, dict[str, object]]]:
+    lines: list[tuple[str, str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        supervisor_module,
+        "log",
+        SimpleNamespace(
+            warning=lambda event, **fields: lines.append(("warning", event, fields)),
+            info=lambda *_a, **_kw: None,
+            debug=lambda event, **fields: lines.append(("debug", event, fields)),
+        ),
+    )
+    return lines
+
+
+def test_one_resident_holding_the_pool_is_warned_about_once_not_on_every_spawn(
+    config: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CR-6 (2026-09-12): 700 identical WARNINGs in 13 days, one chat model holding the pool.
+
+    D50 accepts that the first resident onto an empty pool takes all of it, so
+    while that model stays loaded every other load meets the floor. The warning
+    is worth reading once; the repeats are DEBUG, and the policy is untouched.
+    """
+    supervisor = sup(config, make_binary(tmp_path))
+    pool = supervisor._cache_ram_grant()
+    assert pool is not None
+    hold_cache_ram(supervisor, tmp_path, chat=pool)
+    lines = _recording_log(monkeypatch)
+
+    grants = [supervisor._cache_ram_grant(exclude=f"embed-{n}") for n in range(5)]
+
+    assert grants == [CACHE_RAM_MIN_GRANT_MIB] * 5, "the allocation policy is unchanged"
+    warnings = [line for line in lines if line[0] == "warning"]
+    assert [event for _, event, _ in warnings] == ["cache_ram_pool_oversubscribed"]
+    assert warnings[0][2]["holders"] == [f"chat={pool}"]
+    assert [level for level, _, _ in lines] == ["warning"] + ["debug"] * 4
+
+
+def test_a_changed_holder_set_or_a_recovered_pool_is_warned_about_again(
+    config: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """De-duplicated on the state, not silenced: a new situation is a new WARNING."""
+    supervisor = sup(config, make_binary(tmp_path))
+    pool = supervisor._cache_ram_grant()
+    assert pool is not None
+    hold_cache_ram(supervisor, tmp_path, chat=pool)
+    lines = _recording_log(monkeypatch)
+
+    supervisor._cache_ram_grant()
+    supervisor._cache_ram_grant()
+    hold_cache_ram(supervisor, tmp_path, embed=CACHE_RAM_MIN_GRANT_MIB)
+    supervisor._cache_ram_grant()  # a second holder: new set, new warning
+    supervisor._instances.clear()
+    supervisor._cache_ram_grant()  # the pool is free again: nothing to say
+    hold_cache_ram(supervisor, tmp_path, chat=pool)
+    supervisor._cache_ram_grant()  # over-committed again after recovering
+
+    assert [level for level, _, _ in lines] == ["warning", "debug", "warning", "warning"]
+
+
 def test_an_arriving_child_does_not_have_to_share_with_itself(
     config: Config, tmp_path: Path
 ) -> None:

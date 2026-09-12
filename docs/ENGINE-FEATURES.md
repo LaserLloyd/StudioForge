@@ -168,8 +168,10 @@ still has a cache at all, and the grant it got is `cache_ram_mib` on the instanc
 gets that number, and four residents can then hold four times it. Before D50 `auto` behaved that
 way too, which is how a cap documented as unable to make the box swap came to promise 128 GiB of a
 128 GiB machine. If the floor pushes the total past the pool, the launch logs
-`cache_ram_pool_oversubscribed` with the numbers — lower the setting on a box where host RAM is
-tight.
+`cache_ram_pool_oversubscribed` with the numbers and the `holders` — lower the setting on a box where
+host RAM is tight. It is a WARNING once per set of holders (the repeats for the same set are DEBUG):
+one long-lived model holding the whole pool is D50's design, and every later load meeting the floor
+is the same fact, not a new one (D64).
 
 **Quality cost.** None: it is a cache of computed KV, not an approximation of it. **VRAM cost:
 none** — measured identical VRAM (1492 MiB) at `--cache-ram 8192` and at `32768`.
