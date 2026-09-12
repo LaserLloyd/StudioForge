@@ -47,6 +47,50 @@ log = get_logger(__name__)
 #: scan: liveness for the watchdog/tray/load balancers, and the API docs.
 _NO_BOOT_WAIT_PATHS = frozenset({"/health", "/healthz", "/api/health", "/docs", "/openapi.json"})
 
+#: Refusals an operator should see in a WARNING filter (D64, CR-3): the ones
+#: whose documented client behaviour is to stop and escalate or change the
+#: request, never to retry unchanged. ``lease_conflict`` is the terminal end of
+#: the D56 vacate protocol (1,745 of them at INFO between 09-04 and 09-12, where
+#: no filter saw them); ``insufficient_vram`` is "it does not fit" and is not
+#: retryable. An explicit list, not a status-code heuristic: the status of a
+#: refusal says how HTTP should carry it, not how much an operator cares.
+WARNING_REJECTION_CODES = frozenset({"lease_conflict", "insufficient_vram"})
+
+#: The wait-and-retry family (D64, CR-3): exactly the StudioForge codes
+#: ``docs/OPENCLAW-RIG.md`` lists as "wait and retry unchanged", each carrying
+#: ``retry_after_s``. Routine by definition, so INFO -- even the 503s and the
+#: 507 ``gpu_leased``, which used to be logged as ERROR "request failed" only
+#: because their status is >= 500, burying real faults under busy signals.
+RETRY_REJECTION_CODES = frozenset(
+    {
+        "priority_hold",
+        "model_busy",
+        "benchmark_busy",
+        "model_benchmarking",
+        "lease_vacating",
+        "gpu_leased",
+    }
+)
+
+
+def log_rejection(exc: StudioForgeError) -> None:
+    """Log a refused request at the level its code means (D64, CR-3).
+
+    WARNING for :data:`WARNING_REJECTION_CODES`, INFO for
+    :data:`RETRY_REJECTION_CODES`; any other code keeps the status rule --
+    ERROR ``request failed`` for a 5xx (a fault), INFO ``request rejected``
+    below that.
+    """
+    if exc.code in WARNING_REJECTION_CODES:
+        log.warning("request rejected", error=exc.message, code=exc.code, status=exc.status_code)
+    elif exc.code in RETRY_REJECTION_CODES:
+        log.info("request rejected", error=exc.message, code=exc.code, status=exc.status_code)
+    elif exc.status_code >= 500:
+        log.error("request failed", error=exc.message, code=exc.code, type=exc.error_type)
+    else:
+        log.info("request rejected", error=exc.message, code=exc.code)
+
+
 #: How long a request waits for the boot's first library scan (D33). A cold
 #: scan of a large library is tens of seconds; past this the request proceeds
 #: against whatever is indexed so far, and /health says why.
@@ -901,10 +945,7 @@ def _install_error_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(StudioForgeError)
     async def _studioforge_error(_request: Request, exc: StudioForgeError) -> JSONResponse:
-        if exc.status_code >= 500:
-            log.error("request failed", error=exc.message, code=exc.code, type=exc.error_type)
-        else:
-            log.info("request rejected", error=exc.message, code=exc.code)
+        log_rejection(exc)
         headers: dict[str, str] = {}
         # A 503 here means "busy / transient", so tell the client how long to
         # wait instead of leaving it to guess a backoff (and hammer us).

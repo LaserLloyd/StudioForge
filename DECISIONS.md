@@ -5748,3 +5748,30 @@ frame equal to the error's HTTP envelope plus `retry_after_s`, then `[DONE]`; a 
 has no `retry_after_s`; an uncoded error gets `model_load_failed`; an unexpected exception ends in a
 frame with a reference and without its text; over HTTP it is a 200 `text/event-stream` ending in the
 frame and `[DONE]`.
+
+### CR-3 -- a refusal is logged at the level its code means (partial)
+
+**Finding.** `api/app.py`'s `StudioForgeError` handler chose the level by status alone: below 500
+INFO `request rejected`, 500 and above ERROR `request failed`. So `lease_conflict` (409) -- the end of
+the D56 vacate protocol, where the client is told to stop polling and escalate -- was INFO (1,745
+lines from 09-04 to 09-12, invisible to every WARNING/ERROR filter), while every 503 busy signal and
+the waitable 507 `gpu_leased` were ERROR, and `insufficient_vram` (507) was ERROR too. The request
+assumed the retry family was already INFO; for the 503s it was not.
+
+**Decision.** Two explicit sets, not a heuristic, in `api/app.py`:
+`WARNING_REJECTION_CODES = {lease_conflict, insufficient_vram}` -> WARNING `request rejected`, and
+`RETRY_REJECTION_CODES = {priority_hold, model_busy, benchmark_busy, model_benchmarking,
+lease_vacating, gpu_leased}` -> INFO `request rejected` -- exactly the StudioForge codes
+`docs/OPENCLAW-RIG.md` lists as "wait and retry unchanged" (`client_quota` there is ClawForge2's).
+Any other code keeps the status rule, so a real fault (`model_load_failed`, `upstream_error`, an
+internal error) is still ERROR `request failed`. The two classified lines add `status`. A new code
+lands in neither set and behaves as before until someone decides; a test pins both sets so that
+decision is deliberate.
+
+**Deferred.** The rolling per-code refusal counter on `/api/status` (ClawForge2's `refusals` block)
+was not built.
+
+**Tests.** `tests/unit/test_rejection_log_levels.py`: `lease_conflict` and `insufficient_vram` are
+WARNING; each of the six retry codes is INFO whatever its status; a 502 fault is still ERROR and a
+400 still INFO; the sets are disjoint and pinned; the real handler logs a 409 `lease_conflict` as one
+WARNING line with its status.
