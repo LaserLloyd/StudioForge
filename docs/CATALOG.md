@@ -58,6 +58,7 @@ window, more concurrency, or the `load_args` of a `placements` mode other than t
 | `GET /api/models/{id}/profiles` | The *hardware-mode* cut instead of the context cut: the same `placements` list, in full, with every mode's `load_args`. |
 | `load_recommended(model_id, ctx_size)` (MCP) | Name the model and the window; the server picks the rest and loads at **exactly** that context, or refuses with numbers. |
 | `POST /api/models/{id}/load-recommended` | The same over HTTP: `{"ctx_size": 262144, "prefer_mode": "dual_3090"}`. |
+| `GET /api/models/{id}/plan-recommended` | Its dry run: the same inputs as query parameters, the same decision, nothing loaded (D64). |
 | `benchmark_parallel(model_id)` (MCP) | Measure the slot knee, so `recommended_parallel` stops being an estimate. |
 | `POST /api/models/{id}/benchmark-parallel` | The same as a background job on `/api/benchmark/jobs/{id}`. |
 | `GET /api/models/{id}/parallel-observations` | The measured rows behind `recommended_parallel`. |
@@ -549,6 +550,51 @@ getting 131072 and finding out mid-conversation. So:
 
 `kv_min` ("give me 262144, but not at the cost of the cache") refuses a placement that only reaches
 the window by quantizing, and walks on to one that can afford it.
+
+**GPU leases are part of the walk (D64).** A mode that needs a card leased to someone else (D43) is
+refused inside the walk and the next mode that fits is loaded; nothing ever lands on a leased card.
+When the walk passed a better mode over for a lease, the plan's `notes` say which mode, which card,
+the lease's holder and id, and how it ends (idle TTL, or `DELETE /api/leases/{id}`). When no mode
+fits without the leased card, the `507` names the lease; it is `gpu_leased` -- with `lease`,
+`leases` and a `retry_after_s` -- only when waiting for the release is what would change the answer
+(every mode needs the card, or a mode that needs it would fit once it is free:
+`modes[].fits_once_lease_released`). A lease beside a genuine shortfall stays `insufficient_vram`
+with no retry advice. Every `507` from this route also carries `shortfall_bytes`, `largest_term` and
+`max_ctx_that_fits`.
+
+### The dry run: `GET /api/models/{id}/plan-recommended`
+
+```
+GET /api/models/{id}/plan-recommended?ctx_size=131072&priority=1&max_slots=1
+GET /api/models/{id}/plan-recommended?ctx_size=262144&kv_min=f16&allowed_devices=2&allowed_devices=3
+```
+
+What `load-recommended` would do right now, without doing it. It takes the same inputs as query
+parameters -- `ctx_size` (required), `prefer_mode`, `kv_min`, `max_slots`, `allowed_devices`
+(repeated per index) and `priority` -- refuses bad ones with the same `400`, and runs **the same
+decision function** the real call acts on, so the two cannot disagree (the lesson of CR-9, where two
+paths answered one question two ways). Nothing is loaded, evicted, leased, held, re-tiered or
+persisted. Same auth as `/plan`: a GET, ungated. It is a separate route rather than
+`/plan?recommended=true` because `/plan` previews `/load` (one planner call, the D14 ladder) and
+takes different inputs.
+
+It always answers `200`:
+
+| Field | On a fit (`fits: true`) | On a refusal (`fits: false`) |
+| --- | --- | --- |
+| `mode`, `label`, `devices`, `ctx_size`, `kv_cache_type`, `kv_cache_type_v`, `parallel` | the placement the call would load | -- |
+| `evict_model_ids` | the idle models the load would stop | `[]` |
+| `notes`, `lease_skipped_modes`, `placement_tier` | the plan's notes, incl. a lease routed around | -- |
+| `estimate_bytes` | every estimate term in **bytes**, plus `total` | -- |
+| `already_loaded` | `true` when the call would hand back the resident unchanged | -- |
+| `status_code`, `code`, `message`, `error` | -- | the status and the exact error body the call would answer with (`507` / `503`) |
+| `retry_after_s`, `shortfall_bytes`, `largest_term`, `max_ctx_that_fits` | -- | lifted from the refusal |
+| `modes` | every mode tried, with `fits`, `reason`, `leased_devices` | the same |
+| `dry_run`, `model_id`, `requested_ctx`, `priority`, `allowed_devices` | always | always |
+
+Not previewed: the D46 `503 priority_hold` (a transient admission wait while a better-tier load is
+in flight, not a placement decision), and the D51 observed correction the real load may apply to the
+estimate after the walk -- the placement agrees, the last megabyte of `estimate_bytes` may not.
 
 `max_slots` caps the slot count for this call alone. The walk asks for `recommended_parallel` slots
 by default, and every one of them has its KV cache priced into the fit; a caller who knows there

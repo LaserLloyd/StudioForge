@@ -346,6 +346,15 @@ term that blew the budget (`shortfall_bytes`, `largest_term`), plus `suggestions
 `max_ctx_that_fits` and `max_parallel_that_fits`. `GET /api/models/{id}/plan` is the same answer
 over REST. Cheap enough to ask before every expensive load.
 
+`plan_load` and `/plan` preview **`load_model`**. To preview **`load_recommended`** -- the strict
+exact-context mode walk -- use `GET /api/models/{id}/plan-recommended` with the same inputs as
+query parameters (`ctx_size`, `prefer_mode`, `kv_min`, `max_slots`, `allowed_devices`,
+`priority`). It runs the very decision the real call acts on and answers `200` with either the
+placement (`mode`, `devices`, `ctx_size`, KV types, `parallel`, `evict_model_ids`, `notes`,
+`estimate_bytes`) or `fits: false` plus the exact `error` body, `status_code`, `code`,
+`retry_after_s`, `shortfall_bytes`, `largest_term` and `max_ctx_that_fits` the real call would
+return. Nothing is loaded or evicted. See [CATALOG.md](CATALOG.md) for the full shape (D64).
+
 ### 6. `search_models` → `repo_details` → `download_model`
 
 ```

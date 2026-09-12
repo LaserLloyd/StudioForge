@@ -5670,3 +5670,54 @@ the lease still named; all cards leased is `gpu_leased` with no invented shortfa
 keeps the override advice for a caller-forced placement and drops it for a server-chosen one; a
 lease granted between walk and load re-walks to the next mode, and a second collision is refused as
 the walk's choice. Six of the ten fail with the lease book removed from the walk.
+
+### CR-1 -- `GET /api/models/{id}/plan-recommended`: the dry run is the same decision
+
+**Problem.** `GET /api/models/{id}/plan` previews `/load` -- one planner call down the D14 ladder --
+and takes none of the auto-fit inputs. There was no way to ask what `load-recommended` would do
+without doing it, which for a 40 GB model is a 40-90 s commitment and an eviction. A delegating
+client (ClawChat V14 uses `load-recommended` as its only load call) could only guess from a
+different algorithm or commit.
+
+**Decision.** A new route, `GET /api/models/{id}/plan-recommended`, with `load-recommended`'s inputs
+as query parameters (`ctx_size` required, `prefer_mode`, `kv_min`, `max_slots`, `allowed_devices`
+repeated per index, `priority`). A separate route rather than `?recommended=true` on `/plan`: the
+two preview different calls with different inputs and different shapes, and a flag that switches a
+route's whole contract is the kind of overload the rest of the API avoids (`/load` and
+`/load-recommended` are separate routes for the same reason).
+
+1. *One decision function.* `ModelManager._decide_recommended` holds the whole walk -- metadata and
+   trained-window checks, the mode list, the resident short-cuts, the credited probe, the lease-aware
+   planner, both eviction rounds, the refusal -- and has no side effects. `load_recommended` acts on
+   its result (hold, load, re-walk on a lease race, persist); `plan_recommended` renders it. The
+   argument validation (`_validate_recommended_args`) and the resolution (`_recommended_prep`) are
+   shared too, so a bad request is the same 400 on both. CR-9 is exactly what happens when two paths
+   answer one question two ways; this route cannot drift from the call it previews because it is not
+   a model of it.
+2. *No side effects.* No load, eviction, lease, D46 priority hold, tier memo or settings write. The
+   `priority_hold` 503 is therefore not previewed: it is a transient admission wait, not a placement
+   decision, and taking a hold to preview it would hold traffic off for a question.
+3. *Always 200.* A fit carries the placement, `evict_model_ids`, `notes` (the lease routed around
+   included), `lease_skipped_modes`, `placement_tier`, `per_gpu_bytes` and `estimate_bytes` (bytes,
+   CR-5); `already_loaded` marks the resident short-cut. A refusal carries `status_code` and `error`
+   -- the envelope the real call would answer with, byte for byte -- plus `code`, `retry_after_s`,
+   `shortfall_bytes`, `largest_term` and `max_ctx_that_fits` lifted to the top. `modes` lists every
+   mode either way.
+4. *Same auth as `/plan`.* A GET, ungated (D32/D55: reads are open).
+
+**Left honest.** The estimate is the walk's formula estimate; the real load re-plans onto the chosen
+devices and may apply a D51 observed correction, so the placement, context, KV types, slots and
+evictions agree and the last megabyte may not. The world can change between a dry run and the call
+(a lease, a load); the dry run answers for the moment it was asked, like `/plan`. No MCP tool was
+added: the management server's tool count is pinned by tests and documented, and the REST route is
+what the request asked for.
+
+**Tests.** `tests/unit/test_plan_recommended.py`: the dry run names the placement the real call then
+takes -- on an idle box, with an idle neighbour on the headline pair, and around CR-9's leased card
+(with the lease in its notes); the leased refusal and a plain shortfall come back with the real
+call's status, code, message, per-mode reasons, lease id, `shortfall_bytes`, `largest_term` and
+`max_ctx_that_fits`; the resident short-cut and a serving resident's 503 agree; five bad inputs are
+the same 400 on both; a tier-1 dry run that would displace an idle neighbour leaves the supervisor,
+holds, tier memo, registry and lease book untouched; the route answers 200 and loads nothing,
+forwards all six inputs, refuses a bad one in the OpenAI shape, and appears in `openapi.json` with
+every parameter.

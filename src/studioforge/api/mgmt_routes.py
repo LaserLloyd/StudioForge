@@ -712,6 +712,71 @@ async def plan(
     )
 
 
+@router.get("/models/{model_id:path}/plan-recommended")
+async def plan_recommended(
+    model_id: str,
+    request: Request,
+    ctx_size: int = Query(..., description="Tokens per slot, exactly -- as on load-recommended."),
+    prefer_mode: str | None = Query(None),
+    kv_min: str | None = Query(
+        None, description="Lowest KV cache quality to accept: 'f16', 'q8_0' or 'q4_0'."
+    ),
+    max_slots: int | None = Query(None, description="Ceiling on the slot count (>= 1)."),
+    allowed_devices: list[int] | None = Query(
+        None, description="The CUDA indices the walk may use; repeat per index."
+    ),
+    priority: int | None = Query(
+        None, description="Load tier: 1 active chat, 2 dispatched agent, 3 (or omitted) background."
+    ),
+) -> dict[str, Any]:
+    """The dry run of ``POST /api/models/{id}/load-recommended`` (D64).
+
+    What that call would do right now, without doing it: nothing is loaded,
+    evicted, leased, held, re-tiered or persisted. It takes the same inputs
+    (``ctx_size``, ``prefer_mode``, ``kv_min``, ``max_slots``,
+    ``allowed_devices`` repeated per index, ``priority``; ``persist`` has no
+    meaning for a dry run) and refuses a bad one with the same 400.
+
+    **It is the same decision, not a model of it.** The real call and this
+    route run one function -- the mode walk, leases included -- so the answer
+    cannot drift from what the load would choose. That is the point: on
+    2026-09-12 two paths answered one question two ways and chat was down for
+    seven minutes.
+
+    A separate route rather than ``?recommended=true`` on ``/plan``, because
+    the two answer different questions with different inputs and shapes:
+    ``/plan`` is a dry run of ``/load`` (one planner call, the D14 ladder);
+    this is a dry run of the strict-context mode walk.
+
+    Always **200**. ``fits: true`` carries ``mode``, ``devices``, ``ctx_size``,
+    ``kv_cache_type`` / ``kv_cache_type_v``, ``parallel``, ``evict_model_ids``,
+    ``notes`` (a lease the walk routed around is named there, with its holder
+    and how it ends), ``lease_skipped_modes``, ``placement_tier`` and
+    ``estimate_bytes`` (bytes, every term plus ``total``); ``already_loaded``
+    says the call would return the resident unchanged. ``fits: false`` carries
+    ``status_code`` and ``error`` -- exactly the body the real call would answer
+    with -- plus ``code``, ``retry_after_s``, ``shortfall_bytes``,
+    ``largest_term`` and ``max_ctx_that_fits`` lifted to the top. ``modes``
+    lists every mode tried either way.
+
+    Not previewed: the D46 ``priority_hold`` 503 (a transient admission wait,
+    not a placement decision), and the D51 observed correction the real load
+    may apply on top of the walk's formula estimate -- the placement agrees,
+    the last megabyte of the estimate may not. Same auth as ``/plan``: a GET,
+    ungated.
+    """
+    state = _state(request)
+    return await state.manager.plan_recommended(
+        model_id,
+        int(ctx_size),
+        prefer_modes=[prefer_mode] if prefer_mode else None,
+        kv_min=kv_min,
+        max_slots=max_slots,
+        allowed_devices=allowed_devices,
+        priority=priority,
+    )
+
+
 @router.get("/models/{model_id:path}/options")
 async def model_options(
     model_id: str, request: Request, refresh: bool = Query(False)
