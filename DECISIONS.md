@@ -5895,3 +5895,12 @@ failed OS wait (one line, `exit_code_unavailable`, `model_wait_failed`); a faili
 `supervision failed`, state `failed`); a deliberate stop (no line); `3221226505` named
 `STATUS_STACK_BUFFER_OVERRUN`, `-15` named `SIGTERM`, `None` unavailable. `test_supervisor.py` is
 unchanged and green.
+
+### CR-8 -- two documentation nits, reviewed and rejected (no change)
+
+`client_quota` appears only in `docs/OPENCLAW-RIG.md`, a rig-wide page covering both StudioForge and
+ClawForge2, where every row names its service and `client_quota` is labelled `CF2`; it is a
+ClawForge2 code correctly documented there (and pinned by `test_docs.py`), not an inherited
+StudioForge one. `tag_in_use` is an internal hook (`EngineManager.tag_in_use`, D49 item 7) that
+guards an engine reinstall; it is not documented as an API error code anywhere. Neither page is
+changed.
