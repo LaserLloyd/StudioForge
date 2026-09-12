@@ -3007,7 +3007,9 @@ class ModelManager:
                 # Who is holding the VRAM: on a shared GPU box this is usually
                 # the actual answer to "why did this stop working".
                 "vram_holders": [h.model_dump() for h in rejected.vram_holders],
+                # MiB; the bytes twin beside it (D64, CR-5).
                 "estimate_mb": rejected.estimate.breakdown_mb(),
+                "estimate_bytes": _estimate_bytes_of(rejected.estimate),
                 # A box that is BUSY rather than full: these models would have
                 # freed the VRAM but are serving right now, so the refusal is
                 # worth retrying and says how long to wait (D36).
@@ -5033,6 +5035,12 @@ class ModelManager:
         D36/D59) and at the tier the real load would run at, without touching
         VRAM. Arguments are validated exactly as the load route validates them,
         so a preview refuses what a load would refuse with the same 400.
+
+        Units (D64, CR-5): ``estimate_mb`` is the estimate breakdown in **MiB**
+        (1024 * 1024 bytes, floats) under the terms' own ``*_bytes`` key names
+        plus ``total`` -- kept exactly as it was, because clients read it.
+        ``estimate_bytes`` is the same breakdown in bytes, the unit of
+        ``per_gpu_bytes``, ``shortfall_bytes`` and ``LoadPlan.estimate``.
         """
         validate_load_args(
             ctx_size=ctx_size,
@@ -5117,7 +5125,11 @@ class ModelManager:
                 # the reason the fit preview says no.
                 "notes": result.notes,
                 "vram_holders": [h.model_dump() for h in result.vram_holders],
+                # MiB (1024 * 1024 bytes), each key keeping the term's
+                # ``*_bytes`` name; ``estimate_bytes`` is the same breakdown in
+                # bytes (D64, CR-5). Both stay: clients read the first.
                 "estimate_mb": result.estimate.breakdown_mb(),
+                "estimate_bytes": _estimate_bytes_of(result.estimate),
             }
         return {
             "fits": True,
@@ -5133,7 +5145,9 @@ class ModelManager:
             "per_gpu_bytes": result.per_gpu_bytes,
             "evict_model_ids": result.evict_model_ids,
             "notes": result.notes,
+            # MiB, despite the ``*_bytes`` keys inside; see the refusal branch.
             "estimate_mb": result.estimate.breakdown_mb(),
+            "estimate_bytes": _estimate_bytes_of(result.estimate),
             "single_gpu": result.fits_single_gpu,
             "mixed_generation": any("mixed-generation split" in n for n in result.notes),
             "last_observation": self._last_vram_observation(serving_id),

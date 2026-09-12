@@ -346,6 +346,11 @@ term that blew the budget (`shortfall_bytes`, `largest_term`), plus `suggestions
 `max_ctx_that_fits` and `max_parallel_that_fits`. `GET /api/models/{id}/plan` is the same answer
 over REST. Cheap enough to ask before every expensive load.
 
+Mind the units: `estimate_mb` is the estimate breakdown in **MiB** (1024 x 1024 bytes) even though
+its keys keep the terms' `*_bytes` names (`weights_bytes: 8192.0` is 8 GiB). It stays as it is for
+existing clients; `estimate_bytes` beside it is the same breakdown in bytes, the unit of
+`per_gpu_bytes`, `shortfall_bytes` and every other `*_bytes` field -- prefer it (D64).
+
 `plan_load` and `/plan` preview **`load_model`**. To preview **`load_recommended`** -- the strict
 exact-context mode walk -- use `GET /api/models/{id}/plan-recommended` with the same inputs as
 query parameters (`ctx_size`, `prefer_mode`, `kv_min`, `max_slots`, `allowed_devices`,

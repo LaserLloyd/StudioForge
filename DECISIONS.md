@@ -5789,7 +5789,7 @@ bumped.
 `gpu_leased_code`, `context_exceeded_code`, `lease_vacate`, `loaded_alias`, `allowed_devices`,
 `plan_dry_run`, `mixed_generation_split`, `lease_persistence`, `request_ttl_cap`,
 `engine_stable_channel`, `load_recommended_lease_aware`, `plan_recommended`, `sse_error_frame`,
-`capabilities_implemented`) and `feature_decisions` (which decision
+`capabilities_implemented`, and `estimate_bytes` once CR-5 landed) and `feature_decisions` (which decision
 brought each). The constants are `LATEST_DECISION` and `SERVER_FEATURES` in
 `core/capabilities.py`. Every existing key is unchanged. Identifiers are additive: never renamed or
 removed while the behaviour exists.
@@ -5804,3 +5804,22 @@ the block. Named features cannot be checked mechanically and rely on that rule.
 **Tests.** `tests/unit/test_capabilities_implemented.py`: the decision list equals the file's
 headings; every named feature is a lowercase identifier pointing at an included decision; this
 round's features are named; the route carries `implemented` with every pre-existing key intact.
+
+### CR-5 -- `estimate_mb` is MiB, and `estimate_bytes` rides beside it (non-breaking)
+
+**Finding.** `GET /api/models/{id}/plan` (and the MCP `plan_load` tool, and every load 507) returns
+`estimate_mb` = `VramEstimate.breakdown_mb()`: each term divided by `MB`, which is `1024 * 1024` --
+so **MiB**, as floats -- under the terms' own `*_bytes` key names (`"weights_bytes": 8192.0` is
+8 GiB). Everything else in the API that ends in `_bytes` is bytes. `sfctl models plan` already
+renders it as MiB.
+
+**Decision.** Nothing about `estimate_mb` changes: clients (the GUI's fit check, `sfctl`) read it.
+`estimate_bytes` -- the same breakdown in integer bytes, plus `total` -- is added beside it on both
+branches of `/plan`, on the ordinary load 507 (`_vram_error`) and on the load-recommended 507;
+`plan-recommended` reports bytes only. The unit is stated in `plan_preview`'s docstring, the route
+docstring (the OpenAPI description), the MCP tool docstring and `docs/OPENCLAW.md`, and
+`estimate_bytes` is a named feature in `/api/capabilities`.
+
+**Tests.** `tests/unit/test_plan_route.py`: on a fit and a refusal the two breakdowns have the same
+keys and every `estimate_mb` value is its `estimate_bytes` twin over 1024 * 1024; a load 507 carries
+both.

@@ -952,7 +952,8 @@ def build_management_mcp(state: Any) -> MCPServer:
             ``{"ok": true, "plan": {...}}``. ``plan.fits`` says whether the
             load would land. A fit carries ``devices``, ``tensor_split``,
             ``ctx_size``, ``parallel``, ``kv_cache_type``, ``per_gpu_bytes``,
-            ``evict_model_ids``, ``estimate_mb`` and ``notes`` (including a
+            ``evict_model_ids``, ``estimate_mb`` (MiB) / ``estimate_bytes``
+            (bytes) and ``notes`` (including a
             ``mixed_generation`` warning when the split spans a 5090 and a
             3090); a refusal carries ``reason``, ``reason_code``,
             ``shortfall_bytes``, ``largest_term``, ``suggestions``,

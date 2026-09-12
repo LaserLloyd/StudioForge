@@ -54,3 +54,39 @@ def test_a_refusal_names_the_shortfall_and_the_largest_term(app: Any) -> None:  
     assert body["shortfall_bytes"] > 0
     assert body["largest_term"] is not None
     assert "short by" in body["message"]
+
+
+def test_plan_keeps_estimate_mb_in_mib_and_adds_the_same_breakdown_in_bytes(app: Any) -> None:  # noqa: F811 - the imported fixture, by design
+    """CR-5 (2026-09-12): ``estimate_mb`` is MiB while ``LoadPlan.estimate`` is bytes.
+
+    A factor-of-1,048,576 bug waiting for a client that assumed otherwise --
+    made worse by the MiB values sitting under ``*_bytes`` key names. The
+    existing field cannot change (clients read it), so the bytes twin rides
+    beside it and the two must describe the same estimate.
+    """
+    with TestClient(app) as http:
+        for params in ({"ctx_size": 8192}, {"ctx_size": 32768, "parallel": 64}):
+            body = http.get(f"/api/models/{MODEL_ID}/plan", params=params).json()
+            mib, raw = body["estimate_mb"], body["estimate_bytes"]
+            assert set(mib) == set(raw)
+            assert raw["total"] > 0
+            for key, value in raw.items():
+                assert isinstance(value, int)
+                assert abs(mib[key] - value / (1024 * 1024)) < 1e-6, key
+
+
+def test_a_load_refusal_507_carries_the_bytes_breakdown_beside_the_mib_one(app: Any) -> None:  # noqa: F811 - the imported fixture, by design
+    """The same pair on the real 507, which shipped the same MiB-only breakdown (CR-5)."""
+    from studioforge.types import GB, LoadRejected, VramEstimate
+
+    rejected = LoadRejected(
+        model_id=MODEL_ID,
+        reason="does not fit",
+        required_bytes=40 * GB,
+        available_bytes=30 * GB,
+        estimate=VramEstimate(weights_bytes=8 * GB, kv_bytes=32 * GB),
+    )
+    details = app.state.manager._vram_error(rejected).details
+    assert details["estimate_mb"]["kv_bytes"] == 32 * 1024
+    assert details["estimate_bytes"]["kv_bytes"] == 32 * GB
+    assert details["estimate_bytes"]["total"] == rejected.estimate.total_bytes

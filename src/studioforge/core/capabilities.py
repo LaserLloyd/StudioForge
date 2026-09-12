@@ -100,6 +100,7 @@ SERVER_FEATURES: dict[str, str] = {
     "plan_recommended": "D64",
     "sse_error_frame": "D64",
     "capabilities_implemented": "D64",
+    "estimate_bytes": "D64",
 }
 
 

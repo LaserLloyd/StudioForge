@@ -698,6 +698,12 @@ async def plan(
     Repeat ``devices`` / ``allowed_devices`` per index
     (``?allowed_devices=2&allowed_devices=3``); sending both is a 400, as on
     the load route.
+
+    **Units.** ``estimate_mb`` is the estimate breakdown in MiB (1024 * 1024
+    bytes) -- its keys keep the terms' ``*_bytes`` names, the values are MiB --
+    and is unchanged for existing clients. ``estimate_bytes`` is the same
+    breakdown in bytes, like ``per_gpu_bytes`` and ``shortfall_bytes``; prefer
+    it (D64).
     """
     state = _state(request)
     return state.manager.plan_preview(
