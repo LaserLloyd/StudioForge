@@ -5853,3 +5853,45 @@ configuration; the `holders` field now makes that visible.
 give one WARNING naming the holder and four DEBUG repeats, with every grant still the floor; a new
 holder set warns again, a recovered pool says nothing, and an over-commit after recovery warns again.
 The existing floor/warning test is unchanged and green.
+
+### CR-7 -- every child that ends on its own logs `model_exited`, exactly once
+
+**Finding.** Four llama-server crash dumps in the window, the 09-08 07:00 one matching
+`exit_code=3221226505` (`0xC0000409`, STATUS_STACK_BUFFER_OVERRUN), and two with no `model_exited`
+line. `model_exited` was written in one place: the `_watch` loop, which only exists for a child that
+became ready. Every path traced:
+
+| How a child ends | Before | Now |
+| --- | --- | --- |
+| crashes while serving (watcher) | `model_exited` | unchanged, plus `pid`, `phase: running` |
+| crashes while loading (`_await_ready` sees a return code) | only the load failure, raised to the caller | `model_exited`, `phase: startup` |
+| torn down by `start()` for never becoming healthy, a port squatter, a cancelled load | nothing | `model_exited` with `cause` |
+| a crash-relaunch that crashes while loading | logged on the next loop pass | logged at once, never twice |
+| a crash-relaunch that hangs and is killed | logged as an ordinary exit | `phase: restart`, `cause` |
+| the OS `wait()` task raises | the watcher died silently; a later crash was silence | watched by pid every `EXIT_POLL_S` (2 s); `exit_code_unavailable: true` |
+| the watcher itself raises (a bug, a relaunch `_spawn` raising something other than `ModelLoadError`) | the task died with its exception unretrieved; state stuck | `model_watch_failed` with traceback; if the child is gone, `model_exited` with `cause` and state `failed`; a live child is left alone rather than orphaned into a second launch |
+| deliberate `stop` / `kill` | `model_stopped` / `model_killed` | unchanged -- not an exit in this sense |
+| the server process itself dies (hard kill, power) and the job object takes the children | nothing | still nothing: there is no process left to write the line, and D23's job object is the guarantee there |
+
+**Decision.** One helper, `Supervisor._log_child_exit`, called by each path above; it remembers the
+pid it logged (`_Instance.exit_logged_pid`), so the first path to notice an exit reports it and no
+other can repeat it. The line carries `pid`, `phase` (`startup` / `running` / `restart`),
+`restarts`, the exit code -- `describe_exit_code` adds `exit_code_hex` and a name
+(`STATUS_STACK_BUFFER_OVERRUN`, `STATUS_ACCESS_VIOLATION`, ...) for a Windows NTSTATUS, `signal` for
+a negative POSIX code, and `exit_code_unavailable: true` when the code is not known -- and `cause`
+when this server ended it. The restart policy, the teardown and the states are otherwise unchanged.
+
+**Left honest.** Which path the two silent crashes took cannot be proven from here; a crash while
+loading (the child dies before `/health` answers, and the only trace was the refused load) is the
+likeliest, and it is now logged. A crash dump can also come from a llama-server this supervisor did
+not start -- the engine smoke test, `bench/`, the contract suite -- and those never had a
+`model_exited` line to miss.
+
+**Tests.** `tests/unit/test_supervisor_exit_logging.py`, with the fake llama-server as a real child:
+a crash while serving (one line, its pid, code 9, `running`); death while loading (one line, code 3,
+`startup`, no cause); a health-timeout teardown (one line with the cause); three crashes to the
+restart limit (three lines, three pids); a hung relaunch (`running` then `restart` with its cause); a
+failed OS wait (one line, `exit_code_unavailable`, `model_wait_failed`); a failing watcher (one line,
+`supervision failed`, state `failed`); a deliberate stop (no line); `3221226505` named
+`STATUS_STACK_BUFFER_OVERRUN`, `-15` named `SIGTERM`, `None` unavailable. `test_supervisor.py` is
+unchanged and green.

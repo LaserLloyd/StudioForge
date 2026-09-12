@@ -795,6 +795,56 @@ def process_create_time(pid: int) -> float | None:
         return None
 
 
+#: How often a child whose OS wait failed is re-checked by pid (D64).
+EXIT_POLL_S = 2.0
+
+
+def _why(exc: BaseException) -> str:
+    """A short cause for a log field: the class, and the first line of a StudioForge message."""
+    message = getattr(exc, "message", None)
+    if isinstance(message, str) and message:
+        return f"{type(exc).__name__}: {message.splitlines()[0][:200]}"
+    return type(exc).__name__
+
+
+#: Windows NTSTATUS values a crashing llama-server actually exits with, by name
+#: (D64, CR-7). ``asyncio`` reports them as large positive integers --
+#: ``3221226505`` is ``0xC0000409`` -- which nobody recognises in a log line.
+WINDOWS_EXIT_STATUS: dict[int, str] = {
+    0xC0000005: "STATUS_ACCESS_VIOLATION",
+    0xC000001D: "STATUS_ILLEGAL_INSTRUCTION",
+    0xC0000094: "STATUS_INTEGER_DIVIDE_BY_ZERO",
+    0xC00000FD: "STATUS_STACK_OVERFLOW",
+    0xC000013A: "STATUS_CONTROL_C_EXIT",
+    0xC0000374: "STATUS_HEAP_CORRUPTION",
+    0xC0000409: "STATUS_STACK_BUFFER_OVERRUN",
+}
+
+
+def describe_exit_code(code: int | None) -> dict[str, Any]:
+    """The ``model_exited`` fields for an exit code, readable on both platforms (D64).
+
+    ``None`` is said out loud (``exit_code_unavailable: true``) rather than
+    omitted. A negative code is a POSIX signal (``signal: "SIGKILL"``); a code at
+    or above ``0xC0000000`` is a Windows NTSTATUS (``exit_code_hex`` and, when
+    known, ``exit_status``).
+    """
+    if code is None:
+        return {"exit_code": None, "exit_code_unavailable": True}
+    fields: dict[str, Any] = {"exit_code": code}
+    if code < 0:
+        import signal
+
+        with contextlib.suppress(ValueError):
+            fields["signal"] = signal.Signals(-code).name
+    elif code >= 0xC0000000:
+        fields["exit_code_hex"] = f"0x{code & 0xFFFFFFFF:08X}"
+        name = WINDOWS_EXIT_STATUS.get(code & 0xFFFFFFFF)
+        if name is not None:
+            fields["exit_status"] = name
+    return fields
+
+
 def process_is_alive(pid: int, *, create_time: float | None = None) -> bool:
     """Whether ``pid`` is a live (non-zombie) process, honouring ``create_time``."""
     try:
@@ -1223,6 +1273,9 @@ class _Instance:
         self.port_conflict: str | None = None
         # Captured at spawn so an unload check cannot be fooled by pid reuse.
         self.create_time: float | None = None
+        # The pid whose end has been logged as ``model_exited``: every exit is
+        # reported by whichever path notices it first, and exactly once (D64).
+        self.exit_logged_pid: int | None = None
         self._log_file: IO[str] | None = None
 
     # --- logging -------------------------------------------------------
@@ -2102,6 +2155,12 @@ class Supervisor:
                 if isinstance(exc, ModelLoadError):
                     inst.info.last_error = exc.message
                 await self._teardown(inst, timeout=5.0, force=True)
+                # A child that crashed during startup was logged by
+                # _await_ready; one torn down here (a health timeout, a port
+                # squatter, a cancelled load) ends now, and says so (D64).
+                self._log_child_exit(
+                    inst, phase="startup", cause=f"torn down after a failed start ({_why(exc)})"
+                )
                 # Only live children stay in the table; the diagnostics travel
                 # with the raised ModelLoadError (stderr tail + argv).
                 self._instances.pop(record.id, None)
@@ -2360,6 +2419,11 @@ class Supervisor:
                 # Fail fast: waiting out a 10 minute timeout for a process that
                 # already exited buries the actual error.
                 await self._drain_pumps(inst)
+                # A child that dies while loading is a child that exited, and
+                # it used to leave no model_exited line at all -- only the load
+                # failure, several frames up. Two of four crash dumps in the
+                # 2026-09 window had nothing else (D64, CR-7).
+                self._log_child_exit(inst, phase="startup", code=code)
                 # The shim could not exec the engine at all. That is a launch
                 # failure, not a crashed engine, and it must read like the
                 # `OSError` from `create_subprocess_exec` it replaced --
@@ -2495,27 +2559,128 @@ class Supervisor:
                 asyncio.gather(*inst.pumps, return_exceptions=True), timeout=timeout
             )
 
+    def _log_child_exit(
+        self,
+        inst: _Instance,
+        *,
+        phase: str,
+        code: int | None = None,
+        cause: str | None = None,
+    ) -> None:
+        """Log ``model_exited`` for the instance's current process, once (D64, CR-7).
+
+        Every path that notices a child is gone calls this -- the watcher, the
+        startup health poll, a failed start's teardown, a failed relaunch, a
+        watcher that itself failed -- and the first one wins: the pid is
+        remembered, so the same exit is never reported twice and no exit is
+        reported by nobody. A deliberate ``stop``/``kill`` is not an exit in
+        this sense and logs ``model_stopped``/``model_killed`` instead.
+
+        ``code`` defaults to the process's own ``returncode``; when neither is
+        known the line says ``exit_code_unavailable`` rather than leaving the
+        field out. ``phase`` is ``startup`` (never became ready), ``running``
+        (was serving) or ``restart`` (a crash-relaunch that did not come up).
+        """
+        proc = inst.proc
+        pid = proc.pid if proc is not None else inst.info.pid
+        if pid is None or inst.exit_logged_pid == pid:
+            return
+        inst.exit_logged_pid = pid
+        if code is None and proc is not None:
+            code = proc.returncode
+        fields: dict[str, Any] = {
+            "model_id": inst.record.id,
+            "pid": pid,
+            "phase": phase,
+            "restarts": inst.info.restarts,
+            **describe_exit_code(code),
+        }
+        if cause is not None:
+            fields["cause"] = cause
+        log.warning("model_exited", **fields)
+
     async def _watch(self, inst: _Instance) -> None:
-        """Restart the child on unexpected exit, with exponential backoff."""
+        """Restart the child on unexpected exit, with exponential backoff.
+
+        A watcher that fails is itself a way for a child to vanish unreported:
+        the task dies, its exception is never retrieved, and a crash after that
+        is silence. So a failure here is logged with its traceback, and if the
+        child is gone by then its exit is logged too and the instance marked
+        failed; a child still running is left alone rather than orphaned into a
+        second launch (D64, CR-7).
+        """
+        try:
+            await self._watch_loop(inst)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.exception(
+                "model_watch_failed", model_id=inst.record.id, error=f"{type(exc).__name__}: {exc}"
+            )
+            if inst.stopping:
+                return
+            proc = inst.proc
+            if proc is None or proc.returncode is not None:
+                self._log_child_exit(
+                    inst, phase="running", cause=f"supervision failed: {type(exc).__name__}"
+                )
+                inst.info.state = "failed"
+                inst.info.last_error = (
+                    f"llama-server for '{inst.record.id}' is no longer supervised: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+    async def _wait_for_exit(self, inst: _Instance) -> int | None:
+        """The child's exit code, or ``None`` when the OS wait itself failed.
+
+        ``proc.wait()`` is the normal answer. If that task raises -- a transport
+        torn down under it -- the child is watched by pid instead, so its end is
+        still noticed and reported as ``exit_code_unavailable`` rather than
+        never (D64, CR-7).
+        """
+        wait_task = inst.wait_task
+        assert wait_task is not None
+        try:
+            # Shielded so cancelling the watcher (a deliberate stop) does not
+            # cancel the underlying wait() that stop() itself needs to observe.
+            return await asyncio.shield(wait_task)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - fall back to watching the pid
+            log.warning(
+                "model_wait_failed",
+                model_id=inst.record.id,
+                pid=inst.info.pid,
+                error=f"{type(exc).__name__}: {exc}",
+                detail="watching the pid instead; the exit code will not be known",
+            )
+        pid = inst.info.pid
+        while not inst.stopping:
+            proc = inst.proc
+            if proc is not None and proc.returncode is not None:
+                return proc.returncode
+            if pid is None or not await asyncio.to_thread(
+                process_is_alive, pid, create_time=inst.create_time
+            ):
+                return None
+            await asyncio.sleep(EXIT_POLL_S)
+        return None
+
+    async def _watch_loop(self, inst: _Instance) -> None:
         gateway = self._config.gateway
         while True:
             if inst.stopping or inst.wait_task is None:
                 return
-            # Shielded so cancelling the watcher (a deliberate stop) does not
-            # cancel the underlying wait() that stop() itself needs to observe.
-            code = await asyncio.shield(inst.wait_task)
+            phase = "running" if inst.info.state == "ready" else "restart"
+            code = await self._wait_for_exit(inst)
             if inst.stopping:
                 return
 
             await self._drain_pumps(inst)
-            inst.info.last_error = self._failure_message(inst, f"exited with code {code}")
+            described = f"exited with code {code}" if code is not None else "exited"
+            inst.info.last_error = self._failure_message(inst, described)
             _TRACKED_PIDS.discard(inst.info.pid or -1)
-            log.warning(
-                "model_exited",
-                model_id=inst.record.id,
-                exit_code=code,
-                restarts=inst.info.restarts,
-            )
+            self._log_child_exit(inst, phase=phase, code=code)
 
             if inst.info.restarts >= gateway.max_restarts:
                 inst.info.state = "failed"
@@ -2565,6 +2730,11 @@ class Supervisor:
                 # port and -- far worse -- its VRAM. Teardown is a no-op for a
                 # child that already exited.
                 await self._teardown(inst, timeout=5.0, force=True)
+                # One that crashed was logged by _await_ready; one killed here
+                # for hanging ends now (D64, CR-7).
+                self._log_child_exit(
+                    inst, phase="restart", cause=f"torn down after a failed relaunch ({_why(exc)})"
+                )
                 if inst.info.restarts >= gateway.max_restarts:
                     inst.info.state = "failed"
                     return
