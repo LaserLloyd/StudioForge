@@ -95,6 +95,9 @@ QUICK RECIPES -- copy these exact calls; every argument name is literal:
   what models are there?        list_models()
   is the server busy? VRAM?     server_status()
   is the loaded model enough?   check_loaded_model(min_params="20b", vision=true)
+  use a model ON DEMAND         just send POST /v1/chat/completions {"model": "<id>"}
+                                -- it loads itself; no load call, NO pin needed
+  would it load right now?      plan_load(model_id="<id>")  -> plan.fits, plan.devices
   load a model                  load_recommended(model_id="<id>", ctx_size=32768)
   free a model's VRAM           unload_model(model_id="<id>")
   keep a model loaded forever   pin_model(model_id="<id>")
@@ -114,7 +117,33 @@ free-form ones like "coding"). answer "yes" -> send the work straight to
 do not load anything. answer "no" -> `reason` names the gap ("nothing is
 loaded", "largest loaded model is 4B, below the 20B bar"), and you either
 load_recommended something that clears the bar or fall back to another
-provider. A bar it cannot prove is a "no": unverifiable never passes.
+provider. A bar it cannot prove is a "no": unverifiable never passes. The
+gate is for CHOOSING a model. If you already know which model you want (your
+configured one), "no" / "nothing is loaded" is not a reason to fall back:
+send the request naming it and it loads on demand.
+
+ON DEMAND IS THE DEFAULT, AND PINNING HAS NOTHING TO DO WITH IT. Every model
+loads itself when a /v1 request names it (the request waits for the load;
+streaming requests get keep-alive comments meanwhile), serves, and unloads after
+its idle TTL; the next request loads it again. That is true of an UNPINNED
+model -- you never need pin_model for a model to be usable, and an unloaded
+model that is not pinned is not broken. Each reload uses the model's SAVED
+settings, so make on-demand reliable by saving the shape once, not by pinning:
+  - context/KV/slots: load_recommended(model_id, ctx_size=..., persist=true)
+  - idle timer and tier (no MCP tool; an operator box change):
+    `sfctl models settings <id> --set ttl_s=7200 --set priority=1`
+    (or PATCH /api/models/{id}/settings)
+  - NO saved device_override. It is a forced placement ("exactly these cards,
+    all of them"): while ANY one of those cards is leased (ComfyUI holds one
+    most of the day), every on-demand load is refused 507 gpu_leased. Clear it
+    with `--set device_override=null`; to steer a model toward cards, save
+    allowed_devices instead -- a bound the planner chooses within (one a lease
+    can shrink below what the model needs fails the same way; usually save
+    neither, the planner already works around leased cards).
+Check with plan_load(model_id): plan.fits true means the next request will
+load it; a refusal names what is in the way. In the catalog, `settings_pinned`
+and `if_unpinned` mean SAVED SETTINGS, not pin_model -- `settings_pinned` lists
+them, so a device_override shows up there.
 
 TO KEEP A MODEL LOADED AT ALL TIMES: pin_model(model_id). A pinned model has
 no idle timeout, is never evicted to make room for another model, is loaded
@@ -1014,7 +1043,9 @@ def build_management_mcp(state: Any) -> MCPServer:
            20B bar", "no loaded model reports audio"). Then either
            ``load_recommended(model_id="<a bigger/right model>", ctx_size=...)``
            -- use ``list_models`` to pick one -- or fall back to your other
-           provider. ``hint`` says the same thing in one line.
+           provider. ``hint`` says the same thing in one line. "No" is about
+           what is loaded NOW: a model you already intend to use loads on
+           demand when a request names it, so do not fall back over that.
 
         A bare number in ``min_params`` means **billions**: ``"20"``, ``20`` and
         ``"20b"`` are all a 20-billion-parameter bar, and ``"500m"`` is 0.5B.
@@ -1388,6 +1419,10 @@ def build_management_mcp(state: Any) -> MCPServer:
     @_guard
     async def pin_model(model_id: str, pinned: bool = True) -> dict[str, Any]:
         """Pin a model so it stays loaded at all times, or unpin it.
+
+        NOT needed for on-demand use: every model, pinned or not, loads itself
+        when a ``/v1`` request names it and unloads after its idle TTL. Pin
+        only what must never pay a cold load.
 
         The two calls you will make::
 

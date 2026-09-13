@@ -139,7 +139,7 @@ Then branch on `answer`:
 | `answer` | What to do |
 | --- | --- |
 | `"yes"` | Send the work to `POST /v1/chat/completions` with `model` set to the **`model` field of the response**. It is loaded and warm; do not call `load_model`. `connection_info` has the base URL. |
-| `"no"` | Read `reason` — "nothing is loaded", "largest loaded model is 4B, below the 20B bar", "no loaded model reports audio", "no loaded model can be verified as 'uncensored'" — then either `load_recommended` something that clears the bar (step 2 below picks it) or fall back to your other provider. |
+| `"no"` | Read `reason` — "nothing is loaded", "largest loaded model is 4B, below the 20B bar", "no loaded model reports audio", "no loaded model can be verified as 'uncensored'" — then either `load_recommended` something that clears the bar (step 2 below picks it) or fall back to your other provider. "No" describes what is loaded *now*: if you already know the model you want, skip the gate and name it in the request — it loads on demand, so "nothing is loaded" is never by itself a reason to fall back. |
 
 The answer carries the id on purpose. A bare yes would still cost you a `GET /v1/models` and a guess
 between three resident models; `model` goes straight into the next request. `params_b` and
@@ -318,10 +318,13 @@ Omitted means **3, background**, which a chat-tier or agent-tier load can hold o
 `503 priority_hold`; `1` is for the turn a person is waiting on. The value is validated — anything
 that is not 1, 2 or 3 is a `400`.
 
-Naming an unloaded model **just-in-time loads it** with planner defaults. That is the caveat worth
-knowing: a JIT load takes the planner's own choice of context, not the catalog row you were
-reading. If you need a specific window or slot count, call `load_model` first — a model that is
-already resident is used as-is.
+Naming an unloaded model **just-in-time loads it** with its saved settings and planner defaults
+for everything unsaved — pinned or not. That is the caveat worth knowing: a JIT load takes the
+planner's own choice of context, not the catalog row you were reading. If you need a specific
+window or slot count, save it once (`load_recommended(..., persist=true)`) so every on-demand load
+repeats it, or call `load_model` first — a model that is already resident is used as-is. The full
+recipe, and the one saved setting that breaks on-demand loading, is in
+[On-demand models](#on-demand-models-the-default).
 
 ### 5. `model_options(model_id)` when the recommended row is not enough
 
@@ -409,6 +412,10 @@ zero.
 pin_model(model_id="pub/agent-model")                 # keep loaded at all times
 pin_model(model_id="pub/agent-model", pinned=false)   # undo
 ```
+
+**A pin is not what makes a model load on demand.** Every model loads itself when a `/v1` request
+names it, pinned or not; see [On-demand models](#on-demand-models-the-default). A pin is the
+opposite trade: VRAM held all day so that nobody ever pays the cold load.
 
 A pinned model has no idle TTL and is never evicted to make room for another load. With
 `models.auto_load_pinned` on (the default) it is also loaded at server startup and brought back
@@ -792,6 +799,64 @@ Set it from the CLI without editing YAML:
 ```bash
 sfctl config set models.default_model=<model-id> models.preload_default_model=true
 ```
+
+## On-demand models: the default
+
+Loading on demand is not a mode you switch on, and it has nothing to do with pinning. It is what
+every model does:
+
+1. **Not loaded.** Nothing is resident and nothing is wrong. An unpinned model that is not loaded
+   is simply idle.
+2. **A `/v1` request names it.** The gateway plans a placement against the GPUs and the lease book
+   *as they stand*, spawns the engine and waits for it. Every request that arrives meanwhile waits
+   on the same load (one engine start, never a queue of them). A streaming request gets
+   `: loading <model> (15s)` keep-alive comments; a non-streaming one waits in silence, so give
+   that client a read timeout longer than a cold load. The server's own bound is
+   `gateway.load_timeout_s` (600 s). A 27B at 262k on two cards is ready in about 10 s on this rig.
+3. **Ready.** It serves until it has been idle for its TTL: the saved `ttl_s` if it has one, else
+   `models.ttl_by_priority` for its tier, else `models.default_ttl_s`.
+4. **Unloaded on idle.** Back to step 1. The next request loads it again, at the same saved
+   settings.
+
+A pin (`pin_model`) changes step 4 only: the model is never idle-unloaded and is reloaded if it
+goes down. Use one for a model that must never pay a cold load, not for a model to be *usable*.
+
+### Making an on-demand model reliable
+
+Every reload uses the model's **saved settings**, so save the shape once:
+
+```
+load_recommended(model_id="<id>", ctx_size=262144, persist=true)   # context, KV, slots
+```
+
+```bash
+sfctl models settings <id> --set ttl_s=7200 --set priority=1      # idle timer, tier
+sfctl models settings <id> --set device_override=null             # see below
+```
+
+**Never save a `device_override` on an on-demand model.** An override is a forced placement: exactly
+those cards, all of them. When any one of them is leased (ComfyUI holds a card most of the day, and
+a benchmark takes whole pairs), the planner refuses that load with `507 gpu_leased`, and it goes on
+refusing every on-demand load for as long as the lease stands. It does not fall back to other cards,
+because an override is a promise to use those cards, not a preference. To steer a model toward cards,
+save `allowed_devices` instead: a bound the planner chooses within, which still places the model
+elsewhere in the bound when a card inside it is taken. A bound only helps if what a lease leaves of
+it can still hold the model: `allowed_devices: [0, 1]` on a model that needs two cards fails the
+same way the override did. For a model that should go wherever it fits best, save neither; the
+planner already works around leased cards.
+
+**Check it before you rely on it.** `plan_load(model_id="<id>")` runs the same decision the next
+request would make, loads nothing, and answers `plan.fits` with `plan.devices`, or a refusal naming
+the lease or shortfall in the way. `server_status().leases` shows which cards are spoken for.
+
+### How a failed on-demand load looks to a client
+
+A request whose load is refused gets the refusal, not a hang: `507 gpu_leased` (with `Retry-After`
+and `error.studioforge.lease`) or `507 insufficient_vram`, streaming or not. For a streaming request
+the server decides before the `200` whenever the answer is certain, which includes a saved override
+touching a leased card (D65). Anything it cannot decide in advance arrives as a terminal SSE error
+frame carrying the same envelope, then `[DONE]`. A client with a fallback provider will fall back on
+either one, and it should: the fix is the setting that made the load impossible, not the client.
 
 ## Keeping a model resident
 

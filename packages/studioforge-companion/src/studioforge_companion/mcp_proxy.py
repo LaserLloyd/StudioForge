@@ -127,7 +127,8 @@ MANAGEMENT_FALLBACK_TOOLS: tuple[tuple[str, str], ...] = (
     (
         "pin_model",
         "Keep a model loaded at all times: no idle TTL, never evicted, loaded at "
-        "startup and reloaded if it goes down. pinned=false removes the pin.",
+        "startup and reloaded if it goes down. pinned=false removes the pin. Not "
+        "needed for on-demand use -- any model loads itself when /v1 names it.",
     ),
     (
         "reserve_gpus",
@@ -513,7 +514,9 @@ class McpProxy:
             'uncensored, or free-form `tags=["coding"]`). answer "yes" -> send the work '
             "to POST /v1/chat/completions with the `model` id it returns and load "
             'nothing; "no" -> `reason` names the gap, then pick and load a model as '
-            'below, or fall back to another provider. A bar it cannot verify is a "no".\n\n'
+            'below, or fall back to another provider. A bar it cannot verify is a "no". '
+            "The gate is for choosing: a model you already intend to use loads on demand "
+            "when a request names it, so 'nothing is loaded' is not a reason to fall back.\n\n"
             # The refusal branch and the identity line: everything below this
             # point is about choosing a model, and neither of these is. An
             # agent that reads only the first screen of a merged tool list has
@@ -538,7 +541,10 @@ class McpProxy:
             "if you need a different context size or more concurrency) and pass its `load_args` "
             "verbatim to `load_model`. Inference is NOT here -- use the OpenAI-compatible HTTP "
             "API on the server (POST /v1/chat/completions); naming an unloaded model there loads "
-            "it just-in-time.\n\n"
+            "it just-in-time -- pinned or not, so pin_model is never needed for on-demand use. "
+            "Never save a device_override on an on-demand model: while any one of those cards "
+            "is leased every on-demand load is refused 507 gpu_leased (save allowed_devices "
+            "instead).\n\n"
             "To get a NEW model: `search_models` for compact repo rows (no file sizes exist at "
             "search time), then `repo_details(repo_id)` for that repo's real per-quant sizes, "
             "fit verdicts and the context each GPU placement reaches, then "

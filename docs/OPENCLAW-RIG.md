@@ -27,7 +27,8 @@ choose for the agent in the next section.
 | `8288` | ComfyUI | ClawForge2's backend. **Never talk to it directly** — it has no queue discipline, no lease awareness and no job store |
 
 Which card is whose is a question with a live answer, never a written-down one:
-`comfy_status().pin.index` is the card ComfyUI is on, and `server_status().loaded[].devices` is
+`comfy_status().pin.index` is the card ComfyUI renders on — the LEAD of `pin.devices`, which can
+now be a set of more than one card — and `server_status().loaded[].devices` is
 where each language model sits. Both change during a day.
 
 ## 2. Two registrations, two different files
@@ -221,8 +222,9 @@ makes pictures should be given an allowlist rather than all 54 tools.
 **StudioForge over `sfctl mcp`** holds no session: the bridge reconnects for every call, so there
 is nothing to lose across a restart. If a management tool reports the server unreachable, the
 watchdog is still up — `restart_server`, then retry. After a restart the pinned model comes back on
-its own, and per-model priority settings persist; the lease book does not (it is deliberately a
-clean slate).
+its own, every other model loads again on its first request, per-model saved settings persist, and
+so do standing leases (D61: restored with their clocks; one already idle past its TTL is dropped,
+and StudioForge's own benchmark leases are never restored).
 
 **ClawForge2 over HTTP** does hold a session. Reuse your `Mcp-Session-Id` across calls — a client
 that re-initialises per call pays for `tools/list` and the instructions every time, and leaks a
@@ -248,7 +250,7 @@ Branch on the **code**, never on the prose. StudioForge puts it in the OpenAI er
 
 | Service | HTTP / channel | Code | What it means | What to do |
 | --- | --- | --- | --- | --- |
-| SF | 507 | `gpu_leased` | cards leased to someone else; `error.studioforge.lease` has `kind`, `holder_family`, `retry_after_s`, `expires_at`, plus a `Retry-After` header | `kind: benchmark` → **stand down**; otherwise wait `retry_after_s` and re-ask |
+| SF | 507 | `gpu_leased` | cards leased to someone else; `error.studioforge.lease` has `kind`, `holder_family`, `retry_after_s`, `expires_at`, plus a `Retry-After` header | `kind: benchmark` → **stand down**; otherwise wait `retry_after_s` and re-ask. If it keeps coming back for a model you only *use* (you never asked for cards), suspect a saved `device_override` on that model touching a leased card: `plan_load(model_id)` shows it, and the operator clears it — see [OPENCLAW.md](OPENCLAW.md#on-demand-models-the-default) |
 | SF | 507 | `insufficient_vram` | it genuinely does not fit; `suggestions`, `max_ctx_that_fits`, `max_parallel_that_fits` | load smaller / shorter context / cheaper KV. Never retry unchanged |
 | SF | 507 + `busy_models` | `insufficient_vram` | busy, not full — those models would free the VRAM but are mid-request | wait `retry_after_s` |
 | SF | 507 | `allowed_devices_unavailable` | an `allowed_devices` — the model's saved setting, or the one this request sent — names no usable card, and no lease is why | if you sent one, widen it; otherwise an operator setting, so report |
@@ -303,10 +305,20 @@ Everything else means *change the request*, *stand down*, or *report*.
 > background there and a chat-tier load can hold you off (`503 priority_hold`). ClawForge2's
 > default is already 2. Only a companion a human is talking to sends 1.
 >
+> **Models load on demand; a pin is not needed for that.** Name any model in a `/v1` request and
+> it loads itself (the request waits), then unloads after its idle TTL; the next request loads it
+> again with its saved settings. `pin_model` is only for a model that must never pay that cold
+> load. An unloaded, unpinned model is idle, not broken. What *does* break on-demand loading is a
+> saved `device_override`: it forces exactly those cards, so a lease on any one of them refuses
+> every load with `507 gpu_leased`. `plan_load(model_id)` tells you whether the next request will
+> load it; a persistent refusal there is an operator fix, not something to retry.
+>
 > **Start a session with two cheap calls.** `comfy_status()` — read `can_render`,
 > `leases.foreign`, `workflow_names` (every installed workflow name; do not call `list_workflows`
 > just to check a name), `pin.index` (ComfyUI's card). `check_loaded_model(min_params="20b",
-> vision=true)` — `answer=="yes"` gives you the `model` id; load nothing. `list_workflows()`
+> vision=true)` — `answer=="yes"` gives you the `model` id; load nothing. `"no"` is about what is
+> loaded *now*: if you already have a configured model, name it in the request instead — it loads
+> on demand, so do not fall back just because nothing is loaded. `list_workflows()`
 > (brief) only to choose a workflow; `detail="full"` only for pixel sizes or defaults. Never
 > `list_models` before the gate has said "no".
 >

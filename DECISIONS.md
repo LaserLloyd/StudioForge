@@ -5904,3 +5904,69 @@ ClawForge2 code correctly documented there (and pinned by `test_docs.py`), not a
 StudioForge one. `tag_in_use` is an internal hook (`EngineManager.tag_in_use`, D49 item 7) that
 guards an engine reinstall; it is not documented as an API error code anywhere. Neither page is
 changed.
+
+## D65 -- On demand is the default and a pin has nothing to do with it; a saved override that touches one leased card is a certain refusal
+
+**Status.** Landed on 2026-09-13, one commit on `main`, `tests/unit` green, ruff and mypy clean.
+The live server runs the pre-D65 code until it is restarted; the restart is the deploy step and
+nothing migrates. The wire change is a status code moving earlier (a 507 before the stream instead
+of an error frame inside a 200), never a new refusal: the planner already refused every one of
+these loads.
+
+**Incident, 2026-09-13 15:11-19:52.** The OpenClaw agent's chat model
+(a 27B) carried a saved `device_override` of `[0, 1]`. At 15:02 ClawForge2
+leased CUDA 0 for ComfyUI and re-leased it on idle all afternoon. From then on every load of the
+model met `forced & blocked` in `Planner.plan_load` and was refused `507 gpu_leased` -- about every
+ten minutes from 15:11 to 19:41 (a periodic caller; the log does not record the route, and an
+OpenClaw-side re-issue job that sends `devices: [0, 1]` fits the cadence), and at 19:45 five streaming
+`/v1/chat/completions` turns in six seconds (`jit load failed mid-stream`). OpenClaw fell back to its
+secondary provider for those turns, and its own post-mortem concluded that the model "was not
+pinned, so there was no auto-load path". That conclusion was false: the same afternoon a sibling
+model JIT-loaded from `/v1/chat/completions` at 19:25, and the 27B itself JIT-loaded at 19:51 once
+the override was cleared. Nothing in StudioForge requires a pin for on-demand loading.
+
+**Two defects on our side.**
+
+1. `ModelManager.lease_check` -- the pre-SSE twin of the planner's lease refusal (D53) -- judged a
+   `device_override` with the rule for a set the planner may choose among: refuse only when the
+   override sits wholly inside the blocked set. An override is "all of these cards", and the planner
+   refuses when it touches any blocked card. `[0, 1]` against a lease on `[0]` therefore passed the
+   check, the stream committed its `200`, and the refusal arrived as a terminal error frame; a client
+   branching on the status code saw an unexplained failure rather than a `507` with `Retry-After`.
+2. The teaching surfaces never said the plain thing. INSTRUCTIONS' QUICK RECIPES listed
+   "load a model" and "keep a model loaded forever -> pin_model" but no "use a model", and the one
+   sentence about JIT loading sat under INFERENCE IS NOT HERE, twenty paragraphs below the pin
+   section. The catalog's `settings_pinned` / `if_unpinned` (saved launch settings) reuse the word too.
+   Nothing warned that a saved override turns a lease on one card into a refusal of every
+   on-demand load.
+
+**Decision.**
+
+- `lease_check` refuses when a saved override intersects the blocked set, naming the leased
+  cards, the override, and the remedy (clear it, or save `allowed_devices`). The no-override rule
+  (every known card blocked) is unchanged, and so is "a model already serving is never refused".
+  `GET /api/capabilities` names it `stream_lease_refusal_on_override`.
+- INSTRUCTIONS gain two recipe lines ("use a model ON DEMAND", "would it load right now? ->
+  plan_load") and an ON DEMAND IS THE DEFAULT section ahead of the pin section: unpinned models
+  load themselves, reloads use saved settings, how to save them (`persist=true`, `sfctl models
+  settings --set`), never a saved `device_override` on an on-demand model, check with `plan_load`,
+  and what `settings_pinned` / `if_unpinned` actually mean. `pin_model`'s docstring and the
+  companion proxy's fallback text say the same in one line each.
+- `docs/OPENCLAW.md` gains *On-demand models: the default* (lifecycle, TTL resolution order, the
+  recipe, the override trap, how a failed on-demand load looks to a client);
+  `docs/OPENCLAW-RIG.md`'s short version gains the same paragraph, its `gpu_leased` row names the
+  override as the usual cause of a refusal nobody asked for, and its restart paragraph no longer
+  says leases are a clean slate (stale since D61). `docs/OPENCLAW-SETUP.md` gains a troubleshooting
+  row for "falls back to the secondary provider whenever the model is not loaded".
+
+**Not taken.** Letting an on-demand load ignore a saved override when a card is leased: an override
+is the operator's explicit placement (D36), and silently placing the model elsewhere would break
+that promise for the loads that rely on it. A warning when an override is saved on an unpinned
+model was considered and deferred -- the refusal text and `plan_load` already name the cause, and
+`allowed_devices` is the setting that should be saved instead. Renaming the catalog's
+`settings_pinned` / `if_unpinned` would be a wire change; the INSTRUCTIONS line disambiguates it.
+
+**Tests.** `tests/unit/test_leases.py`: an override of `[0, 1]` with a lease on `[0]` refuses with
+`gpu_leased` naming the holder and CUDA `[0]`; an override of `[1, 2]` beside the same lease is
+silent; the D53 cases are unchanged. `tests/unit/test_mcp.py` pins the recipe line, the section
+heading, the override warning, `allowed_devices` and the `plan_load` recipe in INSTRUCTIONS.

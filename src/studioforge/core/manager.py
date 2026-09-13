@@ -859,13 +859,21 @@ class ModelManager:
 
         * a model that is already serving is never refused -- no load is
           needed, so no card has to be found;
-        * otherwise it refuses only when every device the model could possibly
-          use is leased away: a ``device_override`` wholly inside the blocked
-          set, or (with no override) every card the probe reports.
+        * otherwise it refuses only when the planner is certain to: a
+          ``device_override`` that names ANY blocked card (an override is "all
+          of these cards", so the planner refuses the moment one is leased --
+          ``forced & blocked`` in ``Planner.plan_load``), or, with no override,
+          every card the probe reports being leased away.
 
         Anything less certain returns silently and the in-stream backstop --
         ``ensure_loaded`` raising through ``_stream_with_jit_load`` -- emits the
         error frame it always did, now carrying ``code: "gpu_leased"``.
+
+        D65: this used to require the override to sit WHOLLY inside the blocked
+        set, the rule for a set the planner may choose among. A saved override
+        of [0, 1] with only CUDA 0 leased therefore passed here, and every
+        streaming on-demand load met the refusal as an error frame inside an
+        HTTP 200 -- for four and a half hours on 2026-09-13.
         """
         instance = self.supervisor.get(model_id)
         if instance is not None and instance.state in ("ready", "loading"):
@@ -876,21 +884,33 @@ class ModelManager:
         record = self.registry.resolve(model_id)
         forced = set(record.settings.device_override or ()) if record is not None else set()
         if forced:
-            candidates: set[int] = forced
+            if not forced & set(blocked):
+                return
+            candidates: set[int] = forced & set(blocked)
         else:
             known = self._known_devices()
             if not known:
                 return
             candidates = set(known)
-        if not candidates <= set(blocked):
-            return
-        rejected = LoadRejected(
-            model_id=model_id,
-            reason=(
+            if not candidates <= set(blocked):
+                return
+        if forced:
+            reason = (
+                f"this model is not loaded and its saved device_override {sorted(forced)} "
+                f"names CUDA {sorted(candidates)}, which is leased to someone else; an "
+                f"override means all of those cards, so no on-demand load can succeed until "
+                f"the lease ends -- clear the override (or save allowed_devices instead) to "
+                f"let the planner place it elsewhere"
+            )
+        else:
+            reason = (
                 f"CUDA {sorted(candidates)} is leased to someone else and this model is not "
                 f"loaded, so serving this request would need a card nobody is offering; "
                 f"a lease is not a default to override, it is a promise to its holder"
-            ),
+            )
+        rejected = LoadRejected(
+            model_id=model_id,
+            reason=reason,
             reason_code="gpu_leased",
             leases=[
                 lease_view(lease)

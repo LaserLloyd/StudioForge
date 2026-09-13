@@ -682,6 +682,32 @@ def test_lease_check_refuses_only_when_the_answer_is_certain() -> None:
     manager.lease_check("forced/model")
 
 
+def test_lease_check_refuses_a_saved_override_that_touches_one_leased_card() -> None:
+    """D65: an override is "all of these cards", so one leased card is enough.
+
+    The 2026-09-13 incident: a saved device_override of [0, 1] with only CUDA 0
+    leased to ComfyUI. The planner refuses that load (``forced & blocked``), but
+    this check used to ask for the override to sit wholly inside the blocked set,
+    so every streaming on-demand request got HTTP 200 and an error frame instead
+    of the 507 + Retry-After its client branches on.
+    """
+    from studioforge.errors import InsufficientVramError
+
+    straddling = make_record("straddling/model", device_override=[0, 1])
+    clear = make_record("clear/model", device_override=[1, 2])
+    manager, _supervisor = make_manager([straddling, clear])
+    manager.leases.acquire([0], holder="clawforge2", model_ids=[])
+
+    with pytest.raises(InsufficientVramError) as excinfo:
+        manager.lease_check("straddling/model")
+    assert excinfo.value.code == "gpu_leased"
+    assert excinfo.value.details["lease"]["holder"] == "clawforge2"
+    assert "[0]" in excinfo.value.message
+
+    # An override that avoids the leased card is not this check's business.
+    manager.lease_check("clear/model")
+
+
 def test_lease_check_is_silent_when_nothing_is_leased() -> None:
     record = make_record("mine/model", device_override=[0])
     manager, _supervisor = make_manager([record])

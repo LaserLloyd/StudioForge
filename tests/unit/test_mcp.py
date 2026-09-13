@@ -1025,6 +1025,20 @@ async def test_instructions_teach_the_gate_before_a_load(state: State) -> None:
     assert "BEFORE YOU CHOOSE OR LOAD ANYTHING" in server.instructions
 
 
+async def test_instructions_say_on_demand_needs_no_pin(state: State) -> None:
+    """D65: an agent concluded an unpinned model could not load itself, and a
+    saved device_override silently refused every on-demand load for hours. The
+    recipe block and the prose both have to say it in words a weak model keeps."""
+    server = build_management_mcp(state)
+    text = server.instructions or ""
+    assert "use a model ON DEMAND" in text
+    assert "NO pin needed" in text
+    assert "ON DEMAND IS THE DEFAULT, AND PINNING HAS NOTHING TO DO WITH IT" in text
+    assert "NO saved device_override" in text
+    assert "allowed_devices" in text
+    assert 'plan_load(model_id="<id>")' in text
+
+
 async def test_instructions_teach_the_refusal_codes_and_the_identity(state: State) -> None:
     """D46/D48/D53/D54 shipped four things an agent meets in the wild and the
     INSTRUCTIONS never named: a 507 that is a lease rather than a shortfall
