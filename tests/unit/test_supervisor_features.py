@@ -491,11 +491,16 @@ def hold_cache_ram(supervisor: Supervisor, tmp_path: Path, **grants: int) -> Non
 
 
 def test_the_automatic_grant_is_what_the_other_children_are_not_holding(
-    config: Config, tmp_path: Path
+    config: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Before D50 every child was handed the whole 25%-of-RAM allowance, so four
     residents promised four times it and the "this can never make the box swap"
     comment was only true for one of them."""
+    # Pin the pool. This test is about the DIVISION, and the "auto" pool is 25%
+    # of the HOST's RAM, so leaving it unpinned made the assertion a statement
+    # about the machine: it holds on a big rig and fails on any runner whose
+    # pool is small enough for CACHE_RAM_MIN_GRANT_MIB to bite (the CI runners).
+    monkeypatch.setattr(supervisor_module, "resolve_cache_ram_mb", lambda _v: 32768)
     supervisor = sup(config, make_binary(tmp_path))
     pool = supervisor._cache_ram_grant()
     assert pool is not None
@@ -505,9 +510,15 @@ def test_the_automatic_grant_is_what_the_other_children_are_not_holding(
     assert supervisor._cache_ram_grant() == pool - pool // 2
 
 
-def test_the_grants_of_the_live_children_add_up_to_the_pool(config: Config, tmp_path: Path) -> None:
+def test_the_grants_of_the_live_children_add_up_to_the_pool(
+    config: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """To the pool, not to a multiple of it. Before D50 each of these children
     was handed the whole allowance."""
+    # Pinned for the same reason as the test above, and more sharply: this one
+    # asserts the pool can hold four minimum grants, which is a claim about the
+    # host's RAM (a >64 GiB box) rather than about the code under test.
+    monkeypatch.setattr(supervisor_module, "resolve_cache_ram_mb", lambda _v: 32768)
     supervisor = sup(config, make_binary(tmp_path))
     pool = supervisor._cache_ram_grant()
     assert pool is not None and pool > 4 * CACHE_RAM_MIN_GRANT_MIB
