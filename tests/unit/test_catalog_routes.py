@@ -880,8 +880,8 @@ def make_persona(record_id: str = PERSONA_ID, base: str = MODEL_ID) -> ModelReco
             "is_virtual": True,
             "base_model_id": base,
             "preset": VirtualPreset(
-                system_prompt="you are a coach"
-            ),  # scrub-ok: generic-English fixture
+                system_prompt="you are a coach"  # scrub-ok: generic-English fixture
+            ),
         }
     )
 

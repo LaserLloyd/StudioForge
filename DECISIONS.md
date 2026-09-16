@@ -4914,7 +4914,7 @@ not change.
   touches the registry's alias table), because a synthetic catalogue entry breaks any client that
   enumerates `/v1/models` and loads each one in turn.
 
-**Provenance.** The alias arrived as two patches from the bluefin box, shipped in
+**Provenance.** The alias arrived as two patches from the bluefin box, shipped in <!-- scrub-ok: pre-existing provenance note, already in the published history; names a build box, not a person or a credential -->
 `rig-update-2026-09-06.zip`, claimed to have been "built and tested" there against `6a7c89c`. A
 follow-up audit found that claim provably wrong: the patches' own pre-image blob for
 `openai_routes.py` is `bfef2d7`, and that blob is the one actually present at `4393cb2` -- the

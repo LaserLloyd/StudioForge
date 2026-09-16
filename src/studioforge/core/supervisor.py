@@ -2251,7 +2251,14 @@ class Supervisor:
         # what makes a failed launch diagnosable; what it no longer names is the
         # operator's username, the disk layout and anything key-shaped that
         # reached extra_flags.
-        inst.write_log(f"=== studioforge launch: {' '.join(redact_argv(full_argv))}")
+        #
+        # ONE line, always. `_PDEATHSIG_SHIM` is a multi-line python program, so
+        # joining the argv verbatim spilled this header across five lines and
+        # pushed the model and binary names past the first one — and the header
+        # is the first thing an operator reads (and is read back with
+        # `splitlines()[0]`). Newlines become spaces; no token is lost.
+        launch_line = " ".join(redact_argv(full_argv)).replace("\n", " ").replace("\r", " ")
+        inst.write_log(f"=== studioforge launch: {launch_line}")
 
         kwargs: dict[str, Any] = {}
         # Start suspended when there is a job to put the child in, so the window
