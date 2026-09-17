@@ -2,7 +2,7 @@
    tools/sync_theme.py. Do not edit this copy: change the package (src/,
    adapters/, apps/studioforge.json) and run `python tools/sync_theme.py app studioforge`.
    themes: purple, midnight-gold, glacier, forest, paper, daylight | default: glacier
-   body sha256: 5f7ebb12f194faed */
+   body sha256: 1024082b0d293c1c */
 /* ============================================================================
    theme-base.css — CORE. Purple (base theme) + theme-agnostic layer.
    ----------------------------------------------------------------------------
@@ -1199,16 +1199,22 @@
      remapping the variables below recolours them without fighting classes.
    ============================================================================ */
 
-:root {
-  --q-primary:   var(--accent);
-  --q-secondary: var(--accent-2);
-  --q-accent:    var(--accent-2);
-  --q-positive:  var(--success);
-  --q-negative:  var(--danger);
-  --q-info:      var(--info);
-  --q-warning:   var(--warning);
-  --q-dark:      var(--surface-2);
-  --q-dark-page: var(--surface-0);
+/* Quasar declares the brand variables on :root, and NiceGUI additionally
+   passes its own brand defaults (primary #5898d4, ...) through Quasar's
+   config, which writes them INLINE on <body>. Inline normal declarations
+   beat any stylesheet rule, so the mapping is declared on body as well and
+   marked !important (an author !important beats an inline normal value). */
+:root,
+body {
+  --q-primary:   var(--accent) !important;
+  --q-secondary: var(--accent-2) !important;
+  --q-accent:    var(--accent-2) !important;
+  --q-positive:  var(--success) !important;
+  --q-negative:  var(--danger) !important;
+  --q-info:      var(--info) !important;
+  --q-warning:   var(--warning) !important;
+  --q-dark:      var(--surface-2) !important;
+  --q-dark-page: var(--surface-0) !important;
 }
 
 /* ---- page body -------------------------------------------------------- */
@@ -1454,9 +1460,15 @@ a:focus-visible {
 
 /* ---- linear progress (VRAM bars, download rows, benchmark) ------------ */
 
+/* Progress tracks follow the specimen board: the fill (--accent via
+   --q-primary) sits on --surface-4. --control-track is for control
+   boundaries (slider, toggle), and next to a dark accent it swallowed the
+   fill. Quasar dims the track to .4 opacity; the surface step is already
+   subtle, so it is shown as is. */
 .q-linear-progress__track--light,
 .q-linear-progress__track--dark {
-  background: var(--control-track);
+  background: var(--surface-4);
+  opacity: 1;
 }
 
 /* ---- slider (LoRA adapter scale) --------------------------------------- */
