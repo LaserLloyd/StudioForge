@@ -68,7 +68,7 @@ def render(ctx: GuiContext) -> None:
         path_label = ui.label("").classes("text-xs font-mono opacity-60")
         stale = ui.label("").classes("text-xs text-warning")
         body = ui.label("").classes(
-            "w-full font-mono text-xs whitespace-pre-wrap bg-black/10 dark:bg-white/5 "
+            "w-full font-mono text-xs whitespace-pre-wrap sf-well "
             "p-2 rounded overflow-auto max-h-[60vh]"
         )
 

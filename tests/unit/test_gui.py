@@ -9,6 +9,7 @@ deliberately lives.
 from __future__ import annotations
 
 import ast
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -258,6 +259,100 @@ def test_a_failing_lease_book_is_a_stale_note_not_an_error_card(config: Config) 
         text = client.get("/").text
     assert "The Dashboard tab could not be rendered" not in text
     assert "live refresh failed" in text and "book on fire" in text
+
+
+# ---------------------------------------------------------------------------
+# Theme assets (unifyingTheme V26-09-16): vendored under gui/theme/, served at
+# /sf-theme/, injected once into every page's <head> and the login page.
+# ---------------------------------------------------------------------------
+
+
+def test_theme_assets_are_served(config: Config) -> None:
+    app = create_gui_app(config, api_state=_FakeState(config))
+    with TestClient(app) as client:
+        js = client.get("/sf-theme/ui-theme.js")
+        css = client.get("/sf-theme/ui-theme.css")
+        base_css = client.get("/sf-theme/ui-theme-base.css")
+        manifest = client.get("/sf-theme/ui-theme.json")
+    assert js.status_code == 200
+    assert "UITheme" in js.text
+    assert css.status_code == 200
+    assert base_css.status_code == 200
+    assert manifest.status_code == 200
+    assert "glacier" in manifest.text
+
+
+def test_theme_head_html_has_the_three_tags_in_order_with_version_hashes() -> None:
+    from studioforge.gui.app import _THEME_HEAD_HTML
+
+    js_at = _THEME_HEAD_HTML.index("/sf-theme/ui-theme.js?v=")
+    base_at = _THEME_HEAD_HTML.index("/sf-theme/ui-theme-base.css?v=")
+    css_at = _THEME_HEAD_HTML.index("/sf-theme/ui-theme.css?v=")
+    assert js_at < base_at < css_at, "script must load before the two stylesheets"
+
+    hashes = re.findall(r"\?v=([0-9a-f]+)", _THEME_HEAD_HTML)
+    assert len(hashes) == 3
+    assert all(len(h) == 10 for h in hashes), hashes
+
+
+def test_theme_head_html_is_injected_into_the_page_exactly_once(config: Config) -> None:
+    from studioforge.gui.app import _THEME_HEAD_HTML
+
+    # create_gui_app runs twice (tests do this; a reload could too) and must
+    # not double up on a call that appends to a process-global list.
+    create_gui_app(config, api_state=_FakeState(config))
+    app = create_gui_app(config, api_state=_FakeState(config))
+    with TestClient(app) as client:
+        text = client.get("/").text
+    assert _THEME_HEAD_HTML in text
+    assert text.count("/sf-theme/ui-theme.js?v=") == 1
+
+
+def test_theme_paths_are_exempt_from_the_gate_but_lookalikes_are_not(config: Config) -> None:
+    config.server.api_key = "sf-secret-key-1234"
+    app = create_gui_app(config, api_state=_FakeState(config))
+    with TestClient(app) as client:
+        themed = client.get("/sf-theme/ui-theme.js", follow_redirects=False)
+        assert themed.status_code == 200
+        assert themed.headers["x-frame-options"] == "DENY"
+        assert themed.headers["content-security-policy"] == "frame-ancestors 'none'"
+
+        # A path under the prefix but not a real file still isn't a redirect
+        # to a login form -- it reaches the static handler, which 404s.
+        missing = client.get("/sf-theme/does-not-exist.css", follow_redirects=False)
+        assert missing.status_code == 404
+
+        no_slash = client.get("/sf-theme", follow_redirects=False)
+        assert no_slash.status_code in (303, 401)
+
+        lookalike = client.get("/sf-themex", follow_redirects=False)
+        assert lookalike.status_code in (303, 401)
+
+        nicegui_internal = client.get("/_nicegui/nope", follow_redirects=False)
+        assert nicegui_internal.status_code in (303, 401)
+
+
+def test_login_page_is_themed_and_has_no_hex_colours(config: Config) -> None:
+    from studioforge.gui.app import _THEME_HEAD_HTML
+
+    app = create_gui_app(config, api_state=_FakeState(config))
+    with TestClient(app) as client:
+        text = client.get(LOGIN_PATH).text
+    assert _THEME_HEAD_HTML in text
+    style = text.split("<style>", 1)[1].split("</style>", 1)[0]
+    assert "#" not in style, "login page style block still has a literal hex colour"
+    assert "var(--" in style
+
+
+def test_header_no_longer_creates_a_dark_mode_toggle() -> None:
+    """A theme picker replaced it (see _theme_picker); asserted at source
+    level since a rendered NiceGUI/Quasar element tree isn't introspectable
+    from a plain HTTP response."""
+    from studioforge.gui import app as app_module
+
+    source = Path(app_module.__file__).read_text(encoding="utf-8")
+    assert "ui.dark_mode" not in source
+    assert "_theme_picker" in source
 
 
 # ---------------------------------------------------------------------------

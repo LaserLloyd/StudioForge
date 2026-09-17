@@ -1,0 +1,146 @@
+/* GENERATED theme base layer for studioforge by the unifyingTheme package (V26-09-16),
+   tools/sync_theme.py. Do not edit this copy: change the package (src/,
+   adapters/, apps/studioforge.json) and run `python tools/sync_theme.py app studioforge`.
+   themes: purple, midnight-gold, glacier, forest, paper, daylight | default: glacier
+   body sha256: 423d6a4fc2526e85 */
+/* ==========================================================================
+   C. THEME-AGNOSTIC LAYER
+   ========================================================================== */
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  background: var(--surface-0);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: var(--fs-base);
+  font-weight: var(--fw-regular);
+  line-height: var(--lh-base);
+  letter-spacing: var(--ls-base);
+  font-feature-settings: "cv05" 1, "cv11" 1, "ss01" 1;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+code, kbd, pre, samp, .tnum {
+  font-family: var(--font-mono);
+  font-feature-settings: "tnum" 1, "zero" 1, "calt" 0;
+}
+
+/* Tabular figures anywhere numbers are compared in a column */
+.num, td.num, th.num, .stat-value, .slider-value {
+  font-variant-numeric: tabular-nums;
+}
+
+h1, h2, h3, h4 {
+  font-family: var(--font-display);
+  line-height: var(--lh-tight);
+  letter-spacing: var(--ls-tight);
+  margin: 0;
+}
+
+a { color: var(--text-link); text-decoration-color: color-mix(in srgb, var(--text-link) 45%, transparent); text-underline-offset: 2px; }
+a:hover { color: var(--text-link-hover); text-decoration-color: currentColor; }
+
+::selection { background: var(--selection-bg); color: var(--selection-text); }
+
+/* Focus — every interactive element */
+:focus-visible {
+  outline: var(--focus-ring-width) solid var(--focus-ring);
+  outline-offset: var(--focus-ring-offset);
+}
+:focus:not(:focus-visible) { outline: none; }
+
+/* Eyebrow / kicker */
+.kicker {
+  font-family: var(--font-mono);
+  font-size: var(--fs-micro);
+  font-weight: var(--fw-medium);
+  text-transform: uppercase;
+  letter-spacing: var(--ls-label);
+  color: var(--text-tertiary);
+}
+
+/* Dividers */
+.divider { height: 1px; background: var(--divider); border: 0; }
+.divider--dashed {
+  height: 1px; border: 0; background: repeating-linear-gradient(
+    90deg, var(--divider) 0 10px, transparent 10px 18px);
+}
+
+/* Scrollbars — Chromium */
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-track { background: var(--scrollbar-track); }
+*::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: var(--radius-pill);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-hover); background-clip: padding-box; }
+*::-webkit-scrollbar-corner { background: transparent; }
+/* Scrollbars — Firefox */
+* { scrollbar-width: thin; scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track); }
+
+/* Native control tinting fallback */
+input[type="range"], input[type="checkbox"], input[type="radio"], progress {
+  accent-color: var(--accent);
+}
+
+/* ---- Keyframes — theme-neutral names ---- */
+@keyframes ui-fade-up    { from { opacity:0; transform: translateY(8px);  } to { opacity:1; transform:none; } }
+@keyframes ui-message-in { from { opacity:0; transform: translateY(10px) scale(.995); } to { opacity:1; transform:none; } }
+@keyframes ui-modal-in   { from { opacity:0; transform: translateY(12px) scale(.97); } to { opacity:1; transform:none; } }
+@keyframes ui-overlay-in { from { opacity:0; } to { opacity:1; } }
+@keyframes ui-toast-in   { from { opacity:0; transform: translateY(14px); } to { opacity:1; transform:none; } }
+@keyframes ui-menu-in    { from { opacity:0; transform: translateY(-4px) scale(.98); } to { opacity:1; transform:none; } }
+@keyframes ui-menu-out   { from { opacity:1; transform:none; } to { opacity:0; transform: translateY(-4px) scale(.98); } }
+@keyframes ui-badge-pop  { 0% { transform: scale(.6); opacity:0; } 60% { transform: scale(1.12); } 100% { transform:none; opacity:1; } }
+@keyframes ui-pulse      { 0%,100% { opacity:1; transform: scale(1); } 50% { opacity:.45; transform: scale(.86); } }
+@keyframes ui-breathe    { 0%,100% { box-shadow: 0 0 0 0 var(--accent-glow); } 50% { box-shadow: 0 0 0 6px transparent; } }
+@keyframes ui-typing     { 0%,60%,100% { transform: translateY(0); opacity:.45; } 30% { transform: translateY(-4px); opacity:1; } }
+@keyframes ui-spin       { to { transform: rotate(360deg); } }
+@keyframes ui-shimmer    { from { background-position: -140% 0; } to { background-position: 240% 0; } }
+@keyframes ui-highlight  { 0% { background: var(--accent-subtle); } 100% { background: transparent; } }
+@keyframes ui-send-stop  { 0%,100% { box-shadow: 0 0 0 0 var(--danger-subtle); } 50% { box-shadow: 0 0 0 5px transparent; } }
+
+/* ---- Reduced motion ----
+   Stops: every loop (pulse, breathe, typing, spin, shimmer, send-stop),
+   ambient theme backgrounds, and card-lift transforms.
+   Becomes instant: enter animations (fade-up, message-in, modal-in,
+   overlay-in, toast-in, menu-in/out) and all transitions. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+    scroll-behavior: auto !important;
+  }
+  .ambient, .ambient::before, .ambient::after { animation: none !important; opacity: .5; }
+  .skeleton { background-image: none !important; }
+}
+
+/* ---- highlight.js 11 mapping ---- */
+.hljs { color: var(--syn-fg); background: var(--syn-bg); }
+.hljs-comment, .hljs-quote { color: var(--syn-comment); font-style: italic; }
+.hljs-keyword, .hljs-selector-tag, .hljs-doctag, .hljs-name { color: var(--syn-keyword); }
+.hljs-string, .hljs-regexp, .hljs-selector-attr, .hljs-selector-pseudo,
+.hljs-addition, .hljs-template-variable, .hljs-quote { color: var(--syn-string); }
+.hljs-number, .hljs-literal { color: var(--syn-number); }
+.hljs-function .hljs-title, .hljs-title.function_ { color: var(--syn-function); }
+.hljs-title, .hljs-title.class_, .hljs-section { color: var(--syn-title); }
+.hljs-type, .hljs-class .hljs-title, .hljs-selector-class { color: var(--syn-type); }
+.hljs-variable, .hljs-template-tag, .hljs-params, .hljs-symbol { color: var(--syn-variable); }
+.hljs-attr, .hljs-attribute, .hljs-property { color: var(--syn-attr); }
+.hljs-tag { color: var(--syn-tag); }
+.hljs-built_in, .hljs-builtin-name { color: var(--syn-builtin); }
+.hljs-meta, .hljs-meta .hljs-keyword, .hljs-comment.hljs-doctag { color: var(--syn-meta); }
+.hljs-operator, .hljs-bullet, .hljs-link { color: var(--syn-operator); }
+.hljs-punctuation, .hljs-subst { color: var(--syn-punctuation); }
+.hljs-deletion { color: var(--syn-deletion); background: var(--diff-remove-bg); }
+.hljs-addition { color: var(--syn-addition); background: var(--diff-add-bg); }
+.hljs-emphasis { font-style: italic; }
+.hljs-strong { font-weight: var(--fw-bold); }

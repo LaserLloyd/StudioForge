@@ -1,0 +1,106 @@
+{
+  "generated": "unifyingTheme V26-09-16 tools/sync_theme.py for studioforge; do not edit",
+  "manifest": {
+    "app": "studioforge",
+    "themes": [
+      "purple",
+      "midnight-gold",
+      "glacier",
+      "forest",
+      "paper",
+      "daylight"
+    ],
+    "default": "glacier",
+    "storageKey": "studioforge.theme",
+    "families": false,
+    "legacy": null,
+    "mirrorAttr": null,
+    "fontsHref": null
+  },
+  "themes": [
+    {
+      "slug": "purple",
+      "name": "Purple",
+      "family": "purple",
+      "ground": "dark",
+      "colorScheme": "dark",
+      "themeColor": "#0e0e1b",
+      "set": "core",
+      "swatch": "#7c3aed",
+      "fonts": [
+        "Inter",
+        "JetBrains Mono"
+      ]
+    },
+    {
+      "slug": "midnight-gold",
+      "name": "Midnight Gold",
+      "family": "midnight-gold",
+      "ground": "oled",
+      "colorScheme": "dark",
+      "themeColor": "#000000",
+      "set": "core",
+      "swatch": "#e3bf5a",
+      "fonts": [
+        "Inter",
+        "JetBrains Mono"
+      ]
+    },
+    {
+      "slug": "glacier",
+      "name": "Glacier",
+      "family": "glacier",
+      "ground": "oled",
+      "colorScheme": "dark",
+      "themeColor": "#000000",
+      "set": "core",
+      "swatch": "#7fe0f2",
+      "fonts": [
+        "Inter",
+        "JetBrains Mono"
+      ]
+    },
+    {
+      "slug": "forest",
+      "name": "Forest",
+      "family": "forest",
+      "ground": "dark",
+      "colorScheme": "dark",
+      "themeColor": "#0a0806",
+      "set": "core",
+      "swatch": "#d68a42",
+      "fonts": [
+        "Inter",
+        "JetBrains Mono"
+      ]
+    },
+    {
+      "slug": "paper",
+      "name": "Paper",
+      "family": "paper",
+      "ground": "light",
+      "colorScheme": "light",
+      "themeColor": "#e6d2a8",
+      "set": "core",
+      "swatch": "#a3241c",
+      "fonts": [
+        "Inter",
+        "JetBrains Mono"
+      ]
+    },
+    {
+      "slug": "daylight",
+      "name": "Daylight",
+      "family": "daylight",
+      "ground": "light",
+      "colorScheme": "light",
+      "themeColor": "#ffffff",
+      "set": "core",
+      "swatch": "#2c56c9",
+      "fonts": [
+        "Inter",
+        "JetBrains Mono"
+      ]
+    }
+  ]
+}

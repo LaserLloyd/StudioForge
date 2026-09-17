@@ -259,7 +259,7 @@ def panel_guard(what: str) -> Iterator[None]:
         yield
     except Exception as exc:  # noqa: BLE001 - the point is to contain everything
         log.exception("gui panel failed", panel=what, error=str(exc))
-        with ui.card().classes("w-full bg-red-50 dark:bg-red-950"):
+        with ui.card().classes("w-full sf-danger-card"):
             ui.label(f"{what} could not be rendered").classes("text-negative font-medium")
             ui.label(error_text(exc)).classes("text-xs font-mono whitespace-pre-wrap")
 

@@ -707,7 +707,7 @@ def _settings_dialog(ctx: GuiContext, record: Any, table: Any) -> None:  # noqa:
         # Filled by a one-shot timer rather than inline: it plans this model at
         # every context tier on every hardware mode, which is arithmetic but
         # enough of it to make opening the dialog feel slow on a big library.
-        placements_card = ui.card().classes("w-full bg-black/5 dark:bg-white/5")
+        placements_card = ui.card().classes("w-full sf-well")
         with placements_card:
             ui.label("Optimal settings — computing…").classes("text-xs opacity-60")
         ui.timer(
@@ -717,7 +717,7 @@ def _settings_dialog(ctx: GuiContext, record: Any, table: Any) -> None:  # noqa:
         )
 
         # --- fit verdict -------------------------------------------------
-        verdict_card = ui.card().classes("w-full bg-black/5 dark:bg-white/5")
+        verdict_card = ui.card().classes("w-full sf-well")
 
         # --- Tier 1: basic ----------------------------------------------
         ui.label("Basic").classes("text-sm font-medium mt-2")

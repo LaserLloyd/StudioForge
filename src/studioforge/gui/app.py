@@ -31,7 +31,9 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 from collections.abc import Callable, Mapping
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Form, Request
@@ -57,8 +59,17 @@ LOGIN_PATH = "/login"
 LOGOUT_PATH = "/logout"
 
 #: Reachable without the key: the login form itself, its POST target, and the
-#: liveness probe. Everything else is gated when a key is configured.
+#: liveness probe. Everything else is gated when a key is configured. The
+#: vendored theme assets (see _THEME_URL_PREFIX below) are exempted the same
+#: way, but by prefix rather than exact path.
 _OPEN_PATHS = frozenset({LOGIN_PATH, LOGOUT_PATH, "/favicon.ico", "/gui-health"})
+
+#: Public, non-sensitive static assets (CSS/JS/JSON -- no user data, no
+#: control surface) so the login page itself can be themed before the visitor
+#: has a session. Prefix, not an exact-path member of _OPEN_PATHS, because it
+#: covers a whole directory; "/sf-theme" with no trailing slash and anything
+#: not under it (e.g. "/sf-themex") still goes through the gate below.
+_THEME_URL_PREFIX = "/sf-theme/"
 
 #: NiceGUI's element tree and page routes are process-global singletons, so the
 #: pages are registered exactly once even if the app factory is called again
@@ -310,7 +321,11 @@ class GuiAuthGate:
             return
 
         headers = Headers(scope=scope)
-        if path in _OPEN_PATHS or scope.get("method") == "OPTIONS":
+        if (
+            path in _OPEN_PATHS
+            or path.startswith(_THEME_URL_PREFIX)
+            or scope.get("method") == "OPTIONS"
+        ):
             await self.app(scope, receive, send)
             return
         if _is_authorized(headers, expected):
@@ -344,23 +359,123 @@ class GuiAuthGate:
         await response(scope, receive, send)
 
 
+# ---------------------------------------------------------------------------
+# Theme assets
+# ---------------------------------------------------------------------------
+#
+# Vendored by tools/sync_theme.py from the unifyingTheme package (V26-09-16)
+# -- see docs/DEVELOPMENT.md's "GUI theming" section. Never hand-edited: a
+# change here belongs in that package's src/ or adapters/, followed by
+# `python tools/sync_theme.py app studioforge`.
+
+#: Where the four vendored files (ui-theme.js/.css/-base.css/.json) live.
+_THEME_DIR = Path(__file__).parent / "theme"
+
+
+def _asset_version(name: str) -> str:
+    """First 10 hex chars of a vendored asset's sha256, for cache-busting.
+
+    Computed once at import so every page load and the login page agree on
+    the same query string without re-hashing the file per request. Falls
+    back to a fixed placeholder if the vendored copy is somehow missing --
+    the asset itself 404s in that case, which is the more useful signal.
+    """
+    try:
+        digest = hashlib.sha256((_THEME_DIR / name).read_bytes()).hexdigest()
+    except OSError:  # pragma: no cover - only if the vendored copy is missing
+        return "0" * 10
+    return digest[:10]
+
+
+_THEME_JS_VERSION = _asset_version("ui-theme.js")
+_THEME_BASE_CSS_VERSION = _asset_version("ui-theme-base.css")
+_THEME_CSS_VERSION = _asset_version("ui-theme.css")
+
+
+def _theme_script_tag(name: str, version: str) -> str:
+    return f'<script src="{_THEME_URL_PREFIX}{name}?v={version}"></script>'
+
+
+def _theme_link_tag(name: str, version: str) -> str:
+    return f'<link rel="stylesheet" href="{_THEME_URL_PREFIX}{name}?v={version}">'
+
+
+#: Injected once into every page's <head> (see _register_theme_assets and
+#: _login_html), in this order: the runtime script -- blocking, so the
+#: palette is on the page before first paint -- then the element layer
+#: (loaded before the app's own CSS so its rules keep priority), then the
+#: contract tokens (loaded last so they beat any same-named legacy value).
+_THEME_HEAD_HTML = (
+    _theme_script_tag("ui-theme.js", _THEME_JS_VERSION)
+    + _theme_link_tag("ui-theme-base.css", _THEME_BASE_CSS_VERSION)
+    + _theme_link_tag("ui-theme.css", _THEME_CSS_VERSION)
+)
+
+
+def _theme_manifest() -> Mapping[str, Any]:
+    """The vendored picker manifest: enabled themes in picker order."""
+    try:
+        text = (_THEME_DIR / "ui-theme.json").read_text(encoding="utf-8")
+        return json.loads(text)
+    except (OSError, ValueError):  # pragma: no cover - only if the copy is missing/corrupt
+        return {"manifest": {"default": "glacier"}, "themes": []}
+
+
+_THEME_MANIFEST = _theme_manifest()
+
+
+def _theme_options() -> dict[str, str]:
+    """``{slug: name}`` for the header picker, already in picker order."""
+    return {theme["slug"]: theme["name"] for theme in _THEME_MANIFEST.get("themes", [])}
+
+
+def _theme_default() -> str:
+    return str(_THEME_MANIFEST.get("manifest", {}).get("default", "glacier"))
+
+
+#: Guards the one-time /sf-theme static mount and the one-time <head>
+#: injection. Both are process-global (``nicegui_app`` is a singleton, and
+#: ``ui.add_head_html(shared=True)`` appends to a process-global list on
+#: every call) -- mirrors _PAGES_REGISTERED/_NICEGUI_MOUNTED just below,
+#: since tests call create_gui_app more than once.
+_THEME_ASSETS_REGISTERED = False
+
+
+def _register_theme_assets() -> None:
+    global _THEME_ASSETS_REGISTERED
+    if _THEME_ASSETS_REGISTERED:
+        return
+    _THEME_ASSETS_REGISTERED = True
+    nicegui_app.add_static_files(_THEME_URL_PREFIX.rstrip("/"), _THEME_DIR)
+    ui.add_head_html(_THEME_HEAD_HTML, shared=True)
+
+
 _LOGIN_PAGE = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>StudioForge — sign in</title>
+{theme_head}
 <style>
  :root {{ color-scheme: light dark; }}
- body {{ font-family: system-ui, sans-serif; display: grid; place-items: center;
-        min-height: 100vh; margin: 0; background: #11151c; color: #e8eaed; }}
- form {{ background: #1b212b; padding: 2rem; border-radius: 12px; width: min(24rem, 90vw);
-        box-shadow: 0 10px 40px rgba(0,0,0,.4); }}
+ body {{ font-family: var(--font-sans); display: grid; place-items: center;
+        min-height: 100vh; margin: 0; background: var(--surface-0); color: var(--text-primary); }}
+ form {{ background: var(--surface-1); padding: 2rem; border-radius: var(--radius-lg);
+        width: min(24rem, 90vw); box-shadow: var(--shadow-3);
+        border: 1px solid var(--border-subtle); }}
  h1 {{ font-size: 1.1rem; margin: 0 0 .25rem; }}
- p {{ font-size: .8rem; opacity: .7; margin: 0 0 1.25rem; }}
- input {{ width: 100%; padding: .6rem .7rem; font-size: 1rem; border-radius: 8px;
-         border: 1px solid #333c4a; background: #11151c; color: inherit; box-sizing: border-box; }}
+ p {{ font-size: .8rem; color: var(--text-secondary); margin: 0 0 1.25rem; }}
+ input {{ width: 100%; padding: .6rem .7rem; font-size: 1rem; border-radius: var(--radius-sm);
+         border: 1px solid var(--border-strong); background: var(--surface-sunken);
+         color: var(--text-primary); box-sizing: border-box; }}
+ input:focus-visible {{ outline: var(--focus-ring-width) solid var(--focus-ring);
+         outline-offset: var(--focus-ring-offset); }}
  button {{ margin-top: 1rem; width: 100%; padding: .6rem; font-size: 1rem; border: 0;
-          border-radius: 8px; background: #4f7cff; color: #fff; cursor: pointer; }}
- .error {{ color: #ff8a80; font-size: .8rem; margin-top: .75rem; }}
+          border-radius: var(--radius-sm); background: var(--accent); color: var(--on-accent);
+          cursor: pointer; }}
+ button:hover {{ background: var(--accent-hover); }}
+ button:focus-visible {{ outline: var(--focus-ring-width) solid var(--focus-ring);
+         outline-offset: var(--focus-ring-offset); }}
+ .error {{ color: var(--danger-text); font-size: .8rem; margin-top: .75rem; }}
 </style></head>
 <body><form method="post" action="{login_path}">
  <h1>StudioForge</h1>
@@ -375,7 +490,7 @@ _LOGIN_PAGE = """<!doctype html>
 
 def _login_html(error: str = "") -> str:
     block = f'<div class="error">{error}</div>' if error else ""
-    return _LOGIN_PAGE.format(login_path=LOGIN_PATH, error=block)
+    return _LOGIN_PAGE.format(login_path=LOGIN_PATH, error=block, theme_head=_THEME_HEAD_HTML)
 
 
 def _install_auth_routes(app: FastAPI, config: Config) -> None:
@@ -432,6 +547,48 @@ def _context() -> GuiContext:
     return _CONTEXT
 
 
+def _theme_picker() -> None:
+    """Compact Quasar select that drives ``window.UITheme`` (adapters/quasar.js).
+
+    The page is already painted in the visitor's stored theme before this
+    element even mounts (ui-theme.js runs synchronously in <head>, before
+    first paint), so this is purely a control, not the source of truth for
+    what's on screen. Its initial value is the manifest default; the moment
+    the client connects, ``sync_initial`` corrects it to whatever
+    ``UITheme.current()`` actually applied. The ``initialising`` guard stops
+    that correction from round-tripping through ``on_change`` and persisting
+    the default over the visitor's real (stored) choice -- NiceGUI fires the
+    change handler on a programmatic ``select.value =`` assignment exactly
+    the same as on a user pick.
+    """
+    options = _theme_options()
+    initialising = False
+
+    select = (
+        ui.select(options, value=_theme_default())
+        .props("dense outlined options-dense")
+        .classes("sf-theme-picker")
+    )
+    select.tooltip("Theme")
+
+    def on_change(event: Any) -> None:
+        if initialising:
+            return
+        ui.run_javascript(f"UITheme.set({json.dumps(event.value)})")
+
+    select.on_value_change(on_change)
+
+    async def sync_initial() -> None:
+        nonlocal initialising
+        current = await ui.run_javascript("UITheme.current()")
+        if current in options and current != select.value:
+            initialising = True
+            select.value = current
+            initialising = False
+
+    ui.timer(0.0, sync_initial, once=True)
+
+
 def _header(ctx: GuiContext) -> Any:
     with ui.header().classes("items-center justify-between px-4 py-2"):
         with ui.row().classes("items-center gap-3"):
@@ -440,8 +597,7 @@ def _header(ctx: GuiContext) -> Any:
             ui.label(f"v{__version__}").classes("text-xs opacity-70")
         with ui.row().classes("items-center gap-2"):
             status = ui.label("").classes("text-xs opacity-80 font-mono")
-            dark = ui.dark_mode(value=True)
-            ui.button(icon="dark_mode", on_click=dark.toggle).props("flat round dense")
+            _theme_picker()
             if ctx.config.server.api_key:
                 ui.link("sign out", LOGOUT_PATH).classes("text-xs")
     return status
@@ -617,6 +773,7 @@ def create_gui_app(config: Config, *, api_state: Any) -> FastAPI:
     )
     _install_auth_routes(app, config)
     _register_pages()
+    _register_theme_assets()
 
     if not _NICEGUI_MOUNTED:
         ui.run_with(

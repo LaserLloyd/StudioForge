@@ -642,9 +642,7 @@ def _log_panel(ctx: GuiContext) -> None:
         level = ui.select(["ALL", "DEBUG", "INFO", "WARNING", "ERROR"], value="INFO").props(
             "dense outlined"
         )
-    body = ui.label("").classes(
-        "w-full font-mono text-xs whitespace-pre-wrap bg-black/10 dark:bg-white/5 p-2 rounded"
-    )
+    body = ui.label("").classes("w-full font-mono text-xs whitespace-pre-wrap sf-well p-2 rounded")
 
     def refresh() -> None:
         from studioforge.logging import RING_BUFFER

@@ -110,6 +110,42 @@ depends on nothing above it. A change that makes `core` import from `api` is a c
    widget, like `planner.reserved_mb` has on the GPU card. Add it to
    `gui/state.CUSTOM_WIDGET_KEYS` along with the widget, or the same test fails.
 
+## GUI theming
+
+The panel's colours, type and component skin come from the **unifyingTheme** package
+(`_unifyingTheme/V26-09-16`, a sibling checkout — not part of this repo), not from anything
+hand-written here. `gui/theme/` holds four **generated** files and is never hand-edited:
+
+```
+gui/theme/ui-theme.js         manifest + runtime + the Quasar/NiceGUI adapter (adapters/quasar.js)
+gui/theme/ui-theme.css        contract tokens for the enabled themes + adapters/quasar.css
+gui/theme/ui-theme-base.css   element layer: body type, focus ring, scrollbars, keyframes, hljs
+gui/theme/ui-theme.json       manifest + enabled themes' metadata, in picker order (read by app.py)
+```
+
+`app.py` serves that directory at `/sf-theme/` (exempted from the auth gate, since it has to be
+reachable from the unauthenticated login page too) and injects the three files into every page's
+`<head>` exactly once, each with a `?v=<sha256 prefix>` cache-busting query string computed at
+import. The header's theme picker (`_theme_picker`) is a `ui.select` that calls
+`UITheme.set(slug)` in the browser; `adapters/quasar.js` keeps Quasar's own dark-mode flag in step
+with the active theme's ground, so `ui.run_with(dark=True)` stays fixed in Python regardless of
+which theme is active.
+
+To change how a Quasar component looks, edit `adapters/quasar.css` (and, for the runtime's JS
+behaviour, `adapters/quasar.js`) in the theme package — never `gui/theme/*` directly, it is
+overwritten wholesale. After editing, re-vendor from the package root:
+
+```bash
+python tools/sync_theme.py app studioforge --dest <path to this checkout>
+```
+
+`tools/sync_theme.py check studioforge --dest <path to this checkout>` reports drift without
+writing anything, which is a good pre-commit sanity check if the vendored copy looks stale.
+`pyproject.toml`'s
+`[tool.hatch.build.targets.wheel]` `include` list has explicit globs for `gui/theme/*.{js,css,json}`
+— a wheel build only picks up non-Python data files that are listed there, so a new *kind* of
+vendored file needs an entry added alongside the existing ones.
+
 ## Building the companion wheel
 
 ```bash

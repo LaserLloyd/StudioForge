@@ -86,9 +86,7 @@ def render(ctx: GuiContext) -> None:  # noqa: C901 - one screen, one flow
             .classes("w-full")
         )
 
-        transcript = ui.column().classes(
-            "w-full gap-2 p-2 rounded bg-black/5 dark:bg-white/5 min-h-[12rem]"
-        )
+        transcript = ui.column().classes("w-full gap-2 p-2 rounded sf-well min-h-[12rem]")
         attach_note = ui.label("").classes("text-xs opacity-70")
         thumbs = ui.row().classes("gap-2 flex-wrap")
 

@@ -85,7 +85,15 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/studioforge"]
-include = ["src/studioforge/migrations/*.sql", "src/studioforge/data/*.json"]
+include = [
+    "src/studioforge/migrations/*.sql",
+    "src/studioforge/data/*.json",
+    # Vendored by tools/sync_theme.py in the unifyingTheme package (V26-09-16);
+    # see docs/DEVELOPMENT.md's "GUI theming" section.
+    "src/studioforge/gui/theme/*.js",
+    "src/studioforge/gui/theme/*.css",
+    "src/studioforge/gui/theme/*.json",
+]
 
 [tool.ruff]
 line-length = 100

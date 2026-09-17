@@ -1,0 +1,1731 @@
+/* GENERATED theme tokens for studioforge by the unifyingTheme package (V26-09-16),
+   tools/sync_theme.py. Do not edit this copy: change the package (src/,
+   adapters/, apps/studioforge.json) and run `python tools/sync_theme.py app studioforge`.
+   themes: purple, midnight-gold, glacier, forest, paper, daylight | default: glacier
+   body sha256: ac7169f19ba74f28 */
+/* ============================================================================
+   theme-base.css — CORE. Purple (base theme) + theme-agnostic layer.
+   ----------------------------------------------------------------------------
+   Purple is the base: its values ARE the :root defaults. Purple is selected by
+   the ABSENCE of a data-palette attribute. Every other theme is a
+   theme-<slug>.css file containing one [data-palette="<slug>"] block.
+
+   This file never names a slug.
+
+   Sections
+     A. Contract — Purple token values (:root)
+     B. Theme-invariant tokens (geometry, layers, motion, type scale)
+     C. Theme-agnostic layer (body type, selection, scrollbars, focus,
+        reduced motion, highlight.js mapping, locale overrides)
+   ============================================================================ */
+
+/* ==========================================================================
+   A. CONTRACT — Purple
+   Ground: dark · family: purple · set: core · color-scheme: dark
+   theme-color: #0e0e1b
+   ========================================================================== */
+
+:root {
+  color-scheme: dark;
+
+  /* ---- Surfaces ---- */
+  --surface-void:     #08080f;
+  --surface-0:        #0e0e1b;
+  --surface-1:        #14142a;
+  --surface-2:        #1d1d39;
+  --surface-3:        #232342;
+  --surface-4:        #262648;
+  --surface-sunken:   #0a0a14;
+  --surface-overlay:  #1d1d39;
+  --glass-1:          rgba(29,29,57,.72);
+  --glass-2:          rgba(29,29,57,.84);
+  --glass-3:          rgba(14,14,27,.92);
+  --glass-highlight:  rgba(255,255,255,.055);
+  --code-bg:          #0b0b16;
+
+  /* ---- Text ---- */
+  --text-primary:    #e8e8f0;
+  --text-secondary:  #9a9ab8;
+  --text-tertiary:   #8d8db0;
+  --text-disabled:   #717195;
+  --text-inverse:    #0e0e1b;
+  --text-link:       #a78bfa;
+  --text-link-hover: #c4b5fd;
+  --on-accent:       #ffffff;
+  --on-danger:       #2a0808;
+  --on-success:      #052215;
+  --on-warning:      #251a00;
+  --on-media:        #ffffff;
+  --on-media-muted:  #d9d9e6;
+
+  /* ---- Accent ---- */
+  --accent:          #7c3aed;
+  --accent-hover:    #8b5cf6;
+  --accent-pressed:  #6d28d9;
+  --accent-subtle:   rgba(124,58,237,.16);
+  --accent-muted:    rgba(124,58,237,.26);
+  --accent-glow:     rgba(124,58,237,.35);
+  --accent-rgb:      124,58,237;
+  --accent-2:        #5eead4;
+  --accent-2-subtle: rgba(94,234,212,.12);
+
+  /* ---- Call to action ---- */
+  --cta:               #7c3aed;
+  --cta-hover:         #8b5cf6;
+  --cta-pressed:       #6d28d9;
+  --on-cta:            #ffffff;
+  --cta-shadow:        0 6px 20px rgba(124,58,237,.28);
+  --cta-shadow-hover:  0 10px 28px rgba(124,58,237,.38);
+  --highlight:         #fcd34d;
+  --highlight-subtle:  rgba(252,211,77,.12);
+  --on-highlight:      #251a00;
+
+  /* ---- Lines ---- */
+  --border-subtle:      #21213b;
+  --border:             #292945;
+  --border-strong:      #38385c;
+  --divider:            #21213b;
+  --focus-ring:         #a78bfa;
+  --focus-ring-width:   2px;
+  --focus-ring-offset:  2px;
+  --glass-stroke:        rgba(255,255,255,.08);
+  --glass-stroke-strong: rgba(255,255,255,.16);
+
+  /* ---- Status ---- */
+  --success:         #34d399;
+  --success-hover:   #5fe0b0;
+  --success-subtle:  rgba(52,211,153,.12);
+  --success-text:    #34d399;
+  --success-border:  rgba(52,211,153,.38);
+
+  --warning:         #fbbf24;
+  --warning-hover:   #fcd34d;
+  --warning-subtle:  rgba(251,191,36,.12);
+  --warning-text:    #fbbf24;
+  --warning-border:  rgba(251,191,36,.38);
+
+  --danger:          #f87171;
+  --danger-hover:    #fca5a5;
+  --danger-subtle:   rgba(248,113,113,.12);
+  --danger-text:     #f87171;
+  --danger-border:   rgba(248,113,113,.38);
+
+  --info:            #60a5fa;
+  --info-hover:      #93c5fd;
+  --info-subtle:     rgba(96,165,250,.12);
+  --info-text:       #60a5fa;
+  --info-border:     rgba(96,165,250,.38);
+
+  --live:            #4ade80;
+  --live-hover:      #86efac;
+  --live-subtle:     rgba(74,222,128,.14);
+  --live-text:       #4ade80;
+  --live-border:     rgba(74,222,128,.40);
+
+  --idle:            #fbbf24;
+  --idle-hover:      #fcd34d;
+  --idle-subtle:     rgba(251,191,36,.12);
+  --idle-text:       #fbbf24;
+  --idle-border:     rgba(251,191,36,.34);
+
+  --offline:         #6b6b8a;
+  --offline-hover:   #8585a6;
+  --offline-subtle:  rgba(107,107,138,0.17);
+  --offline-text:    #9a9ab8;
+  --offline-border:  rgba(107,107,138,.40);
+
+  --heartbeat:        #f472b6;
+  --heartbeat-hover:  #f9a8d4;
+  --heartbeat-subtle: rgba(244,114,182,.12);
+  --heartbeat-text:   #f472b6;
+  --heartbeat-border: rgba(244,114,182,.38);
+
+  /* Fills for the five statuses whose --on-* is not shared with the text
+     block. Every status fill in this palette is light, so its label is
+     near-black; --offline is the one dark fill and takes white. */
+  --on-info:      #041022;
+  --on-live:      #052210;
+  --on-idle:      #251a00;
+  --on-offline:   #ffffff;
+  --on-heartbeat: #2a0c1c;
+
+  /* ---- Overlays ---- */
+  --scrim:         rgba(6,6,14,.66);
+  --scrim-strong:  rgba(4,4,10,.88);
+  --scrim-light:   rgba(6,6,14,.44);
+  --scrim-media:   linear-gradient(to top, rgba(8,8,15,.88), rgba(8,8,15,0));
+  --backdrop-blur: 14px;
+
+  /* ---- Chat and content ---- */
+  --bubble-user-bg:        #3b2b6e;
+  --bubble-user-text:      #e8e8f0;
+  --bubble-user-border:    #46337f;
+  --bubble-assistant-bg:   #1d1d39;
+  --bubble-assistant-text: #e8e8f0;
+  --quote-bar:             #5eead4;
+  --mark-bg:               rgba(251,191,36,.30);
+  --md-bold:               #ffffff;
+  --md-italic:             #fcd34d;
+  --md-bolditalic:         #fde68a;
+  --md-bolditalic-glow:    rgba(253,230,138,.40);
+  --rp-speech:             #e8e8f0;
+  --rp-action:             #9a9ab8;
+  --rp-thought:            #a5f3ea;
+  --rp-whisper:            #8d8db0;
+  --rp-ooc:                #7d7da0;
+  --rp-shout:              #ff9a6c;
+  --rp-shout-glow:         rgba(255,154,108,.45);
+  --rp-critical:           #ff7a90;
+  --rp-critical-glow:      rgba(255,122,144,.45);
+  --diff-add-bg:           rgba(52,211,153,.14);
+  --diff-add-text:         #7ee7bc;
+  --diff-remove-bg:        rgba(248,113,113,.14);
+  --diff-remove-text:      #ffa0a0;
+
+  /* ---- Syntax ---- */
+  --syn-fg:          #e2e2ef;
+  --syn-bg:          #0b0b16;
+  --syn-comment:     #7b7b9c;
+  --syn-keyword:     #c4a3ff;
+  --syn-string:      #86e8c8;
+  --syn-number:      #ffc46b;
+  --syn-function:    #8ec2ff;
+  --syn-title:       #8ec2ff;
+  --syn-type:        #6fe3d4;
+  --syn-variable:    #f0a8c8;
+  --syn-attr:        #ffd38a;
+  --syn-tag:         #c4a3ff;
+  --syn-builtin:     #6fe3d4;
+  --syn-literal:     #ffc46b;
+  --syn-meta:        #9a9ab8;
+  --syn-operator:    #d0c2f5;
+  --syn-punctuation: #b6b6cf;
+  --syn-deletion:    #ffa0a0;
+  --syn-addition:    #7ee7bc;
+
+  /* ---- Categorical / data ---- */
+  --cat-1:  #a78bfa;
+  --cat-2:  #5eead4;
+  --cat-3:  #fcd34d;
+  --cat-4:  #f472b6;
+  --cat-5:  #60a5fa;
+  --cat-6:  #fb923c;
+  --cat-7:  #4ade80;
+  --cat-8:  #c4b5fd;
+  --cat-9:  #67e8f9;
+  --cat-10: #facc15;
+  --cat-11: #f0abfc;
+  --cat-12: #93c5fd;
+
+  --kind-transfer:     var(--cat-5);
+  --kind-announcement: var(--cat-3);
+  --kind-escalation:   var(--cat-6);
+  --kind-modification: var(--cat-1);
+  --kind-thread:       var(--cat-9);
+  --kind-meeting:      var(--cat-2);
+  --kind-checkin:      var(--cat-7);
+  --kind-schedule:     var(--cat-12);
+  --kind-scene:        var(--cat-11);
+
+  --chart-grid: rgba(255,255,255,.07);
+  --chart-axis: #5c5c7d;
+
+  /* ---- Canvas ---- */
+  --canvas-mask:    rgba(6,6,14,.72);
+  --canvas-handle:  #a78bfa;
+  --canvas-guide:   rgba(167,139,250,.55);
+  --canvas-outline: #e8e8f0;
+
+  /* ---- Type families ---- */
+  --font-sans:    'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-serif:   var(--font-sans);
+  --font-mono:    'JetBrains Mono', 'Fira Code', ui-monospace, SFMono-Regular, Menlo, monospace;
+  --font-display: var(--font-sans);
+
+  /* ---- Elevation ---- */
+  --shadow-1: 0 1px 2px rgba(0,0,0,.30);
+  --shadow-2: 0 6px 20px rgba(0,0,0,.40);
+  --shadow-3: 0 18px 50px rgba(0,0,0,.55);
+  --shadow-4: 0 32px 80px rgba(0,0,0,.66);
+  --shadow-glow:  0 0 0 1px rgba(124,58,237,.30), 0 8px 30px rgba(124,58,237,.28);
+  --shadow-inset: inset 0 1px 0 rgba(255,255,255,.05);
+
+  /* ---- Browser ---- */
+  --selection-bg:      rgba(124,58,237,.40);
+  --selection-text:    #ffffff;
+  --scrollbar-track:   transparent;
+  --scrollbar-thumb:   #33335a;
+  --scrollbar-hover:   #45457a;
+
+  /* Control-boundary fill. --surface-4 is an elevation step and can never be
+     3:1 from its neighbouring surface while still reading as subtle elevation,
+     so the slider track / toggle off-track role gets its own token.
+     3.06:1 on surface-2, 3.59:1 on surface-0. */
+  --control-track: #696981;
+}
+
+/* ==========================================================================
+   B. THEME-INVARIANT TOKENS
+   Themes may override radii, control heights and shell metrics. Themes NEVER
+   override --z-*.
+   ========================================================================== */
+
+:root {
+  /* Geometry */
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 20px;
+  --radius-pill: 999px;
+
+  --space-1: 4px;  --space-2: 8px;  --space-3: 12px; --space-4: 16px;
+  --space-5: 24px; --space-6: 32px; --space-7: 48px; --space-8: 64px;
+
+  --stroke-hairline: 1px;
+  --stroke-default:  1px;
+
+  --control-h-sm: 28px;
+  --control-h-md: 36px;
+  --control-h-lg: 44px;
+  --touch-target: 44px;
+
+  --sidebar-w:   320px;
+  --header-h:    56px;
+  --rail-w:      72px;
+  --bar-h:       60px;
+  --content-max: 1200px;
+
+  /* Component tokens (defaults derived from layer 2) */
+  --slider-track-h: 4px;
+  --slider-thumb-d: 16px;
+  --slider-color:   var(--accent);
+  --toggle-w:       40px;
+  --toggle-h:       22px;
+  --chip-color:     var(--accent);
+
+  /* Type scale */
+  --fs-micro:   11px;
+  --fs-xs:      12px;
+  --fs-sm:      13px;
+  --fs-base:    15px;
+  --fs-md:      17px;
+  --fs-lg:      20px;
+  --fs-xl:      24px;
+  --fs-2xl:     30px;
+  --fs-3xl:     38px;
+  --fs-display: 52px;
+
+  --fw-regular:  400;
+  --fw-medium:   500;
+  --fw-semibold: 600;
+  --fw-bold:     700;
+
+  --lh-tight:   1.15;
+  --lh-snug:    1.3;
+  --lh-base:    1.55;
+  --lh-relaxed: 1.75;
+
+  --ls-tight: -0.02em;
+  --ls-snug:  -0.01em;
+  --ls-base:  0;
+  --ls-label: 0.18em;
+  --ls-mono:  0.01em;
+
+  /* Motion */
+  --ease-standard: cubic-bezier(.4,0,.2,1);
+  --ease-out:      cubic-bezier(.22,1,.36,1);
+  --ease-in:       cubic-bezier(.4,0,1,1);
+  --ease-spring:   cubic-bezier(.34,1.56,.64,1);
+
+  --dur-instant:    80ms;
+  --dur-fast:       120ms;
+  --dur-base:       200ms;
+  --dur-slow:       320ms;
+  --dur-deliberate: 520ms;
+
+  /* Layers — fixed */
+  --z-base:     1;
+  --z-sticky:   40;
+  --z-banner:   50;
+  --z-header:   100;
+  --z-nav:      200;
+  --z-tooltip:  200;
+  --z-drawer:   500;
+  --z-modal:    1000;
+  --z-lightbox: 2000;
+  --z-popover:  9000;
+  --z-toast:    9999;
+  --z-menu:     100002;
+}
+
+
+/* theme-midnight-gold.css — CORE · opt-out: none
+   Ground: oled · family: midnight-gold · color-scheme: dark
+   theme-color: #000000 · fonts: Inter, JetBrains Mono (shared with base)
+   Extracted from the project's existing [data-palette="midnight-gold"] block.
+   Values marked (D) are derived from this theme's own palette. */
+
+[data-palette="midnight-gold"] {
+  color-scheme: dark;
+
+  --surface-void:    #000000;
+  --surface-0:       #000000;
+  --surface-1:       #060504;
+  --surface-2:       #0d0a06;
+  --surface-3:       #120e08;
+  --surface-4:       #171209;
+  --surface-sunken:  #030201;
+  --surface-overlay: #0d0a06;   /* D — opaque: glass bands on true black */
+  --glass-1:         #0d0a06;   /* D */
+  --glass-2:         #120e08;   /* D */
+  --glass-3:         #060504;   /* D */
+  --glass-highlight: rgba(255,255,255,.045);  /* D */
+  --code-bg:         #030201;
+
+  --text-primary:    #f1e6cf;
+  --text-secondary:  #b7a883;
+  --text-tertiary:   #96896a;
+  --text-disabled:   #6b6250;  /* D */
+  --text-inverse:    #000000;  /* D */
+  --text-link:       #e3bf5a;
+  --text-link-hover: #f2d585;  /* D */
+  --on-accent:       #ffffff;
+  --on-danger:       #2a0808;  /* D */
+  --on-success:      #052215;  /* D */
+  --on-warning:      #251a00;  /* D */
+  --on-media:        #ffffff;  /* D */
+  --on-media-muted:  #e2d8c4;  /* D */
+
+  --accent:          #7a5c12;
+  --accent-hover:    #916d15;
+  --accent-pressed:  #5f470d;  /* D */
+  --accent-subtle:   rgba(122,92,18,.20);  /* D */
+  --accent-muted:    rgba(122,92,18,.34);  /* D */
+  --accent-glow:     rgba(227,191,90,.30); /* D */
+  --accent-rgb:      122,92,18;
+  --accent-2:        #7fc4b8;
+  --accent-2-subtle: rgba(127,196,184,.12); /* D */
+
+  --cta:              #7a5c12;  /* D — aliases accent */
+  --cta-hover:        #916d15;  /* D */
+  --cta-pressed:      #5f470d;  /* D */
+  --on-cta:           #ffffff;  /* D */
+  --cta-shadow:       0 6px 20px rgba(0,0,0,.55);           /* D */
+  --cta-shadow-hover: 0 10px 28px rgba(227,191,90,.18);     /* D */
+  --highlight:        #e3bf5a;
+  --highlight-subtle: rgba(227,191,90,.12);  /* D */
+  --on-highlight:     #241c05;  /* D */
+
+  --border-subtle:       #2a2419;  /* D */
+  --border:              #474133;
+  --border-strong:       #736952;
+  --divider:             #2a2419;  /* D */
+  --focus-ring:          #e3bf5a;
+  --glass-stroke:        rgba(227,191,90,.14);  /* D */
+  --glass-stroke-strong: rgba(227,191,90,.28);  /* D */
+
+  --success: #34d399; --success-hover: #5fe0b0;
+  --success-subtle: rgba(52,211,153,.12); --success-text: #34d399;
+  --success-border: rgba(52,211,153,.36);
+  --warning: #fbbf24; --warning-hover: #fcd34d;
+  --warning-subtle: rgba(251,191,36,.12); --warning-text: #fbbf24;
+  --warning-border: rgba(251,191,36,.36);
+  --danger: #f87171; --danger-hover: #fca5a5;
+  --danger-subtle: rgba(248,113,113,.12); --danger-text: #f87171;
+  --danger-border: rgba(248,113,113,.36);
+  --info: #9fc7d8; --info-hover: #bcdbe8;
+  --info-subtle: rgba(159,199,216,.12); --info-text: #9fc7d8;
+  --info-border: rgba(159,199,216,.36);
+  --live: #4ade80; --live-hover: #86efac;
+  --live-subtle: rgba(74,222,128,.14); --live-text: #4ade80;
+  --live-border: rgba(74,222,128,.38);
+  --idle: #e3bf5a; --idle-hover: #f2d585;
+  --idle-subtle: rgba(227,191,90,.12); --idle-text: #e3bf5a;
+  --idle-border: rgba(227,191,90,.34);
+  --offline: #6b6250; --offline-hover: #8a806a;
+  --offline-subtle: rgba(107,98,80,.20); --offline-text: #96896a;
+  --offline-border: rgba(107,98,80,.44);
+  --heartbeat: #e8a8c8; --heartbeat-hover: #f2c4da;
+  --heartbeat-subtle: rgba(232,168,200,.12); --heartbeat-text: #e8a8c8;
+  --heartbeat-border: rgba(232,168,200,.36);
+  --on-info: #041017; --on-live: #052210; --on-idle: #241c05;   /* D */
+  --on-offline: #ffffff; --on-heartbeat: #2a0c1c;               /* D */
+
+  --scrim:        rgba(0,0,0,.72);  /* D */
+  --scrim-strong: rgba(0,0,0,.92);  /* D */
+  --scrim-light:  rgba(0,0,0,.50);  /* D */
+  --scrim-media:  linear-gradient(to top, rgba(0,0,0,.90), rgba(0,0,0,0)); /* D */
+
+  --bubble-user-bg:        #3e2f0c;
+  --bubble-user-text:      #f1e6cf;  /* D */
+  --bubble-user-border:    #55410f;  /* D */
+  --bubble-assistant-bg:   #000000;
+  --bubble-assistant-text: #f1e6cf;  /* D */
+  --quote-bar:             #7fc4b8;
+  --mark-bg:               rgba(227,191,90,.30);
+  --md-bold:               #fff6df;
+  --md-italic:             #e3bf5a;
+  --md-bolditalic:         #ffe9b0;  /* D */
+  --md-bolditalic-glow:    rgba(255,233,176,.40);  /* D */
+  --rp-speech:  #f1e6cf;  /* D */
+  --rp-action:  #b7a883;  /* D */
+  --rp-thought: #b9e6dd;  /* D */
+  --rp-whisper: #96896a;  /* D */
+  --rp-ooc:     #857a5e;  /* D */
+  --rp-shout:   #ffab6a;  /* D */
+  --rp-shout-glow: rgba(255,171,106,.45);  /* D */
+  --rp-critical: #ff8a9c;  /* D */
+  --rp-critical-glow: rgba(255,138,156,.45);  /* D */
+  --diff-add-bg: rgba(52,211,153,.14); --diff-add-text: #7ee7bc;      /* D */
+  --diff-remove-bg: rgba(248,113,113,.14); --diff-remove-text: #ffa0a0; /* D */
+
+  /* Syntax — D, derived on --code-bg */
+  --syn-fg: #e8dcc2;      --syn-bg: #030201;
+  --syn-comment: #8a7f66; --syn-keyword: #d9a84c; --syn-string: #a8c98a;
+  --syn-number: #e8c06a;  --syn-function: #9fc7d8; --syn-title: #9fc7d8;
+  --syn-type: #8ec9b8;    --syn-variable: #dfae8a; --syn-attr: #e3c987;
+  --syn-tag: #d9a84c;     --syn-builtin: #8ec9b8;  --syn-literal: #e8c06a;
+  --syn-meta: #9b9078;    --syn-operator: #cbbd9c; --syn-punctuation: #b9ad92;
+  --syn-deletion: #ffa0a0; --syn-addition: #7ee7bc;
+
+  /* Categorical — D */
+  --cat-1: #e3bf5a; --cat-2: #8ec9b8; --cat-3: #d99a3c; --cat-4: #e09a9a;
+  --cat-5: #9fc7d8; --cat-6: #c9a3e0; --cat-7: #a8c98a; --cat-8: #f0d9a0;
+  --cat-9: #7fd4c8; --cat-10: #e8c06a; --cat-11: #e8a8c8; --cat-12: #b8c8e0;
+  --chart-grid: rgba(227,191,90,.10);  /* D */
+  --chart-axis: #6b6250;               /* D */
+
+  --canvas-mask:    rgba(0,0,0,.76);        /* D */
+  --canvas-handle:  #e3bf5a;                /* D */
+  --canvas-guide:   rgba(227,191,90,.55);   /* D */
+  --canvas-outline: #f1e6cf;                /* D */
+
+  --shadow-1: 0 1px 2px rgba(0,0,0,.40);
+  --shadow-2: 0 6px 20px rgba(0,0,0,.50);
+  --shadow-3: 0 18px 50px rgba(0,0,0,.65);
+  --shadow-4: 0 32px 80px rgba(0,0,0,.78);  /* D */
+  --shadow-glow:  0 0 0 1px rgba(227,191,90,.22), 0 8px 30px rgba(0,0,0,.6); /* D */
+  --shadow-inset: inset 0 1px 0 rgba(255,255,255,.04);  /* D */
+
+  --selection-bg:    rgba(227,191,90,.32);  /* D */
+  --selection-text:  #fff6df;               /* D */
+  --scrollbar-track: transparent;
+  --scrollbar-thumb: #3a3325;               /* D */
+  --scrollbar-hover: #55492f;               /* D */
+  /* Control-boundary fill. --surface-4 is an elevation step and can never be
+     3:1 from its neighbouring surface while still reading as subtle elevation,
+     so the slider track / toggle off-track role gets its own token.
+     3.06:1 on surface-2, 3.25:1 on surface-0. */
+  --control-track: #615e58;
+
+}
+
+/* theme-glacier.css — CORE
+   Ground: oled · family: glacier · color-scheme: dark · theme-color: #000000
+   Extracted from the project's existing [data-palette="glacier"] block.
+   (D) = derived from this theme's own palette. */
+
+[data-palette="glacier"] {
+  color-scheme: dark;
+
+  --surface-void:    #000000;
+  --surface-0:       #000000;
+  --surface-1:       #060b0f;
+  --surface-2:       #0d161c;
+  --surface-3:       #121c23;
+  --surface-4:       #172228;
+  --surface-sunken:  #030608;
+  --surface-overlay: #0d161c;  /* D — opaque: glass bands on true black */
+  --glass-1:         #0d161c;  /* D */
+  --glass-2:         #121c23;  /* D */
+  --glass-3:         #060b0f;  /* D */
+  --glass-highlight: rgba(255,255,255,.05);  /* D */
+  --code-bg:         #030608;
+
+  --text-primary:    #dcedf4;
+  --text-secondary:  #9fc0cc;
+  --text-tertiary:   #7fa3b0;
+  --text-disabled:   #5a747f;  /* D */
+  --text-inverse:    #000000;  /* D */
+  --text-link:       #7fe0f2;
+  --text-link-hover: #b3eef9;  /* D */
+  --on-accent:       #ffffff;
+  --on-danger:       #2a0808;  /* D */
+  --on-success:      #052215;  /* D */
+  --on-warning:      #251a00;  /* D */
+  --on-media:        #ffffff;  /* D */
+  --on-media-muted:  #cfe4ed;  /* D */
+
+  --accent:          #185e7a;
+  --accent-hover:    #206b88;
+  --accent-pressed:  #12495f;  /* D */
+  --accent-subtle:   rgba(24,94,122,.24);  /* D */
+  --accent-muted:    rgba(24,94,122,.40);  /* D */
+  --accent-glow:     rgba(127,224,242,.28);/* D */
+  --accent-rgb:      24,94,122;
+  --accent-2:        #a5b4f5;
+  --accent-2-subtle: rgba(165,180,245,.12);/* D */
+
+  --cta:              #185e7a;  /* D — aliases accent */
+  --cta-hover:        #206b88;  /* D */
+  --cta-pressed:      #12495f;  /* D */
+  --on-cta:           #ffffff;  /* D */
+  --cta-shadow:       0 6px 20px rgba(0,0,0,.55);        /* D */
+  --cta-shadow-hover: 0 10px 28px rgba(127,224,242,.18); /* D */
+  --highlight:        #7fe0f2;
+  --highlight-subtle: rgba(127,224,242,.12);  /* D */
+  --on-highlight:     #021b21;  /* D */
+
+  --border-subtle:       #1c262b;  /* D */
+  --border:              #33424a;
+  --border-strong:       #5c7480;
+  --divider:             #1c262b;  /* D */
+  --focus-ring:          #7fe0f2;
+  --glass-stroke:        rgba(127,224,242,.14);  /* D */
+  --glass-stroke-strong: rgba(127,224,242,.28);  /* D */
+
+  --success: #34d399; --success-hover: #5fe0b0;
+  --success-subtle: rgba(52,211,153,.12); --success-text: #5fd3b0;
+  --success-border: rgba(52,211,153,.36);
+  --warning: #fbbf24; --warning-hover: #fcd34d;
+  --warning-subtle: rgba(251,191,36,.12); --warning-text: #ffca28;
+  --warning-border: rgba(251,191,36,.36);
+  --danger: #f87171; --danger-hover: #fca5a5;
+  --danger-subtle: rgba(248,113,113,.12); --danger-text: #ff8a80;
+  --danger-border: rgba(248,113,113,.36);
+  --info: #8fd4ff; --info-hover: #b6e3ff;
+  --info-subtle: rgba(143,212,255,.12); --info-text: #8fd4ff;
+  --info-border: rgba(143,212,255,.36);
+  --live: #6fe0c8; --live-hover: #9ceddc;
+  --live-subtle: rgba(111,224,200,.14); --live-text: #6fe0c8;
+  --live-border: rgba(111,224,200,.38);
+  --idle: #ffca28; --idle-hover: #ffd75c;
+  --idle-subtle: rgba(255,202,40,.12); --idle-text: #ffca28;
+  --idle-border: rgba(255,202,40,.34);
+  --offline: #5a747f; --offline-hover: #74909c;
+  --offline-subtle: rgba(90,116,127,.20); --offline-text: #7fa3b0;
+  --offline-border: rgba(90,116,127,.44);
+  --heartbeat: #e0a8d8; --heartbeat-hover: #eec4e8;
+  --heartbeat-subtle: rgba(224,168,216,.12); --heartbeat-text: #e0a8d8;
+  --heartbeat-border: rgba(224,168,216,.36);
+  --on-info: #021520; --on-live: #02211b; --on-idle: #241c00;  /* D */
+  --on-offline: #ffffff; --on-heartbeat: #2a0c24;              /* D */
+
+  --scrim:        rgba(0,0,0,.72);  /* D */
+  --scrim-strong: rgba(0,0,0,.92);  /* D */
+  --scrim-light:  rgba(0,0,0,.50);  /* D */
+  --scrim-media:  linear-gradient(to top, rgba(0,0,0,.90), rgba(0,0,0,0)); /* D */
+
+  --bubble-user-bg:        #153f51;
+  --bubble-user-text:      #dcedf4;  /* D */
+  --bubble-user-border:    #1d5468;  /* D */
+  --bubble-assistant-bg:   #0d161c;
+  --bubble-assistant-text: #dcedf4;  /* D */
+  --quote-bar:             #7fe0f2;
+  --mark-bg:               rgba(127,224,242,.22);
+  --md-bold:               #f2fbff;
+  --md-italic:             #a5b4f5;
+  --md-bolditalic:         #cfd6ff;  /* D */
+  --md-bolditalic-glow:    rgba(207,214,255,.40);  /* D */
+  --rp-speech:  #dcedf4;  /* D */
+  --rp-action:  #9fc0cc;  /* D */
+  --rp-thought: #bdf1fa;  /* D */
+  --rp-whisper: #7fa3b0;  /* D */
+  --rp-ooc:     #6d909d;  /* D */
+  --rp-shout:   #ffa876;  /* D */
+  --rp-shout-glow: rgba(255,168,118,.45);  /* D */
+  --rp-critical: #ff8a9c;  /* D */
+  --rp-critical-glow: rgba(255,138,156,.45);  /* D */
+  --diff-add-bg: rgba(52,211,153,.14); --diff-add-text: #7ee7bc;       /* D */
+  --diff-remove-bg: rgba(248,113,113,.14); --diff-remove-text: #ffa0a0; /* D */
+
+  /* Syntax — D */
+  --syn-fg: #d8eaf2;      --syn-bg: #030608;
+  --syn-comment: #7891a0; --syn-keyword: #8fd4ff; --syn-string: #7fe0c8;
+  --syn-number: #a8c8ff;  --syn-function: #7fe0f2; --syn-title: #7fe0f2;
+  --syn-type: #9ad8e8;    --syn-variable: #b5a8f5; --syn-attr: #a8dcf0;
+  --syn-tag: #8fd4ff;     --syn-builtin: #9ad8e8;  --syn-literal: #a8c8ff;
+  --syn-meta: #8ba3af;    --syn-operator: #c2d8e2; --syn-punctuation: #aec4d0;
+  --syn-deletion: #ff9a95; --syn-addition: #6fe0b0;
+
+  /* Categorical — D */
+  --cat-1: #7fe0f2; --cat-2: #a5b4f5; --cat-3: #6fd8b0; --cat-4: #8fb8ff;
+  --cat-5: #b5a8f5; --cat-6: #7fc4e8; --cat-7: #9ad8e8; --cat-8: #c8e8f4;
+  --cat-9: #6fe0c8; --cat-10: #a8c8ff; --cat-11: #e0a8d8; --cat-12: #ffca28;
+  --chart-grid: rgba(127,224,242,.10);  /* D */
+  --chart-axis: #5a747f;                /* D */
+
+  --canvas-mask:    rgba(0,0,0,.76);       /* D */
+  --canvas-handle:  #7fe0f2;               /* D */
+  --canvas-guide:   rgba(127,224,242,.55); /* D */
+  --canvas-outline: #f2fbff;               /* D */
+
+  --shadow-1: 0 1px 2px rgba(0,0,0,.40);
+  --shadow-2: 0 6px 20px rgba(0,0,0,.50);
+  --shadow-3: 0 18px 50px rgba(0,0,0,.65);
+  --shadow-4: 0 32px 80px rgba(0,0,0,.78);  /* D */
+  --shadow-glow:  0 0 0 1px rgba(127,224,242,.20), 0 8px 30px rgba(0,0,0,.6); /* D */
+  --shadow-inset: inset 0 1px 0 rgba(255,255,255,.045);  /* D */
+
+  --selection-bg:    rgba(127,224,242,.28);  /* D */
+  --selection-text:  #f2fbff;                /* D */
+  --scrollbar-track: transparent;
+  --scrollbar-thumb: #25353d;                /* D */
+  --scrollbar-hover: #3a525d;                /* D */
+  /* Control-boundary fill. --surface-4 is an elevation step and can never be
+     3:1 from its neighbouring surface while still reading as subtle elevation,
+     so the slider track / toggle off-track role gets its own token.
+     3.17:1 on surface-2, 3.64:1 on surface-0. */
+  --control-track: #5f676b;
+
+}
+
+/* theme-forest.css — CORE
+   Ground: dark (near-black, warm) · family: forest · color-scheme: dark
+   theme-color: #0a0806
+   Extracted from the project's existing [data-palette="forest"] block.
+   (D) = derived from this theme's own palette. */
+
+[data-palette="forest"] {
+  color-scheme: dark;
+
+  --surface-void:    #050403;
+  --surface-0:       #0a0806;
+  --surface-1:       #0f0c09;
+  --surface-2:       #150f0a;
+  --surface-3:       #1a130c;
+  --surface-4:       #211a10;
+  --surface-sunken:  #060503;
+  --surface-overlay: #1a130c;  /* D */
+  --glass-1:         rgba(21,15,10,.78);  /* D */
+  --glass-2:         rgba(26,19,12,.88);  /* D */
+  --glass-3:         rgba(10,8,6,.94);    /* D */
+  --glass-highlight: rgba(255,255,255,.045);  /* D */
+  --code-bg:         #060503;
+
+  --text-primary:    #ece3d2;
+  --text-secondary:  #b8a888;
+  --text-tertiary:   #9b8b6c;
+  --text-disabled:   #72674e;  /* D */
+  --text-inverse:    #0a0806;  /* D */
+  --text-link:       #d68a42;
+  --text-link-hover: #e8a668;  /* D */
+  --on-accent:       #ffffff;
+  --on-danger:       #2a0808;  /* D */
+  --on-success:      #052215;  /* D */
+  --on-warning:      #251a00;  /* D */
+  --on-media:        #ffffff;  /* D */
+  --on-media-muted:  #ded4c0;  /* D */
+
+  --accent:          #5e3a1e;
+  --accent-hover:    #6f4626;
+  --accent-pressed:  #482c15;  /* D */
+  --accent-subtle:   rgba(94,58,30,.30);  /* D */
+  --accent-muted:    rgba(94,58,30,.48);  /* D */
+  --accent-glow:     rgba(214,138,66,.26);/* D */
+  --accent-rgb:      94,58,30;
+  --accent-2:        #8fae6e;
+  --accent-2-subtle: rgba(143,174,110,.12);/* D */
+
+  --cta:              #5e3a1e;  /* D — aliases accent */
+  --cta-hover:        #6f4626;  /* D */
+  --cta-pressed:      #482c15;  /* D */
+  --on-cta:           #ffffff;  /* D */
+  --cta-shadow:       0 6px 20px rgba(0,0,0,.55);        /* D */
+  --cta-shadow-hover: 0 10px 28px rgba(214,138,66,.18);  /* D */
+  --highlight:        #e0a52e;
+  --highlight-subtle: rgba(224,165,46,.12);  /* D */
+  --on-highlight:     #241700;  /* D */
+
+  --border-subtle:       #221c14;  /* D */
+  --border:              #3c4536;
+  --border-strong:       #64715a;
+  --divider:             #221c14;  /* D */
+  --focus-ring:          #d68a42;
+  --glass-stroke:        rgba(214,138,66,.14);  /* D */
+  --glass-stroke-strong: rgba(214,138,66,.28);  /* D */
+
+  --success: #34d399; --success-hover: #5fe0b0;
+  --success-subtle: rgba(52,211,153,.12); --success-text: #5fcf98;
+  --success-border: rgba(52,211,153,.36);
+  --warning: #fbbf24; --warning-hover: #fcd34d;
+  --warning-subtle: rgba(251,191,36,.12); --warning-text: #e0a52e;
+  --warning-border: rgba(251,191,36,.36);
+  --danger: #f87171; --danger-hover: #fca5a5;
+  --danger-subtle: rgba(248,113,113,.12); --danger-text: #ff8f7f;
+  --danger-border: rgba(248,113,113,.36);
+  --info: #93c4a6; --info-hover: #b4d8c2;
+  --info-subtle: rgba(147,196,166,.12); --info-text: #93c4a6;
+  --info-border: rgba(147,196,166,.36);
+  --live: #a8c47e; --live-hover: #c1d89e;
+  --live-subtle: rgba(168,196,126,.14); --live-text: #a8c47e;
+  --live-border: rgba(168,196,126,.38);
+  --idle: #e0a52e; --idle-hover: #eeba55;
+  --idle-subtle: rgba(224,165,46,.12); --idle-text: #e0a52e;
+  --idle-border: rgba(224,165,46,.34);
+  --offline: #6e6249; --offline-hover: #8c7e60;
+  --offline-subtle: rgba(110,98,73,.20); --offline-text: #9b8b6c;
+  --offline-border: rgba(110,98,73,.44);
+  --heartbeat: #d8a0b0; --heartbeat-hover: #e7bfca;
+  --heartbeat-subtle: rgba(216,160,176,.12); --heartbeat-text: #d8a0b0;
+  --heartbeat-border: rgba(216,160,176,.36);
+  --on-info: #04150d; --on-live: #10200a; --on-idle: #241700;  /* D */
+  --on-offline: #ffffff; --on-heartbeat: #2a0e15;              /* D */
+
+  --scrim:        rgba(5,4,3,.74);  /* D */
+  --scrim-strong: rgba(3,2,2,.92);  /* D */
+  --scrim-light:  rgba(5,4,3,.50);  /* D */
+  --scrim-media:  linear-gradient(to top, rgba(5,4,3,.90), rgba(5,4,3,0)); /* D */
+
+  --bubble-user-bg:        #4a2e19;
+  --bubble-user-text:      #ece3d2;  /* D */
+  --bubble-user-border:    #5f3b20;  /* D */
+  --bubble-assistant-bg:   #150f0a;
+  --bubble-assistant-text: #ece3d2;  /* D */
+  --quote-bar:             #8fae6e;
+  --mark-bg:               rgba(224,165,46,.28);
+  --md-bold:               #f5ecd8;
+  --md-italic:             #e0a52e;
+  --md-bolditalic:         #f2c76a;  /* D */
+  --md-bolditalic-glow:    rgba(242,199,106,.40);  /* D */
+  --rp-speech:  #ece3d2;  /* D */
+  --rp-action:  #b8a888;  /* D */
+  --rp-thought: #c3dba9;  /* D */
+  --rp-whisper: #9b8b6c;  /* D */
+  --rp-ooc:     #877a5c;  /* D */
+  --rp-shout:   #ff9f56;  /* D */
+  --rp-shout-glow: rgba(255,159,86,.45);  /* D */
+  --rp-critical: #ff8a84;  /* D */
+  --rp-critical-glow: rgba(255,138,132,.45);  /* D */
+  --diff-add-bg: rgba(52,211,153,.14); --diff-add-text: #86dba0;        /* D */
+  --diff-remove-bg: rgba(248,113,113,.14); --diff-remove-text: #ff9f92;  /* D */
+
+  /* Syntax — D */
+  --syn-fg: #e6dcc8;      --syn-bg: #060503;
+  --syn-comment: #857b62; --syn-keyword: #d99a3c; --syn-string: #a8c47e;
+  --syn-number: #e0b45c;  --syn-function: #93c4a6; --syn-title: #93c4a6;
+  --syn-type: #8fc48f;    --syn-variable: #d8a878; --syn-attr: #dcc07e;
+  --syn-tag: #d99a3c;     --syn-builtin: #8fc48f;  --syn-literal: #e0b45c;
+  --syn-meta: #97907c;    --syn-operator: #c8bc9e; --syn-punctuation: #b6ab8e;
+  --syn-deletion: #ff9f92; --syn-addition: #86dba0;
+
+  /* Categorical — D */
+  --cat-1: #d68a42; --cat-2: #8fae6e; --cat-3: #e0a52e; --cat-4: #d8a0b0;
+  --cat-5: #93c4a6; --cat-6: #d8a878; --cat-7: #a8c47e; --cat-8: #e8cf9a;
+  --cat-9: #7fbfae; --cat-10: #dfc07e; --cat-11: #c9a3d8; --cat-12: #a8b8c8;
+  --chart-grid: rgba(214,138,66,.10);  /* D */
+  --chart-axis: #6e6249;               /* D */
+
+  --canvas-mask:    rgba(5,4,3,.78);       /* D */
+  --canvas-handle:  #d68a42;               /* D */
+  --canvas-guide:   rgba(214,138,66,.55);  /* D */
+  --canvas-outline: #f5ecd8;               /* D */
+
+  --shadow-1: 0 1px 2px rgba(0,0,0,.40);
+  --shadow-2: 0 6px 20px rgba(0,0,0,.50);
+  --shadow-3: 0 18px 50px rgba(0,0,0,.65);
+  --shadow-4: 0 32px 80px rgba(0,0,0,.78);  /* D */
+  --shadow-glow:  0 0 0 1px rgba(214,138,66,.20), 0 8px 30px rgba(0,0,0,.6); /* D */
+  --shadow-inset: inset 0 1px 0 rgba(255,255,255,.04);  /* D */
+
+  --selection-bg:    rgba(214,138,66,.30);  /* D */
+  --selection-text:  #f5ecd8;               /* D */
+  --scrollbar-track: transparent;
+  --scrollbar-thumb: #33291d;               /* D */
+  --scrollbar-hover: #4d3d28;               /* D */
+  /* Control-boundary fill. --surface-4 is an elevation step and can never be
+     3:1 from its neighbouring surface while still reading as subtle elevation,
+     so the slider track / toggle off-track role gets its own token.
+     3.10:1 on surface-2, 3.26:1 on surface-0. */
+  --control-track: #66615a;
+
+}
+
+/* theme-paper.css — CORE
+   Ground: light (warm) · family: paper · color-scheme: light
+   theme-color: #e6d2a8
+   Extracted from the project's existing [data-palette="paper"] block.
+   (D) = derived from this theme's own palette.
+
+   Type rule: Paper is the one core theme that uses a real serif. --font-serif
+   is a Charter/Georgia stack and is the intended family for long-form prose
+   and blockquotes here; headings stay on --font-display (sans). */
+
+/* Status fills: Paper's two grounds (#e6d2a8 page, #efdfb8 card) are only
+   Δ16 apart, and its status inks are extracted core values, so no single fill
+   can be hue-visible, Δ-separated from BOTH grounds, and clear 4.5:1 for dark
+   ink at once. The fill here is therefore a modest hue wash and is NOT the
+   role signal — Paper's status components always render --{status}-border,
+   which measures ≥3:1, as the carrier. See the contrast report. */
+[data-palette="paper"] {
+  color-scheme: light;
+
+  --surface-void:    #c9a968;  /* D */
+  --surface-0:       #e6d2a8;
+  --surface-1:       #dcc491;
+  --surface-2:       #efdfb8;
+  --surface-3:       #d4b87e;
+  --surface-4:       #c9a968;  /* D */
+  --surface-sunken:  #f4e8c8;  /* D */
+  --surface-overlay: #efdfb8;
+  --glass-1:         rgba(239,223,184,.82);  /* D */
+  --glass-2:         rgba(239,223,184,.92);  /* D */
+  --glass-3:         rgba(230,210,168,.95);  /* D */
+  --glass-highlight: rgba(255,255,255,.45);  /* D */
+  --code-bg:         #2a1e10;  /* D — code blocks stay dark in every theme */
+
+  --text-primary:    #2e2013;
+  --text-secondary:  #5a4429;
+  --text-tertiary:   #4f3e26;  /* D — see report: extracted --text-muted
+                                  (#5b472b) duplicated --text-secondary */
+  --text-disabled:   #69573d;  /* D */
+  --text-inverse:    #f4e8c8;  /* D */
+  --text-link:       #8a1f18;
+  --text-link-hover: #6b1611;  /* D */
+  --on-accent:       #ffffff;
+  --on-danger:       #2a0808;  /* D */
+  --on-success:      #052215;  /* D */
+  --on-warning:      #251a00;  /* D */
+  --on-media:        #ffffff;  /* D */
+  --on-media-muted:  #ecddc0;  /* D */
+
+  --accent:          #a3241c;
+  --accent-hover:    #b8362d;
+  --accent-pressed:  #8a1f18;  /* D */
+  --accent-subtle:   rgba(163,36,28,.12);  /* D */
+  --accent-muted:    rgba(163,36,28,.24);  /* D */
+  --accent-glow:     rgba(163,36,28,.26);  /* D */
+  --accent-rgb:      163,36,28;
+  --accent-2:        #2b3a66;
+  --accent-2-subtle: rgba(43,58,102,.10);  /* D */
+
+  --cta:              #a3241c;  /* D — aliases accent */
+  --cta-hover:        #b8362d;  /* D */
+  --cta-pressed:      #8a1f18;  /* D */
+  --on-cta:           #ffffff;  /* D */
+  --cta-shadow:       0 6px 20px rgba(20,15,5,.16);  /* D */
+  --cta-shadow-hover: 0 10px 28px rgba(20,15,5,.22); /* D */
+  --highlight:        #7a4f00;  /* D */
+  --highlight-subtle: rgba(122,79,0,0.04);  /* D */
+  --on-highlight:     #ffffff;  /* D */
+
+  --border-subtle:       #d8cbaa;  /* D */
+  --border:              #c7bda0;
+  --border-strong:       #787466;
+  --divider:             #d0c2a0;  /* D */
+  --focus-ring:          #8a1f18;
+  --glass-stroke:        rgba(46,32,19,.12);  /* D */
+  --glass-stroke-strong: rgba(46,32,19,.24);  /* D */
+
+  --success: #34d399; --success-hover: #5fe0b0;
+  --success-subtle: #d1ddb3; --success-text: #13643e;
+  --success-border: rgba(19,100,62,.34);
+  --warning: #fbbf24; --warning-hover: #fcd34d;
+  --warning-subtle: #f1daa0; --warning-text: #7a4f00;
+  --warning-border: rgba(122,79,0,.34);
+  --danger: #f87171; --danger-hover: #fca5a5;
+  --danger-subtle: #f1c4a6; --danger-text: #aa211c;
+  --danger-border: rgba(170,33,28,.34);
+  --info: #2b3a66; --info-hover: #3a4d84;
+  --info-subtle: #d0c5ab; --info-text: #2b3a66;
+  --info-border: rgba(43,58,102,.34);
+  --live: #13643e; --live-hover: #1a7d4e;
+  --live-subtle: #d0cea7; --live-text: #0e4a2e;
+  --live-border: rgba(19,100,62,.36);
+  --idle: #7a4f00; --idle-hover: #966200;
+  --idle-subtle: #dbc799; --idle-text: #5a3a00;
+  --idle-border: rgba(122,79,0,.32);
+  --offline: #787466; --offline-hover: #918c7c;
+  --offline-subtle: #d8cba8; --offline-text: #5b472b;
+  --offline-border: rgba(120,116,102,.40);
+  --heartbeat: #8a2f5a; --heartbeat-hover: #a53c6d;
+  --heartbeat-subtle: #dfc3a9; --heartbeat-text: #6e2648;
+  --heartbeat-border: rgba(138,47,90,.34);
+  --on-info: #ffffff; --on-live: #ffffff; --on-idle: #ffffff;  /* D */
+  --on-offline: #ffffff; --on-heartbeat: #ffffff;              /* D */
+
+  --scrim:        rgba(46,32,19,.52);  /* D */
+  --scrim-strong: rgba(30,20,10,.82);  /* D */
+  --scrim-light:  rgba(46,32,19,.32);  /* D */
+  --scrim-media:  linear-gradient(to top, rgba(30,20,10,.86), rgba(30,20,10,0)); /* D */
+
+  --bubble-user-bg:        #d8a789;
+  --bubble-user-text:      #2e2013;  /* D */
+  --bubble-user-border:    #c08f70;  /* D */
+  --bubble-assistant-bg:   #efdfb8;
+  --bubble-assistant-text: #2e2013;  /* D */
+  --quote-bar:             #2b3a66;
+  --mark-bg:               #eddb8a;
+  --md-bold:               #0a0806;
+  --md-italic:             #a3241c;
+  --md-bolditalic:         #7a1410;  /* D */
+  --md-bolditalic-glow:    rgba(122,20,16,.22);  /* D */
+  --rp-speech:  #2e2013;  /* D */
+  --rp-action:  #5a4429;  /* D */
+  --rp-thought: #1c274a;  /* D */
+  --rp-whisper: #6b5433;  /* D */
+  --rp-ooc:     #7d6641;  /* D */
+  --rp-shout:   #9c3a00;  /* D */
+  --rp-shout-glow: rgba(156,58,0,.24);  /* D */
+  --rp-critical: #8f1512;  /* D */
+  --rp-critical-glow: rgba(143,21,18,.26);  /* D */
+  --diff-add-bg: rgba(19,100,62,0.05); --diff-add-text: #0e4d30;      /* D */
+  --diff-remove-bg: rgba(170,33,28,.12); --diff-remove-text: #8a1a15; /* D */
+
+  /* Syntax — D, on the dark --code-bg */
+  --syn-fg: #e8dfd0;      --syn-bg: #2a1e10;
+  --syn-comment: #a2947e; --syn-keyword: #f0a08f; --syn-string: #b8d4a6;
+  --syn-number: #f0cd8a;  --syn-function: #9fc8e4; --syn-title: #9fc8e4;
+  --syn-type: #96d4cb;    --syn-variable: #e9b2c8; --syn-attr: #efd399;
+  --syn-tag: #f0a08f;     --syn-builtin: #96d4cb;  --syn-literal: #f0cd8a;
+  --syn-meta: #a99f8e;    --syn-operator: #dcd0bd; --syn-punctuation: #c8bdac;
+  --syn-deletion: #ffb3ab; --syn-addition: #96ecbe;
+
+  /* Categorical — D, ≥3:1 on --surface-0 */
+  --cat-1: #a3241c; --cat-2: #2b3a66; --cat-3: #7a4f00; --cat-4: #1f5c4a;
+  --cat-5: #6b3f7a; --cat-6: #8a5a00; --cat-7: #24506b; --cat-8: #5c3a1e;
+  --cat-9: #8a2f5a; --cat-10: #3f5a1c; --cat-11: #1c274a; --cat-12: #6b2a2a;
+  --chart-grid: rgba(46,32,19,.10);  /* D */
+  --chart-axis: #8a7350;             /* D */
+
+  --canvas-mask:    rgba(46,32,19,.58);  /* D */
+  --canvas-handle:  #a3241c;             /* D */
+  --canvas-guide:   rgba(163,36,28,.60); /* D */
+  --canvas-outline: #2e2013;             /* D */
+
+  --font-serif: 'Charter', 'Iowan Old Style', Georgia, 'Times New Roman', serif;
+
+  --shadow-1: 0 1px 2px rgba(20,15,5,.10);
+  --shadow-2: 0 6px 20px rgba(20,15,5,.14);
+  --shadow-3: 0 18px 50px rgba(20,15,5,.20);
+  --shadow-4: 0 30px 72px rgba(20,15,5,.26);  /* D */
+  --shadow-glow:  0 0 0 1px rgba(163,36,28,.26), 0 8px 26px rgba(20,15,5,.18); /* D */
+  --shadow-inset: inset 0 1px 0 rgba(255,255,255,.40);  /* D */
+
+  --selection-bg:    rgba(163,36,28,.22);  /* D */
+  --selection-text:  #2e2013;              /* D */
+  --scrollbar-track: transparent;
+  --scrollbar-thumb: #bfa678;              /* D */
+  --scrollbar-hover: #a68c5c;              /* D */
+  /* Control-boundary fill. --surface-4 is an elevation step and can never be
+     3:1 from its neighbouring surface while still reading as subtle elevation,
+     so the slider track / toggle off-track role gets its own token.
+     3.46:1 on surface-2, 3.07:1 on surface-0. */
+  --control-track: #897347;
+
+}
+
+/* theme-daylight.css — CORE
+   Ground: light · family: daylight · color-scheme: light
+   theme-color: #ffffff
+   Extracted from the project's existing [data-palette="daylight"] block.
+   (D) = derived from this theme's own palette. */
+
+[data-palette="daylight"] {
+  color-scheme: light;
+
+  --surface-void:    #dfe4ec;  /* D */
+  --surface-0:       #ffffff;
+  --surface-1:       #f5f7fa;
+  --surface-2:       #ffffff;
+  --surface-3:       #eef1f5;
+  --surface-4:       #e4e9f0;  /* D */
+  --surface-sunken:  #f5f7fa;
+  --surface-overlay: #ffffff;
+  --glass-1:         rgba(255,255,255,.82);  /* D */
+  --glass-2:         rgba(255,255,255,.92);  /* D */
+  --glass-3:         rgba(245,247,250,.95);  /* D */
+  --glass-highlight: rgba(255,255,255,.70);  /* D */
+  --code-bg:         #12161d;  /* D — code blocks stay dark in every theme */
+
+  --text-primary:    #14181f;
+  --text-secondary:  #4b5563;
+  --text-tertiary:   #5b6472;
+  --text-disabled:   #7b838f;  /* D */
+  --text-inverse:    #ffffff;  /* D */
+  --text-link:       #1d47b8;
+  --text-link-hover: #15368f;  /* D */
+  --on-accent:       #ffffff;
+  --on-danger:       #2a0808;  /* D */
+  --on-success:      #052215;  /* D */
+  --on-warning:      #251a00;  /* D */
+  --on-media:        #ffffff;  /* D */
+  --on-media-muted:  #e6eaf0;  /* D */
+
+  --accent:          #2c56c9;
+  --accent-hover:    #3866d8;
+  --accent-pressed:  #1d47b8;
+  --accent-subtle:   rgba(44,86,201,.10);  /* D */
+  --accent-muted:    rgba(44,86,201,.22);  /* D */
+  --accent-glow:     rgba(44,86,201,.28);  /* D */
+  --accent-rgb:      44,86,201;
+  --accent-2:        #0f6a7a;
+  --accent-2-subtle: rgba(15,106,122,.10); /* D */
+
+  --cta:              #2c56c9;  /* D — aliases accent */
+  --cta-hover:        #3866d8;  /* D */
+  --cta-pressed:      #1d47b8;  /* D */
+  --on-cta:           #ffffff;  /* D */
+  --cta-shadow:       0 6px 20px rgba(20,25,40,.14);  /* D */
+  --cta-shadow-hover: 0 10px 28px rgba(20,25,40,.20); /* D */
+  --highlight:        #8a5500;
+  --highlight-subtle: rgba(138,85,0,.10);  /* D */
+  --on-highlight:     #ffffff;  /* D */
+
+  --border-subtle:       #e2e6ec;  /* D */
+  --border:              #c3c8d1;
+  --border-strong:       #8a91a1;
+  --divider:             #e2e6ec;  /* D */
+  --focus-ring:          #1d47b8;
+  --glass-stroke:        rgba(20,24,31,.10);  /* D */
+  --glass-stroke-strong: rgba(20,24,31,.22);  /* D */
+
+  --success: #34d399; --success-hover: #5fe0b0;
+  --success-subtle: #dff8ef; --success-text: #0f7a48;
+  --success-border: rgba(15,122,72,.32);
+  --warning: #fbbf24; --warning-hover: #fcd34d;
+  --warning-subtle: #fef5dc; --warning-text: #8a5500;
+  --warning-border: rgba(138,85,0,.32);
+  --danger: #f87171; --danger-hover: #fca5a5;
+  --danger-subtle: #fee8e8; --danger-text: #b3241c;
+  --danger-border: rgba(179,36,28,.32);
+  --info: #0b6ea8; --info-hover: #0d80c4;
+  --info-subtle: #e2eef5; --info-text: #0b6ea8;
+  --info-border: rgba(11,110,168,.32);
+  --live: #0f7a48; --live-hover: #13945a;
+  --live-subtle: #e5f0eb; --live-text: #0f7a48;
+  --live-border: rgba(15,122,72,.34);
+  --idle: #8a5500; --idle-hover: #a66700;
+  --idle-subtle: #ece4d6; --idle-text: #8a5500;
+  --idle-border: rgba(138,85,0,.30);
+  --offline: #8a91a1; --offline-hover: #a2a8b6;
+  --offline-subtle: #ecedf0; --offline-text: #5b6472;
+  --offline-border: rgba(138,145,161,.40);
+  --heartbeat: #a8006e; --heartbeat-hover: #c40082;
+  --heartbeat-subtle: #f1d6e8; --heartbeat-text: #a8006e;
+  --heartbeat-border: rgba(168,0,110,.32);
+  --on-info: #ffffff; --on-live: #ffffff; --on-idle: #ffffff;  /* D */
+  --on-offline: #14181f; --on-heartbeat: #ffffff;              /* D */
+
+  --scrim:        rgba(20,25,40,.48);  /* D */
+  --scrim-strong: rgba(10,14,24,.80);  /* D */
+  --scrim-light:  rgba(20,25,40,.28);  /* D */
+  --scrim-media:  linear-gradient(to top, rgba(10,14,24,.86), rgba(10,14,24,0)); /* D */
+
+  --bubble-user-bg:        #c0ccef;
+  --bubble-user-text:      #14181f;  /* D */
+  --bubble-user-border:    #a3b4e3;  /* D */
+  --bubble-assistant-bg:   #ffffff;
+  --bubble-assistant-text: #14181f;  /* D */
+  --quote-bar:             #0f6a7a;
+  --mark-bg:               #fde68a;
+  --md-bold:               #12121a;
+  --md-italic:             #8a5500;
+  --md-bolditalic:         #6b3f00;  /* D */
+  --md-bolditalic-glow:    rgba(107,63,0,.20);  /* D */
+  --rp-speech:  #14181f;  /* D */
+  --rp-action:  #4b5563;  /* D */
+  --rp-thought: #0b4a56;  /* D */
+  --rp-whisper: #5b6472;  /* D */
+  --rp-ooc:     #6d7684;  /* D */
+  --rp-shout:   #a33a00;  /* D */
+  --rp-shout-glow: rgba(163,58,0,.22);  /* D */
+  --rp-critical: #9c1318;  /* D */
+  --rp-critical-glow: rgba(156,19,24,.24);  /* D */
+  --diff-add-bg: rgba(15,122,72,.12); --diff-add-text: #0b5c36;      /* D */
+  --diff-remove-bg: rgba(179,36,28,.12); --diff-remove-text: #931d16; /* D */
+
+  /* Syntax — D, on the dark --code-bg */
+  --syn-fg: #dfe6ef;      --syn-bg: #12161d;
+  --syn-comment: #8e98a6; --syn-keyword: #9fb8ff; --syn-string: #86d9b4;
+  --syn-number: #ffc46b;  --syn-function: #7fc4e8; --syn-title: #7fc4e8;
+  --syn-type: #6fd8cc;    --syn-variable: #e9a0c4; --syn-attr: #ffd38a;
+  --syn-tag: #9fb8ff;     --syn-builtin: #6fd8cc;  --syn-literal: #ffc46b;
+  --syn-meta: #9aa4b2;    --syn-operator: #c6d0de; --syn-punctuation: #b2bccb;
+  --syn-deletion: #ffa0a0; --syn-addition: #7ee7bc;
+
+  /* Categorical — D, ≥3:1 on white */
+  --cat-1: #2c56c9; --cat-2: #0f6a7a; --cat-3: #8a5500; --cat-4: #b3241c;
+  --cat-5: #6b3fa0; --cat-6: #0f7a48; --cat-7: #a8006e; --cat-8: #1d47b8;
+  --cat-9: #5c6b00; --cat-10: #0b6ea8; --cat-11: #7a3a00; --cat-12: #3f4a8a;
+  --chart-grid: rgba(20,24,31,.09);  /* D */
+  --chart-axis: #8c95a3;             /* D */
+
+  --canvas-mask:    rgba(20,25,40,.55);  /* D */
+  --canvas-handle:  #2c56c9;             /* D */
+  --canvas-guide:   rgba(44,86,201,.60); /* D */
+  --canvas-outline: #14181f;             /* D */
+
+  --shadow-1: 0 1px 3px rgba(20,25,40,.08);
+  --shadow-2: 0 8px 22px rgba(20,25,40,.12);
+  --shadow-3: 0 20px 54px rgba(20,25,40,.18);
+  --shadow-4: 0 32px 80px rgba(20,25,40,.24);  /* D */
+  --shadow-glow:  0 0 0 1px rgba(44,86,201,.26), 0 8px 26px rgba(20,25,40,.16); /* D */
+  --shadow-inset: inset 0 1px 0 rgba(255,255,255,.80);  /* D */
+
+  --selection-bg:    rgba(44,86,201,.20);  /* D */
+  --selection-text:  #14181f;              /* D */
+  --scrollbar-track: transparent;
+  --scrollbar-thumb: #c3c8d1;              /* D */
+  --scrollbar-hover: #a2a8b6;              /* D */
+  /* Control-boundary fill. --surface-4 is an elevation step and can never be
+     3:1 from its neighbouring surface while still reading as subtle elevation,
+     so the slider track / toggle off-track role gets its own token.
+     3.09:1 on surface-2, 3.09:1 on surface-0. */
+  --control-track: #909397;
+
+}
+
+
+/* ============================================================================
+   adapter: quasar.css — contract tokens onto Quasar (NiceGUI 3.x)
+   ----------------------------------------------------------------------------
+   NiceGUI 3 declares: @layer theme, base, quasar, nicegui, components,
+   utilities, overrides, quasar_importants;
+   - This file is loaded from a plain, UNLAYERED <link>, so every normal
+     (non-!important) rule in it beats every rule Quasar ships, regardless of
+     Quasar's own selector specificity: unlayered normal declarations always
+     win over layered ones. Most of the component rules below rely on that —
+     they use short, generic selectors on purpose.
+   - The exception is Quasar's own !important classes (.text-white, .bg-grey,
+     .text-cyan, ...), shipped in the LAST layer, `quasar_importants`. For
+     !important declarations the layer order is reversed, so an !important
+     rule placed inside an EARLIER-declared layer beats a later one; an
+     unlayered !important does NOT get that benefit. So the handful of fixes
+     that must beat a Quasar !important class live in `@layer overrides`
+     (declared right before `quasar_importants`) at the bottom of this file.
+   - .bg-primary / .text-primary / .text-warning etc. read var(--q-*), so
+     remapping the variables below recolours them without fighting classes.
+   ============================================================================ */
+
+:root {
+  --q-primary:   var(--accent);
+  --q-secondary: var(--accent-2);
+  --q-accent:    var(--accent-2);
+  --q-positive:  var(--success);
+  --q-negative:  var(--danger);
+  --q-info:      var(--info);
+  --q-warning:   var(--warning);
+  --q-dark:      var(--surface-2);
+  --q-dark-page: var(--surface-0);
+}
+
+/* ---- page body -------------------------------------------------------- */
+/* Quasar hard-codes body.body--dark's text colour to #fff and its own
+   `.q-dark` utility the same way; both are plain (non-!important) rules so
+   an unlayered override here is enough. quasar.js keeps body--dark/--light
+   in step with the active theme's ground (see adapters/quasar.js). */
+
+body.body--dark,
+body.body--light {
+  background: var(--surface-0);
+  color: var(--text-primary);
+}
+
+.q-dark {
+  color: var(--text-primary);
+  background: var(--surface-2);
+}
+
+/* ---- focus-visible ------------------------------------------------------
+   Quasar suppresses the native outline everywhere (`outline: 0`) in favour
+   of its ripple/focus-helper, which is a poor keyboard-focus signal on a
+   plain surface. Restore a real ring for keyboard users without touching
+   mouse-click UX: `:focus-visible` only matches keyboard/programmatic focus
+   in evergreen browsers. `:has()` reaches the visible sibling of controls
+   whose real input is 1px and invisible (checkbox/toggle). ---- */
+
+.q-btn:focus-visible,
+.q-tab:focus-visible,
+.q-item:focus-visible,
+.q-chip:focus-visible,
+a:focus-visible {
+  outline: var(--focus-ring-width) solid var(--focus-ring);
+  outline-offset: var(--focus-ring-offset);
+}
+
+.q-field__native:focus-visible,
+.q-field__input:focus-visible {
+  outline: var(--focus-ring-width) solid var(--focus-ring);
+  outline-offset: var(--focus-ring-offset);
+}
+
+.q-checkbox:has(.q-checkbox__native:focus-visible) .q-checkbox__bg,
+.q-toggle:has(.q-toggle__native:focus-visible) .q-toggle__track,
+.q-radio:has(.q-radio__native:focus-visible) .q-radio__bg {
+  outline: var(--focus-ring-width) solid var(--focus-ring);
+  outline-offset: var(--focus-ring-offset);
+}
+
+/* ---- header ------------------------------------------------------------
+   .q-layout__section--marginal is what actually paints the header/footer;
+   it is a plain rule (`background-color: var(--q-primary); color: #fff`),
+   so this alone stops the header from being accent-coloured. */
+
+.q-header,
+.q-layout__section--marginal {
+  background: var(--surface-1);
+  color: var(--text-primary);
+  border-bottom: 1px solid var(--border);
+  box-shadow: none;
+}
+
+/* ---- tabs ---------------------------------------------------------------
+   .q-tab uses `color: inherit` and .q-tab__indicator paints with
+   `currentColor`, so without an explicit color= prop the whole strip just
+   inherits the page/header text colour. Set it explicitly instead of
+   relying on inheritance to reach every context a tab strip is used in. */
+
+.q-tab {
+  color: var(--text-secondary);
+}
+
+.q-tab--active {
+  color: var(--text-primary);
+}
+
+.q-tab__indicator {
+  background: var(--accent);
+}
+
+.q-tabs {
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+/* ---- cards ---------------------------------------------------------------
+   Quasar's only built-in dark treatment is `.q-card--dark`'s border/shadow
+   (the base .q-card has no dark background rule at all — NiceGUI's own
+   `dark:bg-white/5` classes exist in gui/ precisely to paper over that). One
+   rule now covers both: `.q-card--dark` only ever appears alongside `.q-card`
+   on the same element, so it needs no separate values of its own here.
+   Dialog cards get the raised "overlay" surface instead, since they float
+   above the page. */
+
+.q-card {
+  background: var(--surface-2);
+  color: var(--text-primary);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-1);
+}
+
+.q-dialog .q-card {
+  background: var(--surface-overlay);
+  box-shadow: var(--shadow-3);
+}
+
+.q-dialog__backdrop {
+  background: var(--scrim);
+}
+
+/* ---- fields (input / textarea / select / number) --------------------- */
+
+.q-field__control {
+  background: var(--surface-sunken);
+  border-radius: var(--radius-sm);
+}
+
+.q-field__control:before {
+  border-color: var(--border-strong);
+}
+
+.q-field__control:hover:before {
+  border-color: var(--text-secondary);
+}
+
+/* Filled variant paints its own background instead of using a border. */
+.q-field--filled .q-field__control,
+.q-field--filled .q-field__control:before {
+  background: var(--surface-sunken);
+}
+
+.q-field--filled.q-field--highlighted .q-field__control:before {
+  background: var(--surface-3);
+}
+
+/* Focused state already turns accent-coloured for free: the underline/outline
+   pseudo-elements paint with `currentColor`, and the highlighted state's
+   `color` comes from `--q-primary`, which is remapped to `--accent` above. */
+
+.q-field__native,
+.q-field__input,
+.q-field__prefix,
+.q-field__suffix {
+  color: var(--text-primary);
+}
+
+.q-field__label {
+  color: var(--text-tertiary);
+}
+
+.q-field--dark .q-field__marginal,
+.q-field--dark .q-field__bottom {
+  color: var(--text-tertiary);
+}
+
+.q-field--error .q-field__label,
+.q-field--error .q-field__bottom {
+  color: var(--danger-text);
+}
+
+/* ---- menus, select popups, list items --------------------------------- */
+
+.q-menu {
+  background: var(--surface-overlay);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-2);
+  color: var(--text-primary);
+}
+
+.q-item,
+.q-list--dark,
+.q-item--dark {
+  color: var(--text-primary);
+  border-color: var(--border);
+}
+
+.q-item__section--side {
+  color: var(--text-secondary);
+}
+
+.q-item--active,
+.q-item.q-router-link--active {
+  background: var(--accent-subtle);
+  color: var(--text-primary);
+}
+
+/* Quasar's hover/keyboard-focus tint is `currentColor` at low opacity via a
+   shared .q-focus-helper overlay used by many components; scoped to list
+   items (menus, selects, expansion headers) it becomes the flat hover
+   surface the contract wants instead of a colour-derived tint. */
+.q-item.q-hoverable:hover > .q-focus-helper,
+.q-item.q-manual-focusable--focused > .q-focus-helper {
+  background: var(--surface-3);
+  opacity: 1;
+}
+
+/* ---- buttons --------------------------------------------------------- */
+
+.q-btn.disabled {
+  color: var(--text-disabled);
+}
+
+/* ---- badges ------------------------------------------------------------
+   The base rule is plain CSS (`background-color: var(--q-primary); color:
+   #fff`); only the hard-coded text colour needs fixing here. A colour= prop
+   swaps in a `bg-<name>` / `text-white` pair from quasar_importants, handled
+   in the @layer overrides block below. */
+
+.q-badge {
+  color: var(--on-accent);
+}
+
+/* ---- notifications (ui.notify) ----------------------------------------
+   The base look is a plain rule (`background:#323232;color:#fff`); typed
+   notifications add an !important `bg-<status>` (+ text-white/text-dark),
+   handled in @layer overrides so the status colour still applies but with a
+   correct on-color. */
+
+.q-notification {
+  background: var(--surface-overlay);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-2);
+}
+
+/* ---- tooltip ------------------------------------------------------------ */
+
+.q-tooltip--style {
+  color: var(--text-primary);
+  background: var(--surface-4);
+}
+
+/* ---- linear progress (VRAM bars, download rows, benchmark) ------------ */
+
+.q-linear-progress__track--light,
+.q-linear-progress__track--dark {
+  background: var(--control-track);
+}
+
+/* ---- slider (LoRA adapter scale) --------------------------------------- */
+
+.q-slider__track,
+.q-slider__inner {
+  background: var(--control-track);
+}
+
+.q-slider__track {
+  color: var(--slider-color);
+}
+
+/* ---- toggle (chat "use loaded model", setup switches) ------------------
+   Track/thumb are recoloured directly rather than through `currentColor`,
+   which sidesteps Quasar's separate --dark variant entirely (off and on
+   states look the same regardless of Quasar's own dark/light class). */
+
+.q-toggle__track {
+  background: var(--control-track);
+  opacity: 1;
+}
+
+.q-toggle__inner--truthy .q-toggle__track {
+  background: var(--accent);
+  opacity: 1;
+}
+
+.q-toggle__thumb:after {
+  background: var(--surface-2);
+}
+
+.q-toggle__inner--truthy .q-toggle__thumb:after {
+  background: var(--on-accent);
+}
+
+/* ---- checkbox ----------------------------------------------------------- */
+
+.q-checkbox__inner,
+.q-checkbox--dark .q-checkbox__inner {
+  color: var(--border-strong);
+}
+
+.q-checkbox__inner--truthy,
+.q-checkbox__inner--indet,
+.q-checkbox--dark .q-checkbox__inner--truthy,
+.q-checkbox--dark .q-checkbox__inner--indet {
+  color: var(--accent);
+}
+
+.q-checkbox__svg {
+  color: var(--on-accent);
+}
+
+/* ---- separator ---------------------------------------------------------- */
+
+.q-separator,
+.q-separator--dark {
+  background: var(--divider);
+}
+
+/* ---- expansion item ------------------------------------------------------
+   The clickable header is a .q-item internally, so the hover/active rules
+   above already apply to it -- nothing extra needed here. */
+
+/* ---- table (benchmark history) ------------------------------------------ */
+
+.q-table__card,
+.q-table__card--dark,
+.q-table--dark {
+  background: var(--surface-2);
+  color: var(--text-primary);
+  border-color: var(--border);
+  box-shadow: none;
+}
+
+.q-table th {
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: var(--ls-label);
+}
+
+.q-table th,
+.q-table td,
+.q-table--dark .q-table__bottom,
+.q-table--dark thead,
+.q-table--dark tr,
+.q-table--dark th,
+.q-table--dark td {
+  border-color: var(--divider);
+}
+
+.q-table tbody td:before {
+  background: color-mix(in srgb, var(--text-primary) 3%, transparent);
+}
+
+.q-table tbody td:after {
+  background: var(--surface-3);
+}
+
+/* ============================================================================
+   Tailwind v4 (browser runtime) utility classes used in gui/tabs/*.py.
+   These land in the `utilities` layer, so the same unlayered-beats-layered
+   rule applies: no !important needed here either.
+   ============================================================================ */
+
+.bg-black\/5 {
+  background-color: color-mix(in srgb, var(--text-primary) 5%, transparent);
+}
+
+.bg-black\/10 {
+  background-color: color-mix(in srgb, var(--text-primary) 10%, transparent);
+}
+
+.border-white\/10 {
+  border-color: var(--border-subtle);
+}
+
+.border-white\/20 {
+  border-color: var(--border);
+}
+
+.hover\:bg-white\/5:hover {
+  background-color: var(--surface-3);
+}
+
+.border-primary {
+  border-color: var(--accent);
+}
+
+.bg-primary\/20 {
+  background-color: color-mix(in srgb, var(--accent) 20%, transparent);
+}
+
+/* ============================================================================
+   @layer overrides — beats Quasar's !important classes (quasar_importants).
+   See the file banner: this layer is declared before quasar_importants in
+   NiceGUI's page template, so an !important rule in here wins the reversed
+   important-vs-important contest. Every selector below is a real Quasar (or
+   Tailwind) class name; nothing here is invented.
+   ============================================================================ */
+
+@layer overrides {
+  /* Filled controls (buttons, badges, chips): Quasar defaults their label to
+     `text-white` (or, for ui.notify's "warning" preset, `text-dark`) no
+     matter which colour= was requested. Never literal white/dark -- always
+     the token that is legible on that fill. */
+  .bg-primary.text-white,
+  .bg-secondary.text-white,
+  .bg-accent.text-white {
+    color: var(--on-accent) !important;
+  }
+
+  .bg-positive.text-white {
+    color: var(--on-success) !important;
+  }
+
+  .bg-negative.text-white {
+    color: var(--on-danger) !important;
+  }
+
+  .bg-warning.text-white,
+  .bg-warning.text-dark {
+    color: var(--on-warning) !important;
+  }
+
+  .bg-info.text-white {
+    color: var(--on-info) !important;
+  }
+
+  /* ui.notify(type=...): recolour the toast's own text directly, regardless
+     of which textColor Quasar's built-in preset attached. */
+  .q-notification.bg-positive {
+    color: var(--on-success) !important;
+  }
+
+  .q-notification.bg-negative {
+    color: var(--on-danger) !important;
+  }
+
+  .q-notification.bg-warning {
+    color: var(--on-warning) !important;
+  }
+
+  .q-notification.bg-info {
+    color: var(--on-info) !important;
+  }
+
+  /* Named Quasar palette classes used via color= props (dashboard/download
+     badges, setup/server icons) and gui/state.py's CAPABILITY_ICONS /
+     STATUS_COLOURS maps. "grey" reads as a muted, offline tone; the five
+     capability hues become distinct chart-category tokens so the icons stay
+     visually distinguishable from each other (test-enforced). */
+  .text-grey {
+    color: var(--text-tertiary) !important;
+  }
+
+  .bg-grey {
+    background-color: var(--offline) !important;
+  }
+
+  .text-cyan {
+    color: var(--cat-1) !important;
+  }
+
+  .bg-cyan {
+    background-color: var(--cat-1) !important;
+  }
+
+  .text-orange {
+    color: var(--cat-2) !important;
+  }
+
+  .bg-orange {
+    background-color: var(--cat-2) !important;
+  }
+
+  .text-purple {
+    color: var(--cat-3) !important;
+  }
+
+  .bg-purple {
+    background-color: var(--cat-3) !important;
+  }
+
+  .text-teal {
+    color: var(--cat-4) !important;
+  }
+
+  .bg-teal {
+    background-color: var(--cat-4) !important;
+  }
+
+  .text-blue-grey {
+    color: var(--cat-5) !important;
+  }
+
+  .bg-blue-grey {
+    background-color: var(--cat-5) !important;
+  }
+}
+
+/* ============================================================================
+   sf-* helper classes — StudioForge-specific, kept to a minimum. Used only
+   where gui/tabs/*.py replaced a hard-coded `bg-black/10 dark:bg-white/5`
+   (etc.) pair with one semantic class. Declared last on purpose: they share
+   specificity with .q-card above and must win the source-order tiebreak
+   when a card also carries one of these classes.
+   ============================================================================ */
+
+.sf-well {
+  background: var(--surface-sunken);
+}
+
+.sf-danger-card {
+  background: var(--danger-subtle);
+  border-color: var(--danger-border);
+  color: var(--danger-text);
+}
+
+.sf-warning-card {
+  background: var(--warning-subtle);
+  border-color: var(--warning-border);
+  color: var(--warning-text);
+}
+
+/* Header theme picker: sizing only -- its colours come from the generic
+   .q-field rules above, which already read correctly on --surface-1. */
+.sf-theme-picker {
+  min-width: 9rem;
+}
+
+/* ---- Locale overrides — apply to every theme ---- */
+:lang(ja), :lang(zh) {
+  --font-sans: 'Inter', 'Hiragino Sans', 'Yu Gothic', 'Noto Sans JP',
+               'PingFang SC', 'Microsoft YaHei', sans-serif;
+  --font-display: var(--font-sans);
+}
+:lang(ja) h1, :lang(ja) h2, :lang(ja) h3, :lang(ja) h4,
+:lang(zh) h1, :lang(zh) h2, :lang(zh) h3, :lang(zh) h4 {
+  letter-spacing: normal;
+}
+

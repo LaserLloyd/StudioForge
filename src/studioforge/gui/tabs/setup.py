@@ -1140,8 +1140,7 @@ def _openclaw_panel(ctx: GuiContext) -> None:
                                 "Copy (with the real values)" if trusted else "Copy (masked)"
                             )
                         ui.label(shown).classes(
-                            "w-full font-mono text-xs whitespace-pre-wrap "
-                            "bg-black/10 dark:bg-white/5 p-2 rounded"
+                            "w-full font-mono text-xs whitespace-pre-wrap sf-well p-2 rounded"
                         )
 
         ui.timer(0.05, load, once=True)

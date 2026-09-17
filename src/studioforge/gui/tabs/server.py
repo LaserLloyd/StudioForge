@@ -398,7 +398,7 @@ def snippet_block(title: str, snippet: str) -> None:
                 "flat dense"
             ).tooltip("Copy")
         ui.label(snippet).classes(
-            "w-full font-mono text-xs whitespace-pre-wrap bg-black/10 dark:bg-white/5 p-2 rounded"
+            "w-full font-mono text-xs whitespace-pre-wrap sf-well p-2 rounded"
         )
 
 
@@ -1068,7 +1068,7 @@ def _capabilities_body(ctx: GuiContext, report: dict[str, Any]) -> None:
     # --- 2. the models that genuinely cannot load ------------------------
     warning = st.unsupported_warning(report)
     if warning:
-        with ui.card().classes("w-full bg-orange-50 dark:bg-orange-950"):
+        with ui.card().classes("w-full sf-warning-card"):
             ui.label(warning).classes("text-warning text-sm font-medium")
             for model_id, architecture in st.unsupported_models(report):
                 ui.label(f"{model_id} — {architecture}").classes("text-xs font-mono")
