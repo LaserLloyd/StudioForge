@@ -2,7 +2,7 @@
    tools/sync_theme.py. Do not edit this copy: change the package (src/,
    adapters/, apps/studioforge.json) and run `python tools/sync_theme.py app studioforge`.
    themes: purple, midnight-gold, glacier, forest, paper, daylight | default: glacier
-   body sha256: 1024082b0d293c1c */
+   body sha256: 7f6645c735f8c133 */
 /* ============================================================================
    theme-base.css — CORE. Purple (base theme) + theme-agnostic layer.
    ----------------------------------------------------------------------------
@@ -1659,9 +1659,14 @@ a:focus-visible {
 
   /* Named Quasar palette classes used via color= props (dashboard/download
      badges, setup/server icons) and gui/state.py's CAPABILITY_ICONS /
-     STATUS_COLOURS maps. "grey" reads as a muted, offline tone; the five
-     capability hues become distinct chart-category tokens so the icons stay
-     visually distinguishable from each other (test-enforced). */
+     STATUS_COLOURS maps. These are deliberately mapped to distinct
+     categorical tokens, not to hue-matched colours -- .text-orange lands on
+     --cat-2 (teal), .text-purple on --cat-3 (gold), and so on. The contract
+     only promises the --cat-* set is distinguishable from itself and >=3:1 on
+     --surface-0 (they're a foreground/text-strength colour, not a fill);
+     making "orange" look orange isn't a goal, and the distinctness between
+     the five hues is test-enforced, so don't "fix" this to be hue-accurate.
+     "grey" is the one honestly-named exception, mapped to --offline. */
   .text-grey {
     color: var(--text-tertiary) !important;
   }
@@ -1708,6 +1713,21 @@ a:focus-visible {
 
   .bg-blue-grey {
     background-color: var(--cat-5) !important;
+  }
+
+  /* R17: --cat-* (and --offline) are tuned to be legible as a foreground
+     colour on --surface-0, not as a fill guaranteed to hold Quasar's literal
+     white label -- white on --cat-1 measures ~2:1 in some themes. Route the
+     pairing through --text-inverse (the theme's flipped page ink, always
+     legible on a mid-tone fill) instead of trusting the categorical token's
+     own hue to be dark/light enough. */
+  .bg-cyan.text-white,
+  .bg-orange.text-white,
+  .bg-purple.text-white,
+  .bg-teal.text-white,
+  .bg-blue-grey.text-white,
+  .bg-grey.text-white {
+    color: var(--text-inverse) !important;
   }
 }
 

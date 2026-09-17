@@ -451,7 +451,13 @@ def _register_theme_assets() -> None:
     if _THEME_ASSETS_REGISTERED:
         return
     _THEME_ASSETS_REGISTERED = True
-    nicegui_app.add_static_files(_THEME_URL_PREFIX.rstrip("/"), _THEME_DIR)
+    # R18: max_cache_age=0 -- ?v= hashes are computed once at import (see
+    # _asset_version above), so a re-vendor with no restart would otherwise
+    # keep this process serving the new bytes under the old query string for
+    # up to an hour under NiceGUI's default max-age=3600. A restart is what
+    # actually recomputes the hash (see docs/DEVELOPMENT.md); this just stops
+    # the browser from compounding that with its own long cache meanwhile.
+    nicegui_app.add_static_files(_THEME_URL_PREFIX.rstrip("/"), _THEME_DIR, max_cache_age=0)
     ui.add_head_html(_THEME_HEAD_HTML, shared=True)
 
 
@@ -461,7 +467,6 @@ _LOGIN_PAGE = """<!doctype html>
 <title>StudioForge — sign in</title>
 {theme_head}
 <style>
- :root {{ color-scheme: light dark; }}
  body {{ font-family: var(--font-sans); display: grid; place-items: center;
         min-height: 100vh; margin: 0; background: var(--surface-0); color: var(--text-primary); }}
  form {{ background: var(--surface-1); padding: 2rem; border-radius: var(--radius-lg);
@@ -559,10 +564,13 @@ def _theme_picker() -> None:
     element even mounts (ui-theme.js runs synchronously in <head>, before
     first paint), so this is purely a control, not the source of truth for
     what's on screen. Its initial value is the manifest default; the moment
-    the client connects, ``sync_initial`` corrects it to whatever
-    ``UITheme.current()`` actually applied and subscribes to
-    ``UITheme.onChange``, so a switch made in another tab (the runtime's
-    storage listener) or from script keeps the select in step. The
+    the client connects, ``sync_initial`` installs the ``UITheme.onChange``
+    bridge and has it immediately emit the current slug, in one
+    fire-and-forget call -- so a slow or blocked round-trip can no longer
+    leave the bridge uninstalled the way an awaited ``UITheme.current()``
+    lookup first, subscribe second sequence could (R21). Both the initial
+    correction and any later switch made in another tab (the runtime's
+    storage listener) or from script arrive at ``mirror`` the same way. The
     ``mirroring`` guard stops those corrections from round-tripping through
     ``on_change`` -- NiceGUI fires the change handler on a programmatic
     ``select.value =`` assignment exactly the same as on a user pick.
@@ -571,8 +579,8 @@ def _theme_picker() -> None:
     mirroring = False
 
     select = (
-        ui.select(options, value=_theme_default())
-        .props('dense outlined options-dense aria-label="Theme"')
+        ui.select(options, value=_theme_default(), label="Theme")
+        .props("dense outlined options-dense")
         .classes("sf-theme-picker")
     )
     # An icon rather than a tooltip: a tooltip stays up over the open menu.
@@ -596,10 +604,14 @@ def _theme_picker() -> None:
     select.on_value_change(on_change)
     ui.on(_THEME_CHANGE_EVENT, lambda event: mirror(event.args))
 
-    async def sync_initial() -> None:
-        mirror(await ui.run_javascript("UITheme.current()"))
+    def sync_initial() -> None:
+        # R21: install the bridge and ask it to emit the current slug in one
+        # fire-and-forget call -- nothing here awaits a JS round-trip, so a
+        # slow or blocked client can no longer leave onChange unsubscribed.
         ui.run_javascript(
-            f"UITheme.onChange((d) => emitEvent({json.dumps(_THEME_CHANGE_EVENT)}, d.slug))"
+            "UITheme.onChange((d) => emitEvent("
+            f"{json.dumps(_THEME_CHANGE_EVENT)}, d.slug)); "
+            f"emitEvent({json.dumps(_THEME_CHANGE_EVENT)}, UITheme.current());"
         )
 
     ui.timer(0.0, sync_initial, once=True)

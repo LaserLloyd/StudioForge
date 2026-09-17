@@ -139,12 +139,31 @@ overwritten wholesale. After editing, re-vendor from the package root:
 python tools/sync_theme.py app studioforge --dest <path to this checkout>
 ```
 
+Then restart the server (`POST /api/restart/server` with `{"confirm": true}`, or the tray's
+Restart server) so the `?v=` hashes are recomputed. They're computed once at import (see
+`_asset_version` in `app.py`), so a re-vendor with no restart leaves the running process serving
+the new bytes under the *old* query string; `/sf-theme/` itself is served with `max_cache_age=0`
+precisely so that, once you do restart, browsers don't also sit on the previous response for
+NiceGUI's default hour.
+
 `tools/sync_theme.py check studioforge --dest <path to this checkout>` reports drift without
 writing anything, which is a good pre-commit sanity check if the vendored copy looks stale.
 `pyproject.toml`'s
 `[tool.hatch.build.targets.wheel]` `include` list has explicit globs for `gui/theme/*.{js,css,json}`
 — a wheel build only picks up non-Python data files that are listed there, so a new *kind* of
 vendored file needs an entry added alongside the existing ones.
+
+Quasar's named palette classes (`.text-cyan`, `.bg-orange`, `.text-purple`, `.bg-teal`,
+`.text-blue-grey`, `.text-grey`/`.bg-grey`, used via `color=` props and `gui/state.py`'s
+`CAPABILITY_ICONS`/`STATUS_COLOURS` maps) are remapped in `adapters/quasar.css`'s `@layer
+overrides` to distinct `--cat-*` categorical tokens, not to hue-matched colours — `.text-orange`
+lands on `--cat-2` (teal), `.text-purple` on `--cat-3` (gold), and so on; only `--offline`
+("grey") is actually named for what it is. The contract promises the `--cat-*` set is
+distinguishable from itself and >=3:1 on `--surface-0`, not that "orange" looks orange, and that
+distinctness is test-enforced — don't "fix" the hues to match the names. Because `--cat-*` (and
+`--offline`) are tuned as a foreground colour rather than as a fill, `.bg-<name>.text-white` is
+covered separately in the same layer and routed through `--text-inverse` (the theme's flipped
+page ink) instead of trusting the categorical token's own hue to hold a literal white label.
 
 ## Building the companion wheel
 

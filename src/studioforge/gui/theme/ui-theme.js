@@ -2,7 +2,7 @@
    tools/sync_theme.py. Do not edit this copy: change the package (src/,
    adapters/, apps/studioforge.json) and run `python tools/sync_theme.py app studioforge`.
    themes: purple, midnight-gold, glacier, forest, paper, daylight | default: glacier
-   body sha256: 6e8acddb0ee0e9cb */
+   body sha256: 7050ce5d12a543a9 */
 window.UI_THEME_MANIFEST = {"app": "studioforge", "themes": ["purple", "midnight-gold", "glacier", "forest", "paper", "daylight"], "default": "glacier", "storageKey": "studioforge.theme", "families": false, "legacy": null, "mirrorAttr": null, "fontsHref": null};
 /* ============================================================================
    ui-theme.js — portable theme runtime · unifyingTheme V26-09-16
@@ -154,9 +154,11 @@ window.UI_THEME_MANIFEST = {"app": "studioforge", "themes": ["purple", "midnight
     if (value === null && config.legacy) {
       var old = storeGet(config.legacy.key);
       var mapped = old !== null ? config.legacy.map[old] : undefined;
-      if (mapped && find(mapped)) {
-        // One-time migration. The legacy key is left in place so an older
-        // build of the app still finds it.
+      if (mapped && allowed(mapped)) {
+        // One-time migration, and only onto a theme this app offers: a
+        // mapping to a disabled theme would be stored and then fall back to
+        // the default on every load. The legacy key is left in place so an
+        // older build of the app still finds it.
         value = mapped;
         storeSet(config.storageKey, mapped);
       }

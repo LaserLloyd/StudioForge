@@ -282,6 +282,19 @@ def test_theme_assets_are_served(config: Config) -> None:
     assert "glacier" in manifest.text
 
 
+def test_theme_assets_are_served_with_no_long_cache(config: Config) -> None:
+    """R18: ?v= hashes are computed once at import (_asset_version), so a
+    re-vendor with no restart would otherwise serve new bytes under the old
+    query string while NiceGUI's default `max-age=3600` keeps browsers on the
+    stale response for up to an hour. max_cache_age=0 closes that half of the
+    gap; the other half (the process's own cached hash) needs the restart
+    documented in docs/DEVELOPMENT.md."""
+    app = create_gui_app(config, api_state=_FakeState(config))
+    with TestClient(app) as client:
+        response = client.get("/sf-theme/ui-theme.js")
+    assert response.headers["cache-control"] == "public, max-age=0"
+
+
 def test_theme_head_html_has_the_three_tags_in_order_with_version_hashes() -> None:
     from studioforge.gui.app import _THEME_HEAD_HTML
 
@@ -353,6 +366,20 @@ def test_header_no_longer_creates_a_dark_mode_toggle() -> None:
     source = Path(app_module.__file__).read_text(encoding="utf-8")
     assert "ui.dark_mode" not in source
     assert "_theme_picker" in source
+
+
+def test_theme_picker_select_has_an_accessible_label() -> None:
+    """R13: QSelect derives the rendered combobox's aria-label from its
+    `label` prop (quasar.umd.prod.js builds the combobox's attrs as
+    `role:"combobox","aria-label":e.label,...`) -- a raw `aria-label` prop on
+    the element is not what the combobox announces. Checked at source level,
+    scoped to the one function, since a rendered element tree isn't
+    introspectable from a plain HTTP response."""
+    from studioforge.gui import app as app_module
+
+    code = _code_of(app_module._theme_picker)
+    assert "label='Theme'" in code
+    assert "aria-label" not in code
 
 
 # ---------------------------------------------------------------------------
