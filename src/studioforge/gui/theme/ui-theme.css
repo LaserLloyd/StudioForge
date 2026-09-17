@@ -2,7 +2,7 @@
    tools/sync_theme.py. Do not edit this copy: change the package (src/,
    adapters/, apps/studioforge.json) and run `python tools/sync_theme.py app studioforge`.
    themes: purple, midnight-gold, glacier, forest, paper, daylight | default: glacier
-   body sha256: ac7169f19ba74f28 */
+   body sha256: 5f7ebb12f194faed */
 /* ============================================================================
    theme-base.css — CORE. Purple (base theme) + theme-agnostic layer.
    ----------------------------------------------------------------------------
@@ -1396,13 +1396,24 @@ a:focus-visible {
 }
 
 /* Quasar's hover/keyboard-focus tint is `currentColor` at low opacity via a
-   shared .q-focus-helper overlay used by many components; scoped to list
-   items (menus, selects, expansion headers) it becomes the flat hover
-   surface the contract wants instead of a colour-derived tint. */
+   shared .q-focus-helper overlay used by many components. The overlay is
+   absolutely positioned ABOVE the item's label, so it must never be opaque.
+   For list items (menus, selects, expansion headers) the flat hover surface
+   the contract wants is painted on the item itself and the overlay is kept
+   out of the way; the active (selected) item keeps an accent tint. */
 .q-item.q-hoverable:hover > .q-focus-helper,
 .q-item.q-manual-focusable--focused > .q-focus-helper {
+  opacity: 0;
+}
+
+.q-item.q-hoverable:hover,
+.q-item.q-manual-focusable--focused {
   background: var(--surface-3);
-  opacity: 1;
+}
+
+.q-item--active.q-hoverable:hover,
+.q-item--active.q-manual-focusable--focused {
+  background: var(--accent-muted);
 }
 
 /* ---- buttons --------------------------------------------------------- */

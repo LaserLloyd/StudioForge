@@ -433,6 +433,11 @@ def _theme_default() -> str:
     return str(_THEME_MANIFEST.get("manifest", {}).get("default", "glacier"))
 
 
+#: Page-level event the header picker listens on; the browser emits it from
+#: UITheme.onChange so the select follows switches made elsewhere.
+_THEME_CHANGE_EVENT = "sf_theme_change"
+
+
 #: Guards the one-time /sf-theme static mount and the one-time <head>
 #: injection. Both are process-global (``nicegui_app`` is a singleton, and
 #: ``ui.add_head_html(shared=True)`` appends to a process-global list on
@@ -555,36 +560,47 @@ def _theme_picker() -> None:
     first paint), so this is purely a control, not the source of truth for
     what's on screen. Its initial value is the manifest default; the moment
     the client connects, ``sync_initial`` corrects it to whatever
-    ``UITheme.current()`` actually applied. The ``initialising`` guard stops
-    that correction from round-tripping through ``on_change`` and persisting
-    the default over the visitor's real (stored) choice -- NiceGUI fires the
-    change handler on a programmatic ``select.value =`` assignment exactly
-    the same as on a user pick.
+    ``UITheme.current()`` actually applied and subscribes to
+    ``UITheme.onChange``, so a switch made in another tab (the runtime's
+    storage listener) or from script keeps the select in step. The
+    ``mirroring`` guard stops those corrections from round-tripping through
+    ``on_change`` -- NiceGUI fires the change handler on a programmatic
+    ``select.value =`` assignment exactly the same as on a user pick.
     """
     options = _theme_options()
-    initialising = False
+    mirroring = False
 
     select = (
         ui.select(options, value=_theme_default())
-        .props("dense outlined options-dense")
+        .props('dense outlined options-dense aria-label="Theme"')
         .classes("sf-theme-picker")
     )
-    select.tooltip("Theme")
+    # An icon rather than a tooltip: a tooltip stays up over the open menu.
+    with select.add_slot("prepend"):
+        ui.icon("palette", size="xs")
+
+    def mirror(slug: Any) -> None:
+        nonlocal mirroring
+        if slug not in options or slug == select.value:
+            return
+        mirroring = True
+        try:
+            select.value = slug
+        finally:
+            mirroring = False
 
     def on_change(event: Any) -> None:
-        if initialising:
-            return
-        ui.run_javascript(f"UITheme.set({json.dumps(event.value)})")
+        if not mirroring:
+            ui.run_javascript(f"UITheme.set({json.dumps(event.value)})")
 
     select.on_value_change(on_change)
+    ui.on(_THEME_CHANGE_EVENT, lambda event: mirror(event.args))
 
     async def sync_initial() -> None:
-        nonlocal initialising
-        current = await ui.run_javascript("UITheme.current()")
-        if current in options and current != select.value:
-            initialising = True
-            select.value = current
-            initialising = False
+        mirror(await ui.run_javascript("UITheme.current()"))
+        ui.run_javascript(
+            f"UITheme.onChange((d) => emitEvent({json.dumps(_THEME_CHANGE_EVENT)}, d.slug))"
+        )
 
     ui.timer(0.0, sync_initial, once=True)
 
