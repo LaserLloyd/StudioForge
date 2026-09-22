@@ -2122,18 +2122,35 @@ async def _repo_payload(state: Any, repo: Any, *, with_context: bool = False) ->
     read degrades to today's bounded estimate with the reason attached; it never
     fails the request, because "could not read the header" is not a reason to
     stop the user browsing a repo.
+
+    ``with_context`` also settles ``mtp`` per quant from each file's own header
+    (one small range request per quant, bounded concurrency, cached), because
+    a repo can ship the same quant with and without its multi-token-prediction
+    heads and the geometry read above cannot speak for the siblings. Without it
+    the fields carry the name hint only (``mtp_source: "name"``) or ``null``.
     """
     from studioforge.core.downloader import fit_verdict
-    from studioforge.core.hf_meta import ArchMeta, idle_planner, repo_arch_meta
+    from studioforge.core.hf_meta import (
+        ArchMeta,
+        MtpStatus,
+        idle_planner,
+        mtp_from_name,
+        repo_arch_meta,
+        repo_mtp_status,
+    )
 
     options = repo.logical_models()
     arch = ArchMeta()
     # Built once for the whole repo: constructing it enumerates the GPUs, and
     # every quant of a repo is answered against the same idle inventory.
     idle = None
+    mtp: dict[str, MtpStatus] = {}
     if with_context and options:
         arch = await repo_arch_meta(state.config, repo, registry=state.registry)
         idle = idle_planner(state.planner)
+        # After the geometry read on purpose: that read leaves the smallest
+        # quant's full header cached, and its probe then costs nothing.
+        mtp = await repo_mtp_status(state.config, options, registry=state.registry)
 
     entries = []
     for option in options:
@@ -2151,6 +2168,7 @@ async def _repo_payload(state: Any, repo: Any, *, with_context: bool = False) ->
             "mmproj": option.mmproj.filename if option.mmproj else None,
             "group_id": option.group_id,
             "fit": verdict,
+            **(mtp.get(option.group_id) or mtp_from_name(option.mtp_hint)).as_dict(),
         }
         if with_context:
             entry["context_fit"] = _context_fit(idle, option, arch)
@@ -2175,6 +2193,9 @@ async def _repo_payload(state: Any, repo: Any, *, with_context: bool = False) ->
         # request and without knowing which field the search was filtered on.
         "updated_days_ago": repo.updated_days_ago,
         "created_days_ago": repo.created_days_ago,
+        # Name-based, free at search time: the repo or a loadable file says
+        # MTP. The per-quant ``mtp`` fields are what a header actually proved.
+        "mtp_likely": repo.mtp_hint,
         "quants": entries,
     }
 
