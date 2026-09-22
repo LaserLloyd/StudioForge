@@ -27,6 +27,16 @@ box or a CDN that ignores ``Range`` produces a matrix with ``source: None``, an
 ``unavailable`` reason and the old bounded allowance, flagged ``approximate``.
 An estimate that admits what it does not know is worth more than a confident
 wrong one an hour of downloading later.
+
+**Per-quant MTP.** The third thing, and the only per-*file* one: whether a
+quant keeps its multi-token-prediction heads (``<arch>.nextn_predict_layers``),
+which is what lets the supervisor launch it with ``--spec-type draft-mtp`` for a
+real single-stream speedup. One repo can ship the same quant twice, with and
+without the heads, so the geometry read above cannot answer for its siblings.
+:func:`remote_mtp` reads each file's header but stops at the tokenizer -- every
+architecture key precedes it, and the tokenizer's string arrays are the bulk --
+so a probe is one small range request, cached, and a whole repo is walked with
+bounded concurrency by :func:`repo_mtp_status`.
 """
 
 from __future__ import annotations
@@ -37,9 +47,9 @@ import json
 import os
 import re
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, BinaryIO, Final, cast
 
 import httpx
@@ -64,16 +74,25 @@ log = get_logger(__name__)
 __all__ = [
     "CONTEXT_TIERS",
     "MAX_HEADER_BYTES",
+    "MTP_PROBE_CONCURRENCY",
+    "MtpStatus",
     "RemoteHeaderError",
     "RemoteRangeFile",
     "context_line",
     "context_matrix",
     "context_tooltip",
     "geometry_line",
+    "mtp_from_kv",
+    "mtp_from_meta",
+    "mtp_from_name",
     "open_client",
+    "quant_mtp_status",
+    "registry_file_meta",
     "registry_sibling_meta",
     "remote_meta",
+    "remote_mtp",
     "repo_arch_meta",
+    "repo_mtp_status",
 ]
 
 
@@ -371,8 +390,9 @@ def _cache_put(config: Config, key: str, meta: GgufMeta) -> None:
 
 
 def clear_memory_cache() -> None:
-    """Drop the in-process header cache (tests; a config reload)."""
+    """Drop the in-process header caches (tests; a config reload)."""
     _MEMORY_CACHE.clear()
+    _MTP_MEMORY_CACHE.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -583,6 +603,339 @@ async def repo_arch_meta(
         log.debug("hf.remote_header_failed", repo_id=repo.repo_id, error=str(exc))
         return ArchMeta(unavailable=f"{type(exc).__name__}: {exc}")
     return ArchMeta(meta=meta, source="remote-gguf-header")
+
+
+# ---------------------------------------------------------------------------
+# Per-quant MTP: does THIS file keep its multi-token-prediction heads?
+# ---------------------------------------------------------------------------
+
+#: A probe's range request. The architecture block of a real header is a few
+#: KB (the llmfan46 27B above has every ``qwen35.*`` key inside the first
+#: 1.5 KB), so one request of this size answers almost every file; it is kept
+#: well above that so a long ``general.description`` or licence text cannot
+#: force a second round trip.
+MTP_PROBE_CHUNK_BYTES: Final = 256 << 10
+
+#: Ceiling on bytes one probe may pull. A header whose tokenizer has not
+#: started by 8 MiB is not shaped like any GGUF llama.cpp writes; refusing is
+#: cheaper than quietly downloading it.
+MTP_PROBE_MAX_BYTES: Final = 8 << 20
+
+#: Probes in flight at once for one repo. Four keeps a 22-quant repo to a few
+#: seconds without hammering the CDN; each probe is one small request.
+MTP_PROBE_CONCURRENCY: Final = 4
+
+
+@dataclass(frozen=True)
+class MtpStatus:
+    """Whether one quant carries MTP heads, and how that is known.
+
+    ``mtp`` is ``True``/``False`` when settled and ``None`` when nothing could
+    say; ``source`` names what settled it -- ``"header"`` (the GGUF's own
+    ``nextn_predict_layers`` key, authoritative) or ``"name"`` (the file or repo
+    name says MTP, a hint to show as "likely"). ``layers`` is the head count
+    when the header gave one; ``detail`` is why a header answer is missing,
+    written for a tooltip.
+    """
+
+    mtp: bool | None = None
+    source: str | None = None
+    layers: int | None = None
+    detail: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        """The three wire fields every quant entry carries."""
+        return {"mtp": self.mtp, "mtp_source": self.source, "mtp_layers": self.layers}
+
+
+MTP_UNKNOWN: Final = MtpStatus()
+
+
+def mtp_from_name(hint: bool) -> MtpStatus:
+    """The name-based answer: "likely" when the name says MTP, else unknown."""
+    return MtpStatus(mtp=True, source="name") if hint else MTP_UNKNOWN
+
+
+def mtp_from_meta(meta: GgufMeta) -> MtpStatus:
+    """The header's answer, from metadata already parsed in full.
+
+    Free whenever a full header is already known -- the context-fit read of
+    the repo's smallest quant, or a downloaded copy in the registry -- because
+    :func:`studioforge.core.gguf.meta_from_gguf` keeps the key in ``extra``.
+    """
+    layers = int(meta.extra.get("nextn_predict_layers") or 0)
+    return MtpStatus(mtp=layers > 0, source="header", layers=layers or None)
+
+
+def mtp_from_kv(kv: Mapping[str, Any], *, complete: bool) -> MtpStatus:
+    """The header's answer from a raw, possibly partial, metadata block.
+
+    ``complete`` says whether the walk reached the end. A partial walk that
+    got as far as the architecture block (``<arch>.block_count`` is present)
+    is conclusive too: llama.cpp's converters write every ``<arch>.*`` key
+    before the tokenizer, and the probe stops only there. A walk that stopped
+    *before* the block -- a writer that put the tokenizer first -- proves
+    nothing, and says so rather than reporting "no heads".
+    """
+    arch = kv.get("general.architecture")
+    if not isinstance(arch, str) or not arch:
+        return MtpStatus(detail="the header has no general.architecture key")
+    raw = kv.get(f"{arch}.nextn_predict_layers")
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        return MtpStatus(mtp=raw > 0, source="header", layers=raw or None)
+    if complete or f"{arch}.block_count" in kv:
+        return MtpStatus(mtp=False, source="header")
+    return MtpStatus(detail="the header walk stopped before the architecture block")
+
+
+def _mtp_stop(key: str, _kv: Mapping[str, Any]) -> bool:
+    """Stop the walk at the first tokenizer key.
+
+    Everything the probe wants (``general.architecture`` and the ``<arch>.*``
+    block) precedes the tokenizer in every GGUF llama.cpp's converters and
+    ``llama-quantize`` produce; the keys those tools append at the *end*
+    (``general.file_type``, ``split.*``) are not architecture keys. The
+    tokenizer's ``tokens``/``merges`` arrays are the several-MB walk this
+    probe exists to avoid.
+    """
+    return key.startswith("tokenizer.")
+
+
+@dataclass
+class _MtpCacheEntry:
+    status: MtpStatus
+    stored_at: float
+
+
+_MTP_MEMORY_CACHE: dict[str, _MtpCacheEntry] = {}
+
+
+def _mtp_cache_get(config: Config, key: str) -> MtpStatus | None:
+    now = time.time()
+    hit = _MTP_MEMORY_CACHE.get(key)
+    if hit is not None:
+        if now - hit.stored_at <= CACHE_TTL_S:
+            return hit.status
+        _MTP_MEMORY_CACHE.pop(key, None)
+    path = _cache_path(config, f"mtp\x00{key}")
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict) or now - float(raw.get("stored_at") or 0) > CACHE_TTL_S:
+        return None
+    mtp = raw.get("mtp")
+    if not isinstance(mtp, bool):
+        return None
+    layers = raw.get("layers")
+    status = MtpStatus(
+        mtp=mtp,
+        source="header",
+        layers=int(layers) if isinstance(layers, int) and not isinstance(layers, bool) else None,
+    )
+    _MTP_MEMORY_CACHE[key] = _MtpCacheEntry(status=status, stored_at=float(raw["stored_at"]))
+    return status
+
+
+def _mtp_cache_put(config: Config, key: str, status: MtpStatus) -> None:
+    now = time.time()
+    _MTP_MEMORY_CACHE[key] = _MtpCacheEntry(status=status, stored_at=now)
+    path = _cache_path(config, f"mtp\x00{key}")
+    payload = {
+        "kind": "mtp",
+        "key": key,
+        "stored_at": now,
+        "mtp": status.mtp,
+        "layers": status.layers,
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+    except OSError as exc:  # pragma: no cover - a read-only data dir must not break browsing
+        log.debug("hf_meta mtp cache write failed", path=str(path), error=str(exc))
+
+
+def _read_remote_mtp(
+    config: Config, url: str, *, max_bytes: int, chunk_bytes: int
+) -> tuple[MtpStatus, dict[str, int]]:
+    """Blocking half of :func:`remote_mtp`: one bounded range read. Runs in a thread."""
+    filename = url.rsplit("/", 1)[-1]
+    with open_client() as client:
+        remote = RemoteRangeFile(
+            client,
+            url,
+            headers=_auth_headers(config),
+            chunk_bytes=chunk_bytes,
+            max_bytes=max_bytes,
+        )
+        try:
+            parsed = gguf_mod._read_stream(
+                cast(BinaryIO, remote),
+                Path(filename),
+                load_tensors=False,
+                max_array_len=1,
+                stop_before=_mtp_stop,
+            )
+        finally:
+            remote.close()
+    status = mtp_from_kv(parsed.kv, complete=parsed.kv_complete)
+    return status, {"bytes_fetched": remote.bytes_fetched, "requests": remote.requests}
+
+
+async def remote_mtp(
+    config: Config,
+    repo_id: str,
+    filename: str,
+    *,
+    revision: str = "main",
+    max_bytes: int = MTP_PROBE_MAX_BYTES,
+    chunk_bytes: int = MTP_PROBE_CHUNK_BYTES,
+) -> MtpStatus:
+    """Whether one file on HuggingFace keeps its MTP heads, from its header.
+
+    Cheapest source first: a full header already cached for this file (the
+    context-fit read of the repo's smallest quant lands here for free), then
+    this probe's own memory/disk cache, then one bounded range read that stops
+    at the tokenizer. A header answer is cached for :data:`CACHE_TTL_S`; an
+    inconclusive one is not, so a transient oddity is retried next time.
+
+    Raises :class:`RemoteHeaderError` for anything that stops the read, the
+    same way :func:`remote_meta` does; callers degrade to the name hint.
+    """
+    from studioforge.core.gguf import GgufError
+    from studioforge.core.hf_search import file_url
+
+    key = _cache_key(repo_id, revision, filename)
+    full = _cache_get(config, key)
+    if full is not None:
+        return mtp_from_meta(full)
+    cached = _mtp_cache_get(config, key)
+    if cached is not None:
+        return cached
+
+    url = file_url(repo_id, filename, endpoint=_endpoint(), revision=revision)
+    started = time.perf_counter()
+    try:
+        status, stats = await asyncio.to_thread(
+            _read_remote_mtp, config, url, max_bytes=max_bytes, chunk_bytes=chunk_bytes
+        )
+    except GgufError as exc:
+        raise RemoteHeaderError(
+            f"the remote header of {repo_id}/{filename} is not readable as GGUF: {exc}"
+        ) from exc
+    log.debug(
+        "hf.remote_mtp",
+        repo_id=repo_id,
+        filename=filename,
+        mtp=status.mtp,
+        layers=status.layers,
+        kib=stats["bytes_fetched"] // 1024,
+        requests=stats["requests"],
+        ms=int((time.perf_counter() - started) * 1000),
+    )
+    if status.source == "header":
+        _mtp_cache_put(config, key, status)
+    return status
+
+
+def registry_file_meta(registry: Any, repo_id: str, filename: str) -> GgufMeta | None:
+    """Metadata of *this exact file* if a downloaded copy is already registered.
+
+    Stricter than :func:`registry_sibling_meta`, which answers geometry from
+    any quant of the repo: MTP is per file (a repo can ship a quant with and
+    without the heads), so only a record whose basename matches counts.
+    """
+    if registry is None or "/" not in repo_id:
+        return None
+    publisher, _, name = repo_id.partition("/")
+    publisher = publisher.strip().lower()
+    name = name.strip().lower()
+    wanted = PurePosixPath(filename.replace("\\", "/")).name.lower()
+    try:
+        records = registry.all()
+    except Exception:  # noqa: BLE001 - a sick registry must not break browsing
+        return None
+    for record in records:
+        meta = getattr(record, "meta", None)
+        if meta is None or meta.is_mmproj:
+            continue
+        if (record.publisher or "").strip().lower() != publisher:
+            continue
+        if (record.repo or "").strip().lower() != name:
+            continue
+        if Path(record.path).name.lower() != wanted:
+            continue
+        return cast("GgufMeta", meta)
+    return None
+
+
+async def quant_mtp_status(
+    config: Config, option: Any, *, registry: Any = None, revision: str = "main"
+) -> MtpStatus:
+    """The best available MTP answer for one logical download.
+
+    The header of shard 1 (the only shard llama.cpp writes full metadata to),
+    read from a registered local copy when there is one and over the network
+    otherwise; when no header can be read, the name hint carried on the
+    option, with the reason kept in ``detail`` for the tooltip.
+    """
+    files = list(getattr(option, "files", []) or [])
+    hint = bool(getattr(option, "mtp_hint", False))
+    if not files:
+        return mtp_from_name(hint)
+    filename = str(files[0].filename)
+    local = registry_file_meta(registry, option.repo_id, filename)
+    if local is not None:
+        return mtp_from_meta(local)
+    try:
+        status = await remote_mtp(config, option.repo_id, filename, revision=revision)
+    except StudioForgeError as exc:
+        status = MtpStatus(detail=exc.message)
+    except Exception as exc:  # noqa: BLE001 - browsing must survive any transport surprise
+        status = MtpStatus(detail=f"{type(exc).__name__}: {exc}")
+    if status.source == "header":
+        return status
+    log.debug(
+        "hf.remote_mtp_unsettled", repo_id=option.repo_id, filename=filename, why=status.detail
+    )
+    name = mtp_from_name(hint)
+    return MtpStatus(mtp=name.mtp, source=name.source, detail=status.detail)
+
+
+async def repo_mtp_status(
+    config: Config,
+    options: Sequence[Any],
+    *,
+    registry: Any = None,
+    concurrency: int = MTP_PROBE_CONCURRENCY,
+    on_result: Callable[[Any, MtpStatus], None] | None = None,
+) -> dict[str, MtpStatus]:
+    """MTP status for every quant of a repo, keyed by ``group_id``.
+
+    Probes run at most ``concurrency`` at a time and never fail the whole
+    walk: each quant degrades on its own. ``on_result`` is called as each
+    answer lands, so a GUI can update the badge for that row while the rest
+    are still in flight instead of waiting for the slowest.
+    """
+    semaphore = asyncio.Semaphore(max(1, int(concurrency)))
+    results: dict[str, MtpStatus] = {}
+
+    async def one(option: Any) -> None:
+        async with semaphore:
+            try:
+                status = await quant_mtp_status(config, option, registry=registry)
+            except Exception as exc:  # noqa: BLE001 - one row's surprise is not the repo's
+                log.debug("hf.mtp_probe_failed", repo_id=option.repo_id, error=str(exc))
+                status = MtpStatus(detail=f"{type(exc).__name__}: {exc}")
+        results[str(option.group_id)] = status
+        if on_result is not None:
+            try:
+                on_result(option, status)
+            except Exception as exc:  # noqa: BLE001 - one dead row must not stop the others
+                log.debug("hf.mtp_on_result_failed", repo_id=option.repo_id, error=str(exc))
+
+    await asyncio.gather(*(one(option) for option in options))
+    return results
 
 
 # ---------------------------------------------------------------------------

@@ -56,6 +56,7 @@ __all__ = [
     "LogicalDownload",
     "age_days",
     "file_url",
+    "looks_like_mtp_name",
     "parse_quant",
     "safe_filename",
     "shard_parts",
@@ -152,6 +153,32 @@ def parse_quant(filename: str) -> str:
     """
     label = quant_label_from_filename(Path(filename))
     return label or UNKNOWN_QUANT
+
+
+#: Separators publishers actually use inside repo and file names. ``/`` is in
+#: the set so a path like ``MTP/mtp-foo.gguf`` tokenises the same way whether
+#: the caller passes the basename or the repo-relative path.
+_NAME_TOKEN_RE: Final = re.compile(r"[-_.\s/]+")
+
+
+def looks_like_mtp_name(name: str) -> bool:
+    """Whether a repo or file name carries an ``MTP`` token (no I/O).
+
+    A *hint*, never a verdict. Publishers spell "this GGUF keeps its
+    multi-token-prediction heads" as ``Native-MTP-Preserved`` in the repo name
+    or ``-MTP-`` in the file name, but the spelling is a convention, not a
+    contract: LIMITATIONS.md records a ``...-MTP-GGUF`` repo whose files carry
+    no such heads at all, and unsloth's Qwen3.8 quants carry them under names
+    that never say so. Only the GGUF header (``<arch>.nextn_predict_layers``)
+    settles it, which is what :mod:`studioforge.core.hf_meta` reads; this
+    function is what the search page shows while that read has not happened.
+
+    Tokens, never substrings, for the reason
+    :func:`studioforge.core.gguf.looks_like_auxiliary_gguf` gives: nothing in
+    ``Qwen3.8-27B-Q4_K_M`` should match, and nothing in a publisher's handle
+    should either -- pass the repo *name*, not the owner.
+    """
+    return "mtp" in {token for token in _NAME_TOKEN_RE.split(name.lower()) if token}
 
 
 def shard_parts(filename: str) -> tuple[int | None, int | None]:
@@ -349,6 +376,10 @@ class LogicalDownload:
     #: models at the same quant, so ``group_id`` stays unique without changing
     #: shape for the 99% case.
     discriminator: str = ""
+    #: The *name* says this file keeps its multi-token-prediction heads. Set by
+    #: :meth:`GgufRepoInfo.logical_models` (see the rule there); a hint for the
+    #: UI to show as "likely" until the header confirms or denies it.
+    mtp_hint: bool = False
 
     @property
     def group_id(self) -> str:
@@ -399,6 +430,18 @@ class LogicalDownload:
     @property
     def is_sharded(self) -> bool:
         return len(self.files) > 1
+
+    @property
+    def in_subfolder(self) -> bool:
+        """True when any file sits below a directory inside the repo.
+
+        Such a download would be refused at enqueue time by
+        :func:`safe_filename` (a path separator cannot be a single file in the
+        model directory), so the picker greys the row out with that reason
+        instead of offering a button that fails on click. unsloth's
+        ``BF16/...-00001-of-00002.gguf`` is the common case.
+        """
+        return any("/" in f.filename or "\\" in f.filename for f in self.all_files)
 
     @property
     def label(self) -> str:
@@ -473,6 +516,24 @@ class GgufRepoInfo:
         """False for results from :meth:`HfSearch.search` (list endpoint has no sizes)."""
         return bool(self.files) and all(f.size_known for f in self.files)
 
+    @property
+    def loadable_files(self) -> list[GgufFileInfo]:
+        """The files that can become quants: not a projector, not a draft module."""
+        return [f for f in self.files if not f.is_mmproj and not f.is_auxiliary]
+
+    @property
+    def mtp_hint(self) -> bool:
+        """Whether the repo's name, or any loadable file's, says MTP.
+
+        Free at search time (names only), which is what lets a search row
+        carry a "likely MTP" chip without a header read per row. The ``MTP/``
+        draft modules unsloth ships are excluded: they are auxiliary files,
+        and their being present says nothing about the quants beside them.
+        """
+        if looks_like_mtp_name(self.name):
+            return True
+        return any(looks_like_mtp_name(f.filename) for f in self.loadable_files)
+
     def logical_models(self) -> list[LogicalDownload]:
         """Group the repo's files into individually selectable downloads.
 
@@ -489,17 +550,24 @@ class GgufRepoInfo:
           never offered. It parses as one by filename, which is how a 26B repo
           came to list "Q4_0 2.14 GiB" and "unknown 0.88 GiB" beside its one
           real 13 GiB weight file, each badged as fitting on a single GPU.
+
+        The ``mtp_hint`` each entry carries follows one rule: when *any*
+        loadable file in the repo names MTP, only those files are hinted --
+        the unmarked ones beside them are, in every repo seen so far, the
+        stripped variants -- and when no file says it, the repo name speaks
+        for all of them (``...-Native-MTP-Preserved-NVFP4-GGUF`` ships files
+        whose names never mention it).
         """
         buckets: dict[tuple[str, str], list[GgufFileInfo]] = {}
-        for info in self.files:
-            if info.is_mmproj or info.is_auxiliary:
-                continue
+        for info in self.loadable_files:
             buckets.setdefault((info.quant, shard_base(info.filename)), []).append(info)
 
         # Only disambiguate when a quant really is ambiguous, so the common
         # repo keeps the plain "<repo>:<quant>" group id.
         quant_counts = Counter(quant for quant, _ in buckets)
         projectors = self.mmproj_files
+        any_file_says_mtp = any(looks_like_mtp_name(f.filename) for f in self.loadable_files)
+        repo_says_mtp = looks_like_mtp_name(self.name)
 
         out: list[LogicalDownload] = []
         for (quant, base), parts in sorted(buckets.items(), key=lambda kv: kv[0]):
@@ -531,6 +599,11 @@ class GgufRepoInfo:
                     mmproj=mmproj,
                     total_bytes=total,
                     discriminator="" if quant_counts[quant] == 1 else base,
+                    mtp_hint=(
+                        looks_like_mtp_name(parts[0].filename)
+                        if any_file_says_mtp
+                        else repo_says_mtp
+                    ),
                 )
             )
         return out
