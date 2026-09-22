@@ -3273,7 +3273,7 @@ def test_the_gui_chat_tab_loads_at_the_chat_tier() -> None:
     from studioforge.gui.tabs import chat
 
     source = inspect.getsource(chat)
-    assert f"ensure_loaded(model_id, priority={PRIORITY_CHAT})" in source
+    assert f"ensure_loaded(model_id, priority={PRIORITY_CHAT}," in source
 
 
 # ---------------------------------------------------------------------------

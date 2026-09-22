@@ -52,6 +52,11 @@ _STATE_BADGES: dict[str, tuple[str, str]] = {
     "none": ("No model", "grey"),
 }
 
+#: Client-side focus handler for the model picker (see where it is attached).
+_SELECT_ALL_ON_FOCUS = (
+    "(e) => { const i = e && e.target; if (i && i.select) setTimeout(() => i.select(), 0); }"
+)
+
 _PASTE_SCRIPT = """
 <script>
 document.addEventListener('paste', (event) => {
@@ -100,6 +105,10 @@ def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one fl
                     with_input=True,
                 )
                 model.props("dense outlined options-dense").classes("grow min-w-0")
+                # NiceGUI fills the filter input with the selected label, so typing
+                # edited "(Loaded model) — <id>" in place instead of filtering.
+                # Selecting the text on focus makes the first keystroke replace it.
+                model.on("focus", js_handler=_SELECT_ALL_ON_FOCUS)
                 load_button = ui.button("Load", icon="play_arrow").props("outline no-caps")
                 with load_button:
                     load_tip = ui.tooltip("")
@@ -585,7 +594,7 @@ async def _ensure(ctx: GuiContext, model_id: str) -> tuple[Any, Any]:
     package imports nothing from ``core``; the tiers live in
     ``studioforge/core/priority.py`` (PRIORITY_CHAT).
     """
-    record, instance = await ctx.manager.ensure_loaded(model_id, priority=1)
+    record, instance = await ctx.manager.ensure_loaded(model_id, priority=1, source="gui:chat")
     return record, instance
 
 
@@ -702,7 +711,11 @@ async def _stream(
     painted_at = 0.0
     ctx.supervisor.mark_request_start(serving_id)
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0)) as client:
+        # Loopback plain HTTP: skipping the TLS context (certifi load) and proxy
+        # discovery keeps ~0.15 s of client setup out of the measured total.
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(600.0, connect=10.0), verify=False, trust_env=False
+        ) as client:
             result.sent_at = time.perf_counter()
             async with client.stream(
                 "POST", f"{base}/v1/chat/completions", json=payload
