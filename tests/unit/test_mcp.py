@@ -537,7 +537,12 @@ async def test_list_models_never_leaks_a_chat_template_or_meta_dump(state: State
     # only kind of growth this budget should tolerate -- the PER-MODEL cost is
     # unchanged, because both new keys are dropped from the compact entry until
     # a parallel benchmark makes them say something (`_compact_recommended`).
-    assert len(raw) < 13650, f"list_models output is {len(raw)} chars"
+    #
+    # Re-anchored at D66 by ~150 characters, again ALL in `catalog_hint`: the
+    # sentence saying `arch_supported: false` means "cannot load, pick another".
+    # Per model it costs nothing on a loadable row -- the compact view drops a
+    # `true`, and a `null` like every null.
+    assert len(raw) < 13800, f"list_models output is {len(raw)} chars"
 
 
 async def test_model_options_returns_the_whole_table_for_one_model(state: State) -> None:

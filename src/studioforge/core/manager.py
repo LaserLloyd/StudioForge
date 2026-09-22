@@ -13,11 +13,18 @@ import asyncio
 import contextlib
 import time
 from collections import deque
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
 from studioforge.config import Config, KvCacheType
+from studioforge.core.arch_support import (
+    ArchVerdict,
+    StartupRejection,
+    StartupRejectionMemo,
+    file_signature,
+    startup_rejection,
+)
 from studioforge.core.gpu import vram_processes
 from studioforge.core.leases import (
     DEFAULT_IDLE_TTL_S,
@@ -46,6 +53,7 @@ from studioforge.errors import (
     ModelNotFoundError,
     ModelUnloadError,
     StudioForgeError,
+    UnsupportedArchitectureError,
 )
 from studioforge.logging import get_logger
 from studioforge.types import (
@@ -606,6 +614,19 @@ class ModelManager:
         #: calibration wants "averaged over a long enough window to mean
         #: something".
         self._throughput_gauges: dict[str, dict[str, Any]] = {}
+        #: Launches that already died because the build did not know the model
+        #: (D66, core.arch_support). In memory by design: a restart clears it
+        #: and the library probe answers again at the next load.
+        self._arch_rejections = StartupRejectionMemo()
+        #: (model, build, name) the background passes -- pin reconciler,
+        #: rebalancer, boot autoload -- already logged as unloadable, so a
+        #: standing refusal is one WARNING rather than one per sweep (D66).
+        self._arch_skip_logged: set[tuple[str, str | None, str]] = set()
+        #: serving id -> ``{at, code, message, engine_tag}`` of its last launch
+        #: that died (D66): the supervisor drops a failed child from its table,
+        #: and a listing that says only ``stopped`` hides why. Cleared by the
+        #: next successful load of that model.
+        self._last_load_failure: dict[str, dict[str, Any]] = {}
 
     # -- lifecycle --------------------------------------------------------
 
@@ -874,10 +895,17 @@ class ModelManager:
         of [0, 1] with only CUDA 0 leased therefore passed here, and every
         streaming on-demand load met the refusal as an error frame inside an
         HTTP 200 -- for four and a half hours on 2026-09-13.
+
+        D66: an architecture the build cannot load is refused here first, with
+        its 400 -- a certain, permanent answer that must never reach a client as
+        an error frame, nor hide behind a lease refusal that invites a wait.
         """
         instance = self.supervisor.get(model_id)
         if instance is not None and instance.state in ("ready", "loading"):
             return
+        record_for_arch = self.registry.resolve(model_id)
+        if record_for_arch is not None:
+            self._refuse_unsupported(self.serving_record(record_for_arch))
         blocked = self.leases.blocked_for(model_id)
         if not blocked:
             return
@@ -919,6 +947,328 @@ class ModelManager:
             ],
         )
         raise self._vram_error(rejected)
+
+    # -- architecture preflight (D66) -------------------------------------
+
+    def _arch_table_for(
+        self, tag: str | None, memo: dict[Any, Any] | None
+    ) -> tuple[Any, str | None]:
+        """``(architecture table or None, resolved tag)`` for a load asking for ``tag``.
+
+        Asked of the supervisor, which resolves the binary a spawn would run, so
+        the answer is about that very build (the pin, else the active engine). A
+        stand-in supervisor without the accessor -- tests, the catalog's
+        throwaway objects -- answers "cannot tell", which never refuses.
+        """
+        if memo is not None and tag in memo:
+            cached: tuple[Any, str | None] = memo[tag]
+            return cached
+        table: Any = None
+        lookup = getattr(self.supervisor, "architecture_table", None)
+        if lookup is not None:
+            try:
+                table = lookup(tag)
+            except Exception as exc:  # noqa: BLE001 - "cannot tell" never refuses
+                log.debug("architecture table unavailable", engine_tag=tag, error=str(exc))
+                table = None
+        resolved: str | None = tag
+        resolver = getattr(self.supervisor, "resolved_engine_tag", None)
+        if resolver is not None:
+            try:
+                resolved = resolver(tag) or tag
+            except Exception:  # noqa: BLE001 - naming the build is never fatal
+                resolved = tag
+        result = (table, resolved)
+        if memo is not None:
+            memo[tag] = result
+        return result
+
+    def _scan_marker(self) -> float | None:
+        """The registry's last scan time: a rescan forgets remembered rejections (D66)."""
+        marker = getattr(self.registry, "last_scan_at", None)
+        if callable(marker):  # a property on the real registry, a method on some doubles
+            try:
+                marker = marker()
+            except Exception:  # noqa: BLE001 - bookkeeping only
+                return None
+        return float(marker) if isinstance(marker, int | float) else None
+
+    def arch_verdict(
+        self, record: ModelRecord, *, memo: dict[Any, Any] | None = None
+    ) -> ArchVerdict:
+        """Can the build that would serve ``record`` load its architecture? (D66)
+
+        The build is the one a spawn would use: the serving record's
+        ``settings.engine_tag`` pin, else the active engine. ``False`` when that
+        build's ``llama`` library does not name the architecture (``source:
+        "binary"``), or when a launch of this model file on it already died of
+        "unknown model architecture" / "unknown pre-tokenizer type" and nothing
+        has changed since (``source: "runtime"``); ``True`` when the library
+        names it; ``None`` when nothing can be told. ``memo`` (any dict, fresh
+        per listing) shares the per-build lookups across the rows of one answer.
+        """
+        serving = self.serving_record(record)
+        arch = serving.architecture
+        if (not arch or arch == "unknown") and serving.meta is not None:
+            arch = serving.meta.architecture
+        pin = serving.settings.engine_tag
+        table, tag = self._arch_table_for(pin, memo)
+        known = table.knows(arch) if table is not None else None
+        rejection = None
+        if known is not False and len(self._arch_rejections):
+            rejection = self._arch_rejections.lookup(
+                serving.path,
+                tag,
+                engine_signature=table.signature if table is not None else None,
+                scan_marker=self._scan_marker(),
+            )
+        if known is not False and rejection is None:
+            return ArchVerdict(
+                model_id=serving.id,
+                architecture=arch,
+                supported=known,
+                engine_tag=tag,
+                pinned=bool(pin),
+            )
+        active_tag: str | None = None
+        active_known: bool | None = None
+        if pin:
+            active_table, active_tag = self._arch_table_for(None, memo)
+            if rejection is not None and rejection.kind == "pre_tokenizer":
+                active_known = None  # a library cannot answer for a pre-tokenizer
+            elif active_table is not None:
+                active_known = active_table.knows(rejection.name if rejection else arch)
+        if rejection is not None:
+            return ArchVerdict(
+                model_id=serving.id,
+                architecture=arch,
+                supported=False,
+                engine_tag=tag,
+                pinned=bool(pin),
+                source="runtime",
+                rejected_kind=rejection.kind,
+                rejected_name=rejection.name if rejection.name != arch else None,
+                first_failed_at=rejection.first_failed_at,
+                active_tag=active_tag,
+                active_supports=active_known,
+            )
+        return ArchVerdict(
+            model_id=serving.id,
+            architecture=arch,
+            supported=False,
+            engine_tag=tag,
+            pinned=bool(pin),
+            source="binary",
+            active_tag=active_tag,
+            active_supports=active_known,
+        )
+
+    def arch_verdicts(self, records: Iterable[ModelRecord]) -> dict[str, ArchVerdict]:
+        """:meth:`arch_verdict` for many records, each build looked up once."""
+        memo: dict[Any, Any] = {}
+        out: dict[str, ArchVerdict] = {}
+        for record in records:
+            try:
+                out[record.id] = self.arch_verdict(record, memo=memo)
+            except Exception as exc:  # noqa: BLE001 - a listing must survive one bad row
+                log.debug("architecture verdict failed", model_id=record.id, error=str(exc))
+        return out
+
+    def unsupported_reason(self, record: ModelRecord) -> str | None:
+        """A short reason this model cannot be loaded, or ``None`` (D66).
+
+        ``None`` when it is loadable *or* when that cannot be told -- only a
+        certain "no" earns a reason. The GUI's Chat tab disables Load on it and
+        skips such models when it defaults to the newest download.
+        """
+        try:
+            return self.arch_verdict(record).note()
+        except Exception as exc:  # noqa: BLE001 - a display question, never an error
+            log.debug("architecture verdict failed", model_id=record.id, error=str(exc))
+            return None
+
+    def load_support_fields(
+        self, record: ModelRecord, *, memo: dict[Any, Any] | None = None
+    ) -> dict[str, Any]:
+        """What a listing row says about loading this model (D66).
+
+        ``arch_supported`` (``true`` / ``false`` / ``null``) with ``arch_note``
+        when false; for a certain no also ``engine_supported: false`` and
+        ``unsupported_reason`` (the full refusal); and ``last_load_failure``
+        whenever the last launch of this model died -- the failed instance is
+        gone from the supervisor's table, so this is the only place it shows.
+        """
+        verdict = self.arch_verdict(record, memo=memo)
+        fields = verdict.fields()
+        if verdict.supported is False:
+            fields["engine_supported"] = False
+            fields["unsupported_reason"] = verdict.message()
+        failure = self._last_load_failure.get(self.serving_record(record).id)
+        if failure is not None:
+            fields["last_load_failure"] = dict(failure)
+        return fields
+
+    def forget_arch_rejections(self, tag: str | None = None, what: str = "") -> int:
+        """Forget every remembered startup rejection (D66); the engine changed.
+
+        Wired to ``EngineManager.on_engine_change``, so an install or an
+        activation -- by the route, the GUI or boot -- gives every model a fresh
+        verdict from the build that will actually serve it.
+        """
+        dropped = self._arch_rejections.clear()
+        self._arch_skip_logged.clear()
+        self._catalog_cache = None
+        if dropped:
+            log.info(
+                "forgot remembered architecture rejections",
+                count=dropped,
+                engine_tag=tag,
+                reason=what or None,
+            )
+        return dropped
+
+    def arch_check(self, model_id: str) -> None:
+        """Raise the 400 a load of this model would meet on its architecture (D66).
+
+        The streaming twin of the refusal every load path makes, like
+        :meth:`lease_check`: a streaming request loads inside the SSE body, and a
+        refusal that is certain before the ``200`` must be a real HTTP status,
+        not an error frame. A model already serving is never refused -- no load
+        is needed -- and an unknown id returns silently for the caller's own
+        resolution to answer with its 404.
+        """
+        record = self.registry.resolve(model_id)
+        if record is None:
+            return
+        self._refuse_unsupported(self.serving_record(record), skip_if_ready=True)
+
+    def _refuse_unsupported(self, record: ModelRecord, *, skip_if_ready: bool = False) -> None:
+        """Raise :class:`UnsupportedArchitectureError` when the verdict is a certain no.
+
+        The one helper every side-effecting entry calls first (D66): ``load``,
+        ``ensure_loaded``, ``load_recommended``/``plan_recommended``,
+        ``plan_preview``, ``lease_check``, ``acquire_lease``, ``_load_locked``
+        and the D41/D42 background passes. ``skip_if_ready`` is for paths that
+        return a ready resident untouched: no child is launched, so nothing can
+        fail. A forced reload passes ``False`` -- it launches, on whatever build
+        a launch uses *now*.
+        """
+        if skip_if_ready:
+            instance = self.supervisor.get(record.id)
+            if instance is not None and instance.state == "ready":
+                return
+        verdict = self.arch_verdict(record)
+        if verdict.supported is False:
+            raise verdict.error()
+
+    def _arch_skip(self, record: ModelRecord, *, what: str) -> bool:
+        """True when a background pass must leave ``record`` alone (D66).
+
+        Logs one WARNING per model, build and name -- the pin reconciler sweeps
+        every 15 s, and a refusal that cannot change until a build is installed
+        is worth saying once, not 5,760 times a day.
+        """
+        try:
+            verdict = self.arch_verdict(record)
+        except Exception as exc:  # noqa: BLE001 - a background pass must not die here
+            log.debug("architecture verdict failed", model_id=record.id, error=str(exc))
+            return False
+        if verdict.supported is not False:
+            return False
+        key = (verdict.model_id, verdict.engine_tag, verdict.rejected_name or verdict.architecture)
+        if key not in self._arch_skip_logged:
+            self._arch_skip_logged.add(key)
+            log.warning(
+                "unsupported architecture: not loading",
+                model_id=verdict.model_id,
+                architecture=verdict.architecture,
+                engine_tag=verdict.engine_tag,
+                source=verdict.source,
+                by=what,
+                detail=verdict.message(),
+            )
+        return True
+
+    def _note_load_failure(self, record: ModelRecord, exc: StudioForgeError) -> None:
+        """Keep the last launch failure where a listing can show it (D66).
+
+        ``Supervisor.start`` drops a child that failed to start from its table,
+        so without this ``GET /api/models`` reads ``state: stopped`` with no
+        trace of why. The message's first line only: the stderr tail is in the
+        model's log and in the error that was returned.
+        """
+        lines = (exc.message or "").strip().splitlines()
+        _table, tag = self._arch_table_for(record.settings.engine_tag, None)
+        self._last_load_failure[record.id] = {
+            "at": time.time(),
+            "code": exc.code,
+            "message": (lines[0] if lines else "")[:500],
+            "engine_tag": tag,
+        }
+
+    def _raise_if_rejected_at_startup(self, record: ModelRecord, exc: ModelLoadError) -> None:
+        """Turn a launch that died of "unknown architecture" into the typed refusal (D66).
+
+        The belt and braces for whatever the library probe could not answer. Only
+        the two "this build does not know this model" markers count -- never a
+        missing file or a bad flag. The rejection is remembered against ``(model
+        path, mtime, build tag)``, so the next load of it is refused before it
+        holds, plans, leases, evicts or spawns -- until the file or the build
+        changes, the library is rescanned, or the process restarts. Returns (and
+        the caller re-raises the original) for any other failure.
+        """
+        stderr = exc.details.get("stderr") if isinstance(exc.details, dict) else None
+        tail = [str(line) for line in stderr] if isinstance(stderr, list) else []
+        found = startup_rejection(tail)
+        if found is None:
+            return
+        kind, name = found
+        table, tag = self._arch_table_for(record.settings.engine_tag, None)
+        signature = file_signature(record.path)
+        if signature is not None:
+            # A file that cannot be stat'ed cannot be keyed; the refusal below
+            # still stands for this request.
+            self._arch_rejections.record(
+                StartupRejection(
+                    path=str(record.path),
+                    mtime_ns=signature[0],
+                    engine_tag=tag,
+                    model_id=record.id,
+                    kind=kind,
+                    name=name,
+                    architecture=record.architecture,
+                    engine_signature=table.signature if table is not None else None,
+                    scan_marker=self._scan_marker(),
+                )
+            )
+        # The catalog recommends by the verdict; a cached one would keep
+        # recommending this model for another CACHE_TTL_S.
+        self._catalog_cache = None
+        log.warning(
+            "the engine rejected the model at startup; not launching it on this build again",
+            model_id=record.id,
+            engine_tag=tag,
+            kind=kind,
+            name=name,
+        )
+        verdict = self.arch_verdict(record)
+        if verdict.supported is not False:
+            # Unkeyable (the file could not be stat'ed): refuse this request
+            # with the same words, without remembering it.
+            verdict = ArchVerdict(
+                model_id=record.id,
+                architecture=record.architecture,
+                supported=False,
+                engine_tag=tag,
+                pinned=bool(record.settings.engine_tag),
+                source="runtime",
+                rejected_kind=kind,
+                rejected_name=name if name != record.architecture else None,
+                first_failed_at=time.time(),
+            )
+        error = verdict.error()
+        error.details["stderr"] = tail
+        raise error from exc
 
     def _refuse_if_held(self, model_id: str, *, priority: int) -> None:
         """503 anything a standing chat/agent load outranks (D46).
@@ -997,6 +1347,10 @@ class ModelManager:
         if record is None:
             raise ModelNotFoundError(name, known=self.registry.known_ids())
         serving = self.serving_record(record)
+        # D66: a build that cannot load this architecture refuses here -- before
+        # the hold, the gate, the planner and any eviction. A JIT client retrying
+        # such a model used to re-plan (and evict for) every single request.
+        self._refuse_unsupported(serving, skip_if_ready=True)
         requested = normalise_priority(priority)
         tier = requested if requested is not None else self._effective_priority(serving.id)
         self._refuse_if_held(serving.id, priority=tier)
@@ -1158,6 +1512,12 @@ class ModelManager:
         if record is None:
             raise ModelNotFoundError(name, known=self.registry.known_ids())
         record = self.serving_record(record)
+        # D66, before anything is held, queued, planned or evicted. A ready
+        # resident this call would hand back untouched is exempt; a forced
+        # reload is not -- it launches on whatever build a launch uses now, and
+        # a refusal here keeps the running child serving (the rebalancer, the
+        # restore, the benchmarks and "activate + reload" all come through here).
+        self._refuse_unsupported(record, skip_if_ready=not force)
         if devices is not None:
             record = record.model_copy(
                 update={
@@ -1206,12 +1566,12 @@ class ModelManager:
         tier = self._resolve_tier(record.id, priority)
         if hold_traffic:
             self._refuse_if_held(record.id, priority=tier)
-        if normalise_priority(priority) is not None:
-            # An explicit tier is the caller saying what this model *is*;
-            # remember it so a TTL unload and JIT reload keep it (D46).
-            # Written only past the admission gate: a load the hold just
-            # refused must not re-tier the model as a side effect.
-            self._model_priority[record.id] = tier
+        # An explicit tier is the caller saying what this model *is*; it is
+        # remembered so a TTL unload and JIT reload keep it (D46) -- but only
+        # once this load has succeeded (D66, review item 19). Written here, before
+        # the lock, it re-tiered the model for a load the hold, the planner or
+        # the engine then refused.
+        explicit_tier = normalise_priority(priority) is not None
         hold = tier < PRIORITY_BACKGROUND and hold_traffic
         # The child we are about to queue behind, identified by its launch
         # number rather than by its identity: the per-model lock can be held for
@@ -1229,7 +1589,8 @@ class ModelManager:
                 reload_of: str | None = None
                 if existing is not None and existing.state == "ready":
                     if not force:
-                        if normalise_priority(priority) is not None:
+                        if explicit_tier:
+                            self._model_priority[record.id] = tier
                             self._retier_resident(record, existing, tier)
                         return existing
                     if self._reload_already_done(
@@ -1242,9 +1603,10 @@ class ModelManager:
                         devices=devices,
                         allowed_devices=allowed_devices,
                     ):
-                        if normalise_priority(priority) is not None:
+                        if explicit_tier:
                             # The reload folds; the tier the caller stated does
                             # not. Same re-stamp the un-forced path does (D46).
+                            self._model_priority[record.id] = tier
                             self._retier_resident(record, existing, tier)
                         log.info(
                             "forced_reload_coalesced",
@@ -1256,7 +1618,7 @@ class ModelManager:
                         )
                         return existing
                     reload_of = record.id
-                return await self._load_locked(
+                instance = await self._load_locked(
                     record,
                     ctx_size=ctx_size,
                     kv_cache_type=kv_cache_type,
@@ -1271,6 +1633,9 @@ class ModelManager:
                     priority=tier,
                     hold=hold,
                 )
+                if explicit_tier:
+                    self._model_priority[record.id] = tier
+                return instance
         finally:
             # The same waiter bookkeeping ensure_loaded keeps: without it,
             # _prune_lock can discard a lock this call is queued on, and two
@@ -1638,10 +2003,9 @@ class ModelManager:
         )
         record = prep.record
         self._refuse_if_held(record.id, priority=prep.tier)
-        if prep.asked_tier is not None:
-            # Same rule as load(): an explicit tier is remembered, but only
-            # past the admission gate (D46).
-            self._model_priority[record.id] = prep.tier
+        # Same rule as load(): an explicit tier is remembered only once the
+        # load has succeeded (D46; D66 review item 19) -- the already-loaded
+        # branch below writes it, and the inner load() writes it on success.
 
         hold = prep.tier < PRIORITY_BACKGROUND
         try:
@@ -1681,6 +2045,7 @@ class ModelManager:
                         # persist below prices the tier this call just asked
                         # for rather than the stale one still stamped on the
                         # child.
+                        self._model_priority[record.id] = prep.tier
                         self._retier_resident(record, resident, prep.tier)
                     if persist:
                         # The caller asked for this profile to become the
@@ -1819,6 +2184,11 @@ class ModelManager:
         if requested is None:
             raise ModelNotFoundError(name, known=self.registry.known_ids())
         record = self.serving_record(requested)
+        # D66: before the mode walk, the hold and any eviction -- and the dry
+        # run refuses identically. A ready resident is exempt here because the
+        # walk may hand it back as already loaded; a walk that reloads it goes
+        # through load(force=True), which checks again before it plans.
+        self._refuse_unsupported(record, skip_if_ready=True)
         # Before anything expensive, for the same reason ``persist`` is checked
         # here: a contradiction between this call and the model's saved
         # settings is knowable immediately, and a 400 the caller could have had
@@ -2558,6 +2928,10 @@ class ModelManager:
         numbers. The per-model lock is taken first, then the gate, everywhere,
         so the two cannot deadlock.
         """
+        # D66, before this load is marked in flight, holds worse-tier traffic
+        # or queues at the gate: a doomed tier-1 load would otherwise 503 other
+        # models' requests for as long as it took the engine to say no.
+        self._refuse_unsupported(record)
         if self._load_gate.locked():
             log.info(
                 "waiting for another model load to finish before planning",
@@ -2673,6 +3047,11 @@ class ModelManager:
             if settled is not None:
                 return settled
 
+        # D66 backstop, behind the gate and before the lease profile, the planner
+        # and any eviction: every internal caller (pin reconciler, rebalancer,
+        # restore, autoload, smoke test, benchmarks) reaches the spawn through
+        # here, and the build may have changed while this load queued.
+        self._refuse_unsupported(record)
         record, parallel_auto = self._apply_lease_profile(record)
         if record.capabilities.thinking and not (
             record.settings.reasoning_format
@@ -2782,11 +3161,25 @@ class ModelManager:
                 allow_evict=allow_evict,
                 priority=priority,
             )
+        except ModelLoadError as exc:
+            # D66: "unknown model architecture" / "unknown pre-tokenizer type"
+            # becomes the typed 400 and is remembered for this file and build;
+            # anything else propagates unchanged. Either way the failure is kept
+            # for the listings, which would otherwise just say "stopped".
+            try:
+                self._raise_if_rejected_at_startup(record, exc)
+            except UnsupportedArchitectureError as typed:
+                self._note_load_failure(record, typed)
+                raise
+            self._note_load_failure(record, exc)
+            raise
         except StudioForgeError:
             raise
         except Exception as exc:  # pragma: no cover - defensive
             raise ModelLoadError(f"failed to start '{record.id}': {exc}") from exc
 
+        # A launch that worked supersedes the one that did not (D66).
+        self._last_load_failure.pop(record.id, None)
         # The supervisor only knows the raw per-model setting, which is usually
         # None. The EFFECTIVE ttl -- global default folded in, and 0 for pinned --
         # lives here, and both the TTL sweeper and the planner's pinned check read
@@ -3714,7 +4107,13 @@ class ModelManager:
             record = self.registry.resolve(name)
             if record is None:
                 raise ModelNotFoundError(name, known=self.registry.known_ids())
-            serving_id = self.serving_record(record).id
+            serving = self.serving_record(record)
+            # D66: cards granted to a model that cannot load would be taken from
+            # their residents for nothing -- CrucibleForge leased [0, 1] for
+            # K2-Horizon benchmarks whose load then died 0.3 s into startup.
+            # Refused before the conflict scan and before any eviction.
+            self._refuse_unsupported(serving, skip_if_ready=True)
+            serving_id = serving.id
             if serving_id not in owners:
                 owners.append(serving_id)
         clash = self.leases.conflicts(wanted)
@@ -4342,7 +4741,8 @@ class ModelManager:
         for record in self.registry.all():
             if not record.settings.pinned:
                 continue
-            serving_id = self.serving_record(record).id
+            serving = self.serving_record(record)
+            serving_id = serving.id
             if serving_id in wanted or serving_id in self._loading or serving_id in under_test:
                 continue
             instance = self.supervisor.get(serving_id)
@@ -4352,6 +4752,11 @@ class ModelManager:
                 continue
             next_at, _delay = self._pin_retry.get(serving_id, (0.0, 0.0))
             if now < next_at:
+                continue
+            if self._arch_skip(serving, what="pin reconciler"):
+                # D66: skipped, not backed off -- no amount of waiting loads it,
+                # and the check is a cached lookup. Logged once; picked up again
+                # the sweep after a build that includes it becomes the one used.
                 continue
             wanted.append(serving_id)
         return wanted
@@ -4478,6 +4883,10 @@ class ModelManager:
                 continue
             record = self.registry.get(instance.model_id)
             if record is None or record.settings.device_override is not None:
+                continue
+            if self._arch_skip(record, what="rebalancer"):
+                # D66: a move is a reload on the build a launch uses now; if
+                # that build cannot load it, the resident stays where it is.
                 continue
             if plan.allowed_devices is not None:
                 # The load was bounded by a one-shot ``allowed_devices`` (D59).
@@ -4815,6 +5224,9 @@ class ModelManager:
                 wanted.append(record.id)
 
         for model_id in wanted:
+            record = self.registry.resolve(model_id)
+            if record is not None and self._arch_skip(self.serving_record(record), what="autoload"):
+                continue  # D66: logged once; the reconciler keeps skipping it quietly
             try:
                 await self.load(model_id, source="autoload", hold_traffic=False)
                 log.info("preloaded model", model_id=model_id)
@@ -5014,11 +5426,15 @@ class ModelManager:
         now = time.time()
         cached = self._catalog_cache
         if refresh or cached is None or now - cached[0] > CACHE_TTL_S:
+            # One lookup per build for the whole table (D66): every row names
+            # whether the build that would serve it can load its architecture.
+            arch_memo: dict[Any, Any] = {}
             full = build_catalog(
                 registry=self.registry,
                 planner=self.planner,
                 supervisor=self.supervisor,
                 db=self.db,
+                load_support=lambda record: self.load_support_fields(record, memo=arch_memo),
             )
             self._catalog_cache = (now, full)
         else:
@@ -5106,6 +5522,38 @@ class ModelManager:
             if priority is not None
             else self.effective_priority_for(self.serving_record(record))
         )
+        verdict = self.arch_verdict(record)
+        if verdict.supported is False:
+            # D66: "fits" would be a lie -- the arithmetic may well work out, and
+            # the next request would still be refused before it planned. The
+            # refusal a real load would meet, in the dry run's own shape.
+            refusal = verdict.error()
+            return {
+                "fits": False,
+                "model_id": record.id,
+                "priority": tier,
+                "allowed_devices": sorted(narrowed) if narrowed is not None else None,
+                "dry_run": True,
+                "reason": verdict.note(),
+                "reason_code": refusal.code,
+                "message": refusal.message,
+                "status_code": refusal.status_code,
+                "error": refusal.to_payload()["error"],
+                "architecture": verdict.architecture,
+                "engine_tag": verdict.engine_tag,
+                "shortfall_bytes": None,
+                "largest_term": None,
+                "required_bytes": None,
+                "available_bytes": None,
+                "per_gpu_free": {},
+                "max_ctx_that_fits": None,
+                "max_parallel_that_fits": None,
+                "suggestions": [],
+                "notes": [],
+                "vram_holders": [],
+                "estimate_mb": {},
+                "estimate_bytes": {},
+            }
         result = self.planner.plan_load(
             record,
             ctx_size=ctx_size,

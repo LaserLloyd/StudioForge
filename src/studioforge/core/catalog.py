@@ -135,7 +135,9 @@ CATALOG_HINT = (
     "calibration.basis says from what) or 'estimated' (nominal hardware "
     "numbers: an order of magnitude, not a promise). attention_kind explains a "
     "model's context prices: 'iswa' and 'hybrid' keep only a fraction of the "
-    "window in KV, which is why their huge contexts stay cheap."
+    "window in KV, which is why their huge contexts stay cheap. arch_supported "
+    "false: this llama.cpp build cannot load the model at all (arch_note says "
+    "why), so it has no recommended load -- pick another model."
 )
 
 #: How long a built catalog stays servable before it is rebuilt. Short, because
@@ -929,6 +931,7 @@ def build_catalog(
     compact: bool = False,
     ctx_tiers: Sequence[int] = CTX_TIERS,
     now: float | None = None,
+    load_support: Callable[[ModelRecord], Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build the whole catalog: every model, newest download first.
 
@@ -944,6 +947,13 @@ def build_catalog(
             seven times the tokens.
         ctx_tiers: override the standard ladder (tests, mostly).
         now: override the clock (tests).
+        load_support: optional (D66); ``record -> {"arch_supported": bool |
+            None, "arch_note"?, "engine_supported"?, "unsupported_reason"?,
+            "last_load_failure"?}`` -- ``ModelManager.load_support_fields``. A
+            model whose ``arch_supported`` is ``False`` is not planned at all:
+            it gets ``fits_now: false`` with a basis, no options, no placements
+            and no ``recommended``, because every one of those would be a load
+            the server is certain to refuse.
 
     Never raises for a single bad model: a record whose GGUF metadata could not
     be parsed comes back with an empty ``options`` list and an ``unavailable``
@@ -999,6 +1009,7 @@ def build_catalog(
                 ctx_tiers=ctx_tiers,
                 compact=compact,
                 modes=modes,
+                support=_support_fields(load_support, record),
             )
         )
 
@@ -1041,6 +1052,21 @@ def build_catalog(
     }
 
 
+def _support_fields(
+    load_support: Callable[[ModelRecord], Mapping[str, Any]] | None, record: ModelRecord
+) -> dict[str, Any]:
+    """The D66 row fields; ``{"arch_supported": None}`` when nothing can be told."""
+    if load_support is None:
+        return {"arch_supported": None}
+    try:
+        fields = dict(load_support(record))
+    except Exception as exc:  # noqa: BLE001 - one row's verdict must not sink the catalog
+        log.debug("catalog architecture verdict failed", model_id=record.id, error=str(exc))
+        return {"arch_supported": None}
+    fields.setdefault("arch_supported", None)
+    return fields
+
+
 def _model_entry(
     record: ModelRecord,
     *,
@@ -1055,6 +1081,7 @@ def _model_entry(
     ctx_tiers: Sequence[int],
     compact: bool,
     modes: Sequence[placements_mod.HardwareMode],
+    support: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     meta = record.meta
     weights = int(getattr(meta, "tensor_bytes", 0) or 0) or int(record.size_bytes)
@@ -1142,6 +1169,27 @@ def _model_entry(
         "calibration": _calibration_block(calibrate_for(())),
         "options": [],
     }
+
+    # D66: whether the build that would serve this model can load it at all,
+    # and what happened the last time a launch of it died.
+    verdict = dict(support or {"arch_supported": None})
+    entry["arch_supported"] = verdict.get("arch_supported")
+    for key in ("arch_note", "engine_supported", "unsupported_reason", "last_load_failure"):
+        if verdict.get(key) is not None:
+            entry[key] = verdict[key]
+    if entry["arch_supported"] is False:
+        # Not planned, not placed, not recommended: every row would be a load
+        # the server refuses before it plans. ``fits_now`` is stated outright,
+        # because "fits" is the word a caller reads before loading.
+        note = str(verdict.get("arch_note") or "the build that would serve it cannot load it")
+        entry["engine_supported"] = False
+        entry["fits_now"] = False
+        entry["fits_now_basis"] = f"unsupported_architecture: {note}"
+        entry["unavailable"] = f"cannot be loaded: {note}"
+        entry["placements"] = []
+        entry["recommended"] = None
+        entry["recommended_basis"] = f"not recommended: {note}"
+        return compact_entry(entry) if compact else entry
 
     if meta is None:
         entry["unavailable"] = (
@@ -1379,6 +1427,11 @@ def compact_entry(entry: dict[str, Any]) -> dict[str, Any]:
         for k, v in entry.items()
         if v is not None and k not in {"calibration", "settings_pinned"}
     }
+    if out.get("arch_supported") is True:
+        # D66: only a ``false`` is news. Every loadable model carrying ``true``
+        # would add a key per row to a payload budgeted per row; absent means
+        # "nothing known against it", which is what ``true`` says here.
+        out.pop("arch_supported")
     if entry.get("calibration", {}).get("basis") not in (None, "none"):
         out["calibration"] = entry["calibration"]
     if entry.get("settings_pinned"):

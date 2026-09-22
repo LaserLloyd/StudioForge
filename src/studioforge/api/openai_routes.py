@@ -99,18 +99,40 @@ async def list_models(request: Request) -> JSONResponse:
     # OpenAI clients ignore. Putting them here makes the most-used endpoint
     # authoritative about what is resident, instead of forcing clients to a
     # second endpoint to answer "is anything loaded?".
+    arch_memo: dict[Any, Any] = {}
     for entry in data:
-        _decorate_openai_entry(state, entry)
+        _decorate_openai_entry(state, entry, arch_memo=arch_memo)
     return JSONResponse({"object": "list", "data": data})
 
 
-def _decorate_openai_entry(state: Any, entry: dict[str, Any]) -> None:
+def _arch_fields(state: Any, model_id: str, memo: dict[Any, Any] | None) -> dict[str, Any]:
+    """``arch_supported`` (+ ``arch_note`` when false) for one entry (D66).
+
+    ``null`` when it cannot be told; a listing never fails on it.
+    """
+    record = state.registry.get(model_id)
+    verdict_of = getattr(state.manager, "arch_verdict", None)
+    if record is None or verdict_of is None:
+        return {"arch_supported": None}
+    try:
+        fields: dict[str, Any] = verdict_of(record, memo=memo).fields()
+    except Exception as exc:  # noqa: BLE001 - see the docstring
+        log.debug("architecture verdict failed", model_id=model_id, error=str(exc))
+        return {"arch_supported": None}
+    return fields
+
+
+def _decorate_openai_entry(
+    state: Any, entry: dict[str, Any], *, arch_memo: dict[Any, Any] | None = None
+) -> None:
     """Overlay what is resident onto one ``openai_dict`` entry, in place.
 
     One implementation for the list and the single-model endpoint: the same
     model must not read ``loaded`` from ``GET /v1/models`` and have no
-    ``state`` at all from ``GET /v1/models/{id}``.
+    ``state`` at all from ``GET /v1/models/{id}``. ``arch_memo`` shares the D66
+    per-build lookups across one list.
     """
+    entry["studioforge"].update(_arch_fields(state, entry["id"], arch_memo))
     instance = state.supervisor.get(_serving_id(state, entry["id"]))
     loaded = instance is not None and instance.state == "ready"
     # "loading" is neither: a client that reads not-loaded and issues a
@@ -262,6 +284,10 @@ async def chat_completions(request: Request) -> Any:
     _note_client(state, request, serving.id)
 
     if payload.get("stream"):
+        # D66 first: a build that cannot load this architecture is a certain,
+        # permanent refusal -- a real HTTP 400 before the 200, never an error
+        # frame, and never behind a 503 that invites a retry.
+        state.manager.arch_check(serving.id)
         # The D46 hold check runs BEFORE the 200 and the SSE stream begin: a
         # held request must be a real HTTP 503 with Retry-After, not an
         # in-band error frame most clients treat as fatal. ensure_loaded

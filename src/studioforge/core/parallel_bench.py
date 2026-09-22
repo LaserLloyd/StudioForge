@@ -446,6 +446,11 @@ class ParallelBenchmarker:
             devices=list(devices) if devices is not None else None,
             known_devices=[g.index for g in self._probe.list_gpus()],
         )
+        # D66: before the lease this run takes (which evicts idle residents on
+        # its cards) -- a model the build cannot load has nothing to measure.
+        arch_check = getattr(self.manager, "arch_check", None)
+        if arch_check is not None:
+            arch_check(record.id)
         self._refuse_if_busy()
         wanted = list(devices) if devices is not None else self.resolve_devices(mode)
         levels = sorted({int(n) for n in streams if int(n) >= 1})

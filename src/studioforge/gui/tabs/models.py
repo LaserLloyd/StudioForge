@@ -337,15 +337,50 @@ def _model_table(ctx: GuiContext, view: dict[str, Any]) -> Any:
                 return
             shown = f"{len(records)} of {total}" if len(records) != total else f"{total}"
             ui.label(f"{shown} model(s)").classes("text-xs opacity-60")
+            arch = _arch_fields(ctx, records)
             with (
                 ui.column().classes("w-full gap-0 overflow-x-auto"),
                 ui.column().classes("gap-0 w-max min-w-full"),
             ):
                 _header_row(view, table)
                 for record in records:
-                    _model_row(ctx, record, loaded.get(_serving_id(ctx, record)), table)
+                    _model_row(
+                        ctx,
+                        record,
+                        loaded.get(_serving_id(ctx, record)),
+                        table,
+                        arch=arch.get(record.id),
+                    )
 
     return table
+
+
+def _arch_fields(ctx: GuiContext, records: list[Any]) -> dict[str, dict[str, Any]]:
+    """Each model's D66 verdict, looked up once per engine build; ``{}`` if unavailable.
+
+    Display-only: a manager that cannot answer (or a failure answering) shows
+    no badges, and Load then behaves as it always did -- the load path makes
+    the same check itself and refuses with the same words.
+    """
+    verdicts_of = getattr(ctx.manager, "arch_verdicts", None)
+    if verdicts_of is None:
+        return {}
+    try:
+        verdicts = verdicts_of(records)
+    except Exception:  # noqa: BLE001 - status display only
+        return {}
+    return {model_id: v.fields(with_message=True) for model_id, v in verdicts.items()}
+
+
+def _arch_refusal_text(ctx: GuiContext, record: Any) -> str | None:
+    """The D66 refusal for one model, or ``None`` when it may be loaded."""
+    fields = _arch_fields(ctx, [record]).get(record.id)
+    return st.arch_load_refusal(fields)
+
+
+def _explain_unloadable(text: str) -> None:
+    """What the Load button does for a model its engine cannot load (D66)."""
+    ui.notify(text, type="warning", multi_line=True, close_button=True)
 
 
 def _header_row(view: dict[str, Any], table: Any) -> None:
@@ -404,10 +439,20 @@ def _copy_text(text: str, *, what: str = "copied") -> None:
     ui.notify(what, type="positive")
 
 
-def _model_row(ctx: GuiContext, record: Any, instance: Any, table: Any) -> None:
+def _model_row(
+    ctx: GuiContext,
+    record: Any,
+    instance: Any,
+    table: Any,
+    *,
+    arch: dict[str, Any] | None = None,
+) -> None:
     status = st.model_status_label(instance)
     shared = st.shares_base_instance(record)
     added_at = st.model_added_at(record)
+    # D66: the build that would serve this model cannot load it.
+    arch_badge = st.arch_badge(arch)
+    arch_refusal = st.arch_load_refusal(arch)
     with ui.element("div").classes(
         "sfm-row border-b border-white/10 py-1 hover:bg-white/5 rounded"
     ):
@@ -431,8 +476,11 @@ def _model_row(ctx: GuiContext, record: Any, instance: Any, table: Any) -> None:
             virtual_badges = [
                 text for text in st.capability_badges(record) if text in _VIRTUAL_BADGES
             ]
-            if virtual_badges or record.settings.pinned:
+            if virtual_badges or record.settings.pinned or arch_badge is not None:
                 with ui.row().classes("gap-1 flex-wrap"):
+                    if arch_badge is not None:
+                        label, tooltip = arch_badge
+                        ui.badge(label, color="negative").classes("text-xs").tooltip(tooltip)
                     for text in virtual_badges:
                         ui.badge(text, color="secondary").classes("text-xs")
                     if record.settings.pinned:
@@ -479,6 +527,12 @@ def _model_row(ctx: GuiContext, record: Any, instance: Any, table: Any) -> None:
                     ui.button(
                         icon="stop_circle", on_click=lambda r=record: _unload(ctx, r, table)
                     ).props("flat dense color=negative").tooltip("Unload")
+            elif arch_refusal is not None:
+                # D66: say why instead of opening a load that is certain to be
+                # refused -- the tooltip and the click both carry the reason.
+                ui.button(
+                    icon="play_arrow", on_click=lambda text=arch_refusal: _explain_unloadable(text)
+                ).props("flat dense color=grey").tooltip(f"Cannot load: {arch_refusal}")
             else:
                 ui.button(
                     icon="play_arrow", on_click=lambda r=record: _settings_dialog(ctx, r, table)
@@ -702,6 +756,12 @@ def _settings_dialog(ctx: GuiContext, record: Any, table: Any) -> None:  # noqa:
             f"{record.quant} · {st.format_gib(record.size_bytes)} · trained ctx "
             f"{record.meta.n_ctx_train if record.meta else st.UNKNOWN}"
         ).classes("text-xs opacity-70 font-mono")
+        # D66: settings can still be edited, but every Load below will be refused.
+        arch_refusal = _arch_refusal_text(ctx, record)
+        if arch_refusal is not None:
+            with ui.row().classes("items-start gap-2 w-full flex-nowrap"):
+                ui.badge(st.UNSUPPORTED_ARCH_BADGE, color="negative").classes("text-xs shrink-0")
+                ui.label(arch_refusal).classes("text-xs text-negative whitespace-normal")
 
         # --- optimal settings per hardware mode (D36) --------------------
         # Filled by a one-shot timer rather than inline: it plans this model at

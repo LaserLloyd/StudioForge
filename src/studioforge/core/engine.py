@@ -30,6 +30,7 @@ first-run bootstrap, before any database exists.
 from __future__ import annotations
 
 import asyncio
+import bisect
 import contextlib
 import json
 import os
@@ -41,6 +42,7 @@ import socket
 import stat
 import subprocess
 import tarfile
+import threading
 import time
 import zipfile
 from collections import deque
@@ -1114,6 +1116,214 @@ def probe_engine_features(binary: Path, tag: str = "") -> EngineFeatures:
 
 
 # ---------------------------------------------------------------------------
+# Architecture table (D66)
+# ---------------------------------------------------------------------------
+
+#: The shared library that holds llama.cpp's architecture table
+#: (``LLM_ARCH_NAMES``), one NUL-terminated ASCII literal per architecture.
+#: ``llama-server.exe`` is a 9 KB stub on Windows, and neither
+#: ``llama-server-impl.dll`` nor ``llama-common.dll`` carries the table;
+#: ``llama.dll`` does. Linux builds ship ``libllama.so`` (sometimes versioned),
+#: macOS ``libllama.dylib``. Never the server binary itself: a file that merely
+#: mentions a few model families is not the table, and reading it as one would
+#: refuse models the build loads perfectly well.
+LLAMA_LIBRARY_NAMES: tuple[str, ...] = ("llama.dll", "libllama.so", "libllama.dylib")
+_LLAMA_LIBRARY_VERSIONED = "libllama.so.*"
+
+#: Architecture names every llama.cpp build StudioForge can install knows. A
+#: library missing any of them is not a table this reader understands -- a
+#: renamed file, a static build's leftovers, a future layout -- and is answered
+#: "cannot tell" rather than "unsupported": the one thing this probe must never
+#: do is refuse a model the engine can load.
+ARCH_TABLE_CANARIES: tuple[str, ...] = ("llama", "gemma", "qwen2")
+
+#: What an architecture name looks like (``k2-horizon``, ``qwen35moe``,
+#: ``hy_v3``). Anything else is answered "cannot tell".
+_ARCH_NAME_MAX = 64
+_ARCH_NAME_RE = re.compile(r"[a-z0-9._-]{1,64}")
+#: A maximal run of identifier characters -- letters of either case, digits,
+#: ``_``, ``-`` and ``.``. The runs that end at a NUL are the candidates.
+_IDENT_RUN_RE = re.compile(rb"[A-Za-z0-9._-]+")
+#: ``llama.dll`` is ~3 MB; the cap only keeps a pathological file out of memory.
+_ARCH_LIBRARY_MAX_BYTES = 512 * 1024 * 1024
+#: Tables kept per process: one per (library, mtime, size), so a reinstalled
+#: build is re-read and a handful of installed builds never evict each other.
+_ARCH_TABLE_CACHE_MAX = 16
+_ARCH_TABLE_CACHE: dict[tuple[str, int, int], ArchitectureTable | None] = {}
+_ARCH_TABLE_LOCK = threading.Lock()
+
+#: How a name was found: ``exact`` -- ``name + NUL`` with no identifier
+#: character before it (a literal of its own); ``suffix`` -- only as the tail of
+#: a longer literal, which is what a tail-merging linker makes of it.
+ArchEvidence = Literal["exact", "suffix"]
+
+
+@dataclass(frozen=True)
+class ArchitectureTable:
+    """The architecture names one build's ``llama`` library can load (D66).
+
+    Derived from the bytes once and kept instead of them: every maximal run of
+    identifier characters that ends at a NUL -- a few thousand, ~200 KiB for a
+    3 MB ``llama.dll`` -- as a sorted list of reversed tails (for the suffix
+    search) and a set of the runs themselves (for the exact one).
+
+    **The verdict is one-sided on purpose.** *Absent* -- ``name + NUL`` nowhere
+    in the library -- is certain: llama.cpp resolves ``general.architecture``
+    by comparing it against exactly these literals, and a name that is not
+    among them is ``unknown model architecture`` at startup. *Present* only
+    means "assume supported", and it counts a name found **only as the tail of
+    a longer literal** too (``evidence == "suffix"``): GNU ld and lld
+    tail-merge string literals, so on such a build ``"gemma"`` may exist only
+    inside ``"recurrentgemma"`` and ``"bert"`` only inside ``"nomic-bert"``, and
+    requiring a clean preceding byte there would refuse models the build loads.
+    A present name may also be a pre-tokenizer or some other string that happens
+    to share it; a false *yes* costs the spawn it would have cost anyway (and
+    the runtime memo remembers it), a false *no* would refuse a working model --
+    which is why every uncertainty answers ``None``.
+    """
+
+    library: str
+    #: ``(st_mtime_ns, st_size)`` of the file the table was read from.
+    signature: tuple[int, int]
+    reversed_names: tuple[bytes, ...]
+    exact_names: frozenset[bytes] = frozenset()
+
+    @classmethod
+    def from_bytes(
+        cls, blob: bytes, *, library: str = "", signature: tuple[int, int] = (0, 0)
+    ) -> ArchitectureTable:
+        tails: set[bytes] = set()
+        exact: set[bytes] = set()
+        size = len(blob)
+        for match in _IDENT_RUN_RE.finditer(blob):
+            end = match.end()
+            if end >= size or blob[end] != 0:
+                continue
+            run = match.group(0)
+            tails.add(run[-_ARCH_NAME_MAX:][::-1])
+            if len(run) <= _ARCH_NAME_MAX:
+                exact.add(run)
+        return cls(
+            library=library,
+            signature=signature,
+            reversed_names=tuple(sorted(tails)),
+            exact_names=frozenset(exact),
+        )
+
+    def knows(self, name: str | None) -> bool | None:
+        """``True``/``False`` for an architecture-shaped name, else ``None``."""
+        if not name or name == "unknown" or not _ARCH_NAME_RE.fullmatch(name):
+            return None
+        key = name.encode("ascii")[::-1]
+        index = bisect.bisect_left(self.reversed_names, key)
+        return index < len(self.reversed_names) and self.reversed_names[index].startswith(key)
+
+    def evidence(self, name: str | None) -> ArchEvidence | None:
+        """How a known name was found; ``None`` when it is not (or cannot be) known."""
+        if not self.knows(name):
+            return None
+        assert name is not None  # knows() answered, so it is a real name
+        return "exact" if name.encode("ascii") in self.exact_names else "suffix"
+
+    @property
+    def recognised(self) -> bool:
+        """Whether this reads like llama.cpp's table at all: every canary present."""
+        return all(self.knows(name) for name in ARCH_TABLE_CANARIES)
+
+
+def find_llama_library(location: Path) -> Path | None:
+    """The ``llama`` library of the build at ``location`` (its binary or its directory).
+
+    Next to the binary first -- every prebuilt archive and every source build
+    lays them out side by side -- then a ``lib/`` beside or above it for a
+    CMake-install layout.
+    """
+    base = location if location.is_dir() else location.parent
+    for directory in (base, base / "lib", base.parent / "lib"):
+        for name in LLAMA_LIBRARY_NAMES:
+            candidate = directory / name
+            if candidate.is_file():
+                return candidate
+        with contextlib.suppress(OSError):
+            for candidate in sorted(directory.glob(_LLAMA_LIBRARY_VERSIONED)):
+                if candidate.is_file():
+                    return candidate
+    return None
+
+
+def _read_architecture_table(library: Path) -> tuple[ArchitectureTable | None, bool]:
+    """``(table or None, cacheable)``. An I/O error is not cached: it may pass."""
+    try:
+        info = library.stat()
+        if info.st_size <= 0 or info.st_size > _ARCH_LIBRARY_MAX_BYTES:
+            return None, True
+        blob = library.read_bytes()
+    except OSError as exc:
+        log.warning("engine.arch_table.unreadable", library=library.name, error=str(exc))
+        return None, False
+    started = time.perf_counter()
+    table = ArchitectureTable.from_bytes(
+        blob, library=library.name, signature=(info.st_mtime_ns, info.st_size)
+    )
+    if not table.recognised:
+        log.warning(
+            "engine.arch_table.unrecognised",
+            library=library.name,
+            engine=library.parent.name,
+            detail=(
+                "the library does not name the architectures every llama.cpp build "
+                f"has ({', '.join(ARCH_TABLE_CANARIES)}); architecture support is "
+                "treated as unknown for this build, so nothing is refused on its word"
+            ),
+        )
+        return None, True
+    log.info(
+        "engine.arch_table.read",
+        library=library.name,
+        engine=library.parent.name,
+        names=len(table.reversed_names),
+        ms=round((time.perf_counter() - started) * 1000),
+    )
+    return table, True
+
+
+def architecture_table(location: Path) -> ArchitectureTable | None:
+    """The cached architecture table of the build at ``location``, or ``None``.
+
+    ``None`` means "cannot tell" -- no library, an unreadable one, one that is
+    not llama.cpp's table -- and every caller treats it as *allow*. Keyed by the
+    resolved library path plus its mtime and size, so an engine installed before
+    D66 is read on first use and a reinstall over the same tag is read again.
+    Never raises.
+    """
+    try:
+        library = find_llama_library(location)
+        if library is None:
+            return None
+        resolved = library.resolve()
+        info = resolved.stat()
+    except OSError:
+        return None
+    key = (str(resolved), info.st_mtime_ns, info.st_size)
+    with _ARCH_TABLE_LOCK:
+        if key in _ARCH_TABLE_CACHE:
+            return _ARCH_TABLE_CACHE[key]
+    table, cacheable = _read_architecture_table(resolved)
+    if cacheable:
+        with _ARCH_TABLE_LOCK:
+            _ARCH_TABLE_CACHE[key] = table
+            while len(_ARCH_TABLE_CACHE) > _ARCH_TABLE_CACHE_MAX:
+                _ARCH_TABLE_CACHE.pop(next(iter(_ARCH_TABLE_CACHE)))
+    return table
+
+
+def knows_architecture(location: Path, arch: str | None) -> bool | None:
+    """Does the build at ``location`` include ``arch``? ``None`` = cannot tell (D66)."""
+    table = architecture_table(location)
+    return None if table is None else table.knows(arch)
+
+
+# ---------------------------------------------------------------------------
 # Archive extraction
 # ---------------------------------------------------------------------------
 
@@ -1381,6 +1591,13 @@ class EngineManager:
         #: unwired manager behaves exactly as it did before -- it just cannot
         #: name the children it would have broken.
         self.tag_in_use: Callable[[str], list[str]] | None = tag_in_use
+        #: Told ``(tag, what)`` -- ``what`` is ``"install"`` or ``"activate"`` --
+        #: after a build is installed or made active (D66). ``api.app.build_state``
+        #: points it at the model manager, which forgets the launches it
+        #: remembered as rejected: a different build may well load them. Late
+        #: bound for the same reason as :attr:`tag_in_use`; an unwired manager
+        #: (the CLI, a test) simply tells nobody.
+        self.on_engine_change: Callable[[str, str], object] | None = None
         #: The latest install phase, for ``GET /api/engine`` to poll (D49-10):
         #: ``{tag, phase, fraction, done, error, updated_at}``. ``None`` until an
         #: install runs in this process. Process-local by design -- it describes
@@ -2045,6 +2262,24 @@ class EngineManager:
             )
         return binary
 
+    def architecture_table(self, tag: str | None = None) -> ArchitectureTable | None:
+        """Build ``tag``'s architecture table (``None`` = the active build), if readable (D66).
+
+        Read off the installed files on first use, so a build installed before
+        D66 needs no reinstall. ``None`` -- no engine, a pin naming a build that
+        is not installed, a library that cannot be read -- means "cannot tell".
+        """
+        try:
+            binary = self.server_binary(tag)
+        except Exception:  # noqa: BLE001 - "cannot tell" is never a refusal
+            return None
+        return architecture_table(binary)
+
+    def knows_architecture(self, tag: str | None, arch: str | None) -> bool | None:
+        """Does build ``tag`` (``None`` = active) include ``arch``? ``None`` = cannot tell."""
+        table = self.architecture_table(tag)
+        return None if table is None else table.knows(arch)
+
     def prune(self, keep: int | None = None) -> list[str]:
         """Delete old engine directories, newest ``keep`` retained.
 
@@ -2133,6 +2368,17 @@ class EngineManager:
             json.dumps({"tag": tag, "updated_at": time.time()}, indent=2), encoding="utf-8"
         )
         tmp.replace(path)
+        self._notify_engine_change(tag, "activate")
+
+    def _notify_engine_change(self, tag: str, what: str) -> None:
+        """Tell :attr:`on_engine_change`, if anyone is listening. Never raises."""
+        callback = self.on_engine_change
+        if callback is None:
+            return
+        try:
+            callback(tag, what)
+        except Exception as exc:  # noqa: BLE001 - bookkeeping must not fail an install
+            log.warning("engine.change_listener_failed", tag=tag, what=what, error=str(exc))
 
     async def activate(self, tag: str) -> EngineInfo:
         """Make an installed build the live engine (D49-4/D49-5).
@@ -2536,6 +2782,7 @@ class EngineManager:
             build_log=build_log,
         )
         self._write_meta(info)
+        self._notify_engine_change(info.tag, "install")
         if activate:
             self.set_active(info.tag)
         return info

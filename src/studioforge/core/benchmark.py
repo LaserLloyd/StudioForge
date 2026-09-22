@@ -670,6 +670,11 @@ class Benchmarker:
         2048)``): each placement is measured again at that ``-ub``. Empty by
         default -- it multiplies the run length, and it only moves prefill.
         """
+        # D66: a model the build cannot load is refused before any mode leases
+        # cards -- a lease evicts the idle residents on them, for nothing.
+        arch_check = getattr(self.manager, "arch_check", None)
+        if arch_check is not None:
+            arch_check(record.id)
         if self._lock.locked():
             raise ModelBusyError(
                 "a benchmark is already running; benchmarks are serialized because "

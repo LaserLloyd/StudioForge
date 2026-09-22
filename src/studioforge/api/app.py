@@ -54,7 +54,11 @@ _NO_BOOT_WAIT_PATHS = frozenset({"/health", "/healthz", "/api/health", "/docs", 
 #: no filter saw them); ``insufficient_vram`` is "it does not fit" and is not
 #: retryable. An explicit list, not a status-code heuristic: the status of a
 #: refusal says how HTTP should carry it, not how much an operator cares.
-WARNING_REJECTION_CODES = frozenset({"lease_conflict", "insufficient_vram"})
+#: ``unsupported_architecture`` (D66) is a model the installed llama.cpp build
+#: cannot load at all -- an operator's problem, however patiently it is asked.
+WARNING_REJECTION_CODES = frozenset(
+    {"lease_conflict", "insufficient_vram", "unsupported_architecture"}
+)
 
 #: The wait-and-retry family (D64, CR-3): exactly the StudioForge codes
 #: ``docs/OPENCLAW-RIG.md`` lists as "wait and retry unchanged", each carrying
@@ -586,6 +590,10 @@ def build_state(config: Config, *, version: str = __version__) -> Any:
         version=version,
         leases=leases,
     )
+    # D66: an engine install or activation (route, GUI or boot) forgets the
+    # launches the manager remembered as "unknown architecture" -- the build that
+    # serves the next load may well know it. Late-bound like tag_in_use above.
+    engine_manager.on_engine_change = manager.forget_arch_rejections
 
     state.config = config  # type: ignore[attr-defined]
     state.db = db  # type: ignore[attr-defined]

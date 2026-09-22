@@ -61,7 +61,9 @@ from studioforge.config import (
     resolve_cache_ram_mb,
 )
 from studioforge.core.engine import (
+    ArchitectureTable,
     EngineFeatures,
+    architecture_table,
     child_environment,
     policy_family,
     probe_engine_features,
@@ -1467,6 +1469,25 @@ class Supervisor:
         this needs no reload at all (D50).
         """
         return self.resolved_engine_tag(None)
+
+    def architecture_table(self, tag: str | None) -> ArchitectureTable | None:
+        """The architecture table of the build a launch asking for ``tag`` would use (D66).
+
+        Resolved through the same injected ``resolve_binary`` a spawn uses, so the
+        answer is about the very build the child would run: the model's
+        ``engine_tag`` pin, else the active engine. ``None`` -- the binary cannot
+        be resolved, no ``llama`` library beside it, one that cannot be read --
+        means "cannot tell", which never refuses a load. Never raises.
+        """
+        try:
+            binary = self._resolve_binary(tag)
+        except Exception:  # noqa: BLE001 - a missing engine fails at spawn, loudly
+            return None
+        try:
+            return architecture_table(binary)
+        except Exception as exc:  # noqa: BLE001 - see the docstring
+            log.warning("engine_arch_table_failed", engine_tag=tag, error=str(exc))
+            return None
 
     # ------------------------------------------------------------------
     # Command building

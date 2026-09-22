@@ -503,6 +503,39 @@ def status_colour(label: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Architecture support (D66)
+# ---------------------------------------------------------------------------
+
+#: The badge a model carries when the llama.cpp build that would serve it
+#: cannot load its architecture. Filled with the theme's ``negative`` colour.
+UNSUPPORTED_ARCH_BADGE: Final[str] = "Unsupported arch"
+
+
+def arch_badge(fields: Mapping[str, Any] | None) -> tuple[str, str] | None:
+    """``(label, tooltip)`` for a model its engine cannot load (D66), else ``None``.
+
+    ``fields`` is a listing row's ``arch_supported`` / ``arch_note`` (plus the
+    optional ``arch_message``). Only a certain ``False`` earns the badge: a
+    ``None`` -- the engine could not be asked -- shows nothing, because a badge
+    that says "unsupported" about a model that loads is worse than no badge.
+    """
+    if not fields or fields.get("arch_supported") is not False:
+        return None
+    tooltip = str(
+        fields.get("arch_message")
+        or fields.get("arch_note")
+        or "the llama.cpp build that would serve this model cannot load its architecture"
+    )
+    return UNSUPPORTED_ARCH_BADGE, tooltip
+
+
+def arch_load_refusal(fields: Mapping[str, Any] | None) -> str | None:
+    """What the Load button shows *instead of* loading (D66); ``None`` means load."""
+    badge = arch_badge(fields)
+    return badge[1] if badge is not None else None
+
+
+# ---------------------------------------------------------------------------
 # Model table sorting / filtering
 # ---------------------------------------------------------------------------
 
@@ -1659,6 +1692,18 @@ def fit_verdict(preview: Mapping[str, Any]) -> FitVerdict:
             detail_lines=details,
             notes=notes,
             per_gpu=_int_keyed(preview.get("per_gpu_bytes")),
+            fp4_warning=fp4,
+        )
+
+    if preview.get("reason_code") == "unsupported_architecture":
+        # D66: not a VRAM question at all -- the build cannot load the model.
+        return FitVerdict(
+            fits=False,
+            headline="Cannot load: unsupported architecture",
+            detail_lines=[str(preview.get("message") or preview.get("reason") or "")],
+            notes=notes,
+            suggestions=[],
+            per_gpu=[],
             fp4_warning=fp4,
         )
 
