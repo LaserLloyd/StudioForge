@@ -97,14 +97,14 @@ def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one fl
     with ui.column().classes("w-full gap-3 p-2"):
         # --- what are we talking to? ---------------------------------------
         with ui.card().classes("w-full gap-2"):
-            with ui.row().classes("w-full items-center gap-2 no-wrap"):
+            with ui.row().classes("w-full items-center gap-2 flex-wrap"):
                 model = ui.select(
                     {st.LOADED_MODEL_CHOICE: st.LOADED_MODEL_LABEL},
                     value=st.LOADED_MODEL_CHOICE,
                     label="Model",
                     with_input=True,
                 )
-                model.props("dense outlined options-dense").classes("grow min-w-0")
+                model.props("dense outlined options-dense").classes("grow min-w-[14rem]")
                 # NiceGUI fills the filter input with the selected label, so typing
                 # edited "(Loaded model) — <id>" in place instead of filtering.
                 # Selecting the text on focus makes the first keystroke replace it.
