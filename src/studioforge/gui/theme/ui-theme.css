@@ -2,7 +2,7 @@
    tools/sync_theme.py. Do not edit this copy: change the package (src/,
    adapters/, apps/studioforge.json) and run `python tools/sync_theme.py app studioforge`.
    themes: purple, midnight-gold, glacier, forest, paper, daylight, night-red | default: glacier
-   body sha256: cbe28aad368225cd */
+   body sha256: d2b8b19b9a58f67e */
 /* ============================================================================
    theme-base.css — CORE. Purple (base theme) + theme-agnostic layer.
    ----------------------------------------------------------------------------
@@ -1653,6 +1653,37 @@ a:focus-visible {
   color: var(--on-accent);
 }
 
+/* NiceGUI's ui.badge(text, color=...) adds only a bg-<name> class and no text
+   class, so without these every badge label is --on-accent, whatever its
+   fill. That measured 1.67-2.77:1 on the success, warning and danger fills
+   in the dark core themes, and 1.28:1 on --offline in Night Red. Each label
+   now takes its fill's own on-colour; --accent-2 (secondary, accent) has
+   none, so it takes the flipped page ink, 5.59:1 or better in every theme. */
+.q-badge.bg-positive {
+  color: var(--on-success);
+}
+
+.q-badge.bg-negative {
+  color: var(--on-danger);
+}
+
+.q-badge.bg-warning {
+  color: var(--on-warning);
+}
+
+.q-badge.bg-info {
+  color: var(--on-info);
+}
+
+.q-badge.bg-grey {
+  color: var(--on-offline);
+}
+
+.q-badge.bg-secondary,
+.q-badge.bg-accent {
+  color: var(--text-inverse);
+}
+
 /* ---- notifications (ui.notify) ----------------------------------------
    The base look is a plain rule (`background:#323232;color:#fff`); typed
    notifications add an !important `bg-<status>` (+ text-white/text-dark),
@@ -1831,10 +1862,16 @@ a:focus-visible {
      `text-white` (or, for ui.notify's "warning" preset, `text-dark`) no
      matter which colour= was requested. Never literal white/dark -- always
      the token that is legible on that fill. */
-  .bg-primary.text-white,
+  .bg-primary.text-white {
+    color: var(--on-accent) !important;
+  }
+
+  /* --q-secondary and --q-accent are --accent-2, which has no on-colour of
+     its own: --on-accent on it measured 1.48-2.49:1 in the dark core themes.
+     The flipped page ink clears 5.59:1 in every theme. */
   .bg-secondary.text-white,
   .bg-accent.text-white {
-    color: var(--on-accent) !important;
+    color: var(--text-inverse) !important;
   }
 
   .bg-positive.text-white {
