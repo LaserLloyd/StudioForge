@@ -8,7 +8,8 @@
       "glacier",
       "forest",
       "paper",
-      "daylight"
+      "daylight",
+      "night-red"
     ],
     "default": "glacier",
     "storageKey": "studioforge.theme",
@@ -97,6 +98,20 @@
       "themeColor": "#ffffff",
       "set": "core",
       "swatch": "#2c56c9",
+      "fonts": [
+        "Inter",
+        "JetBrains Mono"
+      ]
+    },
+    {
+      "slug": "night-red",
+      "name": "Night Red",
+      "family": "night-red",
+      "ground": "oled",
+      "colorScheme": "dark",
+      "themeColor": "#000000",
+      "set": "opt-in",
+      "swatch": "#ff0000",
       "fonts": [
         "Inter",
         "JetBrains Mono"

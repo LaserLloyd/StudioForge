@@ -1,9 +1,9 @@
 /* GENERATED theme runtime for studioforge by the unifyingTheme package (V26-09-16),
    tools/sync_theme.py. Do not edit this copy: change the package (src/,
    adapters/, apps/studioforge.json) and run `python tools/sync_theme.py app studioforge`.
-   themes: purple, midnight-gold, glacier, forest, paper, daylight | default: glacier
-   body sha256: 7050ce5d12a543a9 */
-window.UI_THEME_MANIFEST = {"app": "studioforge", "themes": ["purple", "midnight-gold", "glacier", "forest", "paper", "daylight"], "default": "glacier", "storageKey": "studioforge.theme", "families": false, "legacy": null, "mirrorAttr": null, "fontsHref": null};
+   themes: purple, midnight-gold, glacier, forest, paper, daylight, night-red | default: glacier
+   body sha256: c7cf3d811af0b76f */
+window.UI_THEME_MANIFEST = {"app": "studioforge", "themes": ["purple", "midnight-gold", "glacier", "forest", "paper", "daylight", "night-red"], "default": "glacier", "storageKey": "studioforge.theme", "families": false, "legacy": null, "mirrorAttr": null, "fontsHref": null};
 /* ============================================================================
    ui-theme.js — portable theme runtime · unifyingTheme V26-09-16
    ----------------------------------------------------------------------------
@@ -55,7 +55,8 @@ window.UI_THEME_MANIFEST = {"app": "studioforge", "themes": ["purple", "midnight
     {"slug": "daylight", "name": "Daylight", "family": "daylight", "ground": "light", "colorScheme": "light", "themeColor": "#ffffff", "set": "core", "swatch": "#2c56c9", "fonts": ["Inter", "JetBrains Mono"]},
     {"slug": "electric-yellow", "name": "Electric Yellow", "family": "electric-yellow", "ground": "dark", "colorScheme": "dark", "themeColor": "#0a0a0b", "set": "opt-in", "swatch": "#e8ff00", "fonts": ["Archivo", "JetBrains Mono"]},
     {"slug": "laserlloyd", "name": "LaserLloyd", "family": "laserlloyd", "ground": "dark", "colorScheme": "dark", "themeColor": "#080a0d", "set": "opt-in", "swatch": "#2ea8ff", "fonts": ["Inter", "Space Grotesk"]},
-    {"slug": "laserlloyd-light", "name": "LaserLloyd Light", "family": "laserlloyd", "ground": "light", "colorScheme": "light", "themeColor": "#f2f5f9", "set": "opt-in", "swatch": "#0b78d0", "fonts": ["Inter", "Space Grotesk"]}
+    {"slug": "laserlloyd-light", "name": "LaserLloyd Light", "family": "laserlloyd", "ground": "light", "colorScheme": "light", "themeColor": "#f2f5f9", "set": "opt-in", "swatch": "#0b78d0", "fonts": ["Inter", "Space Grotesk"]},
+    {"slug": "night-red", "name": "Night Red", "family": "night-red", "ground": "oled", "colorScheme": "dark", "themeColor": "#000000", "set": "opt-in", "swatch": "#ff0000", "fonts": ["Inter", "JetBrains Mono"]}
   ]/*@end-registry*/;
 
   var BASE = 'purple';
