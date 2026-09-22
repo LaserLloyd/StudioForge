@@ -1,7 +1,13 @@
-"""Chat tab: exercise the real JIT path, including vision.
+"""Chat tab: an ops bench for checking a model end to end (D68).
 
-This deliberately goes through the *same* code the OpenAI endpoints use --
-``manager.ensure_loaded`` then a stream from ``supervisor.base_url(...)`` -- so a
+On this rig the tab is used operationally: open it, see which model is loaded,
+poke it, read the numbers -- or pick a model, load it and test it. So the picker
+defaults to "(Loaded model)", the card above the conversation says what that is
+and how it was launched, and every reply carries its load time, time to first
+token, prefill and decode rates and overall throughput.
+
+It still goes through the *same* code the OpenAI endpoints use --
+``manager.ensure_loaded`` then a stream from the child's own port -- so a
 successful chat here is real evidence that a client will work, not a separate
 mock path that can drift. That includes image attachment: being able to paste a
 screenshot and get an answer is the only practical way to verify a vision model
@@ -10,18 +16,41 @@ end to end without wiring up OpenClaw first.
 
 from __future__ import annotations
 
+import asyncio
+import base64
 import json
 import time
+from collections.abc import Callable
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
 from nicegui import ui
 
 from studioforge.gui import state as st
-from studioforge.gui.tabs import GuiContext, notify_error
+from studioforge.gui.tabs import (
+    GuiContext,
+    busy,
+    element_alive,
+    notify_error,
+    single_flight,
+    viewer_may_change_box,
+)
 
 #: Guard against a paste of a 40 MP screenshot filling the socket buffer.
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
+
+#: Repaint a streaming reply at most this often. A 0.5B model streams ~700
+#: tokens/s, and one websocket message per token only makes the browser lag.
+_REPAINT_S = 0.05
+
+_STATE_BADGES: dict[str, tuple[str, str]] = {
+    "ready": ("Loaded", "positive"),
+    "loading": ("Loading…", "warning"),
+    "failed": ("Failed", "negative"),
+    "not_loaded": ("Not loaded", "grey"),
+    "none": ("No model", "grey"),
+}
 
 _PASTE_SCRIPT = """
 <script>
@@ -42,139 +71,270 @@ document.addEventListener('paste', (event) => {
 """
 
 
-def render(ctx: GuiContext) -> None:  # noqa: C901 - one screen, one flow
-    records = list(ctx.registry.all()) if ctx.registry is not None else []
-    chat_records = st.chat_model_records(records)
-    options = [r.id for r in chat_records]
+def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one flow
     images: list[dict[str, str]] = []
+    history: list[dict[str, Any]] = []
+    #: ``active`` while a send is in flight; ``stop`` is the Stop button's request.
+    run: dict[str, Any] = {"active": False, "stop": False}
+    #: Last painted picker options and card signature, so a poll that changes
+    #: nothing sends nothing to the browser (and never closes an open dropdown).
+    view: dict[str, Any] = {"options": None, "card": None}
+    unloadable = _unloadable_check(ctx)
 
     ui.add_head_html(_PASTE_SCRIPT)
 
-    with ui.column().classes("w-full gap-2 p-2"):
-        if not options:
-            ui.label("No chat models in the library yet.").classes("text-sm opacity-70")
-        hidden_note = st.hidden_chat_models_note(records)
-        if hidden_note:
-            # An embedding model has no chat endpoint; it is deliberately
-            # absent from the picker rather than failing at send time.
-            ui.label(hidden_note).classes("text-xs opacity-70")
+    def records_now() -> list[Any]:
+        return list(ctx.registry.all()) if ctx.registry is not None else []
+
+    def instances_now() -> list[Any]:
+        return list(ctx.supervisor.list()) if ctx.supervisor is not None else []
+
+    with ui.column().classes("w-full gap-3 p-2"):
+        # --- what are we talking to? ---------------------------------------
+        with ui.card().classes("w-full gap-2"):
+            with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                model = ui.select(
+                    {st.LOADED_MODEL_CHOICE: st.LOADED_MODEL_LABEL},
+                    value=st.LOADED_MODEL_CHOICE,
+                    label="Model",
+                    with_input=True,
+                )
+                model.props("dense outlined options-dense").classes("grow min-w-0")
+                load_button = ui.button("Load", icon="play_arrow").props("outline no-caps")
+                with load_button:
+                    load_tip = ui.tooltip("")
+                unload_button = ui.button("Unload", icon="stop_circle").props("flat no-caps")
+            with ui.row().classes("w-full items-center gap-2 flex-wrap"):
+                status_badge = ui.badge("", color="grey").classes("text-xs")
+                target_name = ui.label("").classes("text-sm font-mono break-all")
+            reason_label = ui.label("").classes("text-xs opacity-70")
+            facts_row = ui.row().classes("w-full gap-x-6 gap-y-2 flex-wrap")
+            warn_label = ui.label("").classes("text-xs text-warning whitespace-pre-wrap")
+            others_label = ui.label("").classes("text-xs opacity-70")
+            hidden_label = ui.label("").classes("text-xs opacity-60")
+
+        # --- the conversation ----------------------------------------------
+        transcript = ui.column().classes("w-full gap-4 p-3 rounded sf-well min-h-[10rem]")
+
+        # --- composer ------------------------------------------------------
         with ui.row().classes("w-full items-center gap-2 flex-wrap"):
-            use_loaded = ui.switch("Use the loaded model", value=False)
-            use_loaded.props("dense")
-            # Created once and retargeted: ``.tooltip()`` appends a new child
-            # element each call, and this label is repainted on a timer.
-            with use_loaded:
-                use_loaded_tip = ui.tooltip("")
-            loaded_label = ui.label("").classes("text-sm font-mono opacity-90")
-        loaded_note = ui.label("").classes("text-xs opacity-70")
-        with ui.row().classes("w-full items-center gap-2 flex-wrap"):
-            model = ui.select(
-                options, value=options[0] if options else None, label="Model", with_input=True
-            )
-            model.props("dense outlined").classes("w-96")
-            temperature = ui.number("temperature", value=0.7, precision=2, step=0.05)
-            temperature.props("dense outlined").classes("w-32")
-            top_p = ui.number("top_p", value=0.95, precision=2, step=0.05)
-            top_p.props("dense outlined").classes("w-32")
-            max_tokens = ui.number("max_tokens", value=512, precision=0)
-            max_tokens.props("dense outlined").classes("w-32")
-            rate = ui.label("").classes("text-xs font-mono opacity-80")
-
-        system = (
-            ui.textarea("System prompt", value="You are a helpful assistant.")
-            .props("dense outlined autogrow")
-            .classes("w-full")
-        )
-
-        transcript = ui.column().classes("w-full gap-2 p-2 rounded sf-well min-h-[12rem]")
-        attach_note = ui.label("").classes("text-xs opacity-70")
-        thumbs = ui.row().classes("gap-2 flex-wrap")
-
+            ui.label("Quick tests").classes("text-xs opacity-70")
+            quick_buttons: list[Any] = []
+            for test in st.CHAT_QUICK_TESTS:
+                button = ui.button(
+                    test.label,
+                    on_click=lambda _event=None, key=test.key: send_quick(key),
+                ).props("outline dense no-caps")
+                button.tooltip(test.tooltip)
+                quick_buttons.append(button)
         with ui.row().classes("w-full items-end gap-2 no-wrap"):
             prompt = ui.textarea(placeholder="Message… (Enter to send, Shift+Enter for a new line)")
             prompt.props("dense outlined autogrow").classes("grow")
+            send_button = ui.button("Send", icon="send").props("color=primary no-caps")
+            stop_button = ui.button("Stop", icon="stop").props("flat no-caps")
+            clear_button = ui.button("Clear", icon="clear_all").props("flat no-caps")
+        with ui.row().classes("w-full items-center gap-2 flex-wrap"):
             upload = (
                 ui.upload(
-                    label="image", auto_upload=True, multiple=True, max_file_size=MAX_IMAGE_BYTES
+                    label="Attach image",
+                    auto_upload=True,
+                    multiple=True,
+                    max_file_size=MAX_IMAGE_BYTES,
                 )
                 .props('flat dense accept="image/*"')
-                .classes("max-w-[12rem]")
+                .classes("max-w-[14rem]")
             )
-            send_button = ui.button("Send", icon="send").props("color=primary")
-            clear_button = ui.button("Clear", icon="clear_all").props("flat")
+            attach_note = ui.label("").classes("text-xs opacity-70")
+        thumbs = ui.row().classes("gap-2 flex-wrap")
 
-    history: list[dict[str, Any]] = []
-    # Clearing only the transcript left `history` intact, so the "cleared"
-    # conversation was still sent to the model on the next turn -- it shaped
-    # the answer, ate context, and grew without bound for the page's lifetime.
-    clear_button.on_click(lambda: _clear(transcript, history))
+        with (
+            ui.expansion("Request settings", icon="tune").classes("w-full"),
+            ui.column().classes("w-full gap-2"),
+        ):
+            system = (
+                ui.textarea("System prompt", value="You are a helpful assistant.")
+                .props("dense outlined autogrow")
+                .classes("w-full")
+            )
+            with ui.row().classes("w-full items-center gap-3 flex-wrap"):
+                temperature = ui.number("temperature", value=0.7, precision=2, step=0.05)
+                temperature.props("dense outlined").classes("w-32")
+                top_p = ui.number("top_p", value=0.95, precision=2, step=0.05)
+                top_p.props("dense outlined").classes("w-32")
+                max_tokens = ui.number("max_tokens", value=2048, precision=0)
+                max_tokens.props("dense outlined").classes("w-32")
+                keep_history = ui.switch("Send the conversation so far", value=True)
+                keep_history.props("dense")
+            ui.label(
+                "Requests go straight to the model's own llama-server at the chat tier "
+                "(1), exactly as a client's would after the gateway. Turn the "
+                "conversation off to measure each prompt on its own."
+            ).classes("text-xs opacity-60")
 
-    # --- which model are we actually talking to? -------------------------
-    #
-    # The switch is a convenience over a real ambiguity (nothing loaded / one
-    # thing loaded / several), so the resolution lives in ``state.chat_target``
-    # and this only paints the answer. ``manual`` is kept separately so turning
-    # the switch off restores what the user had picked rather than snapping back
-    # to the first model in the library.
+    def show_empty_hint() -> None:
+        with transcript:
+            view["hint"] = ui.label(
+                "Send a message or pick a quick test. Every reply shows load time, time to "
+                "first token, prefill and decode speed, and overall tokens per second."
+            ).classes("text-sm opacity-60")
 
-    manual: dict[str, Any] = {"choice": model.value}
+    def drop_empty_hint() -> None:
+        hint = view.pop("hint", None)
+        if hint is not None and element_alive(hint):
+            hint.delete()
 
-    def resolve_target() -> Any:
-        records_now = list(ctx.registry.all()) if ctx.registry is not None else []
-        instances = list(ctx.supervisor.list()) if ctx.supervisor is not None else []
-        return st.chat_target(
-            records_now,
-            instances,
-            use_loaded=bool(use_loaded.value),
-            manual_choice=manual["choice"],
+    show_empty_hint()
+
+    # --- target resolution and painting -------------------------------------
+
+    def pick_now(records: list[Any] | None = None, instances: list[Any] | None = None) -> Any:
+        return st.chat_pick(
+            records if records is not None else records_now(),
+            instances if instances is not None else instances_now(),
+            choice=model.value,
+            unloadable=unloadable,
         )
 
-    def sync_target() -> None:
-        """Repaint the switch from live state; runs on the GUI's poll cadence."""
-        target = resolve_target()
-        if target.switch_disabled and use_loaded.value:
-            # Nothing loadable to point at: the switch must never sit silently
-            # on while chat quietly falls back to the picker.
-            use_loaded.set_value(False)
-            target = resolve_target()
-        use_loaded.set_enabled(not target.switch_disabled)
-        use_loaded_tip.set_text(
-            target.disabled_reason
-            or "Send to whatever is already resident, instead of the model picked below."
+    def serving_instance(record: Any, instances: list[Any]) -> Any:
+        if record is None:
+            return None
+        wanted = [record.id]
+        if record.is_virtual and record.base_model_id:
+            wanted.append(record.base_model_id)
+        for model_id in wanted:
+            found = next((i for i in instances if i.model_id == model_id), None)
+            if found is not None:
+                return found
+        return None
+
+    def gpus_now() -> list[Any]:
+        try:
+            return list(ctx.probe.list_gpus()) if ctx.probe is not None else []
+        except Exception:  # noqa: BLE001 - facts degrade to device numbers only
+            return []
+
+    def paint_facts(record: Any, instance: Any) -> None:
+        facts_row.clear()
+        with facts_row:
+            for label, value in st.chat_target_facts(record, instance, gpus_now()):
+                with ui.column().classes("gap-0"):
+                    ui.label(label).classes("text-[11px] uppercase tracking-wide opacity-60")
+                    ui.label(value).classes("text-sm font-mono")
+
+    def sync() -> None:
+        """Repaint the target card from live state; runs on the GUI's poll cadence."""
+        if not element_alive(model):
+            return
+        records = records_now()
+        instances = instances_now()
+        options = st.chat_picker_options(records, instances, unloadable=unloadable)
+        value = model.value if model.value in options else st.LOADED_MODEL_CHOICE
+        if options != view["options"]:
+            view["options"] = options
+            model.set_options(options, value=value)
+        elif value != model.value:
+            model.set_value(value)
+
+        pick = st.chat_pick(records, instances, choice=value, unloadable=unloadable)
+        record = next((r for r in records if r.id == pick.model_id), None)
+        instance = serving_instance(record, instances)
+
+        text, colour = _STATE_BADGES.get(pick.state, ("", "grey"))
+        status_badge.set_text(text)
+        status_badge.props(f"color={colour}")
+        target_name.set_text(pick.model_id or "—")
+        reason_label.set_text(pick.reason)
+
+        # Facts carry relative times ("3 minutes ago"), so they are repainted
+        # when anything they show changes, and at least once a minute.
+        signature = (
+            pick.model_id,
+            pick.state,
+            getattr(instance, "started_at", None),
+            getattr(instance, "total_requests", None),
+            getattr(instance, "last_tokens_per_second", None),
+            int(time.time() // 60),
         )
-        loaded_label.set_text(target.label)
-        # ``label`` already carries the disabled reason when there is nothing to
-        # point at, so the second line only appears when there is genuinely more
-        # to say (several models loaded, and which one won).
-        loaded_note.set_text(target.note)
-        if target.picker_disabled:
-            model.disable()
+        if signature != view["card"]:
+            view["card"] = signature
+            paint_facts(record, instance)
+
+        why_not = unloadable(record) if (unloadable and record is not None) else None
+        warning = why_not or ""
+        if not warning and pick.state == "failed" and instance is not None:
+            warning = f"Last start failed: {(instance.last_error or 'no detail')[:400]}"
+        warn_label.set_text(warning)
+        warn_label.set_visibility(bool(warning))
+
+        if pick.follows_loaded and pick.other_loaded:
+            others_label.set_text(
+                f"Also loaded: {', '.join(pick.other_loaded)}. (Loaded model) follows the "
+                "one loaded most recently; pick one below to pin the choice."
+            )
+        elif not pick.follows_loaded and pick.loaded_id and pick.loaded_id != pick.model_id:
+            others_label.set_text(f"Currently loaded: {pick.loaded_id}")
         else:
-            model.enable()
-        sync_attach_state()
+            others_label.set_text("")
+        others_label.set_visibility(bool(others_label.text))
 
-    # --- image attachment ------------------------------------------------
+        hidden = st.hidden_chat_models_note(records) or ""
+        hidden_label.set_text(hidden)
+        hidden_label.set_visibility(bool(hidden))
 
-    def selected_record() -> Any:
-        """The record chat will actually use, switch state included."""
-        target_id = resolve_target().model_id
-        return next((r for r in chat_records if r.id == target_id), None)
+        sync_controls(pick, record, why_not)
 
-    def sync_attach_state() -> None:
-        reason = st.vision_attach_reason(selected_record())
+    def sync_controls(pick: Any, record: Any, why_not: str | None) -> None:
+        active = bool(run["active"])
+        can_target = pick.model_id is not None and not why_not
+        load_button.set_visibility(pick.state != "ready")
+        unload_button.set_visibility(pick.state == "ready")
+        if can_target and not active and pick.state in ("not_loaded", "failed"):
+            load_button.enable()
+            load_tip.set_text("Load it now at the chat tier, without sending anything.")
+        else:
+            load_button.disable()
+            load_tip.set_text(
+                why_not
+                or ("A reply is in progress." if active else "")
+                or ("It is loading now." if pick.state == "loading" else "Nothing to load.")
+            )
+        if active:
+            unload_button.disable()
+        else:
+            unload_button.enable()
+        for control in (send_button, *quick_buttons):
+            if can_target and not active:
+                control.enable()
+            else:
+                control.disable()
+        if active:
+            stop_button.enable()
+        else:
+            stop_button.disable()
+        sync_attach_state(record)
+
+    # --- image attachment ------------------------------------------------------
+
+    def sync_attach_state(record: Any) -> None:
+        reason = st.vision_attach_reason(record)
         if reason:
-            upload.disable()
-            attach_note.set_text(reason)
-            images.clear()
-            _render_thumbs(thumbs, images)
-        else:
-            upload.enable()
+            upload.set_visibility(False)
             attach_note.set_text(
-                "Vision model: attach a file or just paste an image into the page."
+                "Images: this model has no vision projector." if record is not None else ""
             )
+            if images:
+                images.clear()
+                _render_thumbs(thumbs, images)
+        else:
+            upload.set_visibility(True)
+            attach_note.set_text("Vision model: attach a file or paste an image into the page.")
+
+    def target_record() -> Any:
+        pick = pick_now()
+        return next((r for r in records_now() if r.id == pick.model_id), None)
 
     def add_image(data_url: str, name: str) -> None:
-        if st.vision_attach_reason(selected_record()) is not None:
+        if st.vision_attach_reason(target_record()) is not None:
             ui.notify("this model cannot accept images", type="warning")
             return
         if len(data_url) > MAX_IMAGE_BYTES * 2:  # base64 is ~4/3 of the bytes
@@ -184,8 +344,6 @@ def render(ctx: GuiContext) -> None:  # noqa: C901 - one screen, one flow
         _render_thumbs(thumbs, images)
 
     def on_upload(event: Any) -> None:
-        import base64
-
         content = event.content.read()
         mime = getattr(event, "type", None) or "image/png"
         encoded = base64.b64encode(content).decode("ascii")
@@ -204,56 +362,239 @@ def render(ctx: GuiContext) -> None:  # noqa: C901 - one screen, one flow
         if data.startswith("data:image/"):
             add_image(data, str(payload.get("name") or "pasted-image"))
 
-    def on_model_change() -> None:
-        manual["choice"] = model.value
-        sync_target()
-
     ui.on("sf_paste_image", on_paste)
-    model.on_value_change(lambda _: on_model_change())
-    use_loaded.on_value_change(lambda _: sync_target())
-    sync_target()
-    # Same cadence as the rest of the panel: the named model must follow loads
+    model.on_value_change(lambda _: sync())
+    sync()
+    # Same cadence as the rest of the panel: "(Loaded model)" must follow loads
     # and unloads made anywhere else, including by other clients.
-    ui.timer(ctx.refresh_interval, sync_target)
+    ui.timer(ctx.refresh_interval, sync)
 
-    # --- sending ---------------------------------------------------------
+    # --- load / unload ---------------------------------------------------------
 
-    async def send() -> None:
-        text = str(prompt.value or "").strip()
-        if not text and not images:
+    async def load_target() -> None:
+        pick = pick_now()
+        if pick.model_id is None:
             return
-        target = str(resolve_target().model_id or "")
+        with single_flight(f"chat.load:{pick.model_id}", f"load of {pick.model_id}") as claimed:
+            if not claimed:
+                return
+            started = time.perf_counter()
+            with busy(load_button, message=f"Loading {pick.model_id}…"):
+                try:
+                    await _ensure(ctx, pick.model_id)
+                except Exception as exc:  # noqa: BLE001
+                    notify_error(exc, what="load")
+                    sync()
+                    return
+            elapsed = st.format_latency(time.perf_counter() - started)
+            ui.notify(f"{pick.model_id} loaded in {elapsed}", type="positive")
+            sync()
+
+    async def unload_target() -> None:
+        pick = pick_now()
+        records = records_now()
+        record = next((r for r in records if r.id == pick.model_id), None)
+        instance = serving_instance(record, instances_now())
+        if instance is None:
+            return
+        serving_id = instance.model_id
+        with single_flight(f"models.unload:{serving_id}", f"unload of {serving_id}") as claimed:
+            if not claimed:
+                return
+            with busy(unload_button, message=f"Unloading {serving_id}…"):
+                try:
+                    # D55: a viewer who passes D32 may unload a lease-held
+                    # model; a remote viewer on an open install gets the
+                    # manager's 409 as a red toast, as on the Dashboard.
+                    await ctx.manager.unload(serving_id, force=viewer_may_change_box(ctx))
+                except Exception as exc:  # noqa: BLE001
+                    notify_error(exc, what="unload")
+                    sync()
+                    return
+            ui.notify(f"{serving_id} unloaded", type="positive")
+            sync()
+
+    load_button.on_click(load_target)
+    unload_button.on_click(unload_target)
+
+    # --- sending ---------------------------------------------------------------
+
+    async def send(text: str | None = None, display: str | None = None) -> None:
+        if run["active"]:
+            return
+        typed = text is None
+        message = str(prompt.value or "").strip() if typed else str(text)
+        if not message and not images:
+            return
+        records = records_now()
+        instances = instances_now()
+        pick = pick_now(records, instances)
+        target = pick.model_id
         if not target:
-            ui.notify("no model selected", type="warning")
+            ui.notify("no model to send to", type="warning")
             return
+        record = next((r for r in records if r.id == target), None)
+        was_ready = record is not None and st.chat_model_state(record, instances) == "ready"
+
         attached = [image["url"] for image in images]
-        history.append({"role": "user", "content": st.build_chat_content(text, attached)})
+        user_turn = {"role": "user", "content": st.build_chat_content(message, attached)}
+        drop_empty_hint()
+        shown = display if display is not None else message
         with transcript:
-            _bubble("you", text + (f"\n[{len(attached)} image(s)]" if attached else ""))
-            answer = _bubble(target, "")
-        prompt.set_value("")
+            _bubble("you", shown + (f"\n[{len(attached)} image(s)]" if attached else ""))
+            reply = _reply_block(target)
+        if typed:
+            prompt.set_value("")
         images.clear()
         _render_thumbs(thumbs, images)
-        send_button.disable()
-        rate.set_text("loading…")
-        try:
-            await _stream(
-                ctx, target, system.value, history, answer, rate, temperature, top_p, max_tokens
-            )
-        except Exception as exc:  # noqa: BLE001
-            notify_error(exc, what="chat")
-            answer.set_text(f"{answer.text}\n\n[failed: {exc}]")
-            rate.set_text("")
-        finally:
-            send_button.enable()
 
-    send_button.on_click(send)
+        messages: list[dict[str, Any]] = []
+        system_text = str(system.value or "").strip()
+        if system_text:
+            messages.append({"role": "system", "content": system_text})
+        if keep_history.value:
+            messages.extend(history)
+        messages.append(user_turn)
+        history.append(user_turn)
+
+        payload: dict[str, Any] = {
+            "model": target,
+            "messages": messages,
+            "stream": True,
+            # usage + llama-server's own timings ride on the final chunk.
+            "stream_options": {"include_usage": True},
+            # number_value, not ``or``: an explicit 0 (greedy temperature) must
+            # be sent as 0, never silently replaced with the default.
+            "temperature": st.number_value(temperature.value, 0.7),
+            "top_p": st.number_value(top_p.value, 0.95),
+            "max_tokens": int(st.number_value(max_tokens.value, 2048)),
+        }
+
+        run["active"] = True
+        run["stop"] = False
+        sync()
+        clicked_at = time.perf_counter()
+        load_s: float | None = None
+        try:
+            ticker = None
+            if not was_ready:
+                ticker = asyncio.create_task(_tick_loading(reply.status, clicked_at))
+            try:
+                _record, instance = await _ensure(ctx, target)
+            except Exception as exc:  # noqa: BLE001
+                elapsed = time.perf_counter() - clicked_at
+                _show_failure(reply, f"load failed after {st.format_latency(elapsed)}", exc)
+                notify_error(exc, what="chat")
+                history.pop()
+                return
+            finally:
+                if ticker is not None:
+                    ticker.cancel()
+            if not was_ready:
+                load_s = time.perf_counter() - clicked_at
+            serving_id = instance.model_id
+            base = ctx.supervisor.base_url(serving_id)
+            if base is None:
+                _show_failure(reply, "not serving", RuntimeError(f"'{serving_id}' has no port"))
+                history.pop()
+                return
+            payload["model"] = serving_id
+            if element_alive(reply.status):
+                reply.status.set_text("waiting for the first token…")
+            result = await _stream(ctx, serving_id, base, payload, reply, run)
+            metrics = st.chat_run_metrics(
+                clicked_at=clicked_at,
+                sent_at=result.sent_at,
+                first_token_at=result.first_token_at,
+                last_token_at=result.last_token_at or time.perf_counter(),
+                load_s=load_s,
+                chunks=result.chunks,
+                usage=result.usage,
+                timings=result.timings,
+                finish_reason=result.finish_reason,
+                stopped=result.stopped,
+            )
+            if element_alive(reply.status):
+                reply.status.set_text("stopped" if result.stopped else "")
+                _render_metrics(reply.metrics, metrics)
+            _reasoning, answer = st.split_reasoning(result.content)
+            history.append({"role": "assistant", "content": answer or result.content})
+        except Exception as exc:  # noqa: BLE001
+            _show_failure(reply, "failed", exc)
+            notify_error(exc, what="chat")
+            # A turn the model never answered must not ride along with the next
+            # message, or the next answer replies to both.
+            if history and history[-1] is user_turn:
+                history.pop()
+        finally:
+            run["active"] = False
+            run["stop"] = False
+            sync()
+
+    async def send_quick(key: str) -> None:
+        test = next(t for t in st.CHAT_QUICK_TESTS if t.key == key)
+        await send(st.quick_test_prompt(key), test.display)
+
+    def request_stop() -> None:
+        if run["active"]:
+            run["stop"] = True
+
+    def clear() -> None:
+        _clear(transcript, history)
+        show_empty_hint()
+
+    send_button.on_click(lambda: send())
+    stop_button.on_click(request_stop)
+    clear_button.on_click(clear)
     # Enter sends; Shift+Enter falls through to the browser's default and
     # inserts the newline (``exact`` keeps modifier combinations out, and
     # ``prevent`` stops the sent message from also gaining a newline).
     # Ctrl+Enter stays as an alias for muscle memory from the old binding.
-    prompt.on("keydown.enter.exact.prevent", send)
-    prompt.on("keydown.ctrl.enter", send)
+    prompt.on("keydown.enter.exact.prevent", lambda: send())
+    prompt.on("keydown.ctrl.enter", lambda: send())
+
+
+def _unloadable_check(ctx: GuiContext) -> Callable[[Any], str | None] | None:
+    """Why a model cannot be loaded at all, when the server can say (D66).
+
+    Used to keep ``(Loaded model)`` from defaulting to a download the engine
+    cannot run, and to explain a disabled Load button instead of letting it
+    fail. ``None`` when this build has no such check.
+    """
+    reason_for = getattr(ctx.manager, "unsupported_reason", None)
+    if not callable(reason_for):
+        return None
+
+    def check(record: Any) -> str | None:
+        try:
+            reason = reason_for(record)
+        except Exception:  # noqa: BLE001 - a failed check must never block a load
+            return None
+        return str(reason) if reason else None
+
+    return check
+
+
+async def _ensure(ctx: GuiContext, model_id: str) -> tuple[Any, Any]:
+    """Load (or find) the model the way a client's first request would.
+
+    Tier 1, literally: a person typing in this tab *is* the active chat, which
+    is D46's own definition of the tier. Claiming nothing left the server's own
+    UI as background work -- an agent's tier-2 load could 503 the human sitting
+    in front of it. The number is spelled out rather than imported because this
+    package imports nothing from ``core``; the tiers live in
+    ``studioforge/core/priority.py`` (PRIORITY_CHAT).
+    """
+    record, instance = await ctx.manager.ensure_loaded(model_id, priority=1)
+    return record, instance
+
+
+async def _tick_loading(label: Any, started: float) -> None:
+    """Count the seconds of a cold load in the reply's status line."""
+    while True:
+        if element_alive(label):
+            label.set_text(f"loading the model… {time.perf_counter() - started:.0f} s")
+        await asyncio.sleep(0.5)
 
 
 def _clear(transcript: Any, history: list[dict[str, Any]] | None = None) -> None:
@@ -273,90 +614,166 @@ def _render_thumbs(container: Any, images: list[dict[str, str]]) -> None:
 
 def _bubble(who: str, text: str) -> Any:
     with ui.column().classes("w-full gap-0"):
-        ui.label(who).classes("text-[10px] uppercase opacity-50")
+        ui.label(who).classes("text-[11px] uppercase tracking-wide opacity-60")
         return ui.label(text).classes("text-sm whitespace-pre-wrap")
+
+
+def _reply_block(model_id: str) -> SimpleNamespace:
+    """A reply: who answered, its thinking (folded), the answer, then its numbers."""
+    with ui.column().classes("w-full gap-1"):
+        with ui.row().classes("w-full items-center gap-2"):
+            ui.label(model_id).classes("text-[11px] tracking-wide opacity-60 font-mono break-all")
+            status = ui.label("").classes("text-xs opacity-70")
+        thinking = ui.expansion("Thinking", icon="psychology").classes("w-full").props("dense")
+        with thinking:
+            reasoning = ui.label("").classes("text-xs whitespace-pre-wrap opacity-80")
+        thinking.set_visibility(False)
+        answer = ui.label("").classes("text-sm whitespace-pre-wrap")
+        metrics = ui.column().classes("w-full gap-1 mt-1")
+    return SimpleNamespace(
+        status=status, thinking=thinking, reasoning=reasoning, answer=answer, metrics=metrics
+    )
+
+
+def _show_failure(reply: SimpleNamespace, what: str, exc: BaseException) -> None:
+    if not element_alive(reply.answer):
+        return
+    reply.status.set_text(what)
+    reply.answer.classes(add="text-negative")
+    reply.answer.set_text(f"{reply.answer.text}\n\n[{what}: {exc}]".strip())
+
+
+def _paint_reply(reply: SimpleNamespace, content: str, reasoning_stream: str) -> None:
+    """Show the answer, with any thinking folded away above it."""
+    if not element_alive(reply.answer):
+        return
+    inline_reasoning, answer = st.split_reasoning(content)
+    reasoning = "\n\n".join(part for part in (reasoning_stream, inline_reasoning) if part)
+    if reasoning:
+        reply.thinking.set_visibility(True)
+        reply.thinking.set_text(f"Thinking ({len(reasoning):,} chars)")
+        reply.reasoning.set_text(reasoning)
+    reply.answer.set_text(answer)
+
+
+def _render_metrics(container: Any, metrics: Any) -> None:
+    container.clear()
+    with container:
+        with ui.row().classes("w-full gap-x-6 gap-y-2 flex-wrap"):
+            for tile in st.chat_metric_tiles(metrics):
+                with ui.column().classes("gap-0 min-w-[6.5rem]") as column:
+                    ui.label(tile.label).classes("text-[11px] uppercase tracking-wide opacity-60")
+                    ui.label(tile.value).classes("text-base font-mono")
+                    ui.label(tile.detail).classes("text-[11px] opacity-70")
+                column.tooltip(tile.tooltip)
+        footer = st.chat_metric_footer(metrics)
+        if footer:
+            ui.label(footer).classes("text-xs opacity-70")
 
 
 async def _stream(
     ctx: GuiContext,
-    model_id: str,
-    system_prompt: str | None,
-    history: list[dict[str, Any]],
-    target_label: Any,
-    rate_label: Any,
-    temperature: Any,
-    top_p: Any,
-    max_tokens: Any,
-) -> None:
+    serving_id: str,
+    base: str,
+    payload: dict[str, Any],
+    reply: SimpleNamespace,
+    run: dict[str, Any],
+) -> SimpleNamespace:
     """Stream a completion from the model's own llama-server child.
 
     The base URL comes from the supervisor, so it is always the loopback port of
     the child we started -- there is no configured or guessed URL anywhere, which
     is what keeps this working behind any proxy.
     """
-    # Tier 1, literally: a person typing in this tab *is* the active chat, which
-    # is D46's own definition of the tier. Claiming nothing left the server's own
-    # UI as background work -- an agent's tier-2 load could 503 the human sitting
-    # in front of it. The number is spelled out rather than imported because this
-    # package imports nothing from ``core``; the tiers live in
-    # ``studioforge/core/priority.py`` (PRIORITY_CHAT).
-    record, _instance = await ctx.manager.ensure_loaded(model_id, priority=1)
-    base = ctx.supervisor.base_url(record.id)
-    if base is None:
-        raise RuntimeError(f"model '{record.id}' is not serving")
-
-    messages: list[dict[str, Any]] = []
-    if system_prompt and str(system_prompt).strip():
-        messages.append({"role": "system", "content": str(system_prompt)})
-    messages.extend(history)
-
-    payload: dict[str, Any] = {
-        "model": record.id,
-        "messages": messages,
-        "stream": True,
-        # number_value, not ``or``: an explicit 0 (greedy temperature) must be
-        # sent as 0, never silently replaced with the default.
-        "temperature": st.number_value(temperature.value, 0.7),
-        "top_p": st.number_value(top_p.value, 0.95),
-        "max_tokens": int(st.number_value(max_tokens.value, 512)),
-    }
-
-    started = time.perf_counter()
-    tokens = 0
-    collected: list[str] = []
-    ctx.supervisor.mark_request_start(record.id)
+    result = SimpleNamespace(
+        content="",
+        reasoning="",
+        chunks=0,
+        sent_at=None,
+        first_token_at=None,
+        last_token_at=None,
+        usage=None,
+        timings=None,
+        finish_reason=None,
+        stopped=False,
+    )
+    content: list[str] = []
+    reasoning: list[str] = []
+    painted_at = 0.0
+    ctx.supervisor.mark_request_start(serving_id)
     try:
-        async with (
-            httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0)) as client,
-            client.stream("POST", f"{base}/v1/chat/completions", json=payload) as response,
-        ):
-            response.raise_for_status()
-            async for line in response.aiter_lines():
-                if not line.startswith("data:"):
-                    continue
-                chunk = line[5:].strip()
-                if not chunk or chunk == "[DONE]":
-                    continue
-                try:
-                    data = json.loads(chunk)
-                except ValueError:
-                    continue
-                choices = data.get("choices") or []
-                if not choices:
-                    continue
-                delta = choices[0].get("delta") or {}
-                piece = delta.get("content")
-                if not piece:
-                    continue
-                tokens += 1
-                collected.append(piece)
-                target_label.set_text("".join(collected))
-                elapsed = time.perf_counter() - started
-                tps = st.tokens_per_second(tokens, elapsed)
-                rate_label.set_text(f"{tps} tok/s" if tps else "")
+        async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0)) as client:
+            result.sent_at = time.perf_counter()
+            async with client.stream(
+                "POST", f"{base}/v1/chat/completions", json=payload
+            ) as response:
+                if response.status_code >= 400:
+                    body = (await response.aread()).decode("utf-8", "replace")
+                    raise RuntimeError(f"HTTP {response.status_code}: {body[:600]}")
+                async for line in response.aiter_lines():
+                    if run.get("stop"):
+                        result.stopped = True
+                        break
+                    data = _parse_sse(line)
+                    if data is None:
+                        continue
+                    if isinstance(data.get("usage"), dict):
+                        result.usage = data["usage"]
+                    if isinstance(data.get("timings"), dict):
+                        result.timings = data["timings"]
+                    choices = data.get("choices") or []
+                    if not choices:
+                        continue
+                    choice = choices[0]
+                    if choice.get("finish_reason"):
+                        result.finish_reason = str(choice["finish_reason"])
+                    delta = choice.get("delta") or {}
+                    piece = delta.get("content") or ""
+                    thought = delta.get("reasoning_content") or ""
+                    if not piece and not thought:
+                        continue
+                    now = time.perf_counter()
+                    if result.first_token_at is None:
+                        result.first_token_at = now
+                        if element_alive(reply.status):
+                            reply.status.set_text("streaming…")
+                    result.last_token_at = now
+                    result.chunks += 1
+                    if piece:
+                        content.append(piece)
+                    if thought:
+                        reasoning.append(thought)
+                    if now - painted_at >= _REPAINT_S:
+                        painted_at = now
+                        _paint_reply(reply, "".join(content), "".join(reasoning))
     finally:
-        elapsed = time.perf_counter() - started
-        ctx.supervisor.mark_request_end(
-            record.id, tokens_per_second=st.tokens_per_second(tokens, elapsed)
+        result.content = "".join(content)
+        result.reasoning = "".join(reasoning)
+        _paint_reply(reply, result.content, result.reasoning)
+        elapsed = (result.last_token_at or time.perf_counter()) - (
+            result.first_token_at or result.sent_at or time.perf_counter()
         )
-    history.append({"role": "assistant", "content": "".join(collected)})
+        rate = None
+        if isinstance(result.timings, dict):
+            rate = result.timings.get("predicted_per_second")
+        ctx.supervisor.mark_request_end(
+            serving_id,
+            tokens_per_second=round(float(rate), 2)
+            if isinstance(rate, int | float) and rate > 0
+            else st.tokens_per_second(max(0, result.chunks - 1), elapsed),
+        )
+    return result
+
+
+def _parse_sse(line: str) -> dict[str, Any] | None:
+    """One ``data:`` line of an OpenAI stream as a dict, or ``None``."""
+    if not line.startswith("data:"):
+        return None
+    chunk = line[5:].strip()
+    if not chunk or chunk == "[DONE]":
+        return None
+    try:
+        data = json.loads(chunk)
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None

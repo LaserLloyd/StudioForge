@@ -2856,125 +2856,445 @@ def hidden_chat_models_note(records: Sequence[ModelRecord]) -> str | None:
     )
 
 
-@dataclass(frozen=True)
-class ChatTarget:
-    """Which model the Chat tab will actually talk to, and why.
+#: The Chat picker's first entry (D68). It is not a model id: it means "whatever
+#: is loaded right now" and is re-resolved on every poll and on every send,
+#: which is what an operator opening the tab to check the box wants by default.
+LOADED_MODEL_CHOICE: Final = "__loaded__"
 
-    The "use the loaded model" switch is a convenience over a real ambiguity --
-    there can be nothing loaded, exactly one thing loaded, or several -- and each
-    of those needs a different visible answer. Resolving it here means the tab
-    never has to guess, and the awkward cases (nothing loaded; two models
-    loaded; a loaded embedding model that cannot chat) are testable.
+#: Label stem for :data:`LOADED_MODEL_CHOICE`; the model it resolves to follows.
+LOADED_MODEL_LABEL: Final = "(Loaded model)"
+
+#: Values of :attr:`ChatPick.state`.
+CHAT_STATES: Final = ("ready", "loading", "failed", "not_loaded", "none")
+
+
+def download_recency(record: ModelRecord) -> float:
+    """When a model arrived, by the catalog's ``downloaded_at`` rule.
+
+    The newest mtime across the model's files, else the scan time: the same key
+    ``core.catalog`` sorts "newest download first" by, so the Chat tab and the
+    catalog never disagree about which model is the newest.
+    """
+    return float(record.mtime or record.added_at or 0.0)
+
+
+def loaded_recency(instance: InstanceInfo) -> float:
+    """When a child became ready. The supervisor stamps ``started_at`` at ready."""
+    return float(instance.started_at or instance.last_activity_at or 0.0)
+
+
+def chat_model_state(record: ModelRecord, instances: Sequence[InstanceInfo]) -> str:
+    """``ready`` / ``loading`` / ``failed`` / ``not_loaded`` for one chat model.
+
+    A virtual model (a persona over a base) has no child of its own. It is as
+    loaded as the base it shares, so the base's instance answers for it.
+    """
+    wanted = {record.id}
+    if record.is_virtual and record.base_model_id:
+        wanted.add(record.base_model_id)
+    states = {str(i.state) for i in instances if i.model_id in wanted}
+    for state in ("ready", "loading", "failed"):
+        if state in states:
+            return state
+    return "not_loaded"
+
+
+def newest_download(
+    records: Sequence[ModelRecord],
+    *,
+    unloadable: typing.Callable[[ModelRecord], str | None] | None = None,
+) -> ModelRecord | None:
+    """The most recently downloaded chat model that could actually be loaded.
+
+    Virtual models are skipped because they are settings over a base, not
+    downloads. A model the engine cannot run (``unloadable`` returns a reason) is
+    skipped too, so the default never points at a load that is known to fail.
+    """
+    candidates = [
+        r
+        for r in records
+        if r.kind == "chat" and not r.is_virtual and not (unloadable and unloadable(r))
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda r: (download_recency(r), r.id.lower()))
+
+
+@dataclass(frozen=True)
+class ChatPick:
+    """What the Chat tab's next send talks to, and why (D68).
+
+    ``(Loaded model)`` is the default because the tab is an ops bench: open it,
+    see what is resident, poke it. It resolves to the most recently *loaded*
+    ready chat model. With nothing ready, it follows a load in flight. With
+    nothing loaded at all, it names the newest download, so Send (or Load) is a
+    one-click "does the model I just downloaded work?".
+
+    An explicit pick is honoured as long as the model is still in the library;
+    a pick that has disappeared (deleted, renamed by a rescan) falls back to the
+    ``(Loaded model)`` rules instead of silently sending to nothing.
     """
 
-    #: The model the next send goes to, or ``None`` when there is nothing to send to.
+    choice: str
     model_id: str | None
-    #: Whether the switch is *effectively* on. Never ``True`` when it is disabled.
-    use_loaded: bool
-    #: Whether the switch itself can be operated.
-    switch_disabled: bool
-    #: Why the switch cannot be used, or ``None`` when it can.
-    disabled_reason: str | None
-    #: Whether the manual model picker is greyed out.
-    picker_disabled: bool
-    #: The loaded model the switch targets, if any.
-    loaded_id: str | None
-    #: Other loaded chat models that the switch is *not* targeting.
+    #: One of :data:`CHAT_STATES`, for :attr:`model_id`.
+    state: str
+    follows_loaded: bool
+    #: The most recently loaded ready chat model, whatever the choice.
+    loaded_id: str | None = None
+    #: Other ready chat models, most recently loaded first.
     other_loaded: tuple[str, ...] = ()
+    #: One line saying why this is the target.
+    reason: str = ""
 
     @property
-    def label(self) -> str:
-        """What is shown next to the switch."""
-        if self.loaded_id is None:
-            return self.disabled_reason or "no model is loaded"
-        if self.other_loaded:
-            return f"{self.loaded_id}  (most recently used of {1 + len(self.other_loaded)} loaded)"
-        return self.loaded_id
-
-    @property
-    def note(self) -> str:
-        """Extra line shown when the choice was not obvious, else ``""``."""
-        if self.loaded_id is None or not self.other_loaded:
-            return ""
-        return (
-            f"Also loaded: {', '.join(self.other_loaded)}. The switch follows the most "
-            "recently used model, so it can change under you as other clients make "
-            "requests — turn it off to pin the choice."
-        )
+    def will_load(self) -> bool:
+        """Whether sending (or pressing Load) starts or waits for a load."""
+        return self.model_id is not None and self.state != "ready"
 
 
-def _instance_recency(instance: InstanceInfo) -> float:
-    return float(instance.last_activity_at or instance.started_at or 0.0)
-
-
-def chat_target(
+def chat_pick(
     records: Sequence[ModelRecord],
     instances: Sequence[InstanceInfo],
     *,
-    use_loaded: bool,
-    manual_choice: str | None,
-) -> ChatTarget:
-    """Resolve the Chat tab's target model.
-
-    Rules, each of which exists because the silent alternative is worse:
-
-    * Nothing loaded -> the switch is **disabled with a reason**, not quietly
-      on and pointing at nothing.
-    * Something loaded but nothing that can chat (an embedding model) -> also
-      disabled, and it says which model and why, rather than offering a target
-      that would fail at send time.
-    * Several loaded -> the most recently used one is chosen **and named**,
-      with the others listed, so the choice is visible rather than arbitrary.
-    * Switch off -> ``manual_choice`` is handed straight back, so turning the
-      switch off restores what the user had picked instead of resetting the
-      picker to the first model in the library.
-    """
-    chat_ids = {r.id for r in records if r.kind == "chat"}
-    ready = [i for i in instances if i.state == "ready"]
-    candidates = sorted(
-        (i for i in ready if i.model_id in chat_ids),
-        key=lambda i: (-_instance_recency(i), i.model_id.lower()),
+    choice: str | None,
+    unloadable: typing.Callable[[ModelRecord], str | None] | None = None,
+) -> ChatPick:
+    """Resolve the Chat picker's value into the model the next send goes to."""
+    chat = {r.id: r for r in records if r.kind == "chat"}
+    ready = sorted(
+        (i for i in instances if i.state == "ready" and i.model_id in chat),
+        key=lambda i: (-loaded_recency(i), i.model_id.lower()),
     )
+    loaded_id = ready[0].model_id if ready else None
+    others = tuple(i.model_id for i in ready[1:])
 
-    if not candidates:
-        if not ready:
-            reason = "no model is loaded"
-        else:
-            names = ", ".join(sorted(i.model_id for i in ready))
-            reason = (
-                f"no chat model is loaded ({names} cannot chat — an embedding model has "
-                "no chat endpoint)"
-            )
-        return ChatTarget(
-            model_id=manual_choice or None,
-            use_loaded=False,
-            switch_disabled=True,
-            disabled_reason=reason,
-            picker_disabled=False,
-            loaded_id=None,
-        )
-
-    loaded_id = candidates[0].model_id
-    others = tuple(i.model_id for i in candidates[1:])
-    if use_loaded:
-        return ChatTarget(
-            model_id=loaded_id,
-            use_loaded=True,
-            switch_disabled=False,
-            disabled_reason=None,
-            picker_disabled=True,
+    if choice and choice != LOADED_MODEL_CHOICE and choice in chat:
+        state = chat_model_state(chat[choice], instances)
+        reasons = {
+            "ready": "picked · loaded",
+            "loading": "picked · loading now; Send waits for it",
+            "failed": "picked · its last start failed; Send or Load retries it",
+            "not_loaded": "picked · not loaded; Send or Load loads it at the chat tier",
+        }
+        return ChatPick(
+            choice=choice,
+            model_id=choice,
+            state=state,
+            follows_loaded=False,
             loaded_id=loaded_id,
             other_loaded=others,
+            reason=reasons.get(state, "picked"),
         )
-    return ChatTarget(
-        model_id=manual_choice or None,
-        use_loaded=False,
-        switch_disabled=False,
-        disabled_reason=None,
-        picker_disabled=False,
-        loaded_id=loaded_id,
-        other_loaded=others,
+
+    if loaded_id is not None:
+        reason = "the most recently loaded model"
+        if others:
+            reason += f" (of {1 + len(others)} loaded)"
+        return ChatPick(
+            choice=LOADED_MODEL_CHOICE,
+            model_id=loaded_id,
+            state="ready",
+            follows_loaded=True,
+            loaded_id=loaded_id,
+            other_loaded=others,
+            reason=reason,
+        )
+
+    loading = sorted(
+        (i for i in instances if i.state == "loading" and i.model_id in chat),
+        key=lambda i: i.model_id.lower(),
     )
+    if loading:
+        return ChatPick(
+            choice=LOADED_MODEL_CHOICE,
+            model_id=loading[0].model_id,
+            state="loading",
+            follows_loaded=True,
+            reason="nothing is ready yet; this model is loading and Send waits for it",
+        )
+
+    newest = newest_download(list(chat.values()), unloadable=unloadable)
+    if newest is not None:
+        return ChatPick(
+            choice=LOADED_MODEL_CHOICE,
+            model_id=newest.id,
+            state=chat_model_state(newest, instances),
+            follows_loaded=True,
+            reason="nothing is loaded; this is the newest download, and Send or Load loads it",
+        )
+    return ChatPick(
+        choice=LOADED_MODEL_CHOICE,
+        model_id=None,
+        state="none",
+        follows_loaded=True,
+        reason="there are no chat models in the library",
+    )
+
+
+def loaded_choice_label(auto: ChatPick) -> str:
+    """The ``(Loaded model)`` entry's label: always says what it resolves to."""
+    if auto.model_id is None:
+        return f"{LOADED_MODEL_LABEL} — nothing loaded"
+    if auto.state == "ready":
+        return f"{LOADED_MODEL_LABEL} — {auto.model_id}"
+    if auto.state == "loading":
+        return f"{LOADED_MODEL_LABEL} — {auto.model_id} (loading…)"
+    return f"{LOADED_MODEL_LABEL} — nothing loaded · newest: {auto.model_id}"
+
+
+def chat_picker_options(
+    records: Sequence[ModelRecord],
+    instances: Sequence[InstanceInfo],
+    *,
+    unloadable: typing.Callable[[ModelRecord], str | None] | None = None,
+) -> dict[str, str]:
+    """``{value: label}`` for the Chat picker, in the order an operator wants.
+
+    ``(Loaded model)`` first, then what is loaded (most recently loaded first),
+    then what is loading, then the rest of the library newest download first:
+    the model you are most likely to want to test is always near the top.
+    """
+    auto = chat_pick(records, instances, choice=LOADED_MODEL_CHOICE, unloadable=unloadable)
+    options: dict[str, str] = {LOADED_MODEL_CHOICE: loaded_choice_label(auto)}
+    chat = [r for r in records if r.kind == "chat"]
+    ready_at = {i.model_id: loaded_recency(i) for i in instances if i.state == "ready"}
+    rank = {"ready": 0, "loading": 1, "failed": 2, "not_loaded": 3}
+
+    def order(record: ModelRecord) -> tuple[int, float, str]:
+        state = chat_model_state(record, instances)
+        when = ready_at.get(record.id) if state == "ready" else download_recency(record)
+        return (rank.get(state, 3), -float(when or 0.0), record.id.lower())
+
+    for record in sorted(chat, key=order):
+        state = chat_model_state(record, instances)
+        label = record.id
+        if state == "ready":
+            label += " · loaded"
+        elif state == "loading":
+            label += " · loading"
+        elif state == "failed":
+            label += " · failed"
+        why_not = unloadable(record) if unloadable else None
+        if why_not:
+            label += " · cannot load"
+        options[record.id] = label
+    return options
+
+
+def _short_gpu(name: str) -> str:
+    return name.replace("NVIDIA ", "").replace("GeForce ", "").strip() or name
+
+
+def gpu_summary(devices: Sequence[int] | None, gpus: Sequence[GpuInfo] = ()) -> str:
+    """``"0,1 · RTX 5090 ×2"``: which cards, and what they are."""
+    if not devices:
+        return UNKNOWN
+    names = {g.index: _short_gpu(g.name) for g in gpus}
+    counts: dict[str, int] = {}
+    for device in devices:
+        name = names.get(int(device))
+        if name:
+            counts[name] = counts.get(name, 0) + 1
+    listed = format_device_list(devices)
+    if not counts:
+        return f"GPU {listed}"
+    kinds = " + ".join(f"{name} ×{n}" if n > 1 else name for name, n in counts.items())
+    return f"GPU {listed} · {kinds}"
+
+
+def _speculative_text(instance: InstanceInfo) -> str:
+    spec = instance.speculative or {}
+    kind = str(spec.get("type") or "")
+    if not kind and instance.effective is not None:
+        kind = str(instance.effective.spec_type or "")
+    if not kind or kind == "none":
+        return "off"
+    draft = spec.get("draft_n_max")
+    label = {
+        "draft-mtp": "MTP heads",
+        "draft-simple": "draft model",
+        "ngram-mod": "n-gram",
+    }.get(kind, kind)
+    return f"{label} (up to {draft} per step)" if draft else label
+
+
+_TIER_NAMES: Final = {1: "chat", 2: "agent", 3: "background"}
+
+
+def mtp_heads(record: ModelRecord) -> int:
+    """How many multi-token-prediction heads the GGUF carries (0 = none)."""
+    meta = record.meta
+    if meta is None:
+        return 0
+    try:
+        return int(meta.extra.get("nextn_predict_layers") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def model_feature_text(record: ModelRecord) -> str:
+    """``"vision · thinking · tools · MTP ×1"``, or ``"—"``."""
+    caps = record.capabilities
+    parts = [
+        name
+        for name, on in (
+            ("vision", caps.vision),
+            ("thinking", caps.thinking),
+            ("tools", caps.tools),
+        )
+        if on
+    ]
+    heads = mtp_heads(record)
+    if heads:
+        parts.append(f"MTP ×{heads}")
+    return " · ".join(parts) or UNKNOWN
+
+
+def chat_target_facts(
+    record: ModelRecord | None,
+    instance: InstanceInfo | None,
+    gpus: Sequence[GpuInfo] = (),
+    *,
+    now: float | None = None,
+) -> list[tuple[str, str]]:
+    """``(label, value)`` pairs for the Chat tab's target card.
+
+    Loaded: where it runs and how it was launched, the facts an operator checks
+    first when a model "feels slow". Not loaded: what it is and what loading it
+    will involve.
+    """
+    if record is None:
+        return []
+    facts: list[tuple[str, str]] = []
+    ready = instance is not None and instance.state == "ready"
+    if instance is not None and ready:
+        plan = instance.plan
+        effective = instance.effective
+        devices = plan.devices if plan is not None else None
+        facts.append(("GPUs", gpu_summary(devices, gpus)))
+        per_slot = (effective.ctx_per_slot if effective is not None else None) or (
+            (plan.ctx_per_slot or plan.ctx_size) if plan is not None else None
+        )
+        slots = (effective.parallel if effective is not None else None) or (
+            plan.parallel if plan is not None else None
+        )
+        if per_slot:
+            facts.append(
+                (
+                    "Context",
+                    f"{int(per_slot):,} × {slots} slot{'s' if (slots or 1) != 1 else ''}"
+                    if slots
+                    else f"{int(per_slot):,}",
+                )
+            )
+        if plan is not None:
+            kv = plan.kv_cache_type
+            if plan.kv_cache_type_v and plan.kv_cache_type_v != kv:
+                kv = f"{kv} / {plan.kv_cache_type_v}"
+            facts.append(("KV cache", str(kv)))
+        facts.append(("Speculative", _speculative_text(instance)))
+        facts.append(("Engine", instance.resolved_engine_tag or UNKNOWN))
+        when = format_when(instance.started_at, now=now) if instance.started_at else UNKNOWN
+        by = f" by {instance.loaded_by}" if instance.loaded_by else ""
+        facts.append(("Loaded", f"{when}{by}"))
+        tier = int(instance.priority or 3)
+        facts.append(("Tier", f"{tier} {_TIER_NAMES.get(tier, '')}".strip()))
+        if instance.ttl_s is not None:
+            facts.append(
+                (
+                    "Idle unload",
+                    "never" if instance.ttl_s <= 0 else f"after {format_duration(instance.ttl_s)}",
+                )
+            )
+        facts.append(("Requests", f"{instance.total_requests:,}"))
+        if instance.last_tokens_per_second:
+            facts.append(("Last decode", f"{format_tps(instance.last_tokens_per_second)} tok/s"))
+    else:
+        size = format_bytes(record.size_bytes) if record.size_bytes else UNKNOWN
+        if record.mmproj_bytes:
+            size += f" + {format_bytes(record.mmproj_bytes)} vision"
+        facts.append(("Size", size))
+        facts.append(("Quant", str(record.quant or UNKNOWN)))
+        facts.append(("Arch", str(record.architecture or UNKNOWN)))
+        meta = record.meta
+        if meta is not None and meta.param_count:
+            facts.append(("Params", f"{meta.param_count / 1e9:.1f}B"))
+        if meta is not None and meta.n_ctx_train:
+            facts.append(("Trained ctx", f"{int(meta.n_ctx_train):,}"))
+        facts.append(("Downloaded", format_when(download_recency(record), now=now)))
+    facts.append(("Features", model_feature_text(record)))
+    return facts
+
+
+#: A one-click test prompt on the Chat tab (D68).
+@dataclass(frozen=True)
+class QuickTest:
+    key: str
+    label: str
+    #: What the transcript shows. The prefill test's real prompt is ~4k tokens
+    #: of filler, and printing that would bury the answer.
+    display: str
+    tooltip: str
+
+
+CHAT_QUICK_TESTS: Final[tuple[QuickTest, ...]] = (
+    QuickTest(
+        key="hello",
+        label="Hello",
+        display="Reply in one short sentence: hello, which model are you?",
+        tooltip="Smoke test: does the model answer at all, and how fast is the first token?",
+    ),
+    QuickTest(
+        key="count",
+        label="Count to 100",
+        display="Count from 1 to 100, separated by commas. Output only the numbers.",
+        tooltip="Decode speed: a long, predictable answer that is easy to check.",
+    ),
+    QuickTest(
+        key="long",
+        label="Long answer",
+        display="Explain, in about 400 words, how a GPU executes a large matrix multiplication.",
+        tooltip="Sustained decode: several hundred tokens of free text.",
+    ),
+    QuickTest(
+        key="prefill",
+        label="Prefill ~4k",
+        display="[prefill test: ~4,000 tokens of filler text] What is the text above about?",
+        tooltip=(
+            "Prompt processing: ~4,000 tokens in, one sentence out. Watch TTFT and prefill "
+            "tok/s. The second run of the same prompt shows the prompt cache at work."
+        ),
+    ),
+)
+
+_FILLER_SENTENCES: Final = (
+    "The harbour master logged each arriving vessel by name, tonnage and cargo.",
+    "Rain had fallen on the valley for nine days, and the river rose past the old mark.",
+    "In the workshop, the clockmaker adjusted the escapement with a steel pin.",
+    "A caravan of forty camels crossed the salt flats before the midday heat.",
+    "The committee argued for an hour about the colour of the new railway posters.",
+    "Beneath the library, a second archive held maps that nobody had catalogued.",
+    "The orchard keeper grafted three varieties of apple onto a single rootstock.",
+    "Every lighthouse on the coast was painted with its own pattern of stripes.",
+)
+
+
+def quick_test_prompt(key: str, *, approx_tokens: int = 4000) -> str:
+    """The prompt actually sent for a quick test (deterministic, no I/O)."""
+    test = next((t for t in CHAT_QUICK_TESTS if t.key == key), None)
+    if test is None:
+        raise KeyError(key)
+    if key != "prefill":
+        return test.display
+    # ~14 tokens per sentence in common tokenizers; numbering each paragraph
+    # keeps consecutive runs from collapsing into one repeated n-gram.
+    sentences_needed = max(1, approx_tokens // 14)
+    paragraphs: list[str] = []
+    for index in range(0, sentences_needed, len(_FILLER_SENTENCES)):
+        body = " ".join(_FILLER_SENTENCES)
+        paragraphs.append(f"Section {index // len(_FILLER_SENTENCES) + 1}. {body}")
+    return "\n\n".join(paragraphs) + "\n\nWhat is the text above about? Answer in one sentence."
 
 
 def vision_attach_reason(record: ModelRecord | None) -> str | None:
@@ -3026,6 +3346,339 @@ def number_value(raw: Any, default: float) -> float:
         return float(raw)
     except (TypeError, ValueError):
         return float(default)
+
+
+def format_tps(value: float | None) -> str:
+    """Tokens per second at a readable precision: ``"722"``, ``"24.8"``, ``"3.12"``."""
+    if value is None or value <= 0:
+        return UNKNOWN
+    if value >= 100:
+        return f"{value:,.0f}"
+    if value >= 10:
+        return f"{value:.1f}"
+    return f"{value:.2f}"
+
+
+def format_latency(seconds: float | None) -> str:
+    """``"420 ms"`` under a second, then ``"1.61 s"``, ``"11.5 s"``, ``"2m 05s"``."""
+    if seconds is None or seconds < 0:
+        return UNKNOWN
+    if seconds < 1.0:
+        return f"{seconds * 1000:.0f} ms"
+    if seconds < 10.0:
+        return f"{seconds:.2f} s"
+    if seconds < 120.0:
+        return f"{seconds:.1f} s"
+    return format_duration(seconds)
+
+
+def split_reasoning(content: str) -> tuple[str, str]:
+    """``(reasoning, answer)`` from a reply that may carry ``<think>`` inline.
+
+    Thinking models are launched with ``--reasoning-format none`` (``auto``
+    returned empty content), so their thoughts arrive inline in ``content``.
+    Chat templates differ on whether the *opening* tag is generated or already
+    in the prompt, so a closing tag with no opening one still ends the
+    reasoning. While streaming, an opened-but-unclosed block is all reasoning
+    so far.
+    """
+    open_tag, close_tag = "<think>", "</think>"
+    start = content.find(open_tag)
+    end = content.find(close_tag)
+    if start != -1 and (end == -1 or start < end):
+        before = content[:start]
+        rest = content[start + len(open_tag) :]
+        close = rest.find(close_tag)
+        if close == -1:
+            return rest.strip(), before.strip()
+        return rest[:close].strip(), (before + rest[close + len(close_tag) :]).strip()
+    if end != -1:
+        return content[:end].strip(), content[end + len(close_tag) :].strip()
+    return "", content
+
+
+def _int_or_none(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _float_or_none(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number == number and number not in (float("inf"), float("-inf")) else None
+
+
+@dataclass(frozen=True)
+class ChatRunMetrics:
+    """The numbers under one Chat reply (D68).
+
+    Engine numbers come from llama-server's own ``timings`` block, which the
+    last stream chunk carries when the request asks for
+    ``stream_options.include_usage``. They are measured inside the engine and
+    are the ones to trust for prefill and decode speed. Wall-clock numbers
+    (load, TTFT, total) are measured by the tab around its own calls, so they
+    include everything a client would feel.
+    """
+
+    #: Seconds spent loading before the request, or ``None`` when it was already loaded.
+    load_s: float | None = None
+    #: Request sent to the child -> first streamed token (thinking included).
+    ttft_s: float | None = None
+    #: Request sent -> last token.
+    request_s: float | None = None
+    #: Click -> last token, load included.
+    total_s: float | None = None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    cached_tokens: int | None = None
+    prefill_tokens: int | None = None
+    prefill_ms: float | None = None
+    prefill_tps: float | None = None
+    decode_tokens: int | None = None
+    decode_ms: float | None = None
+    decode_tps: float | None = None
+    draft_tokens: int | None = None
+    draft_accepted: int | None = None
+    finish_reason: str | None = None
+    stopped: bool = False
+    #: ``"engine"`` when llama-server's timings arrived; ``"client"`` when the
+    #: decode rate had to be estimated from the stream here.
+    source: str = "engine"
+
+    @property
+    def overall_tps(self) -> float | None:
+        """Generated tokens over the whole request: prefill included, load not."""
+        return tokens_per_second(self.completion_tokens or 0, self.request_s or 0.0)
+
+    @property
+    def overall_with_load_tps(self) -> float | None:
+        """The same, with the load included. Only meaningful after a cold start."""
+        if self.load_s is None:
+            return None
+        return tokens_per_second(self.completion_tokens or 0, self.total_s or 0.0)
+
+
+def chat_run_metrics(
+    *,
+    clicked_at: float,
+    sent_at: float | None,
+    first_token_at: float | None,
+    last_token_at: float | None,
+    load_s: float | None,
+    chunks: int,
+    usage: Mapping[str, Any] | None,
+    timings: Mapping[str, Any] | None,
+    finish_reason: str | None,
+    stopped: bool = False,
+) -> ChatRunMetrics:
+    """Combine the tab's clock readings with the engine's own accounting.
+
+    Times are ``time.perf_counter()`` readings. ``chunks`` counts streamed
+    deltas that carried text. llama-server sends one token per chunk, which is
+    what the client-side fallback relies on when ``timings`` is missing (a
+    stopped stream never reaches the final chunk).
+    """
+    usage = usage or {}
+    timings = timings or {}
+    end = last_token_at
+    ttft = first_token_at - sent_at if first_token_at is not None and sent_at is not None else None
+    request_s = end - sent_at if end is not None and sent_at is not None else None
+    total_s = end - clicked_at if end is not None else None
+
+    decode_tokens = _int_or_none(timings.get("predicted_n"))
+    decode_ms = _float_or_none(timings.get("predicted_ms"))
+    decode_tps = _float_or_none(timings.get("predicted_per_second"))
+    source = "engine" if timings else "client"
+    if (
+        decode_tps is None
+        and chunks > 1
+        and first_token_at is not None
+        and end is not None
+        and end > first_token_at
+    ):
+        decode_tps = round((chunks - 1) / (end - first_token_at), 2)
+        if decode_tokens is None:
+            decode_tokens = chunks
+        if decode_ms is None:
+            decode_ms = (end - first_token_at) * 1000.0
+
+    completion = _int_or_none(usage.get("completion_tokens"))
+    if completion is None:
+        completion = decode_tokens if decode_tokens is not None else (chunks or None)
+
+    prefill_tokens = _int_or_none(timings.get("prompt_n"))
+    prefill_tps = _float_or_none(timings.get("prompt_per_second"))
+    if prefill_tokens == 0:
+        # Fully cached prompt: the rate of zero tokens is not a speed.
+        prefill_tps = None
+    details = usage.get("prompt_tokens_details")
+    cached = _int_or_none(timings.get("cache_n"))
+    if cached is None and isinstance(details, Mapping):
+        cached = _int_or_none(details.get("cached_tokens"))
+
+    return ChatRunMetrics(
+        load_s=load_s,
+        ttft_s=ttft,
+        request_s=request_s,
+        total_s=total_s,
+        prompt_tokens=_int_or_none(usage.get("prompt_tokens")),
+        completion_tokens=completion,
+        cached_tokens=cached,
+        prefill_tokens=prefill_tokens,
+        prefill_ms=_float_or_none(timings.get("prompt_ms")),
+        prefill_tps=prefill_tps,
+        decode_tokens=decode_tokens,
+        decode_ms=decode_ms,
+        decode_tps=decode_tps,
+        draft_tokens=_int_or_none(timings.get("draft_n")),
+        draft_accepted=_int_or_none(timings.get("draft_n_accepted")),
+        finish_reason=finish_reason,
+        stopped=stopped,
+        source=source,
+    )
+
+
+@dataclass(frozen=True)
+class MetricTile:
+    """One labelled number under a Chat reply."""
+
+    label: str
+    value: str
+    detail: str
+    tooltip: str
+
+
+def chat_metric_tiles(m: ChatRunMetrics) -> list[MetricTile]:
+    """Load, TTFT, Prefill, Decode, Overall, Total: in the order they happen."""
+    tiles: list[MetricTile] = []
+    if m.load_s is None:
+        tiles.append(
+            MetricTile(
+                "Load",
+                UNKNOWN,
+                "already loaded",
+                "Time spent loading the model before this reply. Only counted when "
+                "the send had to load it.",
+            )
+        )
+    else:
+        tiles.append(
+            MetricTile(
+                "Load",
+                format_latency(m.load_s),
+                "cold start",
+                "Wall time from Send until the model was ready: planning, any "
+                "eviction, starting llama-server and uploading the weights.",
+            )
+        )
+    tiles.append(
+        MetricTile(
+            "TTFT",
+            format_latency(m.ttft_s),
+            "time to first token",
+            "From the request reaching the model to the first streamed token "
+            "(thinking counts). Includes prompt processing, excludes the load.",
+        )
+    )
+
+    if m.prefill_tokens == 0 and m.cached_tokens:
+        prefill_value, prefill_detail = "cached", f"all {m.cached_tokens:,} prompt tok reused"
+    else:
+        prefill_value = f"{format_tps(m.prefill_tps)} tok/s" if m.prefill_tps else UNKNOWN
+        parts: list[str] = []
+        if m.prefill_tokens is not None:
+            parts.append(f"{m.prefill_tokens:,} tok")
+        if m.prefill_ms is not None:
+            parts.append(format_latency(m.prefill_ms / 1000.0))
+        if m.cached_tokens:
+            parts.append(f"{m.cached_tokens:,} cached")
+        prefill_detail = " · ".join(parts) or "no engine timings"
+    tiles.append(
+        MetricTile(
+            "Prefill",
+            prefill_value,
+            prefill_detail,
+            "Prompt processing speed, measured by the engine. Cached tokens are "
+            "reused from the prompt cache and cost nothing.",
+        )
+    )
+
+    decode_parts: list[str] = []
+    if m.decode_tokens is not None:
+        decode_parts.append(f"{m.decode_tokens:,} tok")
+    if m.decode_ms is not None:
+        decode_parts.append(format_latency(m.decode_ms / 1000.0))
+    if m.source == "client":
+        decode_parts.append("estimated")
+    tiles.append(
+        MetricTile(
+            "Decode",
+            f"{format_tps(m.decode_tps)} tok/s" if m.decode_tps else UNKNOWN,
+            " · ".join(decode_parts) or "no tokens",
+            "Generation speed, measured by the engine (thinking tokens included). "
+            "'estimated' means the engine's timings did not arrive, e.g. after Stop.",
+        )
+    )
+
+    overall_detail = ""
+    if m.completion_tokens is not None and m.request_s is not None:
+        overall_detail = f"{m.completion_tokens:,} tok in {format_latency(m.request_s)}"
+    if m.overall_with_load_tps:
+        overall_detail += f" · {format_tps(m.overall_with_load_tps)} incl. load"
+    tiles.append(
+        MetricTile(
+            "Overall",
+            f"{format_tps(m.overall_tps)} tok/s" if m.overall_tps else UNKNOWN,
+            overall_detail or UNKNOWN,
+            "Tokens generated over the whole request, prompt processing included, "
+            "load excluded. What a client actually experiences once the model is up.",
+        )
+    )
+    tiles.append(
+        MetricTile(
+            "Total",
+            format_latency(m.total_s),
+            "click to last token" + (", load incl." if m.load_s is not None else ""),
+            "End-to-end wall time for this reply.",
+        )
+    )
+    return tiles
+
+
+_FINISH_TEXT: Final = {
+    "stop": "finished normally",
+    "length": "hit max_tokens",
+    "tool_calls": "stopped for a tool call",
+    "content_filter": "stopped by a filter",
+}
+
+
+def chat_metric_footer(m: ChatRunMetrics) -> str:
+    """Token counts, speculative acceptance and how the reply ended, on one line."""
+    parts: list[str] = []
+    if m.prompt_tokens is not None or m.completion_tokens is not None:
+        prompt = f"{m.prompt_tokens:,}" if m.prompt_tokens is not None else UNKNOWN
+        reply = f"{m.completion_tokens:,}" if m.completion_tokens is not None else UNKNOWN
+        parts.append(f"tokens: {prompt} in, {reply} out")
+    if m.draft_tokens:
+        accepted = m.draft_accepted or 0
+        rate = accepted / m.draft_tokens
+        parts.append(f"speculative: {accepted:,}/{m.draft_tokens:,} drafted accepted ({rate:.0%})")
+    if m.stopped:
+        parts.append("stopped by you")
+    elif m.finish_reason:
+        parts.append(f"finish: {_FINISH_TEXT.get(m.finish_reason, m.finish_reason)}")
+    if m.source == "client" and not m.stopped:
+        parts.append("engine timings missing, decode estimated from the stream")
+    return " · ".join(parts)
 
 
 # ---------------------------------------------------------------------------
