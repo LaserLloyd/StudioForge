@@ -567,3 +567,492 @@ async def test_repo_mtp_status_bounds_concurrency_and_reports_per_row(
     assert broken.mtp is None
     assert "boom" in (broken.detail or "")
     assert sorted(landed) == sorted(o.quant for o in options)
+
+
+# ===========================================================================
+# The wire: GET /api/hf/repo, GET /api/hf/search, MCP rows
+# ===========================================================================
+
+
+class MultiFileServer:
+    """One RangeServer per file, dispatched on the URL's basename."""
+
+    def __init__(self, files: dict[str, bytes]) -> None:
+        self.servers = {name: RangeServer(data) for name, data in files.items()}
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        name = request.url.path.rsplit("/", 1)[-1]
+        server = self.servers.get(name)
+        if server is None:
+            return httpx.Response(404, json={"error": f"no such file {name}"})
+        return server(request)
+
+    def ranges(self, name: str) -> list[str | None]:
+        return self.servers[name].ranges
+
+
+@pytest.fixture
+def mtp_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
+    """The real app, a fake 4-GPU rig, and a stubbed HF listing of a mixed repo.
+
+    ``Hybrid-MTP-GGUF`` (the name says MTP) ships a Q4_K_M whose header
+    carries the heads and a Q5_K_M whose header does not.
+    """
+    from studioforge.api.app import build_state, create_app
+    from studioforge.core.hf_search import HfSearch
+    from tests.unit.test_hf_meta import planner_for
+
+    info = repo(
+        "acme/Hybrid-MTP-GGUF",
+        [gguf_file("hybrid-Q4_K_M.gguf", 17 * GB), gguf_file("hybrid-Q5_K_M.gguf", 21 * GB)],
+    )
+
+    async def fake_repo_info(self: Any, repo_id: str) -> Any:
+        return info
+
+    async def fake_search(self: Any, query: str, **_kwargs: Any) -> Any:
+        return [info]
+
+    monkeypatch.setattr(HfSearch, "repo_info", fake_repo_info)
+    monkeypatch.setattr(HfSearch, "search", fake_search)
+
+    config = Config(
+        data_dir=tmp_path / "data",
+        server={"host": "127.0.0.1", "port": 1234},
+        models={"dir": tmp_path / "models"},
+        gui={"enabled": False},
+        watchdog={"enabled": False},
+        logging={"level": "ERROR"},
+    )
+    state = build_state(config)
+    state.planner = planner_for(config)
+    try:
+        yield create_app(config, state=state, start_background=False)
+    finally:
+        state.db.close()
+
+
+def two_headers(tmp_path: Path) -> MultiFileServer:
+    return MultiFileServer(
+        {
+            "hybrid-Q4_K_M.gguf": mtp_gguf(tmp_path / "q4.gguf", nextn=1).read_bytes(),
+            "hybrid-Q5_K_M.gguf": mtp_gguf(tmp_path / "q5.gguf", nextn=None).read_bytes(),
+        }
+    )
+
+
+def test_repo_route_settles_mtp_per_quant_from_each_header(
+    mtp_app: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fastapi.testclient import TestClient
+
+    server = two_headers(tmp_path)
+    use_transport(monkeypatch, server)
+
+    with TestClient(mtp_app) as http:
+        body = http.get("/api/hf/repo/acme/Hybrid-MTP-GGUF").json()
+
+    assert body["mtp_likely"] is True  # the name
+    quants = {q["quant"]: q for q in body["quants"]}
+    assert (quants["Q4_K_M"]["mtp"], quants["Q4_K_M"]["mtp_source"]) == (True, "header")
+    assert quants["Q4_K_M"]["mtp_layers"] == 1
+    # Named MTP, header says otherwise: the header wins, and says so.
+    assert (quants["Q5_K_M"]["mtp"], quants["Q5_K_M"]["mtp_source"]) == (False, "header")
+    assert quants["Q5_K_M"]["mtp_layers"] is None
+    # The smallest quant's full header (the context read) answered its probe:
+    # the file was fetched exactly once. The other file cost one small probe.
+    assert len(server.ranges("hybrid-Q4_K_M.gguf")) == 1
+    assert server.ranges("hybrid-Q5_K_M.gguf") == ["bytes=0-262143"]
+    assert quants["Q4_K_M"]["context_fit"]["source"] == "remote-gguf-header"
+
+
+def test_search_route_carries_the_name_hint_and_reads_no_header(
+    mtp_app: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fastapi.testclient import TestClient
+
+    server = two_headers(tmp_path)
+    use_transport(monkeypatch, server)
+
+    with TestClient(mtp_app) as http:
+        body = http.get("/api/hf/search", params={"q": "hybrid"}).json()
+
+    row = body["repos"][0]
+    assert row["mtp_likely"] is True
+    for entry in row["quants"]:
+        assert entry["mtp"] is True
+        assert entry["mtp_source"] == "name"
+        assert entry["mtp_layers"] is None
+    assert all(not s.ranges for s in server.servers.values())
+
+
+def test_repo_route_keeps_the_name_hint_when_the_header_is_refused(
+    mtp_app: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fastapi.testclient import TestClient
+
+    use_transport(monkeypatch, refusing(403))
+
+    with TestClient(mtp_app) as http:
+        body = http.get("/api/hf/repo/acme/Hybrid-MTP-GGUF").json()
+
+    for entry in body["quants"]:
+        assert (entry["mtp"], entry["mtp_source"]) == (True, "name")
+        assert "hf.token" in entry["context_fit"]["unavailable"]
+
+
+def test_mcp_repo_details_keeps_the_mtp_fields_compact() -> None:
+    from studioforge.mcp.management import _compact_repo
+
+    payload = {
+        "repo_id": "acme/Hybrid-MTP-GGUF",
+        "quants": [
+            {
+                "quant": "Q4_K_M",
+                "total_bytes": 17 * GB,
+                "files": ["hybrid-Q4_K_M.gguf"],
+                "mmproj": None,
+                "group_id": "g",
+                "fit": {"verdict": "fits-one-gpu", "message": "", "approximate": False},
+                "mtp": True,
+                "mtp_source": "header",
+                "mtp_layers": 1,
+            },
+            {
+                "quant": "Q5_K_M",
+                "total_bytes": 21 * GB,
+                "files": ["hybrid-Q5_K_M.gguf"],
+                "mmproj": None,
+                "group_id": "h",
+                "fit": {},
+                "mtp": False,
+                "mtp_source": "header",
+                "mtp_layers": None,
+            },
+            {"quant": "Q8_0", "total_bytes": 0, "files": [], "mmproj": None, "fit": {}},
+        ],
+    }
+    compact = {q["quant"]: q for q in _compact_repo(payload)["quants"]}
+    assert (compact["Q4_K_M"]["mtp"], compact["Q4_K_M"]["mtp_source"]) == (True, "header")
+    assert compact["Q4_K_M"]["mtp_layers"] == 1
+    assert (compact["Q5_K_M"]["mtp"], compact["Q5_K_M"]["mtp_source"]) == (False, "header")
+    assert "mtp_layers" not in compact["Q5_K_M"]  # only when there is a count
+    # An older payload without the fields still compacts, as unknown.
+    assert (compact["Q8_0"]["mtp"], compact["Q8_0"]["mtp_source"]) == (None, None)
+
+
+def test_mcp_search_row_carries_the_name_hint_only() -> None:
+    from studioforge.mcp.management import _search_row
+
+    named = repo("acme/Foo-MTP-GGUF", [gguf_file("foo-Q4_K_M.gguf")])
+    plain = repo("acme/Foo-GGUF", [gguf_file("foo-Q4_K_M.gguf")])
+    assert _search_row(named, trending=False)["mtp_likely"] is True
+    assert _search_row(plain, trending=False)["mtp_likely"] is False
+    assert "mtp_source" not in _search_row(named, trending=False)
+
+
+# ===========================================================================
+# GUI helpers (pure)
+# ===========================================================================
+
+
+@pytest.mark.parametrize(
+    ("label", "bits"),
+    [
+        ("Q4_K_M", 4),
+        ("IQ3_XXS", 3),
+        ("Q2_K_L", 2),
+        ("TQ1_0", 1),
+        ("NVFP4", 4),
+        ("MXFP4", 4),
+        ("Q8_0", 8),
+        ("F16", 16),
+        ("BF16", 16),
+        ("F32", 32),
+        ("unknown", None),
+        ("", None),
+        (None, None),
+    ],
+)
+def test_quant_bits(label: str | None, bits: int | None) -> None:
+    from studioforge.gui import state as st
+
+    assert st.quant_bits(label) == bits
+    assert st.quant_bit_group(label) == ("other" if bits is None else f"{bits}-bit")
+
+
+def test_quant_bit_groups_are_shelves_smallest_first() -> None:
+    from studioforge.gui import state as st
+
+    info = repo(
+        "acme/M-GGUF",
+        [
+            gguf_file("m-BF16.gguf", 52 * GB),
+            gguf_file("m-Q4_K_M.gguf", 16 * GB),
+            gguf_file("m-IQ4_XS.gguf", 14 * GB),
+            gguf_file("m-Q8_0.gguf", 28 * GB),
+            gguf_file("m-IQ2_M.gguf", 9 * GB),
+            gguf_file("m-weird.gguf", 1 * GB, quant="unknown"),
+        ],
+    )
+    shelves = st.quant_bit_groups(info.logical_models())
+
+    assert [shelf for shelf, _ in shelves] == ["2-bit", "4-bit", "8-bit", "16-bit", "other"]
+    four_bit = [o.quant for o in dict(shelves)["4-bit"]]
+    assert four_bit == ["IQ4_XS", "Q4_K_M"]  # 14 GB before 16 GB, not alphabetical
+
+
+def test_quant_note_and_files_tooltip_describe_the_whole_download() -> None:
+    from studioforge.gui import state as st
+
+    info = repo(
+        "acme/Vision-GGUF",
+        [
+            gguf_file("v-Q8_0-00001-of-00002.gguf", 20 * GB),
+            gguf_file("v-Q8_0-00002-of-00002.gguf", 8 * GB),
+            gguf_file("mmproj-F16.gguf", 1 * GB),
+        ],
+    )
+    option = info.logical_models()[0]
+    assert st.quant_note(option) == "2 parts · +mmproj"
+    tooltip = st.quant_files_tooltip(option)
+    assert tooltip.splitlines() == [
+        option.label,
+        "v-Q8_0-00001-of-00002.gguf",
+        "v-Q8_0-00002-of-00002.gguf",
+        "mmproj-F16.gguf",
+    ]
+    plain = repo("acme/P-GGUF", [gguf_file("p-Q4_K_M.gguf")]).logical_models()[0]
+    assert st.quant_note(plain) == ""
+
+
+def test_rig_summary_names_the_shelf_the_fit_column_is_measured_against() -> None:
+    from studioforge.gui import state as st
+    from tests.unit.test_hf_meta import rig_4
+
+    assert st.rig_summary(rig_4()) == "Rig: 2× RTX 5090 (32 GiB) + 2× RTX 3090 (24 GiB)"
+    assert st.rig_summary([]) == ""
+
+
+def test_mtp_badge_states() -> None:
+    from studioforge.gui import state as st
+
+    # First paint: only the name is known.
+    likely = st.mtp_badge(None, name_hint=True)
+    assert likely is not None
+    assert (likely.text, likely.colour, likely.outline) == ("likely MTP", "info", True)
+    assert "not been read yet" in likely.tooltip
+    assert st.mtp_badge(None, name_hint=False) is None
+
+    confirmed = st.mtp_badge(MtpStatus(mtp=True, source="header", layers=1), name_hint=False)
+    assert confirmed is not None
+    assert (confirmed.text, confirmed.outline) == ("MTP", False)
+    assert "1 head" in confirmed.tooltip and "draft-mtp" in confirmed.tooltip
+
+    two = st.mtp_badge(MtpStatus(mtp=True, source="header", layers=2), name_hint=True)
+    assert two is not None and "2 heads" in two.tooltip
+
+    # The name promised, the header did not deliver: said, in grey.
+    denied = st.mtp_badge(MtpStatus(mtp=False, source="header"), name_hint=True)
+    assert denied is not None
+    assert (denied.text, denied.colour) == ("no MTP heads", "grey")
+    # Nothing promised, nothing there: no badge at all.
+    assert st.mtp_badge(MtpStatus(mtp=False, source="header"), name_hint=False) is None
+
+    # Header unreadable, name says MTP: still "likely", with the reason.
+    fallback = st.mtp_badge(
+        MtpStatus(mtp=True, source="name", detail="HTTP 403: set hf.token"), name_hint=True
+    )
+    assert fallback is not None
+    assert fallback.text == "likely MTP" and "hf.token" in fallback.tooltip
+    assert st.mtp_badge(MtpStatus(detail="offline"), name_hint=False) is None
+
+
+# ===========================================================================
+# GUI: the badge pass and the rendered picker
+# ===========================================================================
+
+
+class FakeBadge:
+    def __init__(self) -> None:
+        self.text = ""
+        self.visible = True
+        self.props_added: list[str] = []
+        self.props_removed: list[str] = []
+
+    def set_text(self, value: str) -> None:
+        self.text = value
+
+    def props(self, add: str | None = None, *, remove: str | None = None) -> None:
+        if add:
+            self.props_added.append(add)
+        if remove:
+            self.props_removed.append(remove)
+
+    def set_visibility(self, visible: bool) -> None:
+        self.visible = visible
+
+
+class FakeTip:
+    def __init__(self) -> None:
+        self.text = ""
+
+
+class FakeGuiContext:
+    def __init__(self, config: Config, registry: Any = None) -> None:
+        self.config = config
+        self.registry = registry
+
+
+async def test_gui_mtp_pass_paints_each_row_from_its_own_header(
+    tmp_path: Path, config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from studioforge.gui.tabs.download import _fill_mtp_badges
+
+    use_transport(
+        monkeypatch,
+        MultiFileServer(
+            {
+                "h-Q4_K_M.gguf": mtp_gguf(tmp_path / "q4.gguf", nextn=1).read_bytes(),
+                "h-MTP-Q5_K_M.gguf": mtp_gguf(tmp_path / "q5.gguf", nextn=None).read_bytes(),
+                "h-Q6_K.gguf": mtp_gguf(tmp_path / "q6.gguf", nextn=None).read_bytes(),
+            }
+        ),
+    )
+    info = repo(
+        "acme/H-GGUF",
+        [
+            gguf_file("h-Q4_K_M.gguf", 16 * GB),
+            gguf_file("h-MTP-Q5_K_M.gguf", 19 * GB),
+            gguf_file("h-Q6_K.gguf", 22 * GB),
+        ],
+    )
+    cells = [(option, FakeBadge(), FakeTip()) for option in info.logical_models()]
+
+    await _fill_mtp_badges(FakeGuiContext(config), cells)
+
+    by_quant = {option.quant: (badge, tip) for option, badge, tip in cells}
+    # No hint in the name, heads in the header: confirmed, filled.
+    badge, tip = by_quant["Q4_K_M"]
+    assert (badge.text, badge.visible) == ("MTP", True)
+    assert "color=info" in badge.props_added and "outline" in badge.props_removed
+    assert "Confirmed from the GGUF header" in tip.text
+    # Named MTP, no heads: the grey correction.
+    badge, _tip = by_quant["Q5_K_M"]
+    assert (badge.text, badge.visible) == ("no MTP heads", True)
+    assert "color=grey" in badge.props_added
+    # Neither: hidden.
+    assert by_quant["Q6_K"][0].visible is False
+
+
+async def test_gui_mtp_pass_keeps_likely_when_headers_cannot_be_read(
+    config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from studioforge.gui.tabs.download import _fill_mtp_badges
+
+    use_transport(monkeypatch, refusing(403))
+    info = repo("acme/H-MTP-GGUF", [gguf_file("h-Q4_K_M.gguf", 16 * GB)])
+    cells = [(option, FakeBadge(), FakeTip()) for option in info.logical_models()]
+
+    await _fill_mtp_badges(FakeGuiContext(config), cells)
+
+    badge, tip = cells[0][1], cells[0][2]
+    assert badge.text == "likely MTP"
+    assert "outline" in badge.props_added
+    assert "hf.token" in tip.text
+
+
+def test_quant_picker_renders_shelves_badges_and_the_rig_line(
+    config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One real NiceGUI render of the grouped picker, first paint only."""
+    import shutil
+
+    from fastapi.testclient import TestClient
+    from nicegui import ui
+
+    from studioforge.core import diskspace
+    from studioforge.gui.app import create_gui_app
+    from studioforge.gui.tabs import GuiContext
+    from studioforge.gui.tabs import download as tab
+    from tests.unit.test_gui import _FakeOption, _FakeRepoFiles, _FakeState
+
+    diskspace.clear_cache()
+    monkeypatch.setattr(shutil, "disk_usage", lambda _p: (4 * 1024**4, 0, 400 * GB))
+    state = _FakeState(config)
+    ctx = GuiContext(config=config, api_state=state)
+    full = _FakeRepoFiles(
+        [
+            _FakeOption("Q4_K_M", 12 * GB, mtp_hint=True),
+            _FakeOption("Q8_0", 30 * GB, in_subfolder=True),
+            _FakeOption("F16", 60 * GB, discriminator="other-base"),
+        ]
+    )
+
+    @ui.page("/_mtp_picker_smoke")
+    def _page() -> None:
+        tab._quant_rows(ctx, full, highlight=None, on_picked=None)
+
+    app = create_gui_app(config, api_state=state)
+    with TestClient(app) as client:
+        response = client.get("/_mtp_picker_smoke")
+    diskspace.clear_cache()
+
+    assert response.status_code == 200
+    text = response.text
+    for shelf in ("4-bit", "8-bit", "16-bit"):
+        assert shelf in text
+    assert "Rig: 1× RTX 5090 (32 GiB)" in text
+    assert "likely MTP" in text  # the name hint, at first paint
+    assert text.count("model-F16.gguf") >= 2  # inline (duplicate label) and in the hover
+    assert "subfolder of the repository" in text  # the disabled button's reason
+    assert "fits one GPU" in text
+
+
+def test_download_tab_offers_the_mtp_filter(config: Config) -> None:
+    from fastapi.testclient import TestClient
+
+    from studioforge.gui.app import create_gui_app
+    from tests.unit.test_gui import _FakeState
+
+    app = create_gui_app(config, api_state=_FakeState(config))
+    with TestClient(app) as client:
+        response = client.get("/?tab=download")
+    assert response.status_code == 200
+    assert "MTP only" in response.text
+
+
+def test_search_row_chip_is_filled_only_for_a_downloaded_quant_with_heads(
+    config: Config,
+) -> None:
+    from fastapi.testclient import TestClient
+    from nicegui import ui
+
+    from studioforge.gui.app import create_gui_app
+    from studioforge.gui.tabs import GuiContext
+    from studioforge.gui.tabs import download as tab
+    from tests.unit.test_gui import _FakeRegistry, _FakeState
+
+    known = repo("acme/Known-GGUF", [gguf_file("known-Q4_K_M.gguf")])
+    named = repo("acme/Named-MTP-GGUF", [gguf_file("named-Q4_K_M.gguf")])
+    plain = repo("acme/Plain-GGUF", [gguf_file("plain-Q4_K_M.gguf")])
+    state = _FakeState(config)
+    state.registry = _FakeRegistry([local_record("acme", "Known-GGUF", "known-Q8_0.gguf", nextn=1)])
+    ctx = GuiContext(config=config, api_state=state)
+
+    statuses = {r.repo_id: tab._repo_mtp(ctx, r) for r in (known, named, plain)}
+    assert statuses["acme/Known-GGUF"].source == "header"
+    assert statuses["acme/Named-MTP-GGUF"].source == "name"
+    assert statuses["acme/Plain-GGUF"].mtp is None
+
+    @ui.page("/_mtp_rows_smoke")
+    def _page() -> None:
+        for info in (known, named, plain):
+            tab._repo_row(ctx, info, mtp=statuses[info.repo_id])
+
+    app = create_gui_app(config, api_state=state)
+    with TestClient(app) as client:
+        response = client.get("/_mtp_rows_smoke")
+    assert response.status_code == 200
+    assert response.text.count("likely MTP") == 1
+    assert "Confirmed from the GGUF header" in response.text
