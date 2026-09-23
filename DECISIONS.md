@@ -5970,3 +5970,357 @@ model was considered and deferred -- the refusal text and `plan_load` already na
 `gpu_leased` naming the holder and CUDA `[0]`; an override of `[1, 2]` beside the same lease is
 silent; the D53 cases are unchanged. `tests/unit/test_mcp.py` pins the recipe line, the section
 heading, the override warning, `allowed_devices` and the `plan_load` recipe in INSTRUCTIONS.
+
+## D66 -- A model the engine cannot load is refused before anything happens, from the build's own library
+
+**Status.** Built on branch `lane/arch-preflight` (on `efd06bb`), `tests/unit` green, ruff and mypy
+clean. Not merged or deployed; the orchestrator folds this record into `DECISIONS.md` and bumps
+`LATEST_DECISION`. Nothing migrates: the verdict is read from the installed engine directories, so
+builds installed before D66 need no reinstall.
+
+**Incident, 2026-09-16 .. 09-22.** `InfinimindCreations/K2-Horizon-MoVA-36B-A4B-uncensored-GGUF`
+(Q6_K, 30.8 GB, downloaded 09-18) has `general.architecture = 'k2-horizon'` and
+`tokenizer.ggml.pre = 'k2-horizon'`. No llama.cpp release includes that architecture -- upstream
+master (b11102) does not; only a fork branch does -- and the owner decided against downloading or
+building a fork and against touching the engine. CrucibleForge asked for it three times (09-20
+11:22, 09-20 14:00, 09-22 12:05), each time the same sequence: a GPU lease on CUDA [0, 1] for a
+benchmark (a lease grant unloads the idle residents on its cards), `load-recommended` walking the
+hardware modes, a plan (`estimate_mb=40473`), a composed launch (`--spec-type ngram-mod`, a
+reasoning-format warning), a spawn, and 0.3 s later `llama_model_load: error loading model: unknown
+model architecture: 'k2-horizon'`. The client got `502 model_load_failed` -- a code that reads as a
+fault to report, not a fact to act on -- and nothing remembered the answer. The catalog went on
+offering the model (`recommended.fits_now: true`, four placements), `/api/models` said only
+`stopped` after each death (the supervisor drops a child that failed to start), and
+`/api/capabilities` listed it as merely *unknown to the architecture list* because that list was a
+b10425 snapshot. An earlier `longcat-flash-sparse` model (09-16, three spawns) died the same way.
+No resident happened to be evicted for those six spawns -- the 5090 pair had just been vacated -- but
+nothing prevented it: with the chat model resident on [0, 1], the benchmark lease would have unloaded
+it for a load that could not succeed. (The `re-planned after eviction ... K2-Horizon` lines of 09-20
+evening and 09-22 morning are the catalog's preview planners, not loads.)
+
+**Decision.**
+
+1. **The build's own library is the source of truth.** `llama.dll` (Linux `libllama.so`, possibly
+   versioned; macOS `libllama.dylib`) beside the engine's `llama-server` holds llama.cpp's
+   architecture table as one NUL-terminated ASCII literal per name. `core/engine.py` reads it once
+   per (resolved path, mtime, size) -- warmed off the event loop at boot, re-read after a
+   reinstall -- into an `ArchitectureTable`: every maximal run of identifier characters that ends at
+   a NUL, kept as sorted reversed tails plus the exact runs instead of the bytes (b11037: ~3,600 runs,
+   under 0.5 MiB, ~0.1 s to build, once). The server binary itself (a 9 KB stub on Windows),
+   `llama-server-impl.dll` and `llama-common.dll` are never read as the table.
+2. **The check is one-sided.** A name is known when `name + NUL` occurs anywhere in the library.
+   *Absent* is certain -- llama.cpp resolves `general.architecture` against exactly these literals --
+   and is the only answer that refuses. *Present* means "assume supported": a stray string that ends
+   in the name, or a pre-tokenizer of the same name, is a false *yes* that costs the spawn it would
+   have cost anyway (and the runtime memo below remembers it). A name found only as the **tail of a
+   longer literal** still counts (`evidence: "suffix"`), because linkers tail-merge string literals:
+   on the live, MSVC-built b11037 `llama.dll` the literal `qwen2` exists *only* as the end of
+   `rwkv6qwen2` (`\0qwen2\0` occurs zero times). Requiring a clean preceding byte -- as an
+   independent review suggested -- would have refused both qwen2 models in the library, and failed
+   the `qwen2` canary so that the whole table read as unrecognised.
+3. **Fail open, always.** No library, an unreadable one (an I/O error is not cached), an empty one,
+   an architecture that is not architecture-shaped (`unknown`, uppercase, over 64 characters), a pin
+   naming a build that is not installed, a supervisor stand-in without the accessor: each is
+   `None` -- "cannot tell" -- and never refuses. A library that does not contain all three canaries
+   (`llama`, `gemma`, `qwen2`) is not a table this reader understands and is `None` too.
+4. **One typed refusal, before any side effect.** `UnsupportedArchitectureError`: `400
+   unsupported_architecture`, `type: invalid_request_error`, `param: "model"`, `error.studioforge`
+   `{model_id, architecture, engine_tag, source: "binary"|"runtime", first_failed_at, remedy,
+   engine_tag_pinned}` (plus `rejected {kind, name}` for a runtime verdict and the active build's
+   answer when the model pins a build). 400 like `context_exceeded` -- change the request, never
+   retry it unchanged; not 502 (a fault), 503/507 (a wait) or 409 (retried by the OpenAI SDKs). It
+   joins `WARNING_REJECTION_CODES`. The message is written for both an operator and an agent: *"'<id>'
+   uses the model architecture 'k2-horizon', which llama.cpp build b11037 does not include, so it
+   cannot be loaded. No StudioForge setting changes that; it needs a llama.cpp build that supports
+   'k2-horizon'."* When a saved `engine_tag` pin is the cause and the active build includes the
+   architecture, it says to clear the pin instead.
+5. **Every side-effecting entry calls one helper first** (`ModelManager._refuse_unsupported`), for
+   the build that would serve the model -- its `settings.engine_tag` pin, else the active engine,
+   resolved through the same `resolve_binary` a spawn uses: `load` (before the hold, the tier memo
+   and the lock; a ready resident handed back untouched is exempt, a forced reload is not and keeps
+   the running child serving), `ensure_loaded` (before `_refuse_if_held`), `_recommended_prep`
+   (`load_recommended` and the `plan_recommended` dry run refuse identically), `lease_check` (the
+   pre-SSE refusal), `acquire_lease` (per `model_ids`, before the conflict scan and any eviction),
+   `_load_locked` (before `_loading` and the priority hold) and `_load_gated` (a backstop behind the
+   gate, before the lease profile and the planner). `plan_preview` (and MCP `plan_load`) renders the
+   same refusal as `fits: false`, `reason_code: "unsupported_architecture"`. Streaming chat checks
+   before the `200`; the benchmark routes and both benchmark runners check before their first lease.
+6. **The background passes skip, and say so once.** The D41 pin reconciler, the D42 rebalancer and
+   the boot autoload skip such a model with one WARNING per (model, build, name) -- the reconciler's
+   60-900 s backoff would otherwise have spawned a doomed child for a pinned model all day.
+7. **A runtime memo for what the library cannot answer.** When a child dies at startup with
+   `unknown model architecture: '<x>'` or `unknown pre-tokenizer type: '<x>'` in its log tail -- only
+   those two markers, never `CONFIG_ERROR_MARKERS`' "does not exist" / "no such file" -- the failure
+   becomes the typed 400 (`source: "runtime"`, the stderr tail attached) and is remembered against
+   (model path, mtime, resolved build tag) -- when the rejection is the model's own: a different
+   architecture name, or a pre-tokenizer while a draft model rode along, may be the draft's, so that
+   request is refused but nothing is remembered (detaching a draft changes no file). Later loads of a
+   remembered file on that build are refused before they hold, plan, lease, evict or spawn. It
+   lapses when the file changes, when the build's library
+   is reinstalled (its signature moves) or when the library is rescanned, and is cleared on an engine
+   install or activation (`EngineManager.on_engine_change`, wired in `build_state`) or a restart. A
+   pre-tokenizer probe of the library was considered and rejected on live data: six library models
+   declare `tokenizer.ggml.pre = 'default'`, which llama.cpp accepts, yet `default\0` occurs nowhere
+   in any installed build's `llama.dll` (a short constant compare is compiled inline), so the probe
+   would have refused six working models.
+8. **The explicit tier is remembered only after a load succeeds** (review item 19). `load()` used to
+   write `_model_priority` before the lock, so a load the planner, the hold or the engine then
+   refused still re-tiered the model. Decay on unload remains the owner's policy call.
+9. **Every surface says the same thing.** `arch_supported: true | false | null` (+ `arch_note` when
+   false) on `GET /api/models`, the `/v1/models` `studioforge` block, catalog rows (`list_models`,
+   `model_options`) and MCP `model_info`; for a certain no also `engine_supported: false` and
+   `unsupported_reason`. A catalog row that cannot load is not planned: `fits_now: false` with
+   `fits_now_basis`, no options, no placements, `recommended: null` -- the compact view drops a
+   `true` so loadable rows cost nothing. `last_load_failure {at, code, message, engine_tag}` shows the
+   last launch that died until one succeeds (the message's first line, absolute paths reduced to
+   basenames per D55 -- the listing is open). `ModelManager.unsupported_reason(record)` is the Chat
+   tab's short answer. The GUI Models tab shows an "Unsupported arch" badge (theme `negative`) with
+   the reason, and Load explains instead of loading; the settings dialog and its fit verdict say so.
+   `/api/capabilities` judges each model from its build's library (`library.unsupported_by_engine`
+   rows with `source: "binary"`, `architecture_verdict_source`), and when the report's build's
+   library is readable its engine block says `capability_source: "binary"`,
+   `capability_describes_engine: true`, `architecture_library: "llama.dll"`, with the architecture
+   list reduced to the names that build contains; the bundled snapshot now supplies only that list's
+   candidates and the ftype/ggml-type names (`docs/RELEASING.md` amended).
+
+**Not taken.** A fork build or any engine change (the owner's decision). Requiring a non-identifier
+byte before the name for a refusal (item 2: tail merging refuses working models, `qwen2` on the live
+build). Probing pre-tokenizers from the library (item 7). Reading the server binary when no library
+exists. Persisting the memo across restarts: the library probe answers again at the next load, and a
+memo that outlived its cause would be a new way to refuse a working model. Refusing a lease that
+names no model. A new MCP tool (the count is pinned). A capability feature key: adding one to
+`SERVER_FEATURES` needs `LATEST_DECISION = 66`, which is the fold's job -- suggested key
+`unsupported_architecture_code` (and `arch_supported_field` if a second is wanted).
+
+**Consequences.** Wire changes, all additive except one: a load that used to die as `502
+model_load_failed` for these two markers is now `400 unsupported_architecture` -- earlier, and
+usually without any spawn at all. New fields as listed; catalog rows for unloadable models lose
+their options, placements and `recommended`; `/api/capabilities` reports `capability_source:
+"binary"` on a rig whose library is readable, and its architecture list shrinks to names the build
+contains. The `list_models` payload budget in `tests/unit/test_mcp.py` is re-anchored by the one
+`catalog_hint` sentence (~150 characters, fixed per call). One-sidedness means a model the library
+cannot judge still costs one spawn before the memo refuses it; a false *yes* costs exactly what every
+load cost before D66.
+
+**Live check (read-only).** The committed table against the live `b11037` `llama.dll`, for all 34
+records in the library: 33 supported -- 31 with exact evidence, 2 with suffix evidence (the two
+`qwen2` models, per item 2) -- and exactly one refused: K2-Horizon, `'k2-horizon'`. The same result on
+all eight installed builds, b10425 through b11037. The independently reviewed exotic names are all found
+exactly (`qwen35`, `qwen35moe`, `gemma4`, `kimi-linear`, `laguna`, `muse-glimmer`, `hy_v3`,
+`deepseek4`, `nemotron_h_moe`); `k2-horizon` and `longcat-flash-sparse` are absent.
+
+**Tests.** `tests/unit/test_arch_probe.py` (42): the table (absent/exact/suffix, the live build's
+`qwen2`-inside-`rwkv6qwen2` bytes, a longer literal does not make its prefix known,
+non-architecture names, canaries), the library search per platform
+name and `lib/`, the per-signature cache and its re-read, an I/O error not cached, the engine manager
+and supervisor answers, `on_engine_change`, the two startup markers and the failures that are not
+them, the memo's keying and lapses, path redaction, the verdict's words, remedy, details and 400
+shape. `tests/unit/test_arch_preflight.py` (35): every entry above refuses before any hold, plan,
+lease, eviction or spawn (a lease for K2 evicts nobody; the same lease for a loadable model does); a
+ready resident is handed back but not force-reloaded; "cannot tell" loads; a pinned build names the
+fix; the tier memo only after success; the reconciler, rebalancer and autoload skip with one
+WARNING; the runtime memo and its lapses; a rejection that may be a draft's and a missing file are
+not memoised; the listed failure carries no absolute path; the Models tab rendered for real shows
+the badge and the Load refusal; through the real app with a fake engine
+on disk, streaming and plain chat, completions, load, load-recommended, plan-recommended, leases and
+both benchmark routes are 400s (streaming before any SSE byte), logged at WARNING, and `/api/models`,
+`/v1/models`, the catalog, `/api/capabilities`, MCP `model_info` / `plan_load` / `load_model` carry
+the verdict. `tests/unit/test_docs.py` and `tests/unit/test_mcp.py` pin the new code in the rig
+page's failure table and in INSTRUCTIONS; `tests/unit/test_rejection_log_levels.py` expects it in
+`WARNING_REJECTION_CODES`.
+
+## D67 -- The quant picker says which files keep their MTP heads, from each file's own header
+
+**Status.** Built on `lane/downloads-mtp` (four commits on top of `efd06bb`), `tests/unit` green,
+ruff and mypy clean. Additive on every wire surface: three new fields per quant entry, one per
+repo, one column in `sfctl models repo`. Nothing existing changes shape or meaning. Not yet seen
+live; the live check is the merge's job.
+
+**Context.** HuggingFace's "hardware compatibility" panel groups a GGUF repo's files by bit-width
+and badges each one that keeps its multi-token-prediction heads -- and the same quant label can
+appear twice, `Q4_K_M 18.5 GB MTP` beside `Q4_K_M 18 GB`, with the badge the only thing telling
+them apart. That badge matters here: a GGUF with `<arch>.nextn_predict_layers >= 1` is launched
+with `--spec-type draft-mtp` (ENGINE-FEATURES.md), a measured +34% single-stream on a 27B at no
+extra VRAM, and the supervisor already does that for anything in the library. The Download tab
+could not show it. It reads one header per repo -- the smallest quant, for the context matrix --
+and that header cannot speak for its siblings when a publisher ships the same quant with and
+without the heads. HF's API exposes nothing per file (`?expand[]=gguf` is repo-level architecture,
+context length and chat template; `/tree` is sizes and scan status), so the answer has to come
+from each file's header, and a full header is 2-15 MB of tokenizer strings that cannot be seeked
+over. Twenty-two of those per opened repo was the reason it had not been done.
+
+The name is not evidence either way. LIMITATIONS.md already records a `...-MTP-GGUF` repo whose
+files carry no such key; and unsloth's `Qwen3.8-27B-GGUF` quants carry `nextn_predict_layers=1`
+under names that never say MTP, while the `llmfan46/...-Native-MTP-Preserved-NVFP4-GGUF` repo
+says it in the repo name and in no file name. (Both checked live, read-only, 2026-09-22.)
+
+**Decision.**
+
+- **A per-file probe that stops at the tokenizer.** `gguf._read_stream` takes a
+  `stop_before(key, kv_so_far)` predicate and `GgufFile` gains `kv_complete`. Every `<arch>.*`
+  key precedes the first `tokenizer.*` key in what llama.cpp's converters and `llama-quantize`
+  write -- `general.architecture` is key 0, the `<arch>.*` block follows the `general.*` block,
+  the keys `llama-quantize` and `llama-gguf-split` append at the *end* are `general.file_type` and
+  `split.*`, not architecture keys -- and on the live 27B the `nextn_predict_layers` key sits
+  inside the first 1.5 KB with a 248k-entry token array right after it. So `hf_meta.remote_mtp`
+  is one 256 KiB range request per file (8 MiB hard cap), cached in memory and on disk for a day
+  under its own `kind: "mtp"` entry, and free when the full header is already cached (the
+  context-fit read of the smallest quant) or the exact file is registered locally
+  (`registry_file_meta`, stricter than the geometry's `registry_sibling_meta` because MTP is per
+  file). `mtp_from_kv` refuses to guess when the walk stopped before the architecture block (a
+  writer that put the tokenizer first): that is *unknown*, not *no heads*, and is not cached.
+- **Bounded, per-quant, progressive.** `repo_mtp_status` walks a repo at most four probes at a
+  time (`MTP_PROBE_CONCURRENCY`), degrades each quant on its own (an unreadable header falls back
+  to the name hint with the reason kept in `detail`; a probe that raises is *unknown* for that row
+  and nothing else), and calls `on_result` as each answer lands so the GUI paints rows one by one.
+- **The data model.** `MtpStatus(mtp: true|false|null, source: "header"|"name"|null, layers,
+  detail)`. Only `"header"` is a verdict. `"name"` is `hf_search.looks_like_mtp_name`, token-based
+  like `looks_like_auxiliary_gguf`, applied by one rule in `GgufRepoInfo.logical_models`: when any
+  loadable file in the repo names MTP, only those files are hinted (the unmarked siblings are the
+  stripped variants); otherwise the repo name speaks for all. `MTP/` draft modules are auxiliary
+  and never a hint. `LogicalDownload.mtp_hint` and `GgufRepoInfo.mtp_hint` carry it.
+- **Wire.** Every quant entry on `GET /api/hf/repo/{id}` and `GET /api/hf/search` carries `mtp`,
+  `mtp_source`, `mtp_layers`; the repo payload carries `mtp_likely`. `with_context` (always on for
+  `/hf/repo`, opt-in and capped for search) is what triggers the probes, run *after* the geometry
+  read so the smallest quant's probe is a cache hit; without it the fields carry the name hint.
+  MCP `repo_details` keeps `mtp`/`mtp_source` and `mtp_layers` when there is a count, and its
+  description tells an agent to prefer a header-confirmed MTP quant over the same quant without
+  it; `search_models` rows gain `mtp_likely` and still read no header. `sfctl models repo` gains
+  an `MTP` column (`yes (1)` / `no` / `likely` / `-`).
+- **The picker.** Quants sit on bit-width shelves (`2-bit` ... `16-bit`, `other` last; nominal
+  bits from the label's leading precision token, `quant_bits`), smallest file first inside a
+  shelf, under a quiet divider with the count, below a `Rig: 2× RTX 5090 (32 GiB) + 2× RTX 3090
+  (24 GiB)` line. Each row keeps everything it had -- size, weights-only verdict, the planner's
+  context line and fit badge, the disk warning, Download -- and adds an MTP badge: `likely MTP`
+  (outline, `info`) from the name at first paint, then `MTP` (filled), `no MTP heads` (grey; the
+  name promised, the header did not deliver) or nothing as each probe lands, painted concurrently
+  with the context read and never blocking. Colours are theme tokens through the existing badge
+  rules; no hard-coded colour. A label that appears twice in a repo shows its file name inline
+  (the llmfan46 repo's two files both parse to `NVFP4`), every label's hover lists the files that
+  would be downloaded, and a subfolder file (unsloth's `BF16/...`) gets a disabled Download with
+  the reason instead of a click that `safe_filename` refuses. The dialog body scrolls.
+- **Search.** Rows get the same chip from the name, or filled from a registered quant of the repo
+  whose header carries the heads (a dictionary walk, no network). An `MTP only` checkbox fetches a
+  wider single page (60, one request either way) and filters it locally, saying how many of the
+  fetched rows it kept -- HF cannot search on this and a silent "3 results" would read as "only
+  three exist".
+
+**Not taken.** Reading every file's header on the search page (twenty rows is twenty requests per
+keystroke; `mtp_likely` and the registry are what a row can afford). Deriving MTP from the
+architecture name at search time (`qwen35` *can* carry the heads; a stripped quant is the same
+architecture). Flattening subfolder files to their basename at download time (`safe_filename`'s
+collision argument stands; the row now says why instead). Building the context-fit geometry from
+the same partial read: the full read also captures `n_vocab`, the chat template and the file
+type, and its cache must stay consistent with the local parser. A header-order assumption
+elevated to a hard rule: the probe reports *unknown* rather than *false* when it cannot prove the
+key absent.
+
+**Tests.** `tests/unit/test_download_mtp.py` (63): the name rule (token not substring; repo name
+vs file names; draft modules; the owner handle ignored); the early-stop walk (`kv_complete`,
+nothing past the stop, the full parser unchanged); `mtp_from_kv` settling and refusing;
+`remote_mtp` confirming from one 64 KiB chunk of a 550 KB header, denying a named-MTP file,
+inconclusive on tokenizer-first, memory and disk caches, free after a full read, gated and
+truncated errors, the token in a header not the URL; the registry shortcut on the exact file;
+shard 1 probed; the name fallback with its reason; concurrency `<= 2` under a cap of 2 with a
+raising probe and a raising callback; `GET /api/hf/repo` settling a mixed repo per file with the
+smallest quant fetched once; the search route carrying only the hint and reading nothing; the 403
+fallback; MCP compact and search-row fields; `quant_bits`/shelves/note/tooltip/rig line; every
+badge state; the GUI pass painting three rows three ways from real headers; a real NiceGUI render
+of shelves, badges, the duplicate-label file name and the disabled subfolder button; the search
+filter present; the search chip filled only for a registered quant with heads.
+`tests/unit/test_mcp.py`'s search-row key set gains `mtp_likely`; `tests/unit/test_gui.py`'s fake
+option carries the new attributes.
+
+## D68 -- The Chat tab is an ops bench: "(Loaded model)" by default, and every reply carries its numbers
+
+**Context.** On this rig the Chat tab is used operationally, not conversationally:
+open it, check that the loaded model answers, and see how fast it is. Or pick a model
+that was just downloaded, load it and test it. The old tab was built for chatting. It
+had a "Use the loaded model" switch that was off by default, a picker that defaulted
+to the first model in the library, a single live tok/s label (one streamed chunk
+counted as one token, measured from the click, so the load and prefill were folded
+into the "rate"), and no way to see how the target was launched. The switch followed
+the most recently *used* model, so another client's traffic could move it.
+
+**Decision.**
+
+1. **The picker's first entry is "(Loaded model)", and it is the default.** It is not a
+   model id. It is re-resolved on every poll and every send (`state.chat_pick`):
+   - the most recently **loaded** ready chat model (`InstanceInfo.started_at` is stamped
+     when a child becomes ready). Loaded, not used, so traffic from other clients
+     cannot move it;
+   - with nothing ready, a chat model that is loading right now (Send waits for it);
+   - with nothing loaded at all, the **newest download** (the catalog's
+     `downloaded_at` rule, `mtime or added_at`). Virtual models are skipped, and so are
+     models the server says it cannot load (the D66 hook `manager.unsupported_reason`,
+     used only when present), so Send or Load is a one-click "does the model I just
+     downloaded work?".
+
+   The entry's label always says what it resolves to ("(Loaded model) — <id>",
+   "… (loading…)", "… — nothing loaded · newest: <id>"). The rest of the list is loaded
+   models first, then loading ones, then the library newest download first. Each entry
+   is marked "· loaded", "· loading", "· failed" or "· cannot load". An explicit pick is
+   honoured while the model exists. A pick that has left the library falls back to the
+   "(Loaded model)" rules.
+
+2. **A target card** above the conversation shows the target's state badge
+   (Loaded / Loading… / Not loaded / Failed) and why it is the target.
+   - Loaded: GPUs with card names, context × slots, KV types, speculative mode (MTP
+     heads / draft model / n-gram), engine build, when and by whom it was loaded, tier,
+     idle-unload TTL, request count, last decode rate.
+   - Not loaded: size (+ vision projector), quant, arch, parameters, trained context,
+     when it was downloaded.
+   - Always: features (vision, thinking, tools, MTP heads).
+
+   **Load** (not loaded) and **Unload** (loaded) buttons sit beside the picker. Load is
+   `ensure_loaded(model_id, priority=1)`, the same call Send makes. Unload mirrors the
+   Dashboard (D55 lease rules, single-flight per model).
+
+3. **Every reply carries its numbers** (`state.chat_run_metrics`, `chat_metric_tiles`,
+   `chat_metric_footer`):
+   - **Load**: wall time from Send until ready, only when the send had to load.
+   - **TTFT**: from the request reaching the child until the first streamed token
+     (thinking counts). Excludes the load; includes prefill.
+   - **Prefill** and **Decode**: from llama-server's own `timings` block (`prompt_n`,
+     `prompt_ms`, `prompt_per_second`, `cache_n`, `predicted_*`, `draft_n`,
+     `draft_n_accepted`). The block arrives on the final stream chunk when the request
+     sets `stream_options.include_usage`, which the tab now always does. This was
+     measured on b11037: the final chunk carries `usage` and `timings` with empty
+     `choices`. A fully cached prompt shows "cached", not a meaningless rate.
+   - **Overall**: completion tokens over the whole request (prefill included, load
+     excluded), plus "incl. load" after a cold start.
+   - **Total**: click to last token.
+   - Footer: tokens in and out, speculative acceptance, and how the reply ended
+     ("hit max_tokens", "stopped by you").
+
+   If the engine's timings never arrive (Stop, older build), decode is estimated from
+   the stream and labelled "estimated".
+
+4. **Quick tests**: Hello (smoke/TTFT), Count to 100 (decode), Long answer (sustained
+   decode), Prefill ~4k (a deterministic ~4,000-token prompt; run it twice to see the
+   prompt cache). Plus a **Stop** button, thinking folded into a "Thinking" expansion
+   (inline `<think>` or `reasoning_content`), a "Send the conversation so far" switch
+   (off = each prompt measured on its own), max_tokens default 2048 (thinking models
+   ran out of room at 512), request settings folded away.
+
+5. Fixed in passing: the stream went to `supervisor.base_url(record.id)`, which is wrong
+   for a virtual model (its child belongs to the base). It now uses `instance.model_id`
+   for the port and for request accounting. A failed turn is dropped from the history,
+   so the next message does not carry an unanswered one.
+
+**Consequences.** The tab still talks to the model's own llama-server after
+`manager.ensure_loaded`, so a good result is still evidence that a client will work. It
+bypasses the gateway's `/v1` layer (virtual presets, `status.clients` attribution), as it
+always did. `ChatTarget`/`chat_target` and the switch are gone (their only user was this
+tab). The metrics are per reply and not persisted. The Benchmark tab stays the place for
+repeatable numbers.
+
+**Tests.** `tests/unit/test_gui_chat.py` (46): resolution rules (most recently loaded
+beats most recently used; newest download; skips virtual and unloadable; loading;
+embedding never a target; explicit pick; vanished pick; virtual follows its base;
+failed), picker order and labels, card facts for loaded and not-loaded models, GPU
+summary, metrics from the measured b11037 timings, cold start, client fallback, fully
+cached prompt, speculative acceptance and Stop in the footer, junk timings, formatting,
+the thinking split, quick-test prompts, the SSE parser, `include_usage` in the payload,
+the optional unloadable hook, and a rendered page naming the loaded model. The static
+guards in `test_gui.py` (explicit-zero samplers, chat tier 1) still pass unchanged.
