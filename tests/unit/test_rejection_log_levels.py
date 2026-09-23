@@ -7,10 +7,11 @@ escalate -- and at INFO no WARNING or ERROR filter ever showed it. Meanwhile
 every 503 busy signal and the waitable 507 ``gpu_leased`` went out as ERROR
 ``request failed`` purely because their status is >= 500.
 
-What these pin: ``lease_conflict`` and ``insufficient_vram`` are WARNING; the
-documented wait-and-retry family is INFO whatever its status; anything else
-keeps the status rule (a 5xx fault is ERROR, a 4xx is INFO); and the sets are
-explicit, so the list in ``docs/OPENCLAW-RIG.md`` and the logger agree.
+What these pin: ``lease_conflict``, ``insufficient_vram`` and (D66)
+``unsupported_architecture`` are WARNING; the documented wait-and-retry family
+is INFO whatever its status; anything else keeps the status rule (a 5xx fault
+is ERROR, a 4xx is INFO); and the sets are explicit, so the list in
+``docs/OPENCLAW-RIG.md`` and the logger agree.
 """
 
 from __future__ import annotations
@@ -100,7 +101,13 @@ def test_an_ordinary_bad_request_is_still_info(recorded: RecordingLog) -> None:
 
 def test_the_sets_are_disjoint_and_the_retry_set_is_the_documented_one() -> None:
     assert not app_module.WARNING_REJECTION_CODES & app_module.RETRY_REJECTION_CODES
-    assert {"lease_conflict", "insufficient_vram"} == app_module.WARNING_REJECTION_CODES
+    # D66 added the model the installed llama.cpp build cannot load at all: a
+    # 400 an operator must see, however patiently a client asks for it.
+    assert {
+        "lease_conflict",
+        "insufficient_vram",
+        "unsupported_architecture",
+    } == app_module.WARNING_REJECTION_CODES
     # docs/OPENCLAW-RIG.md's closed list, less client_quota (a ClawForge2 code).
     assert {
         "priority_hold",

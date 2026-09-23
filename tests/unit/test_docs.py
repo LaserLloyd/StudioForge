@@ -370,6 +370,8 @@ def test_the_rig_pages_failure_table_uses_real_codes() -> None:
         "benchmark_busy",
         "model_benchmarking",
         "context_exceeded",
+        # D66: an architecture the installed llama.cpp build cannot load.
+        "unsupported_architecture",
         "model_not_found",
         "lease_conflict",
         # D56's vacate refusal: documented beside `lease_conflict` because an

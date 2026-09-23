@@ -54,7 +54,11 @@ _NO_BOOT_WAIT_PATHS = frozenset({"/health", "/healthz", "/api/health", "/docs", 
 #: no filter saw them); ``insufficient_vram`` is "it does not fit" and is not
 #: retryable. An explicit list, not a status-code heuristic: the status of a
 #: refusal says how HTTP should carry it, not how much an operator cares.
-WARNING_REJECTION_CODES = frozenset({"lease_conflict", "insufficient_vram"})
+#: ``unsupported_architecture`` (D66) is a model the installed llama.cpp build
+#: cannot load at all -- an operator's problem, however patiently it is asked.
+WARNING_REJECTION_CODES = frozenset(
+    {"lease_conflict", "insufficient_vram", "unsupported_architecture"}
+)
 
 #: The wait-and-retry family (D64, CR-3): exactly the StudioForge codes
 #: ``docs/OPENCLAW-RIG.md`` lists as "wait and retry unchanged", each carrying
@@ -511,6 +515,12 @@ async def _boot(state: Any, *, start_background: bool) -> None:
             except Exception as exc:  # noqa: BLE001
                 log.error("engine not ready", error=str(exc))
                 state.engine_status = {"ok": False, "tag": None, "error": str(exc)}
+            # D66: read the active build's architecture table now, off the event
+            # loop (a 3 MB read and scan, ~0.1 s), so the first load's preflight
+            # is a cached lookup. Outside the engine's try on purpose: whatever
+            # happens here says nothing about whether the engine is ready.
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(state.engine_manager.architecture_table, None)
             boot.set_phase("starting model manager")
             await state.manager.start()
             # Resumes anything a crash left half-downloaded. Never fatal --
@@ -586,6 +596,10 @@ def build_state(config: Config, *, version: str = __version__) -> Any:
         version=version,
         leases=leases,
     )
+    # D66: an engine install or activation (route, GUI or boot) forgets the
+    # launches the manager remembered as "unknown architecture" -- the build that
+    # serves the next load may well know it. Late-bound like tag_in_use above.
+    engine_manager.on_engine_change = manager.forget_arch_rejections
 
     state.config = config  # type: ignore[attr-defined]
     state.db = db  # type: ignore[attr-defined]

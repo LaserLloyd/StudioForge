@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -185,6 +185,10 @@ class EngineCapabilities:
     #: pinned tag: those say what the project supports, this says what the
     #: binary on this disk will actually accept.
     features: dict[str, Any] = field(default_factory=dict)
+    #: The ``llama`` library this build's architecture verdicts are read from
+    #: (D66), e.g. ``llama.dll``; ``None`` when there is none to read -- then
+    #: the list above is all there is.
+    architecture_library: str | None = None
 
     def supports_architecture(self, arch: str) -> bool:
         return arch.lower() in {a.lower() for a in self.architectures}
@@ -199,7 +203,8 @@ class EngineCapabilities:
         the one place that decides whether a model gets flagged unrunnable. A
         checkout is resolved from the running tag, so it counts; a snapshot only
         counts when its ``source_tag`` matches. Anything else is advisory
-        (D49-8).
+        (D49-8). A ``binary`` list (D66) is read from the build's own library and
+        carries the running tag, so it always counts.
         """
         return self.source == "checkout" or (bool(self.source_tag) and self.source_tag == self.tag)
 
@@ -240,6 +245,7 @@ class CapabilityReport:
                 "capability_source_detail": self.engine.source_detail,
                 "capability_source_tag": self.engine.source_tag,
                 "capability_describes_engine": self.engine.describes_active_engine,
+                "architecture_library": self.engine.architecture_library,
                 "features": self.engine.features,
                 "feature_rows": engine_feature_rows(self.engine.features),
             },
@@ -379,10 +385,26 @@ def engine_capabilities(config: Config, engine_manager: Any = None) -> EngineCap
             installed_at = info.installed_at
 
     features = detect_engine_features(config, tag)
+    table = _architecture_table(engine_manager, tag)
+    architecture_library = str(table.library) if table is not None else None
 
     for root in checkout_candidates(config):
         extracted = extract_from_checkout(root)
         if extracted is not None:
+            if table is not None:
+                return _binary_capabilities(
+                    table,
+                    tag=tag,
+                    variant=variant,
+                    version_string=version_string,
+                    smoke_tested=smoke_tested,
+                    installed_at=installed_at,
+                    listed=extracted["architectures"],
+                    listed_from=f"the checkout at {root.name}",
+                    file_types=extracted["file_types"],
+                    ggml_types=extracted["ggml_types"],
+                    features=features,
+                )
             return EngineCapabilities(
                 tag=tag,
                 variant=variant,
@@ -396,10 +418,25 @@ def engine_capabilities(config: Config, engine_manager: Any = None) -> EngineCap
                 source_detail=str(root),
                 source_tag=tag,
                 features=features,
+                architecture_library=architecture_library,
             )
 
     snapshot = load_snapshot()
     snap_tag = str(snapshot.get("source_tag") or "")
+    if table is not None:
+        return _binary_capabilities(
+            table,
+            tag=tag,
+            variant=variant,
+            version_string=version_string,
+            smoke_tested=smoke_tested,
+            installed_at=installed_at,
+            listed=list(snapshot["architectures"]),
+            listed_from=f"the bundled {snap_tag or 'snapshot'} list",
+            file_types=list(snapshot["file_types"]),
+            ggml_types=list(snapshot["ggml_types"]),
+            features=features,
+        )
     detail = f"bundled snapshot for {snap_tag or 'an unknown tag'}"
     if snap_tag != tag:
         # Say so plainly: the running engine is not the one the list came from.
@@ -418,6 +455,65 @@ def engine_capabilities(config: Config, engine_manager: Any = None) -> EngineCap
         source_detail=detail,
         source_tag=snap_tag,
         features=features,
+        architecture_library=architecture_library,
+    )
+
+
+def _architecture_table(engine_manager: Any, tag: str) -> Any:
+    """The report's build's architecture table (D66), or ``None``."""
+    lookup = getattr(engine_manager, "architecture_table", None)
+    if lookup is None:
+        return None
+    try:
+        return lookup(tag)
+    except Exception:  # noqa: BLE001 - a report must never fail on this
+        return None
+
+
+def _binary_capabilities(
+    table: Any,
+    *,
+    tag: str,
+    variant: str,
+    version_string: str | None,
+    smoke_tested: bool,
+    installed_at: float | None,
+    listed: list[str],
+    listed_from: str,
+    file_types: list[str],
+    ggml_types: list[str],
+    features: dict[str, Any],
+) -> EngineCapabilities:
+    """The report when the build's own library could be read (D66).
+
+    The library is the authority on architectures, so the list becomes the
+    names of the source list (a checkout or the bundled snapshot) that this
+    build's table actually contains, and ``source`` is ``binary`` -- it
+    describes the running build by construction. The library holds literals,
+    not a labelled table, so a name newer than the source list cannot be
+    enumerated here; every model is still judged individually from the same
+    library (``library.unsupported_by_engine``). The quantization and
+    ggml-type names stay the source list's.
+    """
+    names = [name for name in listed if table.knows(name)]
+    return EngineCapabilities(
+        tag=tag,
+        variant=variant,
+        version_string=version_string,
+        smoke_tested=smoke_tested,
+        installed_at=installed_at,
+        architectures=names,
+        quant_types=_quant_labels(file_types),
+        ggml_types=ggml_types,
+        source="binary",
+        source_detail=(
+            f"{table.library} of {tag}: the {len(names)} of {len(listed)} names in "
+            f"{listed_from} that this build contains; newer architectures are judged "
+            f"per model from the same library"
+        ),
+        source_tag=tag,
+        features=features,
+        architecture_library=str(table.library),
     )
 
 
@@ -461,29 +557,83 @@ def hardware_capabilities(
     )
 
 
-def library_summary(records: list[ModelRecord], engine: EngineCapabilities) -> dict[str, Any]:
+#: ``record -> (verdict, engine tag)`` from the build's own ``llama`` library
+#: (D66): ``True`` / ``False`` when the library answered, ``None`` when it could
+#: not be read. See :func:`engine_library_probe`.
+ArchitectureProbe = Callable[[ModelRecord], tuple[bool | None, str | None]]
+
+
+def engine_library_probe(engine_manager: Any) -> ArchitectureProbe | None:
+    """Per-model verdicts from the library of the build that would serve each model (D66).
+
+    The model's ``settings.engine_tag`` pin, else the active build -- the same
+    resolution a load makes -- each build looked up once per report. ``None``
+    when there is no engine manager to ask.
+    """
+    if engine_manager is None or not hasattr(engine_manager, "architecture_table"):
+        return None
+    tables: dict[str | None, tuple[Any, str | None]] = {}
+
+    def lookup(tag: str | None) -> tuple[Any, str | None]:
+        if tag not in tables:
+            try:
+                table = engine_manager.architecture_table(tag)
+            except Exception:  # noqa: BLE001 - "cannot tell" is never a verdict
+                table = None
+            resolved = tag
+            if resolved is None:
+                try:
+                    info = engine_manager.active()
+                    resolved = info.tag if info is not None else None
+                except Exception:  # noqa: BLE001
+                    resolved = None
+            tables[tag] = (table, resolved)
+        return tables[tag]
+
+    def probe(record: ModelRecord) -> tuple[bool | None, str | None]:
+        table, tag = lookup(record.settings.engine_tag)
+        return (table.knows(record.architecture) if table is not None else None), tag
+
+    return probe
+
+
+def library_summary(
+    records: list[ModelRecord],
+    engine: EngineCapabilities,
+    probe: ArchitectureProbe | None = None,
+) -> dict[str, Any]:
     """What is in the library, grouped the way a user thinks about it.
 
     Also flags any architecture the engine does not know -- that is the one case
     where a model in the library genuinely cannot be run, and it is invisible
     until the load fails.
 
-    **The verdict is only given when the architecture list actually describes
-    the running build** (D49-8). The list ships as a snapshot pinned to one tag
-    and the engine moves on its own, so a model using an architecture added
-    *after* the snapshot was taken was being reported as unsupported by an
-    engine that supports it perfectly well -- a hard "cannot run this" derived
-    from a list about a different build. When the list does not describe the
-    active engine those models go to ``unknown_to_architecture_list`` instead,
-    and ``architecture_list_describes_engine`` says which of the two happened so
-    a caller can word it honestly.
+    **The build's own library decides when it can** (D66). ``probe`` reads the
+    ``llama`` library of the build that would serve each model -- its pin, else
+    the active build -- and a name that library does not contain is certain to
+    fail, so that model is ``unsupported_by_engine`` with ``source: "binary"``
+    whatever the list below says; a name it does contain is supported, even
+    when the list is too old to know it.
+
+    **Otherwise the list decides, and only when it describes the running
+    build** (D49-8). The list ships as a snapshot pinned to one tag and the
+    engine moves on its own, so a model using an architecture added *after*
+    the snapshot was taken was being reported as unsupported by an engine that
+    supports it perfectly well -- a hard "cannot run this" derived from a list
+    about a different build. When the list does not describe the active engine
+    those models go to ``unknown_to_architecture_list`` instead, and
+    ``architecture_list_describes_engine`` says which of the two happened so a
+    caller can word it honestly. ``architecture_verdict_source`` says where the
+    per-model verdicts came from: ``binary``, ``architecture_list`` or
+    ``mixed``.
     """
     by_arch: dict[str, int] = {}
     by_quant: dict[str, int] = {}
     caps = {"vision": 0, "tools": 0, "thinking": 0, "embedding": 0, "multi_part": 0}
-    unsupported: list[dict[str, str]] = []
+    unsupported: list[dict[str, Any]] = []
     advisory: list[dict[str, str]] = []
     authoritative = engine.describes_active_engine
+    from_library = from_list = 0
 
     for record in records:
         by_arch[record.architecture] = by_arch.get(record.architecture, 0) + 1
@@ -491,10 +641,30 @@ def library_summary(records: list[ModelRecord], engine: EngineCapabilities) -> d
         for key in caps:
             if getattr(record.capabilities, key, False):
                 caps[key] += 1
+        verdict, tag = probe(record) if probe is not None else (None, None)
+        if verdict is not None:
+            from_library += 1
+            if verdict is False:
+                unsupported.append(
+                    {
+                        "model_id": record.id,
+                        "architecture": record.architecture,
+                        "engine_tag": tag,
+                        "source": "binary",
+                    }
+                )
+            continue
+        from_list += 1
         if engine.architectures and not engine.supports_architecture(record.architecture):
             row = {"model_id": record.id, "architecture": record.architecture}
             (unsupported if authoritative else advisory).append(row)
 
+    if from_library and from_list:
+        source = "mixed"
+    elif from_library:
+        source = "binary"
+    else:
+        source = "architecture_list"
     return {
         "model_count": len(records),
         "total_bytes": sum(r.size_bytes for r in records),
@@ -506,6 +676,9 @@ def library_summary(records: list[ModelRecord], engine: EngineCapabilities) -> d
         "architecture_list_describes_engine": authoritative,
         "architecture_list_source": engine.source,
         "architecture_list_detail": engine.source_detail,
+        "architecture_verdict_source": source,
+        "architecture_verdicts_from_binary": from_library,
+        "architecture_verdicts_from_list": from_list,
     }
 
 
@@ -546,7 +719,7 @@ def build_report(
 ) -> CapabilityReport:
     engine = engine_capabilities(config, engine_manager)
     hardware = hardware_capabilities(config, gpus, probe)
-    library = library_summary(records, engine)
+    library = library_summary(records, engine, engine_library_probe(engine_manager))
     library["sizing"] = size_verdicts(records, hardware)
     return CapabilityReport(
         engine=engine, hardware=hardware, features=dict(FEATURE_NOTES), library=library

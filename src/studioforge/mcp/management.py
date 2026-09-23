@@ -272,7 +272,11 @@ and ask again. reserve_gpus takes the same tier vocabulary as a load
 lease is never taken away from its holder. A 400 context_exceeded means your
 prompt is larger than the loaded slot (error.studioforge.ctx_per_slot):
 shorten it, or load_recommended at a larger ctx_size; the server never
-truncates, so retrying unchanged cannot succeed.
+truncates, so retrying unchanged cannot succeed. A 400 unsupported_architecture
+means the installed llama.cpp build cannot load that model's architecture at
+all (error.studioforge.architecture, engine_tag, remedy): no wait, retry or
+setting changes it -- use another model and tell the operator. list_models and
+model_info mark such models arch_supported: false and recommend no load.
 
 SAY WHO YOU ARE AND WHAT THE WORK IS. Send X-SF-Client: <your agent name> on
 every /v1 request (server_status and GET /api/status.clients attribute traffic
@@ -911,6 +915,9 @@ def build_management_mcp(state: Any) -> MCPServer:
             Identity, files, capabilities, saved settings, GGUF metadata (the
             chat template is summarised, not included -- it is thousands of
             tokens), plus ``loaded``/``actual``/``slots`` when running.
+            ``arch_supported: false`` (with ``arch_note`` and
+            ``unsupported_reason``) means this llama.cpp build cannot load the
+            model at all; ``last_load_failure`` is its last launch that died.
         """
         record = state.registry.resolve(model_id)
         if record is None:
@@ -942,6 +949,14 @@ def build_management_mcp(state: Any) -> MCPServer:
             "meta": _detailed_meta(record.meta),
             "loaded": instance is not None,
         }
+        # D66: arch_supported (+ arch_note, engine_supported, unsupported_reason
+        # when the build cannot load it) and last_load_failure after a launch died.
+        support_of = getattr(state.manager, "load_support_fields", None)
+        if support_of is not None:
+            try:
+                payload.update(support_of(record))
+            except Exception:  # noqa: BLE001 - a detail view never fails on a verdict
+                payload["arch_supported"] = None
         if instance is not None:
             detail = await state.manager.introspect(record.id)
             payload["instance"] = _compact_instance(instance)

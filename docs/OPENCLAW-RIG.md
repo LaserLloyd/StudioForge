@@ -257,6 +257,7 @@ Branch on the **code**, never on the prose. StudioForge puts it in the OpenAI er
 | SF | 503 | `priority_hold` | a tier-1/2 load is in flight; `details.priority_hold` names it | honour `Retry-After`, resend at your true tier |
 | SF | 503 | `model_busy` / `benchmark_busy` / `model_benchmarking` | serving, benchmarking or smoke-testing | wait `retry_after_s` |
 | SF | 400 | `context_exceeded` | prompt larger than the loaded slot (`ctx_per_slot`; `prompt_tokens` when measured). Nothing is ever truncated | shorten, or `load_recommended` at a larger `ctx_size` |
+| SF | 400 | `unsupported_architecture` | the installed llama.cpp build cannot load that model's architecture (`error.studioforge.architecture`, `engine_tag`, `source`, `remedy`); refused before any lease, eviction or spawn, and marked `arch_supported: false` in `list_models` / `/v1/models` | never retry; use another model and report it |
 | SF | 400 | `invalid_config` / a rejected `priority` | the request is malformed | fix the body |
 | SF | 404 | `model_not_found` | unknown id or alias | fix the id (`list_models`) |
 | SF | 404 | `no_loaded_model` | you named `loaded`, and no model of that route's kind is resident or even loading | load a model, or name one explicitly |
@@ -341,7 +342,8 @@ Everything else means *change the request*, *stand down*, or *report*.
 > `lease_vacating`, and a `gpu_leased` whose lease `kind` is `render`/`agent`/`other` — all carry
 > `retry_after_s` / `Retry-After`. `gpu_leased` with `kind: benchmark` means stand down.
 > `insufficient_vram`, `insufficient_compute_cap`, `context_exceeded`, `workflow_not_found`,
-> `model_not_found`, `invalid_priority`, `invalid_detail` mean *change the request*.
+> `model_not_found`, `invalid_priority`, `invalid_detail` mean *change the request*;
+> `unsupported_architecture` means *change the model* — this llama.cpp build cannot load it.
 > `model_load_failed`, `backend_unavailable`, `stalled` mean *report*, then at most one
 > resubmission.
 >

@@ -509,18 +509,35 @@ async def list_models(request: Request) -> dict[str, Any]:
     *running* child was really started with -- prompt cache, continuous
     batching, KV pool shape, slots -- parsed from its argv with the engine's
     defaults filled in. ``null`` for anything not loaded.
+
+    ``arch_supported`` (D66): whether the llama.cpp build that would serve the
+    next load (the model's ``engine_tag`` pin, else the active build) can load
+    its architecture -- ``false`` with a short ``arch_note``, ``engine_supported:
+    false`` and the full ``unsupported_reason`` when it certainly cannot, ``null``
+    when that cannot be told. Every load of a ``false`` model is refused ``400
+    unsupported_architecture``. ``last_load_failure`` (``{at, code, message,
+    engine_tag}``) is the last launch of the model that died, until one works:
+    the failed child is gone, so ``state`` alone would just say ``stopped``.
     """
     state = _state(request)
     from studioforge.api.app import wait_for_boot
 
     await wait_for_boot(state, timeout_s=60.0, scan_only=True)  # D33: not an empty list mid-boot
     loaded = {i.model_id: i for i in state.supervisor.list()}
+    records = list(state.registry.all())
+    # D66: can the build that would serve each model load its architecture, and
+    # did its last launch die? One lookup per build for the whole list.
+    arch_memo: dict[Any, Any] = {}
     models = []
-    for record in state.registry.all():
+    for record in records:
         # Preset-only virtual models serve from their base's instance; report
         # them loaded whenever the base is.
         serving = state.manager.serving_record(record)
         instance = loaded.get(serving.id)
+        try:
+            support = state.manager.load_support_fields(record, memo=arch_memo)
+        except Exception:  # noqa: BLE001 - a listing never fails on a verdict
+            support = {"arch_supported": None}
         models.append(
             {
                 **record.model_dump(mode="json"),
@@ -544,6 +561,7 @@ async def list_models(request: Request) -> dict[str, Any]:
                     if instance is not None and instance.effective is not None
                     else None
                 ),
+                **support,
             }
         )
     return {"models": models, "count": len(models)}
@@ -2457,6 +2475,9 @@ async def start_benchmark(
     record = state.registry.resolve(model_id)
     if record is None:
         raise ModelNotFoundError(model_id, known=state.registry.known_ids())
+    # D66: a 400 now, not a job whose every mode leases cards (evicting their
+    # residents) and then fails to load.
+    state.manager.arch_check(record.id)
 
     data = payload or {}
     ctx_size = _positive_int(data.get("ctx_size"), DEFAULT_CTX_SIZE, "ctx_size")
@@ -2657,6 +2678,8 @@ async def start_parallel_benchmark(
     record = state.registry.resolve(model_id)
     if record is None:
         raise ModelNotFoundError(model_id, known=state.registry.known_ids())
+    # D66: refused before the 202, like a bad argument -- see start_benchmark.
+    state.manager.arch_check(record.id)
 
     data = payload or {}
     mode = data.get("mode")

@@ -61,7 +61,7 @@ than as its own asset.
 against (D2). Moving it is a deliberate release decision, not housekeeping: it changes what a fresh
 install downloads on first run, and the flag surface it validates expert settings against.
 
-When you do move it, **regenerate the capabilities snapshot in the same commit**:
+When you do move it, you may **regenerate the capabilities snapshot in the same commit**:
 
 ```bash
 python scripts/refresh_engine_capabilities.py b10549 --dry-run   # see what would change
@@ -76,11 +76,15 @@ report uses — a second parser here would drift — and rewrites the file with 
 touches exactly that one file and prints a diff summary. `--checkout <path>` reuses a tree you
 already have, if you are sure it is at the right tag.
 
-Leaving it stale is not fatal, and since D49-8 it is not a lie either: when `source_tag` is not the
-running engine's tag, an unrecognised architecture is reported as *unknown to the architecture list
-from `<tag>`* rather than as unsupported by the engine. The cost of not regenerating is therefore a
-weaker answer, not a wrong one — but a release that bumps the pin and ships a snapshot from the
-previous one has given up a verdict for no reason.
+**Since D66 the snapshot no longer decides whether a model can run.** That verdict is read from the
+installed build's own `llama` library (`llama.dll` / `libllama.so` / `libllama.dylib`), per model and
+per build, so it is right for whatever engine is active whether or not anyone regenerated anything;
+`GET /api/capabilities` then reports `capability_source: "binary"`. The snapshot still supplies the
+quantization and ggml-type names, and the *list* of architecture names the report prints (filtered
+to the ones the build contains), so regenerating it keeps those current — but leaving it stale no
+longer weakens any verdict. It only matters on its own when the library cannot be read (a static
+build, an unrecognised layout): then, as since D49-8, an unrecognised architecture is reported as
+*unknown to the architecture list from `<tag>`* rather than as unsupported by the engine.
 
 Then update the four places the tag is quoted as an example: `config.example.yaml`, the README
 quickstart note, `docs/SETUP.md`'s headless YAML, and D2 in `DECISIONS.md` if the measurements were

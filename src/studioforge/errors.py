@@ -86,6 +86,30 @@ class ModelLoadError(StudioForgeError):
     code = "model_load_failed"
 
 
+class UnsupportedArchitectureError(StudioForgeError):
+    """The llama.cpp build that would serve this model cannot load its architecture (D66).
+
+    Known *before* anything is planned, held, leased, evicted or spawned: the
+    build's own ``llama`` library carries every architecture name it can load,
+    and a name that is not in it is a certain ``unknown model architecture`` at
+    startup -- as is a launch that already died of exactly that.
+
+    **400, like** ``context_exceeded`` **-- change the request, never retry it
+    unchanged.** Not a 503 or a 507: both mean "wait", and nothing about this
+    changes by waiting; it changes when a build that includes the architecture
+    is installed. Not a 502 ``model_load_failed``, which is what it used to be
+    and which read like a fault to report rather than a fact to act on. No
+    OpenAI SDK retries a 400. ``param`` is ``model``; ``error.studioforge``
+    carries ``architecture``, ``engine_tag``, ``source`` (``binary`` -- the
+    build's library does not name it -- or ``runtime`` -- a launch on it already
+    failed), ``first_failed_at`` (runtime only), ``remedy`` and ``model_id``.
+    """
+
+    status_code = 400
+    error_type = "invalid_request_error"
+    code = "unsupported_architecture"
+
+
 class ModelUnloadError(StudioForgeError):
     """An unload could not be verified: the child process is still alive.
 
