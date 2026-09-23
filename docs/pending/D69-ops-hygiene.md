@@ -63,3 +63,24 @@ too.
 **Tests.** `tests/unit/test_kv_type_auto.py`: `auto` equals f16 with no log line, both directly and
 through `kv_alloc_bytes`. An unknown type warns once and then logs at DEBUG, and a second unknown type
 warns on its own. `first_time` returns True once per key and resets at its cap.
+
+### §16 — Per-state facts are said once
+
+**Evidence.** Between 09-13 and 09-22, `registry.alias_collision` logged 92 times: three lines per
+rescan for the same Dark-Scarlett IQ4_XS/Q5_K_M pair, one per shared short alias.
+`thinking model loads with no reasoning_format` logged 136 times, once per load of every thinking
+model, although it describes a per-model setting.
+
+**Change.** `Registry._rebuild_aliases` collects the collisions per `(kept, dropped)` pair and logs one
+WARNING per pair, with `aliases=[...]` (sorted) in place of the old single `alias=` field. It warns
+only when that `(kept, dropped, aliases)` state is new to the process. A rescan that finds the same
+collision logs it at DEBUG, and a collision that goes away and comes back is warned again. The
+thinking-format warning in the manager's load path is a WARNING the first time per model per process
+(`first_time("reasoning_format", model_id)`, §14) and DEBUG after. The manager edit is the call site
+and the import only.
+
+**Tests.** `tests/unit/test_registry.py::test_an_alias_collision_is_warned_once_per_state` (one line
+per pair, DEBUG on rescans, re-warned after the collision comes back) and the existing collision test
+reading `aliases`. `tests/unit/test_thinking_format_nag.py` covers three loads of one model, then a
+second model: WARNING for each model once, DEBUG for the repeats, nothing for a model with a
+`reasoning_format`. Both fail against the old code.

@@ -612,10 +612,43 @@ def test_alias_collision_keeps_first_and_warns(reg: Registry, recorder: LogRecor
     assert resolved is not None
     assert resolved.id == winner
     collisions = recorder.of("registry.alias_collision", "warning")
-    assert any(kw["alias"] == "samename-q4_k_m" and kw["dropped"] == loser for kw in collisions)
+    assert any("samename-q4_k_m" in kw["aliases"] and kw["dropped"] == loser for kw in collisions)
     # The shadowed model is still reachable by its full id -- never lost.
     assert reg.get(loser) is not None
     assert reg.resolve(loser) is not None
+
+
+def test_an_alias_collision_is_warned_once_per_state(
+    reg: Registry, recorder: LogRecorder, library: Path
+) -> None:
+    """D69 §16: a collision is a fact about the library. One WARNING per
+    colliding pair naming every alias the pair shares; a rescan that finds
+    the same collision logs it at DEBUG only; a collision that goes away and
+    comes back is warned again."""
+    loser = "collide-b/repo-two-GGUF/samename-Q4_K_M"
+    reg.scan()
+    first = recorder.of("registry.alias_collision", "warning")
+    assert first, "the collision was not reported at all"
+    pairs = [(kw["kept"], kw["dropped"]) for kw in first]
+    assert len(pairs) == len(set(pairs)), "one line per colliding pair, not one per alias"
+    assert all(kw["aliases"] == sorted(kw["aliases"]) for kw in first)
+
+    reg.scan()
+    reg.scan(force=True)
+    assert recorder.of("registry.alias_collision", "warning") == first
+    assert len(recorder.of("registry.alias_collision", "debug")) == 2 * len(first)
+
+    loser_file = library / f"{loser}.gguf"
+    parked = library.parent / "parked.gguf"
+    loser_file.rename(parked)
+    reg.scan()
+    assert reg.get(loser) is None
+    parked.rename(loser_file)
+    reg.scan()
+    again = recorder.of("registry.alias_collision", "warning")
+    # Only the pair that went away and came back is new; the library's other
+    # collision never changed and stays at DEBUG.
+    assert [kw["dropped"] for kw in again[len(first) :]] == [loser]
 
 
 def test_full_ids_never_shadowed_by_short_aliases(scanned: Registry) -> None:
