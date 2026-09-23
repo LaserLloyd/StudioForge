@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import logging
 import sys
-from collections.abc import MutableMapping
+import threading
+from collections.abc import Hashable, MutableMapping
 from pathlib import Path
 from typing import Any
 
@@ -210,3 +211,38 @@ def configure_logging(
 
 def get_logger(name: str) -> Any:
     return structlog.get_logger(name)
+
+
+#: Keys :func:`first_time` has answered ``True`` for, process-wide. Bounded:
+#: past the cap the set starts over, so a caller minting endless keys costs
+#: a repeated line, never memory.
+_FIRST_TIME_CAP = 4096
+_first_time_seen: set[tuple[Hashable, ...]] = set()
+_first_time_lock = threading.Lock()
+
+
+def first_time(*key: Hashable) -> bool:
+    """``True`` the first time this process sees ``key``, ``False`` after (D69).
+
+    For a log line that states a fact about a *state* -- a model's setting,
+    a value in the config -- rather than about an event. Such a fact is worth
+    one WARNING per process. Repeating it on every load buried the log: 136
+    identical "thinking model loads with no reasoning_format" lines and 54
+    "unknown kv cache type" lines between 2026-09-13 and 09-22. Callers log
+    the repeats at DEBUG, so nothing is lost at that level::
+
+        emit = log.warning if first_time("reasoning_format", model_id) else log.debug
+    """
+    with _first_time_lock:
+        if key in _first_time_seen:
+            return False
+        if len(_first_time_seen) >= _FIRST_TIME_CAP:
+            _first_time_seen.clear()
+        _first_time_seen.add(key)
+        return True
+
+
+def reset_first_time() -> None:
+    """Forget every :func:`first_time` key (tests, and nothing else)."""
+    with _first_time_lock:
+        _first_time_seen.clear()

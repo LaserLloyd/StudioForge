@@ -47,7 +47,7 @@ from studioforge.core.gpu import vram_processes
 from studioforge.core.kv_sensitivity import KV_QUALITY_LADDER
 from studioforge.core.leases import LeaseBook, lease_view
 from studioforge.core.priority import PRIORITY_BACKGROUND
-from studioforge.logging import get_logger
+from studioforge.logging import first_time, get_logger
 from studioforge.types import (
     MB,
     AdapterRecord,
@@ -151,10 +151,22 @@ def kv_bytes_per_element(kv_type: str) -> float:
     try:
         return KV_BYTES_PER_ELEMENT[kv_type]
     except KeyError:
-        # Unknown/new cache type: assume f16 rather than guessing low, because
-        # under-estimating the KV cache is what produces an OOM at load.
-        log.warning("unknown kv cache type, assuming f16", kv_cache_type=kv_type)
-        return 2.0
+        pass
+    if kv_type == "auto":
+        # "auto" asks for the quality ladder (:meth:`Planner._kv_options`); it
+        # is not a cache type. A caller that sizes it without fanning it out
+        # -- the download-fit preview passes models.default_kv_cache_type
+        # straight through -- gets the ladder's first rung, f16, silently: the
+        # most expensive rung, so the answer can only err toward refusing.
+        # It used to be the WARNING below, 54 times since 2026-09-13 (D69 §14).
+        return KV_BYTES_PER_ELEMENT["f16"]
+    # Unknown/new cache type: assume f16 rather than guessing low, because
+    # under-estimating the KV cache is what produces an OOM at load. Once per
+    # type per process at WARNING: every rung of every placement asks again,
+    # and the repeats say nothing the first line did not.
+    emit = log.warning if first_time("kv_cache_type", kv_type) else log.debug
+    emit("unknown kv cache type, assuming f16", kv_cache_type=kv_type)
+    return 2.0
 
 
 #: llama.cpp sizes the sliding-window cache as
