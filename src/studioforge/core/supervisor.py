@@ -45,6 +45,7 @@ import socket
 import subprocess
 import sys
 import time
+import uuid
 from collections import deque
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
@@ -60,6 +61,7 @@ from studioforge.config import (
     grant_cache_ram_mib,
     resolve_cache_ram_mb,
 )
+from studioforge.core.attribution import split_source
 from studioforge.core.engine import (
     ArchitectureTable,
     EngineFeatures,
@@ -75,6 +77,7 @@ from studioforge.logging import get_logger
 from studioforge.types import (
     AdapterRecord,
     EffectiveLaunch,
+    InFlightRequest,
     InstanceInfo,
     LoadPlan,
     ModelRecord,
@@ -1238,6 +1241,13 @@ def resolve_launch_features(
     )
 
 
+#: How many in-flight requests an instance describes (D70, S6). The COUNT
+#: (``active_requests``) is unbounded; the records are a window beside it,
+#: never longer than the count. 64 is well past any ``--parallel`` this
+#: server launches, so in practice every request is described.
+IN_FLIGHT_RECORDS_MAX = 64
+
+
 class _Instance:
     """Mutable supervisor-side state for one child process."""
 
@@ -2153,6 +2163,10 @@ class Supervisor:
                 plan=plan,
                 ttl_s=record.settings.ttl_s,
                 loaded_by=source,
+                # The label the loading request carried, when the route
+                # composed one into ``source`` (D70): the part in parentheses
+                # of ``jit:/v1/chat/completions (clawchat)``.
+                loaded_by_client=split_source(source)[1],
                 priority=priority,
                 log_path=self._log_path_for(record.id),
             )
@@ -2330,6 +2344,7 @@ class Supervisor:
             model_id=inst.record.id,
             port=inst.port,
             source=inst.info.loaded_by,
+            client=inst.info.loaded_by_client,
             # The ring buffer behind GET /api/logs. Same reason as the child
             # log header above (D55); ``inst.info.launch_args`` is the very
             # same redaction, already computed.
@@ -3190,15 +3205,48 @@ class Supervisor:
     # Activity accounting (feeds TTL unloading and the Dashboard)
     # ------------------------------------------------------------------
 
-    def mark_request_start(self, model_id: str) -> None:
+    def mark_request_start(self, model_id: str, *, client: str | None = None) -> str | None:
+        """Count one request in, and describe it while it runs (D70, S6).
+
+        Returns the request's id -- hand it back to :meth:`mark_request_end`
+        so the right record leaves -- or ``None`` for an unknown model, which
+        is a no-op rather than an error. ``client`` is the label
+        :func:`~studioforge.core.attribution.client_of` resolved for the
+        request, or ``None`` for an in-process caller.
+
+        The record is a bounded window beside the unbounded count: past
+        ``IN_FLIGHT_RECORDS_MAX`` a request is counted but not described, so
+        a runaway queue cannot turn ``/api/status`` into a memory leak.
+        """
         inst = self._instances.get(model_id)
         if inst is None:
-            return
+            return None
+        now = time.time()
         inst.info.active_requests += 1
         inst.info.total_requests += 1
-        inst.info.last_activity_at = time.time()
+        inst.info.last_activity_at = now
+        request_id = uuid.uuid4().hex[:12]
+        if len(inst.info.in_flight) < IN_FLIGHT_RECORDS_MAX:
+            inst.info.in_flight.append(
+                InFlightRequest(id=request_id, started_at=now, client=client)
+            )
+        return request_id
 
-    def mark_request_end(self, model_id: str, *, tokens_per_second: float | None = None) -> None:
+    def mark_request_end(
+        self,
+        model_id: str,
+        *,
+        tokens_per_second: float | None = None,
+        request_id: str | None = None,
+    ) -> None:
+        """Count one request out, and forget its record -- always.
+
+        Every caller ends in a ``finally``, so this runs on success, error and
+        cancellation alike; the record must leave on all three or a stale
+        row would name a client that is long gone. ``request_id`` removes the
+        exact record; a caller without one (the older signature) leaves the
+        window to the invariant below, which trims from the oldest end.
+        """
         inst = self._instances.get(model_id)
         if inst is None:
             return
@@ -3206,3 +3254,13 @@ class Supervisor:
         inst.info.last_activity_at = time.time()
         if tokens_per_second is not None:
             inst.info.last_tokens_per_second = tokens_per_second
+        records = inst.info.in_flight
+        if request_id is not None:
+            for index, entry in enumerate(records):
+                if entry.id == request_id:
+                    del records[index]
+                    break
+        # Never more records than requests: the count is the leak-proof truth
+        # (every caller decrements in a finally), and the window follows it.
+        while len(records) > inst.info.active_requests:
+            del records[0]

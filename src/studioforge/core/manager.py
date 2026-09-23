@@ -3977,7 +3977,16 @@ class ModelManager:
             details={"leases": [lease_view(lease) for lease in held]},
         )
 
-    async def unload(self, name: str, *, deliberate: bool = True, force: bool = False) -> bool:
+    async def unload(
+        self,
+        name: str,
+        *,
+        deliberate: bool = True,
+        force: bool = False,
+        source: str | None = None,
+        client: str | None = None,
+        peer: str | None = None,
+    ) -> bool:
         """Stop the child serving ``name``; a deliberate unload sticks (D41).
 
         The stopped id is marked so the pin reconciler leaves it down: whoever
@@ -3997,6 +4006,16 @@ class ModelManager:
         (``deliberate=False``) is never guarded -- it only ever puts back what
         it took, and the lease grant's own eviction runs through the supervisor,
         not through here.
+
+        Every deliberate unload is logged with who asked (D70): ``source`` is
+        the entry point (``rest``, ``mcp``, ``gui``...; ``in-process`` when the
+        caller did not say), ``client`` the ``X-SF-Client`` label (else peer
+        address) the request carried, ``peer`` the address it came from, plus
+        ``active_requests`` and the in-flight clients at the moment of the
+        stop. WARNING when that count is above zero: this path does not drain,
+        so those requests are about to be cut -- on 2026-09-20 an explicit
+        unload cut six live streams and nothing recorded who called it. The
+        behaviour is unchanged; refusing a busy unload is a separate decision.
         """
         if deliberate and not force:
             self.require_lease_clear([name], f"to unload '{name}'")
@@ -4006,14 +4025,60 @@ class ModelManager:
             # An explicit unload also cancels a pending priority restore:
             # whoever called this wants the model DOWN, not down-for-a-moment.
             self._restore_entries.pop(model_id, None)
-        if self.supervisor.get(model_id) is None:
+        instance = self.supervisor.get(model_id)
+        if instance is None:
             return False
         if deliberate:
             self._pin_suppressed.add(model_id)
+            self._log_explicit_unload(
+                instance, source=source, client=client, peer=peer, force=force
+            )
         await self.supervisor.stop(model_id)
         return True
 
-    async def unload_all(self, *, force: bool = False) -> list[str]:
+    @staticmethod
+    def _log_explicit_unload(
+        instance: InstanceInfo,
+        *,
+        source: str | None,
+        client: str | None,
+        peer: str | None,
+        force: bool,
+        what: str = "explicit unload",
+    ) -> None:
+        """Who took a model down, and what it was doing at that moment (D70).
+
+        INFO for an idle model; WARNING when requests are in flight, because
+        ``supervisor.stop`` does not drain and they are about to be cut. The
+        event name is fixed per entry point (``explicit unload`` /
+        ``explicit unload-all``) so the log can be grepped for either.
+        """
+        active = int(instance.active_requests)
+        fields: dict[str, Any] = {
+            "model_id": instance.model_id,
+            "source": source or "in-process",
+            "client": client,
+            "peer": peer,
+            "force": force,
+            "active_requests": active,
+            "in_flight_clients": sorted(
+                {str(entry.client) for entry in instance.in_flight if entry.client}
+            ),
+            "loaded_by": instance.loaded_by,
+        }
+        if active > 0:
+            log.warning(f"{what} cuts live requests", **fields)
+        else:
+            log.info(what, **fields)
+
+    async def unload_all(
+        self,
+        *,
+        force: bool = False,
+        source: str | None = None,
+        client: str | None = None,
+        peer: str | None = None,
+    ) -> list[str]:
         """Stop every child. Pinned ones stay down until loaded or re-pinned (D41).
 
         Refused wholesale (409 ``lease_conflict``) when *any* resident is held by
@@ -4027,11 +4092,23 @@ class ModelManager:
         the ones that did go. Until 2026-09-09 this returned the pre-computed id
         list unconditionally and the route answered 200 for children still alive.
         """
-        ids = [i.model_id for i in self.supervisor.list()]
+        residents = list(self.supervisor.list())
+        ids = [i.model_id for i in residents]
         if not force:
             self.require_lease_clear(ids, "to unload every model")
         self._pin_suppressed.update(ids)
         self._restore_entries.clear()
+        for instance in residents:
+            # One line per resident (D70): the busy ones say what they are
+            # about to cut, and every line names the caller.
+            self._log_explicit_unload(
+                instance,
+                source=source,
+                client=client,
+                peer=peer,
+                force=force,
+                what="explicit unload-all",
+            )
         results = await self.supervisor.stop_all()
         unloaded = [model_id for model_id, failure in results.items() if failure is None]
         failed = {model_id: failure for model_id, failure in results.items() if failure is not None}
@@ -4988,6 +5065,14 @@ class ModelManager:
         -- the world changed between preview and gate -- leaves the resident
         child serving exactly as a refused forced reload always has, and a
         resident that vanished meanwhile is not reloaded cold.
+
+        A refusal is not the only failure. D30 plans before it unloads, so
+        a plan that no longer fits leaves the resident serving -- but a
+        launch that dies AFTER the stop leaves nothing serving, and until
+        D70 this path then logged "the model keeps its placement" over a
+        model that was down. That case now relaunches the previous plan on
+        the previous devices (:meth:`_restore_after_failed_rebalance`), and
+        says so truthfully when even that fails.
         """
         if self.leases.for_model(model_id) is not None:
             # Granted between the preview and now: the cards are its alone.
@@ -4995,6 +5080,9 @@ class ModelManager:
                 "rebalance skipped: the model was leased cards after the preview", model_id=model_id
             )
             return
+        # What the model was before the move: the plan to fall back to if the
+        # relaunch dies after the resident has already been stopped.
+        before = self.supervisor.get(model_id)
         try:
             instance = await self.load(
                 model_id,
@@ -5036,12 +5124,84 @@ class ModelManager:
                 model_id=model_id,
                 error=str(exc),
             )
-        except Exception as exc:  # noqa: BLE001 - the model keeps its old placement
-            log.warning(
-                "rebalance failed; the model keeps its placement",
+        except Exception as exc:  # noqa: BLE001 - a failed move must not end the sweep
+            if self.supervisor.get(model_id) is not None:
+                # Refused before the resident was stopped (the plan no longer
+                # fits, the world moved): it is still serving, so this is true.
+                log.warning(
+                    "rebalance failed; the model keeps its placement",
+                    model_id=model_id,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                return
+            await self._restore_after_failed_rebalance(model_id, before, reason, exc)
+
+    async def _restore_after_failed_rebalance(
+        self, model_id: str, before: InstanceInfo | None, reason: str, exc: BaseException
+    ) -> None:
+        """Bring a model back after a rebalance launch died (D70, item 10).
+
+        D30 plans before it unloads, which covers a refusal but not a launch
+        that crashes: on 2026-09-15 12:24 the D42 move of a 27B to [3, 2]
+        stopped the resident, the relaunch died at startup (0xC0000409), the
+        no-evict rule rightly declined to retry by evicting a bystander, and
+        the log said "the model keeps its placement" while the model was
+        down until its next JIT request. The safe completion is to relaunch
+        the PREVIOUS plan on the PREVIOUS devices with no eviction licence:
+        the only thing the move changed was the cards, and the old cards
+        were vacated by this very model moments ago. If that fails too the
+        model is down, and the log and the eviction book (``reason:
+        rebalance-failed``) say so instead of the opposite; the next JIT
+        request or the pin reconciler brings it back, as before.
+        """
+        error = f"{type(exc).__name__}: {exc}"
+        previous = before.plan if before is not None else None
+        if previous is None or not previous.devices:
+            log.error(
+                "rebalance failed and the model is DOWN; no previous placement to relaunch",
                 model_id=model_id,
-                error=str(exc),
+                error=error,
             )
+            self._record_eviction(model_id, reason="rebalance-failed", evicted_by="rebalance")
+            return
+        devices = list(previous.devices)
+        log.warning(
+            "rebalance launch failed; relaunching the previous placement",
+            model_id=model_id,
+            devices=devices,
+            reason=reason,
+            error=error,
+        )
+        try:
+            instance = await self.load(
+                model_id,
+                **reload_settings(previous),
+                devices=devices,
+                evict_busy=False,
+                allow_evict=False,
+                source="rebalance-restore",
+                priority=before.priority if before is not None else None,
+                hold_traffic=False,
+                enforce_parallel_cap=False,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as restore_exc:  # noqa: BLE001 - only the truth is left to report
+            log.error(
+                "rebalance failed and the relaunch of the previous placement failed too; "
+                "the model is DOWN until its next load",
+                model_id=model_id,
+                devices=devices,
+                error=f"{type(restore_exc).__name__}: {restore_exc}",
+            )
+            self._record_eviction(model_id, reason="rebalance-failed", evicted_by="rebalance")
+            return
+        log.info(
+            "rebalance rolled back; the model is back on its previous placement",
+            model_id=model_id,
+            devices=list(instance.plan.devices) if instance.plan else devices,
+            error=error,
+        )
 
     def _model_was_removed(self, model_id: str) -> bool:
         """True only when the registry has scanned and no longer knows ``model_id``.

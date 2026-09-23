@@ -714,7 +714,7 @@ def upstream(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
     sent: list[dict[str, Any]] = []
 
     async def fake_forward(
-        state: Any, record: Any, path: str, payload: dict[str, Any]
+        state: Any, record: Any, path: str, payload: dict[str, Any], **_kwargs: Any
     ) -> dict[str, Any]:
         sent.append(dict(payload))
         return {"id": "cmpl-test", "object": "chat.completion", "choices": []}
@@ -742,7 +742,12 @@ def test_streaming_chat_completions_resolves_loaded_too(
     seen: dict[str, Any] = {}
 
     async def fake_stream_upstream(
-        state: Any, record: Any, url: str, payload: dict[str, Any], started: float
+        state: Any,
+        record: Any,
+        url: str,
+        payload: dict[str, Any],
+        started: float,
+        **_kwargs: Any,
     ):
         seen["record_id"] = record.id
         seen["payload_model"] = payload.get("model")
@@ -870,7 +875,7 @@ def test_v1_tokenize_resolves_loaded_to_the_same_model_as_chat_completions(
     seen: dict[str, Any] = {}
 
     async def fake_forward(
-        state: Any, record: Any, path: str, payload: dict[str, Any]
+        state: Any, record: Any, path: str, payload: dict[str, Any], **_kwargs: Any
     ) -> dict[str, Any]:
         seen["record_id"] = record.id
         seen["path"] = path

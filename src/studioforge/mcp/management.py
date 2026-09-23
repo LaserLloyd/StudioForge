@@ -65,6 +65,7 @@ from mcp.server.mcpserver import MCPServer
 
 from studioforge import __version__
 from studioforge.api.auth import redact_config_dict
+from studioforge.build import build_id
 from studioforge.config import RESTART_REQUIRED_KEYS, Config, apply_overrides, load_config
 from studioforge.core import parallel_bench, throughput
 from studioforge.core.leases import lease_view
@@ -455,6 +456,9 @@ def _compact_instance(instance: Any) -> dict[str, Any]:
         # "gui", "autoload"... On a box several clients share, a model that
         # appeared without a requester is not a diagnosable event (D36).
         "loaded_by": instance.loaded_by,
+        # The client label behind that load (D70): the X-SF-Client header the
+        # loading request carried, else its peer address, else null.
+        "loaded_by_client": getattr(instance, "loaded_by_client", None),
         # The tier this instance was loaded at (D46): 1 active chat, 2
         # dispatched agent, 3 background. Read it beside `loaded_by` to see
         # who would win the cards, and to know which side of a
@@ -470,6 +474,13 @@ def _compact_instance(instance: Any) -> dict[str, Any]:
             round(instance.ttl_remaining_s) if instance.ttl_remaining_s is not None else None
         ),
         "active_requests": instance.active_requests,
+        # The requests behind that count, oldest first (D70, S6): `id`,
+        # `started_at` and `client`, so a bench can tell a two-second call
+        # from a forty-minute stream, and whose it is. A bounded window that
+        # is never longer than the count.
+        "in_flight": [
+            entry.model_dump(mode="json") for entry in (getattr(instance, "in_flight", None) or [])
+        ],
         "total_requests": instance.total_requests,
         "last_tokens_per_second": instance.last_tokens_per_second,
         "last_error": instance.last_error,
@@ -1440,7 +1451,10 @@ def build_management_mcp(state: Any) -> MCPServer:
         # admin by the same test the unload route applies. Without it the D55
         # lease guard would refuse the operator's own `sfctl unload` of a
         # benchmark's model, which is exactly the person entitled to do it.
-        unloaded = await state.manager.unload(model_id, force=True)
+        # ``source``: the manager logs every explicit unload with its entry
+        # point and what the model was serving (D70); an MCP call has no peer
+        # address or X-SF-Client header to add, the PIN gate is its identity.
+        unloaded = await state.manager.unload(model_id, force=True, source="mcp")
         return {"ok": True, "model_id": model_id, "unloaded": unloaded}
 
     @_guard
@@ -2095,6 +2109,9 @@ def build_management_mcp(state: Any) -> MCPServer:
         return {
             "ok": True,
             "version": status.version,
+            # The commit this server runs from (D70); `version` is the last
+            # release, which a server past its tag still reports.
+            "build": build_id(),
             "uptime_s": round(status.uptime_s, 1),
             "gpus": [_compact_gpu(g) for g in status.gpus],
             "loaded": loaded,

@@ -345,6 +345,34 @@ def fmt_duration(seconds: Any) -> str:
     return f"{days}d{hours:02d}h"
 
 
+def in_flight_cells(instance: dict[str, Any]) -> tuple[str, str]:
+    """The `Client` and `Started` cells of one resident row (D70).
+
+    Busy: the distinct client labels of the requests in flight, oldest
+    first, and how long the oldest has been running -- what a co-tenant
+    needs to wait for a two-second call and stand down for a forty-minute
+    stream. Idle: who loaded the model, marked as such, and no start. A
+    server older than D70 sends neither field and gets a dash in both.
+    """
+    records = instance.get("in_flight")
+    if isinstance(records, list) and records:
+        labels: list[str] = []
+        oldest: float | None = None
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            label = str(record.get("client") or "?")
+            if label not in labels:
+                labels.append(label)
+            started = record.get("started_at")
+            if isinstance(started, (int, float)) and (oldest is None or started < oldest):
+                oldest = float(started)
+        started_cell = fmt_duration(time.time() - oldest) if oldest is not None else "-"
+        return ", ".join(labels) or "-", started_cell
+    loader = instance.get("loaded_by_client")
+    return (f"loaded by {loader}" if loader else "-"), "-"
+
+
 def fmt_bool(value: Any) -> str:
     return "yes" if value else "-"
 
@@ -478,14 +506,28 @@ def status(json_out: bool = JSON_OPTION) -> None:
         # `Prio` sits beside `TTL left` because they are one policy: the tier
         # is what `models.ttl_by_priority` looks the countdown up by (D48), and
         # it is also what decides whose load holds off whose.
+        # `Client` and `Started` read the D70 in-flight records: who is on the
+        # model right now and how long the oldest request has been running.
+        # An idle row names who loaded the model instead.
         table = _table(
-            "Model", "State", "Ctx", "Port", "PID", "Prio", "TTL left", "Active", "tok/s"
+            "Model",
+            "State",
+            "Ctx",
+            "Port",
+            "PID",
+            "Prio",
+            "TTL left",
+            "Active",
+            "Client",
+            "Started",
+            "tok/s",
         )
         for instance in loaded:
             plan = instance.get("plan") or {}
             model_id = str(instance.get("model_id"))
             ttl = ttl_by_model.get(model_id, instance.get("ttl_s"))
             tps = instance.get("last_tokens_per_second")
+            client_cell, started_cell = in_flight_cells(instance)
             table.add_row(
                 model_id,
                 str(instance.get("state")),
@@ -495,6 +537,8 @@ def status(json_out: bool = JSON_OPTION) -> None:
                 fmt_priority(instance.get("priority")),
                 "pinned" if not instance.get("ttl_s") else fmt_duration(ttl),
                 str(instance.get("active_requests") or 0),
+                client_cell,
+                started_cell,
                 f"{tps:.1f}" if isinstance(tps, (int, float)) else "-",
             )
         console.print(table)
@@ -524,6 +568,10 @@ def status(json_out: bool = JSON_OPTION) -> None:
     engine = payload.get("engine") or {}
     summary = _table("Field", "Value", title="Server")
     summary.add_row("version", str(payload.get("version", "?")))
+    if payload.get("build"):
+        # The commit the server runs from (D70). Older servers do not send
+        # it, and a missing row says less than a wrong one would.
+        summary.add_row("build", str(payload["build"]))
     summary.add_row("uptime", fmt_duration(payload.get("uptime_s")))
     summary.add_row("engine", str(engine.get("tag") or "not installed"))
     summary.add_row("models in registry", str(payload.get("model_count", 0)))
