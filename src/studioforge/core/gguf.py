@@ -75,7 +75,10 @@ GGUF_MAGIC_SWAPPED: Final = b"FUGG"  # big-endian writers emit the magic reverse
 #:
 #: 1 -> 2: full_attention_interval, ssm.*, nextn_predict_layers, and
 #:         head_count_kv_values for non-iSWA per-layer arrays.
-META_FORMAT_VERSION: Final = 2
+#: 2 -> 3: sliding_window without a pattern, per-layer head_count values,
+#:         leading_dense_block_count and the MLA keys -- captured for a later
+#:         sizing change; nothing reads them yet (D69 §13).
+META_FORMAT_VERSION: Final = 3
 
 DEFAULT_ALIGNMENT: Final = 32
 
@@ -1324,6 +1327,50 @@ def meta_from_gguf(
     nextn = _as_int(kv.get(f"{prefix}nextn_predict_layers"))
     if nextn:
         extra["nextn_predict_layers"] = int(nextn)
+
+    # Captured for a later sizing change and read by nothing yet (D69 §13).
+    # How llama.cpp sizes the KV cache for these shapes is unverified here, so
+    # the planner keeps charging them the uniform full-attention cache, which
+    # errs toward refusing:
+    #
+    # * ``attention.sliding_window`` with no ``sliding_window_pattern``
+    #   (laguna: a 512-token window and no pattern key). Whether upstream
+    #   windows every layer of such an arch is exactly the unverified part,
+    #   so the window is kept under its own name; ``swa_window``, which the
+    #   planner does read, still requires the pattern.
+    # * a per-layer ``attention.head_count`` array (laguna alternates 48/72).
+    # * ``leading_dense_block_count``: the first N blocks of a DeepSeek-style
+    #   MoE are dense.
+    # * MLA (DeepSeek2/3, Kimi, GLM-DSA): ``kv_lora_rank``, ``q_lora_rank``,
+    #   ``key_length_mla``, ``value_length_mla``, and the rope dimension the
+    #   latent cache is sized with. Such a model is charged full GQA KV today.
+    if swa_window:
+        extra["sliding_window"] = int(swa_window)
+    raw_heads: Any = kv.get(f"{prefix}attention.head_count")
+    heads_len = array_len(raw_heads)
+    if heads_len is not None:
+        extra["head_count_len"] = heads_len
+        if _is_array_descriptor(raw_heads) and "values" not in dict(raw_heads):
+            extra["head_count_truncated"] = True
+        head_values = _array_items(raw_heads)
+        if head_values:
+            extra["head_count_values"] = [int(x) for x in head_values]
+    leading_dense = _as_int(kv.get(f"{prefix}leading_dense_block_count"))
+    if leading_dense is not None:
+        extra["leading_dense_block_count"] = int(leading_dense)
+    for suffix, name in (
+        ("attention.kv_lora_rank", "kv_lora_rank"),
+        ("attention.q_lora_rank", "q_lora_rank"),
+        ("attention.key_length_mla", "key_length_mla"),
+        ("attention.value_length_mla", "value_length_mla"),
+    ):
+        value = _as_int(kv.get(f"{prefix}{suffix}"))
+        if value is not None:
+            extra[name] = int(value)
+    if "kv_lora_rank" in extra:
+        rope_dims = _as_int(kv.get(f"{prefix}rope.dimension_count"))
+        if rope_dims is not None:
+            extra["rope_dimension_count"] = int(rope_dims)
 
     n_vocab = array_len(kv.get("tokenizer.ggml.tokens"))
     if n_vocab is None:

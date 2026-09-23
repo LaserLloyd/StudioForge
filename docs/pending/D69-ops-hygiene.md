@@ -153,3 +153,43 @@ model hits this today. A new architecture, or a conversion that dropped keys, wo
   `attention.key_length`, with no `0.00 GiB` in the message and `fits_on` returning `None`;
 - a metadata-less record is refused the same way. The existing
   `test_rejection_without_metadata_still_reports_a_size` still passes.
+
+### §13 — The parser keeps laguna's window and the MLA keys (capture only)
+
+**Evidence.** laguna (`Laguna-S-2.1`) declares `attention.sliding_window = 512` with no
+`sliding_window_pattern`. It also has a per-layer `attention.head_count` array and
+`leading_dense_block_count = 1`. The parser required the pattern before it kept the window, collapsed
+the head array to its maximum, and dropped the rest. MLA models (DeepSeek2/3, Kimi, GLM-DSA) declare
+`attention.kv_lora_rank` and related keys, and none of them was kept. None of this data would be
+there when someone checks the sizing rule against upstream.
+
+**Change** (`core/gguf.py`, inside `meta_from_gguf` and the version constant only). `GgufMeta.extra`
+gains these keys:
+- `sliding_window`, whenever the key exists, pattern or not;
+- `head_count_values`, `head_count_len` and, when the array arrived truncated, `head_count_truncated`,
+  for a per-layer `attention.head_count`;
+- `leading_dense_block_count`;
+- `kv_lora_rank`, `q_lora_rank`, `key_length_mla`, `value_length_mla`, and `rope_dimension_count`
+  when `kv_lora_rank` is present.
+
+Nothing reads them. The planner's iSWA keys (`swa_window`, `swa_pattern`) still require the pattern,
+so every KV number is unchanged, byte for byte: the tests compare each shape's allocation with and
+without the new keys. Upstream's semantics for laguna are unverified, so this change does not alter
+the sizing rule.
+
+`META_FORMAT_VERSION` 2 → 3, so every registered model re-parses its header on the first scan after
+the deploy (the boot scan runs in the background, D33). The remote-header cache in `hf_meta`
+re-fetches on the next browse for the same reason.
+
+A read-only parse of the real `Laguna-S-2.1…Q3_K_S.gguf` with this parser gives `sliding_window 512`,
+`leading_dense_block_count 1` and `head_count_values` of length 48 in a 48, 72, 72, 72 repeat (one
+48-head layer in four). That is the data the later check needs. The planner still charges 48 uniform
+full layers: 24,576 MiB at 131,072 f16.
+
+**Tests.** `tests/unit/test_gguf_capture.py`:
+- the version bump;
+- a laguna-shaped header keeps the window, the head values and the dense prefix, gains no
+  `swa_*` keys, and sizes exactly as without the new keys;
+- a DeepSeek2-shaped MLA header keeps all five MLA keys, with unchanged sizing;
+- an iSWA header keeps both `swa_window` and the raw `sliding_window`, with unchanged sizing;
+- a plain llama with `rope.dimension_count` gains none of the new keys.
