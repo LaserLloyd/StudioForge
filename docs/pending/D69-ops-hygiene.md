@@ -339,8 +339,9 @@ routes' `should_exit`, Ctrl+C, SIGTERM.
   tasks on the shared manager, not as requests on this server.
 
 One INFO line records the decision (`draining connections before exit server=… inference_in_flight=…
-drain_s=…`). Nothing else in the restart path changed: the manager's own drain, the exit codes, the
-handover and the watchdog adoption are untouched.
+drain_s=…`). If anything in the decision fails, uvicorn keeps the configured drain, so the
+optimisation can never break a shutdown. Nothing else in the restart path changed: the manager's own
+drain, the exit codes, the handover and the watchdog adoption are untouched.
 
 **Why not close the MCP sessions explicitly.** Terminating them before the drain would need the MCP
 SDK's private `StreamableHTTPSessionManager._server_instances` inside the one code path where a
@@ -353,6 +354,7 @@ re-initialise (the 11 `Rejected request with unknown or expired session ID` line
 - the in-flight count, where unknown means busy;
 - the decision per case: idle 2, streaming 30, unknown 30;
 - the full drain is read live, and an operator's 0 is honoured;
+- a decision that raises keeps the configured drain;
 - `_serve` builds both servers with their rules;
 - **a real uvicorn server** on an ephemeral loopback port holding an endless streaming response: an
   idle shutdown returns in under 1.5 s against a 3 s configured drain, and a shutdown with inference in

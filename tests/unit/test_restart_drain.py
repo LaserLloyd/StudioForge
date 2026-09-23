@@ -95,6 +95,30 @@ async def test_the_full_drain_is_read_live_and_never_exceeded_by_the_idle_one(
     assert seen == [45, 0]
 
 
+async def test_a_failing_decision_keeps_the_configured_drain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The restart path must never fail on its own optimisation."""
+    seen: list[Any] = []
+
+    async def base_shutdown(self: uvicorn.Server, sockets: Any = None) -> None:
+        seen.append(self.config.timeout_graceful_shutdown)
+
+    def broken() -> float:
+        raise RuntimeError("config mid-reload")
+
+    monkeypatch.setattr(uvicorn.Server, "shutdown", base_shutdown)
+    server = cli._draining_server_class()(
+        uvicorn.Config(app=lambda *_a: None, timeout_graceful_shutdown=30, log_config=None),
+        name="api",
+        full_drain_s=broken,
+        in_flight=lambda: 0,
+    )
+    await server.shutdown()
+    assert seen == [30]
+    assert server.drain_s is None
+
+
 def test_serve_builds_both_servers_with_the_right_in_flight_rule() -> None:
     source = inspect.getsource(cli._serve)
     assert source.count("draining_server(") == 2

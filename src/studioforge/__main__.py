@@ -284,12 +284,14 @@ def _draining_server_class() -> Any:
             self.drain_s: int | None = None
 
         async def shutdown(self, sockets: Any = None) -> None:
-            busy = self._in_flight()
-            full = max(0, int(self._full_drain_s()))
-            drain = full if busy is None or busy > 0 else min(IDLE_DRAIN_S, full)
-            self.drain_s = drain
-            self.config.timeout_graceful_shutdown = drain
-            with contextlib.suppress(Exception):  # a log line must not stop a shutdown
+            # The decision is an optimisation and the shutdown is not: if
+            # anything in it fails, uvicorn keeps the configured drain.
+            with contextlib.suppress(Exception):
+                busy = self._in_flight()
+                full = max(0, int(self._full_drain_s()))
+                drain = full if busy is None or busy > 0 else min(IDLE_DRAIN_S, full)
+                self.config.timeout_graceful_shutdown = drain
+                self.drain_s = drain
                 log.info(
                     "draining connections before exit",
                     server=self.drain_name,
