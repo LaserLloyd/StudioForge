@@ -542,3 +542,15 @@ def test_the_chat_tab_renders_with_the_loaded_model_named(tmp_path: Path) -> Non
     assert response.status_code == 200
     assert "(Loaded model) — pub/repo/loaded-model" in response.text
     assert "Quick tests" in response.text
+
+
+def test_an_explicit_pick_the_engine_cannot_load_does_not_promise_a_load() -> None:
+    records = [rec("ok"), rec("k2")]
+    pick = st.chat_pick(
+        records,
+        [],
+        choice="k2",
+        unloadable=lambda r: "unsupported architecture" if r.id == "k2" else None,
+    )
+    assert pick.model_id == "k2"
+    assert pick.reason == "picked · this engine cannot load it"

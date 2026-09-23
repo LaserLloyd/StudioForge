@@ -3171,6 +3171,10 @@ def chat_pick(
             "failed": "picked · its last start failed; Send or Load retries it",
             "not_loaded": "picked · not loaded; Send or Load loads it at the chat tier",
         }
+        reason = reasons.get(state, "picked")
+        if state != "ready" and unloadable is not None and unloadable(chat[choice]):
+            # The card shows why underneath; this line must not promise a load.
+            reason = "picked · this engine cannot load it"
         return ChatPick(
             choice=choice,
             model_id=choice,
@@ -3178,7 +3182,7 @@ def chat_pick(
             follows_loaded=False,
             loaded_id=loaded_id,
             other_loaded=others,
-            reason=reasons.get(state, "picked"),
+            reason=reason,
         )
 
     if loaded_id is not None:
