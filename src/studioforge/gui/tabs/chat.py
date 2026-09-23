@@ -709,7 +709,7 @@ async def _stream(
     content: list[str] = []
     reasoning: list[str] = []
     painted_at = 0.0
-    ctx.supervisor.mark_request_start(serving_id)
+    request_id = ctx.supervisor.mark_request_start(serving_id, client="gui:chat")
     try:
         # Loopback plain HTTP: skipping the TLS context (certifi load) and proxy
         # discovery keeps ~0.15 s of client setup out of the measured total.
@@ -771,6 +771,7 @@ async def _stream(
             rate = result.timings.get("predicted_per_second")
         ctx.supervisor.mark_request_end(
             serving_id,
+            request_id=request_id,
             tokens_per_second=round(float(rate), 2)
             if isinstance(rate, int | float) and rate > 0
             else st.tokens_per_second(max(0, result.chunks - 1), elapsed),

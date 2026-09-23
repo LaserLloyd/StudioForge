@@ -452,6 +452,9 @@ def _compact_instance(instance: Any) -> dict[str, Any]:
         # "gui", "autoload"... On a box several clients share, a model that
         # appeared without a requester is not a diagnosable event (D36).
         "loaded_by": instance.loaded_by,
+        # The client label behind that load (D70): the X-SF-Client header the
+        # loading request carried, else its peer address, else null.
+        "loaded_by_client": getattr(instance, "loaded_by_client", None),
         # The tier this instance was loaded at (D46): 1 active chat, 2
         # dispatched agent, 3 background. Read it beside `loaded_by` to see
         # who would win the cards, and to know which side of a
@@ -467,6 +470,13 @@ def _compact_instance(instance: Any) -> dict[str, Any]:
             round(instance.ttl_remaining_s) if instance.ttl_remaining_s is not None else None
         ),
         "active_requests": instance.active_requests,
+        # The requests behind that count, oldest first (D70, S6): `id`,
+        # `started_at` and `client`, so a bench can tell a two-second call
+        # from a forty-minute stream, and whose it is. A bounded window that
+        # is never longer than the count.
+        "in_flight": [
+            entry.model_dump(mode="json") for entry in (getattr(instance, "in_flight", None) or [])
+        ],
         "total_requests": instance.total_requests,
         "last_tokens_per_second": instance.last_tokens_per_second,
         "last_error": instance.last_error,

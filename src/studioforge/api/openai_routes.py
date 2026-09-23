@@ -27,6 +27,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from studioforge.api.vision import prepare_messages
+from studioforge.core.attribution import attributed_source, client_of
 from studioforge.core.model_gate import approx_params_b
 from studioforge.core.planner import BUSY_RETRY_AFTER_S
 from studioforge.core.priority import normalise_priority
@@ -260,6 +261,9 @@ async def chat_completions(request: Request) -> Any:
     # from here down (load, URL, request accounting) keys off `serving`.
     serving = state.manager.serving_record(record)
     _note_client(state, request, serving.id)
+    # The X-SF-Client label (else the peer address) rides on the load's
+    # ``source`` and on the in-flight record for this request (D70).
+    client = client_of(request)
 
     if payload.get("stream"):
         # The D46 hold check runs BEFORE the 200 and the SSE stream begin: a
@@ -276,16 +280,16 @@ async def chat_completions(request: Request) -> Any:
         # Load inside the stream so a multi-minute cold start is covered by
         # keep-alive comments rather than silence.
         return StreamingResponse(
-            _stream_with_jit_load(state, serving, payload, ttl_override, priority),
+            _stream_with_jit_load(state, serving, payload, ttl_override, priority, client=client),
             media_type="text/event-stream",
             headers=SSE_HEADERS,
         )
 
     await state.manager.ensure_loaded(
-        serving.id, source="jit:/v1/chat/completions", priority=priority
+        serving.id, source=attributed_source("jit:/v1/chat/completions", client), priority=priority
     )
     _apply_ttl_override(state, serving.id, ttl_override)
-    return await _forward(state, serving, "/v1/chat/completions", payload)
+    return await _forward(state, serving, "/v1/chat/completions", payload, client=client)
 
 
 def _resolve_or_404(state: Any, name: str) -> ModelRecord:
@@ -301,6 +305,7 @@ async def _stream_with_jit_load(
     payload: dict[str, Any],
     ttl_override: int | None,
     priority: int | None = None,
+    client: str | None = None,
 ) -> AsyncIterator[bytes]:
     """Emit SSE keep-alives while a model loads, then proxy the real stream.
 
@@ -313,9 +318,16 @@ async def _stream_with_jit_load(
     ``priority`` is the request's own tier (D48), forwarded so the load this
     turn triggers is queued and placed at that tier. It gates the load, not the
     resident: a model already serving is never re-tiered from here.
+
+    ``client`` is the request's attribution (D70): it rides on the load's
+    ``source`` and on the in-flight record of the stream that follows.
     """
     loader = asyncio.ensure_future(
-        state.manager.ensure_loaded(record.id, source="jit:/v1/chat/completions", priority=priority)
+        state.manager.ensure_loaded(
+            record.id,
+            source=attributed_source("jit:/v1/chat/completions", client),
+            priority=priority,
+        )
     )
     # If the client disconnects mid-load this generator is closed while the task
     # is still running. The load is deliberately NOT cancelled -- the model will
@@ -375,7 +387,7 @@ async def _stream_with_jit_load(
 
     started = time.perf_counter()
     async for chunk in _stream_upstream(
-        state, record, f"{base}/v1/chat/completions", payload, started
+        state, record, f"{base}/v1/chat/completions", payload, started, client=client
     ):
         yield chunk
 
@@ -418,9 +430,12 @@ async def completions(request: Request) -> Any:
         record.preset.apply_to_payload(payload, chat=False)
     serving = state.manager.serving_record(record)
     _note_client(state, request, serving.id)
-    await state.manager.ensure_loaded(serving.id, source="jit:/v1/completions", priority=priority)
+    client = client_of(request)
+    await state.manager.ensure_loaded(
+        serving.id, source=attributed_source("jit:/v1/completions", client), priority=priority
+    )
     _apply_ttl_override(state, serving.id, ttl_override)
-    return await _forward(state, serving, "/v1/completions", payload)
+    return await _forward(state, serving, "/v1/completions", payload, client=client)
 
 
 @router.post("/v1/embeddings")
@@ -451,8 +466,11 @@ async def embeddings(request: Request) -> Any:
         raise BadRequestError("'input' is required", param="input")
     serving = state.manager.serving_record(record)
     _note_client(state, request, serving.id)
-    await state.manager.ensure_loaded(serving.id, source="jit:/v1/embeddings")
-    return await _forward(state, serving, "/v1/embeddings", payload)
+    client = client_of(request)
+    await state.manager.ensure_loaded(
+        serving.id, source=attributed_source("jit:/v1/embeddings", client)
+    )
+    return await _forward(state, serving, "/v1/embeddings", payload, client=client)
 
 
 @router.post("/v1/rerank")
@@ -468,8 +486,11 @@ async def rerank(request: Request) -> Any:
     payload["model"] = record.id
     serving = state.manager.serving_record(record)
     _note_client(state, request, serving.id)
-    await state.manager.ensure_loaded(serving.id, source="jit:/v1/rerank")
-    return await _forward(state, serving, "/v1/rerank", payload)
+    client = client_of(request)
+    await state.manager.ensure_loaded(
+        serving.id, source=attributed_source("jit:/v1/rerank", client)
+    )
+    return await _forward(state, serving, "/v1/rerank", payload, client=client)
 
 
 @router.post("/v1/tokenize")
@@ -483,8 +504,11 @@ async def tokenize(request: Request) -> Any:
     record = _resolve_or_404(state, model_name)
     serving = state.manager.serving_record(record)
     _note_client(state, request, serving.id)
-    await state.manager.ensure_loaded(serving.id, source="jit:/v1/tokenize")
-    return await _forward(state, serving, "/tokenize", dict(body))
+    client = client_of(request)
+    await state.manager.ensure_loaded(
+        serving.id, source=attributed_source("jit:/v1/tokenize", client)
+    )
+    return await _forward(state, serving, "/tokenize", dict(body), client=client)
 
 
 # ---------------------------------------------------------------------------
@@ -830,7 +854,14 @@ def _validate_response_format(payload: dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _forward(state: Any, record: ModelRecord, path: str, payload: dict[str, Any]) -> Any:
+async def _forward(
+    state: Any,
+    record: ModelRecord,
+    path: str,
+    payload: dict[str, Any],
+    *,
+    client: str | None = None,
+) -> Any:
     base = state.supervisor.base_url(record.id)
     if base is None:
         raise UpstreamError(f"model '{record.id}' is not serving")
@@ -845,7 +876,7 @@ async def _forward(state: Any, record: ModelRecord, path: str, payload: dict[str
         # before the response body is first iterated -- StreamingResponse does
         # not start the generator until then.
         return StreamingResponse(
-            _stream_upstream(state, record, url, payload, started),
+            _stream_upstream(state, record, url, payload, started, client=client),
             media_type="text/event-stream",
             headers=SSE_HEADERS,
         )
@@ -855,7 +886,7 @@ async def _forward(state: Any, record: ModelRecord, path: str, payload: dict[str
     # outside the httpx hierarchy left active_requests stuck at 1 -- which
     # blocks TTL unload and eviction for that model until a restart. The
     # streaming path has had this discipline for a while; this is its twin.
-    state.supervisor.mark_request_start(record.id)
+    request_id = state.supervisor.mark_request_start(record.id, client=client)
     tps: float | None = None
     try:
         try:
@@ -890,7 +921,7 @@ async def _forward(state: Any, record: ModelRecord, path: str, payload: dict[str
             )
         data = response.json()
     finally:
-        state.supervisor.mark_request_end(record.id, tokens_per_second=tps)
+        state.supervisor.mark_request_end(record.id, tokens_per_second=tps, request_id=request_id)
 
     if state.config.gateway.merge_reasoning_into_content:
         _merge_reasoning(data, record.id)
@@ -933,7 +964,13 @@ def _merge_reasoning(data: Any, model_id: str) -> None:
 
 
 async def _stream_upstream(
-    state: Any, record: ModelRecord, url: str, payload: dict[str, Any], started: float
+    state: Any,
+    record: ModelRecord,
+    url: str,
+    payload: dict[str, Any],
+    started: float,
+    *,
+    client: str | None = None,
 ) -> AsyncIterator[bytes]:
     """Pass SSE through verbatim, and never leave the stream unterminated.
 
@@ -948,7 +985,7 @@ async def _stream_upstream(
     #: at function scope so the finally can cancel it if the client disconnects
     #: mid-prefill -- an orphaned read task would hold the httpx stream open.
     first: asyncio.Task[bytes] | None = None
-    state.supervisor.mark_request_start(record.id)
+    request_id = state.supervisor.mark_request_start(record.id, client=client)
     try:
         async with state.client.stream(
             "POST", url, json=payload, timeout=state.config.server.request_timeout_s
@@ -1040,7 +1077,7 @@ async def _stream_upstream(
         # model: a one-client hang-up would pin VRAM until restart.
         elapsed = time.perf_counter() - started
         tps = round(completion_tokens / elapsed, 2) if elapsed > 0 and completion_tokens else None
-        state.supervisor.mark_request_end(record.id, tokens_per_second=tps)
+        state.supervisor.mark_request_end(record.id, tokens_per_second=tps, request_id=request_id)
         # Only terminate the stream if there is still a client to terminate it
         # for. Yielding during a GeneratorExit unwind raises RuntimeError.
         if not sent_done and not closing:

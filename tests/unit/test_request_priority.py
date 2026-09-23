@@ -81,7 +81,7 @@ def upstream(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
     sent: list[dict[str, Any]] = []
 
     async def fake_forward(
-        state: Any, record: Any, path: str, payload: dict[str, Any]
+        state: Any, record: Any, path: str, payload: dict[str, Any], **_kwargs: Any
     ) -> dict[str, Any]:
         sent.append(dict(payload))
         return {"id": "cmpl-test", "object": "chat.completion", "choices": []}

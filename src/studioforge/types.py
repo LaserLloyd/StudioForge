@@ -1027,6 +1027,22 @@ class EffectiveLaunch(BaseModel):
         }
 
 
+class InFlightRequest(BaseModel):
+    """One inference request in flight against an instance (D70, S6).
+
+    ``active_requests`` is a bare count: it says six streams are running and
+    nothing about whether they are two-second calls or forty-minute stories,
+    or whose they are -- which is what a bench that wants to wait politely,
+    and the log line that names who cut them, both need. ``client`` is the
+    ``X-SF-Client`` label when the caller sent one, else its peer address,
+    else ``None`` for an in-process caller.
+    """
+
+    id: str
+    started_at: float
+    client: str | None = None
+
+
 class InstanceInfo(BaseModel):
     """Public view of a loaded llama-server child."""
 
@@ -1085,6 +1101,19 @@ class InstanceInfo(BaseModel):
     #: event without a requester, and the 2026-08-19 log review could not tell
     #: an OpenClaw load from the GUI's (D36).
     loaded_by: str | None = None
+    #: The client label behind ``loaded_by`` (D70, X2): the ``X-SF-Client``
+    #: header the loading request carried, else its peer address, else
+    #: ``None`` -- an MCP tool, the GUI or the reconciler. ``loaded_by`` keeps
+    #: its route literal in front (``jit:/v1/chat/completions (clawchat)``),
+    #: so a reader matching on the prefix is unaffected; this is the label
+    #: alone for the readers that want it without parsing.
+    loaded_by_client: str | None = None
+    #: The requests in flight right now, oldest first (D70, S6): ``id``,
+    #: ``started_at`` and ``client``. A bounded window beside the unbounded
+    #: ``active_requests`` count -- never longer than the count, capped at
+    #: ``supervisor.IN_FLIGHT_RECORDS_MAX`` -- and every record leaves when its
+    #: request ends, however it ends.
+    in_flight: list[InFlightRequest] = Field(default_factory=list)
     #: Load-priority tier (D46): 1 = the active chat model, 2 = a dispatched
     #: agent, 3 = background. Lower outranks higher when models compete for
     #: VRAM; a load that never said is background, so every pre-D46 instance

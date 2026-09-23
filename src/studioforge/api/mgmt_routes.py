@@ -28,6 +28,7 @@ from studioforge.api.auth import (
 from studioforge.build import build_id
 from studioforge.config import RESTART_REQUIRED_KEYS, apply_overrides
 from studioforge.core import parallel_bench
+from studioforge.core.attribution import attributed_source, client_of
 from studioforge.core.benchmark import (
     DEFAULT_CTX_SIZE,
     DEFAULT_MAX_TOKENS,
@@ -161,6 +162,13 @@ async def status(request: Request) -> dict[str, Any]:
 
     ``busy.priority_hold`` alongside says whether a chat/agent load is
     currently holding worse-tier traffic off.
+
+    ``in_flight`` on each row lists the requests behind ``active_requests``,
+    oldest first, as ``{id, started_at, client}`` (D70, S6) -- a bounded
+    window, never longer than the count -- and ``loaded_by_client`` is the
+    ``X-SF-Client`` label (else peer address) behind ``loaded_by``. A bench
+    that wants to wait for a two-second call and stand down for a
+    forty-minute stream reads the first; "who loaded that?" reads the second.
     """
     state = _state(request)
     engine = state.engine_manager.active()
@@ -896,7 +904,7 @@ async def load_model(
         devices=devices,
         allowed_devices=allowed_devices,
         force=force,
-        source="api:/api/models/{id}/load",
+        source=attributed_source("api:/api/models/{id}/load", client_of(request)),
         priority=priority,
     )
     return instance.model_dump(mode="json")
@@ -1034,7 +1042,7 @@ async def load_recommended(
         max_slots=max_slots,
         allowed_devices=allowed_devices,
         persist=persist,
-        source="api:/api/models/{id}/load-recommended",
+        source=attributed_source("api:/api/models/{id}/load-recommended", client_of(request)),
         priority=priority,
     )
     return instance.model_dump(mode="json")

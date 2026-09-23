@@ -37,17 +37,30 @@ class CountingSupervisor:
         self.starts = 0
         self.ends = 0
         self.instances: dict[str, InstanceInfo] = {}
+        # D70: the client label each start carried, and the request id each
+        # end handed back, so attribution and record removal are observable.
+        self.clients: list[str | None] = []
+        self.ended: list[str | None] = []
 
-    def mark_request_start(self, model_id: str) -> None:
+    def mark_request_start(self, model_id: str, *, client: str | None = None) -> str | None:
         self.starts += 1
         self.active += 1
+        self.clients.append(client)
         instance = self.instances.get(model_id)
         if instance is not None:
             instance.active_requests += 1
+        return f"req-{self.starts}"
 
-    def mark_request_end(self, model_id: str, *, tokens_per_second: float | None = None) -> None:
+    def mark_request_end(
+        self,
+        model_id: str,
+        *,
+        tokens_per_second: float | None = None,
+        request_id: str | None = None,
+    ) -> None:
         self.ends += 1
         self.active -= 1
+        self.ended.append(request_id)
         instance = self.instances.get(model_id)
         if instance is not None:
             instance.active_requests = max(0, instance.active_requests - 1)
