@@ -2,7 +2,7 @@
    tools/sync_theme.py. Do not edit this copy: change the package (src/,
    adapters/, apps/studioforge.json) and run `python tools/sync_theme.py app studioforge`.
    themes: purple, midnight-gold, glacier, forest, paper, daylight, night-red | default: glacier
-   body sha256: 423d6a4fc2526e85 */
+   body sha256: 13c91a073834d6dd */
 /* ==========================================================================
    C. THEME-AGNOSTIC LAYER
    ========================================================================== */
@@ -144,3 +144,147 @@ input[type="range"], input[type="checkbox"], input[type="radio"], progress {
 .hljs-addition { color: var(--syn-addition); background: var(--diff-add-bg); }
 .hljs-emphasis { font-style: italic; }
 .hljs-strong { font-weight: var(--fw-bold); }
+
+/* ============================================================================
+   text.css — THE TEXT STANDARD (see TEXT.md). Theme-agnostic.
+   ----------------------------------------------------------------------------
+   Every colour here is a contract token, so the rules follow whichever theme
+   is active. sync_theme.py appends this file to each app's base layer
+   (ui-theme-base.css), which loads before the app's own CSS. Rules are one
+   class plus an element (0-1-1): enough to beat the base layer's own bare
+   element rules (h1-h4 { margin: 0 }, a { ... }), while an app rule of the
+   same shape, such as ClawChat's .md-content strong, loads later and wins.
+
+   This file never names a slug and never holds a colour literal.
+   ============================================================================ */
+
+/* ---- Text roles -------------------------------------------------------------
+   One class per tier. Use a tier, never opacity, to make text quieter:
+   opacity multiplies the theme's own colour, which still leaves about 6:1 in
+   the dark core themes but takes Night Red's body text to 2.9:1. */
+
+.ui-text-primary   { color: var(--text-primary); }
+.ui-text-secondary { color: var(--text-secondary); }
+.ui-text-tertiary  { color: var(--text-tertiary); }
+.ui-text-disabled  { color: var(--text-disabled); }
+.ui-text-link      { color: var(--text-link); }
+
+/* ---- Markdown ---------------------------------------------------------------
+   Rendered prose: chat replies, notes, previews. Put .ui-markdown on the
+   element that holds the rendered HTML. The emphasis colours are the
+   contract's --md-* tokens; ClawChat layers its roleplay rules on top. */
+
+/* No colour on the container itself: it inherits from its bubble or panel,
+   which may set its own (ClawChat's --bubble-user-text). */
+.ui-markdown {
+  line-height: 1.7;
+  overflow-wrap: break-word;
+}
+.ui-markdown > :first-child { margin-top: 0; }
+.ui-markdown > :last-child  { margin-bottom: 0; }
+
+.ui-markdown p, .ui-markdown ul, .ui-markdown ol, .ui-markdown dl,
+.ui-markdown pre, .ui-markdown blockquote, .ui-markdown table, .ui-markdown figure {
+  margin: 0 0 .8em;
+}
+
+.ui-markdown h1, .ui-markdown h2, .ui-markdown h3,
+.ui-markdown h4, .ui-markdown h5, .ui-markdown h6 {
+  color: var(--text-primary);
+  font-family: var(--font-display);
+  font-weight: var(--fw-semibold);
+  line-height: var(--lh-snug);
+  letter-spacing: var(--ls-snug);
+  margin: .9em 0 .45em;
+}
+.ui-markdown h1 { font-size: 1.35em; }
+.ui-markdown h2 { font-size: 1.2em; }
+.ui-markdown h3 { font-size: 1.08em; }
+.ui-markdown h4, .ui-markdown h5, .ui-markdown h6 { font-size: 1em; }
+
+.ui-markdown ul, .ui-markdown ol { padding-left: 1.4em; }
+.ui-markdown li { margin: 0 0 .25em; }
+.ui-markdown li::marker { color: var(--text-tertiary); }
+.ui-markdown li > :where(ul, ol) { margin: .25em 0 0; }
+
+.ui-markdown strong { color: var(--md-bold); font-weight: var(--fw-bold); }
+.ui-markdown em { color: var(--md-italic); font-style: italic; }
+.ui-markdown strong em, .ui-markdown em strong {
+  color: var(--md-bolditalic);
+  font-weight: var(--fw-bold);
+  font-style: italic;
+  text-shadow: 0 0 5px var(--md-bolditalic-glow);
+}
+
+.ui-markdown a {
+  color: var(--text-link);
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, var(--text-link) 45%, transparent);
+  text-underline-offset: 2px;
+}
+.ui-markdown a:hover { color: var(--text-link-hover); text-decoration-color: currentColor; }
+
+.ui-markdown code {
+  font-family: var(--font-mono);
+  font-size: .86em;
+  color: var(--text-link);
+  background: var(--surface-2);
+  border: 1px solid var(--glass-stroke);
+  border-radius: var(--radius-sm);
+  padding: .05em .4em;
+}
+.ui-markdown pre {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  line-height: 1.6;
+  color: var(--text-primary);
+  background: var(--code-bg);
+  border: 1px solid var(--glass-stroke);
+  border-radius: var(--radius-md);
+  padding: 12px 14px;
+  overflow-x: auto;
+}
+.ui-markdown pre code {
+  font-size: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+}
+
+.ui-markdown blockquote {
+  color: var(--text-secondary);
+  background: var(--surface-sunken);
+  border-left: 3px solid var(--quote-bar);
+  border-radius: 0 var(--radius-md) var(--radius-md) 0;
+  padding: 4px 14px;
+}
+
+.ui-markdown hr { border: 0; border-top: 1px solid var(--divider); margin: 1em 0; }
+
+.ui-markdown table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: .92em;
+  line-height: 1.5;
+}
+.ui-markdown th, .ui-markdown td {
+  border: 1px solid var(--border);
+  padding: 6px 10px;
+  text-align: left;
+}
+.ui-markdown th {
+  color: var(--text-primary);
+  background: var(--surface-3);
+  font-weight: var(--fw-semibold);
+}
+.ui-markdown td { color: var(--text-secondary); }
+
+.ui-markdown mark {
+  color: var(--text-primary);
+  background: var(--mark-bg);
+  border-radius: 2px;
+  padding: 1px 3px;
+}
+.ui-markdown del, .ui-markdown s { color: var(--text-tertiary); }
+.ui-markdown img { max-width: 100%; border-radius: var(--radius-sm); }
