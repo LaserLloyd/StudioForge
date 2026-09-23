@@ -1,4 +1,4 @@
-"""A load whose measured VRAM misses the plan by more than 5% is a WARNING,
+"""A load whose measured VRAM misses the plan by more than the bar is a WARNING,
 and the last observation per model is readable without a database (2026-09-09
 review: "prediction error >5% is a bug", so it must be visible as one).
 
@@ -6,6 +6,12 @@ The error is the FORMULA's (D63): a plan D51 sized from the last measurement
 plus ``OBS_SAFETY`` lands about 9% under its own total on every repeat load by
 construction, and that band is reported as the plan's *margin*, never as the
 planner's error and never as a warning.
+
+The bar has two sides (D69 §6): 5% for an under-estimate (the child holds
+MORE than the formula said, the OOM direction) and 10% for an over-estimate,
+because up to ~9.1% over is the headroom D51 reserves on purpose, and between
+8.6% and 9.5% over no correction is ever made -- that band was warned on every
+load and never corrected.
 """
 
 from __future__ import annotations
@@ -19,10 +25,12 @@ from studioforge.core import planner as planner_module
 from studioforge.core.planner import (
     _APPLIED_CORRECTIONS_CAP,
     CORRECTION_NOTE_PREFIX,
+    OBS_NOOP_TOLERANCE,
     OBS_SAFETY,
     OBSERVATION_FORMULA_KEY,
     OBSERVATION_NOTE_PER_PID_DEVICE,
     PREDICTION_ERROR_WARN_PCT,
+    PREDICTION_OVER_ESTIMATE_WARN_PCT,
     AppliedCorrection,
     Planner,
     _correction_key,
@@ -107,15 +115,58 @@ def test_a_miss_inside_the_bar_is_not_a_warning(recorder: RecordingLog) -> None:
     assert last["error_pct"] == pytest.approx(2.0, abs=0.2)
 
 
-def test_an_under_estimate_counts_the_same_as_an_over_estimate(recorder: RecordingLog) -> None:
+def test_a_large_over_estimate_is_still_a_warning(recorder: RecordingLog) -> None:
+    """Past the over-estimate bar the formula is carrying phantom VRAM -- a term
+    it does not model -- and that is still worth a line."""
     planner = Planner(make_config(), rig_5090x2_3090x2(), log_plans=False)
     plan = _plan()
     predicted = plan.estimate.total_bytes
     planner.observe(model_id="test/model", plan=plan, actual_bytes=int(predicted * 0.80))
 
-    assert [e for e, _ in recorder.warnings if e == "vram prediction error exceeds the bar"]
+    fields = next(f for e, f in recorder.warnings if e == "vram prediction error exceeds the bar")
+    assert fields["bar_pct"] == PREDICTION_OVER_ESTIMATE_WARN_PCT
     last = planner.last_observation("test/model")
     assert last is not None and last["within_bar"] is False and last["error_pct"] < 0
+    assert last["bar_pct"] == PREDICTION_OVER_ESTIMATE_WARN_PCT
+
+
+def test_the_over_estimate_bar_covers_the_uncorrectable_band() -> None:
+    """D69 §6. ``observed_correction`` makes no correction when ``ratio *
+    OBS_SAFETY`` lands within ``OBS_NOOP_TOLERANCE`` of 1, so every repeat of
+    such a load stays uncorrected. The over-estimate bar must sit past the far
+    edge of that band, or those loads warn forever with nothing to fix them."""
+    far_edge_pct = (1 - (1 - OBS_NOOP_TOLERANCE) / OBS_SAFETY) * 100
+    assert far_edge_pct <= PREDICTION_OVER_ESTIMATE_WARN_PCT
+    # The same fact, walked: every uncorrectable ratio is inside the bar.
+    formula = 20 * GB
+    for per_mille in range(880, 1001):
+        ratio = per_mille / 1000
+        if observed_correction(formula_bytes=formula, observed_bytes=int(formula * ratio)) is None:
+            assert (1 - ratio) * 100 <= PREDICTION_OVER_ESTIMATE_WARN_PCT, ratio
+    # ...and the under-estimate side, the OOM direction, keeps the tight bar.
+    assert PREDICTION_ERROR_WARN_PCT < PREDICTION_OVER_ESTIMATE_WARN_PCT
+
+
+@pytest.mark.parametrize("ratio", [0.911, 0.908, 0.906, 0.901], ids=lambda r: f"x{r}")
+def test_an_over_estimate_inside_the_band_is_not_a_warning(
+    recorder: RecordingLog, ratio: float
+) -> None:
+    """The live cases. Hy-MT2 at 0.911 (28 of the 52 warnings, the same
+    configuration 13 s apart both uncorrected), Precog-123B at 0.908 and
+    Orion-26B at 0.906 sit in the band D51 never corrects, so they warned on
+    every load. The embedding model at 0.901 is corrected from its second load
+    on, but its first load of each configuration warned too."""
+    planner = Planner(make_config(), rig_5090x2_3090x2(), log_plans=False)
+    plan = _plan()
+    predicted = plan.estimate.total_bytes
+    planner.observe(model_id="test/model", plan=plan, actual_bytes=int(predicted * ratio))
+
+    assert recorder.warnings == []
+    last = planner.last_observation("test/model")
+    assert last is not None
+    assert last["within_bar"] is True and last["corrected"] is False
+    assert last["error_pct"] == pytest.approx((ratio - 1) * 100, abs=0.05)
+    assert last["over_bar_pct"] == PREDICTION_OVER_ESTIMATE_WARN_PCT
 
 
 def test_last_observation_is_none_until_a_load_was_measured() -> None:
@@ -203,19 +254,28 @@ def test_a_child_inside_the_bar_above_the_corrected_total_is_not(recorder: Recor
     assert recorder.warnings == []
 
 
-@pytest.mark.parametrize("sign", [1, -1], ids=["under", "over"])
-def test_an_uncorrected_plan_seven_percent_off_is_a_warning(
-    recorder: RecordingLog, sign: int
+@pytest.mark.parametrize(
+    ("sign", "warned"), [(1, True), (-1, False)], ids=["under-estimate", "over-estimate"]
+)
+def test_an_uncorrected_plan_seven_percent_off_warns_only_when_it_is_short(
+    recorder: RecordingLog, sign: int, warned: bool
 ) -> None:
+    """The child holding 7% MORE than the formula is the OOM direction: a
+    warning. 7% LESS is inside the headroom D51 reserves on purpose (D69 §6)."""
     planner = Planner(make_config(), rig_5090x2_3090x2(), log_plans=False)
     plan = _plan()
     total = plan.estimate.total_bytes
     planner.observe(model_id="test/model", plan=plan, actual_bytes=int(total * (1 + sign * 0.07)))
 
-    fields = next(f for e, f in recorder.warnings if e == "vram prediction error exceeds the bar")
-    assert fields["error_pct"] == pytest.approx(sign * 7.0, abs=0.1)
+    warnings = [f for e, f in recorder.warnings if e == "vram prediction error exceeds the bar"]
+    assert bool(warnings) is warned
+    if warned:
+        assert warnings[0]["error_pct"] == pytest.approx(7.0, abs=0.1)
+        assert warnings[0]["bar_pct"] == PREDICTION_ERROR_WARN_PCT
     last = planner.last_observation("test/model")
     assert last is not None
+    assert last["error_pct"] == pytest.approx(sign * 7.0, abs=0.1)
+    assert last["within_bar"] is not warned
     assert last["corrected"] is False
     assert last["margin_pct"] is None and last["correction_factor"] is None
     assert last["predicted_bytes"] == last["planned_bytes"] == total

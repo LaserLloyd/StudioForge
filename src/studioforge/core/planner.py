@@ -111,6 +111,23 @@ BUSY_RETRY_AFTER_S = 15.0
 #: corrected total by this bar, which is the direction the band exists for.
 PREDICTION_ERROR_WARN_PCT = 5.0
 
+#: The bar for an OVER-estimate, where the child holds less than the formula
+#: said. It is wider than the bar for an under-estimate on purpose (D69 §6).
+#: An over-estimate costs headroom, never an OOM, and up to
+#: ``1 - 1/OBS_SAFETY`` (9.1%) of headroom is what D51 reserves deliberately
+#: on every corrected plan: a formula that far over already sits where a
+#: measured plan would put the load. With one bar, that band was also a trap.
+#: :func:`observed_correction` makes no correction when the factor lands
+#: within :data:`OBS_NOOP_TOLERANCE` of 1, which is every over-estimate
+#: between 8.6% and 9.5%, so a model in that band was warned on EVERY load and
+#: could never be corrected: 52 warnings between 2026-09-13 and 09-22 (Hy-MT2
+#: at -8.9%, Precog-123B -9.2%, Dark-Scarlett Q5_K_M -9.1%, Orion-26B -9.4%).
+#: 10% covers that whole band. ``test_planner_prediction_error.py`` pins it
+#: against ``OBS_SAFETY`` and ``OBS_NOOP_TOLERANCE``, so the three constants
+#: cannot drift apart. An under-estimate, the direction that OOMs, keeps the
+#: 5% bar and stays loud.
+PREDICTION_OVER_ESTIMATE_WARN_PCT = 10.0
+
 # Context sizes we are willing to suggest as a fallback, descending.
 _CTX_LADDER = (
     262144,
@@ -983,8 +1000,10 @@ class Planner:
         """The most recent predicted-vs-actual VRAM record for ``model_id``.
 
         ``None`` until a load of that model has been measured in this process.
-        ``within_bar`` says whether the miss stayed inside
-        :data:`PREDICTION_ERROR_WARN_PCT`.
+        ``within_bar`` says whether the miss stayed inside the bar for its
+        direction, ``bar_pct``: :data:`PREDICTION_ERROR_WARN_PCT` for an
+        under-estimate, :data:`PREDICTION_OVER_ESTIMATE_WARN_PCT` for an
+        over-estimate (D69 §6).
         """
         found = self._last_observations.get(model_id)
         return dict(found) if found is not None else None
@@ -3840,9 +3859,16 @@ class Planner:
                     "means the charge is too small for this model"
                 ),
             )
-        within_bar: bool | None = (
-            abs(error_pct) <= PREDICTION_ERROR_WARN_PCT if error_pct is not None else None
+        # One bar per direction (D69 §6): an under-estimate (the child holds
+        # more than the formula said) is the OOM direction and keeps the 5%
+        # bar; an over-estimate is measured against the wider band D51 would
+        # reserve anyway. See PREDICTION_OVER_ESTIMATE_WARN_PCT.
+        bar_pct = (
+            PREDICTION_OVER_ESTIMATE_WARN_PCT
+            if error_pct is not None and error_pct < 0
+            else PREDICTION_ERROR_WARN_PCT
         )
+        within_bar: bool | None = abs(error_pct) <= bar_pct if error_pct is not None else None
         if not corrected and error_pct is not None and not within_bar:
             log.warning(
                 "vram prediction error exceeds the bar",
@@ -3850,7 +3876,7 @@ class Planner:
                 predicted_mb=round(predicted / MB) if predicted is not None else None,
                 actual_mb=round(actual_bytes / MB),
                 error_pct=round(error_pct, 1),
-                bar_pct=PREDICTION_ERROR_WARN_PCT,
+                bar_pct=bar_pct,
                 ctx=plan.ctx_size,
                 parallel=plan.parallel,
                 kv=f"{plan.kv_cache_type}/{plan.kv_cache_type_v}",
@@ -3893,7 +3919,9 @@ class Planner:
             "actual_bytes": int(actual_bytes),
             "error_pct": round(error_pct, 2) if error_pct is not None else None,
             "within_bar": within_bar,
-            "bar_pct": PREDICTION_ERROR_WARN_PCT,
+            # The bar this miss was held to: 5% under, 10% over (D69 §6).
+            "bar_pct": bar_pct,
+            "over_bar_pct": PREDICTION_OVER_ESTIMATE_WARN_PCT,
             "corrected": corrected,
             "correction_factor": (
                 round(applied.correction.factor, 4) if applied is not None else None
@@ -4019,6 +4047,13 @@ def per_device_overruns(
 #: that would have fit, rather than at "OOM", which costs a child mid-request.
 OBS_SAFETY = 1.10
 
+#: A correction whose factor is this close to 1 is no correction at all, and
+#: :func:`observed_correction` returns ``None`` for it: the plan then stays on
+#: the formula and is observed as uncorrected. Named because
+#: :data:`PREDICTION_OVER_ESTIMATE_WARN_PCT` has to cover the over-estimates it
+#: leaves uncorrected (D69 §6).
+OBS_NOOP_TOLERANCE = 0.005
+
 #: The floor the correction may pull the estimate down to, as a fraction of the
 #: formula's own answer. A row that is a fluke -- or contaminated in some way
 #: the note check has not yet learned to spot -- can talk the estimate down by
@@ -4136,7 +4171,7 @@ def observed_correction(*, formula_bytes: int, observed_bytes: int) -> ObservedC
     corrected = min(high, max(low, trusted))
     clamped = corrected != trusted
     factor = corrected / formula_bytes
-    if abs(factor - 1.0) < 0.005:
+    if abs(factor - 1.0) < OBS_NOOP_TOLERANCE:
         return None
     note = (
         f"{CORRECTION_NOTE_PREFIX}{factor:.2f} from the last load of this exact "

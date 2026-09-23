@@ -84,3 +84,36 @@ per pair, DEBUG on rescans, re-warned after the collision comes back) and the ex
 reading `aliases`. `tests/unit/test_thinking_format_nag.py` covers three loads of one model, then a
 second model: WARNING for each model once, DEBUG for the repeats, nothing for a model with a
 `reasoning_format`. Both fail against the old code.
+
+### §6 — The D63 dead zone: an over-estimate D51 cannot correct is not warned about
+
+**Evidence.** `observed_correction` returns `None` when the factor is within 0.005 of 1, and the
+factor is `ratio × OBS_SAFETY` (1.10). So for every over-estimate between 8.6 % and 9.5 % (ratio
+0.9045 to 0.9136) D51 makes no correction. The plan stays on the formula, `observe` treats it as
+uncorrected and applies the 5 % bar, and the load is warned. Every repeat does the same. The registry
+has two Hy-MT2 rows 13 s apart, same configuration, both ratio 0.911 and both `corrected=False`.
+There were 52 `vram prediction error exceeds the bar` warnings since 09-13: 28 were Hy-MT2 at −8.9 %,
+and the rest were Precog-123B −9.2 %, Dark-Scarlett Q5_K_M −9.1 %, Orion-26B −9.4 %, Qwen3-VL-Emb-8B
+−9.9 % and Hy-MT2 −9.1/−11.4 %.
+
+**Choice.** The bar is asymmetric, not "skip the warning when D51 would make no correction". An
+over-estimate costs headroom, never an OOM. Up to `1 − 1/OBS_SAFETY` (9.1 %) of headroom is what D51
+reserves on purpose on every corrected plan, so a formula that far over already sits where a measured
+plan would put the load. It is not a defect worth a WARNING, on the first load or on any later one.
+Skipping only the uncorrectable band would still warn at −7 % on first loads and then correct the
+plan *upward*. An under-estimate is the OOM direction and keeps the 5 % bar, so it stays loud.
+
+**Change.** `PREDICTION_OVER_ESTIMATE_WARN_PCT = 10.0` sits beside `PREDICTION_ERROR_WARN_PCT = 5.0`
+in `core/planner.py`, and the literal `0.005` became `OBS_NOOP_TOLERANCE`. `observe()` holds a
+negative error (the child holds less than the formula said) to the 10 % bar and a positive one to
+5 %. The warning's `bar_pct` and `last_observation()`'s `bar_pct` name the bar that applied, and
+`last_observation()` also carries `over_bar_pct` (an additive field; `model_info.vram_prediction` passes
+it through). The corrected-plan warning ("measured footprint exceeds the corrected estimate") is
+unchanged: it is the under-estimate direction. Nothing about the correction itself changed.
+
+**Tests.** `tests/unit/test_planner_prediction_error.py`:
+- the over-estimate bar is pinned at or past the far edge of the uncorrectable band, computed from
+  `OBS_SAFETY` and `OBS_NOOP_TOLERANCE` and walked ratio by ratio;
+- the four live ratios (0.911, 0.908, 0.906, 0.901) are not warnings;
+- a −20 % miss still is, with `bar_pct` 10;
+- the old "7 % off either way warns" case is now split: +7 % warns at bar 5, −7 % does not.
