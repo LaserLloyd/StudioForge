@@ -2382,7 +2382,9 @@ async def evictions(request: Request, since: float | None = Query(None)) -> dict
     evicting plan scrolled out of /api/status -- and it is the first question
     asked whenever a companion's model goes missing mid-conversation. Each
     event carries ``{ts, evicted, evicted_by, reason, freed_bytes, priority}``
-    with ``reason`` in {plan, oom-retry, ttl, lease, removed}. In-memory ring:
+    with ``reason`` in {plan, oom-retry, ttl, lease, removed, rebalance-failed}
+    -- the last one is a D42 move whose relaunch died and whose rollback to
+    the previous placement failed too, so the model is down (D70). In-memory ring:
     survives as long as the process, which is when the question is asked.
     """
     events = _state(request).manager.evictions(since)

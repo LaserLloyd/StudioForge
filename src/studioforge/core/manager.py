@@ -4642,6 +4642,14 @@ class ModelManager:
         -- the world changed between preview and gate -- leaves the resident
         child serving exactly as a refused forced reload always has, and a
         resident that vanished meanwhile is not reloaded cold.
+
+        A refusal is not the only failure. D30 plans before it unloads, so
+        a plan that no longer fits leaves the resident serving -- but a
+        launch that dies AFTER the stop leaves nothing serving, and until
+        D70 this path then logged "the model keeps its placement" over a
+        model that was down. That case now relaunches the previous plan on
+        the previous devices (:meth:`_restore_after_failed_rebalance`), and
+        says so truthfully when even that fails.
         """
         if self.leases.for_model(model_id) is not None:
             # Granted between the preview and now: the cards are its alone.
@@ -4649,6 +4657,9 @@ class ModelManager:
                 "rebalance skipped: the model was leased cards after the preview", model_id=model_id
             )
             return
+        # What the model was before the move: the plan to fall back to if the
+        # relaunch dies after the resident has already been stopped.
+        before = self.supervisor.get(model_id)
         try:
             instance = await self.load(
                 model_id,
@@ -4690,12 +4701,84 @@ class ModelManager:
                 model_id=model_id,
                 error=str(exc),
             )
-        except Exception as exc:  # noqa: BLE001 - the model keeps its old placement
-            log.warning(
-                "rebalance failed; the model keeps its placement",
+        except Exception as exc:  # noqa: BLE001 - a failed move must not end the sweep
+            if self.supervisor.get(model_id) is not None:
+                # Refused before the resident was stopped (the plan no longer
+                # fits, the world moved): it is still serving, so this is true.
+                log.warning(
+                    "rebalance failed; the model keeps its placement",
+                    model_id=model_id,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                return
+            await self._restore_after_failed_rebalance(model_id, before, reason, exc)
+
+    async def _restore_after_failed_rebalance(
+        self, model_id: str, before: InstanceInfo | None, reason: str, exc: BaseException
+    ) -> None:
+        """Bring a model back after a rebalance launch died (D70, item 10).
+
+        D30 plans before it unloads, which covers a refusal but not a launch
+        that crashes: on 2026-09-15 12:24 the D42 move of a 27B to [3, 2]
+        stopped the resident, the relaunch died at startup (0xC0000409), the
+        no-evict rule rightly declined to retry by evicting a bystander, and
+        the log said "the model keeps its placement" while the model was
+        down until its next JIT request. The safe completion is to relaunch
+        the PREVIOUS plan on the PREVIOUS devices with no eviction licence:
+        the only thing the move changed was the cards, and the old cards
+        were vacated by this very model moments ago. If that fails too the
+        model is down, and the log and the eviction book (``reason:
+        rebalance-failed``) say so instead of the opposite; the next JIT
+        request or the pin reconciler brings it back, as before.
+        """
+        error = f"{type(exc).__name__}: {exc}"
+        previous = before.plan if before is not None else None
+        if previous is None or not previous.devices:
+            log.error(
+                "rebalance failed and the model is DOWN; no previous placement to relaunch",
                 model_id=model_id,
-                error=str(exc),
+                error=error,
             )
+            self._record_eviction(model_id, reason="rebalance-failed", evicted_by="rebalance")
+            return
+        devices = list(previous.devices)
+        log.warning(
+            "rebalance launch failed; relaunching the previous placement",
+            model_id=model_id,
+            devices=devices,
+            reason=reason,
+            error=error,
+        )
+        try:
+            instance = await self.load(
+                model_id,
+                **reload_settings(previous),
+                devices=devices,
+                evict_busy=False,
+                allow_evict=False,
+                source="rebalance-restore",
+                priority=before.priority if before is not None else None,
+                hold_traffic=False,
+                enforce_parallel_cap=False,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as restore_exc:  # noqa: BLE001 - only the truth is left to report
+            log.error(
+                "rebalance failed and the relaunch of the previous placement failed too; "
+                "the model is DOWN until its next load",
+                model_id=model_id,
+                devices=devices,
+                error=f"{type(restore_exc).__name__}: {restore_exc}",
+            )
+            self._record_eviction(model_id, reason="rebalance-failed", evicted_by="rebalance")
+            return
+        log.info(
+            "rebalance rolled back; the model is back on its previous placement",
+            model_id=model_id,
+            devices=list(instance.plan.devices) if instance.plan else devices,
+            error=error,
+        )
 
     def _model_was_removed(self, model_id: str) -> bool:
         """True only when the registry has scanned and no longer knows ``model_id``.
