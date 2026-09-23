@@ -27,6 +27,7 @@ import typer
 from studioforge import __version__
 from studioforge.config import Config, find_config_path, load_config
 from studioforge.errors import ConfigError
+from studioforge.logfiles import MB
 from studioforge.logging import configure_logging, get_logger
 
 if TYPE_CHECKING:
@@ -42,7 +43,7 @@ app = typer.Typer(
 )
 
 
-def _load(config_path: Path | None) -> Config:
+def _load(config_path: Path | None, *, owns_log: bool = False) -> Config:
     """Load config for a CLI command, turning a bad file into one readable line.
 
     ``load_config`` already raises :class:`ConfigError` with the YAML error and
@@ -50,6 +51,11 @@ def _load(config_path: Path | None) -> Config:
     greeted the user with a forty-line traceback ending in ``ConfigError``
     (WP17 F8). Exit code 2 = "usage/config problem"; the traceback is still
     available with ``SF_DEBUG=1`` for the case where the message is not enough.
+
+    ``owns_log`` is true for ``serve`` only: the server holds and rotates
+    ``studioforge.log``. Every other command -- the weeks-long tray above all --
+    appends to it a record at a time, so it never pins the file against the
+    server's rename (D69 §15, :mod:`studioforge.logfiles`).
     """
     try:
         config = load_config(config_path, create=True)
@@ -60,7 +66,12 @@ def _load(config_path: Path | None) -> Config:
         typer.echo("  (set SF_DEBUG=1 for the full traceback)", err=True)
         raise typer.Exit(2) from exc
     configure_logging(
-        config.logging.level, json_logs=config.logging.json_logs, log_dir=config.logs_dir
+        config.logging.level,
+        json_logs=config.logging.json_logs,
+        log_dir=config.logs_dir,
+        owner=owns_log,
+        max_bytes=config.logging.file_max_mb * MB,
+        backup_count=config.logging.file_backups,
     )
     return config
 
@@ -79,7 +90,7 @@ def serve(
     ),
 ) -> None:
     """Run the gateway (and GUI + watchdog unless disabled)."""
-    config = _load(config_path)
+    config = _load(config_path, owns_log=True)
     if host:
         config.server.host = host
     if port:

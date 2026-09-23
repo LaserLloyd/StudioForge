@@ -225,3 +225,83 @@ is reachable through the card's slot only while the card exists).
 
 All six fail against the old code. The existing static guards in `test_gui.py` (single-flight keys,
 `require_local_admin`) pass unchanged.
+
+### §15 — Log files rotate, safely on a shared file; the watchdog stops logging every probe
+
+**Evidence.** `logging.py` installed a plain `FileHandler`. `watchdog.log` was 61 MB, about 10.7k lines
+a day, nearly all httpx INFO `HTTP Request: GET …/health 200 OK` lines: the watchdog's own logging
+setup never quieted httpx, although the server's did. `studioforge.log` was 16.9 MB and
+`tray-server.log` 13.5 MB.
+
+**Who writes which file** (checked in code and in the live log):
+- `studioforge.log` is written by the server (a `FileHandler`, configured twice: `_load`, then
+  `create_app`) and by **the tray**. Every CLI command, the tray included, called `_load` →
+  `configure_logging(log_dir=…)`, so the tray held the file open for weeks: its `server exited for a
+  requested restart; respawning` lines are in `studioforge.log`. The file is also written by any
+  one-shot CLI command while it runs, by the stdio MCP server (`run_stdio`), and by two servers at
+  once for a moment during a restart handover.
+- `watchdog.log` is written by the watchdog only.
+- `tray-server.log` is opened by the tray at each spawn and inherited by the server child as its
+  stdout/stderr. The child writes the file, and nothing can rotate a handle another process writes
+  through.
+
+**The hazard.** On Windows a file another process has open cannot be renamed, because Python opens
+files without `FILE_SHARE_DELETE`. The stdlib `RotatingFileHandler` shifts `.1 → .2 …` *before* it
+renames the live file. On a shared file, every failed attempt therefore pushes each backup one step
+further out, deletes the oldest, and drops the triggering record with a traceback on stderr, and every
+later record repeats it. Swapping the handler in on its own would have destroyed data on this rig.
+
+**Change.**
+- `studioforge/logfiles.py` (new, standard library only, so the watchdog may import it):
+  - `SafeRotatingFileHandler` is for the one owner of a file. It renames the live file first, to a new
+    timestamped name (`studioforge.20260923-210507.log`, `_N` for a second rotation in the same
+    second, `.log` kept so it still opens as a log). That rename is the only step that can fail. If
+    it does, nothing else is touched: the handler keeps appending, writes one `log rotation deferred`
+    line into the file per episode, and retries every 5 min. After a successful rename it prunes the
+    oldest copies beyond `backup_count` (a copy it cannot delete stays for next time) and writes `log
+    rotated; the previous file is …` at the top of the new file. On POSIX, if another process rotated
+    the file under the open handle, the handler follows it rather than rotating the fresh file.
+  - `AppendFileHandler` is for a guest process: open, append one record, close. It never holds the
+    file and never rotates.
+  - `rotate_if_large` is for a file nobody holds at that moment.
+- **Ownership.** `configure_logging(..., owner=True|False, max_bytes, backup_count)`. `studioforge
+  serve` (`_load(…, owns_log=True)`) and `create_app` own `studioforge.log`. Every other CLI command,
+  above all the tray, is a guest, and so is `run_stdio`. The flag is not sticky, so a test suite's
+  earlier CLI call cannot change what a later `create_app` does. A replaced handler is closed, not just
+  detached, so the server's second `configure_logging` does not pin the file either. Two servers during
+  a handover both hold the file for a moment; the rename is then deferred, and nothing is lost.
+- **The watchdog** (`watchdog/__main__.py`) owns and rotates `watchdog.log`, and sets `httpx` /
+  `httpcore` to WARNING. Its poll already logs every health transition, and a failed probe raises into
+  `health poll failed`. `tail_logs` (`watchdog/server.py:tail_file`) puts the tail of the newest
+  rotated copy in front when the live file is short. `studioforge.logfiles` joins the watchdog's
+  import allowlist beside `config` and `credential_guard`, and a test keeps it a stdlib-only leaf.
+- **The tray** rotates `tray-server.log` in `_open_server_log`, when it is about to start a server:
+  the previous child has exited and nobody holds the file. If a rename fails (an old child is still
+  alive), the file just grows until the next start. The file's growth is bounded by one server
+  lifetime. It duplicates the server's own records (stderr), and removing that duplication was left
+  alone as a behaviour change nobody asked for.
+- **Config.** `logging.file_max_mb: 20` (0 = never rotate) and `logging.file_backups: 5` (1–100) are
+  in `RESTART_REQUIRED_KEYS`, `config.example.yaml`, and the Setup tab's generated Advanced section.
+  `docs/RUNBOOK.md` "Where the logs are" says all of the above.
+
+**Tests.** `tests/unit/test_log_rotation.py`:
+- rotation at the limit with nothing lost between the newest backup and the live file, pruning, and the
+  pointer line;
+- a refused rename loses no record, touches no backup and notes it once;
+- a retry after `retry_s`, and one note per episode across many refused retries;
+- **a real Windows sharing violation**: a second handle held open without share-delete;
+- `max_bytes 0`, the POSIX "rotated under us" case, and prune touching only this log's own backups;
+- a guest never pinning the file, `rotate_if_large`, and the tray rotating its console before a spawn;
+- `configure_logging` owner/guest (not sticky, replaced handler closed), and only `serve` owning (source
+  check plus a real `_load`);
+- the watchdog's handler and quieted httpx, `tail_file` reaching into the newest copy, the config keys,
+  and backup naming order past `_9`.
+
+`test_watchdog.py` gains the stdlib-only leaf check and the allowlist entry. `test_lifecycle_hardening`
+checks for a `FileHandler` by `isinstance` rather than by class name.
+
+**Deploy note.** The old tray process holds `studioforge.log` open until it is restarted on this code.
+Until then the server's rotation is deferred: one note, retried every 5 min, nothing lost. The
+watchdog outlives server restarts by design (D21), so its rotation and the silenced probe lines start
+only when the watchdog process itself restarts. The first rotation of the 61 MB `watchdog.log` then
+happens at its first line.

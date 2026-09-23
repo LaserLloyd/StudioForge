@@ -207,6 +207,10 @@ hf:
 logging:
   level: INFO
   json: false
+  # Log files rotate at this size (MiB) and keep this many copies (D69).
+  # 0 never rotates.
+  file_max_mb: 20
+  file_backups: 5
 update:
   # GitHub `owner/name` that publishes StudioForge releases, or null when there
   # is none yet: the self-update check then reports "not configured" without

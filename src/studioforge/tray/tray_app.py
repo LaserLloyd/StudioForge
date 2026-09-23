@@ -43,6 +43,7 @@ from studioforge.core.ports import (
     find_watchdog_pids,
     port_is_bindable,
 )
+from studioforge.logfiles import MB, rotate_if_large
 from studioforge.logging import get_logger
 
 log = get_logger(__name__)
@@ -588,7 +589,17 @@ class TrayApp:
 
     def _open_server_log(self) -> Any:
         self.config.logs_dir.mkdir(parents=True, exist_ok=True)
-        return (self.config.logs_dir / "tray-server.log").open("ab", buffering=0)
+        path = self.config.logs_dir / "tray-server.log"
+        # The child writes this file through a handle it inherits, so nobody can
+        # rotate it while a server runs. Now, before the next child exists, is
+        # the one moment it can be; a rename that fails (an old child still
+        # holds it) just leaves it to grow until the next start (D69 §15).
+        rotate_if_large(
+            path,
+            max_bytes=self.config.logging.file_max_mb * MB,
+            backup_count=self.config.logging.file_backups,
+        )
+        return path.open("ab", buffering=0)
 
     def _close_log(self) -> None:
         if self._log_handle is not None:

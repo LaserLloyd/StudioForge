@@ -1506,11 +1506,27 @@ FORBIDDEN_PREFIXES = ("studioforge.core", "studioforge.api", "studioforge.db")
 # package, so it drags none of the app machinery into the recovery process.
 # The watchdog needs it because the destructive tools live behind the same
 # eight-digit PIN, and a lockout on only one of the two doors is no lockout.
+# `logfiles` (D69 §15) is the same kind of leaf: the size-rotating handler for
+# watchdog.log and the backup naming ``tail_logs`` reads, standard library only
+# -- which ``test_logfiles_is_a_stdlib_only_leaf`` below keeps true.
 ALLOWED_STUDIOFORGE = (
     "studioforge.config",
     "studioforge.credential_guard",
+    "studioforge.logfiles",
     "studioforge.watchdog",
 )
+
+
+def test_logfiles_is_a_stdlib_only_leaf() -> None:
+    """The watchdog may import ``studioforge.logfiles`` only while it stays one."""
+    path = _module_path("studioforge.logfiles")
+    stdlib = set(sys.stdlib_module_names)
+    strays = [
+        name
+        for name in _imported_names(path)
+        if name.split(".")[0] not in stdlib and name.split(".")[0] != "__future__"
+    ]
+    assert strays == [], f"studioforge.logfiles must import the stdlib only, found {strays}"
 
 
 def _module_path(dotted: str) -> Path:

@@ -8,6 +8,7 @@ token, a missed processor is impossible.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import sys
 import threading
@@ -16,6 +17,13 @@ from pathlib import Path
 from typing import Any
 
 import structlog
+
+from studioforge.logfiles import (
+    DEFAULT_BACKUP_COUNT,
+    DEFAULT_MAX_BYTES,
+    AppendFileHandler,
+    SafeRotatingFileHandler,
+)
 
 _SECRET_KEYS = {
     "api_key",
@@ -150,10 +158,35 @@ class _SafeStreamHandler(logging.StreamHandler):  # type: ignore[type-arg,unused
         self.stream = None  # type: ignore[assignment,unused-ignore]
 
 
+#: Name of the server's log file inside ``log_dir``.
+SERVER_LOG_NAME = "studioforge.log"
+
+
+#: The file handler the last :func:`configure_logging` installed, so the next
+#: call can close it rather than leave it holding the file.
+_file_handler: logging.Handler | None = None
+
+
 def configure_logging(
-    level: str = "INFO", *, json_logs: bool = False, log_dir: Path | None = None
+    level: str = "INFO",
+    *,
+    json_logs: bool = False,
+    log_dir: Path | None = None,
+    owner: bool = True,
+    max_bytes: int = DEFAULT_MAX_BYTES,
+    backup_count: int = DEFAULT_BACKUP_COUNT,
 ) -> None:
-    """Configure structlog + stdlib logging. Safe to call more than once."""
+    """Configure structlog + stdlib logging. Safe to call more than once.
+
+    ``owner`` says how this process writes ``<log_dir>/studioforge.log``
+    (D69 §15). The owner -- the server, and anything that builds the app --
+    holds the file and rotates it at ``max_bytes`` (0 = never), keeping
+    ``backup_count`` copies. A guest (``owner=False``: the tray, the one-shot
+    CLI commands, the stdio MCP server) appends one record at a time and never
+    holds the file, so it cannot block the owner's rename on Windows. See
+    :mod:`studioforge.logfiles` for who writes which file.
+    """
+    global _file_handler
     renderer: Any = (
         structlog.processors.JSONRenderer()
         if json_logs
@@ -184,6 +217,12 @@ def configure_logging(
     root = logging.getLogger()
     for handler in list(root.handlers):
         root.removeHandler(handler)
+    if _file_handler is not None:
+        # Closed, not just detached: a replaced handler still holding the file
+        # would block the new one's rename exactly as another process does.
+        with contextlib.suppress(Exception):
+            _file_handler.close()
+        _file_handler = None
     root.setLevel(logging.getLevelNamesMapping().get(level.upper(), logging.INFO))
 
     # Only when there is a stderr at all: under pythonw.exe it is None, and a
@@ -199,9 +238,17 @@ def configure_logging(
 
     if log_dir is not None:
         log_dir.mkdir(parents=True, exist_ok=True)
-        file_handler = logging.FileHandler(log_dir / "studioforge.log", encoding="utf-8")
+        path = log_dir / SERVER_LOG_NAME
+        file_handler: logging.Handler
+        if owner:
+            file_handler = SafeRotatingFileHandler(
+                path, max_bytes=max_bytes, backup_count=backup_count
+            )
+        else:
+            file_handler = AppendFileHandler(path)
         file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
         root.addHandler(file_handler)
+        _file_handler = file_handler
 
     # uvicorn's own loggers duplicate access lines; keep them but quieter.
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)

@@ -811,6 +811,14 @@ class LoggingConfig(BaseModel):
 
     level: LogLevel = "INFO"
     json_logs: bool = Field(default=False, alias="json")
+    #: Size in MiB at which a log file is rotated (D69 §15). The server rotates
+    #: ``studioforge.log``, the watchdog ``watchdog.log``, and the tray rotates
+    #: ``tray-server.log`` when it starts a server. 20 MiB is weeks of
+    #: ``studioforge.log`` on a busy rig; 0 never rotates (the old behaviour).
+    file_max_mb: int = Field(default=20, ge=0)
+    #: Rotated copies kept per log file, newest first; the oldest is deleted
+    #: when a new one is made. At least 1.
+    file_backups: int = Field(default=5, ge=1, le=100)
 
     @field_validator("level", mode="before")
     @classmethod
@@ -1296,5 +1304,8 @@ RESTART_REQUIRED_KEYS = frozenset(
         "server.cors_allow_credentials",
         "mcp.path",
         "mcp.enabled",
+        # The log file handlers are built once, at start (D69 §15).
+        "logging.file_max_mb",
+        "logging.file_backups",
     }
 )
