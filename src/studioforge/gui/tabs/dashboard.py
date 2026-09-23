@@ -10,6 +10,7 @@ the two is exactly what an operator needs to see.
 
 from __future__ import annotations
 
+from contextlib import suppress
 from typing import Any
 
 from nicegui import ui
@@ -27,8 +28,77 @@ from studioforge.gui.tabs import (
     single_flight,
     viewer_may_change_box,
 )
+from studioforge.logging import get_logger
+
+log = get_logger(__name__)
 
 LOG_TAIL_LINES = 40
+
+
+class _Page:
+    """The browser page an action was clicked on, captured before its first await.
+
+    A click handler runs inside the slot of the button that fired it, and NiceGUI
+    finds the client for ``ui.notify`` through that slot. The panels here rebuild
+    their rows on a timer (the Loaded models cards every refresh), so by the time
+    an unload or a reload has been awaited the button's card is usually gone.
+    ``ui.notify`` then raised "The parent element this slot belongs to has been
+    deleted", and NiceGUI's own error handler raised it a second time. The live
+    log has it on 09-13, 09-15, 09-16 and twice on 09-22 (D69 §17).
+
+    The client captured at entry outlives the card. ``with page:`` makes the
+    page's own content slot the current one for the whole action, so the busy
+    spinner and the result toast are drawn at page level and survive a rebuild
+    of the card. After the await, a page whose browser has gone away is skipped
+    rather than drawn into (NiceGUI's "Client has been deleted but is still
+    being used"). With no page context at all (a direct call from a test),
+    ``capture`` binds nothing and the calls behave as they always did.
+    """
+
+    def __init__(self, client: Any) -> None:
+        self._client = client
+        self._entered = False
+
+    @classmethod
+    def capture(cls) -> _Page:
+        try:
+            return cls(ui.context.client)
+        except Exception:  # noqa: BLE001 - no page context: nothing to bind
+            return cls(None)
+
+    @property
+    def alive(self) -> bool:
+        """Whether drawing is still safe; always true when no page was bound."""
+        if self._client is None:
+            return True
+        try:
+            return not bool(self._client.is_deleted)
+        except Exception:  # noqa: BLE001 - a check that cannot answer means "gone"
+            return False
+
+    def __enter__(self) -> _Page:
+        if self._client is not None and self.alive:
+            self._client.__enter__()
+            self._entered = True
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        if self._entered:
+            self._entered = False
+            with suppress(Exception):  # leaving a torn-down page must not mask the action
+                self._client.__exit__(None, None, None)
+
+    def notify(self, message: str, **kwargs: Any) -> None:
+        if self.alive:
+            ui.notify(message, **kwargs)
+
+    def error(self, exc: BaseException, *, what: str) -> None:
+        if self.alive:
+            notify_error(exc, what=what)
+        else:
+            # The toast has nowhere to go; the log line notify_error would
+            # have written still does.
+            log.warning("gui action failed", what=what, error=str(exc), page="closed")
 
 
 def _safe_gpus(ctx: GuiContext) -> list[Any]:
@@ -165,19 +235,22 @@ def _vram_holders_panel(ctx: GuiContext) -> None:
 
 
 async def _reclaim_orphans(ctx: GuiContext, refresh: Any) -> None:
-    with busy(message="Reclaiming leaked VRAM…"):
-        try:
-            require_local_admin(ctx, "reclaim VRAM")
-            from studioforge.api.mgmt_routes import vram_reclaim
+    # The Reclaim button sits in a row the holders timer rebuilds (D69 §17).
+    page = _Page.capture()
+    with page:
+        with busy(message="Reclaiming leaked VRAM…"):
+            try:
+                require_local_admin(ctx, "reclaim VRAM")
+                from studioforge.api.mgmt_routes import vram_reclaim
 
-            payload = await vram_reclaim(api_request(ctx), dry_run=False)
-        except Exception as exc:  # noqa: BLE001
-            notify_error(exc, what="reclaim VRAM")
-            return
-    ui.notify(
-        f"killed {payload.get('killed', 0)} of {payload.get('orphans_found', 0)} orphan(s)",
-        type="positive",
-    )
+                payload = await vram_reclaim(api_request(ctx), dry_run=False)
+            except Exception as exc:  # noqa: BLE001
+                page.error(exc, what="reclaim VRAM")
+                return
+        page.notify(
+            f"killed {payload.get('killed', 0)} of {payload.get('orphans_found', 0)} orphan(s)",
+            type="positive",
+        )
     await refresh()
 
 
@@ -481,24 +554,30 @@ def _loaded_card(
 
 
 async def _toggle_pin(ctx: GuiContext, model_id: str, pinned: bool, refresh: Any) -> None:
-    try:
-        # A pin outlives the instance (boot autoload, reconciler), so it is a
-        # box change under D32/D41, not residency.
-        require_local_admin(ctx, "pin")
-        updated, _ttl = await run_blocking(ctx.manager.set_pinned, model_id, not pinned)
-    except Exception as exc:  # noqa: BLE001
-        notify_error(exc, what="pin")
-        return
-    ui.notify(
-        f"{updated.id} {'pinned' if updated.settings.pinned else 'unpinned'}", type="positive"
-    )
+    # The pin button is on a card the refresh timer rebuilds (D69 §17).
+    page = _Page.capture()
+    with page:
+        try:
+            # A pin outlives the instance (boot autoload, reconciler), so it is a
+            # box change under D32/D41, not residency.
+            require_local_admin(ctx, "pin")
+            updated, _ttl = await run_blocking(ctx.manager.set_pinned, model_id, not pinned)
+        except Exception as exc:  # noqa: BLE001
+            page.error(exc, what="pin")
+            return
+        page.notify(
+            f"{updated.id} {'pinned' if updated.settings.pinned else 'unpinned'}", type="positive"
+        )
     await refresh()
 
 
 async def _unload_one(ctx: GuiContext, model_id: str, refresh: Any) -> None:
+    # Captured before the await: the card this button sits on is rebuilt by
+    # the refresh timer while the unload runs (D69 §17).
+    page = _Page.capture()
     # Keyed per model (D50): unloading two different models at once is normal,
     # unloading the same one twice is a double-click racing a child's exit.
-    with single_flight(f"models.unload:{model_id}", f"unload of {model_id}") as claimed:
+    with page, single_flight(f"models.unload:{model_id}", f"unload of {model_id}") as claimed:
         if not claimed:
             return
         with busy(message=f"Unloading {model_id}…"):
@@ -508,17 +587,19 @@ async def _unload_one(ctx: GuiContext, model_id: str, refresh: Any) -> None:
                 # open install gets the manager's 409 as a red toast.
                 await ctx.manager.unload(model_id, force=viewer_may_change_box(ctx))
             except Exception as exc:  # noqa: BLE001
-                notify_error(exc, what="unload")
+                page.error(exc, what="unload")
                 return
-        ui.notify(f"{model_id} unloaded", type="positive")
+        page.notify(f"{model_id} unloaded", type="positive")
         await refresh()
 
 
 async def _restart_model(ctx: GuiContext, model_id: str, refresh: Any) -> None:
+    # Captured before the await, as in _unload_one (D69 §17).
+    page = _Page.capture()
     # Keyed per model (D50): a minute-long reload behind a button that stays
     # enabled is the D50 double-click in miniature, but restarting a *different*
     # model meanwhile is a legitimate thing to want.
-    with single_flight(f"models.restart:{model_id}", f"restart of {model_id}") as claimed:
+    with page, single_flight(f"models.restart:{model_id}", f"restart of {model_id}") as claimed:
         if not claimed:
             return
         with busy(message=f"Restarting {model_id}…"):
@@ -528,9 +609,9 @@ async def _restart_model(ctx: GuiContext, model_id: str, refresh: Any) -> None:
                 # model unloaded when it was working a moment ago.
                 instance = await ctx.manager.load(model_id, force=True, source="gui")
             except Exception as exc:  # noqa: BLE001
-                notify_error(exc, what="restart model")
+                page.error(exc, what="restart model")
                 return
-        ui.notify(f"{model_id} restarted on port {instance.port}", type="positive")
+        page.notify(f"{model_id} restarted on port {instance.port}", type="positive")
         await refresh()
 
 
@@ -541,20 +622,21 @@ def _unload_all_dialog(ctx: GuiContext, loaded_ids: list[str], refresh: Any) -> 
         ui.label(st.unload_all_prompt(loaded_ids)).classes("text-sm whitespace-pre-wrap opacity-80")
 
         async def confirm() -> None:
+            page = _Page.capture()  # before the await (D69 §17)
             dialog.close()
             # D50: the dialog closes on the first click, but a second click
             # lands before it does often enough -- and this one stops every
             # child on the box.
-            with single_flight("models.unload_all", "unload all") as claimed:
+            with page, single_flight("models.unload_all", "unload all") as claimed:
                 if not claimed:
                     return
                 with busy(message="Unloading every model…"):
                     try:
                         unloaded = await ctx.manager.unload_all(force=viewer_may_change_box(ctx))
                     except Exception as exc:  # noqa: BLE001
-                        notify_error(exc, what="unload all")
+                        page.error(exc, what="unload all")
                         return
-                ui.notify(f"unloaded {len(unloaded)} model(s)", type="positive")
+                page.notify(f"unloaded {len(unloaded)} model(s)", type="positive")
                 await refresh()
 
         with ui.row().classes("justify-end gap-2 w-full"):
@@ -573,9 +655,12 @@ async def _restart_engines(ctx: GuiContext, refresh: Any) -> None:
     for a misbehaving child, and a child that is misbehaving on the active build
     is exactly the one a staleness filter would skip.
     """
+    # Minutes of reloads: the viewer may well have reconnected or closed the
+    # tab by the end, so the page is captured first (D69 §17).
+    page = _Page.capture()
     # D50: minutes of reloads behind a button that never disables. Same key
     # shape as every other long action, so a second click is told, not obeyed.
-    with single_flight("models.restart_engines", "engine restart") as claimed:
+    with page, single_flight("models.restart_engines", "engine restart") as claimed:
         if not claimed:
             return
         with busy(message="Restarting the inference engines…"):
@@ -585,9 +670,9 @@ async def _restart_engines(ctx: GuiContext, refresh: Any) -> None:
 
                 payload = await restart_backend(api_request(ctx))
             except Exception as exc:  # noqa: BLE001
-                notify_error(exc, what="restart engines")
+                page.error(exc, what="restart engines")
                 return
-        ui.notify(st.restart_backend_note(payload), type="positive", multi_line=True)
+        page.notify(st.restart_backend_note(payload), type="positive", multi_line=True)
         await refresh()
 
 
@@ -603,11 +688,12 @@ def _restart_server_dialog(ctx: GuiContext, banner: Any) -> None:
         ui.label(st.RESTART_SERVER_WARNING).classes("text-sm opacity-80")
 
         async def confirm() -> None:
+            page = _Page.capture()  # before the await (D69 §17)
             dialog.close()
             # D50: two restart requests are two respawn attempts racing one
             # dying process, which is how a restart turns into a box with no
             # gateway on it.
-            with single_flight("server.restart", "server restart") as claimed:
+            with page, single_flight("server.restart", "server restart") as claimed:
                 if not claimed:
                     return
                 banner.set_text("Restarting the server… this page will reconnect by itself.")
@@ -619,11 +705,14 @@ def _restart_server_dialog(ctx: GuiContext, banner: Any) -> None:
                     # is what that confirmation means here.
                     payload = await restart_server(api_request(ctx), confirm=True)
                 except Exception as exc:  # noqa: BLE001
-                    banner.set_text("")
-                    notify_error(exc, what="restart server")
+                    if element_alive(banner):
+                        banner.set_text("")
+                    page.error(exc, what="restart server")
                     return
-                banner.set_text(st.restart_server_note(payload))
-                ui.notify(st.restart_server_note(payload), type="warning", multi_line=True)
+                # The restart is what tears pages down; paint only what is left.
+                if element_alive(banner):
+                    banner.set_text(st.restart_server_note(payload))
+                page.notify(st.restart_server_note(payload), type="warning", multi_line=True)
 
         with ui.row().classes("justify-end gap-2 w-full"):
             ui.button("Cancel", on_click=dialog.close).props("flat")

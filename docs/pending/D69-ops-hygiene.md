@@ -193,3 +193,35 @@ full layers: 24,576 MiB at 131,072 f16.
 - a DeepSeek2-shaped MLA header keeps all five MLA keys, with unchanged sizing;
 - an iSWA header keeps both `swa_window` and the raw `sliding_window`, with unchanged sizing;
 - a plain llama with `rope.dimension_count` gains none of the new keys.
+
+### §17 — Dashboard actions draw on the page, not on the card the refresh deleted
+
+**Evidence.** NiceGUI runs a click handler inside the slot of the button that fired it, and
+`ui.notify` finds its client through that slot. The Loaded models panel rebuilds every card on its
+refresh timer. By the time `_unload_one` had awaited `manager.unload`, the card was gone: `ui.notify`
+raised `The parent element this slot belongs to has been deleted`, and NiceGUI's own exception handler
+raised it again (35 lines each on 09-13 17:27, 09-15 22:16, 09-16 16:39, 09-22 23:10 and 23:19).
+
+**Change** (`gui/tabs/dashboard.py` only). A small `_Page` helper captures `ui.context.client` at
+handler entry, while the button's slot still exists. `with page:` enters the page's own content slot
+for the whole action, so the busy spinner and the toast are drawn at page level and outlive a card
+rebuild. After the await, `page.notify` / `page.error` draw only if the client is still alive; a closed
+browser gets a log line (`gui action failed … page=closed`), not NiceGUI's "Client has been deleted but
+is still being used". With no page context (a direct call), nothing is bound and behaviour is as before.
+
+Every awaiting handler with that shape uses it: `_unload_one`, `_restart_model`, `_toggle_pin` and
+`_reclaim_orphans` (whose Reclaim button sits in a row the holders timer rebuilds), the Unload-all and
+Restart-server dialogs' `confirm`, and `_restart_engines`. The restart dialog also paints its banner
+only while `element_alive(banner)`. `gui/tabs/chat.py` is untouched, as the brief asked, and the D50
+single-flight and D32 guards are unchanged.
+
+**Tests.** `tests/unit/test_dashboard_page_context.py` stands in for NiceGUI's slot lookup (the client
+is reachable through the card's slot only while the card exists).
+- Unload, restart and pin each toast at page level after their card was deleted mid-await.
+- A failure after the card is gone is still a red toast.
+- A page whose browser went away gets no toast, and its refresh still runs.
+- A static guard checks that every awaiting handler captures the page and none toasts through the
+  slot.
+
+All six fail against the old code. The existing static guards in `test_gui.py` (single-flight keys,
+`require_local_admin`) pass unchanged.
