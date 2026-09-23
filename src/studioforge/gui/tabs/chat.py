@@ -620,7 +620,7 @@ def _render_thumbs(container: Any, images: list[dict[str, str]]) -> None:
         for image in images:
             with ui.column().classes("gap-0 items-center"):
                 ui.image(image["url"]).classes("w-16 h-16 object-cover rounded")
-                ui.label(image["name"][:16]).classes("text-[10px] opacity-60")
+                ui.label(image["name"][:16]).classes("text-[11px] opacity-60")
 
 
 def _bubble(who: str, text: str) -> Any:
