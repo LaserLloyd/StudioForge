@@ -1163,19 +1163,22 @@ class ArchitectureTable:
     """The architecture names one build's ``llama`` library can load (D66).
 
     Derived from the bytes once and kept instead of them: every maximal run of
-    identifier characters that ends at a NUL -- a few thousand, ~200 KiB for a
-    3 MB ``llama.dll`` -- as a sorted list of reversed tails (for the suffix
-    search) and a set of the runs themselves (for the exact one).
+    identifier characters that ends at a NUL -- ~3,600 runs, under 0.5 MiB and
+    ~0.1 s to build for the 3 MB b11037 ``llama.dll`` -- as a sorted list of
+    reversed tails (for the suffix search) and a set of the runs themselves
+    (for the exact one).
 
     **The verdict is one-sided on purpose.** *Absent* -- ``name + NUL`` nowhere
     in the library -- is certain: llama.cpp resolves ``general.architecture``
     by comparing it against exactly these literals, and a name that is not
     among them is ``unknown model architecture`` at startup. *Present* only
     means "assume supported", and it counts a name found **only as the tail of
-    a longer literal** too (``evidence == "suffix"``): GNU ld and lld
-    tail-merge string literals, so on such a build ``"gemma"`` may exist only
-    inside ``"recurrentgemma"`` and ``"bert"`` only inside ``"nomic-bert"``, and
-    requiring a clean preceding byte there would refuse models the build loads.
+    a longer literal** too (``evidence == "suffix"``): linkers tail-merge
+    string literals. The live, MSVC-built b11037 ``llama.dll`` holds ``qwen2``
+    only as the end of ``rwkv6qwen2`` -- ``\\0qwen2\\0`` occurs nowhere -- and
+    GNU ld or lld may do the same to ``gemma`` (``recurrentgemma``) or ``bert``
+    (``nomic-bert``); requiring a clean preceding byte would refuse models the
+    build loads.
     A present name may also be a pre-tokenizer or some other string that happens
     to share it; a false *yes* costs the spawn it would have cost anyway (and
     the runtime memo remembers it), a false *no* would refuse a working model --

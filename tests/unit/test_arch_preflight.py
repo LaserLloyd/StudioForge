@@ -615,6 +615,24 @@ async def test_a_reinstalled_build_forgets_it(tmp_path: Path) -> None:
     assert sup.starts == 2
 
 
+async def test_a_rejection_that_may_be_the_drafts_is_refused_but_not_remembered(
+    tmp_path: Path,
+) -> None:
+    """The rejected name is not the model's own: a draft model launched with it
+    is the likely culprit, and detaching the draft is a settings change, not a
+    file change -- so this request is refused, the next one launches."""
+    record = qwen(path=model_file(tmp_path))
+    sup = StubSupervisor({None: None}, fail_times=1, stderr=K2_TAIL)
+    manager, _, _ = make_manager([record], sup)
+    with pytest.raises(UnsupportedArchitectureError) as caught:
+        await manager.load(OK)
+    assert caught.value.details["rejected"] == {"kind": "architecture", "name": "k2-horizon"}
+    assert "may belong to a draft model" in caught.value.message
+    assert "will not launch it on this build again" not in caught.value.message
+    assert (await manager.load(OK)).state == "ready"
+    assert sup.starts == 2
+
+
 async def test_a_missing_file_is_not_an_unsupported_model(tmp_path: Path) -> None:
     record = k2(path=model_file(tmp_path))
     sup = StubSupervisor({None: None}, fail_times=1, stderr=MISSING_FILE_TAIL)
@@ -694,6 +712,32 @@ def test_the_gui_badge_and_load_refusal() -> None:
     assert st.arch_badge(full) == ("Unsupported arch", "the whole reason")
     assert st.arch_load_refusal(full) == "the whole reason"
     assert st.arch_load_refusal({"arch_supported": True}) is None
+
+
+def test_the_models_tab_shows_the_badge_and_says_why_instead_of_loading(tmp_path: Path) -> None:
+    """Rendered for real: the row carries the "Unsupported arch" badge with the
+    reason, and its Load button explains rather than opening a doomed load."""
+    from studioforge.gui.app import create_gui_app
+    from tests.unit.test_gui import _FakeRegistry, _FakeState
+
+    config = Config(data_dir=tmp_path / "data")
+    config.models.dir = tmp_path / "models"
+    config.models.dir.mkdir(parents=True, exist_ok=True)
+    config.ensure_dirs()
+    manager, sup, plan = make_manager([k2(), qwen()])
+    state = _FakeState(config)
+    state.registry = _FakeRegistry([k2(), qwen()])
+    state.manager = manager
+    state.supervisor = sup
+    app = create_gui_app(config, api_state=state)
+    with TestClient(app) as client:
+        text = client.get("/?tab=models").text
+    assert "Model library could not be rendered" not in text
+    assert st.UNSUPPORTED_ARCH_BADGE in text
+    assert "Cannot load:" in text, "the Load button's tooltip carries the reason"
+    assert "does not include" in text and "k2-horizon" in text
+    assert text.count(st.UNSUPPORTED_ARCH_BADGE) >= 1
+    assert plan.calls == 0 and sup.starts == 0
 
 
 def test_the_chat_tabs_question_has_a_short_answer() -> None:

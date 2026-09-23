@@ -119,6 +119,20 @@ def test_a_name_left_only_inside_a_tail_merged_literal_still_counts() -> None:
     assert table.evidence("llama") == "exact"
 
 
+def test_the_live_builds_qwen2_lives_only_inside_rwkv6qwen2() -> None:
+    """The bytes around ``qwen2`` in the live, MSVC-built b11037 ``llama.dll``:
+    the linker merged the literal into ``rwkv6qwen2``, so ``\\0qwen2\\0`` occurs
+    nowhere. A rule demanding a clean preceding byte would refuse every qwen2
+    model -- and lose the ``qwen2`` canary, blinding the whole probe."""
+    blob = b"\x00llama\x00gemma\x00\x00olmo2\x00mimo2\x00plamo2\x00rwkv6qwen2\x00mell"
+    assert b"\x00qwen2\x00" not in blob
+    table = ArchitectureTable.from_bytes(blob)
+    assert table.recognised
+    assert table.knows("qwen2") is True
+    assert table.evidence("qwen2") == "suffix"
+    assert table.evidence("rwkv6qwen2") == "exact"
+
+
 def test_a_longer_literal_does_not_make_its_prefix_known() -> None:
     """``name + NUL`` must be in the library: a longer name that STARTS with it
     is not a match -- "k2-horizon-v2" says nothing about "k2-horizon"."""

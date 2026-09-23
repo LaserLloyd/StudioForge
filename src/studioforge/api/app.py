@@ -515,6 +515,12 @@ async def _boot(state: Any, *, start_background: bool) -> None:
             except Exception as exc:  # noqa: BLE001
                 log.error("engine not ready", error=str(exc))
                 state.engine_status = {"ok": False, "tag": None, "error": str(exc)}
+            # D66: read the active build's architecture table now, off the event
+            # loop (a 3 MB read and scan, ~0.1 s), so the first load's preflight
+            # is a cached lookup. Outside the engine's try on purpose: whatever
+            # happens here says nothing about whether the engine is ready.
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(state.engine_manager.architecture_table, None)
             boot.set_phase("starting model manager")
             await state.manager.start()
             # Resumes anything a crash left half-downloaded. Never fatal --

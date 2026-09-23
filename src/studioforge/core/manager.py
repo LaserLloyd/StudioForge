@@ -1225,7 +1225,15 @@ class ModelManager:
         kind, name = found
         table, tag = self._arch_table_for(record.settings.engine_tag, None)
         signature = file_signature(record.path)
-        if signature is not None:
+        # Remembered against THIS file only when the rejection is its own: a
+        # different architecture name, or a pre-tokenizer when a draft model
+        # rode along, may be the draft's -- and detaching the draft (a settings
+        # change, not a file change) must not leave the model refused.
+        arch = record.architecture
+        if (not arch or arch == "unknown") and record.meta is not None:
+            arch = record.meta.architecture
+        own = name == arch if kind == "architecture" else not record.settings.draft_model_id
+        if signature is not None and own:
             # A file that cannot be stat'ed cannot be keyed; the refusal below
             # still stands for this request.
             self._arch_rejections.record(
@@ -1236,35 +1244,37 @@ class ModelManager:
                     model_id=record.id,
                     kind=kind,
                     name=name,
-                    architecture=record.architecture,
+                    architecture=arch,
                     engine_signature=table.signature if table is not None else None,
                     scan_marker=self._scan_marker(),
                 )
             )
-        # The catalog recommends by the verdict; a cached one would keep
-        # recommending this model for another CACHE_TTL_S.
-        self._catalog_cache = None
+            # The catalog recommends by the verdict; a cached one would keep
+            # recommending this model for another CACHE_TTL_S.
+            self._catalog_cache = None
         log.warning(
-            "the engine rejected the model at startup; not launching it on this build again",
+            "the engine rejected the model at startup",
             model_id=record.id,
             engine_tag=tag,
             kind=kind,
             name=name,
+            remembered=signature is not None and own,
         )
         verdict = self.arch_verdict(record)
         if verdict.supported is not False:
-            # Unkeyable (the file could not be stat'ed): refuse this request
-            # with the same words, without remembering it.
+            # Not remembered (the file could not be stat'ed, or the name may be
+            # a draft's): refuse this request with the same words, only.
             verdict = ArchVerdict(
                 model_id=record.id,
-                architecture=record.architecture,
+                architecture=arch,
                 supported=False,
                 engine_tag=tag,
                 pinned=bool(record.settings.engine_tag),
                 source="runtime",
                 rejected_kind=kind,
-                rejected_name=name if name != record.architecture else None,
+                rejected_name=name if name != arch else None,
                 first_failed_at=time.time(),
+                remembered=False,
             )
         error = verdict.error()
         error.details["stderr"] = tail

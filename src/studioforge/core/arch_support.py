@@ -106,6 +106,9 @@ class ArchVerdict:
     rejected_name: str | None = None
     #: When a runtime verdict's launch failed (epoch seconds).
     first_failed_at: float | None = None
+    #: Whether a runtime rejection is remembered for later loads -- false when
+    #: the rejected name may be a draft model's, or the file could not be keyed.
+    remembered: bool = True
     #: For a pinned build that lacks the architecture: the active build, and
     #: whether it includes it -- the one case a StudioForge setting does fix.
     active_tag: str | None = None
@@ -157,9 +160,13 @@ class ArchVerdict:
             phrase = _ENGINE_PHRASE[self.rejected_kind]
             text = (
                 f"'{self.model_id}' uses {what}, which {build} rejected at startup "
-                f"('{phrase}'), so it cannot be loaded. StudioForge will not launch it on "
-                f"this build again until the engine or the model file changes."
+                f"('{phrase}'), so it cannot be loaded."
             )
+            if self.remembered:
+                text += (
+                    " StudioForge will not launch it on this build again until the engine "
+                    "or the model file changes."
+                )
         else:
             text = (
                 f"'{self.model_id}' uses {what}, which {build} does not include, so it "
