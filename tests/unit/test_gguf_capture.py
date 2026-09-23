@@ -54,7 +54,8 @@ def _laguna(tmp_path: Path) -> GgufMeta:
 
 
 def test_the_meta_format_version_was_bumped_so_cached_rows_reparse() -> None:
-    assert gguf.META_FORMAT_VERSION == 3
+    # D69 needed at least 3; D71 moved it on to 4 (test_planner_moe_compute).
+    assert gguf.META_FORMAT_VERSION >= 3
 
 
 def test_laguna_keeps_its_window_head_counts_and_dense_prefix(tmp_path: Path) -> None:

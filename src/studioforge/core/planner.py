@@ -934,6 +934,46 @@ def active_weight_bytes(meta: Any, weights_bytes: int) -> int:
     return weights
 
 
+def compute_basis_bytes(meta: Any, weights_bytes: int) -> int:
+    """The weight bytes the compute term is a fraction of (D71).
+
+    Dense: all of them, as always. MoE: the dense trunk plus the share of
+    the routed experts a token actually runs -- ``trunk + experts *
+    n_expert_used / n_expert``. The compute buffer tracks the width of what
+    runs, and an expert that is not selected adds bytes but no width: a
+    122B-A10B is ~95% routed experts, so a fraction of *all* of it charged
+    12.4 GB for graph buffers the child measured at under 1 GB.
+
+    Needs ``meta.extra['expert_tensor_bytes']`` from the GGUF tensor table
+    (:func:`studioforge.core.gguf.expert_tensor_bytes`). Without it -- a
+    header read over HTTP, a table that could not be summed -- the answer is
+    the whole weights: the old, conservative charge.
+    """
+    weights = max(0, int(weights_bytes))
+    n_expert = int(getattr(meta, "n_expert", 0) or 0)
+    n_used = int(getattr(meta, "n_expert_used", 0) or 0)
+    extra = getattr(meta, "extra", None)
+    experts = 0
+    if isinstance(extra, Mapping):
+        raw = extra.get("expert_tensor_bytes")
+        if isinstance(raw, int) and not isinstance(raw, bool):
+            experts = raw
+    if n_expert > 1 and 0 < n_used < n_expert and 0 < experts <= weights:
+        return (weights - experts) + experts * n_used // n_expert
+    return weights
+
+
+def kq_mask_bytes(ctx_cells: int, ubatch: int) -> int:
+    """The f16 attention mask one device reserves: ``[n_kv, n_ubatch]`` (D71).
+
+    Every device that runs attention layers gets its own copy, and it grows
+    with the context -- 256 MiB per card at 262k. A dense model's compute
+    fraction has always had room for it; a MoE's, sized from far fewer
+    bytes, has to charge it.
+    """
+    return max(0, int(ctx_cells)) * max(DEFAULT_UBATCH, int(ubatch or 0)) * 2
+
+
 def max_parallel_for(
     *,
     kv_budget_bytes: int,
@@ -1200,7 +1240,9 @@ class Planner:
           (``ctx_size * parallel``); see :func:`kv_alloc_bytes`
         * compute/graph buffers -- scratch that scales with model width, plus
           the growth a micro-batch above the engine's 512 costs on every
-          device (:func:`ubatch_scratch_bytes`, D40)
+          device (:func:`ubatch_scratch_bytes`, D40); for a MoE, sized from
+          the weights that run plus a per-device floor and attention mask
+          (:func:`compute_basis_bytes`, :func:`kq_mask_bytes`, D71)
         * mmproj weights + the image-encoding buffer, for vision models
         * adapter weights
         * draft model weights + its own KV cache
@@ -1242,10 +1284,28 @@ class Planner:
         # engine's default micro-batch the scratch grows with -ub on every device,
         # and that growth is charged explicitly rather than folded into the
         # fraction (which is calibrated against loads at the default).
-        compute = max(
-            planner_cfg.compute_overhead_floor_mb * MB,
-            int(weights * planner_cfg.compute_overhead_fraction),
-        ) + ubatch_scratch_bytes(meta, ubatch=micro_batch, n_devices=n_devices)
+        basis = compute_basis_bytes(meta, weights)
+        if basis < weights:
+            # A MoE (D71): the fraction applies to the weights that run, not
+            # to every expert. What that smaller proxy no longer covers is
+            # charged as the allocations it really is: each device's own
+            # compute buffer (the floor, per device) and each device's copy
+            # of the attention mask, which grows with the context.
+            n_dev = max(1, n_devices)
+            mask_cells = max(1, ctx_size) * (max(1, parallel) if record.settings.kv_unified else 1)
+            compute = (
+                max(
+                    planner_cfg.compute_overhead_floor_mb * MB * n_dev,
+                    int(basis * planner_cfg.compute_overhead_fraction),
+                )
+                + kq_mask_bytes(mask_cells, micro_batch) * n_dev
+            )
+        else:
+            compute = max(
+                planner_cfg.compute_overhead_floor_mb * MB,
+                int(weights * planner_cfg.compute_overhead_fraction),
+            )
+        compute += ubatch_scratch_bytes(meta, ubatch=micro_batch, n_devices=n_devices)
 
         mmproj_bytes = 0
         mmproj_compute = 0

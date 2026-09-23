@@ -6814,3 +6814,102 @@ through `_forward`/`_stream_upstream`/`_stream_with_jit_load` and the five `ensu
 unload routes, `_peer_host`, the evictions docstring. `management.py`: imports, `_compact_instance`,
 `server_status`, `unload_model`. `errors.py`, `planner.py`, `capabilities.py`, `catalog.py`,
 `dashboard.py` and `models.py` (beyond one `source="gui"` line) were not touched.
+
+## D71 -- A MoE's compute term is sized from the weights that run, with a per-device floor and mask
+
+**Status.** Landed on 2026-09-24 at the owner's request ("Fix the moe computation, no other
+changes"). This was item 12 of the 2026-09-22 Fable review, where the formula change was held for
+sign-off. Dense models are unchanged byte for byte. `META_FORMAT_VERSION` 3 -> 4, so every model
+re-reads its header once at the next boot scan (33 models took 1.8 s on the D69 bump).
+
+**Context.** `Planner.estimate` charged every model's compute/graph buffers as
+`max(floor, compute_overhead_fraction x weights)`. The fraction is a proxy for model *width*. For
+a mixture-of-experts it is a fraction of bytes that never run together: 86-95 % of a MoE's
+weights are routed experts, and only `n_expert_used / n_expert` of them run for any token.
+Measured against every per-pid load observation that carries its formula (D63), the old term
+over-charged every MoE in the library:
+
+| model | experts | formula compute | measured residual |
+|---|---|---|---|
+| Qwen3.5-122B-A10B Q5_K_M | 94.6 % of 81 GiB, 8/256 | 12,438 MiB | 877 MiB (16k x 4, 4 cards) |
+| Hy-MT2-30B-A3B Q4_K_S | 93.9 % of 16 GiB, 8/128 | 2,453 MiB | -63 .. 708 MiB |
+| Orion-26B-A4B Q5_K_M | 90.4 % of 17.8 GiB, 8/128 | 2,735 MiB | 467 .. 975 MiB |
+| Laguna-S-2.1 Q3_K_S | 85.8 % of 53 GiB, 10/256 | 8,139 MiB | negative (over elsewhere too) |
+
+The "measured residual" is `actual - (formula total - formula compute)`, from
+`load_observations`. It absorbs the CUDA-context and KV errors as well, which is why it can go
+negative. Child logs at `-lv 3` do not print llama.cpp's compute buffer sizes, so this is the
+only ground truth the rig has. Observations are taken right after a load, so they are
+load-time allocations.
+
+**Decision.**
+
+1. **The parser counts the routed experts.** `gguf.expert_tensor_bytes` sums every tensor whose
+   name carries `_exps.` (`ffn_{gate,up,down,gate_up}_exps`, and their biases). A shared expert
+   (`*_shexp`) runs on every token, so it counts as trunk. `read_meta` stores the sum as
+   `extra["expert_tensor_bytes"]`. A split model's count is summed over every shard and is
+   dropped entirely if a shard is missing, because half a count would make the trunk look bigger
+   than it is. The remote (HuggingFace) reader parses without the tensor table, so remote
+   headers carry no count.
+2. **The basis.** `planner.compute_basis_bytes(meta, weights)` is
+   `(weights - experts) + experts x n_expert_used // n_expert` for a MoE with a sane count, and
+   the whole `weights` otherwise: dense, no count, a count larger than the weights, a non-integer
+   count, or every expert running.
+3. **The MoE compute term** (only when the basis is below the weights):
+   `max(floor x n_devices, fraction x basis) + kq_mask_bytes(cells, ubatch) x n_devices`, plus
+   the unchanged `ubatch_scratch_bytes`.
+   - The floor applies per device because every card in a split has its own compute buffer.
+   - The KQ mask is the f16 `[n_kv, n_ubatch]` tensor each device reserves. `cells` is the
+     per-slot context, or every slot's when `kv_unified` is set. It grows with context (256 MiB
+     per card at 262k), which the old whole-weights fraction always had room for and a basis
+     one tenth the size does not.
+4. **Dense models keep `max(floor, fraction x weights)` exactly.** They get no per-device floor
+   and no mask term. The fraction's calibration (D18/D51/D63) is a dense calibration and stays
+   one.
+
+**Result against the same observations** (formula total vs measured; + is an over-estimate):
+
+| model / load | before | after |
+|---|---|---|
+| Hy-MT2, ten configurations, 1-3 cards | +8.5 .. +14.4 % | +0.8 .. +2.8 % |
+| Orion-26B-A4B, 1 and 2 cards | +8.5 .. +10.4 % | -0.5 .. +0.3 % |
+| 122B-A10B 16k x 4, 4 cards | +13.3 % | +0.9 % |
+| 122B-A10B 131k f16, 4 cards | +11.2 % | -0.3 % |
+| Laguna-S-2.1 8k, 4 cards | +15.0 % | +3.7 % |
+| gemma-4-26B-A4B 262k q8_0, 1 card | +5.3 % | -1.4 % |
+| 122B-A10B 262k q8_0/q4_0, 4 cards | +6.3 % | -4.3 % |
+| gemma-4-26B-A4B 262k q8_0, 2 cards | -7.7 % | -10.8 % |
+
+The seven dense configurations re-estimated alongside came out byte-identical once the
+many-slots micro-batch (D40) was applied as the child ran it.
+
+**Known limits, left honest.**
+- **Two long-context loads now sit below their measurement**, both inside the per-card 10 %
+  headroom (`planner.headroom_fraction`), and both are configurations D51 already corrects from
+  their own observation (`observed x 1.10`).
+  - The gemma-4-26B two-card shortfall (-2.9 GB) is not compute. The old formula missed it by
+    1.8 GB too, and the same model on one card at the same context lands within 1.4 %. Adding
+    the second 3090 costs about 3.2 GB for reasons outside this term.
+  - The 122B's 262k q8_0/q4_0 residual grows with context faster than the mask: about 24 KiB
+    per token across the four cards between 131k and 262k. That points at the hybrid
+    (qwen35moe) KV/state or the flash-attention path for mixed K/V types.
+  - Both are for a KV/CUDA-context follow-up, not for a compute proxy.
+- **Where the rest of the residual goes.** Much of what remains of a multi-card residual is the
+  CUDA context. `planner.cuda_context_mb` is 300 per card, and a second RTX 5090 measured
+  roughly +400 MiB of residual (Hy-MT2). The per-device floor covers it for a MoE. For dense
+  models the whole-weights fraction always did.
+- **Untouched on purpose.** `active_weight_bytes` (the throughput/knee estimate), the D63
+  calibrator (a MoE row is still read against its whole weights, which only damps its pull on a
+  fraction already at the 0.15 ceiling), the CUDA context charge, and remote/Downloads fit lines
+  (no count in a remote header, so they keep the conservative whole-weights charge).
+
+**Tests.** `tests/unit/test_planner_moe_compute.py`:
+- **Parser:** routed experts counted and shared ones not, dense has no key, split models summed,
+  a missing shard dropped, a remote parse has no count, `META_FORMAT_VERSION == 4`.
+- **Basis:** trunk plus routed share, dense and no-count fallbacks, nonsense counts.
+- **Mask:** its arithmetic.
+- **Estimate:** the live 122B (12,438 -> ~1,664 MiB), the per-device floor, the mask following
+  the context, unified KV, dense byte-identical at every device count and context, and an
+  uncounted MoE byte-identical to before.
+
+`test_gguf_capture.py` now pins `>= 3`: D69 needed the bump, D71 moved it on.

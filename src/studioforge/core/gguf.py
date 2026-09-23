@@ -78,7 +78,10 @@ GGUF_MAGIC_SWAPPED: Final = b"FUGG"  # big-endian writers emit the magic reverse
 #: 2 -> 3: sliding_window without a pattern, per-layer head_count values,
 #:         leading_dense_block_count and the MLA keys -- captured for a later
 #:         sizing change; nothing reads them yet (D69 §13).
-META_FORMAT_VERSION: Final = 3
+#: 3 -> 4: expert_tensor_bytes -- the bytes in routed-expert tensors, so the
+#:         planner can size a MoE's compute term from the weights that
+#:         actually run (D71).
+META_FORMAT_VERSION: Final = 4
 
 DEFAULT_ALIGNMENT: Final = 32
 
@@ -1190,23 +1193,43 @@ def _sum_shard_bytes(
     for the planner rather than cosmetic.
     """
     total = 0
+    experts = 0
     counted: list[str] = []
     missing: list[str] = []
     for candidate in shard_paths:
         shard = Path(candidate)
         if _same_file(shard, path):
             total += main.total_tensor_bytes
+            experts += expert_tensor_bytes(main.tensors)
             counted.append(shard.name)
             continue
         if not shard.is_file():
             missing.append(shard.name)
             continue
-        total += read_gguf(shard).total_tensor_bytes
+        parsed = read_gguf(shard)
+        total += parsed.total_tensor_bytes
+        experts += expert_tensor_bytes(parsed.tensors)
         counted.append(shard.name)
     if missing:
         extra["missing_shards"] = missing
     extra["shard_count"] = len(counted)
+    # Only a complete count is worth keeping: experts summed over some of
+    # the shards would make a MoE's trunk look bigger than it is (D71).
+    if experts and not missing:
+        extra["expert_tensor_bytes"] = experts
     return total
+
+
+#: Routed-expert tensors carry this in their name (``blk.N.ffn_gate_exps.weight``,
+#: ``ffn_up_exps``, ``ffn_down_exps``, ``ffn_gate_up_exps``, and their biases).
+#: A shared expert is ``*_shexp`` and runs on every token, so it is part of
+#: the dense trunk and deliberately does not match.
+EXPERT_TENSOR_MARKER: Final = "_exps."
+
+
+def expert_tensor_bytes(tensors: Sequence[TensorInfo]) -> int:
+    """Bytes held by a MoE's routed experts; 0 for a dense model (D71)."""
+    return sum(t.n_bytes for t in tensors if EXPERT_TENSOR_MARKER in t.name)
 
 
 def _same_file(left: Path, right: Path) -> bool:
@@ -1414,8 +1437,15 @@ def meta_from_gguf(
 
     if shard_paths:
         tensor_bytes = _sum_shard_bytes(path, gguf, shard_paths, extra)
-    elif tensor_bytes <= 0:
-        tensor_bytes = gguf.total_tensor_bytes
+    else:
+        if tensor_bytes <= 0:
+            tensor_bytes = gguf.total_tensor_bytes
+        # The remote reader parses without the tensor table, so a model
+        # read over HTTP has no count and keeps the whole-weights compute
+        # term -- the conservative side (D71).
+        experts = expert_tensor_bytes(gguf.tensors)
+        if experts:
+            extra["expert_tensor_bytes"] = experts
     if local and not shard_paths:
         implied_missing = missing_shard_names(path)
         if implied_missing:
