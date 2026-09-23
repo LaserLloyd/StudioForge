@@ -633,6 +633,27 @@ async def test_a_rejection_that_may_be_the_drafts_is_refused_but_not_remembered(
     assert sup.starts == 2
 
 
+async def test_the_listed_failure_carries_no_absolute_path() -> None:
+    """``last_load_failure`` is on an open listing (D55): basenames only."""
+
+    class Unlaunchable(StubSupervisor):
+        async def start(self, record: ModelRecord, plan: LoadPlan, **kwargs: Any) -> Any:
+            self.starts += 1
+            raise ModelLoadError(
+                f"Could not launch llama-server for '{record.id}': [WinError 2] The system "
+                "cannot find the file specified: "
+                "'C:\\Users\\example\\engines\\b1\\llama-server.exe'",
+                details={"argv": ["llama-server"]},
+            )
+
+    manager, _, _ = make_manager([qwen()], Unlaunchable())
+    with pytest.raises(ModelLoadError):
+        await manager.load(OK)
+    message = manager.load_support_fields(qwen())["last_load_failure"]["message"]
+    assert "llama-server.exe" in message
+    assert "Users" not in message and "engines" not in message
+
+
 async def test_a_missing_file_is_not_an_unsupported_model(tmp_path: Path) -> None:
     record = k2(path=model_file(tmp_path))
     sup = StubSupervisor({None: None}, fail_times=1, stderr=MISSING_FILE_TAIL)

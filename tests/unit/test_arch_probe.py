@@ -371,6 +371,16 @@ def test_other_failures_are_not_architecture_rejections(line: str) -> None:
     assert startup_rejection([line]) is None
 
 
+def test_paths_in_a_listed_failure_are_reduced_to_basenames() -> None:
+    from studioforge.core.arch_support import redact_paths
+
+    assert redact_paths("failed: 'D:\\data\\engines\\b1\\llama-server.exe' (x)") == (
+        "failed: 'llama-server.exe' (x)"
+    )
+    assert redact_paths("open /home/example/models/k2.gguf failed") == "open k2.gguf failed"
+    assert redact_paths("no path here") == "no path here"
+
+
 def test_a_file_signature_is_mtime_and_size(tmp_path: Path) -> None:
     path = tmp_path / "model.gguf"
     path.write_bytes(b"GGUF" + b"\x00" * 60)

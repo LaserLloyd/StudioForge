@@ -31,7 +31,7 @@ import re
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Literal
 
 from studioforge.errors import UnsupportedArchitectureError
@@ -69,6 +69,28 @@ def startup_rejection(stderr_tail: Sequence[Any]) -> tuple[RejectedKind, str] | 
             if match:
                 return kind, match.group(1)
     return None
+
+
+#: An absolute path in prose -- the same shape the D55 log redaction matches.
+_ABS_PATH_RE = re.compile(
+    r"(?:[A-Za-z]:[\\/]|\\\\[^\\/\s]+[\\/])[^\s\"'<>|]*"
+    r"|/(?:home|root|Users|usr|opt|var|etc|mnt|media|srv|tmp)/[^\s\"'<>|]*"
+)
+
+
+def redact_paths(text: str) -> str:
+    """Every absolute path in ``text`` reduced to its basename (the D55 rule).
+
+    For a failure shown on an open listing (``last_load_failure``): the
+    username, the drive layout and the data-dir path stay off the wire, and
+    ``llama-server.exe`` or ``model.gguf`` still says what went wrong.
+    """
+
+    def basename(match: re.Match[str]) -> str:
+        token = match.group(0)
+        return PureWindowsPath(token).name or PurePosixPath(token).name or token
+
+    return _ABS_PATH_RE.sub(basename, text)
 
 
 def file_signature(path: Path | str | None) -> tuple[int, int] | None:

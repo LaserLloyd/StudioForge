@@ -99,7 +99,8 @@ evening and 09-22 morning are the catalog's preview planners, not loads.)
    `unsupported_reason`. A catalog row that cannot load is not planned: `fits_now: false` with
    `fits_now_basis`, no options, no placements, `recommended: null` -- the compact view drops a
    `true` so loadable rows cost nothing. `last_load_failure {at, code, message, engine_tag}` shows the
-   last launch that died until one succeeds. `ModelManager.unsupported_reason(record)` is the Chat
+   last launch that died until one succeeds (the message's first line, absolute paths reduced to
+   basenames per D55 -- the listing is open). `ModelManager.unsupported_reason(record)` is the Chat
    tab's short answer. The GUI Models tab shows an "Unsupported arch" badge (theme `negative`) with
    the reason, and Load explains instead of loading; the settings dialog and its fit verdict say so.
    `/api/capabilities` judges each model from its build's library (`library.unsupported_by_engine`
@@ -135,19 +136,19 @@ all eight installed builds, b10425 through b11037. The independently reviewed ex
 exactly (`qwen35`, `qwen35moe`, `gemma4`, `kimi-linear`, `laguna`, `muse-glimmer`, `hy_v3`,
 `deepseek4`, `nemotron_h_moe`); `k2-horizon` and `longcat-flash-sparse` are absent.
 
-**Tests.** `tests/unit/test_arch_probe.py` (41): the table (absent/exact/suffix, the live build's
+**Tests.** `tests/unit/test_arch_probe.py` (42): the table (absent/exact/suffix, the live build's
 `qwen2`-inside-`rwkv6qwen2` bytes, a longer literal does not make its prefix known,
 non-architecture names, canaries), the library search per platform
 name and `lib/`, the per-signature cache and its re-read, an I/O error not cached, the engine manager
 and supervisor answers, `on_engine_change`, the two startup markers and the failures that are not
-them, the memo's keying and lapses, the verdict's words, remedy, details and 400 shape.
-`tests/unit/test_arch_preflight.py` (34): every entry above refuses before any hold, plan, lease,
-eviction or spawn (a lease for K2 evicts nobody; the same lease for a loadable model does); a ready
-resident is handed back but not force-reloaded; "cannot tell" loads; a pinned build names the fix;
-the tier memo only after success; the reconciler, rebalancer and autoload skip with one WARNING; the
-runtime memo and its lapses; a rejection that may be a draft's and a missing file are not memoised;
-the Models tab rendered for real shows the badge and the Load refusal; through the real app with a
-fake engine
+them, the memo's keying and lapses, path redaction, the verdict's words, remedy, details and 400
+shape. `tests/unit/test_arch_preflight.py` (35): every entry above refuses before any hold, plan,
+lease, eviction or spawn (a lease for K2 evicts nobody; the same lease for a loadable model does); a
+ready resident is handed back but not force-reloaded; "cannot tell" loads; a pinned build names the
+fix; the tier memo only after success; the reconciler, rebalancer and autoload skip with one
+WARNING; the runtime memo and its lapses; a rejection that may be a draft's and a missing file are
+not memoised; the listed failure carries no absolute path; the Models tab rendered for real shows
+the badge and the Load refusal; through the real app with a fake engine
 on disk, streaming and plain chat, completions, load, load-recommended, plan-recommended, leases and
 both benchmark routes are 400s (streaming before any SSE byte), logged at WARNING, and `/api/models`,
 `/v1/models`, the catalog, `/api/capabilities`, MCP `model_info` / `plan_load` / `load_model` carry

@@ -23,6 +23,7 @@ from studioforge.core.arch_support import (
     StartupRejection,
     StartupRejectionMemo,
     file_signature,
+    redact_paths,
     startup_rejection,
 )
 from studioforge.core.gpu import vram_processes
@@ -1194,15 +1195,18 @@ class ModelManager:
 
         ``Supervisor.start`` drops a child that failed to start from its table,
         so without this ``GET /api/models`` reads ``state: stopped`` with no
-        trace of why. The message's first line only: the stderr tail is in the
-        model's log and in the error that was returned.
+        trace of why. The message's first line only, with absolute paths
+        reduced to basenames (D55: the listing is open to anyone who can reach
+        the port) -- the stderr tail is in the model's log and in the error
+        that was returned to whoever asked.
         """
         lines = (exc.message or "").strip().splitlines()
+        first = (lines[0] if lines else "").removesuffix(" Last output:")
         _table, tag = self._arch_table_for(record.settings.engine_tag, None)
         self._last_load_failure[record.id] = {
             "at": time.time(),
             "code": exc.code,
-            "message": (lines[0] if lines else "")[:500],
+            "message": redact_paths(first)[:500],
             "engine_tag": tag,
         }
 
