@@ -88,11 +88,9 @@ packages = ["src/studioforge"]
 include = [
     "src/studioforge/migrations/*.sql",
     "src/studioforge/data/*.json",
-    # Vendored by tools/sync_theme.py in the unifyingTheme package (V26-09-16);
-    # see docs/DEVELOPMENT.md's "GUI theming" section.
-    "src/studioforge/gui/theme/*.js",
-    "src/studioforge/gui/theme/*.css",
-    "src/studioforge/gui/theme/*.json",
+    # The unifyingTheme drop-in bundle, copied verbatim from the theme repo;
+    # see docs/DEVELOPMENT.md's "GUI theming" section. Everything in it ships.
+    "src/studioforge/gui/theme/**",
 ]
 
 [tool.ruff]

@@ -263,8 +263,9 @@ def test_a_failing_lease_book_is_a_stale_note_not_an_error_card(config: Config) 
 
 
 # ---------------------------------------------------------------------------
-# Theme assets (unifyingTheme V26-09-16): vendored under gui/theme/, served at
-# /sf-theme/, injected once into every page's <head> and the login page.
+# Theme assets: gui/theme/ is the unifyingTheme drop-in bundle, served at
+# /sf-theme/, injected once into every page's <head> and the login page, and
+# configured by THEME_SETTINGS on the ui-theme.js script tag.
 # ---------------------------------------------------------------------------
 
 
@@ -274,39 +275,70 @@ def test_theme_assets_are_served(config: Config) -> None:
         js = client.get("/sf-theme/ui-theme.js")
         css = client.get("/sf-theme/ui-theme.css")
         base_css = client.get("/sf-theme/ui-theme-base.css")
-        manifest = client.get("/sf-theme/ui-theme.json")
+        registry = client.get("/sf-theme/themes.json")
+        quasar_js = client.get("/sf-theme/adapters/quasar.js")
+        quasar_css = client.get("/sf-theme/adapters/quasar.css")
     assert js.status_code == 200
     assert "UITheme" in js.text
     assert css.status_code == 200
     assert base_css.status_code == 200
-    assert manifest.status_code == 200
-    assert "glacier" in manifest.text
+    assert registry.status_code == 200
+    assert "glacier" in registry.text
+    assert quasar_js.status_code == 200
+    assert "Quasar" in quasar_js.text
+    assert quasar_css.status_code == 200
 
 
 def test_theme_assets_are_served_with_no_long_cache(config: Config) -> None:
-    """R18: ?v= hashes are computed once at import (_asset_version), so a
-    re-vendor with no restart would otherwise serve new bytes under the old
-    query string while NiceGUI's default `max-age=3600` keeps browsers on the
-    stale response for up to an hour. max_cache_age=0 closes that half of the
-    gap; the other half (the process's own cached hash) needs the restart
-    documented in docs/DEVELOPMENT.md."""
+    """R18: ?v= hashes are computed once at import (_asset_version), so a new
+    copy of the bundle with no restart is served under the old query string.
+    NiceGUI's default `max-age=3600` would keep browsers on the stale response
+    for up to an hour; max_cache_age=0 makes them revalidate on every load, so
+    the new bytes arrive anyway (docs/DEVELOPMENT.md, "GUI theming")."""
     app = create_gui_app(config, api_state=_FakeState(config))
     with TestClient(app) as client:
         response = client.get("/sf-theme/ui-theme.js")
     assert response.headers["cache-control"] == "public, max-age=0"
 
 
-def test_theme_head_html_has_the_three_tags_in_order_with_version_hashes() -> None:
+def test_theme_head_html_has_the_five_tags_in_order_with_version_hashes() -> None:
     from studioforge.gui.app import _THEME_HEAD_HTML
 
     js_at = _THEME_HEAD_HTML.index("/sf-theme/ui-theme.js?v=")
+    adapter_js_at = _THEME_HEAD_HTML.index("/sf-theme/adapters/quasar.js?v=")
     base_at = _THEME_HEAD_HTML.index("/sf-theme/ui-theme-base.css?v=")
     css_at = _THEME_HEAD_HTML.index("/sf-theme/ui-theme.css?v=")
-    assert js_at < base_at < css_at, "script must load before the two stylesheets"
+    adapter_css_at = _THEME_HEAD_HTML.index("/sf-theme/adapters/quasar.css?v=")
+    assert js_at < adapter_js_at < base_at < css_at < adapter_css_at, (
+        "runtime, then its Quasar script, then base, tokens and the Quasar CSS"
+    )
 
     hashes = re.findall(r"\?v=([0-9a-f]+)", _THEME_HEAD_HTML)
-    assert len(hashes) == 3
+    assert len(hashes) == 5
     assert all(len(h) == 10 for h in hashes), hashes
+
+
+def test_theme_settings_ride_on_the_runtime_script_tag() -> None:
+    """The drop-in bundle carries no app settings: the picker list, default
+    and storage key are StudioForge's own, written as data-* onto the tag."""
+    from studioforge.gui.app import _THEME_HEAD_HTML, THEME_SETTINGS
+
+    tag = re.search(r'<script src="/sf-theme/ui-theme\.js\?v=[0-9a-f]+"([^>]*)>', _THEME_HEAD_HTML)
+    assert tag, _THEME_HEAD_HTML
+    attrs = dict(re.findall(r'(data-[a-z-]+)="([^"]*)"', tag.group(1)))
+    assert attrs["data-themes"].split(",") == list(THEME_SETTINGS["themes"])
+    assert attrs["data-default"] == THEME_SETTINGS["default"] == "glacier"
+    assert attrs["data-storage-key"] == "studioforge.theme"
+    assert "night-red" in THEME_SETTINGS["themes"]
+
+
+def test_theme_picker_options_come_from_the_bundle_registry_in_settings_order() -> None:
+    from studioforge.gui.app import THEME_SETTINGS, _theme_default, _theme_options
+
+    options = _theme_options()
+    assert list(options) == list(THEME_SETTINGS["themes"])
+    assert options["night-red"] == "Night Red"
+    assert _theme_default() in options
 
 
 def test_theme_head_html_is_injected_into_the_page_exactly_once(config: Config) -> None:

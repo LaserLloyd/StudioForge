@@ -1,0 +1,676 @@
+/* GENERATED adapter quasar.css: unifyingTheme V26-09-16 drop-in bundle (ui-theme/),
+   the same in every app. Do not edit this copy: change the package's src/
+   or adapters/, run `python tools/sync_theme.py build`, then copy ui-theme/
+   into each app (or run `python tools/sync_theme.py install`).
+   body sha256: 489688d9edb97e7a */
+
+/* ============================================================================
+   adapter: quasar.css — contract tokens onto Quasar (NiceGUI 3.x)
+   ----------------------------------------------------------------------------
+   NiceGUI 3 declares: @layer theme, base, quasar, nicegui, components,
+   utilities, overrides, quasar_importants;
+   - This file is loaded from a plain, UNLAYERED <link>, so every normal
+     (non-!important) rule in it beats every rule Quasar ships, regardless of
+     Quasar's own selector specificity: unlayered normal declarations always
+     win over layered ones. Most of the component rules below rely on that —
+     they use short, generic selectors on purpose.
+   - The exception is Quasar's own !important classes (.text-white, .bg-grey,
+     .text-cyan, ...), shipped in the LAST layer, `quasar_importants`. For
+     !important declarations the layer order is reversed, so an !important
+     rule placed inside an EARLIER-declared layer beats a later one; an
+     unlayered !important does NOT get that benefit. So the handful of fixes
+     that must beat a Quasar !important class live in `@layer overrides`
+     (declared right before `quasar_importants`) at the bottom of this file.
+   - .bg-primary / .text-primary / .text-warning etc. read var(--q-*), so
+     remapping the variables below recolours them without fighting classes.
+   ============================================================================ */
+
+/* Quasar declares the brand variables on :root, and NiceGUI additionally
+   passes its own brand defaults (primary #5898d4, ...) through Quasar's
+   config, which writes them INLINE on <body>. Inline normal declarations
+   beat any stylesheet rule, so the mapping is declared on body as well and
+   marked !important (an author !important beats an inline normal value). */
+:root,
+body {
+  --q-primary:   var(--accent) !important;
+  --q-secondary: var(--accent-2) !important;
+  --q-accent:    var(--accent-2) !important;
+  --q-positive:  var(--success) !important;
+  --q-negative:  var(--danger) !important;
+  --q-info:      var(--info) !important;
+  --q-warning:   var(--warning) !important;
+  --q-dark:      var(--surface-2) !important;
+  --q-dark-page: var(--surface-0) !important;
+}
+
+/* ---- page body -------------------------------------------------------- */
+/* Quasar hard-codes body.body--dark's text colour to #fff and its own
+   `.q-dark` utility the same way; both are plain (non-!important) rules so
+   an unlayered override here is enough. quasar.js keeps body--dark/--light
+   in step with the active theme's ground (see adapters/quasar.js). */
+
+body.body--dark,
+body.body--light {
+  background: var(--surface-0);
+  color: var(--text-primary);
+}
+
+.q-dark {
+  color: var(--text-primary);
+  background: var(--surface-2);
+}
+
+/* ---- focus-visible ------------------------------------------------------
+   Quasar suppresses the native outline everywhere (`outline: 0`) in favour
+   of its ripple/focus-helper, which is a poor keyboard-focus signal on a
+   plain surface. Restore a real ring for keyboard users without touching
+   mouse-click UX: `:focus-visible` only matches keyboard/programmatic focus
+   in evergreen browsers. `:has()` reaches the visible sibling of controls
+   whose real input is 1px and invisible (checkbox/toggle). ---- */
+
+.q-btn:focus-visible,
+.q-tab:focus-visible,
+.q-item:focus-visible,
+.q-chip:focus-visible,
+a:focus-visible {
+  outline: var(--focus-ring-width) solid var(--focus-ring);
+  outline-offset: var(--focus-ring-offset);
+}
+
+.q-field__native:focus-visible,
+.q-field__input:focus-visible {
+  outline: var(--focus-ring-width) solid var(--focus-ring);
+  outline-offset: var(--focus-ring-offset);
+}
+
+.q-checkbox:has(.q-checkbox__native:focus-visible) .q-checkbox__bg,
+.q-toggle:has(.q-toggle__native:focus-visible) .q-toggle__track,
+.q-radio:has(.q-radio__native:focus-visible) .q-radio__bg {
+  outline: var(--focus-ring-width) solid var(--focus-ring);
+  outline-offset: var(--focus-ring-offset);
+}
+
+/* ---- header ------------------------------------------------------------
+   .q-layout__section--marginal is what actually paints the header/footer;
+   it is a plain rule (`background-color: var(--q-primary); color: #fff`),
+   so this alone stops the header from being accent-coloured. */
+
+.q-header,
+.q-layout__section--marginal {
+  background: var(--surface-1);
+  color: var(--text-primary);
+  border-bottom: 1px solid var(--border);
+  box-shadow: none;
+}
+
+/* ---- tabs ---------------------------------------------------------------
+   .q-tab uses `color: inherit` and .q-tab__indicator paints with
+   `currentColor`, so without an explicit color= prop the whole strip just
+   inherits the page/header text colour. Set it explicitly instead of
+   relying on inheritance to reach every context a tab strip is used in. */
+
+.q-tab {
+  color: var(--text-secondary);
+}
+
+.q-tab--active {
+  color: var(--text-primary);
+}
+
+.q-tab__indicator {
+  background: var(--accent);
+}
+
+.q-tabs {
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+/* ---- cards ---------------------------------------------------------------
+   Quasar's only built-in dark treatment is `.q-card--dark`'s border/shadow
+   (the base .q-card has no dark background rule at all — NiceGUI's own
+   `dark:bg-white/5` classes exist in gui/ precisely to paper over that). One
+   rule now covers both: `.q-card--dark` only ever appears alongside `.q-card`
+   on the same element, so it needs no separate values of its own here.
+   Dialog cards get the raised "overlay" surface instead, since they float
+   above the page. */
+
+.q-card {
+  background: var(--surface-2);
+  color: var(--text-primary);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-1);
+}
+
+.q-dialog .q-card {
+  background: var(--surface-overlay);
+  box-shadow: var(--shadow-3);
+}
+
+.q-dialog__backdrop {
+  background: var(--scrim);
+}
+
+/* ---- fields (input / textarea / select / number) --------------------- */
+
+.q-field__control {
+  background: var(--surface-sunken);
+  border-radius: var(--radius-sm);
+}
+
+.q-field__control:before {
+  border-color: var(--border-strong);
+}
+
+.q-field__control:hover:before {
+  border-color: var(--text-secondary);
+}
+
+/* Filled variant paints its own background instead of using a border. */
+.q-field--filled .q-field__control,
+.q-field--filled .q-field__control:before {
+  background: var(--surface-sunken);
+}
+
+.q-field--filled.q-field--highlighted .q-field__control:before {
+  background: var(--surface-3);
+}
+
+/* Focused state already turns accent-coloured for free: the underline/outline
+   pseudo-elements paint with `currentColor`, and the highlighted state's
+   `color` comes from `--q-primary`, which is remapped to `--accent` above. */
+
+.q-field__native,
+.q-field__input,
+.q-field__prefix,
+.q-field__suffix {
+  color: var(--text-primary);
+}
+
+.q-field__label {
+  color: var(--text-tertiary);
+}
+
+.q-field--dark .q-field__marginal,
+.q-field--dark .q-field__bottom {
+  color: var(--text-tertiary);
+}
+
+.q-field--error .q-field__label,
+.q-field--error .q-field__bottom {
+  color: var(--danger-text);
+}
+
+/* ---- menus, select popups, list items --------------------------------- */
+
+.q-menu {
+  background: var(--surface-overlay);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-2);
+  color: var(--text-primary);
+}
+
+.q-item,
+.q-list--dark,
+.q-item--dark {
+  color: var(--text-primary);
+  border-color: var(--border);
+}
+
+.q-item__section--side {
+  color: var(--text-secondary);
+}
+
+.q-item--active,
+.q-item.q-router-link--active {
+  background: var(--accent-subtle);
+  color: var(--text-primary);
+}
+
+/* Quasar's hover/keyboard-focus tint is `currentColor` at low opacity via a
+   shared .q-focus-helper overlay used by many components. The overlay is
+   absolutely positioned ABOVE the item's label, so it must never be opaque.
+   For list items (menus, selects, expansion headers) the flat hover surface
+   the contract wants is painted on the item itself and the overlay is kept
+   out of the way; the active (selected) item keeps an accent tint. */
+.q-item.q-hoverable:hover > .q-focus-helper,
+.q-item.q-manual-focusable--focused > .q-focus-helper {
+  opacity: 0;
+}
+
+.q-item.q-hoverable:hover,
+.q-item.q-manual-focusable--focused {
+  background: var(--surface-3);
+}
+
+.q-item--active.q-hoverable:hover,
+.q-item--active.q-manual-focusable--focused {
+  background: var(--accent-muted);
+}
+
+/* ---- buttons --------------------------------------------------------- */
+
+.q-btn.disabled {
+  color: var(--text-disabled);
+}
+
+/* ---- badges ------------------------------------------------------------
+   The base rule is plain CSS (`background-color: var(--q-primary); color:
+   #fff`); only the hard-coded text colour needs fixing here. A colour= prop
+   swaps in a `bg-<name>` / `text-white` pair from quasar_importants, handled
+   in the @layer overrides block below. */
+
+.q-badge {
+  color: var(--on-accent);
+}
+
+/* NiceGUI's ui.badge(text, color=...) adds only a bg-<name> class and no text
+   class, so without these every badge label is --on-accent, whatever its
+   fill. That measured 1.67-2.77:1 on the success, warning and danger fills
+   in the dark core themes, and 1.28:1 on --offline in Night Red. Each label
+   now takes its fill's own on-colour; --accent-2 (secondary, accent) has
+   none, so it takes the flipped page ink, 5.59:1 or better in every theme. */
+.q-badge.bg-positive {
+  color: var(--on-success);
+}
+
+.q-badge.bg-negative {
+  color: var(--on-danger);
+}
+
+.q-badge.bg-warning {
+  color: var(--on-warning);
+}
+
+.q-badge.bg-info {
+  color: var(--on-info);
+}
+
+.q-badge.bg-grey {
+  color: var(--on-offline);
+}
+
+.q-badge.bg-secondary,
+.q-badge.bg-accent {
+  color: var(--text-inverse);
+}
+
+/* ---- notifications (ui.notify) ----------------------------------------
+   The base look is a plain rule (`background:#323232;color:#fff`); typed
+   notifications add an !important `bg-<status>` (+ text-white/text-dark),
+   handled in @layer overrides so the status colour still applies but with a
+   correct on-color. */
+
+.q-notification {
+  background: var(--surface-overlay);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-2);
+}
+
+/* ---- uploader (chat "Attach image") -----------------------------------
+   Quasar paints the header on --q-primary (the accent) with a hard-coded
+   white label, and the header's add button is an <a>, so the base layer's
+   link colour reached it: 4.00:1 and 1.29:1 on Night Red's red plate, and
+   the white lit the blue sub-pixel. Everything on the plate takes the
+   accent's on-colour. */
+
+.q-uploader__header,
+.q-uploader__header .q-uploader__title,
+.q-uploader__header .q-uploader__subtitle,
+.q-uploader__header .q-btn {
+  color: var(--on-accent);
+}
+
+/* ---- tooltip ------------------------------------------------------------ */
+
+.q-tooltip--style {
+  color: var(--text-primary);
+  background: var(--surface-4);
+}
+
+/* ---- linear progress (VRAM bars, download rows, benchmark) ------------ */
+
+/* Progress tracks follow the specimen board: the fill (--accent via
+   --q-primary) sits on --surface-4. --control-track is for control
+   boundaries (slider, toggle), and next to a dark accent it swallowed the
+   fill. Quasar dims the track to .4 opacity; the surface step is already
+   subtle, so it is shown as is. */
+.q-linear-progress__track--light,
+.q-linear-progress__track--dark {
+  background: var(--surface-4);
+  opacity: 1;
+}
+
+/* ---- slider (LoRA adapter scale) --------------------------------------- */
+
+.q-slider__track,
+.q-slider__inner {
+  background: var(--control-track);
+}
+
+.q-slider__track {
+  color: var(--slider-color);
+}
+
+/* ---- toggle (chat "use loaded model", setup switches) ------------------
+   Track/thumb are recoloured directly rather than through `currentColor`,
+   which sidesteps Quasar's separate --dark variant entirely (off and on
+   states look the same regardless of Quasar's own dark/light class). */
+
+.q-toggle__track {
+  background: var(--control-track);
+  opacity: 1;
+}
+
+.q-toggle__inner--truthy .q-toggle__track {
+  background: var(--accent);
+  opacity: 1;
+}
+
+.q-toggle__thumb:after {
+  background: var(--surface-2);
+}
+
+.q-toggle__inner--truthy .q-toggle__thumb:after {
+  background: var(--on-accent);
+}
+
+/* ---- checkbox ----------------------------------------------------------- */
+
+.q-checkbox__inner,
+.q-checkbox--dark .q-checkbox__inner {
+  color: var(--border-strong);
+}
+
+.q-checkbox__inner--truthy,
+.q-checkbox__inner--indet,
+.q-checkbox--dark .q-checkbox__inner--truthy,
+.q-checkbox--dark .q-checkbox__inner--indet {
+  color: var(--accent);
+}
+
+.q-checkbox__svg {
+  color: var(--on-accent);
+}
+
+/* ---- separator ---------------------------------------------------------- */
+
+.q-separator,
+.q-separator--dark {
+  background: var(--divider);
+}
+
+/* ---- expansion item ------------------------------------------------------
+   The clickable header is a .q-item internally, so the hover/active rules
+   above already apply to it -- nothing extra needed here. */
+
+/* ---- table (benchmark history) ------------------------------------------ */
+
+.q-table__card,
+.q-table__card--dark,
+.q-table--dark {
+  background: var(--surface-2);
+  color: var(--text-primary);
+  border-color: var(--border);
+  box-shadow: none;
+}
+
+.q-table th {
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: var(--ls-label);
+}
+
+.q-table th,
+.q-table td,
+.q-table--dark .q-table__bottom,
+.q-table--dark thead,
+.q-table--dark tr,
+.q-table--dark th,
+.q-table--dark td {
+  border-color: var(--divider);
+}
+
+.q-table tbody td:before {
+  background: color-mix(in srgb, var(--text-primary) 3%, transparent);
+}
+
+.q-table tbody td:after {
+  background: var(--surface-3);
+}
+
+/* ============================================================================
+   Tailwind v4 (browser runtime) utility classes used in gui/tabs/*.py.
+   These land in the `utilities` layer, so the same unlayered-beats-layered
+   rule applies: no !important needed here either.
+   ============================================================================ */
+
+.bg-black\/5 {
+  background-color: color-mix(in srgb, var(--text-primary) 5%, transparent);
+}
+
+.bg-black\/10 {
+  background-color: color-mix(in srgb, var(--text-primary) 10%, transparent);
+}
+
+.border-white\/10 {
+  border-color: var(--border-subtle);
+}
+
+.border-white\/20 {
+  border-color: var(--border);
+}
+
+.hover\:bg-white\/5:hover {
+  background-color: var(--surface-3);
+}
+
+.border-primary {
+  border-color: var(--accent);
+}
+
+.bg-primary\/20 {
+  background-color: color-mix(in srgb, var(--accent) 20%, transparent);
+}
+
+/* Dimmed text. The GUI makes its secondary text quieter with an opacity
+   utility on a text-sized label (`text-xs opacity-70`, about 165 labels).
+   Opacity multiplies the theme's own text colour: that still leaves about
+   6:1 in the dark core themes, but 60% of Night Red's #ff5800 is 2.9:1.
+   TEXT.md's rule is "a tier, never opacity", so these labels are drawn at
+   full opacity in a tier instead: 80 and 70 take --text-secondary, 60 and
+   50 take --text-tertiary. Quasar's semantic text classes (.text-warning,
+   .text-negative, ...) are !important in their own layer and keep their
+   colour. */
+:is(.text-xs, .text-sm, .text-base, [class*="text-["]):is(.opacity-80, .opacity-70) {
+  opacity: 1;
+  color: var(--text-secondary);
+}
+
+:is(.text-xs, .text-sm, .text-base, [class*="text-["]):is(.opacity-60, .opacity-50) {
+  opacity: 1;
+  color: var(--text-tertiary);
+}
+
+/* ============================================================================
+   @layer overrides — beats Quasar's !important classes (quasar_importants).
+   See the file banner: this layer is declared before quasar_importants in
+   NiceGUI's page template, so an !important rule in here wins the reversed
+   important-vs-important contest. Every selector below is a real Quasar (or
+   Tailwind) class name; nothing here is invented.
+   ============================================================================ */
+
+@layer overrides {
+  /* Filled controls (buttons, badges, chips): Quasar defaults their label to
+     `text-white` (or, for ui.notify's "warning" preset, `text-dark`) no
+     matter which colour= was requested. Never literal white/dark -- always
+     the token that is legible on that fill. */
+  .bg-primary.text-white {
+    color: var(--on-accent) !important;
+  }
+
+  /* Flat and outline buttons with color=primary carry the accent as their
+     label (`.text-primary`), and accent fills are never text (TEXT.md):
+     that label was 3.17:1 in Midnight Gold and Lc 37 pure red in Night
+     Red. They are link-like actions, so they take the link colour; an
+     outline follows it (currentColor). */
+  .q-btn--flat.text-primary,
+  .q-btn--outline.text-primary {
+    color: var(--text-link) !important;
+  }
+
+  /* --q-secondary and --q-accent are --accent-2, which has no on-colour of
+     its own: --on-accent on it measured 1.48-2.49:1 in the dark core themes.
+     The flipped page ink clears 5.59:1 in every theme. */
+  .bg-secondary.text-white,
+  .bg-accent.text-white {
+    color: var(--text-inverse) !important;
+  }
+
+  .bg-positive.text-white {
+    color: var(--on-success) !important;
+  }
+
+  .bg-negative.text-white {
+    color: var(--on-danger) !important;
+  }
+
+  .bg-warning.text-white,
+  .bg-warning.text-dark {
+    color: var(--on-warning) !important;
+  }
+
+  .bg-info.text-white {
+    color: var(--on-info) !important;
+  }
+
+  /* ui.notify(type=...): recolour the toast's own text directly, regardless
+     of which textColor Quasar's built-in preset attached. */
+  .q-notification.bg-positive {
+    color: var(--on-success) !important;
+  }
+
+  .q-notification.bg-negative {
+    color: var(--on-danger) !important;
+  }
+
+  .q-notification.bg-warning {
+    color: var(--on-warning) !important;
+  }
+
+  .q-notification.bg-info {
+    color: var(--on-info) !important;
+  }
+
+  /* Named Quasar palette classes used via color= props (dashboard/download
+     badges, setup/server icons) and gui/state.py's CAPABILITY_ICONS /
+     STATUS_COLOURS maps. These are deliberately mapped to distinct
+     categorical tokens, not to hue-matched colours -- .text-orange lands on
+     --cat-2 (teal), .text-purple on --cat-3 (gold), and so on. The contract
+     only promises the --cat-* set is distinguishable from itself and >=3:1 on
+     --surface-0 (they're a foreground/text-strength colour, not a fill);
+     making "orange" look orange isn't a goal, and the distinctness between
+     the five hues is test-enforced, so don't "fix" this to be hue-accurate.
+     "grey" is the one honestly-named exception, mapped to --offline. */
+  .text-grey {
+    color: var(--text-tertiary) !important;
+  }
+
+  .bg-grey {
+    background-color: var(--offline) !important;
+  }
+
+  .text-cyan {
+    color: var(--cat-1) !important;
+  }
+
+  .bg-cyan {
+    background-color: var(--cat-1) !important;
+  }
+
+  .text-orange {
+    color: var(--cat-2) !important;
+  }
+
+  .bg-orange {
+    background-color: var(--cat-2) !important;
+  }
+
+  .text-purple {
+    color: var(--cat-3) !important;
+  }
+
+  .bg-purple {
+    background-color: var(--cat-3) !important;
+  }
+
+  .text-teal {
+    color: var(--cat-4) !important;
+  }
+
+  .bg-teal {
+    background-color: var(--cat-4) !important;
+  }
+
+  .text-blue-grey {
+    color: var(--cat-5) !important;
+  }
+
+  .bg-blue-grey {
+    background-color: var(--cat-5) !important;
+  }
+
+  /* R17: --cat-* are tuned to be legible as a foreground colour on
+     --surface-0, not as a fill guaranteed to hold Quasar's literal white
+     label -- white on --cat-1 measures ~2:1 in some themes. Route the
+     pairing through --text-inverse (the theme's flipped page ink, always
+     legible on a mid-tone fill) instead of trusting the categorical token's
+     own hue to be dark/light enough. */
+  .bg-cyan.text-white,
+  .bg-orange.text-white,
+  .bg-purple.text-white,
+  .bg-teal.text-white,
+  .bg-blue-grey.text-white {
+    color: var(--text-inverse) !important;
+  }
+
+  /* --offline is a status fill with its own on-colour, and "grey" badges
+     (unloaded, idle, queued, canceled) are the common case. --text-inverse
+     on --offline measured 2.78-4.24:1 across the themes and 1.28:1 in Night
+     Red, whose offline fill is dark; --on-offline clears 4.5:1 in every one
+     (4.68-6.02, checked by tools/check_contrast.py). */
+  .bg-grey.text-white {
+    color: var(--on-offline) !important;
+  }
+}
+
+/* ============================================================================
+   sf-* helper classes — StudioForge-specific, kept to a minimum. Used only
+   where gui/tabs/*.py replaced a hard-coded `bg-black/10 dark:bg-white/5`
+   (etc.) pair with one semantic class. Declared last on purpose: they share
+   specificity with .q-card above and must win the source-order tiebreak
+   when a card also carries one of these classes.
+   ============================================================================ */
+
+.sf-well {
+  background: var(--surface-sunken);
+}
+
+.sf-danger-card {
+  background: var(--danger-subtle);
+  border-color: var(--danger-border);
+  color: var(--danger-text);
+}
+
+.sf-warning-card {
+  background: var(--warning-subtle);
+  border-color: var(--warning-border);
+  color: var(--warning-text);
+}
+
+/* Header theme picker: sizing only -- its colours come from the generic
+   .q-field rules above, which already read correctly on --surface-1. */
+.sf-theme-picker {
+  min-width: 9rem;
+}

@@ -113,45 +113,49 @@ depends on nothing above it. A change that makes `core` import from `api` is a c
 ## GUI theming
 
 The panel's colours, type and component skin come from the **unifyingTheme** package
-(`_unifyingTheme/V26-09-16`, a sibling checkout — not part of this repo), not from anything
-hand-written here. `gui/theme/` holds four **generated** files and is never hand-edited:
+(`_unifyingTheme`, a sibling checkout — not part of this repo), not from anything hand-written
+here. `gui/theme/` is that repo's **drop-in bundle** (`_unifyingTheme/ui-theme/`), copied
+verbatim: the same folder every app gets. It is never hand-edited:
 
 ```
-gui/theme/ui-theme.js         manifest + runtime + the Quasar/NiceGUI adapter (adapters/quasar.js)
-gui/theme/ui-theme.css        contract tokens for the enabled themes + adapters/quasar.css
-gui/theme/ui-theme-base.css   element layer: body type, focus ring, scrollbars, keyframes, hljs
-gui/theme/ui-theme.json       manifest + enabled themes' metadata, in picker order (read by app.py)
+gui/theme/ui-theme.js            the runtime and the full theme registry
+gui/theme/ui-theme-base.css      element layer + the text standard (.ui-text-*, .ui-markdown)
+gui/theme/ui-theme.css           contract tokens for every theme
+gui/theme/adapters/quasar.js     keeps Quasar's dark-mode flag in step with the theme's ground
+gui/theme/adapters/quasar.css    contract tokens onto Quasar's components
+gui/theme/themes.json            the registry (app.py reads it for the picker's names)
+gui/theme/VERSION, README.md     bundle version and plug-in notes
 ```
 
-`app.py` serves that directory at `/sf-theme/` (exempted from the auth gate, since it has to be
-reachable from the unauthenticated login page too) and injects the three files into every page's
-`<head>` exactly once, each with a `?v=<sha256 prefix>` cache-busting query string computed at
-import. The header's theme picker (`_theme_picker`) is a `ui.select` that calls
+StudioForge's own settings are `THEME_SETTINGS` in `app.py`: the picker's themes in order, the
+default (Glacier) and the storage key. They ride as `data-*` attributes on the `ui-theme.js`
+script tag. `app.py` serves `gui/theme/` at `/sf-theme/` (exempted from the auth gate, since it
+has to be reachable from the unauthenticated login page too) and injects five tags into every
+page's `<head>` exactly once, each with a `?v=<sha256 prefix>` cache-busting query string
+computed at import. The header's theme picker (`_theme_picker`) is a `ui.select` that calls
 `UITheme.set(slug)` in the browser; `adapters/quasar.js` keeps Quasar's own dark-mode flag in step
 with the active theme's ground, so `ui.run_with(dark=True)` stays fixed in Python regardless of
 which theme is active.
 
 To change how a Quasar component looks, edit `adapters/quasar.css` (and, for the runtime's JS
 behaviour, `adapters/quasar.js`) in the theme package — never `gui/theme/*` directly, it is
-overwritten wholesale. After editing, re-vendor from the package root:
+replaced wholesale. A theme update is: build the bundle in the theme repo, then copy it over
+`gui/theme/`, by hand or from the theme package's folder:
 
 ```bash
-python tools/sync_theme.py app studioforge --dest <path to this checkout>
+python tools/sync_theme.py build
+python tools/sync_theme.py install studioforge --dest <path to this checkout>
 ```
 
-Then restart the server (`POST /api/restart/server` with `{"confirm": true}`, or the tray's
-Restart server) so the `?v=` hashes are recomputed. They're computed once at import (see
-`_asset_version` in `app.py`), so a re-vendor with no restart leaves the running process serving
-the new bytes under the *old* query string; `/sf-theme/` itself is served with `max_cache_age=0`
-precisely so that, once you do restart, browsers don't also sit on the previous response for
-NiceGUI's default hour.
+No restart is needed for new colours: `/sf-theme/` is served with `max_cache_age=0`, so browsers
+revalidate on every load and get the new bytes even under the old `?v=` (computed once at
+import, see `_asset_version`). Restart the server (`POST /api/restart/server` with
+`{"confirm": true}`, or the tray's Restart server) only when the bundle gains a theme you add to
+`THEME_SETTINGS`, since the picker's options are read at import.
 
 `tools/sync_theme.py check studioforge --dest <path to this checkout>` reports drift without
-writing anything, which is a good pre-commit sanity check if the vendored copy looks stale.
-`pyproject.toml`'s
-`[tool.hatch.build.targets.wheel]` `include` list has explicit globs for `gui/theme/*.{js,css,json}`
-— a wheel build only picks up non-Python data files that are listed there, so a new *kind* of
-vendored file needs an entry added alongside the existing ones.
+writing anything. `pyproject.toml`'s `[tool.hatch.build.targets.wheel]` `include` list ships
+`gui/theme/**`, the whole bundle.
 
 Quasar's named palette classes (`.text-cyan`, `.bg-orange`, `.text-purple`, `.bg-teal`,
 `.text-blue-grey`, `.text-grey`/`.bg-grey`, used via `color=` props and `gui/state.py`'s

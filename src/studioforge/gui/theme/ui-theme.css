@@ -1,8 +1,8 @@
-/* GENERATED theme tokens for studioforge by the unifyingTheme package (V26-09-16),
-   tools/sync_theme.py. Do not edit this copy: change the package (src/,
-   adapters/, apps/studioforge.json) and run `python tools/sync_theme.py app studioforge`.
-   themes: purple, midnight-gold, glacier, forest, paper, daylight, night-red | default: glacier
-   body sha256: 15d2e823ecb98aae */
+/* GENERATED theme tokens: unifyingTheme V26-09-16 drop-in bundle (ui-theme/),
+   the same in every app. Do not edit this copy: change the package's src/
+   or adapters/, run `python tools/sync_theme.py build`, then copy ui-theme/
+   into each app (or run `python tools/sync_theme.py install`).
+   body sha256: de842fdec71ef23c */
 /* ============================================================================
    theme-base.css — CORE. Purple (base theme) + theme-agnostic layer.
    ----------------------------------------------------------------------------
@@ -1177,6 +1177,620 @@
 
 }
 
+/* theme-electric-yellow.css — OPT-IN
+   Ground: dark (graphite) · family: electric-yellow · color-scheme: dark
+   theme-color: #0a0a0b
+   fonts: Archivo (400/500/600/700, geometric grotesk w/ tabular figures),
+          JetBrains Mono. Self-host or preload; no @import.
+
+   Design notes
+   - Accent #e8ff00 is a cold acid yellow. Every large surface stays neutral
+     graphite; yellow appears only on primary action, active nav marker,
+     focus ring, slider fill, live dot and selection.
+   - Reads apart from Midnight Gold by four moves: colder/more saturated
+     yellow, graphite ground (not true black), tighter radii (4/6/10/14),
+     crisp 1px strokes instead of gold hairlines.
+   - Text on yellow is near-black (--on-accent #0e1200, 17.0:1).
+   - Warning is orange (#f78a1f) so it never reads as a primary action.
+   - Second accent is cool ice-blue (#5ad8ff). No second warm colour.
+   - One ambient effect: .ambient scanline, disabled under reduced motion. */
+
+[data-palette="electric-yellow"] {
+  color-scheme: dark;
+
+  --surface-void:    #050506;
+  --surface-0:       #0a0a0b;
+  --surface-1:       #111113;
+  --surface-2:       #18181b;
+  --surface-3:       #202024;
+  --surface-4:       #2a2a2f;
+  --surface-sunken:  #0d0d0f;
+  --surface-overlay: #18181b;
+  --glass-1:         rgba(24,24,27,.76);
+  --glass-2:         rgba(24,24,27,.88);
+  --glass-3:         rgba(10,10,11,.94);
+  --glass-highlight: rgba(255,255,255,.06);
+  --code-bg:         #0d0d0f;
+
+  --text-primary:    #f4f5f7;
+  --text-secondary:  #a8acb6;
+  --text-tertiary:   #8d929e;
+  --text-disabled:   #717581;
+  --text-inverse:    #0a0a0b;
+  --text-link:       #e8ff00;
+  --text-link-hover: #f2ff5c;
+  --on-accent:       #0e1200;
+  --on-danger:       #1a0303;
+  --on-success:      #04210f;
+  --on-warning:      #1a0d00;
+  --on-media:        #ffffff;
+  --on-media-muted:  #dcdee3;
+
+  --accent:          #e8ff00;
+  --accent-hover:    #f2ff3d;
+  --accent-pressed:  #ccdf00;
+  --accent-subtle:   rgba(232,255,0,.12);
+  --accent-muted:    rgba(232,255,0,.24);
+  --accent-glow:     rgba(232,255,0,.30);
+  --accent-rgb:      232,255,0;
+  --accent-2:        #5ad8ff;
+  --accent-2-subtle: rgba(90,216,255,.12);
+
+  --cta:              #e8ff00;
+  --cta-hover:        #f2ff3d;
+  --cta-pressed:      #ccdf00;
+  --on-cta:           #0e1200;
+  --cta-shadow:       0 6px 20px rgba(0,0,0,.55);
+  --cta-shadow-hover: 0 10px 28px rgba(232,255,0,.18);
+  --highlight:        #5ad8ff;
+  --highlight-subtle: rgba(90,216,255,.10);
+  --on-highlight:     #001420;
+
+  --border-subtle:       #1c1c20;
+  --border:              #2a2a2f;
+  --border-strong:       #6a6f7a;
+  --divider:             #1c1c20;
+  --focus-ring:          #e8ff00;
+  --glass-stroke:        rgba(255,255,255,.09);
+  --glass-stroke-strong: rgba(232,255,0,.30);
+
+  --success: #4ade80; --success-hover: #86efac;
+  --success-subtle: rgba(74,222,128,.12); --success-text: #4ade80;
+  --success-border: rgba(74,222,128,.38);
+  --warning: #f78a1f; --warning-hover: #ffa24a;
+  --warning-subtle: rgba(247,138,31,.12); --warning-text: #ffa24a;
+  --warning-border: rgba(247,138,31,.40);
+  --danger: #ff5c5c; --danger-hover: #ff8585;
+  --danger-subtle: rgba(255,92,92,.12); --danger-text: #ff8585;
+  --danger-border: rgba(255,92,92,.40);
+  --info: #63b3ff; --info-hover: #8cc8ff;
+  --info-subtle: rgba(99,179,255,.12); --info-text: #63b3ff;
+  --info-border: rgba(99,179,255,.38);
+  --live: #e8ff00; --live-hover: #f2ff3d;
+  --live-subtle: rgba(232,255,0,.14); --live-text: #e8ff00;
+  --live-border: rgba(232,255,0,.44);
+  --idle: #f78a1f; --idle-hover: #ffa24a;
+  --idle-subtle: rgba(247,138,31,.12); --idle-text: #ffa24a;
+  --idle-border: rgba(247,138,31,.34);
+  --offline: #666b77; --offline-hover: #828794;
+  --offline-subtle: rgba(102,107,119,0.15); --offline-text: #888d99;
+  --offline-border: rgba(102,107,119,.48);
+  --heartbeat: #ff7ab8; --heartbeat-hover: #ffa0cd;
+  --heartbeat-subtle: rgba(255,122,184,.12); --heartbeat-text: #ff7ab8;
+  --heartbeat-border: rgba(255,122,184,.38);
+  --on-info: #001220; --on-live: #0e1200; --on-idle: #1a0d00;
+  --on-offline: #ffffff; --on-heartbeat: #2a0616;
+
+  --scrim:        rgba(5,5,6,.72);
+  --scrim-strong: rgba(3,3,4,.92);
+  --scrim-light:  rgba(5,5,6,.48);
+  --scrim-media:  linear-gradient(to top, rgba(5,5,6,.90), rgba(5,5,6,0));
+  --backdrop-blur: 12px;
+
+  --bubble-user-bg:        #303014;
+  --bubble-user-text:      #f4f5f7;
+  --bubble-user-border:    #47471b;
+  --bubble-assistant-bg:   #18181b;
+  --bubble-assistant-text: #f4f5f7;
+  --quote-bar:             #e8ff00;
+  --mark-bg:               rgba(232,255,0,.26);
+  --md-bold:               #ffffff;
+  --md-italic:             #5ad8ff;
+  --md-bolditalic:         #a3e8ff;
+  --md-bolditalic-glow:    rgba(163,232,255,.40);
+  --rp-speech:  #f4f5f7;
+  --rp-action:  #a8acb6;
+  --rp-thought: #a3e8ff;
+  --rp-whisper: #828794;
+  --rp-ooc:     #74798a;
+  --rp-shout:   #ffa24a;
+  --rp-shout-glow: rgba(255,162,74,.45);
+  --rp-critical: #ff8585;
+  --rp-critical-glow: rgba(255,133,133,.45);
+  --diff-add-bg: rgba(74,222,128,.14); --diff-add-text: #9ce8a8;
+  --diff-remove-bg: rgba(255,92,92,.14); --diff-remove-text: #ff9a9a;
+
+  --syn-fg: #e4e6ea;      --syn-bg: #0d0d0f;
+  --syn-comment: #8a8f9a; --syn-keyword: #b8c4ff; --syn-string: #9ce8a8;
+  --syn-number: #ffd166;  --syn-function: #5ad8ff; --syn-title: #5ad8ff;
+  --syn-type: #7ee7d0;    --syn-variable: #f0a8d0; --syn-attr: #ffd9a0;
+  --syn-tag: #b8c4ff;     --syn-builtin: #7ee7d0;  --syn-literal: #ffd166;
+  --syn-meta: #9aa0ac;    --syn-operator: #d0d5df; --syn-punctuation: #b8bec9;
+  --syn-deletion: #ff9a9a; --syn-addition: #9ce8a8;
+
+  --cat-1: #e8ff00; --cat-2: #5ad8ff; --cat-3: #f78a1f; --cat-4: #ff7ab8;
+  --cat-5: #63b3ff; --cat-6: #4ade80; --cat-7: #c9a3ff; --cat-8: #ffd166;
+  --cat-9: #7ee7d0; --cat-10: #ff8585; --cat-11: #a3e635; --cat-12: #b8c4ff;
+  --chart-grid: rgba(255,255,255,.07);
+  --chart-axis: #666b77;
+
+  --canvas-mask:    rgba(5,5,6,.76);
+  --canvas-handle:  #e8ff00;
+  --canvas-guide:   rgba(232,255,0,.55);
+  --canvas-outline: #f4f5f7;
+
+  --font-sans:    'Archivo', 'Helvetica Neue', Helvetica, system-ui, sans-serif;
+  --font-serif:   var(--font-sans);
+  --font-display: 'Archivo', 'Helvetica Neue', Helvetica, system-ui, sans-serif;
+  --font-mono:    'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  /* Tighter geometry — a second signal against Midnight Gold */
+  --radius-xs: 3px;
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 10px;
+  --radius-xl: 14px;
+
+  --shadow-1: 0 1px 2px rgba(0,0,0,.45);
+  --shadow-2: 0 6px 18px rgba(0,0,0,.52);
+  --shadow-3: 0 16px 44px rgba(0,0,0,.62);
+  --shadow-4: 0 30px 74px rgba(0,0,0,.72);
+  --shadow-glow:  0 0 0 1px rgba(232,255,0,.26), 0 8px 26px rgba(232,255,0,.14);
+  --shadow-inset: inset 0 1px 0 rgba(255,255,255,.05);
+
+  --selection-bg:    rgba(232,255,0,.30);
+  --selection-text:  #ffffff;
+  --scrollbar-track: transparent;
+  --scrollbar-thumb: #33333a;
+  --scrollbar-hover: #4a4a54;
+
+  /* Component tokens */
+  --table-zebra: rgba(255,255,255,.02);
+  --table-total: rgba(232,255,0,.06);
+  /* Control-boundary fill. --surface-4 is an elevation step and can never be
+     3:1 from its neighbouring surface while still reading as subtle elevation,
+     so the slider track / toggle off-track role gets its own token.
+     3.10:1 on surface-2, 3.46:1 on surface-0. */
+  --control-track: #666669;
+
+}
+
+/* Ambient: one faint scanline field. Off under reduced motion (theme-base). */
+[data-palette="electric-yellow"] .ambient::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: repeating-linear-gradient(
+    180deg, rgba(255,255,255,.022) 0 1px, transparent 1px 3px);
+  animation: ey-scan 9s linear infinite;
+}
+@keyframes ey-scan { to { background-position: 0 3px; } }
+
+/* theme-laserlloyd.css — OPT-IN
+   Ground: dark · family: laserlloyd · color-scheme: dark
+   theme-color: #080a0d
+   fonts: Inter (400/500/600/700) body, Space Grotesk (500/600/700) display,
+          system mono stack. Self-hosted; no @import.
+
+   Values are taken from the live LaserLloyd.com stylesheet. Tokens NOT on the
+   site are derived here and marked (D).
+
+   Derived-semantics notes
+   - Amber (#ffb64a) means money / pro-tip / highlight on this site, so
+     --warning is pushed to a hotter orange (#f97c2e) AND is distinguished by
+     treatment: warnings always carry a left edge bar + glyph, while
+     highlight/amber is fill-only and never bordered.
+   - --info is a soft periwinkle (#8fb3ff) rather than a blue, so it cannot be
+     mistaken for the laser-blue primary action.
+   - --text-tertiary is the site's muted-2 #6f8496, measured at 4.60:1 on
+     --surface-2. It clears the 4.5:1 floor, so it is kept as-is. */
+
+[data-palette="laserlloyd"] {
+  color-scheme: dark;
+
+  --surface-void:    #040608;  /* D */
+  --surface-0:       #080a0d;
+  --surface-1:       #0d1116;
+  --surface-2:       #12171e;
+  --surface-3:       #171e27;
+  --surface-4:       #1e2732;
+  --surface-sunken:  #06080b;  /* D */
+  --surface-overlay: #12171e;  /* D */
+  --glass-1:         rgba(18,23,30,.80);  /* D */
+  --glass-2:         rgba(23,30,39,.90);  /* D */
+  --glass-3:         rgba(8,10,13,.86);   /* site header */
+  --glass-highlight: rgba(255,255,255,.055); /* D */
+  --code-bg:         #06080b;  /* D */
+
+  --text-primary:    #eaf1f8;
+  --text-secondary:  #9aabbc;
+  --text-tertiary:   #7d90a1;
+  --text-disabled:   #647380;  /* D */
+  --text-inverse:    #080a0d;  /* D */
+  --text-link:       #2ea8ff;
+  --text-link-hover: #4fb6ff;
+  --on-accent:       #00121f;
+  --on-danger:       #1d0505;  /* D */
+  --on-success:      #04210f;  /* D */
+  --on-warning:      #1d0c02;  /* D */
+  --on-media:        #ffffff;  /* D */
+  --on-media-muted:  #d5e0ea;  /* D */
+
+  --accent:          #2ea8ff;
+  --accent-hover:    #4fb6ff;
+  --accent-pressed:  #1f8ad6;  /* D */
+  --accent-subtle:   rgba(46,168,255,.10);
+  --accent-muted:    rgba(46,168,255,.22);  /* D */
+  --accent-glow:     rgba(46,168,255,.35);
+  --accent-rgb:      46,168,255;
+  --accent-2:        #00e6cf;
+  --accent-2-subtle: rgba(0,230,207,.08);
+
+  /* CTA = the donate "plate". Label is cut out to the page background. */
+  --cta:              #ffc24d;
+  --cta-hover:        #ffce6e;
+  --cta-pressed:      #e8ad3a;  /* D */
+  --on-cta:           #080a0d;
+  --cta-shadow:       0 10px 34px rgba(0,0,0,.45);
+  --cta-shadow-hover: 0 14px 40px rgba(255,194,77,.22);  /* D */
+  --cta-inset:        inset 0 1px 0 rgba(255,255,255,.45),
+                      inset 0 -6px 12px rgba(0,0,0,.28);
+  --highlight:        #ffb64a;
+  --highlight-hover:  #ffc670;
+  --highlight-subtle: rgba(255,182,74,.06);
+  --highlight-glow:   rgba(255,182,74,.4);
+  --on-highlight:     #1d1305;
+
+  --border-subtle:       #1a222b;  /* D */
+  --border:              #242e3a;
+  --border-strong:       #62727f;  /* D — control boundary, 3.61:1 on surface-2 */
+  --divider:             #242e3a;
+  --focus-ring:          #2ea8ff;
+  --focus-ring-width:    2px;
+  --focus-ring-offset:   2px;
+  --glass-stroke:        rgba(255,255,255,.07);   /* D */
+  --glass-stroke-strong: rgba(46,168,255,.34);    /* D */
+
+  --success: #4ade80; --success-hover: #86efac;  /* site OK */
+  --success-subtle: rgba(74,222,128,.10); --success-text: #4ade80;
+  --success-border: rgba(74,222,128,.38);
+  --warning: #f97c2e; --warning-hover: #ff9450;  /* D */
+  --warning-subtle: rgba(249,124,46,.10); --warning-text: #ff9450;
+  --warning-border: rgba(249,124,46,.44);
+  --danger: #ff6b6b; --danger-hover: #ff8f8f;
+  --danger-subtle: rgba(255,107,107,0.08); --danger-text: #ff8f8f;
+  --danger-border: rgba(255,107,107,.40);
+  --info: #8fb3ff; --info-hover: #b0c9ff;  /* D */
+  --info-subtle: rgba(143,179,255,.10); --info-text: #8fb3ff;
+  --info-border: rgba(143,179,255,.38);
+  --live: #00e6cf; --live-hover: #4cf0de;  /* D */
+  --live-subtle: rgba(0,230,207,.12); --live-text: #00e6cf;
+  --live-border: rgba(0,230,207,.42);
+  --idle: #ffb64a; --idle-hover: #ffc670;  /* D */
+  --idle-subtle: rgba(255,182,74,.10); --idle-text: #ffb64a;
+  --idle-border: rgba(255,182,74,.36);
+  --offline: #5a6a78; --offline-hover: #74848f;  /* D */
+  --offline-subtle: rgba(90,106,120,0.15); --offline-text: #7b8e9e;
+  --offline-border: rgba(90,106,120,.48);
+  --heartbeat: #ff8ab5; --heartbeat-hover: #ffadc9;  /* D */
+  --heartbeat-subtle: rgba(255,138,181,.10); --heartbeat-text: #ff8ab5;
+  --heartbeat-border: rgba(255,138,181,.38);
+  --on-info: #00112e; --on-live: #002220; --on-idle: #1d1305;  /* D */
+  --on-offline: #ffffff; --on-heartbeat: #2b0718;              /* D */
+
+  --scrim:        rgba(4,6,8,.70);  /* D */
+  --scrim-strong: rgba(2,4,6,.92);  /* D */
+  --scrim-light:  rgba(4,6,8,.46);  /* D */
+  --scrim-media:  linear-gradient(to top, rgba(8,10,13,.92), rgba(8,10,13,0));
+  --backdrop-blur: 14px;  /* D */
+
+  --bubble-user-bg:        #133248;  /* D */
+  --bubble-user-text:      #eaf1f8;  /* D */
+  --bubble-user-border:    #1d4361;  /* D */
+  --bubble-assistant-bg:   #12171e;  /* D */
+  --bubble-assistant-text: #dbe6f0;  /* D — site prose body */
+  --quote-bar:             #2ea8ff;  /* D */
+  --mark-bg:               rgba(255,182,74,.22);  /* D */
+  --md-bold:               #ffffff;  /* D */
+  --md-italic:             #00e6cf;  /* D */
+  --md-bolditalic:         #7cf2e6;  /* D */
+  --md-bolditalic-glow:    rgba(124,242,230,.40);  /* D */
+  --rp-speech:  #eaf1f8;  /* D */
+  --rp-action:  #9aabbc;  /* D */
+  --rp-thought: #7cf2e6;  /* D */
+  --rp-whisper: #6f8496;  /* D */
+  --rp-ooc:     #7d91a2;  /* D */
+  --rp-shout:   #ff9450;  /* D */
+  --rp-shout-glow: rgba(255,148,80,.45);  /* D */
+  --rp-critical: #ff8f8f;  /* D */
+  --rp-critical-glow: rgba(255,143,143,.45);  /* D */
+  --diff-add-bg: rgba(74,222,128,.12); --diff-add-text: #86efac;       /* D */
+  --diff-remove-bg: rgba(255,107,107,.12); --diff-remove-text: #ff9f9f; /* D */
+
+  /* Syntax — D */
+  --syn-fg: #dbe6f0;      --syn-bg: #06080b;
+  --syn-comment: #7d91a2; --syn-keyword: #8fb3ff; --syn-string: #00e6cf;
+  --syn-number: #ffb64a;  --syn-function: #2ea8ff; --syn-title: #4fb6ff;
+  --syn-type: #7cf2e6;    --syn-variable: #ff8ab5; --syn-attr: #ffc670;
+  --syn-tag: #8fb3ff;     --syn-builtin: #7cf2e6;  --syn-literal: #ffb64a;
+  --syn-meta: #8fa2b3;    --syn-operator: #c4d4e2; --syn-punctuation: #aabdcc;
+  --syn-deletion: #ff9f9f; --syn-addition: #86efac;
+
+  /* Categorical — D */
+  --cat-1: #2ea8ff; --cat-2: #00e6cf; --cat-3: #ffb64a; --cat-4: #ff8ab5;
+  --cat-5: #8fb3ff; --cat-6: #4ade80; --cat-7: #f97c2e; --cat-8: #7cf2e6;
+  --cat-9: #c0a8ff; --cat-10: #ff8f8f; --cat-11: #a3d95f; --cat-12: #9fc0d8;
+  --chart-grid: rgba(255,255,255,.06);  /* D */
+  --chart-axis: #5a6a78;                /* D */
+
+  --canvas-mask:    rgba(4,6,8,.74);       /* D */
+  --canvas-handle:  #2ea8ff;               /* D */
+  --canvas-guide:   rgba(46,168,255,.55);  /* D */
+  --canvas-outline: #eaf1f8;               /* D */
+
+  --font-sans:    'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-serif:   var(--font-sans);
+  --font-display: 'Space Grotesk', 'Inter', system-ui, sans-serif;
+  --font-mono:    ui-monospace, SFMono-Regular, 'Cascadia Code', Menlo, Consolas, monospace;
+
+  --radius-xs: 7px;
+  --radius-sm: 9px;
+  --radius-md: 11px;
+  --radius-lg: 14px;
+  --radius-xl: 18px;
+
+  --shadow-1: 0 2px 8px rgba(0,0,0,.35);    /* D */
+  --shadow-2: 0 10px 34px rgba(0,0,0,.45);
+  --shadow-3: 0 18px 50px rgba(0,0,0,.58);  /* D */
+  --shadow-4: 0 32px 80px rgba(0,0,0,.70);  /* D */
+  --shadow-glow:  0 0 0 1px rgba(46,168,255,.30), 0 10px 34px rgba(46,168,255,.16); /* D */
+  --shadow-inset: inset 0 1px 0 rgba(255,255,255,.05);  /* D */
+
+  --selection-bg:    rgba(46,168,255,.30);  /* D */
+  --selection-text:  #ffffff;               /* D */
+  --scrollbar-track: transparent;
+  --scrollbar-thumb: #253240;               /* D */
+  --scrollbar-hover: #3a4c5c;               /* D */
+
+  /* Component tokens — site signatures */
+  --prose-text:    #dbe6f0;
+  --table-zebra:   rgba(255,255,255,.02);
+  --table-total:   rgba(255,182,74,.07);
+  --beam-dot-d:    10px;
+  --motion-site:   140ms;
+  --hatch:         repeating-linear-gradient(-45deg,
+                     rgba(255,255,255,.022) 0 1px, transparent 1px 7px);
+  --wash-blue:     radial-gradient(900px 520px at 88% -8%, rgba(46,168,255,.10), transparent 70%);
+  --wash-cyan:     radial-gradient(760px 480px at 8% -6%, rgba(0,230,207,.07), transparent 70%);
+  /* Control-boundary fill. --surface-4 is an elevation step and can never be
+     3:1 from its neighbouring surface while still reading as subtle elevation,
+     so the slider track / toggle off-track role gets its own token.
+     3.09:1 on surface-2, 3.41:1 on surface-0. */
+  --control-track: #5f666d;
+
+}
+
+/* Page ambient — hatch under two radial washes */
+[data-palette="laserlloyd"] .ambient {
+  background-image: var(--wash-blue), var(--wash-cyan), var(--hatch);
+  background-color: var(--surface-0);
+}
+
+/* theme-laserlloyd-light.css — OPT-IN
+   Ground: light · family: laserlloyd · color-scheme: light
+   theme-color: #f2f5f9
+   fonts: same as theme-laserlloyd (Inter + Space Grotesk + system mono).
+
+   Values are taken from the live LaserLloyd.com light mode. (D) = derived.
+
+   Two nudges from the site's values, made because this is a new theme:
+   - muted  #546675 → #506270 (was 5.94:1 on --surface-2, floor is 6:1)
+   - muted-2 #6d7f8e → #627585 (was 4.14:1 on --surface-2, floor is 4.5:1) */
+
+[data-palette="laserlloyd-light"] {
+  color-scheme: light;
+
+  --surface-void:    #cdd7e2;  /* D */
+  --surface-0:       #f2f5f9;
+  --surface-1:       #f8fafc;
+  --surface-2:       #ffffff;
+  --surface-3:       #e9eef5;
+  --surface-4:       #dfe6ee;
+  --surface-sunken:  #e9eef5;  /* D */
+  --surface-overlay: #ffffff;  /* D */
+  --glass-1:         rgba(255,255,255,.82);  /* D */
+  --glass-2:         rgba(255,255,255,.92);  /* D */
+  --glass-3:         rgba(242,245,249,.88);  /* D — header */
+  --glass-highlight: rgba(255,255,255,.72);  /* D */
+  --code-bg:         #101820;  /* D — code blocks stay dark in every theme */
+
+  --text-primary:    #16212c;
+  --text-secondary:  #506270;  /* nudged */
+  --text-tertiary:   #576876;  /* nudged */
+  --text-disabled:   #74828e;  /* D */
+  --text-inverse:    #ffffff;  /* D */
+  --text-link:       #0d69b4;
+  --text-link-hover: #0a5a9c;
+  --on-accent:       #ffffff;
+  --on-danger:       #ffffff;  /* D */
+  --on-success:      #ffffff;  /* D */
+  --on-warning:      #ffffff;  /* D */
+  --on-media:        #ffffff;  /* D */
+  --on-media-muted:  #e4ebf2;  /* D */
+
+  --accent:          #0b78d0;
+  --accent-hover:    #0d69b4;
+  --accent-pressed:  #0a5a9c;  /* D */
+  --accent-subtle:   rgba(11,120,208,.08);  /* D */
+  --accent-muted:    rgba(11,120,208,.20);  /* D */
+  --accent-glow:     rgba(11,120,208,.26);  /* D */
+  --accent-rgb:      11,120,208;
+  --accent-2:        #087569;
+  --accent-2-subtle: rgba(10,143,128,.08);  /* D */
+
+  /* CTA plate — label cut out to the page background, so the plate colour is
+     dark enough for a near-white cut-out to clear AA (4.66:1). */
+  --cta:              #96640a;
+  --cta-hover:        #845608;
+  --cta-pressed:      #6f4806;  /* D */
+  --on-cta:           #f2f5f9;
+  --cta-shadow:       0 10px 30px rgba(20,35,50,.12);
+  --cta-shadow-hover: 0 14px 36px rgba(20,35,50,.18);  /* D */
+  --cta-inset:        inset 0 1px 0 rgba(255,255,255,.30),
+                      inset 0 -6px 12px rgba(0,0,0,.20);  /* D */
+  --highlight:        #8a5c08;  /* D — amber ink, AA on white */
+  --highlight-hover:  #6f4806;  /* D */
+  --highlight-subtle: rgba(245,166,35,.14);
+  --highlight-glow:   rgba(245,166,35,.32);  /* D */
+  --on-highlight:     #ffffff;  /* D */
+  --amber-fill:       #f5a623;  /* site amber, fills only — never as text */
+  --amber-fill-hover: #e2960f;
+  --on-amber-fill:    #241703;
+
+  --border-subtle:       #e4eaf1;  /* D */
+  --border:              #d3dce6;
+  --border-strong:       #79899a;  /* D — control boundary */
+  --divider:             #d3dce6;
+  --focus-ring:          #0b78d0;
+  --focus-ring-width:    2px;
+  --focus-ring-offset:   2px;
+  --glass-stroke:        rgba(22,33,44,.10);  /* D */
+  --glass-stroke-strong: rgba(11,120,208,.32);/* D */
+
+  --success: #15803d; --success-hover: #179245;
+  --success-subtle: #e3f0e8; --success-text: #147a3a;
+  --success-border: rgba(21,128,61,.34);
+  --warning: #b4520c; --warning-hover: #9a4409;  /* D */
+  --warning-subtle: #f6eae2; --warning-text: #ab4e0b;
+  --warning-border: rgba(180,82,12,.40);
+  --danger: #c13a3a; --danger-hover: #a82f2f;  /* D — nudged from the site's #d64545 so white-on-danger clears AA */
+  --danger-subtle: #f8e9e9; --danger-text: #c03636;
+  --danger-border: rgba(193,58,58,.40);
+  --info: #3a56b0; --info-hover: #2f4899;  /* D */
+  --info-subtle: #dfe4f2; --info-text: #3a56b0;
+  --info-border: rgba(58,86,176,.36);
+  --live: #087a6d; --live-hover: #066458;  /* D */
+  --live-subtle: #d7eae8; --live-text: #076e62;
+  --live-border: rgba(10,143,128,.40);
+  --idle: #8a5c08; --idle-hover: #6f4806;  /* D */
+  --idle-subtle: #ece5d7; --idle-text: #8a5c08;
+  --idle-border: rgba(138,92,8,.34);
+  --offline: #8d9dab; --offline-hover: #78899a;  /* D */
+  --offline-subtle: #e4e7eb; --offline-text: #576876;
+  --offline-border: rgba(141,157,171,.42);
+  --heartbeat: #a8326c; --heartbeat-hover: #90295c;  /* D */
+  --heartbeat-subtle: #f1dee7; --heartbeat-text: #a8326c;
+  --heartbeat-border: rgba(168,50,108,.34);
+  --on-info: #ffffff; --on-live: #ffffff; --on-idle: #ffffff;  /* D */
+  --on-offline: #16212c; --on-heartbeat: #ffffff;              /* D */
+
+  --scrim:        rgba(20,35,50,.46);  /* D */
+  --scrim-strong: rgba(10,20,30,.80);  /* D */
+  --scrim-light:  rgba(20,35,50,.26);  /* D */
+  --scrim-media:  linear-gradient(to top, rgba(10,20,30,.88), rgba(10,20,30,0)); /* D */
+  --backdrop-blur: 14px;  /* D */
+
+  --bubble-user-bg:        #c9dff4;  /* D */
+  --bubble-user-text:      #16212c;  /* D */
+  --bubble-user-border:    #a8cbec;  /* D */
+  --bubble-assistant-bg:   #ffffff;  /* D */
+  --bubble-assistant-text: #2e3d4a;  /* D — site prose body */
+  --quote-bar:             #0b78d0;  /* D */
+  --mark-bg:               #ffe4a8;  /* D */
+  --md-bold:               #0c141c;  /* D */
+  --md-italic:             #076e62;  /* D */
+  --md-bolditalic:         #076e62;  /* D */
+  --md-bolditalic-glow:    rgba(7,110,98,.20);  /* D */
+  --rp-speech:  #16212c;  /* D */
+  --rp-action:  #506270;  /* D */
+  --rp-thought: #076e62;  /* D */
+  --rp-whisper: #627585;  /* D */
+  --rp-ooc:     #6f8192;  /* D */
+  --rp-shout:   #b4520c;  /* D */
+  --rp-shout-glow: rgba(180,82,12,.22);  /* D */
+  --rp-critical: #b62f2f;  /* D */
+  --rp-critical-glow: rgba(182,47,47,.24);  /* D */
+  --diff-add-bg: rgba(21,128,61,.12); --diff-add-text: #10642f;      /* D */
+  --diff-remove-bg: rgba(214,69,69,.12); --diff-remove-text: #a82d2d; /* D */
+
+  /* Syntax — D, on the dark --code-bg */
+  --syn-fg: #dbe6f0;      --syn-bg: #101820;
+  --syn-comment: #8298a8; --syn-keyword: #9fbcff; --syn-string: #4fe3d0;
+  --syn-number: #ffc36b;  --syn-function: #62bcff; --syn-title: #62bcff;
+  --syn-type: #7cf2e6;    --syn-variable: #ff9fc0; --syn-attr: #ffd28f;
+  --syn-tag: #9fbcff;     --syn-builtin: #7cf2e6;  --syn-literal: #ffc36b;
+  --syn-meta: #93a6b6;    --syn-operator: #c4d4e2; --syn-punctuation: #aabdcc;
+  --syn-deletion: #ffa6a6; --syn-addition: #8cefb0;
+
+  /* Categorical — D, ≥3:1 on --surface-0 */
+  --cat-1: #0b78d0; --cat-2: #0a8f80; --cat-3: #8a5c08; --cat-4: #a8326c;
+  --cat-5: #3a56b0; --cat-6: #15803d; --cat-7: #b4520c; --cat-8: #076e62;
+  --cat-9: #6b3fa0; --cat-10: #c03636; --cat-11: #4f6b13; --cat-12: #2c5670;
+  --chart-grid: rgba(22,33,44,.09);  /* D */
+  --chart-axis: #8b9aa7;             /* D */
+
+  --canvas-mask:    rgba(20,35,50,.52);  /* D */
+  --canvas-handle:  #0b78d0;             /* D */
+  --canvas-guide:   rgba(11,120,208,.58);/* D */
+  --canvas-outline: #16212c;             /* D */
+
+  --font-sans:    'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-serif:   var(--font-sans);
+  --font-display: 'Space Grotesk', 'Inter', system-ui, sans-serif;
+  --font-mono:    ui-monospace, SFMono-Regular, 'Cascadia Code', Menlo, Consolas, monospace;
+
+  --radius-xs: 7px;
+  --radius-sm: 9px;
+  --radius-md: 11px;
+  --radius-lg: 14px;
+  --radius-xl: 18px;
+
+  --shadow-1: 0 1px 3px rgba(20,35,50,.08);   /* D */
+  --shadow-2: 0 10px 30px rgba(20,35,50,.12);
+  --shadow-3: 0 20px 52px rgba(20,35,50,.18); /* D */
+  --shadow-4: 0 32px 78px rgba(20,35,50,.24); /* D */
+  --shadow-glow:  0 0 0 1px rgba(11,120,208,.28), 0 10px 30px rgba(20,35,50,.14); /* D */
+  --shadow-inset: inset 0 1px 0 rgba(255,255,255,.80);  /* D */
+
+  --selection-bg:    rgba(11,120,208,.20);  /* D */
+  --selection-text:  #16212c;               /* D */
+  --scrollbar-track: transparent;
+  --scrollbar-thumb: #c4cfda;               /* D */
+  --scrollbar-hover: #a6b4c2;               /* D */
+
+  --prose-text:    #2e3d4a;
+  --table-zebra:   rgba(22,33,44,.025);  /* D */
+  --table-total:   rgba(245,166,35,.12); /* D */
+  --beam-dot-d:    10px;
+  --motion-site:   140ms;
+  --hatch:         repeating-linear-gradient(-45deg,
+                     rgba(22,33,44,.030) 0 1px, transparent 1px 7px);  /* D */
+  --wash-blue:     radial-gradient(900px 520px at 88% -8%, rgba(11,120,208,.08), transparent 70%);  /* D */
+  --wash-cyan:     radial-gradient(760px 480px at 8% -6%, rgba(10,143,128,.06), transparent 70%);   /* D */
+  /* Control-boundary fill. --surface-4 is an elevation step and can never be
+     3:1 from its neighbouring surface while still reading as subtle elevation,
+     so the slider track / toggle off-track role gets its own token.
+     3.38:1 on surface-2, 3.09:1 on surface-0. */
+  --control-track: #888c91;
+
+}
+
+[data-palette="laserlloyd-light"] .ambient {
+  background-image: var(--wash-blue), var(--wash-cyan), var(--hatch);
+  background-color: var(--surface-0);
+}
+
 /* theme-night-red.css — OPT-IN · contrast profile: night
    Ground: oled · family: night-red · color-scheme: dark · theme-color: #000000
    fonts: Inter, JetBrains Mono (shared with base)
@@ -1226,11 +1840,11 @@
       (control boundaries), strokes at 1.7-2.5:1. Surfaces step up in
       luminance like Midnight Gold's do.
    6. The alert ladder moves one step toward yellow, because red is taken
-      by the ground. Danger is hot orange #ff8400, warning is amber-yellow
+      by the ground. Danger is hot orange #ff9000, warning is amber-yellow
       #d49a00, info is yellow-olive #a4a000 and success is olive #6e9e00.
-      Danger clears the red accent by 1.63:1 and dE00 22, so Delete never
-      looks like Save, and clears body text by dE00 12, so an error line
-      stands out from prose.
+      Danger clears the red accent by 1.76:1 and dE00 26, so Delete never
+      looks like Save; body text by dE00 16, so an error line stands out
+      from prose; and bold prose (#ff6c00) by dE00 11.
    7. Calm: black shadows, opaque glass, and glow only on shout, critical
       and bold-italic text. Accent fills are bright red with a black label
       (5.25:1).
@@ -1315,9 +1929,9 @@
   --warning: #d49a00; --warning-hover: #e8aa00;
   --warning-subtle: rgba(212,154,0,.14); --warning-text: #d49a00;
   --warning-border: rgba(212,154,0,.50);
-  --danger: #ff8400; --danger-hover: #ff9800;
-  --danger-subtle: rgba(255,132,0,.14); --danger-text: #ff8400;
-  --danger-border: rgba(255,132,0,.55);
+  --danger: #ff9000; --danger-hover: #ffa000;
+  --danger-subtle: rgba(255,144,0,.14); --danger-text: #ff9000;
+  --danger-border: rgba(255,144,0,.55);
   --info: #a4a000; --info-hover: #b8b400;
   --info-subtle: rgba(164,160,0,.14); --info-text: #a4a000;
   --info-border: rgba(164,160,0,.50);
@@ -1331,7 +1945,7 @@
   --offline-subtle: rgba(255,0,0,.08); --offline-text: #ff3000;
   --offline-border: rgba(255,0,0,.40);
   --heartbeat: #ff0000; --heartbeat-hover: #ff2a00;
-  --heartbeat-subtle: rgba(255,0,0,.10); --heartbeat-text: #ff0000;
+  --heartbeat-subtle: rgba(255,0,0,.10); --heartbeat-text: #ff3000;
   --heartbeat-border: rgba(255,0,0,.50);
   --on-info: #000000; --on-live: #000000; --on-idle: #000000;
   --on-offline: #ff6400; --on-heartbeat: #000000;
@@ -1357,11 +1971,11 @@
   --rp-action:  #ff3000;
   --rp-thought: #c88400;
   --rp-whisper: #f01c00;
-  --rp-ooc:     #c41000;
-  --rp-shout:   #ff8400;
-  --rp-shout-glow: rgba(255,132,0,.45);
-  --rp-critical: #ff2400;
-  --rp-critical-glow: rgba(255,36,0,.55);
+  --rp-ooc:     #f01c00;
+  --rp-shout:   #ff9000;
+  --rp-shout-glow: rgba(255,144,0,.45);
+  --rp-critical: #ff9a00;
+  --rp-critical-glow: rgba(255,154,0,.55);
   --diff-add-bg: rgba(110,158,0,.16); --diff-add-text: #6e9e00;
   --diff-remove-bg: rgba(255,0,0,.16); --diff-remove-text: #ff0000;
 
@@ -1369,10 +1983,10 @@
      the warm accents, and the reds carry keywords, comments and
      punctuation. */
   --syn-fg: #ff5800;      --syn-bg: #0c0000;
-  --syn-comment: #e01400; --syn-keyword: #ff0000; --syn-string: #c88400;
+  --syn-comment: #e01400; --syn-keyword: #ff3000; --syn-string: #c88400;
   --syn-number: #a4a000;  --syn-function: #ff8400; --syn-title: #ff8400;
   --syn-type: #6e9e00;    --syn-variable: #ff6c00; --syn-attr: #d49a00;
-  --syn-tag: #ff0000;     --syn-builtin: #6e9e00;  --syn-literal: #a4a000;
+  --syn-tag: #ff3000;     --syn-builtin: #6e9e00;  --syn-literal: #a4a000;
   --syn-meta: #f00000;    --syn-operator: #ff2a00; --syn-punctuation: #f00000;
   --syn-deletion: #ff0000; --syn-addition: #6e9e00;
 
@@ -1407,654 +2021,6 @@
      1.62:1 above it, and the knob position carries the state. */
   --control-track: #c00000;
 
-}
-
-
-/* ============================================================================
-   adapter: quasar.css — contract tokens onto Quasar (NiceGUI 3.x)
-   ----------------------------------------------------------------------------
-   NiceGUI 3 declares: @layer theme, base, quasar, nicegui, components,
-   utilities, overrides, quasar_importants;
-   - This file is loaded from a plain, UNLAYERED <link>, so every normal
-     (non-!important) rule in it beats every rule Quasar ships, regardless of
-     Quasar's own selector specificity: unlayered normal declarations always
-     win over layered ones. Most of the component rules below rely on that —
-     they use short, generic selectors on purpose.
-   - The exception is Quasar's own !important classes (.text-white, .bg-grey,
-     .text-cyan, ...), shipped in the LAST layer, `quasar_importants`. For
-     !important declarations the layer order is reversed, so an !important
-     rule placed inside an EARLIER-declared layer beats a later one; an
-     unlayered !important does NOT get that benefit. So the handful of fixes
-     that must beat a Quasar !important class live in `@layer overrides`
-     (declared right before `quasar_importants`) at the bottom of this file.
-   - .bg-primary / .text-primary / .text-warning etc. read var(--q-*), so
-     remapping the variables below recolours them without fighting classes.
-   ============================================================================ */
-
-/* Quasar declares the brand variables on :root, and NiceGUI additionally
-   passes its own brand defaults (primary #5898d4, ...) through Quasar's
-   config, which writes them INLINE on <body>. Inline normal declarations
-   beat any stylesheet rule, so the mapping is declared on body as well and
-   marked !important (an author !important beats an inline normal value). */
-:root,
-body {
-  --q-primary:   var(--accent) !important;
-  --q-secondary: var(--accent-2) !important;
-  --q-accent:    var(--accent-2) !important;
-  --q-positive:  var(--success) !important;
-  --q-negative:  var(--danger) !important;
-  --q-info:      var(--info) !important;
-  --q-warning:   var(--warning) !important;
-  --q-dark:      var(--surface-2) !important;
-  --q-dark-page: var(--surface-0) !important;
-}
-
-/* ---- page body -------------------------------------------------------- */
-/* Quasar hard-codes body.body--dark's text colour to #fff and its own
-   `.q-dark` utility the same way; both are plain (non-!important) rules so
-   an unlayered override here is enough. quasar.js keeps body--dark/--light
-   in step with the active theme's ground (see adapters/quasar.js). */
-
-body.body--dark,
-body.body--light {
-  background: var(--surface-0);
-  color: var(--text-primary);
-}
-
-.q-dark {
-  color: var(--text-primary);
-  background: var(--surface-2);
-}
-
-/* ---- focus-visible ------------------------------------------------------
-   Quasar suppresses the native outline everywhere (`outline: 0`) in favour
-   of its ripple/focus-helper, which is a poor keyboard-focus signal on a
-   plain surface. Restore a real ring for keyboard users without touching
-   mouse-click UX: `:focus-visible` only matches keyboard/programmatic focus
-   in evergreen browsers. `:has()` reaches the visible sibling of controls
-   whose real input is 1px and invisible (checkbox/toggle). ---- */
-
-.q-btn:focus-visible,
-.q-tab:focus-visible,
-.q-item:focus-visible,
-.q-chip:focus-visible,
-a:focus-visible {
-  outline: var(--focus-ring-width) solid var(--focus-ring);
-  outline-offset: var(--focus-ring-offset);
-}
-
-.q-field__native:focus-visible,
-.q-field__input:focus-visible {
-  outline: var(--focus-ring-width) solid var(--focus-ring);
-  outline-offset: var(--focus-ring-offset);
-}
-
-.q-checkbox:has(.q-checkbox__native:focus-visible) .q-checkbox__bg,
-.q-toggle:has(.q-toggle__native:focus-visible) .q-toggle__track,
-.q-radio:has(.q-radio__native:focus-visible) .q-radio__bg {
-  outline: var(--focus-ring-width) solid var(--focus-ring);
-  outline-offset: var(--focus-ring-offset);
-}
-
-/* ---- header ------------------------------------------------------------
-   .q-layout__section--marginal is what actually paints the header/footer;
-   it is a plain rule (`background-color: var(--q-primary); color: #fff`),
-   so this alone stops the header from being accent-coloured. */
-
-.q-header,
-.q-layout__section--marginal {
-  background: var(--surface-1);
-  color: var(--text-primary);
-  border-bottom: 1px solid var(--border);
-  box-shadow: none;
-}
-
-/* ---- tabs ---------------------------------------------------------------
-   .q-tab uses `color: inherit` and .q-tab__indicator paints with
-   `currentColor`, so without an explicit color= prop the whole strip just
-   inherits the page/header text colour. Set it explicitly instead of
-   relying on inheritance to reach every context a tab strip is used in. */
-
-.q-tab {
-  color: var(--text-secondary);
-}
-
-.q-tab--active {
-  color: var(--text-primary);
-}
-
-.q-tab__indicator {
-  background: var(--accent);
-}
-
-.q-tabs {
-  border-bottom: 1px solid var(--border-subtle);
-}
-
-/* ---- cards ---------------------------------------------------------------
-   Quasar's only built-in dark treatment is `.q-card--dark`'s border/shadow
-   (the base .q-card has no dark background rule at all — NiceGUI's own
-   `dark:bg-white/5` classes exist in gui/ precisely to paper over that). One
-   rule now covers both: `.q-card--dark` only ever appears alongside `.q-card`
-   on the same element, so it needs no separate values of its own here.
-   Dialog cards get the raised "overlay" surface instead, since they float
-   above the page. */
-
-.q-card {
-  background: var(--surface-2);
-  color: var(--text-primary);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-md);
-  box-shadow: var(--shadow-1);
-}
-
-.q-dialog .q-card {
-  background: var(--surface-overlay);
-  box-shadow: var(--shadow-3);
-}
-
-.q-dialog__backdrop {
-  background: var(--scrim);
-}
-
-/* ---- fields (input / textarea / select / number) --------------------- */
-
-.q-field__control {
-  background: var(--surface-sunken);
-  border-radius: var(--radius-sm);
-}
-
-.q-field__control:before {
-  border-color: var(--border-strong);
-}
-
-.q-field__control:hover:before {
-  border-color: var(--text-secondary);
-}
-
-/* Filled variant paints its own background instead of using a border. */
-.q-field--filled .q-field__control,
-.q-field--filled .q-field__control:before {
-  background: var(--surface-sunken);
-}
-
-.q-field--filled.q-field--highlighted .q-field__control:before {
-  background: var(--surface-3);
-}
-
-/* Focused state already turns accent-coloured for free: the underline/outline
-   pseudo-elements paint with `currentColor`, and the highlighted state's
-   `color` comes from `--q-primary`, which is remapped to `--accent` above. */
-
-.q-field__native,
-.q-field__input,
-.q-field__prefix,
-.q-field__suffix {
-  color: var(--text-primary);
-}
-
-.q-field__label {
-  color: var(--text-tertiary);
-}
-
-.q-field--dark .q-field__marginal,
-.q-field--dark .q-field__bottom {
-  color: var(--text-tertiary);
-}
-
-.q-field--error .q-field__label,
-.q-field--error .q-field__bottom {
-  color: var(--danger-text);
-}
-
-/* ---- menus, select popups, list items --------------------------------- */
-
-.q-menu {
-  background: var(--surface-overlay);
-  border: 1px solid var(--border);
-  box-shadow: var(--shadow-2);
-  color: var(--text-primary);
-}
-
-.q-item,
-.q-list--dark,
-.q-item--dark {
-  color: var(--text-primary);
-  border-color: var(--border);
-}
-
-.q-item__section--side {
-  color: var(--text-secondary);
-}
-
-.q-item--active,
-.q-item.q-router-link--active {
-  background: var(--accent-subtle);
-  color: var(--text-primary);
-}
-
-/* Quasar's hover/keyboard-focus tint is `currentColor` at low opacity via a
-   shared .q-focus-helper overlay used by many components. The overlay is
-   absolutely positioned ABOVE the item's label, so it must never be opaque.
-   For list items (menus, selects, expansion headers) the flat hover surface
-   the contract wants is painted on the item itself and the overlay is kept
-   out of the way; the active (selected) item keeps an accent tint. */
-.q-item.q-hoverable:hover > .q-focus-helper,
-.q-item.q-manual-focusable--focused > .q-focus-helper {
-  opacity: 0;
-}
-
-.q-item.q-hoverable:hover,
-.q-item.q-manual-focusable--focused {
-  background: var(--surface-3);
-}
-
-.q-item--active.q-hoverable:hover,
-.q-item--active.q-manual-focusable--focused {
-  background: var(--accent-muted);
-}
-
-/* ---- buttons --------------------------------------------------------- */
-
-.q-btn.disabled {
-  color: var(--text-disabled);
-}
-
-/* ---- badges ------------------------------------------------------------
-   The base rule is plain CSS (`background-color: var(--q-primary); color:
-   #fff`); only the hard-coded text colour needs fixing here. A colour= prop
-   swaps in a `bg-<name>` / `text-white` pair from quasar_importants, handled
-   in the @layer overrides block below. */
-
-.q-badge {
-  color: var(--on-accent);
-}
-
-/* NiceGUI's ui.badge(text, color=...) adds only a bg-<name> class and no text
-   class, so without these every badge label is --on-accent, whatever its
-   fill. That measured 1.67-2.77:1 on the success, warning and danger fills
-   in the dark core themes, and 1.28:1 on --offline in Night Red. Each label
-   now takes its fill's own on-colour; --accent-2 (secondary, accent) has
-   none, so it takes the flipped page ink, 5.59:1 or better in every theme. */
-.q-badge.bg-positive {
-  color: var(--on-success);
-}
-
-.q-badge.bg-negative {
-  color: var(--on-danger);
-}
-
-.q-badge.bg-warning {
-  color: var(--on-warning);
-}
-
-.q-badge.bg-info {
-  color: var(--on-info);
-}
-
-.q-badge.bg-grey {
-  color: var(--on-offline);
-}
-
-.q-badge.bg-secondary,
-.q-badge.bg-accent {
-  color: var(--text-inverse);
-}
-
-/* ---- notifications (ui.notify) ----------------------------------------
-   The base look is a plain rule (`background:#323232;color:#fff`); typed
-   notifications add an !important `bg-<status>` (+ text-white/text-dark),
-   handled in @layer overrides so the status colour still applies but with a
-   correct on-color. */
-
-.q-notification {
-  background: var(--surface-overlay);
-  color: var(--text-primary);
-  border: 1px solid var(--border);
-  box-shadow: var(--shadow-2);
-}
-
-/* ---- tooltip ------------------------------------------------------------ */
-
-.q-tooltip--style {
-  color: var(--text-primary);
-  background: var(--surface-4);
-}
-
-/* ---- linear progress (VRAM bars, download rows, benchmark) ------------ */
-
-/* Progress tracks follow the specimen board: the fill (--accent via
-   --q-primary) sits on --surface-4. --control-track is for control
-   boundaries (slider, toggle), and next to a dark accent it swallowed the
-   fill. Quasar dims the track to .4 opacity; the surface step is already
-   subtle, so it is shown as is. */
-.q-linear-progress__track--light,
-.q-linear-progress__track--dark {
-  background: var(--surface-4);
-  opacity: 1;
-}
-
-/* ---- slider (LoRA adapter scale) --------------------------------------- */
-
-.q-slider__track,
-.q-slider__inner {
-  background: var(--control-track);
-}
-
-.q-slider__track {
-  color: var(--slider-color);
-}
-
-/* ---- toggle (chat "use loaded model", setup switches) ------------------
-   Track/thumb are recoloured directly rather than through `currentColor`,
-   which sidesteps Quasar's separate --dark variant entirely (off and on
-   states look the same regardless of Quasar's own dark/light class). */
-
-.q-toggle__track {
-  background: var(--control-track);
-  opacity: 1;
-}
-
-.q-toggle__inner--truthy .q-toggle__track {
-  background: var(--accent);
-  opacity: 1;
-}
-
-.q-toggle__thumb:after {
-  background: var(--surface-2);
-}
-
-.q-toggle__inner--truthy .q-toggle__thumb:after {
-  background: var(--on-accent);
-}
-
-/* ---- checkbox ----------------------------------------------------------- */
-
-.q-checkbox__inner,
-.q-checkbox--dark .q-checkbox__inner {
-  color: var(--border-strong);
-}
-
-.q-checkbox__inner--truthy,
-.q-checkbox__inner--indet,
-.q-checkbox--dark .q-checkbox__inner--truthy,
-.q-checkbox--dark .q-checkbox__inner--indet {
-  color: var(--accent);
-}
-
-.q-checkbox__svg {
-  color: var(--on-accent);
-}
-
-/* ---- separator ---------------------------------------------------------- */
-
-.q-separator,
-.q-separator--dark {
-  background: var(--divider);
-}
-
-/* ---- expansion item ------------------------------------------------------
-   The clickable header is a .q-item internally, so the hover/active rules
-   above already apply to it -- nothing extra needed here. */
-
-/* ---- table (benchmark history) ------------------------------------------ */
-
-.q-table__card,
-.q-table__card--dark,
-.q-table--dark {
-  background: var(--surface-2);
-  color: var(--text-primary);
-  border-color: var(--border);
-  box-shadow: none;
-}
-
-.q-table th {
-  color: var(--text-tertiary);
-  text-transform: uppercase;
-  letter-spacing: var(--ls-label);
-}
-
-.q-table th,
-.q-table td,
-.q-table--dark .q-table__bottom,
-.q-table--dark thead,
-.q-table--dark tr,
-.q-table--dark th,
-.q-table--dark td {
-  border-color: var(--divider);
-}
-
-.q-table tbody td:before {
-  background: color-mix(in srgb, var(--text-primary) 3%, transparent);
-}
-
-.q-table tbody td:after {
-  background: var(--surface-3);
-}
-
-/* ============================================================================
-   Tailwind v4 (browser runtime) utility classes used in gui/tabs/*.py.
-   These land in the `utilities` layer, so the same unlayered-beats-layered
-   rule applies: no !important needed here either.
-   ============================================================================ */
-
-.bg-black\/5 {
-  background-color: color-mix(in srgb, var(--text-primary) 5%, transparent);
-}
-
-.bg-black\/10 {
-  background-color: color-mix(in srgb, var(--text-primary) 10%, transparent);
-}
-
-.border-white\/10 {
-  border-color: var(--border-subtle);
-}
-
-.border-white\/20 {
-  border-color: var(--border);
-}
-
-.hover\:bg-white\/5:hover {
-  background-color: var(--surface-3);
-}
-
-.border-primary {
-  border-color: var(--accent);
-}
-
-.bg-primary\/20 {
-  background-color: color-mix(in srgb, var(--accent) 20%, transparent);
-}
-
-/* Dimmed text. The GUI makes its secondary text quieter with an opacity
-   utility on a text-sized label (`text-xs opacity-70`, about 165 labels).
-   Opacity multiplies the theme's own text colour: that still leaves about
-   6:1 in the dark core themes, but 60% of Night Red's #ff5800 is 2.9:1.
-   TEXT.md's rule is "a tier, never opacity", so these labels are drawn at
-   full opacity in a tier instead: 80 and 70 take --text-secondary, 60 and
-   50 take --text-tertiary. Quasar's semantic text classes (.text-warning,
-   .text-negative, ...) are !important in their own layer and keep their
-   colour. */
-:is(.text-xs, .text-sm, .text-base, [class*="text-["]):is(.opacity-80, .opacity-70) {
-  opacity: 1;
-  color: var(--text-secondary);
-}
-
-:is(.text-xs, .text-sm, .text-base, [class*="text-["]):is(.opacity-60, .opacity-50) {
-  opacity: 1;
-  color: var(--text-tertiary);
-}
-
-/* ============================================================================
-   @layer overrides — beats Quasar's !important classes (quasar_importants).
-   See the file banner: this layer is declared before quasar_importants in
-   NiceGUI's page template, so an !important rule in here wins the reversed
-   important-vs-important contest. Every selector below is a real Quasar (or
-   Tailwind) class name; nothing here is invented.
-   ============================================================================ */
-
-@layer overrides {
-  /* Filled controls (buttons, badges, chips): Quasar defaults their label to
-     `text-white` (or, for ui.notify's "warning" preset, `text-dark`) no
-     matter which colour= was requested. Never literal white/dark -- always
-     the token that is legible on that fill. */
-  .bg-primary.text-white {
-    color: var(--on-accent) !important;
-  }
-
-  /* --q-secondary and --q-accent are --accent-2, which has no on-colour of
-     its own: --on-accent on it measured 1.48-2.49:1 in the dark core themes.
-     The flipped page ink clears 5.59:1 in every theme. */
-  .bg-secondary.text-white,
-  .bg-accent.text-white {
-    color: var(--text-inverse) !important;
-  }
-
-  .bg-positive.text-white {
-    color: var(--on-success) !important;
-  }
-
-  .bg-negative.text-white {
-    color: var(--on-danger) !important;
-  }
-
-  .bg-warning.text-white,
-  .bg-warning.text-dark {
-    color: var(--on-warning) !important;
-  }
-
-  .bg-info.text-white {
-    color: var(--on-info) !important;
-  }
-
-  /* ui.notify(type=...): recolour the toast's own text directly, regardless
-     of which textColor Quasar's built-in preset attached. */
-  .q-notification.bg-positive {
-    color: var(--on-success) !important;
-  }
-
-  .q-notification.bg-negative {
-    color: var(--on-danger) !important;
-  }
-
-  .q-notification.bg-warning {
-    color: var(--on-warning) !important;
-  }
-
-  .q-notification.bg-info {
-    color: var(--on-info) !important;
-  }
-
-  /* Named Quasar palette classes used via color= props (dashboard/download
-     badges, setup/server icons) and gui/state.py's CAPABILITY_ICONS /
-     STATUS_COLOURS maps. These are deliberately mapped to distinct
-     categorical tokens, not to hue-matched colours -- .text-orange lands on
-     --cat-2 (teal), .text-purple on --cat-3 (gold), and so on. The contract
-     only promises the --cat-* set is distinguishable from itself and >=3:1 on
-     --surface-0 (they're a foreground/text-strength colour, not a fill);
-     making "orange" look orange isn't a goal, and the distinctness between
-     the five hues is test-enforced, so don't "fix" this to be hue-accurate.
-     "grey" is the one honestly-named exception, mapped to --offline. */
-  .text-grey {
-    color: var(--text-tertiary) !important;
-  }
-
-  .bg-grey {
-    background-color: var(--offline) !important;
-  }
-
-  .text-cyan {
-    color: var(--cat-1) !important;
-  }
-
-  .bg-cyan {
-    background-color: var(--cat-1) !important;
-  }
-
-  .text-orange {
-    color: var(--cat-2) !important;
-  }
-
-  .bg-orange {
-    background-color: var(--cat-2) !important;
-  }
-
-  .text-purple {
-    color: var(--cat-3) !important;
-  }
-
-  .bg-purple {
-    background-color: var(--cat-3) !important;
-  }
-
-  .text-teal {
-    color: var(--cat-4) !important;
-  }
-
-  .bg-teal {
-    background-color: var(--cat-4) !important;
-  }
-
-  .text-blue-grey {
-    color: var(--cat-5) !important;
-  }
-
-  .bg-blue-grey {
-    background-color: var(--cat-5) !important;
-  }
-
-  /* R17: --cat-* are tuned to be legible as a foreground colour on
-     --surface-0, not as a fill guaranteed to hold Quasar's literal white
-     label -- white on --cat-1 measures ~2:1 in some themes. Route the
-     pairing through --text-inverse (the theme's flipped page ink, always
-     legible on a mid-tone fill) instead of trusting the categorical token's
-     own hue to be dark/light enough. */
-  .bg-cyan.text-white,
-  .bg-orange.text-white,
-  .bg-purple.text-white,
-  .bg-teal.text-white,
-  .bg-blue-grey.text-white {
-    color: var(--text-inverse) !important;
-  }
-
-  /* --offline is a status fill with its own on-colour, and "grey" badges
-     (unloaded, idle, queued, canceled) are the common case. --text-inverse
-     on --offline measured 2.78-4.24:1 across the themes and 1.28:1 in Night
-     Red, whose offline fill is dark; --on-offline clears 4.5:1 in every one
-     (4.68-6.02, checked by tools/check_contrast.py). */
-  .bg-grey.text-white {
-    color: var(--on-offline) !important;
-  }
-}
-
-/* ============================================================================
-   sf-* helper classes — StudioForge-specific, kept to a minimum. Used only
-   where gui/tabs/*.py replaced a hard-coded `bg-black/10 dark:bg-white/5`
-   (etc.) pair with one semantic class. Declared last on purpose: they share
-   specificity with .q-card above and must win the source-order tiebreak
-   when a card also carries one of these classes.
-   ============================================================================ */
-
-.sf-well {
-  background: var(--surface-sunken);
-}
-
-.sf-danger-card {
-  background: var(--danger-subtle);
-  border-color: var(--danger-border);
-  color: var(--danger-text);
-}
-
-.sf-warning-card {
-  background: var(--warning-subtle);
-  border-color: var(--warning-border);
-  color: var(--warning-text);
-}
-
-/* Header theme picker: sizing only -- its colours come from the generic
-   .q-field rules above, which already read correctly on --surface-1. */
-.sf-theme-picker {
-  min-width: 9rem;
 }
 
 /* ---- Locale overrides — apply to every theme ---- */

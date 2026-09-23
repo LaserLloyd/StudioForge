@@ -363,13 +363,22 @@ class GuiAuthGate:
 # Theme assets
 # ---------------------------------------------------------------------------
 #
-# Vendored by tools/sync_theme.py from the unifyingTheme package (V26-09-16)
-# -- see docs/DEVELOPMENT.md's "GUI theming" section. Never hand-edited: a
-# change here belongs in that package's src/ or adapters/, followed by
-# `python tools/sync_theme.py app studioforge`.
+# gui/theme/ is the unifyingTheme drop-in bundle, copied verbatim from the
+# theme repo: the same folder every app gets (see docs/DEVELOPMENT.md's "GUI
+# theming" section). Never hand-edited; a theme update is copying the new
+# folder over this one. What is StudioForge's own is THEME_SETTINGS below.
 
-#: Where the four vendored files (ui-theme.js/.css/-base.css/.json) live.
+#: The drop-in bundle: ui-theme.js/.css/-base.css, adapters/, themes.json.
 _THEME_DIR = Path(__file__).parent / "theme"
+
+#: This app's own theme settings. The bundle carries none: they ride as
+#: data-* attributes on the ui-theme.js <script> tag (see _THEME_HEAD_HTML),
+#: and the header picker lists the same themes in the same order.
+THEME_SETTINGS: Mapping[str, Any] = {
+    "themes": ("purple", "midnight-gold", "glacier", "forest", "paper", "daylight", "night-red"),
+    "default": "glacier",
+    "storage_key": "studioforge.theme",
+}
 
 
 def _asset_version(name: str) -> str:
@@ -390,10 +399,21 @@ def _asset_version(name: str) -> str:
 _THEME_JS_VERSION = _asset_version("ui-theme.js")
 _THEME_BASE_CSS_VERSION = _asset_version("ui-theme-base.css")
 _THEME_CSS_VERSION = _asset_version("ui-theme.css")
+_QUASAR_JS_VERSION = _asset_version("adapters/quasar.js")
+_QUASAR_CSS_VERSION = _asset_version("adapters/quasar.css")
 
 
-def _theme_script_tag(name: str, version: str) -> str:
-    return f'<script src="{_THEME_URL_PREFIX}{name}?v={version}"></script>'
+def _theme_script_tag(name: str, version: str, attrs: str = "") -> str:
+    return f'<script src="{_THEME_URL_PREFIX}{name}?v={version}"{attrs}></script>'
+
+
+def _theme_settings_attrs() -> str:
+    """THEME_SETTINGS as the runtime's data-* configuration."""
+    return (
+        f' data-themes="{",".join(THEME_SETTINGS["themes"])}"'
+        f' data-default="{THEME_SETTINGS["default"]}"'
+        f' data-storage-key="{THEME_SETTINGS["storage_key"]}"'
+    )
 
 
 def _theme_link_tag(name: str, version: str) -> str:
@@ -402,35 +422,45 @@ def _theme_link_tag(name: str, version: str) -> str:
 
 #: Injected once into every page's <head> (see _register_theme_assets and
 #: _login_html), in this order: the runtime script -- blocking, so the
-#: palette is on the page before first paint -- then the element layer
-#: (loaded before the app's own CSS so its rules keep priority), then the
-#: contract tokens (loaded last so they beat any same-named legacy value).
+#: palette is on the page before first paint, and carrying THEME_SETTINGS --
+#: then the Quasar adapter's script (it needs the runtime), the element
+#: layer (loaded before the app's own CSS so its rules keep priority), the
+#: contract tokens (loaded after it so they beat any same-named legacy
+#: value), and last the Quasar adapter's CSS, which maps the tokens onto
+#: Quasar's components.
 _THEME_HEAD_HTML = (
-    _theme_script_tag("ui-theme.js", _THEME_JS_VERSION)
+    _theme_script_tag("ui-theme.js", _THEME_JS_VERSION, _theme_settings_attrs())
+    + _theme_script_tag("adapters/quasar.js", _QUASAR_JS_VERSION)
     + _theme_link_tag("ui-theme-base.css", _THEME_BASE_CSS_VERSION)
     + _theme_link_tag("ui-theme.css", _THEME_CSS_VERSION)
+    + _theme_link_tag("adapters/quasar.css", _QUASAR_CSS_VERSION)
 )
 
 
-def _theme_manifest() -> Mapping[str, Any]:
-    """The vendored picker manifest: enabled themes in picker order."""
+def _theme_registry() -> Mapping[str, Mapping[str, Any]]:
+    """The bundle's theme registry (themes.json), keyed by slug."""
     try:
-        text = (_THEME_DIR / "ui-theme.json").read_text(encoding="utf-8")
-        return json.loads(text)
-    except (OSError, ValueError):  # pragma: no cover - only if the copy is missing/corrupt
-        return {"manifest": {"default": "glacier"}, "themes": []}
+        data = json.loads((_THEME_DIR / "themes.json").read_text(encoding="utf-8"))
+        return {theme["slug"]: theme for theme in data["themes"]}
+    except (OSError, ValueError, KeyError, TypeError):  # pragma: no cover - only if the copy is missing/corrupt
+        return {}
 
 
-_THEME_MANIFEST = _theme_manifest()
+_THEME_REGISTRY = _theme_registry()
 
 
 def _theme_options() -> dict[str, str]:
-    """``{slug: name}`` for the header picker, already in picker order."""
-    return {theme["slug"]: theme["name"] for theme in _THEME_MANIFEST.get("themes", [])}
+    """``{slug: name}`` for the header picker, in THEME_SETTINGS order. A slug
+    the bundle does not know is left out rather than shown without a name."""
+    return {
+        slug: str(_THEME_REGISTRY[slug]["name"])
+        for slug in THEME_SETTINGS["themes"]
+        if slug in _THEME_REGISTRY
+    }
 
 
 def _theme_default() -> str:
-    return str(_THEME_MANIFEST.get("manifest", {}).get("default", "glacier"))
+    return str(THEME_SETTINGS["default"])
 
 
 #: Page-level event the header picker listens on; the browser emits it from

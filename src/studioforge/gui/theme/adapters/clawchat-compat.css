@@ -1,0 +1,259 @@
+/* GENERATED adapter clawchat-compat.css: unifyingTheme V26-09-16 drop-in bundle (ui-theme/),
+   the same in every app. Do not edit this copy: change the package's src/
+   or adapters/, run `python tools/sync_theme.py build`, then copy ui-theme/
+   into each app (or run `python tools/sync_theme.py install`).
+   body sha256: edf77b70542008b1 */
+
+/* ============================================================================
+   adapter: clawchat-compat.css — ClawChat legacy token names onto the contract
+   ----------------------------------------------------------------------------
+   Vendored into ui-theme.css by tools/sync_theme.py. Loads after theme-base.css
+   and every enabled theme block (Purple, Midnight Gold, Glacier, Forest, Paper,
+   Daylight), so every var() below can read a real contract value. ui-theme.css
+   itself loads after style.css and skin-obsidian.css (base.html), so this file
+   also gets the final say over both for any name it declares.
+
+   Selector: `:root, :root[data-theme]`.
+     - `:root[data-theme]` is specificity 0-2-0, which beats style.css's
+       `[data-theme="amoled"]` / `[data-theme="dark"]` blocks (0-1-0 each)
+       regardless of load order.
+     - the bare `:root` arm is 0-1-0, same as style.css's bare `:root` blocks,
+       so it wins on load order alone (this file loads later).
+
+   NEVER REDECLARED here because the name is already part of the contract and
+   already resolves correctly through the cascade alone:
+     --accent --accent-hover --accent-pressed --accent-subtle --accent-muted
+     --accent-glow --accent-rgb --accent-2 --accent-2-subtle
+     --border --border-subtle --border-strong --divider
+     --success --danger --warning --info --live --idle --offline --heartbeat
+       (and every --{status}-hover/-subtle/-text/-border/on-{status})
+     --code-bg --quote-bar --mark-bg --md-italic --md-bold --md-bolditalic
+       --md-bolditalic-glow --rp-speech --rp-action --rp-thought --rp-whisper
+       --rp-ooc --rp-shout(-glow) --rp-critical(-glow)
+     --radius-xs/sm/md/lg/xl/pill --space-1..8
+     --font-sans --font-serif --font-mono --font-display
+     --ls-tight/snug/base/label/mono
+     --ease-in --ease-out (contract's own motion names — ClawChat's *bare*
+       `--ease` is a different name and IS mapped below)
+     --shadow-1/2/3/4 --shadow-glow --shadow-inset
+     --glass-1/2/3 --glass-stroke --toggle-w --toggle-h --z-*
+   If a rule needs one of these with a different ClawChat-specific meaning, the
+   consuming rule is fixed at its source file instead (see the CSS lane report).
+   ============================================================================ */
+
+:root, :root[data-theme] {
+
+  /* ── Surfaces: legacy style.css --bg-*, skin --ink-*, --void ───────────── */
+  --bg-0: var(--surface-0);
+  --bg-1: var(--surface-1);
+  --bg-2: var(--surface-2);
+  --bg-3: var(--surface-3);
+  --bg-4: var(--surface-4);
+  --void: var(--surface-void);
+  --ink-0: var(--surface-0);
+  --ink-1: var(--surface-1);
+  --ink-2: var(--surface-2);
+  --ink-3: var(--surface-3);
+  /* obsidian's "active" step had no contract equivalent of its own; --surface-4
+     (active/badge) is the contract's own top step, so ink-4 aliases it too. */
+  --ink-4: var(--surface-4);
+  /* Used but never declared (§2.16): a generic "row hover" fill. */
+  --hover: var(--surface-3);
+  --bg-hover: var(--surface-3);
+
+  /* ── Glass ───────────────────────────────────────────────────────────────
+     --glass-1/2/3 and --glass-stroke are themselves contract names (see the
+     NEVER REDECLARE banner) — skin-obsidian.css's existing var(--glass-2) etc.
+     already resolve to the theme's own glass ramp with no help from this file.
+     Only the names the contract does NOT use are mapped here. */
+  --glass: var(--glass-highlight);        /* legacy faint wash / hatch tint   */
+  --glass-border: var(--glass-stroke);    /* legacy, declared-but-unused today */
+  --glass-hi: var(--glass-highlight);     /* "inner top highlight" — exact match */
+  --glass-stroke-2: var(--glass-stroke-strong); /* "emphasised hairline"      */
+
+  /* ── Text ────────────────────────────────────────────────────────────────
+     Legacy 3-tier (--text-1/2/3) and skin 5-tier (--t-0..4) both collapse onto
+     the contract's 4 tiers. The skin tiers carried their own contrast floors
+     in the V14 audit (t-2 >= 6:1, t-3 >= 4.5:1) which match --text-secondary
+     (6:1) and --text-tertiary (4.5:1) exactly, so that pair is a precise
+     mapping, not just a nearest-fit. t-0 ("display/primary") and t-1 ("body")
+     both read as prose/heading colour in the contract's simpler scale, so
+     both land on --text-primary. */
+  --text-1: var(--text-primary);
+  --text-2: var(--text-secondary);
+  --text-3: var(--text-tertiary);
+  --text-0: var(--text-primary);   /* used but never declared (memory inspector) */
+  --text:   var(--text-primary);   /* used but never declared (wf-picker, ipd)   */
+  --text-muted: var(--text-secondary);
+  --t-0: var(--text-primary);
+  --t-1: var(--text-primary);
+  --t-2: var(--text-secondary);
+  --t-3: var(--text-tertiary);
+  --t-4: var(--text-disabled);
+
+  /* ── Accent family: obsidian's --signal* ramp, legacy --iris*, neon leftovers
+     Both --signal and --iris were this app's two different "the accent" names
+     (obsidian native vs. the shared style.css primary-button token) — both
+     collapse onto the one contract accent ramp. */
+  --signal: var(--accent);
+  --signal-hi: var(--accent-hover);
+  --signal-lo: var(--accent-pressed);
+  --signal-glow: var(--accent-glow);
+  --signal-soft: var(--accent-subtle);
+  --signal-ring: var(--accent-muted);
+  --accent-light: var(--accent-hover);     /* legacy hover/link colour (39 uses) */
+  --iris: var(--accent);
+  --iris-deep: var(--accent-hover);        /* .btn-primary:hover reads this      */
+  --iris-soft: var(--accent-subtle);
+  --iris-hi: var(--accent-hover);
+  --iris-lo: var(--accent-pressed);
+  --iris-glow: var(--accent-glow);
+  /* Neon-only aliases: no surviving consumer post-skin-deletion, mapped
+     defensively in case anything still reads them. */
+  --acc: var(--accent);
+  --acc-2: var(--accent-2);
+  --acc-hi: var(--accent-hover);
+  --acc-lo: var(--accent-pressed);
+  --acc-glow: var(--accent-glow);
+  --acc-soft: var(--accent-subtle);
+  --violet: var(--accent);
+
+  /* ── Lines ───────────────────────────────────────────────────────────────
+     --border-focus was a hard violet in every skin (G-7) — this is what fixes
+     every off-palette focus ring app-wide in one place. */
+  --border-focus: var(--focus-ring);
+  --border-0: var(--border);        /* cc-menu panel edge + generated table rows */
+  --line: var(--border-subtle);
+  --line-2: var(--border);
+
+  /* ── Status: obsidian's raw semantic names + used-but-undeclared aliases */
+  --pulse: var(--live);
+  --calm: var(--success);
+  --warn: var(--warning);
+  --alert: var(--danger);
+  --rose: var(--heartbeat);
+  --rose-glow: var(--heartbeat-subtle);
+  --sage: var(--success);
+  --amber: var(--warning);
+  --lime: var(--live);
+  --lime-glow: var(--live-subtle);
+  --cyan: var(--info);
+  --ok: var(--success);
+  --err: var(--danger);
+  --error: var(--danger-text);      /* hangout.js inline status text colour */
+  --muted: var(--offline);          /* settings.html scheduler status dots  */
+  --primary: var(--accent);         /* legacy typo target (style.css active tile border) */
+  --warn-color: var(--warning);
+
+  /* ── Chat / content ──────────────────────────────────────────────────────
+     --code-bg, --quote-bar, --rp-*, --md-* are already contract names (see the
+     NEVER REDECLARE banner). Only the pure legacy chat-bubble names remain. */
+  --user-bubble: var(--bubble-user-bg);
+  --user-bubble-text: var(--bubble-user-text);
+  --assistant-bubble: var(--bubble-assistant-bg);
+  --assistant-bubble-text: var(--bubble-assistant-text);
+
+  /* ── Geometry: radii and spacing follow the contract scale (see report —
+     r-2/r-3 shift by 2px and 6px from obsidian's original 10/14px; every
+     other value is an exact match). Layout SIZES stay obsidian's own numbers
+     per the brief (a rail/header/sidebar width is a layout decision, not a
+     themeable colour or radius). */
+  --r-1: var(--radius-sm);   /* 6px  == radius-sm 6px   (exact) */
+  --r-2: var(--radius-md);   /* 10px -> radius-md 12px          */
+  --r-3: var(--radius-lg);   /* 14px -> radius-lg 16px          */
+  --r-4: var(--radius-xl);   /* 20px == radius-xl 20px  (exact) */
+  --r-5: var(--radius-xl);   /* 28px, declared-but-unused today */
+  --r-pill: var(--radius-pill);
+  --s-1: var(--space-1); --s-2: var(--space-2); --s-3: var(--space-3);
+  --s-4: var(--space-4); --s-5: var(--space-5); --s-6: var(--space-6);
+  --s-7: var(--space-7);   /* all seven are exact px matches, declared-but-unused today */
+  --sidebar-width: 280px;  /* (legacy) kept — distinct dimension from --sidebar-w (320px) */
+  --header-height: 60px;   /* (legacy) kept */
+
+  /* ── Type: --font/--t-* follow the contract scale (see report — t-md/-lg/-xl
+     shift by 1-4px; the rest are exact or near-exact). --font-sans/serif/mono
+     and --ls-* are already contract names. */
+  --font: var(--font-sans);
+  --t-micro: var(--fs-micro); --t-xs: var(--fs-xs); --t-sm: var(--fs-sm);
+  --t-base: var(--fs-base);   --t-md: var(--fs-md); --t-lg: var(--fs-lg);
+  --t-xl: var(--fs-xl);       --t-2xl: var(--fs-2xl); --t-3xl: var(--fs-3xl);
+  --t-display: var(--fs-display);
+
+  /* ── Motion ──────────────────────────────────────────────────────────────
+     --ease-in/--ease-out are contract names already (NEVER REDECLARE banner);
+     ClawChat's bare --ease has no contract equivalent, so it is mapped to the
+     closest personality match (both start steep, per the source curves). */
+  --ease: var(--ease-out);
+  --dur-1: var(--dur-fast);      /* 120ms (exact) */
+  --dur-2: var(--dur-base);      /* 200ms (exact) */
+  --dur-3: var(--dur-slow);      /* 320ms (exact) */
+  --dur-4: var(--dur-deliberate);/* 520ms (exact) */
+  --transition: var(--dur-base) var(--ease-standard);
+
+  /* ── Shadows: legacy 3-tier names only. --shadow-1/2/3/4 are already
+     contract names (NEVER REDECLARE banner) and resolve unaided. */
+  --shadow-sm: var(--shadow-1);
+  --shadow-md: var(--shadow-2);
+  --shadow-lg: var(--shadow-3);
+}
+
+/* ============================================================================
+   Direct rules — legacy selectors cheaper to unify here than at their four
+   scattered sources (style.css x2, rig.css, and hangout.html's own inline
+   <style>, which the CSS lane does not own and cannot edit).
+   ============================================================================ */
+
+/* ── Tabs: one active/current spec for all four tab systems ──────────────
+   Text goes to --text-primary; the accent shows only as the indicator (an
+   underline for underline-style tabs, a filled pill for the segmented ones
+   already handled by their own component CSS). Matches [aria-selected] and
+   [aria-current] as well as each system's own class, per the component brief.
+   skin-obsidian.css escalates `.tab-btn.active` with !important
+   (background/color/box-shadow); this must match that escalation to win. */
+.tab-btn.active,
+.profile-tab.active,
+.rig-tab[aria-selected="true"],
+.settings-tab.active,
+[role="tab"][aria-selected="true"],
+[role="tab"][aria-current] {
+  color: var(--text-primary) !important;
+  border-bottom-color: var(--accent) !important;
+}
+.tab-btn.active {
+  /* Pill tabs sit in a --surface-sunken well (skin-obsidian.css): the active
+     pill is the raised --surface-3 step with the accent as its underline. */
+  background: var(--surface-3) !important;
+  box-shadow: inset 0 -2px 0 var(--accent) !important;
+}
+.rig-tab[aria-selected="true"] {
+  border-bottom-width: 2px;
+}
+
+/* ── Toggle switch: one spec for .toggle/.toggle-wrap and .toggle-switch ──
+   Both wrap a shared `.toggle-slider`. Sized by --toggle-w/--toggle-h (already
+   contract tokens, so a per-instance inline override still works unchanged).
+   Matches the reference spec (design/Theme Foundation.dc.html): off track
+   --control-track / knob --surface-2, on track --accent / knob --on-accent —
+   never a bare white knob. skin-obsidian.css repaints `.toggle-slider,
+   .toggle-switch .toggle-slider` with !important; match it to win. */
+.toggle-slider,
+.toggle-switch .toggle-slider {
+  background: var(--control-track) !important;
+}
+.toggle input:checked + .toggle-slider,
+.toggle-switch input:checked + .toggle-slider {
+  background: var(--accent) !important;
+}
+.toggle-slider::before,
+.toggle-switch .toggle-slider::before {
+  background: var(--surface-2) !important;
+}
+.toggle input:checked + .toggle-slider::before,
+.toggle-switch input:checked + .toggle-slider::before {
+  background: var(--on-accent) !important;
+}
+.toggle:has(input:focus-visible) .toggle-slider,
+.toggle-switch:has(input:focus-visible) .toggle-slider {
+  outline: var(--focus-ring-width) solid var(--focus-ring);
+  outline-offset: var(--focus-ring-offset);
+}

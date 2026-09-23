@@ -1,9 +1,8 @@
-/* GENERATED theme runtime for studioforge by the unifyingTheme package (V26-09-16),
-   tools/sync_theme.py. Do not edit this copy: change the package (src/,
-   adapters/, apps/studioforge.json) and run `python tools/sync_theme.py app studioforge`.
-   themes: purple, midnight-gold, glacier, forest, paper, daylight, night-red | default: glacier
-   body sha256: c7cf3d811af0b76f */
-window.UI_THEME_MANIFEST = {"app": "studioforge", "themes": ["purple", "midnight-gold", "glacier", "forest", "paper", "daylight", "night-red"], "default": "glacier", "storageKey": "studioforge.theme", "families": false, "legacy": null, "mirrorAttr": null, "fontsHref": null};
+/* GENERATED theme runtime: unifyingTheme V26-09-16 drop-in bundle (ui-theme/),
+   the same in every app. Do not edit this copy: change the package's src/
+   or adapters/, run `python tools/sync_theme.py build`, then copy ui-theme/
+   into each app (or run `python tools/sync_theme.py install`).
+   body sha256: 4cd32791614780f3 */
 /* ============================================================================
    ui-theme.js — portable theme runtime · unifyingTheme V26-09-16
    ----------------------------------------------------------------------------
@@ -13,9 +12,11 @@ window.UI_THEME_MANIFEST = {"app": "studioforge", "themes": ["purple", "midnight
      <script src="ui-theme.js"></script>
 
    Configuration, first match wins:
-     1. window.UI_THEME_MANIFEST — tools/sync_theme.py writes this at the top of
-        every vendored copy, generated from apps/<app>.json.
-     2. data-* attributes on this <script> tag (standalone use):
+     1. window.UI_THEME_MANIFEST, if a page sets one before this script (the
+        old per-app builds did; the drop-in bundle does not).
+     2. data-* attributes on this <script> tag. This is how every app
+        configures the drop-in bundle (ui-theme/), which carries no app
+        settings of its own:
           data-themes="purple,midnight-gold,glacier,forest,paper,daylight"
           data-default="purple"
           data-storage-key="theme"
@@ -382,40 +383,4 @@ window.UI_THEME_MANIFEST = {"app": "studioforge", "themes": ["purple", "midnight
     tokens: tokens,
     mountPicker: mountPicker
   };
-})(window);
-
-/* ---- adapter: quasar.js — Quasar / NiceGUI ----
-   Keeps Quasar's dark mode in step with the theme's ground, because Quasar
-   switches its --dark component variants from Dark.isActive, not from CSS.
-   NiceGUI calls Quasar.Dark.set() while it creates the Vue app (and whenever a
-   ui.dark_mode element updates), so body class changes are watched and the
-   theme's ground is re-asserted. Light themes turn dark mode off. */
-(function (global) {
-  'use strict';
-  var T = global.UITheme;
-  if (!T) return;
-  var doc = global.document;
-
-  function wantDark() {
-    var theme = T.theme();
-    return !theme || theme.ground !== 'light';
-  }
-
-  function sync() {
-    var Q = global.Quasar;
-    if (!Q || !Q.Dark || typeof Q.Dark.set !== 'function') return;
-    var want = wantDark();
-    if (Q.Dark.isActive !== want) Q.Dark.set(want);
-  }
-
-  function watch() {
-    if (!doc.body || !global.MutationObserver) return;
-    new global.MutationObserver(sync).observe(doc.body, { attributes: true, attributeFilter: ['class'] });
-    sync();
-  }
-
-  T.onChange(sync);
-  if (doc.body) watch();
-  else doc.addEventListener('DOMContentLoaded', watch);
-  global.addEventListener('load', sync);
 })(window);
