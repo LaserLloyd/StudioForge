@@ -685,8 +685,14 @@ def create_app(
     start_background: bool = True,
 ) -> FastAPI:
     config = config or load_config(create=True)
+    # The process that builds the app is the server, so it owns -- and
+    # rotates -- studioforge.log (D69 §15, studioforge.logfiles).
     configure_logging(
-        config.logging.level, json_logs=config.logging.json_logs, log_dir=config.logs_dir
+        config.logging.level,
+        json_logs=config.logging.json_logs,
+        log_dir=config.logs_dir,
+        max_bytes=config.logging.file_max_mb * (1 << 20),
+        backup_count=config.logging.file_backups,
     )
 
     @contextlib.asynccontextmanager

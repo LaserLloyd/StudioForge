@@ -47,7 +47,7 @@ from studioforge.core.gpu import vram_processes
 from studioforge.core.kv_sensitivity import KV_QUALITY_LADDER
 from studioforge.core.leases import LeaseBook, lease_view
 from studioforge.core.priority import PRIORITY_BACKGROUND
-from studioforge.logging import get_logger
+from studioforge.logging import first_time, get_logger
 from studioforge.types import (
     MB,
     AdapterRecord,
@@ -111,6 +111,23 @@ BUSY_RETRY_AFTER_S = 15.0
 #: corrected total by this bar, which is the direction the band exists for.
 PREDICTION_ERROR_WARN_PCT = 5.0
 
+#: The bar for an OVER-estimate, where the child holds less than the formula
+#: said. It is wider than the bar for an under-estimate on purpose (D69 §6).
+#: An over-estimate costs headroom, never an OOM, and up to
+#: ``1 - 1/OBS_SAFETY`` (9.1%) of headroom is what D51 reserves deliberately
+#: on every corrected plan: a formula that far over already sits where a
+#: measured plan would put the load. With one bar, that band was also a trap.
+#: :func:`observed_correction` makes no correction when the factor lands
+#: within :data:`OBS_NOOP_TOLERANCE` of 1, which is every over-estimate
+#: between 8.6% and 9.5%, so a model in that band was warned on EVERY load and
+#: could never be corrected: 52 warnings between 2026-09-13 and 09-22 (Hy-MT2
+#: at -8.9%, Precog-123B -9.2%, Dark-Scarlett Q5_K_M -9.1%, Orion-26B -9.4%).
+#: 10% covers that whole band. ``test_planner_prediction_error.py`` pins it
+#: against ``OBS_SAFETY`` and ``OBS_NOOP_TOLERANCE``, so the three constants
+#: cannot drift apart. An under-estimate, the direction that OOMs, keeps the
+#: 5% bar and stays loud.
+PREDICTION_OVER_ESTIMATE_WARN_PCT = 10.0
+
 # Context sizes we are willing to suggest as a fallback, descending.
 _CTX_LADDER = (
     262144,
@@ -151,10 +168,22 @@ def kv_bytes_per_element(kv_type: str) -> float:
     try:
         return KV_BYTES_PER_ELEMENT[kv_type]
     except KeyError:
-        # Unknown/new cache type: assume f16 rather than guessing low, because
-        # under-estimating the KV cache is what produces an OOM at load.
-        log.warning("unknown kv cache type, assuming f16", kv_cache_type=kv_type)
-        return 2.0
+        pass
+    if kv_type == "auto":
+        # "auto" asks for the quality ladder (:meth:`Planner._kv_options`); it
+        # is not a cache type. A caller that sizes it without fanning it out
+        # -- the download-fit preview passes models.default_kv_cache_type
+        # straight through -- gets the ladder's first rung, f16, silently: the
+        # most expensive rung, so the answer can only err toward refusing.
+        # It used to be the WARNING below, 54 times since 2026-09-13 (D69 §14).
+        return KV_BYTES_PER_ELEMENT["f16"]
+    # Unknown/new cache type: assume f16 rather than guessing low, because
+    # under-estimating the KV cache is what produces an OOM at load. Once per
+    # type per process at WARNING: every rung of every placement asks again,
+    # and the repeats say nothing the first line did not.
+    emit = log.warning if first_time("kv_cache_type", kv_type) else log.debug
+    emit("unknown kv cache type, assuming f16", kv_cache_type=kv_type)
+    return 2.0
 
 
 #: llama.cpp sizes the sliding-window cache as
@@ -385,6 +414,97 @@ def kv_layers(meta: Any) -> list[KvLayer]:
     return uniform
 
 
+#: The cache type a :func:`fallback_kv_layers` estimate is charged at, whatever
+#: type the load asked for. The geometry behind a fallback is a guess, and a
+#: quantized cache would only make the guess cheaper (D69 §11).
+FALLBACK_KV_CACHE_TYPE = "f16"
+
+
+def fallback_kv_layers(meta: Any) -> list[KvLayer]:
+    """A pessimistic layer list for a model :func:`kv_layers` cannot describe.
+
+    ``kv_layers`` returns ``[]`` when the GGUF lacks a head dimension or every
+    head count. :func:`kv_alloc_bytes` used to sum that into a zero-byte cache,
+    :meth:`Planner.estimate` added the zero, and the slot sizer answered one
+    slot "unknown", so such a model was planned from its weights alone and
+    "fit" wherever they did (D69 §11). The load would then find out otherwise.
+
+    When the layer count and the model width are known, every layer is charged
+    as full multi-head attention with no GQA: K and V each ``n_embd`` wide per
+    token, which is as wide as ordinary attention gets. Where heads and head
+    dimensions are both known, :func:`kv_layers` already answered and this is
+    never consulted. :func:`kv_alloc_bytes` prices it at
+    :data:`FALLBACK_KV_CACHE_TYPE`.
+
+    Returns ``[]`` when there is no layer count or no width either. Nothing is
+    known then, and the planner refuses the load (``KV geometry unknown``)
+    rather than plan a cache of zero bytes.
+    """
+    extra = getattr(meta, "extra", None) or {}
+    n_layer = int(getattr(meta, "n_layer", 0) or 0) or len(extra.get("swa_pattern") or [])
+    per_layer = [int(x) for x in (extra.get("head_count_kv_values") or [])]
+    heads = (
+        int(getattr(meta, "n_head_kv", 0) or 0)
+        or int(getattr(meta, "n_head", 0) or 0)
+        or max(per_layer, default=0)
+    )
+    head_k = int(getattr(meta, "head_dim_k", 0) or 0)
+    head_v = int(getattr(meta, "head_dim_v", 0) or 0) or head_k
+    n_embd = int(getattr(meta, "n_embd", 0) or 0)
+    width_k = max(n_embd, heads * head_k)
+    width_v = max(n_embd, heads * head_v)
+    if n_layer <= 0 or width_k <= 0 or width_v <= 0:
+        return []
+    return [KvLayer("full", 1, width_k, width_v)] * n_layer
+
+
+def kv_geometry_unknown(meta: Any) -> bool:
+    """Whether not even :func:`fallback_kv_layers` can size this model's KV cache."""
+    return not kv_layers(meta) and not fallback_kv_layers(meta)
+
+
+def kv_geometry_rejection(record: ModelRecord) -> LoadRejected:
+    """The refusal for a model whose KV cache nothing can size (D69 §11).
+
+    A 507 with a reason that names the problem rather than a shortfall: there
+    is no arithmetic to show, and "does not fit" would send the caller to a
+    smaller context that cannot help. The estimate still carries the weights,
+    so the refusal says how big the file is.
+    """
+    meta = record.meta
+    weights = int(getattr(meta, "tensor_bytes", 0) or 0) or int(record.size_bytes)
+    if meta is None:
+        what = "it has no parsed GGUF metadata at all"
+    else:
+        heads = int(getattr(meta, "n_head", 0) or 0) or int(getattr(meta, "n_head_kv", 0) or 0)
+        missing = [
+            name
+            for name, value in (
+                ("block_count", int(getattr(meta, "n_layer", 0) or 0)),
+                ("embedding_length", int(getattr(meta, "n_embd", 0) or 0)),
+                ("attention.head_count", heads),
+                # Only when the head dimension could not be derived either.
+                ("attention.key_length", int(getattr(meta, "head_dim_k", 0) or 0)),
+            )
+            if value <= 0
+        ]
+        what = f"its GGUF metadata lacks {', '.join(missing) or 'a usable layer description'}"
+    return LoadRejected(
+        model_id=record.id,
+        reason=(
+            f"KV geometry unknown: {what}, so the size of its KV cache cannot be "
+            f"estimated. Planning it as zero bytes would report a fit that the load "
+            f"then contradicts, so the load is refused instead."
+        ),
+        estimate=VramEstimate(weights_bytes=weights),
+        suggestions=[
+            "re-download the file, or convert it again with a current llama.cpp "
+            "(a complete GGUF declares <arch>.block_count, <arch>.embedding_length "
+            "and <arch>.attention.head_count), then rescan the library",
+        ],
+    )
+
+
 def attention_kind(meta: Any) -> str:
     """``"full"`` | ``"iswa"`` | ``"hybrid"`` | ``"unknown"`` -- a catalog column.
 
@@ -505,14 +625,27 @@ def kv_alloc_bytes(
     branch at all for a hybrid model and so charged Qwen3.5 four times over.
 
     ``ctx_total`` is what reaches ``--ctx-size``: the total shared across slots
-    (D4), not the per-slot window. Returns 0 when the geometry is unknown,
-    which callers must treat as "cannot estimate".
+    (D4), not the per-slot window. A model :func:`kv_layers` cannot describe
+    is charged :func:`fallback_kv_layers` at :data:`FALLBACK_KV_CACHE_TYPE`,
+    never zero (D69 §11). Returns 0 only when nothing about the geometry is
+    known, which callers must treat as "cannot estimate" -- the planner
+    refuses such a load outright.
     """
     if ctx_total <= 0:
         return 0
     layers = kv_layers(meta)
     if not layers:
-        return 0
+        fallback = fallback_kv_layers(meta)
+        if not fallback:
+            return 0
+        return _alloc_bytes(
+            fallback,
+            ctx_total=ctx_total,
+            kv_type_k=FALLBACK_KV_CACHE_TYPE,
+            kv_type_v=FALLBACK_KV_CACHE_TYPE,
+            parallel=parallel,
+            ubatch=ubatch,
+        )
     cache = _alloc_bytes(
         layers,
         ctx_total=ctx_total,
@@ -694,9 +827,11 @@ def max_ctx_for_budget_geometry(
     an iSWA or hybrid model the uniform figure under-offers by 4-40x (D22: the
     window layers do not grow with context), which sent users to a 4k window
     when 65k fit. Returns 0 when nothing on the ladder fits or the geometry is
-    unknown; callers fall back to the uniform figure for the latter.
+    unknown; callers fall back to the uniform figure for the latter. A model
+    sized by :func:`fallback_kv_layers` is walked against that same fallback,
+    so the context a refusal offers is one the next plan accepts (D69 §11).
     """
-    if budget_bytes <= 0 or not kv_layers(meta):
+    if budget_bytes <= 0 or kv_geometry_unknown(meta):
         return 0
     slots = max(1, int(parallel))
     for ctx in _CTX_LADDER:
@@ -971,8 +1106,10 @@ class Planner:
         """The most recent predicted-vs-actual VRAM record for ``model_id``.
 
         ``None`` until a load of that model has been measured in this process.
-        ``within_bar`` says whether the miss stayed inside
-        :data:`PREDICTION_ERROR_WARN_PCT`.
+        ``within_bar`` says whether the miss stayed inside the bar for its
+        direction, ``bar_pct``: :data:`PREDICTION_ERROR_WARN_PCT` for an
+        under-estimate, :data:`PREDICTION_OVER_ESTIMATE_WARN_PCT` for an
+        over-estimate (D69 §6).
         """
         found = self._last_observations.get(model_id)
         return dict(found) if found is not None else None
@@ -1668,8 +1805,10 @@ class Planner:
         )
         # A server-chosen candidate refused here is one mode of a walk that
         # goes on to the next one -- an INFO line per mode per round would be
-        # the D16 flood; the walk logs its own decision.
-        (log.debug if chosen_by_server else log.info)(
+        # the D16 flood; the walk logs its own decision. A preview planner
+        # (log_plans=False) refuses the same saved override on every catalog
+        # build, so it says it at DEBUG too (D69 §8).
+        (log.debug if chosen_by_server or not self._log_plans else log.info)(
             "load rejected: device leased to another holder",
             model_id=record.id,
             devices=clash,
@@ -1729,6 +1868,10 @@ class Planner:
         priority: int = PRIORITY_BACKGROUND,
     ) -> PlanResult:
         """:meth:`plan_load` proper; ``gpus``/``extra_own_pids`` are the reload view."""
+        if kv_geometry_unknown(record.meta):
+            # Every rung has a context, and a context with no KV cache is a
+            # weights-only "fit" the load would then contradict (D69 §11).
+            return kv_geometry_rejection(record)
         settings = record.settings
         defaults = self.config.models
 
@@ -1856,7 +1999,12 @@ class Planner:
                         f"{freed_mb} MB, which reaches {attempt.ctx_size} tokens "
                         f"rather than the {floor} floor"
                     )
-                    log.info(
+                    # Through the log_plans flag like "load planned" (D69 §8): a
+                    # catalog, placements or fit preview plans every model against
+                    # hypothetical victims, and at INFO those lines read like real
+                    # evictions (560 of 1585 lines on 2026-09-20).
+                    emit = log.info if self._log_plans else log.debug
+                    emit(
                         "re-planned after eviction",
                         model_id=record.id,
                         evicting=attempt.evict_model_ids,
@@ -2961,8 +3109,11 @@ class Planner:
 
         No eviction, no auto-parallel, no fallback to another device set: this
         answers about the device set it was handed, at the slot count it was
-        handed. ``None`` means "not at these settings", never "never".
+        handed. ``None`` means "not at these settings", never "never" -- except
+        for a model whose KV cache nothing can size, which fits nowhere (D69 §11).
         """
+        if kv_geometry_unknown(record.meta):
+            return None
         return_plan = self._try_devices(
             record,
             list(devices),
@@ -3821,9 +3972,16 @@ class Planner:
                     "means the charge is too small for this model"
                 ),
             )
-        within_bar: bool | None = (
-            abs(error_pct) <= PREDICTION_ERROR_WARN_PCT if error_pct is not None else None
+        # One bar per direction (D69 §6): an under-estimate (the child holds
+        # more than the formula said) is the OOM direction and keeps the 5%
+        # bar; an over-estimate is measured against the wider band D51 would
+        # reserve anyway. See PREDICTION_OVER_ESTIMATE_WARN_PCT.
+        bar_pct = (
+            PREDICTION_OVER_ESTIMATE_WARN_PCT
+            if error_pct is not None and error_pct < 0
+            else PREDICTION_ERROR_WARN_PCT
         )
+        within_bar: bool | None = abs(error_pct) <= bar_pct if error_pct is not None else None
         if not corrected and error_pct is not None and not within_bar:
             log.warning(
                 "vram prediction error exceeds the bar",
@@ -3831,7 +3989,7 @@ class Planner:
                 predicted_mb=round(predicted / MB) if predicted is not None else None,
                 actual_mb=round(actual_bytes / MB),
                 error_pct=round(error_pct, 1),
-                bar_pct=PREDICTION_ERROR_WARN_PCT,
+                bar_pct=bar_pct,
                 ctx=plan.ctx_size,
                 parallel=plan.parallel,
                 kv=f"{plan.kv_cache_type}/{plan.kv_cache_type_v}",
@@ -3874,7 +4032,9 @@ class Planner:
             "actual_bytes": int(actual_bytes),
             "error_pct": round(error_pct, 2) if error_pct is not None else None,
             "within_bar": within_bar,
-            "bar_pct": PREDICTION_ERROR_WARN_PCT,
+            # The bar this miss was held to: 5% under, 10% over (D69 §6).
+            "bar_pct": bar_pct,
+            "over_bar_pct": PREDICTION_OVER_ESTIMATE_WARN_PCT,
             "corrected": corrected,
             "correction_factor": (
                 round(applied.correction.factor, 4) if applied is not None else None
@@ -4000,6 +4160,13 @@ def per_device_overruns(
 #: that would have fit, rather than at "OOM", which costs a child mid-request.
 OBS_SAFETY = 1.10
 
+#: A correction whose factor is this close to 1 is no correction at all, and
+#: :func:`observed_correction` returns ``None`` for it: the plan then stays on
+#: the formula and is observed as uncorrected. Named because
+#: :data:`PREDICTION_OVER_ESTIMATE_WARN_PCT` has to cover the over-estimates it
+#: leaves uncorrected (D69 §6).
+OBS_NOOP_TOLERANCE = 0.005
+
 #: The floor the correction may pull the estimate down to, as a fraction of the
 #: formula's own answer. A row that is a fluke -- or contaminated in some way
 #: the note check has not yet learned to spot -- can talk the estimate down by
@@ -4117,7 +4284,7 @@ def observed_correction(*, formula_bytes: int, observed_bytes: int) -> ObservedC
     corrected = min(high, max(low, trusted))
     clamped = corrected != trusted
     factor = corrected / formula_bytes
-    if abs(factor - 1.0) < 0.005:
+    if abs(factor - 1.0) < OBS_NOOP_TOLERANCE:
         return None
     note = (
         f"{CORRECTION_NOTE_PREFIX}{factor:.2f} from the last load of this exact "

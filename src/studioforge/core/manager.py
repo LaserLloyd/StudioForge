@@ -56,7 +56,7 @@ from studioforge.errors import (
     StudioForgeError,
     UnsupportedArchitectureError,
 )
-from studioforge.logging import get_logger
+from studioforge.logging import first_time, get_logger
 from studioforge.types import (
     MB,
     AdapterRecord,
@@ -3074,8 +3074,11 @@ class ModelManager:
             # The failure mode lands on the CLIENT: channel markers arrive
             # inline in message.content and look like model damage there, so
             # the one place that knows both facts -- thinking arch, no format
-            # -- says so at load time (D12 keeps "none" as the default).
-            log.warning(
+            # -- says so at load time (D12 keeps "none" as the default). It
+            # describes a setting, not a load: WARNING once per model per
+            # process, DEBUG after (136 identical lines 09-13..09-22, D69 §16).
+            emit = log.warning if first_time("reasoning_format", record.id) else log.debug
+            emit(
                 "thinking model loads with no reasoning_format",
                 model_id=record.id,
                 detail=(

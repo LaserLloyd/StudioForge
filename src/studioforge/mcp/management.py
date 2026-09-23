@@ -2402,8 +2402,13 @@ def run_stdio(config_path: Path | None = None) -> None:
     from studioforge.logging import configure_logging
 
     config = load_config(config_path, create=True)
+    # A guest on studioforge.log: the server owns and rotates it, and this
+    # process can live as long as its MCP client does (D69 §15).
     configure_logging(
-        config.logging.level, json_logs=config.logging.json_logs, log_dir=config.logs_dir
+        config.logging.level,
+        json_logs=config.logging.json_logs,
+        log_dir=config.logs_dir,
+        owner=False,
     )
     state = build_state(config)
     server = build_management_mcp(state)

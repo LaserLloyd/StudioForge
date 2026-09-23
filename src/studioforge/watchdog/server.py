@@ -86,6 +86,7 @@ from studioforge.config import (
     resolve_data_dir,
 )
 from studioforge.credential_guard import CredentialGuard, client_key
+from studioforge.logfiles import backups_of
 
 log = logging.getLogger("studioforge.watchdog")
 
@@ -223,7 +224,22 @@ def tail_file(path: Path, n: int) -> list[str]:
 
     A missing log is a normal state (a model that has never been loaded), not an
     error worth failing a diagnostic call over.
+
+    A rotated log (D69 §15) starts almost empty. When the live file holds fewer
+    than ``n`` lines, the tail of its newest rotated copy goes in front, so a
+    recovery call made just after a rotation still sees what led up to it.
     """
+    if n <= 0:
+        return []
+    lines = _tail_lines(path, n)
+    if len(lines) < n:
+        backups = backups_of(path)
+        if backups:
+            lines = _tail_lines(backups[-1], n - len(lines)) + lines
+    return lines
+
+
+def _tail_lines(path: Path, n: int) -> list[str]:
     if n <= 0 or not path.is_file():
         return []
     try:

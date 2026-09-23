@@ -61,7 +61,9 @@ def test_configure_logging_installs_no_stream_handler_under_pythonw(
     root = logging.getLogger()
     kinds = {type(h).__name__ for h in root.handlers}
     assert "_SafeStreamHandler" not in kinds and "StreamHandler" not in kinds
-    assert "RingBufferHandler" in kinds and "FileHandler" in kinds
+    assert "RingBufferHandler" in kinds
+    # The file handler is the size-rotating one since D69 §15, a FileHandler.
+    assert any(isinstance(h, logging.FileHandler) for h in root.handlers)
     # And logging still works (the ring buffer + file take the record).
     sf_logging.get_logger("t").info("under pythonw")
 

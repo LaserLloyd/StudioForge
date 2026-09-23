@@ -253,6 +253,9 @@ class Registry:
         self._adapters: dict[str, AdapterRecord] = {}
         self._adapters_loaded = False
         self._last_scan_at: float | None = None
+        #: The alias collisions already warned about, as ``(kept, dropped,
+        #: aliases)``. See :meth:`_rebuild_aliases` (D69 §16).
+        self._alias_collisions_warned: set[tuple[str, str, tuple[str, ...]]] = set()
 
     # ------------------------------------------------------------------
     # Scanning
@@ -815,8 +818,18 @@ class Registry:
     def _rebuild_aliases(self) -> None:
         """Full ids first, then short forms -- so a short alias can never
         shadow another model's canonical id. First writer wins; the loser is
-        logged, never silently dropped."""
+        logged, never silently dropped.
+
+        A collision is a fact about the library, not an event, so it is said
+        once per state per process (D69 §16): one WARNING per colliding pair
+        naming every alias the two share, when that set is new. Every rescan
+        rebuilds this map, and the same Dark-Scarlett IQ4_XS/Q5_K_M pair used
+        to log the same three lines each time (92 between 2026-09-13 and
+        09-22). Repeats go to DEBUG; a collision that goes away and comes back
+        is warned again.
+        """
         aliases: dict[str, str] = {}
+        collisions: dict[tuple[str, str], set[str]] = {}
         for model_id in sorted(self._models):
             aliases[model_id.lower()] = model_id
         for model_id in sorted(self._models):
@@ -826,13 +839,24 @@ class Registry:
                 if owner is None:
                     aliases[alias] = model_id
                 elif owner != model_id:
-                    log.warning(
-                        "registry.alias_collision",
-                        alias=alias,
-                        kept=owner,
-                        dropped=model_id,
-                    )
+                    collisions.setdefault((owner, model_id), set()).add(alias)
         self._aliases = aliases
+        current = {
+            (kept, dropped, tuple(sorted(names))) for (kept, dropped), names in collisions.items()
+        }
+        for kept, dropped, names in sorted(current):
+            seen = (kept, dropped, names) in self._alias_collisions_warned
+            (log.debug if seen else log.warning)(
+                "registry.alias_collision",
+                aliases=list(names),
+                kept=kept,
+                dropped=dropped,
+                detail=(
+                    "these short names resolve to the kept model; the dropped one is "
+                    "still reachable by its full id"
+                ),
+            )
+        self._alias_collisions_warned = current
 
     # ------------------------------------------------------------------
     # Read API

@@ -309,3 +309,13 @@ the place a load failure is legible), `logs/watchdog.log`, `logs/tray-server.log
 server's console). `GET /api/logs?n=500` tails the in-memory ring buffer; the watchdog's
 `tail_logs` reads the files even when the server is down. Secrets (`server.api_key`, `hf.token`,
 `mcp.pin`) are redacted in every log line and every config dump.
+
+The three files rotate at `logging.file_max_mb` (20 MiB) and keep `logging.file_backups` (5)
+copies, named with the rotation time: `studioforge.20260923-210507.log` (D69). The server rotates
+`studioforge.log` and the watchdog rotates `watchdog.log`. The tray, the CLI commands and the stdio
+MCP server append a record at a time to `studioforge.log` and never hold it open. The tray rotates
+`tray-server.log` only when it starts a server, because the running child writes it through an
+inherited handle. On Windows, a file another process holds cannot be renamed. The rotation then waits
+(`log rotation deferred ...` in the file itself, retried every 5 min), and nothing is lost.
+`tail_logs` reaches into the newest copy when the live file is short. `file_max_mb: 0` never
+rotates. Both keys take effect at the next restart.

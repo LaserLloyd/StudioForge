@@ -22,6 +22,7 @@ import sys
 from pathlib import Path
 
 from studioforge.config import Config, find_config_path
+from studioforge.logfiles import MB, SafeRotatingFileHandler
 from studioforge.watchdog.server import Watchdog, serve
 
 LOG_FORMAT = "%(asctime)s %(levelname)s [watchdog] %(message)s"
@@ -49,12 +50,26 @@ def configure_logging(config: Config, level: str = "INFO") -> Path | None:
     try:
         config.logs_dir.mkdir(parents=True, exist_ok=True)
         log_path = config.logs_dir / "watchdog.log"
-        file_handler = logging.FileHandler(log_path, encoding="utf-8")
+        # This process is the file's only writer, so it rotates it; see
+        # studioforge.logfiles for why the rotation is safe even if a second
+        # watchdog briefly opens it too (D69 §15).
+        file_handler = SafeRotatingFileHandler(
+            log_path,
+            max_bytes=config.logging.file_max_mb * MB,
+            backup_count=config.logging.file_backups,
+        )
         file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
         root.addHandler(file_handler)
     except OSError as exc:  # pragma: no cover - unwritable data dir
         log_path = None
         root.warning("could not open watchdog log file: %s", exc)
+
+    # The health poll's httpx client logged every probe at INFO ("HTTP Request:
+    # GET .../health 200 OK", two every 10 s): ~10.7k lines a day and nearly
+    # all of a 61 MB watchdog.log (D69 §15). The poll logs every health
+    # transition itself, and a failed probe raises into "health poll failed".
+    for noisy in ("httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
     return log_path
 
 

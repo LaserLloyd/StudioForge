@@ -932,7 +932,8 @@ async def _forward(
             ) from exc
         except httpx.HTTPError as exc:
             raise UpstreamError(
-                f"llama-server for '{record.id}' failed: {exc}. {_stderr_hint(state, record.id)}"
+                f"llama-server for '{record.id}' failed: {_exc_text(exc)}. "
+                f"{_stderr_hint(state, record.id)}"
             ) from exc
 
         elapsed = time.perf_counter() - started
@@ -1083,9 +1084,9 @@ async def _stream_upstream(
         closing = True
         raise
     except httpx.HTTPError as exc:
-        log.warning("stream failed", model_id=record.id, error=str(exc))
+        log.warning("stream failed", model_id=record.id, error=_exc_text(exc))
         yield _sse_error(
-            f"llama-server for '{record.id}' failed mid-stream: {exc}. "
+            f"llama-server for '{record.id}' failed mid-stream: {_exc_text(exc)}. "
             f"{_stderr_hint(state, record.id)}",
             code="upstream_error",
         )
@@ -1261,6 +1262,21 @@ def _stderr_hint(state: Any, model_id: str) -> str:
         return ""
     tail = " | ".join(line.strip() for line in lines if line.strip())
     return f"Recent llama-server output: {tail[:800]}"
+
+
+def _exc_text(exc: BaseException) -> str:
+    """``"ReadError: <message>"``, or just the class name when there is no message.
+
+    ``str()`` of several httpx exceptions is empty: a child that dies or drops
+    the socket mid-read raises ``ReadError('')`` or ``RemoteProtocolError('')``.
+    A bare ``{exc}`` then logged ``stream failed error=`` (six lines on
+    2026-09-20) and told the client ``failed: . Recent llama-server output``
+    (four ERROR lines on 09-16/17). The class name is the fact that survives;
+    ``supervisor._watch`` has logged its failures this way since D60 (D69 §7).
+    """
+    text = str(exc).strip()
+    name = type(exc).__name__
+    return f"{name}: {text}" if text else name
 
 
 def _tokens_per_second(response: httpx.Response, elapsed: float) -> float | None:
