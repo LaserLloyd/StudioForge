@@ -287,6 +287,18 @@ The codes that mean **wait and retry unchanged** are exactly: `priority_hold`, `
 lease `kind` is not `benchmark`. Every one of them carries `retry_after_s` or `Retry-After`.
 Everything else means *change the request*, *stand down*, or *report*.
 
+**Tiers, idle timeouts and the retry split, in one table** (StudioForge; the shipped policy is
+`models.ttl_by_priority: {1: 900, 2: 900, 3: 600}` with `models.default_ttl_s: 600`, D60):
+
+| | What | Idle TTL / what to do | Retry unchanged? |
+| --- | --- | --- | --- |
+| tier 1 | the model a person is chatting with; holds tiers 2–3 off with `503 priority_hold` and may displace their idle residents | 900 s | — |
+| tier 2 | a dispatched agent's model; holds tier 3 off | 900 s | — |
+| tier 3 (and **omitted**) | background; holds nobody off, first to be evicted | 600 s | — |
+| any tier | a request-level `ttl` shortens the timer and never lengthens it (D61); `settings.ttl_s: 0` is pinned and never idles out | — | — |
+| **retry-after** | `priority_hold` 503, `model_busy` 503, `benchmark_busy` 503, `model_benchmarking` 503, `lease_vacating` 409, `gpu_leased` 507 with lease `kind` ≠ `benchmark` | wait `retry_after_s` / `Retry-After`, then resend the same request | **yes** |
+| **terminal** | `unsupported_architecture` 400 (the model's architecture is not in the active llama.cpp build), `context_exceeded` 400, `invalid_config` 400, `model_not_multimodal` 400, `model_not_found` 404, `no_loaded_model` 404, `insufficient_vram` 507, `allowed_devices_unavailable` 507, `gpu_leased` 507 with `kind: benchmark`, `lease_conflict` 409, `model_load_failed` 502, `upstream_error` 502, `upstream_timeout` 504, `remote_admin_requires_credential` 403, `invalid_api_key` / `invalid_mcp_pin` 401 | change the request, stand down, or report | **no** |
+
 ---
 
 ## 10. The short version (this is the part to hand an agent)

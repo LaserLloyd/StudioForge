@@ -3213,6 +3213,12 @@ settings on request. Two per-model hints become answers.
    instance, because a re-tier is a statement about what the model is and outranks one request's
    opinion about how long it should live.
 
+   *Amended 2026-09-23: superseded by D60.* The map no longer ships empty. D60's first rule
+   (2026-09-09) made `{1: 900, 2: 900, 3: 600}` with `default_ttl_s: 600` the shipped policy,
+   and `config.example.yaml` carries those numbers, not the `{1: 3600, 2: 1800, 3: 900}`
+   suggested here. The mechanism -- the tier resolved from the instance, the restamp on a
+   re-tier -- is unchanged; read D60 for the numbers and the owner's reasoning.
+
 6. **`load_recommended` can keep what it found.** `kv_min` reaches the MCP tool (REST and the
    manager already had it). `max_slots` caps the slot count for one call: the estimator's answer is
    what a placement *could* sustain, and a caller that knows it has three bots does not want the
@@ -3377,6 +3383,9 @@ move a line the entry itself had drawn in the wrong place.
   throws the override away for nothing. It now runs only when the map is
   populated. The populated case is unchanged, and still discards the
   override.
+  *Amended 2026-09-23:* since D60 the map ships populated
+  (`{1: 900, 2: 900, 3: 600}`), so on a default install the restamp runs;
+  "the shipped default" above describes the pre-D60 world. See D60.
 * **`persist` writes a tier only when the caller named one.** It wrote the
   *resolved* tier, which meant a call that said nothing about priority could
   capture another client's in-memory memo as this model's permanent setting,
