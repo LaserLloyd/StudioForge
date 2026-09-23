@@ -117,3 +117,39 @@ unchanged: it is the under-estimate direction. Nothing about the correction itse
 - the four live ratios (0.911, 0.908, 0.906, 0.901) are not warnings;
 - a −20 % miss still is, with `bar_pct` 10;
 - the old "7 % off either way warns" case is now split: +7 % warns at bar 5, −7 % does not.
+
+### §11 — Unknown KV geometry is never planned as a free cache
+
+**Evidence.** `kv_layers()` returns `[]` when a GGUF lacks a head dimension or every head count.
+`kv_alloc_bytes` then returned 0, `Planner.estimate()` added the 0, and `size_slots` answered one slot
+`"unknown"`. The model was planned from its weights alone and "fit" wherever they did. No library
+model hits this today. A new architecture, or a conversion that dropped keys, would.
+
+**Change** (`core/planner.py`).
+- `fallback_kv_layers(meta)` covers the partial case, where a layer count and a width are known but
+  `kv_layers` cannot answer. It charges every layer as full multi-head attention with no GQA: K and V
+  each `max(n_embd, heads × head_dim)` wide. `kv_alloc_bytes` prices that at `FALLBACK_KV_CACHE_TYPE`
+  (`f16`) whatever type was asked for, because a guessed geometry does not earn a quantized discount.
+  `effective_kv_bytes_per_token`, the slot sizer and `max_ctx_for_budget_geometry` all fold over the
+  same number.
+- `kv_geometry_unknown(meta)` covers the case where nothing is known: no layer count, or no width at
+  all. `Planner._plan_load` then returns `kv_geometry_rejection(record)` before any rung is tried.
+  That refusal is a `LoadRejected` whose reason starts with `KV geometry unknown:` and names the
+  missing GGUF keys. It carries the weights as its estimate and gives one suggestion: re-download or
+  re-convert, then rescan. `fits_on` returns `None` for the same models, so the pre-download context
+  matrix and the catalog agree with the load. A record with no metadata at all (`meta is None`) takes
+  the same refusal. `load_recommended` already refused those.
+- The refusal keeps the class code: `reason_code` is unset, so the wire code is `insufficient_vram`
+  (a 507, WARNING in the log, "do not retry unchanged"). A dedicated code would be a new public
+  contract row in OPENCLAW.md, which the D66 lane is editing, for a case no library model reaches.
+  The reason text is what names it. The KV sizing rule for every model `kv_layers` *can* describe is
+  unchanged.
+
+**Tests.** `tests/unit/test_kv_geometry_fallback.py`:
+- the fallback's arithmetic, and f16 even when q4_0 is asked;
+- a known geometry never takes the fallback;
+- a fallback model plans with a non-zero KV term, and `fits_on` agrees;
+- a nothing-known model is refused naming `block_count`, `embedding_length` and
+  `attention.key_length`, with no `0.00 GiB` in the message and `fits_on` returning `None`;
+- a metadata-less record is refused the same way. The existing
+  `test_rejection_without_metadata_still_reports_a_size` still passes.

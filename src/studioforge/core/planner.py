@@ -414,6 +414,97 @@ def kv_layers(meta: Any) -> list[KvLayer]:
     return uniform
 
 
+#: The cache type a :func:`fallback_kv_layers` estimate is charged at, whatever
+#: type the load asked for. The geometry behind a fallback is a guess, and a
+#: quantized cache would only make the guess cheaper (D69 §11).
+FALLBACK_KV_CACHE_TYPE = "f16"
+
+
+def fallback_kv_layers(meta: Any) -> list[KvLayer]:
+    """A pessimistic layer list for a model :func:`kv_layers` cannot describe.
+
+    ``kv_layers`` returns ``[]`` when the GGUF lacks a head dimension or every
+    head count. :func:`kv_alloc_bytes` used to sum that into a zero-byte cache,
+    :meth:`Planner.estimate` added the zero, and the slot sizer answered one
+    slot "unknown", so such a model was planned from its weights alone and
+    "fit" wherever they did (D69 §11). The load would then find out otherwise.
+
+    When the layer count and the model width are known, every layer is charged
+    as full multi-head attention with no GQA: K and V each ``n_embd`` wide per
+    token, which is as wide as ordinary attention gets. Where heads and head
+    dimensions are both known, :func:`kv_layers` already answered and this is
+    never consulted. :func:`kv_alloc_bytes` prices it at
+    :data:`FALLBACK_KV_CACHE_TYPE`.
+
+    Returns ``[]`` when there is no layer count or no width either. Nothing is
+    known then, and the planner refuses the load (``KV geometry unknown``)
+    rather than plan a cache of zero bytes.
+    """
+    extra = getattr(meta, "extra", None) or {}
+    n_layer = int(getattr(meta, "n_layer", 0) or 0) or len(extra.get("swa_pattern") or [])
+    per_layer = [int(x) for x in (extra.get("head_count_kv_values") or [])]
+    heads = (
+        int(getattr(meta, "n_head_kv", 0) or 0)
+        or int(getattr(meta, "n_head", 0) or 0)
+        or max(per_layer, default=0)
+    )
+    head_k = int(getattr(meta, "head_dim_k", 0) or 0)
+    head_v = int(getattr(meta, "head_dim_v", 0) or 0) or head_k
+    n_embd = int(getattr(meta, "n_embd", 0) or 0)
+    width_k = max(n_embd, heads * head_k)
+    width_v = max(n_embd, heads * head_v)
+    if n_layer <= 0 or width_k <= 0 or width_v <= 0:
+        return []
+    return [KvLayer("full", 1, width_k, width_v)] * n_layer
+
+
+def kv_geometry_unknown(meta: Any) -> bool:
+    """Whether not even :func:`fallback_kv_layers` can size this model's KV cache."""
+    return not kv_layers(meta) and not fallback_kv_layers(meta)
+
+
+def kv_geometry_rejection(record: ModelRecord) -> LoadRejected:
+    """The refusal for a model whose KV cache nothing can size (D69 §11).
+
+    A 507 with a reason that names the problem rather than a shortfall: there
+    is no arithmetic to show, and "does not fit" would send the caller to a
+    smaller context that cannot help. The estimate still carries the weights,
+    so the refusal says how big the file is.
+    """
+    meta = record.meta
+    weights = int(getattr(meta, "tensor_bytes", 0) or 0) or int(record.size_bytes)
+    if meta is None:
+        what = "it has no parsed GGUF metadata at all"
+    else:
+        heads = int(getattr(meta, "n_head", 0) or 0) or int(getattr(meta, "n_head_kv", 0) or 0)
+        missing = [
+            name
+            for name, value in (
+                ("block_count", int(getattr(meta, "n_layer", 0) or 0)),
+                ("embedding_length", int(getattr(meta, "n_embd", 0) or 0)),
+                ("attention.head_count", heads),
+                # Only when the head dimension could not be derived either.
+                ("attention.key_length", int(getattr(meta, "head_dim_k", 0) or 0)),
+            )
+            if value <= 0
+        ]
+        what = f"its GGUF metadata lacks {', '.join(missing) or 'a usable layer description'}"
+    return LoadRejected(
+        model_id=record.id,
+        reason=(
+            f"KV geometry unknown: {what}, so the size of its KV cache cannot be "
+            f"estimated. Planning it as zero bytes would report a fit that the load "
+            f"then contradicts, so the load is refused instead."
+        ),
+        estimate=VramEstimate(weights_bytes=weights),
+        suggestions=[
+            "re-download the file, or convert it again with a current llama.cpp "
+            "(a complete GGUF declares <arch>.block_count, <arch>.embedding_length "
+            "and <arch>.attention.head_count), then rescan the library",
+        ],
+    )
+
+
 def attention_kind(meta: Any) -> str:
     """``"full"`` | ``"iswa"`` | ``"hybrid"`` | ``"unknown"`` -- a catalog column.
 
@@ -534,14 +625,27 @@ def kv_alloc_bytes(
     branch at all for a hybrid model and so charged Qwen3.5 four times over.
 
     ``ctx_total`` is what reaches ``--ctx-size``: the total shared across slots
-    (D4), not the per-slot window. Returns 0 when the geometry is unknown,
-    which callers must treat as "cannot estimate".
+    (D4), not the per-slot window. A model :func:`kv_layers` cannot describe
+    is charged :func:`fallback_kv_layers` at :data:`FALLBACK_KV_CACHE_TYPE`,
+    never zero (D69 §11). Returns 0 only when nothing about the geometry is
+    known, which callers must treat as "cannot estimate" -- the planner
+    refuses such a load outright.
     """
     if ctx_total <= 0:
         return 0
     layers = kv_layers(meta)
     if not layers:
-        return 0
+        fallback = fallback_kv_layers(meta)
+        if not fallback:
+            return 0
+        return _alloc_bytes(
+            fallback,
+            ctx_total=ctx_total,
+            kv_type_k=FALLBACK_KV_CACHE_TYPE,
+            kv_type_v=FALLBACK_KV_CACHE_TYPE,
+            parallel=parallel,
+            ubatch=ubatch,
+        )
     cache = _alloc_bytes(
         layers,
         ctx_total=ctx_total,
@@ -723,9 +827,11 @@ def max_ctx_for_budget_geometry(
     an iSWA or hybrid model the uniform figure under-offers by 4-40x (D22: the
     window layers do not grow with context), which sent users to a 4k window
     when 65k fit. Returns 0 when nothing on the ladder fits or the geometry is
-    unknown; callers fall back to the uniform figure for the latter.
+    unknown; callers fall back to the uniform figure for the latter. A model
+    sized by :func:`fallback_kv_layers` is walked against that same fallback,
+    so the context a refusal offers is one the next plan accepts (D69 §11).
     """
-    if budget_bytes <= 0 or not kv_layers(meta):
+    if budget_bytes <= 0 or kv_geometry_unknown(meta):
         return 0
     slots = max(1, int(parallel))
     for ctx in _CTX_LADDER:
@@ -1762,6 +1868,10 @@ class Planner:
         priority: int = PRIORITY_BACKGROUND,
     ) -> PlanResult:
         """:meth:`plan_load` proper; ``gpus``/``extra_own_pids`` are the reload view."""
+        if kv_geometry_unknown(record.meta):
+            # Every rung has a context, and a context with no KV cache is a
+            # weights-only "fit" the load would then contradict (D69 §11).
+            return kv_geometry_rejection(record)
         settings = record.settings
         defaults = self.config.models
 
@@ -2999,8 +3109,11 @@ class Planner:
 
         No eviction, no auto-parallel, no fallback to another device set: this
         answers about the device set it was handed, at the slot count it was
-        handed. ``None`` means "not at these settings", never "never".
+        handed. ``None`` means "not at these settings", never "never" -- except
+        for a model whose KV cache nothing can size, which fits nowhere (D69 §11).
         """
+        if kv_geometry_unknown(record.meta):
+            return None
         return_plan = self._try_devices(
             record,
             list(devices),
