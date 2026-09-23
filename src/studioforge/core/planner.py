@@ -1668,8 +1668,10 @@ class Planner:
         )
         # A server-chosen candidate refused here is one mode of a walk that
         # goes on to the next one -- an INFO line per mode per round would be
-        # the D16 flood; the walk logs its own decision.
-        (log.debug if chosen_by_server else log.info)(
+        # the D16 flood; the walk logs its own decision. A preview planner
+        # (log_plans=False) refuses the same saved override on every catalog
+        # build, so it says it at DEBUG too (D69 §8).
+        (log.debug if chosen_by_server or not self._log_plans else log.info)(
             "load rejected: device leased to another holder",
             model_id=record.id,
             devices=clash,
@@ -1856,7 +1858,12 @@ class Planner:
                         f"{freed_mb} MB, which reaches {attempt.ctx_size} tokens "
                         f"rather than the {floor} floor"
                     )
-                    log.info(
+                    # Through the log_plans flag like "load planned" (D69 §8): a
+                    # catalog, placements or fit preview plans every model against
+                    # hypothetical victims, and at INFO those lines read like real
+                    # evictions (560 of 1585 lines on 2026-09-20).
+                    emit = log.info if self._log_plans else log.debug
+                    emit(
                         "re-planned after eviction",
                         model_id=record.id,
                         evicting=attempt.evict_model_ids,

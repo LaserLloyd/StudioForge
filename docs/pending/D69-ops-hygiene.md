@@ -26,3 +26,19 @@ the message is empty. It is the shape `supervisor._watch` has used since D60. Bo
 **Tests.** `tests/unit/test_upstream_error_text.py`: the helper, a stream cut by `ReadError('')`
 (warning field, frame text, `[DONE]` still sent, request slot released), and a non-streamed
 `RemoteProtocolError('')`.
+
+### §8 — Preview planners log at DEBUG
+
+**Evidence.** `_log_plan` and the terminal refusal honour `Planner._log_plans`, but two lines did not.
+`re-planned after eviction` was logged at INFO from every catalog, placements and fit preview.
+On 2026-09-20 that was 560 of 1585 log lines (154 of 670 on 09-22), each one naming an eviction of
+the embedding or judge model "for" K2 that never happened. The review's first reading took them for
+real K2 evictions. `load rejected: device leased to another holder` (340 lines) came from the same
+previews refusing a saved `device_override` on a leased card at every catalog build.
+
+**Change.** Both now use `log.info if self._log_plans else log.debug`, the same rule as `load
+planned`. A real load (`log_plans=True`) logs exactly as before. The server-chosen candidate case of
+the lease line stays at DEBUG, as it was.
+
+**Tests.** `tests/unit/test_preview_planner_logging.py`: both lines at DEBUG with `log_plans=False` and
+at INFO with `log_plans=True` (both fail against the old code).
