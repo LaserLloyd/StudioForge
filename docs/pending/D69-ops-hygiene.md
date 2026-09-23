@@ -319,7 +319,8 @@ came 30.7 s after the request, and the process exited then. Both uvicorn servers
 (request → MCP session manager down → exit):
 - **09-04 12:45, 16:53 and 17:27**: the MCP session manager went down only at ~30.7 s, so the *API*
   server waited out its drain. uvicorn shuts the lifespan, and with it the MCP sessions, only after
-  the drain, so a client's standing SSE stream held it.
+  the drain. The likeliest holder is a client's standing MCP SSE stream (the log cannot name the
+  connection).
 - **09-10 03:31 and 09-22 09:26**: the MCP side was down in under 3 s and the exit still came at ~30 s,
   so it was the *GUI* server waiting on browser connections.
 - The other 25 restarts that log these markers took 1–9 s. Six August restarts predate the markers.
