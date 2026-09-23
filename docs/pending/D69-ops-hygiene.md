@@ -305,3 +305,55 @@ Until then the server's rotation is deferred: one note, retried every 5 min, not
 watchdog outlives server restarts by design (D21), so its rotation and the silenced probe lines start
 only when the watchdog process itself restarts. The first rotation of the 61 MB `watchdog.log` then
 happens at its first line.
+
+### §18 — A restart with nothing in flight does not wait 30 s
+
+**Evidence.** On 2026-09-22 09:26:49 `restart requested` was followed by `StreamableHTTP session
+manager shutting down` 0.9 s later. `Cancel 0 running task(s), timeout graceful shutdown exceeded`
+came 30.7 s after the request, and the process exited then. Both uvicorn servers used
+`timeout_graceful_shutdown = drain_timeout_s` (30 s). Every restart in the log was measured
+(request → MCP session manager down → exit):
+- **09-04 12:45, 16:53 and 17:27**: the MCP session manager went down only at ~30.7 s, so the *API*
+  server waited out its drain. uvicorn shuts the lifespan, and with it the MCP sessions, only after
+  the drain, so a client's standing SSE stream held it.
+- **09-10 03:31 and 09-22 09:26**: the MCP side was down in under 3 s and the exit still came at ~30 s,
+  so it was the *GUI* server waiting on browser connections.
+- The other 20 restarts took 1–9 s.
+
+Every restart route (the tray exit, the self-respawn) first runs `manager.stop()`, which drains the
+inference requests and stops every child. So by the time uvicorn's drain starts, nothing it waits for
+is doing work.
+
+**Change** (`__main__.py`). Both servers are a `uvicorn.Server` subclass whose `shutdown()` decides
+the drain at that moment, before handing over to uvicorn. uvicorn reads
+`config.timeout_graceful_shutdown` inside `shutdown()`, so this covers every way in: the restart
+routes' `should_exit`, Ctrl+C, SIGTERM.
+- **API server.** The full `server.drain_timeout_s` (read live, since it can be changed at runtime)
+  applies while any child has `active_requests > 0`, or when that cannot be read, because a guess
+  must never cut a stream. Otherwise the drain is `IDLE_DRAIN_S` = 2 s.
+- **GUI server.** Always the short drain: its connections are browser tabs, and GUI actions run as
+  tasks on the shared manager, not as requests on this server.
+
+One INFO line records the decision (`draining connections before exit server=… inference_in_flight=…
+drain_s=…`). Nothing else in the restart path changed: the manager's own drain, the exit codes, the
+handover and the watchdog adoption are untouched.
+
+**Why not close the MCP sessions explicitly.** Terminating them before the drain would need the MCP
+SDK's private `StreamableHTTPSessionManager._server_instances` inside the one code path where a
+failure leaves the rig down. The short drain bounds the wait at 2 s whatever holds the connection (an
+SSE stream, a long-poll, an idle keep-alive) and needs no private API. MCP clients reconnect exactly
+as they did after the old 30 s wait: their session id is unknown to the new process, so they
+re-initialise (the 11 `Rejected request with unknown or expired session ID` lines at 09:27:59).
+
+**Tests.** `tests/unit/test_restart_drain.py`:
+- the in-flight count, where unknown means busy;
+- the decision per case: idle 2, streaming 30, unknown 30;
+- the full drain is read live, and an operator's 0 is honoured;
+- `_serve` builds both servers with their rules;
+- **a real uvicorn server** on an ephemeral loopback port holding an endless streaming response: an
+  idle shutdown returns in under 1.5 s against a 3 s configured drain, and a shutdown with inference in
+  flight still waits the full 3 s.
+
+**Verify live.** After the next restart, the log should show `draining connections before exit` with
+`drain_s=2` for both servers, and exit within a few seconds of `restart requested` even with a browser
+tab and an MCP client connected.

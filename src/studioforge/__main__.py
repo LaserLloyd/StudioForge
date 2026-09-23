@@ -223,6 +223,84 @@ def _preflight_ports(config: Config) -> None:
     raise typer.Exit(EXIT_PORT_CONFLICT)
 
 
+#: Seconds uvicorn waits for open connections at shutdown when no inference
+#: request is in flight (D69 §18). Enough for an ordinary response already being
+#: written to finish; what is left after that is idle by definition: an MCP
+#: client's standing SSE stream, a browser tab's socket.io long-poll, a
+#: keep-alive connection. On 2026-09-22 09:26:49 one of those held a restart for
+#: the full 30 s ("Cancel 0 running task(s), timeout graceful shutdown
+#: exceeded") with nothing in flight; the 09-04 and 09-10 restarts did the same.
+IDLE_DRAIN_S = 2
+
+
+def _inference_in_flight(api_state: Any) -> int | None:
+    """Requests the model children are serving right now, or ``None`` if unknown.
+
+    ``None`` is read as busy: a shutdown cut short on a guess could cut a
+    stream, which is the one thing the full drain exists to protect.
+    """
+    supervisor = getattr(api_state, "supervisor", None)
+    if supervisor is None:
+        return 0  # no supervisor, no children, nothing to drain
+    try:
+        return sum(int(getattr(i, "active_requests", 0) or 0) for i in supervisor.list())
+    except Exception:  # noqa: BLE001 - unknown means "drain fully"
+        return None
+
+
+def _draining_server_class() -> Any:
+    """``uvicorn.Server`` whose shutdown drain fits the work in flight (D69 §18).
+
+    Built lazily so importing this module does not import uvicorn.
+    """
+    import uvicorn
+
+    class DrainingServer(uvicorn.Server):
+        """Waits the full drain only while inference is in flight.
+
+        uvicorn reads ``config.timeout_graceful_shutdown`` inside ``shutdown()``,
+        so it is set there, from what is true at that moment. That covers every
+        way in: a restart route flipping ``should_exit``, Ctrl+C, SIGTERM. Every
+        restart route drains the models first (``manager.stop()``), so by then
+        nothing is in flight and the drain is :data:`IDLE_DRAIN_S`. A shutdown
+        that arrives mid-stream -- Ctrl+C, a service stop -- still gets the full
+        ``server.drain_timeout_s``, read live because it can be changed while
+        the server runs.
+        """
+
+        def __init__(
+            self,
+            config: uvicorn.Config,
+            *,
+            name: str,
+            full_drain_s: Any,
+            in_flight: Any,
+        ) -> None:
+            super().__init__(config)
+            self.drain_name = name
+            self._full_drain_s = full_drain_s
+            self._in_flight = in_flight
+            #: What the last shutdown decided, for the log line and the tests.
+            self.drain_s: int | None = None
+
+        async def shutdown(self, sockets: Any = None) -> None:
+            busy = self._in_flight()
+            full = max(0, int(self._full_drain_s()))
+            drain = full if busy is None or busy > 0 else min(IDLE_DRAIN_S, full)
+            self.drain_s = drain
+            self.config.timeout_graceful_shutdown = drain
+            with contextlib.suppress(Exception):  # a log line must not stop a shutdown
+                log.info(
+                    "draining connections before exit",
+                    server=self.drain_name,
+                    inference_in_flight=busy,
+                    drain_s=drain,
+                )
+            await super().shutdown(sockets)
+
+    return DrainingServer
+
+
 async def _serve(config: Config, *, open_gui: bool = False) -> int:
     """Run the API (and GUI) servers until they stop; returns the exit code.
 
@@ -236,13 +314,17 @@ async def _serve(config: Config, *, open_gui: bool = False) -> int:
 
     api = create_app(config)
     servers: list[uvicorn.Server] = []
+    draining_server = _draining_server_class()
+
+    def full_drain_s() -> float:
+        return float(config.server.drain_timeout_s)
 
     # log_config=None on both servers: uvicorn's default dictConfig installs
     # its own handlers on sys.stderr/sys.stdout with propagate=False, outside
     # the hardened root handlers -- so under a dead console (see
     # configure_logging) uvicorn's own "Started server process" line could
     # still kill the process. Its loggers now propagate to the root instead.
-    api_server = uvicorn.Server(
+    api_server = draining_server(
         uvicorn.Config(
             api,
             host=config.server.host,
@@ -251,7 +333,11 @@ async def _serve(config: Config, *, open_gui: bool = False) -> int:
             log_config=None,
             access_log=False,
             timeout_graceful_shutdown=int(config.server.drain_timeout_s),
-        )
+        ),
+        name="api",
+        full_drain_s=full_drain_s,
+        # The full drain only while a child is serving somebody (D69 §18).
+        in_flight=lambda: _inference_in_flight(api.state),
     )
     servers.append(api_server)
 
@@ -261,7 +347,7 @@ async def _serve(config: Config, *, open_gui: bool = False) -> int:
             from studioforge.gui.app import create_gui_app
 
             gui_app = create_gui_app(config, api_state=api.state)
-            gui_server = uvicorn.Server(
+            gui_server = draining_server(
                 uvicorn.Config(
                     gui_app,
                     host=config.gui.host,
@@ -276,7 +362,16 @@ async def _serve(config: Config, *, open_gui: bool = False) -> int:
                     # held the whole process (and the API's drain window never
                     # even started).
                     timeout_graceful_shutdown=int(config.server.drain_timeout_s),
-                )
+                ),
+                name="gui",
+                full_drain_s=full_drain_s,
+                # Always the short drain: the panel's connections are browser
+                # tabs, and nothing a click started runs in a request here --
+                # GUI actions are tasks on the shared manager. This server is
+                # what held the 09-10 03:31 and 09-22 09:26 restarts for 30 s:
+                # the API side had shut its MCP sessions down within 3 s
+                # (D69 §18).
+                in_flight=lambda: 0,
             )
             servers.append(gui_server)
         except Exception as exc:
