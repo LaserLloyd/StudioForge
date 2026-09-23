@@ -25,6 +25,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from studioforge import __version__
 from studioforge.api import admin_routes, health_routes, mgmt_routes, openai_routes
 from studioforge.api.auth import check_request
+from studioforge.build import build_id
 from studioforge.config import Config, load_config
 from studioforge.core.downloader import Downloader
 from studioforge.core.engine import EngineManager
@@ -789,6 +790,10 @@ def create_app(
 
     _install_error_handlers(app)
 
+    # The build identity is resolved here, once, on the startup path: /health
+    # is polled constantly and must never wait on a subprocess (D70).
+    build_id()
+
     @app.get("/health", tags=["health"])
     async def health(
         deep: bool = Query(
@@ -812,6 +817,11 @@ def create_app(
         payload: dict[str, Any] = {
             "status": "ok",
             "version": __version__,
+            # The commit this process runs from (D70): `version` names the
+            # last release and a server past its tag still reports the tag;
+            # `build` is the short SHA, `-dirty` when uncommitted changes are
+            # running, `unknown` from a wheel.
+            "build": build_id(),
             "uptime_s": round(time.time() - app.state.started_at, 1),
             "loaded_models": [i.model_id for i in loaded],
             # What this server is in the middle of (D36). Cheap by

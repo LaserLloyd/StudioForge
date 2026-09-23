@@ -524,6 +524,10 @@ def status(json_out: bool = JSON_OPTION) -> None:
     engine = payload.get("engine") or {}
     summary = _table("Field", "Value", title="Server")
     summary.add_row("version", str(payload.get("version", "?")))
+    if payload.get("build"):
+        # The commit the server runs from (D70). Older servers do not send
+        # it, and a missing row says less than a wrong one would.
+        summary.add_row("build", str(payload["build"]))
     summary.add_row("uptime", fmt_duration(payload.get("uptime_s")))
     summary.add_row("engine", str(engine.get("tag") or "not installed"))
     summary.add_row("models in registry", str(payload.get("model_count", 0)))

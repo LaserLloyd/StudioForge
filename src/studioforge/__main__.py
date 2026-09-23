@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any
 import typer
 
 from studioforge import __version__
+from studioforge.build import build_id
 from studioforge.config import Config, find_config_path, load_config
 from studioforge.errors import ConfigError
 from studioforge.logging import configure_logging, get_logger
@@ -298,6 +299,7 @@ async def _serve(config: Config, *, open_gui: bool = False) -> int:
     log.info(
         "studioforge starting",
         version=__version__,
+        build=build_id(),
         api=f"http://{config.server.host}:{config.server.port}",
         gui=(f"http://{config.gui.host}:{config.gui.port}" if gui_server else "disabled"),
         watchdog=(

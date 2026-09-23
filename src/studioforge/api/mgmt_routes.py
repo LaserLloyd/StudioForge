@@ -25,6 +25,7 @@ from studioforge.api.auth import (
     redact_config_dict,
     require_admin_action,
 )
+from studioforge.build import build_id
 from studioforge.config import RESTART_REQUIRED_KEYS, apply_overrides
 from studioforge.core import parallel_bench
 from studioforge.core.benchmark import (
@@ -138,6 +139,7 @@ async def health(request: Request) -> dict[str, Any]:
     return {
         "status": "ok",
         "version": __version__,
+        "build": build_id(),
         "uptime_s": round(time.time() - state.started_at, 1),
         "loaded_models": [i.model_id for i in state.supervisor.list()],
         "busy": state.manager.busy_snapshot(),
@@ -190,6 +192,10 @@ async def status(request: Request) -> dict[str, Any]:
     # label or peer IP). The open :1234 trade makes this the whole defence
     # until a key is set: the next mystery client names itself here.
     data["clients"] = state.manager.clients_snapshot()
+    # The checkout this process runs from (D70): `version` names the last
+    # release, `build` the commit (`unknown` from a wheel). Here as well as
+    # on /health because `sfctl status` renders this payload.
+    data["build"] = build_id()
     _attach_child_metrics(state, data)
     # Names every VRAM holder, says which GPU each one's memory is actually on
     # (``device_bytes``/``per_gpu_bytes``), and collapses desktop noise. Off the
@@ -1816,7 +1822,7 @@ async def unload_all(request: Request) -> dict[str, Any]:
 
 @router.get("/version")
 async def version() -> dict[str, Any]:
-    return {"version": __version__}
+    return {"version": __version__, "build": build_id()}
 
 
 @router.get("/openclaw-setup")

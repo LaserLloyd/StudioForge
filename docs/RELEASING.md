@@ -21,7 +21,14 @@ User-Agent report. PEP 440 has no way to spell a hyphenated date, so the *packag
 app parses `__version__` with `packaging`; the one parser that reads it is
 `core/updater.py::_version_key`, which reads both spellings as the same four numbers so the updater
 cannot mistake the running build for an update. `tests/unit/test_version.py` pins all four strings
-together and fails if one drifts.
+together — plus the README status line and the `/health` sample in `docs/OPENCLAW-SETUP.md` — and
+fails if one drifts.
+
+The version names the last *release*, so a server running commits past its tag still reports the
+tag. The `build` field beside it (`/health`, `/api/version`, `/api/status`, `server_status`, the
+`studioforge starting` log line, `sfctl status`) names the checkout: the short commit SHA, `-dirty`
+when tracked files carry uncommitted changes, `unknown` from a wheel or without git on PATH. It is
+resolved once at startup (`src/studioforge/build.py`) and needs nothing from the release process.
 
 ## Cutting one
 

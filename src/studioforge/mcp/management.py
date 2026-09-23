@@ -65,6 +65,7 @@ from mcp.server.mcpserver import MCPServer
 
 from studioforge import __version__
 from studioforge.api.auth import redact_config_dict
+from studioforge.build import build_id
 from studioforge.config import RESTART_REQUIRED_KEYS, Config, apply_overrides, load_config
 from studioforge.core import parallel_bench, throughput
 from studioforge.core.leases import lease_view
@@ -2057,6 +2058,9 @@ def build_management_mcp(state: Any) -> MCPServer:
         return {
             "ok": True,
             "version": status.version,
+            # The commit this server runs from (D70); `version` is the last
+            # release, which a server past its tag still reports.
+            "build": build_id(),
             "uptime_s": round(status.uptime_s, 1),
             "gpus": [_compact_gpu(g) for g in status.gpus],
             "loaded": loaded,
