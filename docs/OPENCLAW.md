@@ -858,6 +858,11 @@ touching a leased card (D65). Anything it cannot decide in advance arrives as a 
 frame carrying the same envelope, then `[DONE]`. A client with a fallback provider will fall back on
 either one, and it should: the fix is the setting that made the load impossible, not the client.
 
+A model whose architecture the installed llama.cpp build does not include (D66) is refused `400
+unsupported_architecture` before anything is leased, evicted or spawned, streaming or not — and
+`arch_supported: false` in `/v1/models`, `list_models` and `/api/models` says so before you ask.
+No wait or retry changes it; a llama.cpp build that includes the architecture does.
+
 ## Keeping a model resident
 
 Three ways, in increasing order of stickiness:
@@ -928,6 +933,7 @@ hiding a failure, and never a `200` for a route that does not exist.
 | Unknown model | 404 | `model_not_found` | no |
 | Image sent to a text-only model | 400 | `model_not_multimodal` | no |
 | Prompt larger than the loaded slot | 400 | `context_exceeded` | no — shorten, or reload at a larger `ctx_size` |
+| The installed llama.cpp build cannot load this model's architecture | 400 | `unsupported_architecture` | **never** — use another model and tell the operator; `error.studioforge.remedy` says what would fix it |
 | Model too big for VRAM | 507 | `insufficient_vram` | no — read `suggestions` |
 | An `allowed_devices` — saved, or sent with the load — names no usable card | 507 | `allowed_devices_unavailable` | no — widen the one you sent, or report the setting |
 | **The cards are leased to someone else** | 507 | `gpu_leased` | **it depends on the lease `kind`** — `benchmark` means stand down, anything else means wait `retry_after_s` |

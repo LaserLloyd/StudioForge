@@ -1058,6 +1058,9 @@ async def test_instructions_teach_the_refusal_codes_and_the_identity(state: Stat
         "context_exceeded",
         "lease_conflict",
         "lease_vacating",
+        # D66: the one refusal no wait, retry or setting changes.
+        "unsupported_architecture",
+        "arch_supported: false",
         "X-SF-Client",
         "effective.summary",
         "prompt_cache.hit_ratio",
