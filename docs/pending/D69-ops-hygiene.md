@@ -1,8 +1,9 @@
 ## D69 — Ops hygiene from the 2026-09-22 review: log lines that say what happened, log files that stop growing, a restart that does not wait for nothing
 
 **Status.** Pending, lane `lane/ops-hygiene` (based on `b73de7e`). One commit per item, numbered as
-in the 2026-09-22 review's prioritized list. `tests/unit` green at each commit; ruff, `ruff format
---check` and mypy (the gated packages) clean.
+in the 2026-09-22 review's prioritized list. The suites each item touches were green at its commit,
+and the full `tests/unit` was run once at the end. ruff, `ruff format --check` and mypy (the gated
+packages) are clean.
 
 **Context.** The 2026-09-22 review read the live logs from 2026-09-13 on. Most of the warning volume
 was not a fault. It was the same per-state fact repeated on every load, preview planners logging at
@@ -208,6 +209,8 @@ for the whole action, so the busy spinner and the toast are drawn at page level 
 rebuild. After the await, `page.notify` / `page.error` draw only if the client is still alive; a closed
 browser gets a log line (`gui action failed … page=closed`), not NiceGUI's "Client has been deleted but
 is still being used". With no page context (a direct call), nothing is bound and behaviour is as before.
+If entering the page context itself fails, the action runs anyway, drawing where it always did: the
+drawing context can never block an unload.
 
 Every awaiting handler with that shape uses it: `_unload_one`, `_restart_model`, `_toggle_pin` and
 `_reclaim_orphans` (whose Reclaim button sits in a row the holders timer rebuilds), the Unload-all and
@@ -220,10 +223,11 @@ is reachable through the card's slot only while the card exists).
 - Unload, restart and pin each toast at page level after their card was deleted mid-await.
 - A failure after the card is gone is still a red toast.
 - A page whose browser went away gets no toast, and its refresh still runs.
+- A page that cannot be entered still unloads.
 - A static guard checks that every awaiting handler captures the page and none toasts through the
   slot.
 
-All six fail against the old code. The existing static guards in `test_gui.py` (single-flight keys,
+The first six fail against the old code. The existing static guards in `test_gui.py` (single-flight keys,
 `require_local_admin`) pass unchanged.
 
 ### §15 — Log files rotate, safely on a shared file; the watchdog stops logging every probe
@@ -318,7 +322,7 @@ came 30.7 s after the request, and the process exited then. Both uvicorn servers
   the drain, so a client's standing SSE stream held it.
 - **09-10 03:31 and 09-22 09:26**: the MCP side was down in under 3 s and the exit still came at ~30 s,
   so it was the *GUI* server waiting on browser connections.
-- The other 20 restarts took 1–9 s.
+- The other 25 restarts that log these markers took 1–9 s. Six August restarts predate the markers.
 
 Every restart route (the tray exit, the self-respawn) first runs `manager.stop()`, which drains the
 inference requests and stops every child. So by the time uvicorn's drain starts, nothing it waits for
@@ -357,3 +361,20 @@ re-initialise (the 11 `Rejected request with unknown or expired session ID` line
 **Verify live.** After the next restart, the log should show `draining connections before exit` with
 `drain_s=2` for both servers, and exit within a few seconds of `restart requested` even with a browser
 tab and an MCP client connected.
+
+### Deploying and checking it
+
+- **Restart the server.** That covers §6, §7, §8, §11, §13 (every model re-parses its header on the
+  boot scan), §14, §16, §17 and §18. On the next restart, §18 shows as `draining connections before
+  exit … drain_s=2`.
+- **Restart the tray.** Quit it and start it again, because the running tray holds `studioforge.log`
+  open with the old code. Until then the server cannot rotate the file. Once the file passes 20 MiB,
+  its only sign is one `log rotation deferred` line.
+- **Restart the watchdog process** (a tray Stop/Start does it). It survives server restarts (D21),
+  and until it restarts it keeps the 10 s httpx lines and the unrotated 61 MB `watchdog.log`. After it
+  restarts, the old file becomes `watchdog.<stamp>.log` at the first line written.
+- **Watch these log lines disappear:** repeated `registry.alias_collision` on rescans,
+  `thinking model loads with no reasoning_format` after the first load of each model, `unknown kv cache
+  type` with `auto`, INFO `re-planned after eviction` from previews, `vram prediction error exceeds the
+  bar` for over-estimates up to 10 % (Hy-MT2, Precog-123B, Orion-26B, Dark-Scarlett Q5_K_M), and
+  NiceGUI's `parent element … deleted` after a Dashboard unload.

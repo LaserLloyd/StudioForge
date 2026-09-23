@@ -78,7 +78,10 @@ class _Page:
 
     def __enter__(self) -> _Page:
         if self._client is not None and self.alive:
-            self._client.__enter__()
+            try:
+                self._client.__enter__()
+            except Exception:  # noqa: BLE001 - a drawing context must never block the action
+                return self
             self._entered = True
         return self
 

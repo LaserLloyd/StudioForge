@@ -159,6 +159,25 @@ async def test_a_pin_toggle_toasts_on_the_page(fake_ui: _Ui) -> None:
     assert fake_ui.notes == [("d/model pinned", {"type": "positive"}, 1)]
 
 
+async def test_a_page_that_cannot_be_entered_never_blocks_the_action(
+    fake_ui: _Ui, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken_enter(self: _Client) -> _Client:
+        raise RuntimeError("content slot unavailable")
+
+    monkeypatch.setattr(_Client, "__enter__", broken_enter)
+    unloaded: list[str] = []
+
+    class Manager:
+        async def unload(self, model_id: str, *, force: bool) -> None:
+            unloaded.append(model_id)
+
+    await dashboard._unload_one(_ctx(Manager()), "e/model", _Refresh())
+
+    assert unloaded == ["e/model"]
+    assert fake_ui.notes == [("e/model unloaded", {"type": "positive"}, 0)]
+
+
 def test_every_awaiting_dashboard_action_captures_the_page() -> None:
     """Static guard: each handler that awaits and then draws binds the page first."""
     import inspect
