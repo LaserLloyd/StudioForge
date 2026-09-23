@@ -321,7 +321,10 @@ The **Download** tab searches HuggingFace and queues a quant; `sfctl download <r
 <Q>` does the same from the agent's machine, and an agent uses `search_models` → `repo_details` →
 `download_model`. Downloads are resumable, verified (sha256 where the repository publishes one,
 byte count always) against what is actually on disk, survive a restart, and land in your library
-using LM Studio's `publisher/repo/` layout. Gated repositories need `hf.token`.
+using LM Studio's `publisher/repo/` layout. Gated repositories need `hf.token`. The picker lists a
+repo's quants on bit-width shelves (2-bit … 16-bit) with the fit verdict, the per-GPU context line
+and an **MTP** badge for files whose own header keeps multi-token-prediction heads — read per file,
+so a quant published both with and without them is told apart.
 
 HuggingFace's **Use this model → LM Studio** button can open StudioForge's quant picker instead:
 

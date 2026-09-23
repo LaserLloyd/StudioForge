@@ -1056,6 +1056,24 @@ def _persist_warning(model: str, details: Sequence[str]) -> None:
         STATE.err.print(f"  - {line}")
 
 
+def _mtp_cell(entry: dict[str, Any]) -> str:
+    """``yes``/``no`` when the file's header settled it, ``likely`` from the name, else ``-``.
+
+    Only the header is a verdict: a repo *named* MTP whose files carry no
+    ``nextn_predict_layers`` key reads ``no`` here, and that is the point.
+    """
+    mtp = entry.get("mtp")
+    source = entry.get("mtp_source")
+    if source == "header":
+        if mtp:
+            layers = entry.get("mtp_layers")
+            return f"yes ({layers})" if layers else "yes"
+        return "no"
+    if mtp and source == "name":
+        return "likely"
+    return "-"
+
+
 @models_app.command("repo")
 def models_repo(repo_id: str, json_out: bool = JSON_OPTION) -> None:
     """Every quant in a Hugging Face repo, with a fit verdict for THIS rig.
@@ -1075,7 +1093,7 @@ def models_repo(repo_id: str, json_out: bool = JSON_OPTION) -> None:
     if not quants:
         STATE.console.print(f"no GGUF quants found in {repo_id}")
         return
-    table = _table("Quant", "Size", "Files", "Verdict", "Why", title=repo_id)
+    table = _table("Quant", "Size", "Files", "MTP", "Verdict", "Why", title=repo_id)
     for entry in quants:
         fit = entry.get("fit") or {}
         files = entry.get("files") or []
@@ -1087,6 +1105,7 @@ def models_repo(repo_id: str, json_out: bool = JSON_OPTION) -> None:
             str(entry.get("quant") or "-"),
             fmt_bytes(total) if total else "unknown",
             str(len(files)) if files else "-",
+            _mtp_cell(entry),
             str(fit.get("verdict") or "-"),
             str(fit.get("message") or ""),
         )

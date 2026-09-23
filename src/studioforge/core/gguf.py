@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import re
 import struct
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Final
@@ -399,6 +399,10 @@ class GgufFile:
     # Not part of the requested surface but needed to propagate the "new quant
     # type, sizes guessed" signal up into GgufMeta.extra.
     unknown_ggml_types: tuple[int, ...] = ()
+    #: False when the metadata walk was cut short by a ``stop_before``
+    #: predicate (see :func:`_read_stream`): ``kv`` then holds every key up to
+    #: the stop and nothing after it, and no tensor table was read.
+    kv_complete: bool = True
 
     @property
     def file_size(self) -> int:
@@ -740,19 +744,40 @@ def read_gguf(path: Path, *, load_tensors: bool = True, max_array_len: int = 64)
         raise GgufError(f"cannot read GGUF file {path}: {exc}") from exc
 
 
-def _read_stream(fh: BinaryIO, path: Path, *, load_tensors: bool, max_array_len: int) -> GgufFile:
+#: ``stop_before(key, kv_so_far)``: called for every metadata key *before* its
+#: value is read. Returning True ends the walk with that key unread. Used by the
+#: remote reader to stop at the tokenizer, whose length-prefixed string arrays
+#: are the bulk of a header and cannot be seeked over.
+StopBefore = Callable[[str, Mapping[str, Any]], bool]
+
+
+def _read_stream(
+    fh: BinaryIO,
+    path: Path,
+    *,
+    load_tensors: bool,
+    max_array_len: int,
+    stop_before: StopBefore | None = None,
+) -> GgufFile:
     reader = _Reader(fh)
     version, tensor_count, kv_count = _read_header(reader, path)
 
     kv: dict[str, Any] = {}
+    complete = True
     for _ in range(kv_count):
         key = reader.string()
         value_type = reader.u32()
+        if stop_before is not None and stop_before(key, kv):
+            # The caller has what it came for. Nothing past this key is in
+            # ``kv``, and the tensor table cannot be reached without reading
+            # everything in between, so the result is marked partial.
+            complete = False
+            break
         kv[key] = _read_value(reader, value_type, key=key, max_array_len=max_array_len)
 
     alignment = _resolve_alignment(kv, path)
 
-    if not load_tensors:
+    if not load_tensors or not complete:
         return GgufFile(
             path=path,
             version=version,
@@ -762,6 +787,7 @@ def _read_stream(fh: BinaryIO, path: Path, *, load_tensors: bool, max_array_len:
             tensors=[],
             data_offset=0,
             total_tensor_bytes=0,
+            kv_complete=complete,
         )
 
     unknown: set[int] = set()

@@ -367,9 +367,9 @@ return. Nothing is loaded or evicted. See [CATALOG.md](CATALOG.md) for the full 
 
 ```
 search_models(query="qwen3", sort="downloads", newer_than_days=90)
-   -> compact rows: repo_id, publisher, downloads, likes, quants, mmproj, file_count
+   -> compact rows: repo_id, publisher, downloads, likes, quants, mmproj, mtp_likely, file_count
 repo_details(repo_id)
-   -> per-quant total_gb, fit verdict, and the context matrix
+   -> per-quant total_gb, fit verdict, mtp / mtp_source, and the context matrix
 download_model(repo_id, quant)
    -> queued; it appears in list_models when it lands
 ```
@@ -392,6 +392,15 @@ loader would then refuse. A real example, `unsloth/Qwen3.8-27B-GGUF` on 2× 5090
 | Q8_0 (27.9 GiB) | — | 256k | 256k |
 | Q5_K_M (19.3 GiB) | 128k at q8_0 | 256k | 256k |
 | IQ2_M (10.5 GiB) | 256k | 256k | 256k |
+
+`repo_details` also settles **MTP per quant**. `mtp: true` with `mtp_source: "header"` means that
+file's own GGUF header carries `nextn_predict_layers` (`mtp_layers` of them), so StudioForge will
+launch it with `--spec-type draft-mtp` — a real single-stream speedup (+34% measured on a 27B) at
+no extra VRAM. A repo can ship the same quant with and without the heads, which is why the answer
+is per file: one small range request each, stopping at the tokenizer, cached for a day.
+`mtp_source: "name"` means only the name says MTP and the header could not be read; `null` means
+unknown. `search_models` rows carry `mtp_likely`, the name-based hint, and never read a header.
+When two quants fit equally, prefer the header-confirmed MTP one.
 
 Downloads run in the background, survive a restart and resume from the partial file — five attempts
 with exponential backoff, and 404/401/403 or a checksum mismatch fails immediately rather than

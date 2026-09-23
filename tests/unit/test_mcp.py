@@ -1620,10 +1620,12 @@ async def test_search_rows_carry_no_sizes_and_no_fit_blocks(
         "gated",
         "quants",
         "mmproj",
+        "mtp_likely",
         "file_count",
     }
     assert row["quants"] == ["Q4_K_M", "Q8_0"]  # the projector is not a choice
     assert row["mmproj"] is True
+    assert row["mtp_likely"] is False  # a name hint only; no header read per row
     assert row["file_count"] == 3
     assert "fit" not in json.dumps(row)
     assert "total_bytes" not in json.dumps(row)

@@ -19,6 +19,7 @@ queue degrades to an explanatory panel when ``api_state.downloader is None``.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,9 @@ from nicegui import ui
 
 from studioforge.gui import state as st
 from studioforge.gui.tabs import GuiContext, busy, notify_error, require_local_admin
+from studioforge.logging import get_logger
+
+log = get_logger(__name__)
 
 #: The only external link in the GUI: a repo page on HuggingFace, so a user can
 #: read the model card before committing to a download.
@@ -222,6 +226,18 @@ def _period_tooltip(sort_value: str) -> str:
     )
 
 
+#: Rows per search. With the MTP filter on, the net is cast wider -- it is one
+#: request to HF either way (the hub pages at 100) and most rows will be
+#: dropped, so twenty would often leave an empty page under a real match.
+_SEARCH_LIMIT = 20
+_MTP_FILTER_LIMIT = 60
+
+_MTP_ONLY_TIP = (
+    "Keep only repos whose name says MTP, or that already have a downloaded quant carrying "
+    "MTP heads. A name is a hint: open Quants to confirm it from each file's header."
+)
+
+
 def _search_panel(ctx: GuiContext) -> None:
     ui.label("Find a model").classes("text-lg font-medium")
     with ui.row().classes("w-full items-end gap-2 flex-wrap"):
@@ -235,6 +251,9 @@ def _search_panel(ctx: GuiContext) -> None:
         # returns the select and would leave no handle to retarget the text on.
         with period:
             period_hint = ui.tooltip(_period_tooltip("downloads"))
+        mtp_only = ui.checkbox("MTP only", value=False).props("dense")
+        with mtp_only:
+            ui.tooltip(_MTP_ONLY_TIP).classes("max-w-[24rem]")
         button = ui.button("Search", icon="search").props("color=primary")
     results = ui.column().classes("w-full gap-2")
 
@@ -253,6 +272,7 @@ def _search_panel(ctx: GuiContext) -> None:
         results.clear()
         sort_value = _sort_value()
         window = PERIOD_CHOICES.get(str(period.value or ""))
+        want_mtp = bool(mtp_only.value)
         # "Newly created" is the one sort that asks about birth rather than
         # activity, so its period has to be measured the same way.
         date_field = "created" if sort_value == _CREATED_SORT else "updated"
@@ -264,7 +284,7 @@ def _search_panel(ctx: GuiContext) -> None:
                 try:
                     repos = await client.search(
                         str(query.value or ""),
-                        limit=20,
+                        limit=_MTP_FILTER_LIMIT if want_mtp else _SEARCH_LIMIT,
                         sort=sort_value,
                         newer_than_days=window,
                         date_field=date_field,
@@ -292,11 +312,42 @@ def _search_panel(ctx: GuiContext) -> None:
                     "This period has more matches than one search can fetch, so only its "
                     "most recent part was searched. Narrow the query or shorten the period."
                 ).classes("text-xs text-warning")
-            for repo in repos:
-                _repo_row(ctx, repo, date_field=date_field)
+            rows = [(repo, _repo_mtp(ctx, repo)) for repo in repos]
+            if want_mtp:
+                # A local filter over a wider page, said out loud: HF cannot
+                # search on this, and a silent "3 results" would read as "only
+                # three MTP repos exist".
+                rows = [(repo, status) for repo, status in rows if status.mtp]
+                ui.label(
+                    f"{len(rows)} of the {len(repos)} repos fetched say MTP in their name or "
+                    "have a downloaded quant that carries the heads; the rest can only be "
+                    "settled by opening their quants."
+                ).classes("text-xs opacity-70")
+            for repo, status in rows:
+                _repo_row(ctx, repo, date_field=date_field, mtp=status)
 
     button.on_click(search)
     query.on("keydown.enter", search)
+
+
+def _repo_mtp(ctx: GuiContext, repo: Any) -> Any:
+    """What a search row can say about MTP without reading a header.
+
+    A quant of this repo already in the library has a parsed header, and if
+    it carries the heads the repo is *known* to publish MTP quants (the chip
+    is filled, not "likely"). A local quant *without* them proves nothing
+    about its siblings -- a repo can ship both -- so the name hint is what is
+    left. Never a header read per row: a page of twenty rows would be twenty
+    range requests per keystroke.
+    """
+    from studioforge.core.hf_meta import mtp_from_meta, mtp_from_name, registry_sibling_meta
+
+    sibling = registry_sibling_meta(ctx.registry, repo.repo_id)
+    if sibling is not None:
+        status = mtp_from_meta(sibling)
+        if status.mtp:
+            return status
+    return mtp_from_name(repo.mtp_hint)
 
 
 def _age_label(days: float | None) -> str:
@@ -318,7 +369,7 @@ def _age_label(days: float | None) -> str:
     return f"{int(days // 30)}mo ago"
 
 
-def _repo_row(ctx: GuiContext, repo: Any, *, date_field: str = "updated") -> None:
+def _repo_row(ctx: GuiContext, repo: Any, *, date_field: str = "updated", mtp: Any = None) -> None:
     verb = "created" if date_field == "created" else "updated"
     age = _age_label(repo.created_days_ago if date_field == "created" else repo.updated_days_ago)
     summary = (
@@ -333,6 +384,11 @@ def _repo_row(ctx: GuiContext, repo: Any, *, date_field: str = "updated") -> Non
         with ui.column().classes("gap-0 grow min-w-0"):
             ui.label(repo.repo_id).classes("font-medium text-sm truncate")
             ui.label(summary).classes("text-xs opacity-70 font-mono")
+        chip = st.mtp_badge(mtp, name_hint=repo.mtp_hint)
+        if chip is not None:
+            ui.badge(chip.text, color=chip.colour, outline=chip.outline).classes(
+                "text-xs shrink-0"
+            ).tooltip(chip.tooltip)
         if repo.needs_token:
             ui.badge("gated", color="warning").classes("text-xs").tooltip(
                 "Accept the terms on HuggingFace and set hf.token on the Server tab"
@@ -345,9 +401,11 @@ def _repo_row(ctx: GuiContext, repo: Any, *, date_field: str = "updated") -> Non
 
 def _quant_dialog(ctx: GuiContext, repo: Any) -> None:
     dialog = ui.dialog()
-    with dialog, ui.card().classes("min-w-[40rem] max-w-[95vw]"):
+    with dialog, ui.card().classes("min-w-[44rem] max-w-[95vw]"):
         ui.label(f"{repo.repo_id} — pick a quant").classes("font-medium")
-        body = ui.column().classes("w-full gap-1")
+        # The body scrolls, not the page: a 25-quant repo grouped by bit-width
+        # is taller than a laptop screen, and the Close button must stay put.
+        body = ui.column().classes("w-full gap-1 max-h-[75vh] overflow-y-auto")
         with body:
             ui.label("loading file list…").classes("text-xs opacity-60")
         ui.button("Close", on_click=dialog.close).props("flat")
@@ -372,15 +430,29 @@ def _quant_dialog(ctx: GuiContext, repo: Any) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _quant_rows(ctx: GuiContext, full: Any, *, highlight: Any, on_picked: Any) -> None:
-    """One row per logical download, with a fit verdict and a Download button.
+#: Why a subfolder file has a greyed-out button rather than one that fails.
+_SUBFOLDER_NOTE = (
+    "This file sits in a subfolder of the repository. StudioForge downloads only files at "
+    "the repository root: a path separator cannot be a single file in the model directory."
+)
 
-    Rendered in two passes on purpose. The first is synchronous and uses only
-    what HuggingFace already told us (file sizes vs free VRAM), so the picker is
-    on screen immediately. The second reads the model's GGUF header over the
-    network and fills in the context line -- and upgrades the fit badge to the
-    planner's answer -- so a slow CDN costs the user a late line, not a frozen
-    dialog.
+
+def _quant_rows(ctx: GuiContext, full: Any, *, highlight: Any, on_picked: Any) -> None:
+    """The repo's quants on bit-width shelves, each with fit, context and MTP.
+
+    Laid out the way HuggingFace's own picker is -- ``2-bit``, ``3-bit``, ...
+    ``16-bit`` -- because that is the shelf a person shops on: "the biggest
+    4-bit that fits". Inside a shelf the smallest file comes first. A quant
+    label that appears twice in one repo (the same label with and without MTP
+    heads, or two base models) shows its file name inline, and every label's
+    hover lists exactly what would be downloaded.
+
+    Rendered in passes on purpose. The first is synchronous and uses only what
+    HuggingFace already told us (file sizes vs free VRAM, names), so the
+    picker is on screen immediately. Then, concurrently, one header read for
+    the repo fills in the context line and upgrades the fit badge to the
+    planner's answer, and one small probe per quant settles its MTP badge --
+    so a slow CDN costs the user a late line, not a frozen dialog.
 
     The disk check is the other half of "can I have this?": VRAM decides whether
     it will run, the drive decides whether it can even arrive. It is a warning
@@ -396,52 +468,30 @@ def _quant_rows(ctx: GuiContext, full: Any, *, highlight: Any, on_picked: Any) -
         ui.label("no loadable GGUF files in this repo").classes("text-xs opacity-60")
         return
 
-    geometry = ui.label("").classes("text-xs font-mono opacity-60")
     gpus = _gpus(ctx)
+    rig = st.rig_summary(gpus)
+    if rig:
+        ui.label(rig).classes("text-xs opacity-70")
+    geometry = ui.label("").classes("text-xs font-mono opacity-60")
     disk = _disk(ctx)
     matched = False
     cells: list[tuple[Any, Any, Any, Any]] = []
-    for option in options:
-        is_match = st.quant_matches(highlight, option.quant)
-        matched = matched or is_match
-        verdict = st.download_fit_verdict(
-            option.total_bytes, gpus, headroom_fraction=ctx.config.planner.headroom_fraction
-        )
-        classes = "w-full items-center gap-3 no-wrap rounded p-1"
-        if is_match:
-            classes += " bg-primary/20 border border-primary"
-        with ui.row().classes(classes):
-            with ui.column().classes("gap-0 grow min-w-0"):
-                with ui.row().classes("items-center gap-2"):
-                    ui.label(option.label).classes("text-sm truncate")
-                    if is_match:
-                        ui.badge("from your link", color="primary").classes("text-xs")
-                ui.label(f"{st.format_gib(option.total_bytes)} · {verdict}").classes(
-                    "text-xs font-mono opacity-70"
-                )
-                context = ui.label(_HEADER_PENDING).classes("text-xs font-mono opacity-60")
-                # Nested rather than `.tooltip(...)`, which returns the label and
-                # leaves no handle to retarget once the header arrives.
-                with context:
-                    tip = ui.tooltip("").classes("whitespace-pre-line text-xs")
-            colour = (
-                "positive"
-                if verdict.startswith("fits")
-                else ("warning" if verdict.startswith("needs") else "negative")
+    mtp_cells: list[tuple[Any, Any, Any]] = []
+    for shelf, members in st.quant_bit_groups(options):
+        _shelf_heading(shelf, len(members))
+        for option in members:
+            is_match = st.quant_matches(highlight, option.quant)
+            matched = matched or is_match
+            _quant_row(
+                ctx,
+                option,
+                is_match=is_match,
+                gpus=gpus,
+                disk=disk,
+                on_picked=on_picked,
+                cells=cells,
+                mtp_cells=mtp_cells,
             )
-            fit_badge = ui.badge(verdict.split(" (")[0], color=colour).classes("text-xs")
-            cells.append((option, context, tip, fit_badge))
-            if st.disk_would_overflow(disk, option.total_bytes):
-                ui.badge("not enough disk", color="warning").classes("text-xs").tooltip(
-                    f"{st.format_bytes(option.total_bytes)} needed, "
-                    f"{st.format_bytes(disk['free_after_queue_bytes']) if disk else '?'} "
-                    "free after what is already queued. The download will still run."
-                )
-            ui.button(
-                "Download",
-                icon="download",
-                on_click=lambda o=option: _enqueue(ctx, o, on_picked),
-            ).props("outline dense" if not is_match else "color=primary dense")
 
     if highlight and not matched:
         ui.label(
@@ -450,9 +500,159 @@ def _quant_rows(ctx: GuiContext, full: Any, *, highlight: Any, on_picked: Any) -
         ).classes("text-xs text-warning")
 
     async def fill() -> None:
-        await _fill_context_lines(ctx, full, cells, geometry)
+        await asyncio.gather(
+            _fill_context_lines(ctx, full, cells, geometry),
+            _fill_mtp_badges(ctx, mtp_cells),
+        )
 
     ui.timer(0.05, fill, once=True)
+
+
+def _shelf_heading(shelf: str, count: int) -> None:
+    """``4-BIT ── 5`` -- a quiet divider, not a card: the rows are the content."""
+    with ui.row().classes("w-full items-center gap-2 no-wrap mt-2"):
+        ui.label(shelf).classes("text-xs font-medium uppercase tracking-wide opacity-60 shrink-0")
+        ui.separator().classes("grow")
+        ui.label(str(count)).classes("text-xs opacity-50 shrink-0")
+
+
+def _quant_row(
+    ctx: GuiContext,
+    option: Any,
+    *,
+    is_match: bool,
+    gpus: list[Any],
+    disk: dict[str, Any] | None,
+    on_picked: Any,
+    cells: list[tuple[Any, Any, Any, Any]],
+    mtp_cells: list[tuple[Any, Any, Any]],
+) -> None:
+    """One quant: label line, size + fit line, context line; badges; Download."""
+    verdict = st.download_fit_verdict(
+        option.total_bytes, gpus, headroom_fraction=ctx.config.planner.headroom_fraction
+    )
+    classes = "w-full items-center gap-3 no-wrap rounded p-1"
+    if is_match:
+        classes += " bg-primary/20 border border-primary"
+    with ui.row().classes(classes):
+        with ui.column().classes("gap-0 grow min-w-0"):
+            with ui.row().classes("items-center gap-2 no-wrap min-w-0"):
+                name = ui.label(option.quant).classes("text-sm font-medium shrink-0")
+                with name:
+                    ui.tooltip(st.quant_files_tooltip(option)).classes(
+                        "whitespace-pre-line text-xs font-mono"
+                    )
+                note = st.quant_note(option)
+                if note:
+                    ui.label(note).classes("text-xs opacity-60 shrink-0")
+                if option.discriminator:
+                    # The same label twice in one repo: the file name is the
+                    # only thing that tells the rows apart, so it is shown,
+                    # not just hovered.
+                    ui.label(option.files[0].filename).classes(
+                        "text-xs font-mono opacity-60 truncate"
+                    )
+                mtp_badge, mtp_tip = _mtp_badge_element(
+                    st.mtp_badge(None, name_hint=option.mtp_hint)
+                )
+                mtp_cells.append((option, mtp_badge, mtp_tip))
+                if is_match:
+                    ui.badge("from your link", color="primary").classes("text-xs shrink-0")
+            ui.label(f"{st.format_gib(option.total_bytes)} · {verdict}").classes(
+                "text-xs font-mono opacity-70"
+            )
+            context = ui.label(_HEADER_PENDING).classes("text-xs font-mono opacity-60")
+            # Nested rather than `.tooltip(...)`, which returns the label and
+            # leaves no handle to retarget once the header arrives.
+            with context:
+                tip = ui.tooltip("").classes("whitespace-pre-line text-xs")
+        colour = (
+            "positive"
+            if verdict.startswith("fits")
+            else ("warning" if verdict.startswith("needs") else "negative")
+        )
+        fit_badge = ui.badge(verdict.split(" (")[0], color=colour).classes("text-xs")
+        cells.append((option, context, tip, fit_badge))
+        if st.disk_would_overflow(disk, option.total_bytes):
+            ui.badge("not enough disk", color="warning").classes("text-xs").tooltip(
+                f"{st.format_bytes(option.total_bytes)} needed, "
+                f"{st.format_bytes(disk['free_after_queue_bytes']) if disk else '?'} "
+                "free after what is already queued. The download will still run."
+            )
+        button = ui.button(
+            "Download",
+            icon="download",
+            on_click=lambda o=option: _enqueue(ctx, o, on_picked),
+        ).props("outline dense" if not is_match else "color=primary dense")
+        if option.in_subfolder:
+            # Would be refused by safe_filename on click; say so up front.
+            button.disable()
+            button.tooltip(_SUBFOLDER_NOTE)
+
+
+def _mtp_badge_element(spec: st.MtpBadge | None) -> tuple[Any, Any]:
+    """An MTP badge with a retargetable tooltip, hidden when there is nothing to say.
+
+    Always created, even hidden, so the header pass has an element to paint
+    into without re-rendering the row.
+    """
+    badge = ui.badge(
+        spec.text if spec else "",
+        color=spec.colour if spec else "info",
+        outline=bool(spec and spec.outline),
+    ).classes("text-xs shrink-0")
+    with badge:
+        tip = ui.tooltip(spec.tooltip if spec else "").classes(
+            "whitespace-pre-line text-xs max-w-[28rem]"
+        )
+    if spec is None:
+        badge.set_visibility(False)
+    return badge, tip
+
+
+def _paint_mtp_badge(badge: Any, tip: Any, spec: st.MtpBadge | None) -> None:
+    if spec is None:
+        badge.set_visibility(False)
+        return
+    badge.set_text(spec.text)
+    badge.props(f"color={spec.colour}")
+    if spec.outline:
+        badge.props("outline")
+    else:
+        badge.props(remove="outline")
+    tip.text = spec.tooltip
+    badge.set_visibility(True)
+
+
+async def _fill_mtp_badges(ctx: GuiContext, cells: list[tuple[Any, Any, Any]]) -> None:
+    """Third pass: each quant's MTP badge from its own file header.
+
+    Per file, because a repo can ship the same quant with and without the
+    heads and the repo-wide geometry read cannot speak for the siblings. Each
+    probe is one small range request that stops at the tokenizer, at most
+    four in flight, and every row is painted the moment its own answer lands
+    -- "likely MTP" becomes "MTP", "no MTP heads", or disappears -- rather
+    than all of them waiting for the slowest.
+    """
+    from studioforge.core.hf_meta import repo_mtp_status
+
+    if not cells:
+        return
+    by_group = {option.group_id: (badge, tip) for option, badge, tip in cells}
+
+    def landed(option: Any, status: Any) -> None:
+        badge, tip = by_group[option.group_id]
+        _paint_mtp_badge(badge, tip, st.mtp_badge(status, name_hint=option.mtp_hint))
+
+    try:
+        await repo_mtp_status(
+            ctx.config,
+            [option for option, _badge, _tip in cells],
+            registry=ctx.registry,
+            on_result=landed,
+        )
+    except Exception as exc:  # noqa: BLE001 - the first-paint badges stand; nothing to add
+        log.debug("download.mtp_pass_failed", error=str(exc))
 
 
 #: Placeholder while the remote header is in flight. Present from the first

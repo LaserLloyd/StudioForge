@@ -12,6 +12,7 @@ import ast
 import re
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -1225,12 +1226,27 @@ def test_download_tab_shows_the_disk_headroom(
 class _FakeOption:
     """One row of the quant picker: what ``LogicalDownload`` gives the tab."""
 
-    def __init__(self, quant: str, total_bytes: int) -> None:
+    def __init__(
+        self,
+        quant: str,
+        total_bytes: int,
+        *,
+        mtp_hint: bool = False,
+        in_subfolder: bool = False,
+        discriminator: str = "",
+    ) -> None:
         self.quant = quant
         self.label = f"model-{quant}.gguf"
         self.total_bytes = total_bytes
         self.repo_id = "owner/repo"
+        self.group_id = f"owner-repo-{quant.lower()}"
+        self.files = [SimpleNamespace(filename=f"model-{quant}.gguf")]
+        self.all_files = list(self.files)
         self.mmproj = None
+        self.is_sharded = False
+        self.discriminator = discriminator
+        self.mtp_hint = mtp_hint
+        self.in_subfolder = in_subfolder
 
 
 class _FakeRepoFiles:

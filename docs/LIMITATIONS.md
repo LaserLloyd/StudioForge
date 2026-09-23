@@ -444,6 +444,9 @@ real:
   say that.
 * `draft-mtp` needs a GGUF with `nextn_predict_layers >= 1`. A repository *named* "...-MTP-GGUF"
   is not evidence: one such model in the reference library carries no such key and gets no MTP.
+  The Download tab, `GET /api/hf/repo` and `repo_details` therefore read each quant's own header
+  (one small range request that stops at the tokenizer) and badge only what the header proves; a
+  name is shown as *likely MTP* until then, and as *no MTP heads* when the header disagrees.
 * `ngram-mod` learns from text it has already seen, so a benchmark that sends the same prompt
   repeatedly will report enormous gains that no real workload sees. On a 27B, four *distinct*
   prompts measured +0.4%; the same prompt three times measured +751%. Vary the prompt.

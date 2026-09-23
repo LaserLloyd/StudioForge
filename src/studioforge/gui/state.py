@@ -2290,6 +2290,155 @@ def fit_badge_from_context(context_fit: Mapping[str, Any] | None) -> tuple[str, 
 
 
 # ---------------------------------------------------------------------------
+# Quant picker: bit-width groups, the rig line, MTP badges
+# ---------------------------------------------------------------------------
+
+#: The precision token that leads every label the whitelist knows: ``Q4_K_M``,
+#: ``IQ3_XXS``, ``TQ1_0``, ``NVFP4``, ``MXFP4``, ``F16``, ``BF16``, ``F32``.
+_QUANT_BITS_RE: Final = re.compile(r"^(?:I?Q|TQ|NVFP|MXFP|FP|BF|F)(\d+)", re.I)
+
+
+def quant_bits(label: str | None) -> int | None:
+    """Nominal bit-width of a quant label: ``Q4_K_M`` -> 4, ``IQ3_XXS`` -> 3, ``BF16`` -> 16.
+
+    Nominal, the way HuggingFace's own picker groups files: a Q4_K_M is ~4.5
+    bits per weight and TQ1_0 is ~1.7, but "4-bit" is the shelf a person looks
+    on. ``None`` for a label with no leading precision token (``unknown``).
+    """
+    if not label:
+        return None
+    match = _QUANT_BITS_RE.match(label.strip())
+    return int(match.group(1)) if match else None
+
+
+def quant_bit_group(label: str | None) -> str:
+    """The shelf name: ``4-bit``, ``16-bit``, or ``other``."""
+    bits = quant_bits(label)
+    return "other" if bits is None else f"{bits}-bit"
+
+
+def quant_bit_groups(options: Sequence[Any]) -> list[tuple[str, list[Any]]]:
+    """Picker rows grouped by bit-width, smallest shelf first, smallest file first.
+
+    Within a shelf the order is by size rather than by label, because size is
+    what the eye is comparing across a shelf ("the 4-bit that fits"); the label
+    and the base name only break ties, so two entries never swap between
+    renders. ``other`` (no recognisable precision) comes last.
+    """
+    shelves: dict[int | None, list[Any]] = {}
+    for option in options:
+        shelves.setdefault(quant_bits(option.quant), []).append(option)
+    out: list[tuple[str, list[Any]]] = []
+    for bits in sorted(shelves, key=lambda b: (b is None, b or 0)):
+        members = sorted(
+            shelves[bits],
+            key=lambda o: (int(o.total_bytes or 0), str(o.quant), str(o.discriminator)),
+        )
+        out.append(("other" if bits is None else f"{bits}-bit", members))
+    return out
+
+
+def quant_note(option: Any) -> str:
+    """``2 parts · +mmproj`` beside a quant label; ``""`` for a plain single file."""
+    bits: list[str] = []
+    if option.is_sharded:
+        bits.append(f"{len(option.files)} parts")
+    if option.mmproj is not None:
+        bits.append("+mmproj")
+    return " · ".join(bits)
+
+
+def quant_files_tooltip(option: Any) -> str:
+    """The hover on a quant label: what would actually be downloaded, file by file."""
+    lines = [str(option.label)]
+    lines.extend(str(f.filename) for f in option.all_files)
+    return "\n".join(lines)
+
+
+def rig_summary(gpus: Sequence[GpuInfo]) -> str:
+    """``Rig: 2× RTX 5090 (32 GiB) + 2× RTX 3090 (24 GiB)``.
+
+    The shelf the fit column is measured against, said once at the top of the
+    picker rather than implied by every badge. Cards are grouped by name and
+    size in device order, so the best class reads first on a mixed box.
+    """
+    from studioforge.core.hf_meta import short_gpu_name
+
+    counts: dict[tuple[str, int], int] = {}
+    for gpu in gpus:
+        key = (short_gpu_name(gpu.name), round(int(gpu.total_bytes or 0) / (1 << 30)))
+        counts[key] = counts.get(key, 0) + 1
+    if not counts:
+        return ""
+    parts = [f"{count}× {name} ({gib} GiB)" for (name, gib), count in counts.items()]
+    return "Rig: " + " + ".join(parts)
+
+
+#: What the MTP badge's hover explains, once, in the words the owner uses.
+MTP_EXPLAINER: Final = (
+    "MTP = multi-token prediction: extra head(s) kept inside the model draft several tokens "
+    "per step and the model verifies them in one pass (llama.cpp --spec-type draft-mtp, which "
+    "StudioForge selects automatically at load). Same output, faster single-stream decode -- "
+    "+34% measured on a 27B -- with no draft model and no extra VRAM."
+)
+
+
+class MtpBadge(typing.NamedTuple):
+    """One badge: its text, Quasar colour, outline-or-filled, and hover text."""
+
+    text: str
+    colour: str
+    outline: bool
+    tooltip: str
+
+
+def mtp_badge(status: Any, *, name_hint: bool) -> MtpBadge | None:
+    """The MTP badge for one quant (or one search row), or ``None`` for no badge.
+
+    ``status`` is an ``hf_meta.MtpStatus`` (``mtp``/``source``/``layers``/
+    ``detail``) or ``None`` before anything has been read. Four states, and
+    only the header can produce the first two:
+
+    * ``MTP`` (filled) -- the GGUF header carries ``nextn_predict_layers``;
+    * ``no MTP heads`` (grey) -- the *name* promised MTP and the header does
+      not deliver, which is worth saying because the name is what a person
+      downloads on (LIMITATIONS.md has a real repo like this);
+    * ``likely MTP`` (outline) -- only the name says so: the header is not
+      read yet, or could not be (the reason rides in the hover);
+    * nothing -- neither the header nor the name has anything to say.
+    """
+    mtp = getattr(status, "mtp", None)
+    source = getattr(status, "source", None)
+    layers = getattr(status, "layers", None)
+    detail = getattr(status, "detail", None)
+    if source == "header":
+        if mtp:
+            heads = f"{layers} head{'s' if layers != 1 else ''}" if layers else "heads present"
+            return MtpBadge(
+                "MTP", "info", False, f"Confirmed from the GGUF header ({heads}).\n{MTP_EXPLAINER}"
+            )
+        if name_hint:
+            return MtpBadge(
+                "no MTP heads",
+                "grey",
+                False,
+                "The name says MTP, but this file's GGUF header carries no "
+                "nextn_predict_layers key: there is nothing to draft with, so it loads "
+                "without MTP speculative decode.",
+            )
+        return None
+    if name_hint and (status is None or (mtp and source == "name")):
+        why = detail or "the header has not been read yet"
+        return MtpBadge(
+            "likely MTP",
+            "info",
+            True,
+            f"The name says MTP; only the GGUF header can confirm it ({why}).\n{MTP_EXPLAINER}",
+        )
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Disk space
 # ---------------------------------------------------------------------------
 

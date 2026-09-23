@@ -547,6 +547,10 @@ def _search_row(repo: Any, *, trending: bool) -> dict[str, Any]:
     ``trending_score`` is included only when the search was *sorted* by it: HF
     omits the field entirely under any other ordering, so emitting it always
     would report ``None`` as though the repo scored nothing.
+
+    ``mtp_likely`` is the one capability hint a search row can afford: the repo
+    or a file *name* says MTP. No header is read per row; ``repo_details``
+    settles it per quant.
     """
     row: dict[str, Any] = {
         "repo_id": repo.repo_id,
@@ -567,6 +571,7 @@ def _search_row(repo: Any, *, trending: bool) -> dict[str, Any]:
             "gated": bool(repo.gated),
             "quants": repo.quant_variants,
             "mmproj": bool(repo.mmproj_files),
+            "mtp_likely": bool(repo.mtp_hint),
             "file_count": len(repo.files),
         }
     )
@@ -603,6 +608,11 @@ def _compact_repo(payload: dict[str, Any]) -> dict[str, Any]:
             "total_gb": round(int(entry.get("total_bytes") or 0) / GB, 2),
             "files": entry.get("files", []),
             "mmproj": entry.get("mmproj"),
+            # True/False by "header" is the file's own nextn_predict_layers key;
+            # True by "name" is a hint the header could not confirm; null is
+            # unknown. Kept together so an agent never reads a hint as a fact.
+            "mtp": entry.get("mtp"),
+            "mtp_source": entry.get("mtp_source"),
             "fit": {
                 "verdict": fit.get("verdict"),
                 "message": fit.get("message"),
@@ -613,6 +623,8 @@ def _compact_repo(payload: dict[str, Any]) -> dict[str, Any]:
                 "approximate": fit.get("approximate"),
             },
         }
+        if entry.get("mtp_layers"):
+            compact["mtp_layers"] = entry["mtp_layers"]
         context = _compact_context_fit(entry.get("context_fit"))
         if context:
             compact["context_fit"] = context
@@ -1825,7 +1837,9 @@ def build_management_mcp(state: Any) -> MCPServer:
             ``publisher``, ``downloads``, ``likes``, ``updated_days_ago``,
             ``created_days_ago``, ``gated`` (true means you must accept terms
             and have an HF token), ``quants`` (the labels on offer), ``mmproj``
-            (true if the repo ships a vision projector) and ``file_count``.
+            (true if the repo ships a vision projector), ``mtp_likely`` (the
+            repo or a file NAME says MTP -- a hint only; ``repo_details`` reads
+            each quant's header to settle it) and ``file_count``.
             ``trending_score`` appears only with ``sort="trending"`` -- HF omits
             the field under every other ordering, so its absence is not a zero.
             ``truncated: true`` means the date window holds more matches than
@@ -1878,6 +1892,14 @@ def build_management_mcp(state: Any) -> MCPServer:
           further, so a tier that is ``true`` in ``fits`` but above ``max_ctx``
           is one you would be buying with a quantized cache. Tiers above the
           model's trained window are absent, never offered.
+        * ``mtp`` / ``mtp_source`` -- whether THIS quant keeps its
+          multi-token-prediction heads (``mtp_layers`` of them), which
+          StudioForge turns into ``--spec-type draft-mtp`` at load: a real
+          single-stream speedup (+34% measured on a 27B) at no extra VRAM.
+          ``"header"`` means the file's own GGUF header said so and is the
+          only source to trust; ``"name"`` means only the name says MTP;
+          ``null`` means unknown. Prefer a header-confirmed MTP quant over the
+          same quant without it when both fit.
 
         The matrix is computed with the same planner a real load uses, so it
         cannot promise a context the loader would refuse. ``weights_fit: false``
@@ -1896,7 +1918,8 @@ def build_management_mcp(state: Any) -> MCPServer:
         Returns:
             Repo identity and popularity, plus ``quants``: one entry per
             downloadable quantization with ``quant``, ``total_gb``, ``files``,
-            ``mmproj``, ``fit`` and (by default) ``context_fit``.
+            ``mmproj``, ``mtp``, ``mtp_source``, ``fit`` and (by default)
+            ``context_fit``.
         """
         from studioforge.api.mgmt_routes import _repo_payload
         from studioforge.core.hf_search import HfSearch
