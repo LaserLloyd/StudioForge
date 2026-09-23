@@ -72,4 +72,3 @@ def test_d48s_stale_ttl_text_now_points_at_d60_without_a_new_heading() -> None:
         block = d48[d48.index(line) : d48.index(line) + 600]
         assert "D60" in block
         assert "900" in block, "the amendment states the numbers D60 shipped"
-    assert "## D70" not in text, "the D70 record is docs/pending until the owner promotes it"

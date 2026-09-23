@@ -588,7 +588,7 @@ async def _unload_one(ctx: GuiContext, model_id: str, refresh: Any) -> None:
                 # D55: the panel is the operator's, so a viewer who passes
                 # D32 may unload a lease-held model; a remote viewer on an
                 # open install gets the manager's 409 as a red toast.
-                await ctx.manager.unload(model_id, force=viewer_may_change_box(ctx))
+                await ctx.manager.unload(model_id, force=viewer_may_change_box(ctx), source="gui")
             except Exception as exc:  # noqa: BLE001
                 page.error(exc, what="unload")
                 return
@@ -635,7 +635,9 @@ def _unload_all_dialog(ctx: GuiContext, loaded_ids: list[str], refresh: Any) -> 
                     return
                 with busy(message="Unloading every model…"):
                     try:
-                        unloaded = await ctx.manager.unload_all(force=viewer_may_change_box(ctx))
+                        unloaded = await ctx.manager.unload_all(
+                            force=viewer_may_change_box(ctx), source="gui"
+                        )
                     except Exception as exc:  # noqa: BLE001
                         page.error(exc, what="unload all")
                         return

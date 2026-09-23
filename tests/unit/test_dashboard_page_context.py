@@ -98,7 +98,7 @@ class _Refresh:
 
 async def test_unload_toasts_on_the_page_after_the_refresh_deleted_its_card(fake_ui: _Ui) -> None:
     class Manager:
-        async def unload(self, model_id: str, *, force: bool) -> None:
+        async def unload(self, model_id: str, *, force: bool, source: str | None = None) -> None:
             fake_ui.context.card_deleted = True  # the 2 s repaint ran during the await
 
     refresh = _Refresh()
@@ -122,7 +122,7 @@ async def test_restart_toasts_on_the_page_too(fake_ui: _Ui) -> None:
 
 async def test_a_failure_after_the_card_is_gone_is_still_a_red_toast(fake_ui: _Ui) -> None:
     class Manager:
-        async def unload(self, model_id: str, *, force: bool) -> None:
+        async def unload(self, model_id: str, *, force: bool, source: str | None = None) -> None:
             fake_ui.context.card_deleted = True
             raise RuntimeError("child did not exit")
 
@@ -137,7 +137,7 @@ async def test_a_failure_after_the_card_is_gone_is_still_a_red_toast(fake_ui: _U
 
 async def test_a_page_whose_browser_went_away_is_not_drawn_into(fake_ui: _Ui) -> None:
     class Manager:
-        async def unload(self, model_id: str, *, force: bool) -> None:
+        async def unload(self, model_id: str, *, force: bool, source: str | None = None) -> None:
             fake_ui.context.card_deleted = True
             fake_ui.client.is_deleted = True
 
@@ -169,7 +169,7 @@ async def test_a_page_that_cannot_be_entered_never_blocks_the_action(
     unloaded: list[str] = []
 
     class Manager:
-        async def unload(self, model_id: str, *, force: bool) -> None:
+        async def unload(self, model_id: str, *, force: bool, source: str | None = None) -> None:
             unloaded.append(model_id)
 
     await dashboard._unload_one(_ctx(Manager()), "e/model", _Refresh())

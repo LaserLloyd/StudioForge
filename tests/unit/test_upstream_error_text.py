@@ -36,10 +36,17 @@ class _Supervisor:
     def __init__(self) -> None:
         self.active = 0
 
-    def mark_request_start(self, model_id: str) -> None:
+    def mark_request_start(self, model_id: str, *, client: str | None = None) -> str | None:
         self.active += 1
+        return None
 
-    def mark_request_end(self, model_id: str, *, tokens_per_second: float | None = None) -> None:
+    def mark_request_end(
+        self,
+        model_id: str,
+        *,
+        tokens_per_second: float | None = None,
+        request_id: str | None = None,
+    ) -> None:
         self.active -= 1
 
     def base_url(self, model_id: str) -> str:
