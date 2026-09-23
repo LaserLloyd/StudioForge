@@ -1424,7 +1424,10 @@ def build_management_mcp(state: Any) -> MCPServer:
         # admin by the same test the unload route applies. Without it the D55
         # lease guard would refuse the operator's own `sfctl unload` of a
         # benchmark's model, which is exactly the person entitled to do it.
-        unloaded = await state.manager.unload(model_id, force=True)
+        # ``source``: the manager logs every explicit unload with its entry
+        # point and what the model was serving (D70); an MCP call has no peer
+        # address or X-SF-Client header to add, the PIN gate is its identity.
+        unloaded = await state.manager.unload(model_id, force=True, source="mcp")
         return {"ok": True, "model_id": model_id, "unloaded": unloaded}
 
     @_guard

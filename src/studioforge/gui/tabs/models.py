@@ -532,7 +532,7 @@ def _benchmark(ctx: GuiContext, record: Any) -> None:
 async def _unload(ctx: GuiContext, record: Any, table: Any) -> None:
     with busy(message=f"Unloading {record.id}…"):
         try:
-            await ctx.manager.unload(record.id, force=viewer_may_change_box(ctx))
+            await ctx.manager.unload(record.id, force=viewer_may_change_box(ctx), source="gui")
         except Exception as exc:  # noqa: BLE001
             notify_error(exc, what="unload")
             return

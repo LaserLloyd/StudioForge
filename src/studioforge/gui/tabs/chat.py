@@ -415,7 +415,9 @@ def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one fl
                     # D55: a viewer who passes D32 may unload a lease-held
                     # model; a remote viewer on an open install gets the
                     # manager's 409 as a red toast, as on the Dashboard.
-                    await ctx.manager.unload(serving_id, force=viewer_may_change_box(ctx))
+                    await ctx.manager.unload(
+                        serving_id, force=viewer_may_change_box(ctx), source="gui:chat"
+                    )
                 except Exception as exc:  # noqa: BLE001
                     notify_error(exc, what="unload")
                     sync()

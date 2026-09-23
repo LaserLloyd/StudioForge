@@ -120,6 +120,12 @@ def may_unload_lease_held(request: Request, state: Any, model_ids: Any) -> bool:
     return all(_holder_proof(lease, peer=peer, presented=presented) for lease in held)
 
 
+def _peer_host(request: Request) -> str | None:
+    """The address a request came from, or ``None`` for an in-process call."""
+    host = getattr(getattr(request, "client", None), "host", None)
+    return str(host) if host else None
+
+
 def _holder_proof(lease: Any, *, peer: str, presented: str) -> bool:
     """One lease's proof of holdership: the registering peer, or its own token."""
     registered = getattr(lease, "holder_peer", None)
@@ -1050,10 +1056,20 @@ async def load_recommended(
 
 @router.post("/models/{model_id:path}/unload")
 async def unload_model(model_id: str, request: Request) -> dict[str, Any]:
-    """Stop the child serving this model. Open, except against a GPU lease (D55)."""
+    """Stop the child serving this model. Open, except against a GPU lease (D55).
+
+    Logged with the caller (D70): the peer address, the ``X-SF-Client`` label
+    and what the model was serving at that moment. This route does not
+    drain -- requests in flight are cut -- and until D70 nothing recorded who
+    had asked.
+    """
     state = _state(request)
     unloaded = await state.manager.unload(
-        model_id, force=may_unload_lease_held(request, state, [model_id])
+        model_id,
+        force=may_unload_lease_held(request, state, [model_id]),
+        source="rest",
+        client=client_of(request),
+        peer=_peer_host(request),
     )
     return {"model_id": model_id, "unloaded": unloaded}
 
@@ -1823,7 +1839,12 @@ async def unload_all(request: Request) -> dict[str, Any]:
     """
     state = _state(request)
     resident = [i.model_id for i in state.supervisor.list()]
-    unloaded = await state.manager.unload_all(force=may_unload_lease_held(request, state, resident))
+    unloaded = await state.manager.unload_all(
+        force=may_unload_lease_held(request, state, resident),
+        source="rest",
+        client=client_of(request),
+        peer=_peer_host(request),
+    )
     log.info("unloaded all models", count=len(unloaded))
     return {"unloaded": unloaded, "count": len(unloaded)}
 

@@ -3570,7 +3570,16 @@ class ModelManager:
             details={"leases": [lease_view(lease) for lease in held]},
         )
 
-    async def unload(self, name: str, *, deliberate: bool = True, force: bool = False) -> bool:
+    async def unload(
+        self,
+        name: str,
+        *,
+        deliberate: bool = True,
+        force: bool = False,
+        source: str | None = None,
+        client: str | None = None,
+        peer: str | None = None,
+    ) -> bool:
         """Stop the child serving ``name``; a deliberate unload sticks (D41).
 
         The stopped id is marked so the pin reconciler leaves it down: whoever
@@ -3590,6 +3599,16 @@ class ModelManager:
         (``deliberate=False``) is never guarded -- it only ever puts back what
         it took, and the lease grant's own eviction runs through the supervisor,
         not through here.
+
+        Every deliberate unload is logged with who asked (D70): ``source`` is
+        the entry point (``rest``, ``mcp``, ``gui``...; ``in-process`` when the
+        caller did not say), ``client`` the ``X-SF-Client`` label (else peer
+        address) the request carried, ``peer`` the address it came from, plus
+        ``active_requests`` and the in-flight clients at the moment of the
+        stop. WARNING when that count is above zero: this path does not drain,
+        so those requests are about to be cut -- on 2026-09-20 an explicit
+        unload cut six live streams and nothing recorded who called it. The
+        behaviour is unchanged; refusing a busy unload is a separate decision.
         """
         if deliberate and not force:
             self.require_lease_clear([name], f"to unload '{name}'")
@@ -3599,14 +3618,60 @@ class ModelManager:
             # An explicit unload also cancels a pending priority restore:
             # whoever called this wants the model DOWN, not down-for-a-moment.
             self._restore_entries.pop(model_id, None)
-        if self.supervisor.get(model_id) is None:
+        instance = self.supervisor.get(model_id)
+        if instance is None:
             return False
         if deliberate:
             self._pin_suppressed.add(model_id)
+            self._log_explicit_unload(
+                instance, source=source, client=client, peer=peer, force=force
+            )
         await self.supervisor.stop(model_id)
         return True
 
-    async def unload_all(self, *, force: bool = False) -> list[str]:
+    @staticmethod
+    def _log_explicit_unload(
+        instance: InstanceInfo,
+        *,
+        source: str | None,
+        client: str | None,
+        peer: str | None,
+        force: bool,
+        what: str = "explicit unload",
+    ) -> None:
+        """Who took a model down, and what it was doing at that moment (D70).
+
+        INFO for an idle model; WARNING when requests are in flight, because
+        ``supervisor.stop`` does not drain and they are about to be cut. The
+        event name is fixed per entry point (``explicit unload`` /
+        ``explicit unload-all``) so the log can be grepped for either.
+        """
+        active = int(instance.active_requests)
+        fields: dict[str, Any] = {
+            "model_id": instance.model_id,
+            "source": source or "in-process",
+            "client": client,
+            "peer": peer,
+            "force": force,
+            "active_requests": active,
+            "in_flight_clients": sorted(
+                {str(entry.client) for entry in instance.in_flight if entry.client}
+            ),
+            "loaded_by": instance.loaded_by,
+        }
+        if active > 0:
+            log.warning(f"{what} cuts live requests", **fields)
+        else:
+            log.info(what, **fields)
+
+    async def unload_all(
+        self,
+        *,
+        force: bool = False,
+        source: str | None = None,
+        client: str | None = None,
+        peer: str | None = None,
+    ) -> list[str]:
         """Stop every child. Pinned ones stay down until loaded or re-pinned (D41).
 
         Refused wholesale (409 ``lease_conflict``) when *any* resident is held by
@@ -3620,11 +3685,23 @@ class ModelManager:
         the ones that did go. Until 2026-09-09 this returned the pre-computed id
         list unconditionally and the route answered 200 for children still alive.
         """
-        ids = [i.model_id for i in self.supervisor.list()]
+        residents = list(self.supervisor.list())
+        ids = [i.model_id for i in residents]
         if not force:
             self.require_lease_clear(ids, "to unload every model")
         self._pin_suppressed.update(ids)
         self._restore_entries.clear()
+        for instance in residents:
+            # One line per resident (D70): the busy ones say what they are
+            # about to cut, and every line names the caller.
+            self._log_explicit_unload(
+                instance,
+                source=source,
+                client=client,
+                peer=peer,
+                force=force,
+                what="explicit unload-all",
+            )
         results = await self.supervisor.stop_all()
         unloaded = [model_id for model_id, failure in results.items() if failure is None]
         failed = {model_id: failure for model_id, failure in results.items() if failure is not None}
