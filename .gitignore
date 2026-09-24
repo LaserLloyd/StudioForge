@@ -22,6 +22,16 @@ local-env.bat
 .env
 .env.*
 
+# bench/run_bench.py writes one JSON per run. Each file is a snapshot of the
+# machine that ran it: absolute model paths, pids, GPU temperatures and the
+# other tenants' leases. Keep results local and quote the numbers you need in
+# DECISIONS.md or bench/rejected.md. results/.gitkeep keeps the directory.
+/bench/results/*.json
+
+# Change-request triage notes written against a local clone. They quote
+# private paths and unreleased findings, so they stay out of the repository.
+CHANGE-REQUESTS-TRIAGE*.md
+
 # --- python --------------------------------------------------------------
 .venv/
 venv/

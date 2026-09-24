@@ -101,6 +101,10 @@ message and `error.studioforge` details are printed verbatim) · **3** completed
    uncommitted changes; a second run at the same sha gets `-2`, `-3`, …), print the summary,
    and — for a baseline — the comparison against the newest previous non-smoke file.
 
+Results files stay on the machine that ran them: `bench/results/*.json` is gitignored, because
+each file records absolute model paths, pids and the other tenants' leases. Quote the numbers a
+decision rests on in `DECISIONS.md` or `rejected.md`.
+
 ## The invalidity rule
 
 A results file is **valid only if every compute holder on the target devices during the runs was

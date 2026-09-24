@@ -9,7 +9,9 @@ lands here for one of two reasons: it *regressed* a headline metric by more than
 a major restructuring that did not clear the bar. A small win is never rejected on size.
 
 Every row must point at the results file that measured it (`bench/results/<sha>[-<label>].json`),
-and the file's `validity.valid` must be `true` — an invalid run cannot reject anything.
+and the file's `validity.valid` must be `true` — an invalid run cannot reject anything. Results
+files are gitignored and stay on the machine that ran them, so the delta column is the published
+record.
 
 | Change | Measured delta (median decode @256k / prefill @≥128k) | Date | Results file | Why rejected |
 | --- | --- | --- | --- | --- |
