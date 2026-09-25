@@ -2,7 +2,7 @@
    the same in every app. Do not edit this copy: change the package's src/
    or adapters/, run `python tools/sync_theme.py build`, then copy ui-theme/
    into each app (or run `python tools/sync_theme.py install`).
-   body sha256: de842fdec71ef23c */
+   body sha256: 44de2e22fe60c2da */
 /* ============================================================================
    theme-base.css — CORE. Purple (base theme) + theme-agnostic layer.
    ----------------------------------------------------------------------------
@@ -45,7 +45,7 @@
 
   /* ---- Text ---- */
   --text-primary:    #e8e8f0;
-  --text-secondary:  #9a9ab8;
+  --text-secondary:  #a0a0bd;  /* core fix 2026-09-25, was #9a9ab8 */
   --text-tertiary:   #8d8db0;
   --text-disabled:   #717195;
   --text-inverse:    #0e0e1b;
@@ -60,7 +60,7 @@
 
   /* ---- Accent ---- */
   --accent:          #7c3aed;
-  --accent-hover:    #8b5cf6;
+  --accent-hover:    #8250f0;  /* core fix 2026-09-25, was #8b5cf6 */
   --accent-pressed:  #6d28d9;
   --accent-subtle:   rgba(124,58,237,.16);
   --accent-muted:    rgba(124,58,237,.26);
@@ -71,7 +71,7 @@
 
   /* ---- Call to action ---- */
   --cta:               #7c3aed;
-  --cta-hover:         #8b5cf6;
+  --cta-hover:         #8250f0;  /* core fix 2026-09-25, was #8b5cf6 */
   --cta-pressed:       #6d28d9;
   --on-cta:            #ffffff;
   --cta-shadow:        0 6px 20px rgba(124,58,237,.28);
@@ -83,7 +83,7 @@
   /* ---- Lines ---- */
   --border-subtle:      #21213b;
   --border:             #292945;
-  --border-strong:      #38385c;
+  --border-strong:      #6f6f9c;  /* core fix 2026-09-25, was #38385c */
   --divider:            #21213b;
   --focus-ring:         #a78bfa;
   --focus-ring-width:   2px;
@@ -169,7 +169,7 @@
   --md-bolditalic:         #fde68a;
   --md-bolditalic-glow:    rgba(253,230,138,.40);
   --rp-speech:             #e8e8f0;
-  --rp-action:             #9a9ab8;
+  --rp-action:             #a0a0bd;  /* core fix 2026-09-25: follows --text-secondary */
   --rp-thought:            #a5f3ea;
   --rp-whisper:            #8d8db0;
   --rp-ooc:                #7d7da0;
@@ -678,168 +678,188 @@
      so the slider track / toggle off-track role gets its own token.
      3.17:1 on surface-2, 3.64:1 on surface-0. */
   --control-track: #5f676b;
+  /* Core fix 2026-09-25 (review T25-7): the accent fill was darker than
+     the empty track, so the slider read inverted. Ice fill, 3.81:1 above
+     the track. */
+  --slider-color: var(--highlight);
 
 }
 
-/* theme-forest.css — CORE
-   Ground: dark (near-black, warm) · family: forest · color-scheme: dark
-   theme-color: #0a0806
-   Extracted from the project's existing [data-palette="forest"] block.
-   (D) = derived from this theme's own palette. */
+/* theme-forest.css — CORE · owner-approved redesign 2026-09-25
+   Ground: oled · family: forest · color-scheme: dark · theme-color: #000000
+
+   Moss on bark, at night. The first Forest (the design import) was cream
+   text, orange links and a brown accent: warm on warm, close to Midnight
+   Gold. The owner asked for an earthy, mossy theme built like Glacier
+   ("pale green and browns instead of pale blue"), so this one follows
+   Glacier's structure with forest colours:
+   - true-black page, olive-black raised surfaces at Glacier's luminance
+     steps;
+   - one text family: pale lichen green stepping down to moss grey, the way
+     Glacier's text steps from ice to slate;
+   - one bright signature, lichen #b4d68c: links, focus ring, highlight,
+     quote bar, glass strokes, glow;
+   - a deep moss accent plate (#326430) with a white label;
+   - browns for everything woody: bark borders, your own chat bubbles,
+     italics, the secondary accent (#c9a57a) and the scrollbars.
+   Statuses keep Glacier's clear set (emerald success, amber warning, coral
+   danger), with sky-blue info as the one cool hue. Live is the spring
+   green Purple and Midnight Gold use, kept clear of the lichen signature;
+   sliders fill with the signature, so the filled part reads brighter than
+   the empty track.
+
+   Review: reports/review-2026-09-25-themes.md (T25-1, T25-5 to T25-8).
+
+   design/output/theme-forest.css still holds the imported values; this file
+   diverges from it on purpose ("redesign" in src/themes.json). */
 
 [data-palette="forest"] {
   color-scheme: dark;
 
-  --surface-void:    #050403;
-  --surface-0:       #0a0806;
-  --surface-1:       #0f0c09;
-  --surface-2:       #150f0a;
-  --surface-3:       #1a130c;
-  --surface-4:       #211a10;
-  --surface-sunken:  #060503;
-  --surface-overlay: #1a130c;  /* D */
-  --glass-1:         rgba(21,15,10,.78);  /* D */
-  --glass-2:         rgba(26,19,12,.88);  /* D */
-  --glass-3:         rgba(10,8,6,.94);    /* D */
-  --glass-highlight: rgba(255,255,255,.045);  /* D */
-  --code-bg:         #060503;
+  --surface-void:    #000000;
+  --surface-0:       #000000;
+  --surface-1:       #080d07;
+  --surface-2:       #0e170c;
+  --surface-3:       #131d10;
+  --surface-4:       #182414;
+  --surface-sunken:  #040703;
+  --surface-overlay: #0e170c;
+  --glass-1:         #0e170c;
+  --glass-2:         #131d10;
+  --glass-3:         #080d07;
+  --glass-highlight: rgba(255,255,255,.05);
+  --code-bg:         #040703;
 
-  --text-primary:    #ece3d2;
-  --text-secondary:  #b8a888;
-  --text-tertiary:   #9b8b6c;
-  --text-disabled:   #72674e;  /* D */
-  --text-inverse:    #0a0806;  /* D */
-  --text-link:       #d68a42;
-  --text-link-hover: #e8a668;  /* D */
+  --text-primary:    #dbeccf;
+  --text-secondary:  #a8bf9a;
+  --text-tertiary:   #8aa27c;
+  --text-disabled:   #62745a;
+  --text-inverse:    #000000;
+  --text-link:       #b4d68c;
+  --text-link-hover: #d2eab4;
   --on-accent:       #ffffff;
-  --on-danger:       #2a0808;  /* D */
-  --on-success:      #052215;  /* D */
-  --on-warning:      #251a00;  /* D */
-  --on-media:        #ffffff;  /* D */
-  --on-media-muted:  #ded4c0;  /* D */
+  --on-danger:       #2a0808;
+  --on-success:      #052215;
+  --on-warning:      #251a00;
+  --on-media:        #ffffff;
+  --on-media-muted:  #d6e4cc;
 
-  --accent:          #5e3a1e;
-  --accent-hover:    #6f4626;
-  --accent-pressed:  #482c15;  /* D */
-  --accent-subtle:   rgba(94,58,30,.30);  /* D */
-  --accent-muted:    rgba(94,58,30,.48);  /* D */
-  --accent-glow:     rgba(214,138,66,.26);/* D */
-  --accent-rgb:      94,58,30;
-  --accent-2:        #8fae6e;
-  --accent-2-subtle: rgba(143,174,110,.12);/* D */
+  --accent:          #326430;
+  --accent-hover:    #3c7539;
+  --accent-pressed:  #28522a;
+  --accent-subtle:   rgba(50,100,48,.26);
+  --accent-muted:    rgba(50,100,48,.42);
+  --accent-glow:     rgba(180,214,140,.28);
+  --accent-rgb:      50,100,48;
+  --accent-2:        #c9a57a;
+  --accent-2-subtle: rgba(201,165,122,.12);
 
-  --cta:              #5e3a1e;  /* D — aliases accent */
-  --cta-hover:        #6f4626;  /* D */
-  --cta-pressed:      #482c15;  /* D */
-  --on-cta:           #ffffff;  /* D */
-  --cta-shadow:       0 6px 20px rgba(0,0,0,.55);        /* D */
-  --cta-shadow-hover: 0 10px 28px rgba(214,138,66,.18);  /* D */
-  --highlight:        #e0a52e;
-  --highlight-subtle: rgba(224,165,46,.12);  /* D */
-  --on-highlight:     #241700;  /* D */
+  --cta:              #326430;
+  --cta-hover:        #3c7539;
+  --cta-pressed:      #28522a;
+  --on-cta:           #ffffff;
+  --cta-shadow:       0 6px 20px rgba(0,0,0,.55);
+  --cta-shadow-hover: 0 10px 28px rgba(180,214,140,.18);
+  --highlight:        #b4d68c;
+  --highlight-subtle: rgba(180,214,140,.12);
+  --on-highlight:     #142009;
 
-  --border-subtle:       #221c14;  /* D */
-  --border:              #3c4536;
-  --border-strong:       #64715a;
-  --divider:             #221c14;  /* D */
-  --focus-ring:          #d68a42;
-  --glass-stroke:        rgba(214,138,66,.14);  /* D */
-  --glass-stroke-strong: rgba(214,138,66,.28);  /* D */
+  --border-subtle:       #2c231a;
+  --border:              #4b3c2b;
+  --border-strong:       #7f6a4e;
+  --divider:             #2c231a;
+  --focus-ring:          #b4d68c;
+  --glass-stroke:        rgba(180,214,140,.14);
+  --glass-stroke-strong: rgba(180,214,140,.28);
 
   --success: #34d399; --success-hover: #5fe0b0;
-  --success-subtle: rgba(52,211,153,.12); --success-text: #5fcf98;
+  --success-subtle: rgba(52,211,153,.12); --success-text: #5fd3a8;
   --success-border: rgba(52,211,153,.36);
   --warning: #fbbf24; --warning-hover: #fcd34d;
-  --warning-subtle: rgba(251,191,36,.12); --warning-text: #e0a52e;
+  --warning-subtle: rgba(251,191,36,.12); --warning-text: #f2c14e;
   --warning-border: rgba(251,191,36,.36);
   --danger: #f87171; --danger-hover: #fca5a5;
-  --danger-subtle: rgba(248,113,113,.12); --danger-text: #ff8f7f;
+  --danger-subtle: rgba(248,113,113,.12); --danger-text: #ff8a80;
   --danger-border: rgba(248,113,113,.36);
-  --info: #93c4a6; --info-hover: #b4d8c2;
-  --info-subtle: rgba(147,196,166,.12); --info-text: #93c4a6;
-  --info-border: rgba(147,196,166,.36);
-  --live: #a8c47e; --live-hover: #c1d89e;
-  --live-subtle: rgba(168,196,126,.14); --live-text: #a8c47e;
-  --live-border: rgba(168,196,126,.38);
-  --idle: #e0a52e; --idle-hover: #eeba55;
-  --idle-subtle: rgba(224,165,46,.12); --idle-text: #e0a52e;
-  --idle-border: rgba(224,165,46,.34);
-  --offline: #6e6249; --offline-hover: #8c7e60;
-  --offline-subtle: rgba(110,98,73,.20); --offline-text: #9b8b6c;
-  --offline-border: rgba(110,98,73,.44);
-  --heartbeat: #d8a0b0; --heartbeat-hover: #e7bfca;
-  --heartbeat-subtle: rgba(216,160,176,.12); --heartbeat-text: #d8a0b0;
-  --heartbeat-border: rgba(216,160,176,.36);
-  --on-info: #04150d; --on-live: #10200a; --on-idle: #241700;  /* D */
-  --on-offline: #ffffff; --on-heartbeat: #2a0e15;              /* D */
+  --info: #94c8e0; --info-hover: #b8dcec;
+  --info-subtle: rgba(148,200,224,.12); --info-text: #94c8e0;
+  --info-border: rgba(148,200,224,.36);
+  --live: #4ade80; --live-hover: #86efac;
+  --live-subtle: rgba(74,222,128,.14); --live-text: #4ade80;
+  --live-border: rgba(74,222,128,.38);
+  --idle: #f2c14e; --idle-hover: #f6d27d;
+  --idle-subtle: rgba(242,193,78,.12); --idle-text: #f2c14e;
+  --idle-border: rgba(242,193,78,.34);
+  --offline: #6f6656; --offline-hover: #8a806e;
+  --offline-subtle: rgba(111,102,86,.20); --offline-text: #9a9080;
+  --offline-border: rgba(111,102,86,.44);
+  --heartbeat: #e3a4b4; --heartbeat-hover: #eec2cd;
+  --heartbeat-subtle: rgba(227,164,180,.12); --heartbeat-text: #e3a4b4;
+  --heartbeat-border: rgba(227,164,180,.36);
+  --on-info: #04151f; --on-live: #06200c; --on-idle: #241a00;
+  --on-offline: #ffffff; --on-heartbeat: #2a0e16;
 
-  --scrim:        rgba(5,4,3,.74);  /* D */
-  --scrim-strong: rgba(3,2,2,.92);  /* D */
-  --scrim-light:  rgba(5,4,3,.50);  /* D */
-  --scrim-media:  linear-gradient(to top, rgba(5,4,3,.90), rgba(5,4,3,0)); /* D */
+  --scrim:        rgba(0,0,0,.72);
+  --scrim-strong: rgba(0,0,0,.92);
+  --scrim-light:  rgba(0,0,0,.50);
+  --scrim-media:  linear-gradient(to top, rgba(0,0,0,.90), rgba(0,0,0,0));
 
-  --bubble-user-bg:        #4a2e19;
-  --bubble-user-text:      #ece3d2;  /* D */
-  --bubble-user-border:    #5f3b20;  /* D */
-  --bubble-assistant-bg:   #150f0a;
-  --bubble-assistant-text: #ece3d2;  /* D */
-  --quote-bar:             #8fae6e;
-  --mark-bg:               rgba(224,165,46,.28);
-  --md-bold:               #f5ecd8;
-  --md-italic:             #e0a52e;
-  --md-bolditalic:         #f2c76a;  /* D */
-  --md-bolditalic-glow:    rgba(242,199,106,.40);  /* D */
-  --rp-speech:  #ece3d2;  /* D */
-  --rp-action:  #b8a888;  /* D */
-  --rp-thought: #c3dba9;  /* D */
-  --rp-whisper: #9b8b6c;  /* D */
-  --rp-ooc:     #877a5c;  /* D */
-  --rp-shout:   #ff9f56;  /* D */
-  --rp-shout-glow: rgba(255,159,86,.45);  /* D */
-  --rp-critical: #ff8a84;  /* D */
-  --rp-critical-glow: rgba(255,138,132,.45);  /* D */
-  --diff-add-bg: rgba(52,211,153,.14); --diff-add-text: #86dba0;        /* D */
-  --diff-remove-bg: rgba(248,113,113,.14); --diff-remove-text: #ff9f92;  /* D */
+  --bubble-user-bg:        #3b2f22;
+  --bubble-user-text:      #dbeccf;
+  --bubble-user-border:    #4f3f2d;
+  --bubble-assistant-bg:   #0e170c;
+  --bubble-assistant-text: #dbeccf;
+  --quote-bar:             #b4d68c;
+  --mark-bg:               rgba(180,214,140,.22);
+  --md-bold:               #f1fbe8;
+  --md-italic:             #d2b288;
+  --md-bolditalic:         #ecd3a8;
+  --md-bolditalic-glow:    rgba(236,211,168,.40);
+  --rp-speech:  #dbeccf;
+  --rp-action:  #a8bf9a;
+  --rp-thought: #cfe8b4;
+  --rp-whisper: #8aa27c;
+  --rp-ooc:     #76906a;
+  --rp-shout:   #ffa66e;
+  --rp-shout-glow: rgba(255,166,110,.45);
+  --rp-critical: #ff8a92;
+  --rp-critical-glow: rgba(255,138,146,.45);
+  --diff-add-bg: rgba(52,211,153,.14); --diff-add-text: #86dfae;
+  --diff-remove-bg: rgba(248,113,113,.14); --diff-remove-text: #ffa0a0;
 
-  /* Syntax — D */
-  --syn-fg: #e6dcc8;      --syn-bg: #060503;
-  --syn-comment: #857b62; --syn-keyword: #d99a3c; --syn-string: #a8c47e;
-  --syn-number: #e0b45c;  --syn-function: #93c4a6; --syn-title: #93c4a6;
-  --syn-type: #8fc48f;    --syn-variable: #d8a878; --syn-attr: #dcc07e;
-  --syn-tag: #d99a3c;     --syn-builtin: #8fc48f;  --syn-literal: #e0b45c;
-  --syn-meta: #97907c;    --syn-operator: #c8bc9e; --syn-punctuation: #b6ab8e;
-  --syn-deletion: #ff9f92; --syn-addition: #86dba0;
+  --syn-fg: #d6e8cc;      --syn-bg: #040703;
+  --syn-comment: #7f9274; --syn-keyword: #c9a57a; --syn-string: #a9d88a;
+  --syn-number: #e0c283;  --syn-function: #8fd6b4; --syn-title: #8fd6b4;
+  --syn-type: #a0d0a0;    --syn-variable: #d8bc94; --syn-attr: #c8dc94;
+  --syn-tag: #c9a57a;     --syn-builtin: #a0d0a0;  --syn-literal: #e0c283;
+  --syn-meta: #8e9c84;    --syn-operator: #cfdcc4; --syn-punctuation: #b4c4a8;
+  --syn-deletion: #ff9a95; --syn-addition: #86dfae;
 
-  /* Categorical — D */
-  --cat-1: #d68a42; --cat-2: #8fae6e; --cat-3: #e0a52e; --cat-4: #d8a0b0;
-  --cat-5: #93c4a6; --cat-6: #d8a878; --cat-7: #a8c47e; --cat-8: #e8cf9a;
-  --cat-9: #7fbfae; --cat-10: #dfc07e; --cat-11: #c9a3d8; --cat-12: #a8b8c8;
-  --chart-grid: rgba(214,138,66,.10);  /* D */
-  --chart-axis: #6e6249;               /* D */
+  --cat-1: #b4d68c; --cat-2: #c9a57a; --cat-3: #94c8e0; --cat-4: #4ade80;
+  --cat-5: #e0c283; --cat-6: #e3a4b4; --cat-7: #7fcfbf; --cat-8: #d89070;
+  --cat-9: #b088a8; --cat-10: #d0c0a0; --cat-11: #b8a8d8; --cat-12: #f2c14e;
+  --chart-grid: rgba(180,214,140,.10);
+  --chart-axis: #62745a;
 
-  --canvas-mask:    rgba(5,4,3,.78);       /* D */
-  --canvas-handle:  #d68a42;               /* D */
-  --canvas-guide:   rgba(214,138,66,.55);  /* D */
-  --canvas-outline: #f5ecd8;               /* D */
+  --canvas-mask:    rgba(0,0,0,.76);
+  --canvas-handle:  #b4d68c;
+  --canvas-guide:   rgba(180,214,140,.55);
+  --canvas-outline: #f1fbe8;
 
   --shadow-1: 0 1px 2px rgba(0,0,0,.40);
   --shadow-2: 0 6px 20px rgba(0,0,0,.50);
   --shadow-3: 0 18px 50px rgba(0,0,0,.65);
-  --shadow-4: 0 32px 80px rgba(0,0,0,.78);  /* D */
-  --shadow-glow:  0 0 0 1px rgba(214,138,66,.20), 0 8px 30px rgba(0,0,0,.6); /* D */
-  --shadow-inset: inset 0 1px 0 rgba(255,255,255,.04);  /* D */
+  --shadow-4: 0 32px 80px rgba(0,0,0,.78);
+  --shadow-glow:  0 0 0 1px rgba(180,214,140,.20), 0 8px 30px rgba(0,0,0,.6);
+  --shadow-inset: inset 0 1px 0 rgba(255,255,255,.045);
 
-  --selection-bg:    rgba(214,138,66,.30);  /* D */
-  --selection-text:  #f5ecd8;               /* D */
+  --selection-bg:    rgba(180,214,140,.28);
+  --selection-text:  #f1fbe8;
   --scrollbar-track: transparent;
-  --scrollbar-thumb: #33291d;               /* D */
-  --scrollbar-hover: #4d3d28;               /* D */
-  /* Control-boundary fill. --surface-4 is an elevation step and can never be
-     3:1 from its neighbouring surface while still reading as subtle elevation,
-     so the slider track / toggle off-track role gets its own token.
-     3.10:1 on surface-2, 3.26:1 on surface-0. */
-  --control-track: #66615a;
-
+  --scrollbar-thumb: #3a2d20;
+  --scrollbar-hover: #55432f;
+  --control-track: #6a6456;
+  --slider-color:  var(--highlight);
 }
 
 /* theme-paper.css — CORE
@@ -876,7 +896,7 @@
   --code-bg:         #2a1e10;  /* D — code blocks stay dark in every theme */
 
   --text-primary:    #2e2013;
-  --text-secondary:  #5a4429;
+  --text-secondary:  #4a3722;  /* core fix 2026-09-25, was #5a4429 */
   --text-tertiary:   #4f3e26;  /* D — see report: extracted --text-muted
                                   (#5b472b) duplicated --text-secondary */
   --text-disabled:   #69573d;  /* D */
@@ -919,13 +939,13 @@
   --glass-stroke-strong: rgba(46,32,19,.24);  /* D */
 
   --success: #34d399; --success-hover: #5fe0b0;
-  --success-subtle: #d1ddb3; --success-text: #13643e;
+  --success-subtle: #d1ddb3; --success-text: #0e4a2e;  /* core fix 2026-09-25, was #13643e */
   --success-border: rgba(19,100,62,.34);
   --warning: #fbbf24; --warning-hover: #fcd34d;
-  --warning-subtle: #f1daa0; --warning-text: #7a4f00;
+  --warning-subtle: #f1daa0; --warning-text: #5a3a00;  /* core fix 2026-09-25, was #7a4f00 */
   --warning-border: rgba(122,79,0,.34);
   --danger: #f87171; --danger-hover: #fca5a5;
-  --danger-subtle: #f1c4a6; --danger-text: #aa211c;
+  --danger-subtle: #f1c4a6; --danger-text: #8a1a15;  /* core fix 2026-09-25, was #aa211c */
   --danger-border: rgba(170,33,28,.34);
   --info: #2b3a66; --info-hover: #3a4d84;
   --info-subtle: #d0c5ab; --info-text: #2b3a66;

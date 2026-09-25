@@ -8,6 +8,8 @@
     "family groups a dark/light pair for apps that offer a dark/light switch (laserlloyd <-> laserlloyd-light).",
     "set is core (shipped by default) or opt-in (only where an app manifest names it).",
     "contrastProfile (optional) names the floor set tools/check_contrast.py applies: standard (the brief's table, the default) or night (red-on-black night themes, where text gains luminance only by moving toward orange: the text floors become primary 5.5, secondary 4.5, tertiary 4, disabled 2 and md-bold 6; structure, text-ladder and colour-separation checks are added, APCA is reported, and a zero-blue audit runs).",
+    "redesign (optional, core themes only) records an owner-approved redesign: the theme's values no longer come from design/output, so sync_theme.py's core drift guard skips it. Forest was redesigned on 2026-09-25.",
+    "coreFixes (optional, core themes only) lists approved token fixes, one object per round (date, tokens as token -> value, review, note). The core theme file may differ from design/output only in those tokens (and comments), and must hold exactly the recorded values; sync_theme.py's drift guard checks both. Purple's file is theme-base.css.",
     "swatch is the picker dot colour from the specimen board. fonts are web-font families the theme names first in its stacks; every stack falls back to system fonts, so none of them has to be installed."
   ],
   "themes": [
@@ -25,7 +27,21 @@
         "JetBrains Mono"
       ],
       "css": null,
-      "tokens": "base.json"
+      "tokens": "base.json",
+      "coreFixes": [
+        {
+          "date": "2026-09-25",
+          "tokens": {
+            "--text-secondary": "#a0a0bd",
+            "--rp-action": "#a0a0bd",
+            "--accent-hover": "#8250f0",
+            "--cta-hover": "#8250f0",
+            "--border-strong": "#6f6f9c"
+          },
+          "review": "reports/review-2026-09-25-themes.md",
+          "note": "The waiting fixes from design/output/contrast-report.md; --rp-action follows --text-secondary and --cta-hover follows --accent-hover."
+        }
+      ]
     },
     {
       "slug": "midnight-gold",
@@ -57,23 +73,39 @@
         "JetBrains Mono"
       ],
       "css": "theme-glacier.css",
-      "tokens": "glacier.json"
+      "tokens": "glacier.json",
+      "coreFixes": [
+        {
+          "date": "2026-09-25",
+          "tokens": {
+            "--slider-color": "var(--highlight)"
+          },
+          "review": "reports/review-2026-09-25-themes.md",
+          "note": "Slider fill in the ice highlight: the accent fill was darker than the empty track."
+        }
+      ]
     },
     {
       "slug": "forest",
       "name": "Forest",
       "family": "forest",
-      "ground": "dark",
+      "ground": "oled",
       "colorScheme": "dark",
-      "themeColor": "#0a0806",
+      "themeColor": "#000000",
       "set": "core",
-      "swatch": "#d68a42",
+      "swatch": "#b4d68c",
       "fonts": [
         "Inter",
         "JetBrains Mono"
       ],
       "css": "theme-forest.css",
-      "tokens": "forest.json"
+      "tokens": "forest.json",
+      "redesign": {
+        "date": "2026-09-25",
+        "by": "owner request",
+        "note": "Earthy moss theme built like Glacier (pale green and browns); diverges from design/output/theme-forest.css on purpose.",
+        "review": "reports/review-2026-09-25-themes.md"
+      }
     },
     {
       "slug": "paper",
@@ -89,7 +121,20 @@
         "JetBrains Mono"
       ],
       "css": "theme-paper.css",
-      "tokens": "paper.json"
+      "tokens": "paper.json",
+      "coreFixes": [
+        {
+          "date": "2026-09-25",
+          "tokens": {
+            "--text-secondary": "#4a3722",
+            "--success-text": "#0e4a2e",
+            "--warning-text": "#5a3a00",
+            "--danger-text": "#8a1a15"
+          },
+          "review": "reports/review-2026-09-25-themes.md",
+          "note": "The waiting fixes from design/output/contrast-report.md; one --danger-text value clears both of its rows."
+        }
+      ]
     },
     {
       "slug": "daylight",

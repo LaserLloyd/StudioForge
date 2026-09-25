@@ -2,7 +2,7 @@
    the same in every app. Do not edit this copy: change the package's src/
    or adapters/, run `python tools/sync_theme.py build`, then copy ui-theme/
    into each app (or run `python tools/sync_theme.py install`).
-   body sha256: 3f9120b043232aef */
+   body sha256: 839cb87992a55603 */
 /* ==========================================================================
    C. THEME-AGNOSTIC LAYER
    ========================================================================== */
@@ -250,8 +250,10 @@ input[type="range"], input[type="checkbox"], input[type="radio"], progress {
   font-family: var(--font-mono);
   font-size: var(--fs-xs);
   line-height: 1.6;
-  color: var(--text-primary);
-  background: var(--code-bg);
+  /* Code stays dark in every theme, so it takes the syntax pair, never
+     --text-primary (ink on the light themes). */
+  color: var(--syn-fg);
+  background: var(--syn-bg);
   border: 1px solid var(--glass-stroke);
   border-radius: var(--radius-md);
   padding: 12px 14px;
