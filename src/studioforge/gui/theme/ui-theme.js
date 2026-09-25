@@ -2,7 +2,7 @@
    the same in every app. Do not edit this copy: change the package's src/
    or adapters/, run `python tools/sync_theme.py build`, then copy ui-theme/
    into each app (or run `python tools/sync_theme.py install`).
-   body sha256: 018b1ece2c80a3ec */
+   body sha256: a1c1e30271750777 */
 /* ============================================================================
    ui-theme.js — portable theme runtime · unifyingTheme V26-09-16
    ----------------------------------------------------------------------------
@@ -51,7 +51,7 @@
     {"slug": "purple", "name": "Purple", "family": "purple", "ground": "dark", "colorScheme": "dark", "themeColor": "#0e0e1b", "set": "core", "swatch": "#7c3aed", "fonts": ["Inter", "JetBrains Mono"]},
     {"slug": "midnight-gold", "name": "Midnight Gold", "family": "midnight-gold", "ground": "oled", "colorScheme": "dark", "themeColor": "#000000", "set": "core", "swatch": "#e3bf5a", "fonts": ["Inter", "JetBrains Mono"]},
     {"slug": "glacier", "name": "Glacier", "family": "glacier", "ground": "oled", "colorScheme": "dark", "themeColor": "#000000", "set": "core", "swatch": "#7fe0f2", "fonts": ["Inter", "JetBrains Mono"]},
-    {"slug": "forest", "name": "Forest", "family": "forest", "ground": "oled", "colorScheme": "dark", "themeColor": "#000000", "set": "core", "swatch": "#b4d68c", "fonts": ["Inter", "JetBrains Mono"]},
+    {"slug": "forest", "name": "Forest", "family": "forest", "ground": "oled", "colorScheme": "dark", "themeColor": "#000000", "set": "core", "swatch": "#b5d59b", "fonts": ["Inter", "JetBrains Mono"]},
     {"slug": "paper", "name": "Paper", "family": "paper", "ground": "light", "colorScheme": "light", "themeColor": "#e6d2a8", "set": "core", "swatch": "#a3241c", "fonts": ["Inter", "JetBrains Mono"]},
     {"slug": "daylight", "name": "Daylight", "family": "daylight", "ground": "light", "colorScheme": "light", "themeColor": "#ffffff", "set": "core", "swatch": "#2c56c9", "fonts": ["Inter", "JetBrains Mono"]},
     {"slug": "electric-yellow", "name": "Electric Yellow", "family": "electric-yellow", "ground": "dark", "colorScheme": "dark", "themeColor": "#0a0a0b", "set": "opt-in", "swatch": "#e8ff00", "fonts": ["Archivo", "JetBrains Mono"]},

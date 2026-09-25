@@ -93,7 +93,7 @@
       "colorScheme": "dark",
       "themeColor": "#000000",
       "set": "core",
-      "swatch": "#b4d68c",
+      "swatch": "#b5d59b",
       "fonts": [
         "Inter",
         "JetBrains Mono"
@@ -103,7 +103,7 @@
       "redesign": {
         "date": "2026-09-25",
         "by": "owner request",
-        "note": "Earthy moss theme built like Glacier (pale green and browns); diverges from design/output/theme-forest.css on purpose.",
+        "note": "Earthy moss theme built like Glacier (pale green and browns); diverges from design/output/theme-forest.css on purpose. Revision 2 the same day: calmer (chroma toward Glacier's) and true black on every large surface for OLED.",
         "review": "reports/review-2026-09-25-themes.md"
       }
     },
