@@ -24,10 +24,16 @@ things the server cannot do well:
 from __future__ import annotations
 
 CHAT_CSS = """
-.sfc-wrap { position: relative; width: 100%; }
+/* The tab fills the viewport below the tab strip (the script sets --sfc-h),
+   and the conversation window takes whatever that leaves. min-height, not
+   height: an open Details or Request settings grows the page instead of
+   crushing the window below its floor. */
+.sfc-root { min-height: var(--sfc-h, calc(100dvh - 9rem)); flex-wrap: nowrap; }
+.sfc-root > .sfc-none { flex: none; }
+.sfc-wrap { position: relative; width: 100%; flex: 1 1 auto; min-height: 16rem; }
 .sfc-window {
-  height: calc(100vh - 22rem);
-  min-height: 18rem;
+  position: absolute;
+  inset: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
   display: flex;
@@ -151,6 +157,20 @@ CHAT_CSS = """
   border-left: 2px solid var(--border);
 }
 .sfc-error { color: var(--danger-text); white-space: pre-wrap; font-size: var(--fs-sm); }
+
+.sfc-ctx { font: var(--fs-xs)/1.3 var(--font-mono); white-space: nowrap; overflow: hidden;
+  text-overflow: ellipsis; min-width: 0; }
+.sfc-ctx-unknown, .sfc-ctx-ok { color: var(--text-tertiary); }
+.sfc-ctx-warn { color: var(--warning-text); }
+.sfc-ctx-full { color: var(--danger-text); font-weight: var(--fw-semibold); }
+
+.sfc-settings .q-expansion-item__content { padding-top: .25rem; }
+.sfc-sampler-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(9.5rem, 1fr));
+  gap: .5rem;
+  align-items: start;
+}
 .sfc-composer textarea { max-height: 16rem; max-height: 12lh; }  /* Quasar autogrow honours it */
 .sfc-editor textarea { max-height: 24rem; }
 """
@@ -313,8 +333,27 @@ CHAT_JS = r"""
     copyText(clone.textContent.replace(/\n$/, ''));
   });
 
+  // Size the tab's column to the viewport below where it starts, so the model
+  // line, the conversation window and the composer fit without a page scroll
+  // and the window (flex: 1) takes the rest. Re-run when the tab is shown and
+  // on resize (the fixed header wraps on a phone, moving where the tab starts).
+  function fit() {
+    document.querySelectorAll('.sfc-root').forEach((root) => {
+      if (!root.offsetParent) return;  // tab not shown
+      let pad = parseFloat(getComputedStyle(root).marginBottom) || 0;
+      for (let el = root.parentElement; el && el !== document.body; el = el.parentElement) {
+        const cs = getComputedStyle(el);
+        pad += (parseFloat(cs.paddingBottom) || 0) + (parseFloat(cs.borderBottomWidth) || 0);
+      }
+      const top = root.getBoundingClientRect().top + window.scrollY;
+      const height = Math.floor(window.innerHeight - top - pad);
+      root.style.setProperty('--sfc-h', Math.max(0, height) + 'px');
+    });
+  }
+
   const observer = new MutationObserver((mutations) => {
     const windows = new Set();
+    let shown = false;
     for (const m of mutations) {
       const node = m.target.nodeType === 1 ? m.target : m.target.parentElement;
       const win = node && node.closest ? node.closest('.sfc-window') : null;
@@ -323,17 +362,36 @@ CHAT_JS = r"""
         if (added.nodeType !== 1) continue;
         if (added.matches('.sfc-window')) windows.add(added);
         else added.querySelectorAll('.sfc-window').forEach((w) => windows.add(w));
+        if (added.matches('.sfc-root') || added.querySelector('.sfc-root')) shown = true;
       }
     }
+    if (shown) { fit(); setTimeout(fit, 350); }  // tab panels animate in
     windows.forEach(follow);
+  });
+
+  // Files picked with the paperclip travel exactly like a pasted image.
+  document.addEventListener('change', (event) => {
+    const input = event.target;
+    if (!input || !input.classList || !input.classList.contains('sfc-file')) return;
+    for (const file of Array.from(input.files || [])) {
+      if (!(file.type || '').startsWith('image/')) continue;
+      const reader = new FileReader();
+      reader.onload = () => emitEvent('sf_paste_image', { data: reader.result, name: file.name });
+      reader.readAsDataURL(file);
+    }
+    input.value = '';
   });
 
   function start() {
     observer.observe(document.body, { childList: true, subtree: true, characterData: true });
     document.querySelectorAll('.sfc-window').forEach(follow);
+    fit();
+    setTimeout(fit, 300);  // after web fonts settle the header's height
   }
   if (document.body) start(); else document.addEventListener('DOMContentLoaded', start);
+  window.addEventListener('resize', fit);
+  window.addEventListener('load', fit);
 
-  window.sfChat = { copyText, copyHtml, bottom };
+  window.sfChat = { copyText, copyHtml, bottom, fit };
 })();
 """

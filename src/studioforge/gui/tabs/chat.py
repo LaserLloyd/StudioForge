@@ -23,7 +23,6 @@ HTML), never ``ui.markdown``, which would pass a reply's raw HTML through.
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import time
 from collections.abc import Callable
@@ -97,6 +96,28 @@ _EMPTY_HINT = (
 
 _STOP_FIRST = "Stop the reply first."
 
+_CTX_LEVEL_CLASSES = ("sfc-ctx-unknown", "sfc-ctx-ok", "sfc-ctx-warn", "sfc-ctx-full")
+
+
+class ChatRequestError(RuntimeError):
+    """The engine refused or failed a chat request; ``str()`` is the readable line.
+
+    ``context_full`` marks the "prompt does not fit the slot" refusal, whose
+    message already says what to do (Clear, delete older messages, reload).
+    """
+
+    def __init__(self, message: str, *, context_full: bool = False) -> None:
+        super().__init__(message)
+        self.context_full = context_full
+
+
+def _request_error(
+    status_code: int | None, body: Any, *, n_ctx: int | None, model_id: str
+) -> ChatRequestError:
+    full = st.context_overflow(status_code, body, n_ctx=n_ctx, model_id=model_id) is not None
+    text = st.chat_error_text(status_code, body, n_ctx=n_ctx, model_id=model_id)
+    return ChatRequestError(text, context_full=full)
+
 
 def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one flow
     images: list[dict[str, str]] = []
@@ -110,6 +131,8 @@ def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one fl
     #: Last painted picker options and card signature, so a poll that changes
     #: nothing sends nothing to the browser (and never closes an open dropdown).
     view: dict[str, Any] = {"options": None, "card": None, "actions": None}
+    #: The per-conversation context window each reply was served with.
+    limits: dict[str, int | None] = {}
     unloadable = _unloadable_check(ctx)
 
     ui.add_head_html(_PASTE_SCRIPT)
@@ -122,9 +145,12 @@ def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one fl
     def instances_now() -> list[Any]:
         return list(ctx.supervisor.list()) if ctx.supervisor is not None else []
 
-    with ui.column().classes("w-full gap-3 p-2"):
-        # --- what are we talking to? ---------------------------------------
-        with ui.card().classes("w-full gap-2"):
+    # The tab is one flex column sized to the viewport (see ``fit`` in
+    # chat_assets): model line, conversation window, composer all on screen,
+    # the window taking whatever height is left.
+    with ui.column().classes("w-full gap-2 sfc-root"):
+        # --- what are we talking to? (one line; the rest behind Details) ------
+        with ui.card().classes("w-full gap-1 py-2 px-3 sfc-none"):
             with ui.row().classes("w-full items-center gap-2 flex-wrap"):
                 model = ui.select(
                     {st.LOADED_MODEL_CHOICE: st.LOADED_MODEL_LABEL},
@@ -137,23 +163,35 @@ def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one fl
                 # edited "(Loaded model) — <id>" in place instead of filtering.
                 # Selecting the text on focus makes the first keystroke replace it.
                 model.on("focus", js_handler=_SELECT_ALL_ON_FOCUS)
-                load_button = ui.button("Load", icon="play_arrow").props("outline no-caps")
+                status_badge = ui.badge("", color="grey").classes("text-xs")
+                load_button = ui.button("Load", icon="play_arrow").props("outline dense no-caps")
                 with load_button:
                     load_tip = ui.tooltip("")
-                unload_button = ui.button("Unload", icon="stop_circle").props("flat no-caps")
-            with ui.row().classes("w-full items-center gap-2 flex-wrap"):
-                status_badge = ui.badge("", color="grey").classes("text-xs")
-                target_name = ui.label("").classes("text-sm font-mono break-all")
-            reason_label = ui.label("").classes("text-xs opacity-70")
-            facts_row = ui.row().classes("w-full gap-x-6 gap-y-2 flex-wrap")
+                unload_button = ui.button("Unload", icon="stop_circle").props("flat dense no-caps")
+                details_button = ui.button(
+                    "Details", icon="expand_more", on_click=lambda: toggle_details()
+                ).props("flat dense no-caps")
+                details_button.tooltip("Where and how the model runs")
+            # Warnings stay out of the fold: they are why a Load is disabled.
             warn_label = ui.label("").classes("text-xs text-warning whitespace-pre-wrap")
-            others_label = ui.label("").classes("text-xs opacity-70")
-            hidden_label = ui.label("").classes("text-xs opacity-60")
+            details = ui.column().classes("w-full gap-1")
+            details.set_visibility(False)
+            with details:
+                with ui.row().classes("w-full items-center gap-2 flex-wrap"):
+                    target_name = ui.label("").classes("text-sm font-mono break-all")
+                    reason_label = ui.label("").classes("text-xs opacity-70")
+                facts_row = ui.row().classes("w-full gap-x-6 gap-y-2 flex-wrap")
+                others_label = ui.label("").classes("text-xs opacity-70")
+                hidden_label = ui.label("").classes("text-xs opacity-60")
 
         # --- the conversation ----------------------------------------------
-        with ui.row().classes("w-full items-center gap-2 no-wrap"):
+        with ui.row().classes("w-full items-center gap-2 no-wrap sfc-none"):
             ui.label("Conversation").classes("text-sm font-medium")
             count_label = ui.label("").classes("text-xs opacity-60 whitespace-nowrap")
+            ctx_label = ui.label("").classes("sfc-ctx sfc-ctx-unknown")
+            with ctx_label:
+                ctx_tip = ui.tooltip("")
+            ctx_label.set_visibility(False)
             ui.space()
             copy_all_button = ui.button(
                 "Copy all", icon="content_copy", on_click=lambda: copy_all()
@@ -169,41 +207,41 @@ def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one fl
             ).classes("sfc-latest").on("click", js_handler="() => window.sfChat.bottom()")
 
         # --- composer ------------------------------------------------------
-        with ui.row().classes("w-full items-center gap-2 flex-wrap"):
-            ui.label("Quick tests").classes("text-xs opacity-70")
-            quick_buttons: list[Any] = []
-            for test in st.CHAT_QUICK_TESTS:
-                button = ui.button(
-                    test.label,
-                    on_click=lambda _event=None, key=test.key: send_quick(key),
-                ).props("outline dense no-caps")
-                button.tooltip(test.tooltip)
-                quick_buttons.append(button)
-        with ui.row().classes("w-full items-end gap-2 flex-wrap"):
+        thumbs = ui.row().classes("gap-2 flex-wrap sfc-none")
+        with ui.row().classes("w-full items-end gap-2 flex-wrap sfc-none"):
+            # A hidden file input read in the browser and handed over through
+            # the same event as a paste, so attaching costs no row of its own.
+            file_input = ui.element("input").props('type=file accept="image/*" multiple')
+            file_input.classes("sfc-file hidden")
+            attach_button = ui.button(icon="attach_file").props("flat dense round")
+            attach_button.on(
+                "click",
+                js_handler=f"() => document.getElementById('{file_input.html_id}').click()",
+            )
+            attach_button.tooltip("Attach an image (or paste one anywhere on the page)")
             prompt = ui.textarea(
                 placeholder="Message… (Enter to send, Shift+Enter for a new line, "
                 "↑ to edit your last message)"
             )
             prompt.props("dense outlined autogrow").classes("grow min-w-[14rem] sfc-composer")
-            send_button = ui.button("Send", icon="send").props("color=primary no-caps")
-            stop_button = ui.button("Stop", icon="stop").props("flat no-caps")
-            stop_button.tooltip("Stop the reply (Esc)")
-        with ui.row().classes("w-full items-center gap-2 flex-wrap"):
-            upload = (
-                ui.upload(
-                    label="Attach image",
-                    auto_upload=True,
-                    multiple=True,
-                    max_file_size=MAX_IMAGE_BYTES,
-                )
-                .props('flat dense accept="image/*"')
-                .classes("max-w-[14rem]")
-            )
-            attach_note = ui.label("").classes("text-xs opacity-70")
-        thumbs = ui.row().classes("gap-2 flex-wrap")
+            with ui.row().classes("items-center gap-1 no-wrap"):
+                quick_button = ui.button(icon="bolt").props("flat dense round")
+                quick_button.tooltip("Quick tests")
+                with quick_button, ui.menu():
+                    for test in st.CHAT_QUICK_TESTS:
+                        item = ui.menu_item(
+                            test.label,
+                            on_click=lambda _event=None, key=test.key: send_quick(key),
+                        )
+                        item.tooltip(test.tooltip)
+                send_button = ui.button("Send", icon="send").props("color=primary no-caps")
+                stop_button = ui.button("Stop", icon="stop").props("flat no-caps")
+                stop_button.tooltip("Stop the reply (Esc)")
 
         with (
-            ui.expansion("Request settings", icon="tune").classes("w-full"),
+            ui.expansion("Request settings", icon="tune")
+            .props("dense")
+            .classes("w-full sfc-none sfc-settings"),
             ui.column().classes("w-full gap-2"),
         ):
             system = (
@@ -211,20 +249,37 @@ def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one fl
                 .props("dense outlined autogrow")
                 .classes("w-full")
             )
+            sampler_inputs: dict[str, Any] = {}
+            with ui.element("div").classes("w-full sfc-sampler-grid"):
+                for spec in st.CHAT_SAMPLER_FIELDS:
+                    field: Any
+                    if spec.kind == "text":
+                        field = ui.textarea(spec.label).props("dense outlined autogrow")
+                    else:
+                        field = ui.number(
+                            spec.label,
+                            value=spec.default if isinstance(spec.default, int | float) else None,
+                            step=spec.step,
+                            min=spec.minimum,
+                            max=spec.maximum,
+                        )
+                        field.props("dense outlined clearable")
+                    field.props("stack-label").tooltip(spec.tooltip)
+                    sampler_inputs[spec.key] = field
+                thinking = ui.select(
+                    dict(st.CHAT_THINKING_CHOICES), value="auto", label="Thinking"
+                ).props("dense outlined options-dense")
+                thinking.tooltip(st.CHAT_THINKING_TOOLTIP)
+                thinking.set_visibility(False)
             with ui.row().classes("w-full items-center gap-3 flex-wrap"):
-                temperature = ui.number("temperature", value=0.7, precision=2, step=0.05)
-                temperature.props("dense outlined").classes("w-32")
-                top_p = ui.number("top_p", value=0.95, precision=2, step=0.05)
-                top_p.props("dense outlined").classes("w-32")
-                max_tokens = ui.number("max_tokens", value=2048, precision=0)
-                max_tokens.props("dense outlined").classes("w-32")
                 keep_history = ui.switch("Send the conversation so far", value=True)
                 keep_history.props("dense")
-            ui.label(
-                "Requests go straight to the model's own llama-server at the chat tier "
-                "(1), exactly as a client's would after the gateway. Turn the "
-                "conversation off to measure each prompt on its own."
-            ).classes("text-xs opacity-60")
+                ui.label(
+                    "Blank = the model's own recommendation (greyed out), then the "
+                    "engine's default. Requests go straight to the model's own "
+                    "llama-server at the chat tier (1), exactly as a client's would "
+                    "after the gateway."
+                ).classes("text-xs opacity-60")
 
     def show_empty_hint() -> None:
         with window:
@@ -329,6 +384,42 @@ def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one fl
             count_label.set_text(f"· {count} message{'' if count == 1 else 's'}" if count else "")
             clear_button.set_enabled(not active and count > 0)
             copy_all_button.set_enabled(count > 0)
+        refresh_context()
+
+    def sampler_values() -> dict[str, Any]:
+        return {key: field.value for key, field in sampler_inputs.items()}
+
+    def refresh_context() -> None:
+        """The header's context readout, from the latest answered reply."""
+        latest = next(
+            (
+                m
+                for m in reversed(conversation.messages)
+                if m.role == "assistant" and not m.failed and m.metrics is not None
+            ),
+            None,
+        )
+        usage = None
+        if latest is not None:
+            max_tokens = st.build_sampler_payload(sampler_values()).get("max_tokens")
+            usage = st.chat_context_usage(
+                latest.metrics, limits.get(latest.id), max_tokens=max_tokens
+            )
+        painted = (usage.text, usage.level, usage.tooltip) if usage is not None else None
+        if painted == view.get("ctx"):
+            return
+        view["ctx"] = painted
+        ctx_label.set_visibility(usage is not None)
+        if usage is None:
+            return
+        ctx_label.set_text(usage.text)
+        ctx_label.classes(remove=" ".join(_CTX_LEVEL_CLASSES), add=f"sfc-ctx-{usage.level}")
+        ctx_tip.set_text(usage.tooltip)
+
+    def toggle_details() -> None:
+        opened = not details.visible
+        details.set_visibility(opened)
+        details_button.props(f"icon={'expand_less' if opened else 'expand_more'}")
 
     # --- thinking fold ----------------------------------------------------------
 
@@ -457,7 +548,28 @@ def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one fl
         hidden_label.set_text(hidden)
         hidden_label.set_visibility(bool(hidden))
 
+        sync_settings(record, records)
         sync_controls(pick, record, why_not)
+
+    def sync_settings(record: Any, records: list[Any]) -> None:
+        """Placeholders say what a blank setting will be for *this* model."""
+        base = None
+        if record is not None and record.is_virtual and record.base_model_id:
+            base = next((r for r in records if r.id == record.base_model_id), None)
+        recommended = st.recommended_sampling(record, base=base)
+        signature = (
+            tuple(sorted(recommended.items())),
+            st.thinking_toggle_supported(record),
+        )
+        if signature == view.get("settings"):
+            return
+        view["settings"] = signature
+        for spec in st.CHAT_SAMPLER_FIELDS:
+            text = st.sampler_placeholder(spec, recommended).replace('"', "'")
+            sampler_inputs[spec.key].props(f'placeholder="{text}"')
+        thinking.set_visibility(signature[1])
+        if not signature[1]:
+            thinking.set_value("auto")
 
     def sync_controls(pick: Any, record: Any, why_not: str | None) -> None:
         active = bool(run["active"])
@@ -478,7 +590,7 @@ def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one fl
             unload_button.disable()
         else:
             unload_button.enable()
-        for control in (send_button, *quick_buttons):
+        for control in (send_button, quick_button):
             if can_target and not active:
                 control.enable()
             else:
@@ -493,18 +605,13 @@ def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one fl
     # --- image attachment ------------------------------------------------------
 
     def sync_attach_state(record: Any) -> None:
-        reason = st.vision_attach_reason(record)
-        if reason:
-            upload.set_visibility(False)
-            attach_note.set_text(
-                "Images: this model has no vision projector." if record is not None else ""
-            )
-            if images:
-                images.clear()
-                _render_thumbs(thumbs, images)
-        else:
-            upload.set_visibility(True)
-            attach_note.set_text("Vision model: attach a file or paste an image into the page.")
+        vision = st.vision_attach_reason(record) is None
+        if vision != view.get("vision"):
+            view["vision"] = vision
+            attach_button.set_visibility(vision)
+        if not vision and images:
+            images.clear()
+            _render_thumbs(thumbs, images)
 
     def target_record() -> Any:
         pick = pick_now()
@@ -519,15 +626,6 @@ def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one fl
             return
         images.append({"name": name, "url": data_url})
         _render_thumbs(thumbs, images)
-
-    def on_upload(event: Any) -> None:
-        content = event.content.read()
-        mime = getattr(event, "type", None) or "image/png"
-        encoded = base64.b64encode(content).decode("ascii")
-        add_image(f"data:{mime};base64,{encoded}", getattr(event, "name", "upload"))
-        upload.reset()
-
-    upload.on_upload(on_upload)
 
     def on_paste(event: Any) -> None:
         payload = event.args
@@ -598,8 +696,8 @@ def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one fl
 
     # --- sending ---------------------------------------------------------------
 
-    def resolve_target() -> tuple[str, bool] | None:
-        """The model the next reply goes to, and whether it is already loaded."""
+    def resolve_target() -> tuple[str, bool, Any] | None:
+        """The model the next reply goes to, whether it is loaded, and its record."""
         records = records_now()
         instances = instances_now()
         pick = pick_now(records, instances)
@@ -608,7 +706,7 @@ def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one fl
             return None
         record = next((r for r in records if r.id == pick.model_id), None)
         was_ready = record is not None and st.chat_model_state(record, instances) == "ready"
-        return pick.model_id, was_ready
+        return pick.model_id, was_ready, record
 
     async def send(text: str | None = None, display: str | None = None) -> None:
         if run["active"]:
@@ -631,7 +729,7 @@ def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one fl
         _render_thumbs(thumbs, images)
         await reply_to(user.id, target)
 
-    async def reply_to(user_id: str, target: tuple[str, bool] | None = None) -> None:
+    async def reply_to(user_id: str, target: tuple[str, bool, Any] | None = None) -> None:
         """Stream a fresh reply to the user turn ``user_id`` into a new block."""
         # Regenerate / "Save & resend" arrive from a button inside a block they
         # just deleted; NiceGUI resolves notify/run_javascript through the
@@ -639,12 +737,12 @@ def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one fl
         with window:
             await _reply_to(user_id, target)
 
-    async def _reply_to(user_id: str, target: tuple[str, bool] | None) -> None:
+    async def _reply_to(user_id: str, target: tuple[str, bool, Any] | None) -> None:
         target = target or resolve_target()
         if target is None:
             refresh_actions()
             return
-        model_id, was_ready = target
+        model_id, was_ready, record = target
         system_text = str(system.value or "").strip()
         messages = conversation.request_messages(
             system=system_text or None, keep_history=bool(keep_history.value), upto=user_id
@@ -659,12 +757,18 @@ def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one fl
             "stream": True,
             # usage + llama-server's own timings ride on the final chunk.
             "stream_options": {"include_usage": True},
-            # number_value, not ``or``: an explicit 0 (greedy temperature) must
-            # be sent as 0, never silently replaced with the default.
-            "temperature": st.number_value(temperature.value, 0.7),
-            "top_p": st.number_value(top_p.value, 0.95),
-            "max_tokens": int(st.number_value(max_tokens.value, 2048)),
+            # prompt_progress frames: a prefill readout, and bytes on the wire
+            # during a long prefill.
+            "return_progress": True,
         }
+        # Blank settings are left out so the model's recommendation applies; an
+        # explicit 0 (greedy temperature) is sent as 0.
+        payload.update(st.build_sampler_payload({**sampler_values(), "thinking": thinking.value}))
+        # The gateway folds a persona preset in; this tab talks to the child
+        # directly, so it must do the same or a persona would chat as its base.
+        preset = getattr(record, "preset", None)
+        if preset is not None:
+            preset.apply_to_payload(payload, chat=True)
 
         def status(text: str) -> None:
             if element_alive(block.status):
@@ -691,6 +795,8 @@ def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one fl
                     ticker.cancel()
             if not was_ready:
                 load_s = time.perf_counter() - clicked_at
+            limit = st.chat_context_limit(instance)
+            limits[reply.id] = limit
             serving_id = instance.model_id
             base = ctx.supervisor.base_url(serving_id)
             if base is None:
@@ -698,15 +804,26 @@ def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one fl
                 return
             payload["model"] = serving_id
             status("waiting for the first token…")
-            result = await _stream(
-                ctx,
-                serving_id,
-                base,
-                payload,
-                paint_reply(block, reply),
-                run,
-                on_first=lambda: status("streaming…"),
+            # A task, so Stop can cancel it even while the engine is still
+            # reading the prompt and nothing arrives to check the flag against.
+            task = asyncio.create_task(
+                _stream(
+                    ctx,
+                    serving_id,
+                    base,
+                    payload,
+                    paint_reply(block, reply),
+                    run,
+                    on_first=lambda: status("streaming…"),
+                    on_progress=status,
+                    n_ctx=limit,
+                )
             )
+            run["task"] = task
+            try:
+                result = await task
+            finally:
+                run.pop("task", None)
             metrics = st.chat_run_metrics(
                 clicked_at=clicked_at,
                 sent_at=result.sent_at,
@@ -725,6 +842,8 @@ def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one fl
             status(reply.status)
             if block.metrics is not None and element_alive(block.metrics):
                 _render_metrics(block.metrics, metrics)
+        except ChatRequestError as exc:
+            fail(reply, block, "context full" if exc.context_full else "failed", exc)
         except Exception as exc:  # noqa: BLE001
             fail(reply, block, "failed", exc)
             notify_error(exc, what="chat")
@@ -742,7 +861,10 @@ def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one fl
             return
         block.status.set_text(what)
         block.root.classes(add="sfc-failed")
-        block.error.set_text(f"[{what}: {exc}]")
+        # The engine's refusal is already a plain sentence (with what to do
+        # about a full context); anything else keeps the "[what: detail]" form.
+        text = str(exc) if isinstance(exc, ChatRequestError) else f"[{what}: {exc}]"
+        block.error.set_text(text)
         block.error.set_visibility(True)
 
     async def send_quick(key: str) -> None:
@@ -752,6 +874,9 @@ def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one fl
     def request_stop() -> None:
         if run["active"]:
             run["stop"] = True
+            task = run.get("task")
+            if task is not None and not task.done():
+                task.cancel()
 
     # --- per-message actions -----------------------------------------------------
 
@@ -1026,6 +1151,8 @@ async def _stream(
     run: dict[str, Any],
     *,
     on_first: Callable[[], None] | None = None,
+    on_progress: Callable[[str], None] | None = None,
+    n_ctx: int | None = None,
 ) -> SimpleNamespace:
     """Stream a completion from the model's own llama-server child.
 
@@ -1036,6 +1163,14 @@ async def _stream(
     ``paint(content, reasoning, final)`` is called at most every
     ``_REPAINT_S`` while tokens arrive and exactly once more, with
     ``final=True``, when the stream ends for any reason (done, stopped, failed).
+
+    Stop is honoured two ways: the ``run["stop"]`` flag, checked per frame, and
+    a cancel of the task running this coroutine -- the only thing that reaches a
+    request still in prefill. A cancel that follows a Stop ends the reply as
+    stopped, partial text kept; any other cancel propagates. Engine refusals
+    (an HTTP error, or a ``data: {"error": ...}`` frame after the 200) raise
+    :class:`ChatRequestError` with a readable line; ``n_ctx`` lets a context
+    overflow name the window when the engine does not.
     """
     result = SimpleNamespace(
         content="",
@@ -1065,7 +1200,9 @@ async def _stream(
             ) as response:
                 if response.status_code >= 400:
                     body = (await response.aread()).decode("utf-8", "replace")
-                    raise RuntimeError(f"HTTP {response.status_code}: {body[:600]}")
+                    raise _request_error(
+                        response.status_code, body, n_ctx=n_ctx, model_id=serving_id
+                    )
                 async for line in response.aiter_lines():
                     if run.get("stop"):
                         result.stopped = True
@@ -1073,6 +1210,11 @@ async def _stream(
                     data = _parse_sse(line)
                     if data is None:
                         continue
+                    if st.stream_error(data):
+                        raise _request_error(None, data, n_ctx=n_ctx, model_id=serving_id)
+                    progress = st.prefill_progress(data)
+                    if progress is not None and on_progress is not None:
+                        on_progress(progress.text)
                     if isinstance(data.get("usage"), dict):
                         result.usage = data["usage"]
                     if isinstance(data.get("timings"), dict):
@@ -1102,6 +1244,14 @@ async def _stream(
                     if now - painted_at >= _REPAINT_S:
                         painted_at = now
                         paint("".join(content), "".join(reasoning), False)
+    except asyncio.CancelledError:
+        if not run.get("stop"):
+            raise
+        # Our own Stop: finish as a normal stopped reply.
+        task = asyncio.current_task()
+        if task is not None:
+            task.uncancel()
+        result.stopped = True
     finally:
         result.content = "".join(content)
         result.reasoning = "".join(reasoning)

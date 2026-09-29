@@ -6,6 +6,7 @@ runs without NiceGUI, a GPU or a model.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import re
@@ -774,3 +775,193 @@ def test_chat_css_uses_theme_tokens_not_colour_literals() -> None:
     assert not re.search(r"#[0-9a-fA-F]{3,8}\b", css)
     assert not re.search(r"\b(rgb|rgba|hsl|hsla)\(", css)
     assert "var(--accent)" in css
+
+
+# ---------------------------------------------------------------------------
+# Round 2: request settings, engine errors, prefill progress, Stop in prefill
+# ---------------------------------------------------------------------------
+
+
+def test_the_tab_builds_samplers_from_state_and_asks_for_progress() -> None:
+    source = inspect.getsource(chat)
+    assert "st.CHAT_SAMPLER_FIELDS" in source
+    assert '"return_progress": True' in source
+    assert "apply_to_payload(payload, chat=True)" in source
+    # The hard-coded defaults are gone: blank means the model's recommendation.
+    assert "0.7)" not in source
+    assert "0.95)" not in source
+
+
+def test_the_page_shows_every_sampler_field_and_the_compact_layout(tmp_path: Path) -> None:
+    from fastapi.testclient import TestClient
+
+    from studioforge.config import Config
+    from studioforge.gui.app import create_gui_app
+    from tests.unit.test_gui import _FakeRegistry, _FakeState
+
+    config = Config(data_dir=tmp_path / "data")
+    config.models.dir = tmp_path / "models"
+    config.models.dir.mkdir(parents=True, exist_ok=True)
+    config.ensure_dirs()
+    state = _FakeState(config)
+    state.registry = _FakeRegistry([rec("m")])
+    app = create_gui_app(config, api_state=state)
+    with TestClient(app) as client:
+        text = client.get("/?tab=chat").text
+    for spec in st.CHAT_SAMPLER_FIELDS:
+        assert spec.label in text
+    for needle in ("sfc-root", "Details", "sfc-file", "Quick tests"):
+        assert needle in text
+
+
+def _stream_ctx(supervisor: _Supervisor) -> Any:
+    return SimpleNamespace(supervisor=supervisor)
+
+
+async def test_stream_error_frame_after_the_200_fails_the_reply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import httpx
+
+    frame = {"error": {"code": 500, "message": "slot crashed", "type": "server_error"}}
+    _patch_transport(
+        monkeypatch, lambda request: httpx.Response(200, content=_sse(_delta(content="Hi"), frame))
+    )
+    supervisor = _Supervisor()
+    paints: list[tuple[str, str, bool]] = []
+    with pytest.raises(chat.ChatRequestError, match="slot crashed") as caught:
+        await chat._stream(
+            _stream_ctx(supervisor),
+            "m",
+            "http://127.0.0.1:1",
+            {},
+            lambda c, r, f: paints.append((c, r, f)),
+            {"stop": False},
+        )
+    assert caught.value.context_full is False
+    assert paints[-1] == ("Hi", "", True)  # the partial text is still painted
+    assert supervisor.calls[-1][0] == "end"
+
+
+async def test_stream_context_overflow_is_a_plain_sentence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import httpx
+
+    body = {
+        "error": {
+            "code": 400,
+            "type": "exceed_context_size_error",
+            "message": "request (9120 tokens) exceeds the available context size (8192 tokens)",
+            "n_prompt_tokens": 9120,
+            "n_ctx": 8192,
+        }
+    }
+    _patch_transport(monkeypatch, lambda request: httpx.Response(400, json=body))
+    with pytest.raises(chat.ChatRequestError) as caught:
+        await chat._stream(
+            _stream_ctx(_Supervisor()),
+            "pub/model",
+            "http://127.0.0.1:1",
+            {},
+            lambda c, r, f: None,
+            {"stop": False},
+            n_ctx=8192,
+        )
+    assert caught.value.context_full is True
+    message = str(caught.value)
+    assert "9,120 tokens" in message
+    assert "8,192" in message
+    assert "Clear the chat" in message
+    assert "{" not in message  # no raw JSON in the reply block
+
+
+async def test_stream_reports_prefill_progress(monkeypatch: pytest.MonkeyPatch) -> None:
+    import httpx
+
+    progress = {"prompt_progress": {"total": 4000, "cache": 0, "processed": 1000, "time_ms": 9}}
+    _patch_transport(
+        monkeypatch,
+        lambda request: httpx.Response(200, content=_sse(progress, _delta(content="ok"))),
+    )
+    seen: list[str] = []
+    result = await chat._stream(
+        _stream_ctx(_Supervisor()),
+        "m",
+        "http://127.0.0.1:1",
+        {},
+        lambda c, r, f: None,
+        {"stop": False},
+        on_progress=seen.append,
+    )
+    assert seen == ["reading the prompt… 25% of 4,000 tok"]
+    assert result.content == "ok"
+
+
+def _hanging_transport(monkeypatch: pytest.MonkeyPatch, started: asyncio.Event) -> None:
+    """A child that sends one token, then goes quiet (a long prefill or stall)."""
+    import httpx
+
+    async def body() -> Any:
+        yield f"data: {json.dumps(_delta(content='so far'))}\n\n".encode()
+        started.set()
+        await asyncio.sleep(3600)
+
+    _patch_transport(monkeypatch, lambda request: httpx.Response(200, content=body()))
+
+
+async def test_stop_cancels_a_stream_that_has_gone_quiet(monkeypatch: pytest.MonkeyPatch) -> None:
+    started = asyncio.Event()
+    _hanging_transport(monkeypatch, started)
+    supervisor = _Supervisor()
+    run: dict[str, Any] = {"stop": False}
+    paints: list[tuple[str, str, bool]] = []
+    task = asyncio.create_task(
+        chat._stream(
+            _stream_ctx(supervisor),
+            "m",
+            "http://127.0.0.1:1",
+            {},
+            lambda c, r, f: paints.append((c, r, f)),
+            run,
+        )
+    )
+    await asyncio.wait_for(started.wait(), 5)
+    run["stop"] = True  # what the Stop button does ...
+    task.cancel()  # ... and the cancel that reaches a silent stream
+    result = await asyncio.wait_for(task, 5)
+    assert result.stopped is True
+    assert result.content == "so far"
+    assert paints[-1] == ("so far", "", True)
+    assert supervisor.calls[-1][0] == "end"
+
+
+async def test_a_cancel_that_is_not_a_stop_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
+    started = asyncio.Event()
+    _hanging_transport(monkeypatch, started)
+    supervisor = _Supervisor()
+    task = asyncio.create_task(
+        chat._stream(
+            _stream_ctx(supervisor),
+            "m",
+            "http://127.0.0.1:1",
+            {},
+            lambda c, r, f: None,
+            {"stop": False},
+        )
+    )
+    await asyncio.wait_for(started.wait(), 5)
+    task.cancel()  # e.g. the browser tab went away
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert supervisor.calls[-1][0] == "end"  # the request is still accounted for
+
+
+def test_chat_css_colours_the_context_readout_by_level() -> None:
+    from studioforge.gui import chat_assets
+
+    css = chat_assets.CHAT_CSS
+    for level in ("ok", "warn", "full", "unknown"):
+        assert f".sfc-ctx-{level}" in css
+    assert ".sfc-root" in css
+    assert "fit" in chat_assets.CHAT_JS
