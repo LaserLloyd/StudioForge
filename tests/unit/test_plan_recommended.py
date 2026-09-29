@@ -151,6 +151,19 @@ async def test_a_serving_resident_is_previewed_as_the_503_the_real_call_raises()
     assert dry["retry_after_s"] == excinfo.value.details["retry_after_s"]
 
 
+async def test_a_serving_resident_already_at_that_context_is_previewed_as_already_loaded() -> None:
+    """Serving or idle, a resident that already has the asked-for window is
+    "already loaded" on both the dry run and the real call (2026-09-29: the
+    busy refusal used to be judged first and hid this answer)."""
+    manager, supervisor = make_manager(loaded=[resident_self(ctx=65536, requests=2)])
+    dry = await manager.plan_recommended(MODEL, 65536)
+    assert dry["fits"] is True
+    assert dry["already_loaded"] is True
+    returned = await manager.load_recommended(MODEL, 65536)
+    assert returned.active_requests == 2
+    assert supervisor.starts == 0
+
+
 async def test_bad_input_is_the_same_400_on_the_dry_run_and_the_real_call() -> None:
     manager, _supervisor = make_manager(n_ctx_train=32768)
     for kwargs in (

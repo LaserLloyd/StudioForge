@@ -2291,19 +2291,13 @@ class ModelManager:
             resident = None
         decision.resident = resident
         if resident is not None:
-            if resident.active_requests > 0:
-                decision.refusal = ModelBusyError(
-                    f"'{record.id}' is serving {resident.active_requests} request(s); "
-                    f"loading it at {ctx_size} tokens would interrupt them. Wait for "
-                    f"the stream(s) to finish, or pass force=true to load_model to do it "
-                    f"anyway.",
-                    details={
-                        "busy": self.busy_snapshot(),
-                        "retry_after_s": BUSY_RETRY_AFTER_S,
-                        "loaded_by": resident.loaded_by,
-                    },
-                )
-                return decision
+            # The "already exactly that" shortcut is judged BEFORE the busy
+            # refusal below, because it reloads nothing and so interrupts
+            # nothing. Judged after it (until 2026-09-29), a resident serving
+            # somebody else's stream answered 503 model_busy to a caller that
+            # asked for precisely the window it already had -- ClawChat asks
+            # for the resident's own ctx_per_slot on every send -- and kept
+            # answering it for as long as the other client's run lasted.
             plan_now = resident.plan
             if (
                 plan_now is not None
@@ -2331,6 +2325,19 @@ class ModelManager:
                 # Already exactly that. Reloading would cost a cold start and
                 # a window of "loading" for every client, to arrive where we are.
                 decision.already_loaded = True
+                return decision
+            if resident.active_requests > 0:
+                decision.refusal = ModelBusyError(
+                    f"'{record.id}' is serving {resident.active_requests} request(s); "
+                    f"loading it at {ctx_size} tokens would interrupt them. Wait for "
+                    f"the stream(s) to finish, or pass force=true to load_model to do it "
+                    f"anyway.",
+                    details={
+                        "busy": self.busy_snapshot(),
+                        "retry_after_s": BUSY_RETRY_AFTER_S,
+                        "loaded_by": resident.loaded_by,
+                    },
+                )
                 return decision
 
         probe: Any = self.planner.probe

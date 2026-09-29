@@ -432,6 +432,24 @@ async def test_a_resident_model_already_at_that_context_is_returned_as_is() -> N
     assert supervisor.stopped == []
 
 
+async def test_a_serving_resident_already_at_that_context_is_returned_as_is_too() -> None:
+    """The "already exactly that" answer reloads nothing, so it interrupts
+    nothing -- it must win over the busy refusal, not lose to it.
+
+    Before (until 2026-09-29) the busy check ran first: a resident serving
+    another client's stream answered 503 model_busy to a caller asking for
+    precisely the window it already had -- ClawChat asks for the resident's own
+    ctx_per_slot on every send -- for as long as that client's run lasted.
+    """
+    manager, supervisor = make_manager(loaded=[resident_self(ctx=65536, requests=5)])
+    instance = await manager.load_recommended(MODEL, 65536)
+    assert instance.plan is not None
+    assert instance.plan.ctx_per_slot == 65536
+    assert instance.active_requests == 5, "the same instance, still serving"
+    assert supervisor.starts == 0
+    assert supervisor.stopped == []
+
+
 async def test_the_resident_early_return_re_tiers_the_instance_it_hands_back() -> None:
     """``load_recommended(priority=1)`` on a model that is already at that
     context must re-tier it exactly as ``load(priority=1)`` does on its ready
