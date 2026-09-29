@@ -57,6 +57,7 @@ __all__ = [
     "quant_label_from",
     "read_gguf",
     "read_meta",
+    "sampling_defaults",
     "shard_paths_for",
 ]
 
@@ -81,7 +82,24 @@ GGUF_MAGIC_SWAPPED: Final = b"FUGG"  # big-endian writers emit the magic reverse
 #: 3 -> 4: expert_tensor_bytes -- the bytes in routed-expert tensors, so the
 #:         planner can size a MoE's compute term from the weights that
 #:         actually run (D71).
-META_FORMAT_VERSION: Final = 4
+#: 4 -> 5: sampling -- the publisher's recommended sampler defaults
+#:         (``general.sampling.*``), so the Chat tab can show what a request
+#:         that leaves them blank will actually be served with.
+META_FORMAT_VERSION: Final = 5
+
+#: ``general.sampling.*`` keys llama.cpp's converter writes from a model's
+#: ``generation_config.json``, mapped to the OpenAI/llama-server request names.
+#: llama-server applies them itself to every request that omits the field
+#: (a ``--temp``-style launch flag wins over them). Only the samplers the Chat
+#: tab offers are kept; the rest (mirostat, xtc, the sampler sequence) are
+#: left for the engine to read on its own.
+GGUF_SAMPLING_KEYS: Final[dict[str, tuple[str, type]]] = {
+    "general.sampling.temp": ("temperature", float),
+    "general.sampling.top_p": ("top_p", float),
+    "general.sampling.top_k": ("top_k", int),
+    "general.sampling.min_p": ("min_p", float),
+    "general.sampling.penalty_repeat": ("repeat_penalty", float),
+}
 
 DEFAULT_ALIGNMENT: Final = 32
 
@@ -1017,6 +1035,26 @@ def _as_str(value: Any) -> str | None:
     return value if isinstance(value, str) else None
 
 
+def sampling_defaults(kv: Mapping[str, Any]) -> dict[str, float | int]:
+    """The publisher's recommended samplers from ``general.sampling.*``.
+
+    Keyed by request name (``temperature``, ``top_p``, ``top_k``, ``min_p``,
+    ``repeat_penalty``). Floats are rounded to 4 places because the file stores
+    float32 -- ``0.95`` reads back as ``0.949999988`` and would be shown as
+    such. A value of the wrong type (an array, a string) is dropped rather than
+    guessed at.
+    """
+    out: dict[str, float | int] = {}
+    for key, (name, kind) in GGUF_SAMPLING_KEYS.items():
+        value = kv.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        if value != value or value in (float("inf"), float("-inf")):
+            continue
+        out[name] = int(value) if kind is int else round(float(value), 4)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Quantisation labelling
 # ---------------------------------------------------------------------------
@@ -1430,6 +1468,9 @@ def meta_from_gguf(
     )
 
     file_type = _as_int(kv.get("general.file_type"))
+    sampling = sampling_defaults(kv)
+    if sampling:
+        extra["sampling"] = sampling
     caps = _detect_caps(path, gguf, arch)
     extra.update(caps.extra)
     if gguf.unknown_ggml_types:

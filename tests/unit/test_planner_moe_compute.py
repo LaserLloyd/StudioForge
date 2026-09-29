@@ -121,7 +121,7 @@ def test_a_header_read_without_the_tensor_table_has_no_count(tmp_path: Path) -> 
 
 
 def test_the_meta_format_version_moved_so_every_model_recounts() -> None:
-    assert gguf.META_FORMAT_VERSION == 4
+    assert gguf.META_FORMAT_VERSION >= 4
 
 
 # ---------------------------------------------------------------------------

@@ -48,6 +48,7 @@ from studioforge.core.gguf import (
     quant_label_from_filename,
     read_gguf,
     read_meta,
+    sampling_defaults,
     shard_paths_for,
 )
 
@@ -534,6 +535,46 @@ def test_missing_file_raises(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # read_meta mapping
 # ---------------------------------------------------------------------------
+
+
+def test_meta_captures_the_publishers_sampling_defaults(tmp_path: Path) -> None:
+    """``general.sampling.*`` lands in ``extra["sampling"]`` under request names.
+
+    The values are the ones a real Qwen3.8 file carries; float32 storage turns
+    0.95 into 0.949999988, which is rounded back for display.
+    """
+    kv = [
+        *llm_kv(),
+        ("general.sampling.temp", FLOAT32, 0.6),
+        ("general.sampling.top_p", FLOAT32, 0.95),
+        ("general.sampling.top_k", INT32, 20),
+        ("general.sampling.min_p", FLOAT32, 0.0),
+        ("general.sampling.penalty_repeat", FLOAT32, 1.05),
+        ("general.sampling.xtc_probability", FLOAT32, 0.5),  # not a Chat-tab sampler
+    ]
+    meta = read_meta(write_gguf(tmp_path / "s.gguf", kv, [("blk.0.w", (256, 4), 12)]))
+    assert meta.extra["sampling"] == {
+        "temperature": 0.6,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "repeat_penalty": 1.05,
+    }
+
+
+def test_meta_without_sampling_keys_has_no_sampling_entry(tmp_path: Path) -> None:
+    meta = read_meta(write_gguf(tmp_path / "n.gguf", llm_kv(), [("blk.0.w", (256, 4), 12)]))
+    assert "sampling" not in meta.extra
+
+
+def test_sampling_defaults_drops_values_of_the_wrong_type() -> None:
+    kv = {
+        "general.sampling.temp": "hot",
+        "general.sampling.top_k": True,
+        "general.sampling.top_p": float("nan"),
+        "general.sampling.min_p": 0.05,
+    }
+    assert sampling_defaults(kv) == {"min_p": 0.05}
 
 
 def test_meta_basic_mapping(tmp_path: Path) -> None:
