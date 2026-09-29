@@ -92,6 +92,10 @@ CHAT_CSS = """
 
 .sfc-body { overflow-wrap: anywhere; color: var(--text-primary); }
 .sfc-body:empty { display: none; }
+/* Tailwind's preflight strips list markers; a reply's lists need them back. */
+.sfc-body ol { list-style: decimal; }
+.sfc-body ul { list-style: disc; }
+.sfc-body ul ul, .sfc-body ol ul { list-style: circle; }
 .sfc-body pre { position: relative; }
 .sfc-code-copy {
   position: absolute;
@@ -147,8 +151,8 @@ CHAT_CSS = """
   border-left: 2px solid var(--border);
 }
 .sfc-error { color: var(--danger-text); white-space: pre-wrap; font-size: var(--fs-sm); }
-.sfc-composer textarea { max-height: calc(12 * 1.5em); overflow-y: auto !important; }
-.sfc-editor textarea { max-height: 24rem; overflow-y: auto !important; }
+.sfc-composer textarea { max-height: 16rem; max-height: 12lh; }  /* Quasar autogrow honours it */
+.sfc-editor textarea { max-height: 24rem; }
 """
 
 CHAT_JS = r"""
@@ -248,17 +252,27 @@ CHAT_JS = r"""
     return ok;
   }
 
-  function stick(win, near) {
-    win._sfcStick = near;
+  function flag(win, near) {
     const wrap = win.parentElement;
     if (wrap && wrap.classList.contains('sfc-wrap')) wrap.dataset.away = near ? '0' : '1';
   }
 
+  // Was the reader at the bottom *before* this growth? Measured against the
+  // height last seen, not the current one, so a scroll-up whose scroll event
+  // has not been dispatched yet still counts as "reading above".
+  function pin(box, isWindow) {
+    const seen = box._sfcH === undefined ? box.scrollHeight : box._sfcH;
+    const near = seen - box.scrollTop - box.clientHeight < NEAR;
+    if (near) box.scrollTop = box.scrollHeight;
+    box._sfcH = box.scrollHeight;
+    if (isWindow) flag(box, near);
+  }
+
   function bottom() {
     document.querySelectorAll('.sfc-window').forEach((win) => {
-      stick(win, true);
       win.scrollTop = win.scrollHeight;
-      requestAnimationFrame(() => { win.scrollTop = win.scrollHeight; });
+      win._sfcH = win.scrollHeight;
+      flag(win, true);
     });
   }
 
@@ -276,18 +290,17 @@ CHAT_JS = r"""
 
   function follow(win) {
     decorate(win);
-    win.querySelectorAll('.sfc-think-body').forEach((box) => {
-      if (box._sfcStick !== false) box.scrollTop = box.scrollHeight;
-    });
-    if (win._sfcStick !== false) win.scrollTop = win.scrollHeight;
+    win.querySelectorAll('.sfc-think-body').forEach((box) => pin(box, false));
+    pin(win, true);
   }
 
   document.addEventListener('scroll', (event) => {
     const el = event.target;
     if (!el || !el.classList) return;
-    const near = el.scrollHeight - el.scrollTop - el.clientHeight < NEAR;
-    if (el.classList.contains('sfc-window')) stick(el, near);
-    else if (el.classList.contains('sfc-think-body')) el._sfcStick = near;
+    const isWindow = el.classList.contains('sfc-window');
+    if (!isWindow && !el.classList.contains('sfc-think-body')) return;
+    el._sfcH = el.scrollHeight;
+    if (isWindow) flag(el, el.scrollHeight - el.scrollTop - el.clientHeight < NEAR);
   }, true);
 
   document.addEventListener('click', (event) => {

@@ -153,7 +153,7 @@ def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one fl
         # --- the conversation ----------------------------------------------
         with ui.row().classes("w-full items-center gap-2 no-wrap"):
             ui.label("Conversation").classes("text-sm font-medium")
-            count_label = ui.label("").classes("text-xs opacity-60")
+            count_label = ui.label("").classes("text-xs opacity-60 whitespace-nowrap")
             ui.space()
             copy_all_button = ui.button(
                 "Copy all", icon="content_copy", on_click=lambda: copy_all()
@@ -179,12 +179,12 @@ def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one fl
                 ).props("outline dense no-caps")
                 button.tooltip(test.tooltip)
                 quick_buttons.append(button)
-        with ui.row().classes("w-full items-end gap-2 no-wrap"):
+        with ui.row().classes("w-full items-end gap-2 flex-wrap"):
             prompt = ui.textarea(
                 placeholder="Message… (Enter to send, Shift+Enter for a new line, "
                 "↑ to edit your last message)"
             )
-            prompt.props("dense outlined autogrow").classes("grow sfc-composer")
+            prompt.props("dense outlined autogrow").classes("grow min-w-[14rem] sfc-composer")
             send_button = ui.button("Send", icon="send").props("color=primary no-caps")
             stop_button = ui.button("Stop", icon="stop").props("flat no-caps")
             stop_button.tooltip("Stop the reply (Esc)")
@@ -633,6 +633,13 @@ def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one fl
 
     async def reply_to(user_id: str, target: tuple[str, bool] | None = None) -> None:
         """Stream a fresh reply to the user turn ``user_id`` into a new block."""
+        # Regenerate / "Save & resend" arrive from a button inside a block they
+        # just deleted; NiceGUI resolves notify/run_javascript through the
+        # caller's slot, so re-anchor on the window, which outlives every block.
+        with window:
+            await _reply_to(user_id, target)
+
+    async def _reply_to(user_id: str, target: tuple[str, bool] | None) -> None:
         target = target or resolve_target()
         if target is None:
             refresh_actions()

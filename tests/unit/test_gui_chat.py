@@ -7,6 +7,8 @@ runs without NiceGUI, a GPU or a model.
 from __future__ import annotations
 
 import inspect
+import json
+import re
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -554,3 +556,221 @@ def test_an_explicit_pick_the_engine_cannot_load_does_not_promise_a_load() -> No
     )
     assert pick.model_id == "k2"
     assert pick.reason == "picked · this engine cannot load it"
+
+
+# ---------------------------------------------------------------------------
+# The conversation window (message blocks, thinking fold, streaming, assets)
+# ---------------------------------------------------------------------------
+
+
+def test_the_chat_tab_has_a_conversation_window_with_its_actions(tmp_path: Path) -> None:
+    from fastapi.testclient import TestClient
+
+    from studioforge.config import Config
+    from studioforge.gui.app import create_gui_app
+    from tests.unit.test_gui import _FakeRegistry, _FakeState
+
+    config = Config(data_dir=tmp_path / "data")
+    config.models.dir = tmp_path / "models"
+    config.models.dir.mkdir(parents=True, exist_ok=True)
+    config.ensure_dirs()
+    state = _FakeState(config)
+    state.registry = _FakeRegistry([rec("m")])
+    app = create_gui_app(config, api_state=state)
+    with TestClient(app) as client:
+        text = client.get("/?tab=chat").text
+    for needle in ("Conversation", "Clear all", "Copy all", "sfc-window", "window.sfChat"):
+        assert needle in text
+
+
+def test_thinking_fold_opens_while_thinking_and_collapses_on_the_answer() -> None:
+    fold = chat.ThinkingFold()
+    header, want = fold.step(10, answering=False, final=False, now=100.0)
+    assert want is True
+    assert header == "Thinking… (10 chars, 0.0s)"
+    header, want = fold.step(2_500, answering=False, final=False, now=101.5)
+    assert (header, want) == ("Thinking… (2,500 chars, 1.5s)", True)
+    header, want = fold.step(2_600, answering=True, final=False, now=102.0)
+    assert (header, want) == ("Thought for 2.0s (2,600 chars)", False)
+    # Later paints keep the end time of thinking, not the end of the answer.
+    header, _ = fold.step(2_600, answering=True, final=True, now=130.0)
+    assert header == "Thought for 2.0s (2,600 chars)"
+
+
+def test_thinking_fold_closes_when_the_stream_ends_mid_thought() -> None:
+    fold = chat.ThinkingFold()
+    fold.step(5, answering=False, final=False, now=0.0)
+    header, want = fold.step(9, answering=False, final=True, now=12.4)
+    assert (header, want) == ("Thought for 12s (9 chars)", False)
+
+
+def test_thinking_fold_leaves_a_hand_toggled_fold_alone() -> None:
+    fold = chat.ThinkingFold()
+    fold.step(5, answering=False, final=False, now=0.0)
+    fold.manual = True
+    assert fold.step(50, answering=False, final=False, now=1.0)[1] is None
+    header, want = fold.step(60, answering=True, final=False, now=2.0)
+    assert want is None
+    assert header.startswith("Thought for")
+
+
+@pytest.mark.parametrize(
+    ("seconds", "text"),
+    [(-1, "0.0s"), (0.44, "0.4s"), (9.94, "9.9s"), (42.4, "42s"), (125, "2m 05s")],
+)
+def test_seconds(seconds: float, text: str) -> None:
+    assert chat._seconds(seconds) == text
+
+
+class _Supervisor:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, Any]] = []
+
+    def mark_request_start(self, model_id: str, *, client: str) -> str:
+        self.calls.append(("start", client))
+        return "req-1"
+
+    def mark_request_end(self, model_id: str, **kwargs: Any) -> None:
+        self.calls.append(("end", kwargs))
+
+
+def _sse(*chunks: dict[str, Any]) -> bytes:
+    lines = [f"data: {json.dumps(chunk)}\n\n" for chunk in chunks]
+    return ("".join(lines) + "data: [DONE]\n\n").encode()
+
+
+def _delta(**delta: str) -> dict[str, Any]:
+    return {"choices": [{"index": 0, "delta": delta}]}
+
+
+def _patch_transport(monkeypatch: pytest.MonkeyPatch, handler: Any) -> None:
+    import httpx
+
+    real = httpx.AsyncClient
+
+    def client(*args: Any, **kwargs: Any) -> Any:
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(chat.httpx, "AsyncClient", client)
+
+
+async def test_stream_paints_reasoning_and_answer_then_a_final_paint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import httpx
+
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        body = _sse(
+            _delta(reasoning_content="let me "),
+            _delta(reasoning_content="think"),
+            _delta(content="**Hi**"),
+            _delta(content=" there"),
+            {
+                "choices": [],
+                "usage": {"completion_tokens": 4},
+                "timings": {"predicted_per_second": 50.0},
+            },
+        )
+        return httpx.Response(200, content=body, headers={"content-type": "text/event-stream"})
+
+    _patch_transport(monkeypatch, handler)
+    supervisor = _Supervisor()
+    paints: list[tuple[str, str, bool]] = []
+    firsts: list[bool] = []
+    result = await chat._stream(
+        SimpleNamespace(supervisor=supervisor),  # type: ignore[arg-type]
+        "m",
+        "http://127.0.0.1:1",
+        {"model": "m", "messages": []},
+        lambda c, r, f: paints.append((c, r, f)),
+        {"stop": False},
+        on_first=lambda: firsts.append(True),
+    )
+    assert seen["url"] == "http://127.0.0.1:1/v1/chat/completions"
+    assert result.content == "**Hi** there"
+    assert result.reasoning == "let me think"
+    assert result.chunks == 4
+    assert result.usage == {"completion_tokens": 4}
+    assert firsts == [True]
+    assert paints[-1] == ("**Hi** there", "let me think", True)
+    assert [p for p in paints if p[2]] == [paints[-1]]  # exactly one final paint
+    assert supervisor.calls[0] == ("start", "gui:chat")
+    assert supervisor.calls[-1][1]["tokens_per_second"] == 50.0
+
+
+async def test_stream_stop_keeps_the_partial_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_sse(_delta(content="partial"), _delta(content=" more")))
+
+    _patch_transport(monkeypatch, handler)
+    run = {"stop": False}
+    paints: list[tuple[str, str, bool]] = []
+
+    def paint(content: str, reasoning: str, final: bool) -> None:
+        paints.append((content, reasoning, final))
+        run["stop"] = True  # the Stop button, pressed after the first token
+
+    result = await chat._stream(
+        SimpleNamespace(supervisor=_Supervisor()),  # type: ignore[arg-type]
+        "m",
+        "http://127.0.0.1:1",
+        {},
+        paint,
+        run,
+    )
+    assert result.stopped is True
+    assert result.content == "partial"
+    assert paints[-1] == ("partial", "", True)
+
+
+async def test_stream_http_error_still_paints_and_ends_the_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import httpx
+
+    _patch_transport(monkeypatch, lambda request: httpx.Response(500, text="boom"))
+    supervisor = _Supervisor()
+    paints: list[tuple[str, str, bool]] = []
+    with pytest.raises(RuntimeError, match="HTTP 500: boom"):
+        await chat._stream(
+            SimpleNamespace(supervisor=supervisor),  # type: ignore[arg-type]
+            "m",
+            "http://127.0.0.1:1",
+            {},
+            lambda c, r, f: paints.append((c, r, f)),
+            {"stop": False},
+        )
+    assert paints == [("", "", True)]
+    assert supervisor.calls[-1][0] == "end"
+
+
+def test_model_output_is_never_rendered_with_ui_markdown() -> None:
+    """``ui.markdown`` passes raw HTML through; replies go via render_markdown."""
+    source = inspect.getsource(chat)
+    assert "ui.markdown(" not in source
+    assert "render_markdown(" in source
+
+
+def test_copy_helpers_fall_back_off_secure_contexts() -> None:
+    from studioforge.gui import chat_assets
+
+    js = chat_assets.CHAT_JS
+    assert "isSecureContext" in js
+    assert "ClipboardItem" in js
+    assert "execCommand('copy')" in js
+    assert "'text/html'" in js
+
+
+def test_chat_css_uses_theme_tokens_not_colour_literals() -> None:
+    from studioforge.gui import chat_assets
+
+    css = chat_assets.CHAT_CSS
+    assert not re.search(r"#[0-9a-fA-F]{3,8}\b", css)
+    assert not re.search(r"\b(rgb|rgba|hsl|hsla)\(", css)
+    assert "var(--accent)" in css
