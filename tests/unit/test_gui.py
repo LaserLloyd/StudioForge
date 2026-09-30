@@ -3293,18 +3293,18 @@ def test_chat_tab_does_not_default_samplers_with_boolean_or() -> None:
     """The ``widget.value or default`` idiom silently rewrites 0; ban it here.
 
     This is a static guard on the chat tab's payload construction: every
-    sampler field must go through ``st.number_value`` so an explicit 0 survives.
+    sampler field goes through ``st.build_sampler_payload`` (which keeps an
+    explicit 0 and drops only blanks), never a hard-coded default.
     """
     import inspect
 
     from studioforge.gui.tabs import chat
 
     source = inspect.getsource(chat)
-    for needle in ("temperature.value or", "top_p.value or", "max_tokens.value or"):
+    for needle in ("temperature.value or", "top_p.value or", "max_tokens.value or", ".value or 0"):
         assert needle not in source, f"chat.py regressed to boolean-or defaulting: {needle!r}"
-    assert "number_value(temperature.value" in source
-    assert "number_value(top_p.value" in source
-    assert "number_value(max_tokens.value" in source
+    assert "st.build_sampler_payload(" in source
+    assert st.build_sampler_payload({"temperature": 0})["temperature"] == 0
 
 
 def test_the_gui_chat_tab_loads_at_the_chat_tier() -> None:

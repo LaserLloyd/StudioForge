@@ -6334,6 +6334,44 @@ the thinking split, quick-test prompts, the SSE parser, `include_usage` in the p
 the optional unloadable hook, and a rendered page naming the loaded model. The static
 guards in `test_gui.py` (explicit-zero samplers, chat tier 1) still pass unchanged.
 
+### D68, amended 2026-09-29: blank samplers, the model's own recommendation, and the context window
+
+**Context.** The Chat tab always sent `temperature 0.7, top_p 0.95`. A request field
+beats everything below it, and 21 of the 36 GGUF files in the library carry the publisher's own
+samplers in `general.sampling.*` (Qwen3.x: temp 1.0, top_k 20; Qwen3.5-122B: temp 0.6;
+Gemma 4: top_k 64), which llama-server applies to a request that omits the field. So
+the tab tested every model at a temperature nobody recommended. The redesigned tab also
+invites long conversations, and a conversation that outgrows the slot came back as a raw
+`HTTP 400` JSON body.
+
+**Decision.**
+
+1. A blank sampler is not sent. Precedence for an omitted field, lowest first:
+   llama.cpp's default, the GGUF's `general.sampling.*`, the model's saved launch flag
+   (`--temp` ...), and (gateway only) a persona preset. `recommended_sampling(record,
+   base)` layers the same way and is shown as each blank field's placeholder. The GGUF
+   values are read at scan time into `meta.extra["sampling"]`
+   (`gguf.sampling_defaults`; `META_FORMAT_VERSION` 4 -> 5, so every model re-reads its
+   header once on the next scan).
+2. The tab offers `temperature, top_p, top_k, min_p, repeat_penalty, max_tokens` (starts
+   at 4096; blank or 0 = no cap), `seed` and `stop` (`CHAT_SAMPLER_FIELDS`,
+   `build_sampler_payload`), plus a Thinking switch sent as
+   `chat_template_kwargs.enable_thinking`, offered only when the chat template reads it.
+3. The context one conversation may hold is the instance's per-slot context (the whole
+   pool under `--kv-unified`), `chat_context_limit(instance)`. Each reply can show
+   `chat_context_usage(metrics, limit)`. The engine's refusal is recognised exactly as the
+   gateway's D53 mapping recognises it and rendered as advice
+   (`context_overflow`, `chat_error_text`): the conversation's size, the window, and
+   "Clear, delete older messages, or reload with a larger context".
+
+**Consequences.** A persona's preset is still not applied by the tab unless it calls
+`VirtualPreset.apply_to_payload`, since the tab bypasses the gateway. Nothing about the
+load path changes: a GUI chat still loads through `ensure_loaded(priority=1)` at the
+planner's largest-fitting context (`models.target_ctx`, clamped to the trained window).
+
+**Tests.** `tests/unit/test_gui_chat_request.py`, and the `general.sampling` cases in
+`tests/unit/test_gguf.py`.
+
 ## D69 -- Ops hygiene from the 2026-09-22 review: log lines that say what happened, log files that stop growing, a restart that does not wait for nothing
 
 **Status.** Pending, lane `lane/ops-hygiene` (based on `b73de7e`). One commit per item, numbered as

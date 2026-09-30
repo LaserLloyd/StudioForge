@@ -12,15 +12,22 @@ successful chat here is real evidence that a client will work, not a separate
 mock path that can drift. That includes image attachment: being able to paste a
 screenshot and get an answer is the only practical way to verify a vision model
 end to end without wiring up OpenClaw first.
+
+The conversation itself is a :class:`~studioforge.gui.chat_conversation.Conversation`
+of message blocks with stable ids, each painted once and then touched on its
+own (edit, delete, regenerate, copy); nothing is saved -- it lives for the page
+view. Model output is rendered with ``render_markdown`` (escaped, allowlisted
+HTML), never ``ui.markdown``, which would pass a reply's raw HTML through.
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
+import contextlib
 import json
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
@@ -28,6 +35,13 @@ import httpx
 from nicegui import ui
 
 from studioforge.gui import state as st
+from studioforge.gui.chat_assets import CHAT_CSS, CHAT_JS
+from studioforge.gui.chat_conversation import (
+    ChatMessage,
+    Conversation,
+    plain_text,
+    render_markdown,
+)
 from studioforge.gui.tabs import (
     GuiContext,
     busy,
@@ -40,9 +54,10 @@ from studioforge.gui.tabs import (
 #: Guard against a paste of a 40 MP screenshot filling the socket buffer.
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 
-#: Repaint a streaming reply at most this often. A 0.5B model streams ~700
-#: tokens/s, and one websocket message per token only makes the browser lag.
-_REPAINT_S = 0.05
+#: Repaint a streaming reply at most this often. Each repaint re-renders the
+#: whole Markdown body and ships it over the websocket, and a 0.5B model streams
+#: ~700 tokens/s -- one repaint per token would only make the browser lag.
+_REPAINT_S = 0.1
 
 _STATE_BADGES: dict[str, tuple[str, str]] = {
     "ready": ("Loaded", "positive"),
@@ -75,18 +90,55 @@ document.addEventListener('paste', (event) => {
 </script>
 """
 
+_EMPTY_HINT = (
+    "Send a message or pick a quick test. Every reply shows load time, time to first "
+    "token, prefill and decode speed, and overall tokens per second."
+)
+
+_STOP_FIRST = "Stop the reply first."
+
+_CTX_LEVEL_CLASSES = ("sfc-ctx-unknown", "sfc-ctx-ok", "sfc-ctx-warn", "sfc-ctx-full")
+
+
+class ChatRequestError(RuntimeError):
+    """The engine refused or failed a chat request; ``str()`` is the readable line.
+
+    ``context_full`` marks the "prompt does not fit the slot" refusal, whose
+    message already says what to do (Clear, delete older messages, reload).
+    """
+
+    def __init__(self, message: str, *, context_full: bool = False) -> None:
+        super().__init__(message)
+        self.context_full = context_full
+
+
+def _request_error(
+    status_code: int | None, body: Any, *, n_ctx: int | None, model_id: str
+) -> ChatRequestError:
+    full = st.context_overflow(status_code, body, n_ctx=n_ctx, model_id=model_id) is not None
+    text = st.chat_error_text(status_code, body, n_ctx=n_ctx, model_id=model_id)
+    return ChatRequestError(text, context_full=full)
+
 
 def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one flow
     images: list[dict[str, str]] = []
-    history: list[dict[str, Any]] = []
+    conversation = Conversation()
+    #: One entry per message id: that block's elements (see ``add_block``).
+    blocks: dict[str, SimpleNamespace] = {}
+    #: What a quick test's user block shows instead of its (long) prompt.
+    shown: dict[str, str] = {}
     #: ``active`` while a send is in flight; ``stop`` is the Stop button's request.
     run: dict[str, Any] = {"active": False, "stop": False}
     #: Last painted picker options and card signature, so a poll that changes
     #: nothing sends nothing to the browser (and never closes an open dropdown).
-    view: dict[str, Any] = {"options": None, "card": None}
+    view: dict[str, Any] = {"options": None, "card": None, "actions": None}
+    #: The per-conversation context window each reply was served with.
+    limits: dict[str, int | None] = {}
     unloadable = _unloadable_check(ctx)
 
     ui.add_head_html(_PASTE_SCRIPT)
+    ui.add_css(CHAT_CSS)
+    ui.add_body_html(f"<script>{CHAT_JS}</script>")
 
     def records_now() -> list[Any]:
         return list(ctx.registry.all()) if ctx.registry is not None else []
@@ -94,9 +146,12 @@ def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one fl
     def instances_now() -> list[Any]:
         return list(ctx.supervisor.list()) if ctx.supervisor is not None else []
 
-    with ui.column().classes("w-full gap-3 p-2"):
-        # --- what are we talking to? ---------------------------------------
-        with ui.card().classes("w-full gap-2"):
+    # The tab is one flex column sized to the viewport (see ``fit`` in
+    # chat_assets): model line, conversation window, composer all on screen,
+    # the window taking whatever height is left.
+    with ui.column().classes("w-full gap-2 sfc-root"):
+        # --- what are we talking to? (one line; the rest behind Details) ------
+        with ui.card().classes("w-full gap-1 py-2 px-3 sfc-none"):
             with ui.row().classes("w-full items-center gap-2 flex-wrap"):
                 model = ui.select(
                     {st.LOADED_MODEL_CHOICE: st.LOADED_MODEL_LABEL},
@@ -109,55 +164,85 @@ def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one fl
                 # edited "(Loaded model) — <id>" in place instead of filtering.
                 # Selecting the text on focus makes the first keystroke replace it.
                 model.on("focus", js_handler=_SELECT_ALL_ON_FOCUS)
-                load_button = ui.button("Load", icon="play_arrow").props("outline no-caps")
+                status_badge = ui.badge("", color="grey").classes("text-xs")
+                load_button = ui.button("Load", icon="play_arrow").props("outline dense no-caps")
                 with load_button:
                     load_tip = ui.tooltip("")
-                unload_button = ui.button("Unload", icon="stop_circle").props("flat no-caps")
-            with ui.row().classes("w-full items-center gap-2 flex-wrap"):
-                status_badge = ui.badge("", color="grey").classes("text-xs")
-                target_name = ui.label("").classes("text-sm font-mono break-all")
-            reason_label = ui.label("").classes("text-xs opacity-70")
-            facts_row = ui.row().classes("w-full gap-x-6 gap-y-2 flex-wrap")
+                unload_button = ui.button("Unload", icon="stop_circle").props("flat dense no-caps")
+                details_button = ui.button(
+                    "Details", icon="expand_more", on_click=lambda: toggle_details()
+                ).props("flat dense no-caps")
+                details_button.tooltip("Where and how the model runs")
+            # Warnings stay out of the fold: they are why a Load is disabled.
             warn_label = ui.label("").classes("text-xs text-warning whitespace-pre-wrap")
-            others_label = ui.label("").classes("text-xs opacity-70")
-            hidden_label = ui.label("").classes("text-xs opacity-60")
+            details = ui.column().classes("w-full gap-1")
+            details.set_visibility(False)
+            with details:
+                with ui.row().classes("w-full items-center gap-2 flex-wrap"):
+                    target_name = ui.label("").classes("text-sm font-mono break-all")
+                    reason_label = ui.label("").classes("text-xs opacity-70")
+                facts_row = ui.row().classes("w-full gap-x-6 gap-y-2 flex-wrap")
+                others_label = ui.label("").classes("text-xs opacity-70")
+                hidden_label = ui.label("").classes("text-xs opacity-60")
 
         # --- the conversation ----------------------------------------------
-        transcript = ui.column().classes("w-full gap-4 p-3 rounded sf-well min-h-[10rem]")
+        with ui.row().classes("w-full items-center gap-2 no-wrap sfc-none"):
+            ui.label("Conversation").classes("text-sm font-medium")
+            count_label = ui.label("").classes("text-xs opacity-60 whitespace-nowrap")
+            ctx_label = ui.label("").classes("sfc-ctx sfc-ctx-unknown")
+            with ctx_label:
+                ctx_tip = ui.tooltip("")
+            ctx_label.set_visibility(False)
+            ui.space()
+            copy_all_button = ui.button(
+                "Copy all", icon="content_copy", on_click=lambda: copy_all()
+            ).props("flat dense no-caps")
+            copy_all_button.tooltip("Copy the whole conversation as Markdown")
+            clear_button = ui.button("Clear all", icon="clear_all", on_click=lambda: clear())
+            clear_button.props("flat dense no-caps")
+            clear_button.tooltip("Remove every message (nothing is saved)")
+        with ui.element("div").classes("sfc-wrap"):
+            window = ui.element("div").classes("sfc-window")
+            ui.button("Latest", icon="arrow_downward").props(
+                "unelevated dense rounded no-caps size=sm color=primary"
+            ).classes("sfc-latest").on("click", js_handler="() => window.sfChat.bottom()")
 
         # --- composer ------------------------------------------------------
-        with ui.row().classes("w-full items-center gap-2 flex-wrap"):
-            ui.label("Quick tests").classes("text-xs opacity-70")
-            quick_buttons: list[Any] = []
-            for test in st.CHAT_QUICK_TESTS:
-                button = ui.button(
-                    test.label,
-                    on_click=lambda _event=None, key=test.key: send_quick(key),
-                ).props("outline dense no-caps")
-                button.tooltip(test.tooltip)
-                quick_buttons.append(button)
-        with ui.row().classes("w-full items-end gap-2 no-wrap"):
-            prompt = ui.textarea(placeholder="Message… (Enter to send, Shift+Enter for a new line)")
-            prompt.props("dense outlined autogrow").classes("grow")
-            send_button = ui.button("Send", icon="send").props("color=primary no-caps")
-            stop_button = ui.button("Stop", icon="stop").props("flat no-caps")
-            clear_button = ui.button("Clear", icon="clear_all").props("flat no-caps")
-        with ui.row().classes("w-full items-center gap-2 flex-wrap"):
-            upload = (
-                ui.upload(
-                    label="Attach image",
-                    auto_upload=True,
-                    multiple=True,
-                    max_file_size=MAX_IMAGE_BYTES,
-                )
-                .props('flat dense accept="image/*"')
-                .classes("max-w-[14rem]")
+        thumbs = ui.row().classes("gap-2 flex-wrap sfc-none")
+        with ui.row().classes("w-full items-end gap-2 flex-wrap sfc-none"):
+            # A hidden file input read in the browser and handed over through
+            # the same event as a paste, so attaching costs no row of its own.
+            file_input = ui.element("input").props('type=file accept="image/*" multiple')
+            file_input.classes("sfc-file hidden")
+            attach_button = ui.button(icon="attach_file").props("flat dense round")
+            attach_button.on(
+                "click",
+                js_handler=f"() => document.getElementById('{file_input.html_id}').click()",
             )
-            attach_note = ui.label("").classes("text-xs opacity-70")
-        thumbs = ui.row().classes("gap-2 flex-wrap")
+            attach_button.tooltip("Attach an image (or paste one anywhere on the page)")
+            prompt = ui.textarea(
+                placeholder="Message… (Enter to send, Shift+Enter for a new line, "
+                "↑ to edit your last message)"
+            )
+            prompt.props("dense outlined autogrow").classes("grow min-w-[14rem] sfc-composer")
+            with ui.row().classes("items-center gap-1 no-wrap"):
+                quick_button = ui.button(icon="bolt").props("flat dense round")
+                quick_button.tooltip("Quick tests")
+                with quick_button, ui.menu():
+                    for test in st.CHAT_QUICK_TESTS:
+                        item = ui.menu_item(
+                            test.label,
+                            on_click=lambda _event=None, key=test.key: send_quick(key),
+                        )
+                        item.tooltip(test.tooltip)
+                send_button = ui.button("Send", icon="send").props("color=primary no-caps")
+                stop_button = ui.button("Stop", icon="stop").props("flat no-caps")
+                stop_button.tooltip("Stop the reply (Esc)")
 
         with (
-            ui.expansion("Request settings", icon="tune").classes("w-full"),
+            ui.expansion("Request settings", icon="tune")
+            .props("dense")
+            .classes("w-full sfc-none sfc-settings"),
             ui.column().classes("w-full gap-2"),
         ):
             system = (
@@ -165,34 +250,221 @@ def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one fl
                 .props("dense outlined autogrow")
                 .classes("w-full")
             )
+            sampler_inputs: dict[str, Any] = {}
+            with ui.element("div").classes("w-full sfc-sampler-grid"):
+                for spec in st.CHAT_SAMPLER_FIELDS:
+                    field: Any
+                    if spec.kind == "text":
+                        field = ui.textarea(spec.label).props("dense outlined autogrow")
+                    else:
+                        field = ui.number(
+                            spec.label,
+                            value=spec.default if isinstance(spec.default, int | float) else None,
+                            step=spec.step,
+                            min=spec.minimum,
+                            max=spec.maximum,
+                        )
+                        field.props("dense outlined clearable")
+                    field.props("stack-label").tooltip(spec.tooltip)
+                    sampler_inputs[spec.key] = field
+                thinking = ui.select(
+                    dict(st.CHAT_THINKING_CHOICES), value="auto", label="Thinking"
+                ).props("dense outlined options-dense")
+                thinking.tooltip(st.CHAT_THINKING_TOOLTIP)
+                thinking.set_visibility(False)
             with ui.row().classes("w-full items-center gap-3 flex-wrap"):
-                temperature = ui.number("temperature", value=0.7, precision=2, step=0.05)
-                temperature.props("dense outlined").classes("w-32")
-                top_p = ui.number("top_p", value=0.95, precision=2, step=0.05)
-                top_p.props("dense outlined").classes("w-32")
-                max_tokens = ui.number("max_tokens", value=2048, precision=0)
-                max_tokens.props("dense outlined").classes("w-32")
                 keep_history = ui.switch("Send the conversation so far", value=True)
                 keep_history.props("dense")
-            ui.label(
-                "Requests go straight to the model's own llama-server at the chat tier "
-                "(1), exactly as a client's would after the gateway. Turn the "
-                "conversation off to measure each prompt on its own."
-            ).classes("text-xs opacity-60")
+                ui.label(
+                    "Blank = the model's own recommendation (greyed out), then the "
+                    "engine's default. Requests go straight to the model's own "
+                    "llama-server at the chat tier (1), exactly as a client's would "
+                    "after the gateway."
+                ).classes("text-xs opacity-60")
 
     def show_empty_hint() -> None:
-        with transcript:
-            view["hint"] = ui.label(
-                "Send a message or pick a quick test. Every reply shows load time, time to "
-                "first token, prefill and decode speed, and overall tokens per second."
-            ).classes("text-sm opacity-60")
+        with window:
+            view["hint"] = ui.label(_EMPTY_HINT).classes("text-sm opacity-60")
 
     def drop_empty_hint() -> None:
         hint = view.pop("hint", None)
         if hint is not None and element_alive(hint):
             hint.delete()
 
+    def follow_bottom() -> None:
+        ui.run_javascript("window.sfChat && window.sfChat.bottom()")
+
     show_empty_hint()
+
+    # --- message blocks -------------------------------------------------------
+
+    def body_text(message: ChatMessage) -> str:
+        return shown.get(message.id, message.content)
+
+    def add_block(message: ChatMessage) -> SimpleNamespace:
+        """Paint one message block at the end of the window and remember it."""
+        user = message.role == "user"
+        block = SimpleNamespace(id=message.id, editing=None, fold=ThinkingFold(), expected=False)
+        with window:
+            block.root = ui.column().classes(
+                "sfc-msg gap-1 " + ("sfc-user" if user else "sfc-assistant")
+            )
+        with block.root:
+            with ui.element("div").classes("sfc-head w-full"):
+                ui.label("You" if user else (message.model or "assistant")).classes("sfc-who")
+                ui.label(_clock(message.created_at))
+                block.edited = ui.label("(edited)")
+                block.edited.set_visibility(message.edited)
+                block.status = ui.label(message.status if message.status != "streaming" else "")
+                with ui.element("div").classes("sfc-actions"):
+                    _action(
+                        "content_copy", "Copy raw (Markdown source)", lambda: copy_raw(block.id)
+                    )
+                    _action("content_paste_go", "Copy formatted", lambda: copy_formatted(block.id))
+                    block.edit_btn = _action("edit", "Edit", lambda: open_editor(block.id))
+                    block.regen_btn = _action(
+                        "replay" if user else "refresh",
+                        "Retry: send this message again" if user else "Regenerate this reply",
+                        lambda: regenerate(block.id),
+                    )
+                    block.delete_btn = _action("delete", "Delete", lambda: delete(block.id))
+            if user:
+                block.think = block.think_body = None
+            else:
+                block.think = (
+                    ui.expansion("Thinking", icon="psychology")
+                    .props("dense")
+                    .classes("w-full sfc-think")
+                )
+                with block.think:
+                    block.think_body = ui.label("").classes("sfc-think-body")
+                block.think.set_visibility(False)
+                block.think.on_value_change(lambda event: on_fold_toggle(block, event.value))
+            block.body = ui.html(render_markdown(body_text(message)), sanitize=False).classes(
+                "ui-markdown sfc-body w-full"
+            )
+            block.editor_slot = ui.column().classes("w-full gap-1")
+            block.error = ui.label("").classes("sfc-error")
+            block.error.set_visibility(False)
+            if user and message.images:
+                with ui.row().classes("gap-2 flex-wrap"):
+                    for url in message.images:
+                        ui.image(url).classes("w-16 h-16 object-cover rounded")
+            block.metrics = None if user else ui.column().classes("w-full gap-1")
+        blocks[message.id] = block
+        return block
+
+    def remove_block(message_id: str) -> None:
+        block = blocks.pop(message_id, None)
+        shown.pop(message_id, None)
+        if block is not None and element_alive(block.root):
+            block.root.delete()
+
+    def repaint_body(message: ChatMessage) -> None:
+        block = blocks.get(message.id)
+        if block is None or not element_alive(block.body):
+            return
+        block.body.set_content(render_markdown(body_text(message)))
+        block.edited.set_visibility(message.edited)
+
+    def refresh_actions() -> None:
+        """Enable/disable per-block actions; only blocks whose state changed are touched."""
+        active = bool(run["active"])
+        for message_id, block in blocks.items():
+            wanted = (active, conversation.can_regenerate(message_id))
+            if getattr(block, "action_state", None) == wanted:
+                continue
+            block.action_state = wanted
+            for control in (block.edit_btn, block.delete_btn, block.regen_btn):
+                control.set_enabled(not active)
+            block.regen_btn.set_visibility(wanted[1])
+        count = len(conversation)
+        state = (active, count)
+        if view["actions"] != state:
+            view["actions"] = state
+            count_label.set_text(f"· {count} message{'' if count == 1 else 's'}" if count else "")
+            clear_button.set_enabled(not active and count > 0)
+            copy_all_button.set_enabled(count > 0)
+        refresh_context()
+
+    def sampler_values() -> dict[str, Any]:
+        return {key: field.value for key, field in sampler_inputs.items()}
+
+    def refresh_context() -> None:
+        """The header's context readout, from the latest answered reply."""
+        latest = next(
+            (
+                m
+                for m in reversed(conversation.messages)
+                if m.role == "assistant" and not m.failed and m.metrics is not None
+            ),
+            None,
+        )
+        usage = None
+        if latest is not None:
+            max_tokens = st.build_sampler_payload(sampler_values()).get("max_tokens")
+            usage = st.chat_context_usage(
+                latest.metrics, limits.get(latest.id), max_tokens=max_tokens
+            )
+        painted = (usage.text, usage.level, usage.tooltip) if usage is not None else None
+        if painted == view.get("ctx"):
+            return
+        view["ctx"] = painted
+        ctx_label.set_visibility(usage is not None)
+        if usage is None:
+            return
+        ctx_label.set_text(usage.text)
+        ctx_label.classes(remove=" ".join(_CTX_LEVEL_CLASSES), add=f"sfc-ctx-{usage.level}")
+        ctx_tip.set_text(usage.tooltip)
+
+    def toggle_details() -> None:
+        opened = not details.visible
+        details.set_visibility(opened)
+        details_button.props(f"icon={'expand_less' if opened else 'expand_more'}")
+
+    # --- thinking fold ----------------------------------------------------------
+
+    def on_fold_toggle(block: SimpleNamespace, value: bool) -> None:
+        # A change we did not ask for is the reader's: stop auto-toggling it.
+        if bool(value) != block.expected:
+            block.fold.manual = True
+
+    def paint_reply(block: SimpleNamespace, message: ChatMessage) -> Callable[..., None]:
+        """The stream's painter for one reply block: thinking fold + answer.
+
+        The message and the fold's header change at once; the rendered answer
+        and the thinking text (the heavy parts) go through ``block.renderer``,
+        which the caller drains before the reply counts as finished.
+        """
+
+        def apply(html: str, reasoning: str) -> None:
+            if not element_alive(block.body):
+                return
+            if block.think_body is not None and reasoning:
+                block.think_body.set_text(reasoning)
+            block.body.set_content(html)
+
+        block.renderer = _ReplyRenderer(apply)
+
+        def paint(content: str, reasoning_stream: str, final: bool) -> None:
+            inline_reasoning, answer = st.split_reasoning(content)
+            reasoning = "\n\n".join(part for part in (reasoning_stream, inline_reasoning) if part)
+            message.content = answer
+            message.reasoning = reasoning
+            if not element_alive(block.body):
+                return
+            if reasoning and block.think is not None:
+                header, want_open = block.fold.step(
+                    len(reasoning), bool(answer.strip()), final, time.perf_counter()
+                )
+                block.think.set_visibility(True)
+                block.think.set_text(header)
+                if want_open is not None and bool(block.think.value) != want_open:
+                    block.expected = want_open
+                    block.think.set_value(want_open)
+            block.renderer.submit(answer, reasoning, final=final)
+
+        return paint
 
     # --- target resolution and painting -------------------------------------
 
@@ -290,7 +562,28 @@ def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one fl
         hidden_label.set_text(hidden)
         hidden_label.set_visibility(bool(hidden))
 
+        sync_settings(record, records)
         sync_controls(pick, record, why_not)
+
+    def sync_settings(record: Any, records: list[Any]) -> None:
+        """Placeholders say what a blank setting will be for *this* model."""
+        base = None
+        if record is not None and record.is_virtual and record.base_model_id:
+            base = next((r for r in records if r.id == record.base_model_id), None)
+        recommended = st.recommended_sampling(record, base=base)
+        signature = (
+            tuple(sorted(recommended.items())),
+            st.thinking_toggle_supported(record),
+        )
+        if signature == view.get("settings"):
+            return
+        view["settings"] = signature
+        for spec in st.CHAT_SAMPLER_FIELDS:
+            text = st.sampler_placeholder(spec, recommended).replace('"', "'")
+            sampler_inputs[spec.key].props(f'placeholder="{text}"')
+        thinking.set_visibility(signature[1])
+        if not signature[1]:
+            thinking.set_value("auto")
 
     def sync_controls(pick: Any, record: Any, why_not: str | None) -> None:
         active = bool(run["active"])
@@ -311,7 +604,7 @@ def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one fl
             unload_button.disable()
         else:
             unload_button.enable()
-        for control in (send_button, *quick_buttons):
+        for control in (send_button, quick_button):
             if can_target and not active:
                 control.enable()
             else:
@@ -321,22 +614,18 @@ def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one fl
         else:
             stop_button.disable()
         sync_attach_state(record)
+        refresh_actions()
 
     # --- image attachment ------------------------------------------------------
 
     def sync_attach_state(record: Any) -> None:
-        reason = st.vision_attach_reason(record)
-        if reason:
-            upload.set_visibility(False)
-            attach_note.set_text(
-                "Images: this model has no vision projector." if record is not None else ""
-            )
-            if images:
-                images.clear()
-                _render_thumbs(thumbs, images)
-        else:
-            upload.set_visibility(True)
-            attach_note.set_text("Vision model: attach a file or paste an image into the page.")
+        vision = st.vision_attach_reason(record) is None
+        if vision != view.get("vision"):
+            view["vision"] = vision
+            attach_button.set_visibility(vision)
+        if not vision and images:
+            images.clear()
+            _render_thumbs(thumbs, images)
 
     def target_record() -> Any:
         pick = pick_now()
@@ -351,15 +640,6 @@ def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one fl
             return
         images.append({"name": name, "url": data_url})
         _render_thumbs(thumbs, images)
-
-    def on_upload(event: Any) -> None:
-        content = event.content.read()
-        mime = getattr(event, "type", None) or "image/png"
-        encoded = base64.b64encode(content).decode("ascii")
-        add_image(f"data:{mime};base64,{encoded}", getattr(event, "name", "upload"))
-        upload.reset()
-
-    upload.on_upload(on_upload)
 
     def on_paste(event: Any) -> None:
         payload = event.args
@@ -430,6 +710,18 @@ def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one fl
 
     # --- sending ---------------------------------------------------------------
 
+    def resolve_target() -> tuple[str, bool, Any] | None:
+        """The model the next reply goes to, whether it is loaded, and its record."""
+        records = records_now()
+        instances = instances_now()
+        pick = pick_now(records, instances)
+        if not pick.model_id:
+            ui.notify("no model to send to", type="warning")
+            return None
+        record = next((r for r in records if r.id == pick.model_id), None)
+        was_ready = record is not None and st.chat_model_state(record, instances) == "ready"
+        return pick.model_id, was_ready, record
+
     async def send(text: str | None = None, display: str | None = None) -> None:
         if run["active"]:
             return
@@ -437,82 +729,135 @@ def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one fl
         message = str(prompt.value or "").strip() if typed else str(text)
         if not message and not images:
             return
-        records = records_now()
-        instances = instances_now()
-        pick = pick_now(records, instances)
-        target = pick.model_id
-        if not target:
-            ui.notify("no model to send to", type="warning")
+        target = resolve_target()
+        if target is None:
             return
-        record = next((r for r in records if r.id == target), None)
-        was_ready = record is not None and st.chat_model_state(record, instances) == "ready"
-
-        attached = [image["url"] for image in images]
-        user_turn = {"role": "user", "content": st.build_chat_content(message, attached)}
         drop_empty_hint()
-        shown = display if display is not None else message
-        with transcript:
-            _bubble("you", shown + (f"\n[{len(attached)} image(s)]" if attached else ""))
-            reply = _reply_block(target)
+        user = conversation.add_user(message, [image["url"] for image in images])
+        if display is not None and display != message:
+            shown[user.id] = display
+        add_block(user)
         if typed:
             prompt.set_value("")
         images.clear()
         _render_thumbs(thumbs, images)
+        await reply_to(user.id, target)
 
-        messages: list[dict[str, Any]] = []
+    async def reply_to(user_id: str, target: tuple[str, bool, Any] | None = None) -> None:
+        """Stream a fresh reply to the user turn ``user_id`` into a new block."""
+        # Regenerate / "Save & resend" arrive from a button inside a block they
+        # just deleted; NiceGUI resolves notify/run_javascript through the
+        # caller's slot, so re-anchor on the window, which outlives every block.
+        with window:
+            await _reply_to(user_id, target)
+
+    async def _reply_to(user_id: str, target: tuple[str, bool, Any] | None) -> None:
+        target = target or resolve_target()
+        if target is None:
+            refresh_actions()
+            return
+        model_id, was_ready, record = target
         system_text = str(system.value or "").strip()
-        if system_text:
-            messages.append({"role": "system", "content": system_text})
-        if keep_history.value:
-            messages.extend(history)
-        messages.append(user_turn)
-        history.append(user_turn)
+        messages = conversation.request_messages(
+            system=system_text or None, keep_history=bool(keep_history.value), upto=user_id
+        )
+        reply = conversation.add_assistant(model_id)
+        block = add_block(reply)
+        follow_bottom()
 
         payload: dict[str, Any] = {
-            "model": target,
+            "model": model_id,
             "messages": messages,
             "stream": True,
             # usage + llama-server's own timings ride on the final chunk.
             "stream_options": {"include_usage": True},
-            # number_value, not ``or``: an explicit 0 (greedy temperature) must
-            # be sent as 0, never silently replaced with the default.
-            "temperature": st.number_value(temperature.value, 0.7),
-            "top_p": st.number_value(top_p.value, 0.95),
-            "max_tokens": int(st.number_value(max_tokens.value, 2048)),
+            # prompt_progress frames: a prefill readout, and bytes on the wire
+            # during a long prefill.
+            "return_progress": True,
         }
+        # Blank settings are left out so the model's recommendation applies; an
+        # explicit 0 (greedy temperature) is sent as 0.
+        payload.update(st.build_sampler_payload({**sampler_values(), "thinking": thinking.value}))
+        # The gateway folds a persona preset in; this tab talks to the child
+        # directly, so it must do the same or a persona would chat as its base.
+        preset = getattr(record, "preset", None)
+        if preset is not None:
+            preset.apply_to_payload(payload, chat=True)
+
+        def status(text: str) -> None:
+            if element_alive(block.status):
+                block.status.set_text(text)
 
         run["active"] = True
         run["stop"] = False
         sync()
         clicked_at = time.perf_counter()
         load_s: float | None = None
+        painter = paint_reply(block, reply)
+
+        def stopped_early(note: str) -> None:
+            # Nothing was generated: a blank reply, which is never context.
+            reply.status = "stopped"
+            status(note)
+
         try:
             ticker = None
             if not was_ready:
-                ticker = asyncio.create_task(_tick_loading(reply.status, clicked_at))
+                ticker = asyncio.create_task(_tick_loading(block.status, clicked_at))
+            # Stop during a cold load abandons only *this* wait: the load is
+            # shielded, so it finishes (or fails) for every other client
+            # queued on it, and the manager never sees a cancel mid-start.
+            load = asyncio.ensure_future(_ensure(ctx, model_id))
+            load.add_done_callback(_retrieve)
             try:
-                _record, instance = await _ensure(ctx, target)
+                loaded = await _stoppable(asyncio.shield(load), run)
             except Exception as exc:  # noqa: BLE001
                 elapsed = time.perf_counter() - clicked_at
-                _show_failure(reply, f"load failed after {st.format_latency(elapsed)}", exc)
+                fail(reply, block, f"load failed after {st.format_latency(elapsed)}", exc)
                 notify_error(exc, what="chat")
-                history.pop()
                 return
             finally:
                 if ticker is not None:
                     ticker.cancel()
+            if loaded is _STOPPED:
+                stopped_early("stopped · the model is still loading")
+                return
+            _record, instance = loaded
+            if run["stop"]:
+                # Stop landed between the load and the request: send nothing.
+                stopped_early("stopped")
+                return
             if not was_ready:
                 load_s = time.perf_counter() - clicked_at
+            limit = st.chat_context_limit(instance)
+            limits[reply.id] = limit
             serving_id = instance.model_id
             base = ctx.supervisor.base_url(serving_id)
             if base is None:
-                _show_failure(reply, "not serving", RuntimeError(f"'{serving_id}' has no port"))
-                history.pop()
+                fail(reply, block, "not serving", RuntimeError(f"'{serving_id}' has no port"))
                 return
             payload["model"] = serving_id
-            if element_alive(reply.status):
-                reply.status.set_text("waiting for the first token…")
-            result = await _stream(ctx, serving_id, base, payload, reply, run)
+            status("waiting for the first token…")
+            # A task, so Stop can cancel it even while the engine is still
+            # reading the prompt and nothing arrives to check the flag against.
+            result = await _stoppable(
+                _stream(
+                    ctx,
+                    serving_id,
+                    base,
+                    payload,
+                    painter,
+                    run,
+                    on_first=lambda: status("streaming…"),
+                    on_progress=status,
+                    n_ctx=limit,
+                ),
+                run,
+            )
+            await block.renderer.drain()
+            if result is _STOPPED:
+                stopped_early("stopped")
+                return
             metrics = st.chat_run_metrics(
                 clicked_at=clicked_at,
                 sent_at=result.sent_at,
@@ -525,44 +870,250 @@ def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one fl
                 finish_reason=result.finish_reason,
                 stopped=result.stopped,
             )
-            if element_alive(reply.status):
-                reply.status.set_text("stopped" if result.stopped else "")
-                _render_metrics(reply.metrics, metrics)
-            _reasoning, answer = st.split_reasoning(result.content)
-            history.append({"role": "assistant", "content": answer or result.content})
+            reply.metrics = metrics
+            # A stopped reply keeps its partial text as ordinary context.
+            reply.status = "stopped" if result.stopped else ""
+            status(reply.status)
+            if block.metrics is not None and element_alive(block.metrics):
+                _render_metrics(block.metrics, metrics)
+        except ChatRequestError as exc:
+            fail(reply, block, "context full" if exc.context_full else "failed", exc)
         except Exception as exc:  # noqa: BLE001
-            _show_failure(reply, "failed", exc)
+            fail(reply, block, "failed", exc)
             notify_error(exc, what="chat")
-            # A turn the model never answered must not ride along with the next
-            # message, or the next answer replies to both.
-            if history and history[-1] is user_turn:
-                history.pop()
         finally:
+            # The last paint lands before the block can be edited or deleted.
+            await block.renderer.drain()
             run["active"] = False
             run["stop"] = False
             sync()
+
+    def fail(message: ChatMessage, block: SimpleNamespace, what: str, exc: BaseException) -> None:
+        # A failed reply is never context: the next request (or a Retry on the
+        # user turn above) behaves as if it had not been answered.
+        message.failed = True
+        message.status = what
+        if not element_alive(block.root):
+            return
+        block.status.set_text(what)
+        block.root.classes(add="sfc-failed")
+        # The engine's refusal is already a plain sentence (with what to do
+        # about a full context); anything else keeps the "[what: detail]" form.
+        text = str(exc) if isinstance(exc, ChatRequestError) else f"[{what}: {exc}]"
+        block.error.set_text(text)
+        block.error.set_visibility(True)
 
     async def send_quick(key: str) -> None:
         test = next(t for t in st.CHAT_QUICK_TESTS if t.key == key)
         await send(st.quick_test_prompt(key), test.display)
 
     def request_stop() -> None:
+        # Once per reply: a second cancel would land in the stream's cleanup.
+        if not run["active"] or run["stop"]:
+            return
+        run["stop"] = True
+        task = run.get("task")
+        if task is not None and not task.done():
+            task.cancel()
+
+    # --- per-message actions -----------------------------------------------------
+
+    def copy_raw(message_id: str) -> None:
+        message = conversation.get(message_id)
+        if message is not None:
+            _copy_text(message.content)
+
+    def copy_formatted(message_id: str) -> None:
+        message = conversation.get(message_id)
+        block = blocks.get(message_id)
+        if message is None or block is None:
+            return
+        ui.run_javascript(
+            f"window.sfChat.copyHtml({json.dumps(block.body.html_id)}, "
+            f"{json.dumps(plain_text(message.content))})"
+        )
+
+    def copy_all() -> None:
+        if len(conversation):
+            _copy_text(conversation.as_markdown())
+
+    def blocked() -> bool:
         if run["active"]:
-            run["stop"] = True
+            ui.notify(_STOP_FIRST, type="warning")
+            return True
+        return False
+
+    def delete(message_id: str) -> None:
+        if blocked():
+            return
+        conversation.delete(message_id)
+        remove_block(message_id)
+        if not len(conversation):
+            show_empty_hint()
+        refresh_actions()
+
+    async def regenerate(message_id: str) -> None:
+        if blocked():
+            return
+        point = conversation.regenerate_point(message_id)
+        if point is None:
+            return
+        for dropped in conversation.truncate_after(point.id):
+            remove_block(dropped.id)
+        await reply_to(point.id)
 
     def clear() -> None:
-        _clear(transcript, history)
+        if blocked():
+            return
+        conversation.clear()
+        blocks.clear()
+        shown.clear()
+        window.clear()
+        view.pop("hint", None)
         show_empty_hint()
+        refresh_actions()
+
+    # --- inline editor -----------------------------------------------------------
+
+    def close_editor(block: SimpleNamespace) -> None:
+        block.editing = None
+        if element_alive(block.editor_slot):
+            block.editor_slot.clear()
+            block.body.set_visibility(True)
+
+    def open_editor(message_id: str) -> None:
+        if blocked():
+            return
+        message = conversation.get(message_id)
+        block = blocks.get(message_id)
+        if message is None or block is None:
+            return
+        if block.editing is not None:
+            block.editing.run_method("focus")
+            return
+        user = message.role == "user"
+        block.body.set_visibility(False)
+        with block.editor_slot:
+            editor = ui.textarea(value=message.content).props("dense outlined autogrow autofocus")
+            editor.classes("w-full sfc-editor")
+            with ui.row().classes("gap-2 items-center"):
+                if user:
+                    ui.button(
+                        "Save & resend", icon="send", on_click=lambda: save(block, resend=True)
+                    ).props("color=primary dense no-caps")
+                    ui.button("Save", on_click=lambda: save(block, resend=False)).props(
+                        "flat dense no-caps"
+                    )
+                else:
+                    ui.button("Save", on_click=lambda: save(block, resend=False)).props(
+                        "color=primary dense no-caps"
+                    )
+                ui.button("Cancel", on_click=lambda: close_editor(block)).props(
+                    "flat dense no-caps"
+                )
+                ui.label(
+                    "Ctrl+Enter to " + ("save & resend" if user else "save") + " · Esc to cancel"
+                ).classes("text-xs opacity-60")
+        block.editing = editor
+        editor.on("keydown.ctrl.enter", lambda: save(block, resend=user))
+        editor.on("keydown.esc", lambda: close_editor(block))
+
+    async def save(block: SimpleNamespace, *, resend: bool) -> None:
+        editor = block.editing
+        message = conversation.get(block.id)
+        if editor is None or message is None:
+            return
+        if resend and blocked():
+            return
+        text = str(editor.value or "")
+        if conversation.edit(block.id, text):
+            shown.pop(block.id, None)
+        close_editor(block)
+        repaint_body(message)
+        if resend:
+            for dropped in conversation.truncate_after(block.id):
+                remove_block(dropped.id)
+            await reply_to(block.id)
+        else:
+            refresh_actions()
+
+    def edit_last_user() -> None:
+        if str(prompt.value or "") or run["active"]:
+            return
+        last = conversation.last_user()
+        if last is not None:
+            open_editor(last.id)
 
     send_button.on_click(lambda: send())
     stop_button.on_click(request_stop)
-    clear_button.on_click(clear)
     # Enter sends; Shift+Enter falls through to the browser's default and
     # inserts the newline (``exact`` keeps modifier combinations out, and
     # ``prevent`` stops the sent message from also gaining a newline).
     # Ctrl+Enter stays as an alias for muscle memory from the old binding.
     prompt.on("keydown.enter.exact.prevent", lambda: send())
     prompt.on("keydown.ctrl.enter", lambda: send())
+    prompt.on("keydown.esc", request_stop)
+    prompt.on("keydown.up.exact", edit_last_user)
+    # Event handlers outlive their page: without this a closed browser tab
+    # keeps its reply generating on the GPU until max_tokens or the timeout.
+    ui.context.client.on_delete(request_stop)
+    refresh_actions()
+
+
+@dataclass
+class ThinkingFold:
+    """When a reply's Thinking fold opens and closes by itself, and what it says.
+
+    It opens on the first reasoning token and collapses once thinking ends --
+    the first answer token, or the end of the stream -- so the latest thought
+    is visible while the model thinks without a long monologue pushing the
+    answer down afterwards. Once the reader toggles it by hand (``manual``) it
+    is theirs: :meth:`step` stops asking for a change.
+    """
+
+    started: float | None = None
+    ended: float | None = None
+    manual: bool = False
+
+    def step(self, chars: int, answering: bool, final: bool, now: float) -> tuple[str, bool | None]:
+        """``(header, want_open)``; ``want_open`` is ``None`` to leave it as it is."""
+        if self.started is None:
+            self.started = now
+        if self.ended is None and (answering or final):
+            self.ended = now
+        if self.ended is None:
+            header = f"Thinking… ({chars:,} chars, {_seconds(now - self.started)})"
+            want: bool | None = True
+        else:
+            header = f"Thought for {_seconds(self.ended - self.started)} ({chars:,} chars)"
+            want = False
+        return header, None if self.manual else want
+
+
+def _seconds(value: float) -> str:
+    value = max(0.0, value)
+    if value < 10:
+        return f"{value:.1f}s"
+    if value < 60:
+        return f"{value:.0f}s"
+    minutes, seconds = divmod(int(value), 60)
+    return f"{minutes}m {seconds:02d}s"
+
+
+def _clock(epoch: float) -> str:
+    return time.strftime("%H:%M", time.localtime(epoch))
+
+
+def _action(icon: str, tip: str, handler: Callable[..., Any]) -> Any:
+    button = ui.button(icon=icon, on_click=handler).props("flat dense round size=sm")
+    button.tooltip(tip)
+    button.props(f'aria-label="{tip}"')
+    return button
+
+
+def _copy_text(text: str) -> None:
+    """Copy through the page's helper, which falls back off secure contexts."""
+    ui.run_javascript(f"window.sfChat.copyText({json.dumps(text)})")
 
 
 def _unloadable_check(ctx: GuiContext) -> Callable[[Any], str | None] | None:
@@ -608,12 +1159,6 @@ async def _tick_loading(label: Any, started: float) -> None:
         await asyncio.sleep(0.5)
 
 
-def _clear(transcript: Any, history: list[dict[str, Any]] | None = None) -> None:
-    transcript.clear()
-    if history is not None:
-        history.clear()
-
-
 def _render_thumbs(container: Any, images: list[dict[str, str]]) -> None:
     container.clear()
     with container:
@@ -623,59 +1168,15 @@ def _render_thumbs(container: Any, images: list[dict[str, str]]) -> None:
                 ui.label(image["name"][:16]).classes("text-[11px] opacity-60")
 
 
-def _bubble(who: str, text: str) -> Any:
-    with ui.column().classes("w-full gap-0"):
-        ui.label(who).classes("text-[11px] uppercase tracking-wide opacity-60")
-        return ui.label(text).classes("text-sm whitespace-pre-wrap")
-
-
-def _reply_block(model_id: str) -> SimpleNamespace:
-    """A reply: who answered, its thinking (folded), the answer, then its numbers."""
-    with ui.column().classes("w-full gap-1"):
-        with ui.row().classes("w-full items-center gap-2"):
-            ui.label(model_id).classes("text-[11px] tracking-wide opacity-60 font-mono break-all")
-            status = ui.label("").classes("text-xs opacity-70")
-        thinking = ui.expansion("Thinking", icon="psychology").classes("w-full").props("dense")
-        with thinking:
-            reasoning = ui.label("").classes("text-xs whitespace-pre-wrap opacity-80")
-        thinking.set_visibility(False)
-        answer = ui.label("").classes("text-sm whitespace-pre-wrap")
-        metrics = ui.column().classes("w-full gap-1 mt-1")
-    return SimpleNamespace(
-        status=status, thinking=thinking, reasoning=reasoning, answer=answer, metrics=metrics
-    )
-
-
-def _show_failure(reply: SimpleNamespace, what: str, exc: BaseException) -> None:
-    if not element_alive(reply.answer):
-        return
-    reply.status.set_text(what)
-    reply.answer.classes(add="text-negative")
-    reply.answer.set_text(f"{reply.answer.text}\n\n[{what}: {exc}]".strip())
-
-
-def _paint_reply(reply: SimpleNamespace, content: str, reasoning_stream: str) -> None:
-    """Show the answer, with any thinking folded away above it."""
-    if not element_alive(reply.answer):
-        return
-    inline_reasoning, answer = st.split_reasoning(content)
-    reasoning = "\n\n".join(part for part in (reasoning_stream, inline_reasoning) if part)
-    if reasoning:
-        reply.thinking.set_visibility(True)
-        reply.thinking.set_text(f"Thinking ({len(reasoning):,} chars)")
-        reply.reasoning.set_text(reasoning)
-    reply.answer.set_text(answer)
-
-
 def _render_metrics(container: Any, metrics: Any) -> None:
     container.clear()
     with container:
-        with ui.row().classes("w-full gap-x-6 gap-y-2 flex-wrap"):
+        with ui.row().classes("w-full gap-x-5 gap-y-1 flex-wrap"):
             for tile in st.chat_metric_tiles(metrics):
-                with ui.column().classes("gap-0 min-w-[6.5rem]") as column:
-                    ui.label(tile.label).classes("text-[11px] uppercase tracking-wide opacity-60")
-                    ui.label(tile.value).classes("text-base font-mono")
-                    ui.label(tile.detail).classes("text-[11px] opacity-70")
+                with ui.column().classes("gap-0 min-w-[5.5rem]") as column:
+                    ui.label(tile.label).classes("text-[10px] uppercase tracking-wide opacity-60")
+                    ui.label(tile.value).classes("text-sm font-mono")
+                    ui.label(tile.detail).classes("text-[10px] opacity-70")
                 column.tooltip(tile.tooltip)
         footer = st.chat_metric_footer(metrics)
         if footer:
@@ -687,14 +1188,30 @@ async def _stream(
     serving_id: str,
     base: str,
     payload: dict[str, Any],
-    reply: SimpleNamespace,
+    paint: Callable[[str, str, bool], None],
     run: dict[str, Any],
+    *,
+    on_first: Callable[[], None] | None = None,
+    on_progress: Callable[[str], None] | None = None,
+    n_ctx: int | None = None,
 ) -> SimpleNamespace:
     """Stream a completion from the model's own llama-server child.
 
     The base URL comes from the supervisor, so it is always the loopback port of
     the child we started -- there is no configured or guessed URL anywhere, which
     is what keeps this working behind any proxy.
+
+    ``paint(content, reasoning, final)`` is called at most every
+    ``_REPAINT_S`` while tokens arrive and exactly once more, with
+    ``final=True``, when the stream ends for any reason (done, stopped, failed).
+
+    Stop is honoured two ways: the ``run["stop"]`` flag, checked per frame, and
+    a cancel of the task running this coroutine -- the only thing that reaches a
+    request still in prefill. A cancel that follows a Stop ends the reply as
+    stopped, partial text kept; any other cancel propagates. Engine refusals
+    (an HTTP error, or a ``data: {"error": ...}`` frame after the 200) raise
+    :class:`ChatRequestError` with a readable line; ``n_ctx`` lets a context
+    overflow name the window when the engine does not.
     """
     result = SimpleNamespace(
         content="",
@@ -724,7 +1241,9 @@ async def _stream(
             ) as response:
                 if response.status_code >= 400:
                     body = (await response.aread()).decode("utf-8", "replace")
-                    raise RuntimeError(f"HTTP {response.status_code}: {body[:600]}")
+                    raise _request_error(
+                        response.status_code, body, n_ctx=n_ctx, model_id=serving_id
+                    )
                 async for line in response.aiter_lines():
                     if run.get("stop"):
                         result.stopped = True
@@ -732,6 +1251,11 @@ async def _stream(
                     data = _parse_sse(line)
                     if data is None:
                         continue
+                    if st.stream_error(data):
+                        raise _request_error(None, data, n_ctx=n_ctx, model_id=serving_id)
+                    progress = st.prefill_progress(data)
+                    if progress is not None and on_progress is not None:
+                        on_progress(progress.text)
                     if isinstance(data.get("usage"), dict):
                         result.usage = data["usage"]
                     if isinstance(data.get("timings"), dict):
@@ -750,8 +1274,8 @@ async def _stream(
                     now = time.perf_counter()
                     if result.first_token_at is None:
                         result.first_token_at = now
-                        if element_alive(reply.status):
-                            reply.status.set_text("streaming…")
+                        if on_first is not None:
+                            on_first()
                     result.last_token_at = now
                     result.chunks += 1
                     if piece:
@@ -760,25 +1284,138 @@ async def _stream(
                         reasoning.append(thought)
                     if now - painted_at >= _REPAINT_S:
                         painted_at = now
-                        _paint_reply(reply, "".join(content), "".join(reasoning))
+                        paint("".join(content), "".join(reasoning), False)
+    except asyncio.CancelledError:
+        if not run.get("stop"):
+            raise
+        # Our own Stop: finish as a normal stopped reply.
+        task = asyncio.current_task()
+        if task is not None:
+            task.uncancel()
+        result.stopped = True
     finally:
         result.content = "".join(content)
         result.reasoning = "".join(reasoning)
-        _paint_reply(reply, result.content, result.reasoning)
-        elapsed = (result.last_token_at or time.perf_counter()) - (
-            result.first_token_at or result.sent_at or time.perf_counter()
-        )
-        rate = None
-        if isinstance(result.timings, dict):
-            rate = result.timings.get("predicted_per_second")
-        ctx.supervisor.mark_request_end(
-            serving_id,
-            request_id=request_id,
-            tokens_per_second=round(float(rate), 2)
-            if isinstance(rate, int | float) and rate > 0
-            else st.tokens_per_second(max(0, result.chunks - 1), elapsed),
-        )
+        try:
+            paint(result.content, result.reasoning, True)
+        finally:
+            # Paired with mark_request_start on every path, a painter that
+            # raises included: a missed end leaves the instance "busy" forever.
+            elapsed = (result.last_token_at or time.perf_counter()) - (
+                result.first_token_at or result.sent_at or time.perf_counter()
+            )
+            rate = None
+            if isinstance(result.timings, dict):
+                rate = result.timings.get("predicted_per_second")
+            ctx.supervisor.mark_request_end(
+                serving_id,
+                request_id=request_id,
+                tokens_per_second=round(float(rate), 2)
+                if isinstance(rate, int | float) and rate > 0
+                else st.tokens_per_second(max(0, result.chunks - 1), elapsed),
+            )
     return result
+
+
+#: What :func:`_stoppable` returns when Stop cancelled the wait.
+_STOPPED: Any = object()
+
+
+async def _stoppable(awaitable: Any, run: dict[str, Any]) -> Any:
+    """Await ``awaitable`` as ``run["task"]``, so the Stop button can cancel it.
+
+    Returns :data:`_STOPPED` when Stop did -- including a Stop that lands before
+    a freshly created task has run a single step, where the coroutine never
+    gets the chance to catch its own cancel and ``await`` raises instead. Any
+    other cancel (this handler's own, at shutdown) propagates.
+    """
+    task = asyncio.ensure_future(awaitable)
+    run["task"] = task
+    try:
+        return await task
+    except asyncio.CancelledError:
+        current = asyncio.current_task()
+        outer = current is not None and current.cancelling() > 0
+        if run.get("stop") and task.cancelled() and not outer:
+            return _STOPPED
+        raise
+    finally:
+        if run.get("task") is task:
+            run.pop("task", None)
+
+
+def _retrieve(task: asyncio.Future[Any]) -> None:
+    """Done-callback for a load nobody awaits any more (Stop during a load)."""
+    if not task.cancelled():
+        task.exception()
+
+
+#: A render slower than this makes the next one wait (see :class:`_ReplyRenderer`).
+_RENDER_BACKOFF = 2.0
+_RENDER_MAX_GAP_S = 5.0
+
+
+class _ReplyRenderer:
+    """Renders a streaming reply's Markdown off the event loop, newest text wins.
+
+    ``render_markdown`` is pure Python (markdown2 + Pygments) and grows with the
+    reply: ~0.7 s for 100 KB of answer on the rig, ~2.3 s for 200 KB. Run on the
+    event loop every ``_REPAINT_S`` that froze the whole panel -- every tab of
+    every viewer -- for most of a long reply. So the HTML is built in a worker
+    thread, only one render is in flight per reply (paints that arrive meanwhile
+    collapse into the newest), and after a slow render the next one waits
+    ``_RENDER_BACKOFF`` times as long, which also caps what a long reply ships
+    over the websocket. A ``final`` submit skips that wait; :meth:`drain` returns
+    once the newest submitted text is on screen.
+    """
+
+    def __init__(
+        self,
+        apply: Callable[[str, str], None],
+        render: Callable[[str], str] = render_markdown,
+    ) -> None:
+        self._apply = apply
+        self._render = render
+        self._pending: tuple[str, str] | None = None
+        self._task: asyncio.Task[None] | None = None
+        self._wake: asyncio.Event | None = None
+        self._final = False
+
+    def submit(self, answer: str, reasoning: str, *, final: bool = False) -> None:
+        self._pending = (answer, reasoning)
+        if final:
+            self._final = True
+            if self._wake is not None:
+                self._wake.set()
+        if self._task is None or self._task.done():
+            self._task = asyncio.get_running_loop().create_task(self._run())
+
+    async def _run(self) -> None:
+        while self._pending is not None:
+            answer, reasoning = self._pending
+            self._pending = None
+            started = time.perf_counter()
+            html = await asyncio.to_thread(self._render, answer)
+            self._apply(html, reasoning)
+            cost = time.perf_counter() - started
+            if self._pending is None or self._final or cost * _RENDER_BACKOFF <= _REPAINT_S:
+                continue
+            self._wake = asyncio.Event()
+            try:
+                await asyncio.wait_for(
+                    self._wake.wait(), min(cost * _RENDER_BACKOFF, _RENDER_MAX_GAP_S)
+                )
+            except TimeoutError:
+                pass
+            finally:
+                self._wake = None
+
+    async def drain(self) -> None:
+        """Wait until the newest submitted text has been painted (never raises)."""
+        task = self._task
+        if task is not None:
+            with contextlib.suppress(Exception):
+                await task
 
 
 def _parse_sse(line: str) -> dict[str, Any] | None:

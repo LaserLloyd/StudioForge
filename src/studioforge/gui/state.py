@@ -21,6 +21,7 @@ Two invariants are load-bearing and are covered by tests:
 from __future__ import annotations
 
 import contextlib
+import json
 import re
 import time
 import types
@@ -3393,7 +3394,7 @@ def chat_target_facts(
                 context = f"{int(per_slot):,}"
             facts.append(("Context", context))
         if plan is not None:
-            kv = plan.kv_cache_type
+            kv: str = plan.kv_cache_type
             if plan.kv_cache_type_v and plan.kv_cache_type_v != kv:
                 kv = f"{kv} / {plan.kv_cache_type_v}"
             facts.append(("KV cache", str(kv)))
@@ -3883,6 +3884,594 @@ def chat_metric_footer(m: ChatRunMetrics) -> str:
     if m.source == "client" and not m.stopped:
         parts.append("engine timings missing, decode estimated from the stream")
     return " · ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Chat request settings
+# ---------------------------------------------------------------------------
+#
+# The Chat tab streams from the child's own port, so a field it sends is a field
+# the model's recommended value can no longer supply. Where a sampler value
+# comes from when a request leaves it out, lowest to highest:
+#
+#   llama.cpp's built-in default  <  the GGUF's ``general.sampling.*``
+#     <  the launch flag from the model's settings (``--temp`` ...)
+#
+# and on the gateway only, a virtual model's preset fills an absent field
+# (``VirtualPreset.apply_to_payload``). So blank means "not sent", and the tab
+# shows :func:`recommended_sampling` as the placeholder of each blank field.
+
+
+@dataclass(frozen=True)
+class SamplerField:
+    """One Chat request setting: pure data the tab renders as an input.
+
+    ``default`` is the value the input starts with; ``None`` starts it blank,
+    and blank is never sent. ``kind`` is ``"float"``, ``"int"`` or ``"text"``.
+    Bounds are what :func:`build_sampler_payload` clamps to (``None`` = open).
+    ``engine_default`` is what llama-server uses when neither the request, the
+    launch flags nor the GGUF say, for the placeholder of a model with no
+    recommendation.
+    """
+
+    key: str
+    label: str
+    kind: str
+    default: float | int | str | None
+    minimum: float | None
+    maximum: float | None
+    step: float | None
+    engine_default: str
+    tooltip: str
+
+
+CHAT_SAMPLER_FIELDS: Final[tuple[SamplerField, ...]] = (
+    SamplerField(
+        key="temperature",
+        label="temperature",
+        kind="float",
+        default=None,
+        minimum=0.0,
+        maximum=2.0,
+        step=0.05,
+        engine_default="0.8",
+        tooltip=(
+            "Randomness. 0 always picks the most likely token (greedy, repeatable). "
+            "Blank uses the model's own recommendation, shown greyed out."
+        ),
+    ),
+    SamplerField(
+        key="top_p",
+        label="top_p",
+        kind="float",
+        default=None,
+        minimum=0.0,
+        maximum=1.0,
+        step=0.05,
+        engine_default="0.95",
+        tooltip="Sample only from the most likely tokens that together make up this share "
+        "of the probability. 1 turns it off. Blank uses the model's recommendation.",
+    ),
+    SamplerField(
+        key="top_k",
+        label="top_k",
+        kind="int",
+        default=None,
+        minimum=0,
+        maximum=500,
+        step=1,
+        engine_default="40",
+        tooltip="Sample only from this many most likely tokens. 0 turns it off. "
+        "Blank uses the model's recommendation.",
+    ),
+    SamplerField(
+        key="min_p",
+        label="min_p",
+        kind="float",
+        default=None,
+        minimum=0.0,
+        maximum=1.0,
+        step=0.01,
+        engine_default="0.05",
+        tooltip="Drop tokens less likely than this fraction of the most likely one. "
+        "0 turns it off. Blank uses the model's recommendation.",
+    ),
+    SamplerField(
+        key="repeat_penalty",
+        label="repeat_penalty",
+        kind="float",
+        default=None,
+        minimum=0.5,
+        maximum=2.0,
+        step=0.05,
+        engine_default="1.0 (off)",
+        tooltip="Above 1 discourages repeating recent tokens; 1 is off. Try 1.05-1.1 for "
+        "a model that loops. Blank uses the model's own setting.",
+    ),
+    SamplerField(
+        key="max_tokens",
+        label="max_tokens",
+        kind="int",
+        default=4096,
+        minimum=1,
+        maximum=None,
+        step=256,
+        engine_default="no limit",
+        tooltip=(
+            "Longest reply, thinking included. A thinking model can spend thousands of "
+            "tokens before it answers, so a low cap cuts the answer off. Blank or 0 = "
+            "no cap: the reply ends when the model stops or the context is full."
+        ),
+    ),
+    SamplerField(
+        key="seed",
+        label="seed",
+        kind="int",
+        default=None,
+        minimum=0,
+        maximum=2**32 - 2,
+        step=1,
+        engine_default="random",
+        tooltip=(
+            "Fix it to make Regenerate repeat itself: the same seed, settings and "
+            "conversation give the same reply. Blank or -1 = a new random seed each time."
+        ),
+    ),
+    SamplerField(
+        key="stop",
+        label="stop sequences",
+        kind="text",
+        default=None,
+        minimum=None,
+        maximum=None,
+        step=None,
+        engine_default="none",
+        tooltip=(
+            "One per line; the reply ends before the first one it produces. "
+            "Write \\n for a newline. On a thinking model a stop can also fire "
+            "inside the thinking."
+        ),
+    ),
+)
+
+CHAT_SAMPLER_FIELD_BY_KEY: Final[Mapping[str, SamplerField]] = {
+    f.key: f for f in CHAT_SAMPLER_FIELDS
+}
+
+#: The Thinking select: request value -> label. ``"auto"`` sends nothing.
+CHAT_THINKING_CHOICES: Final[Mapping[str, str]] = {
+    "auto": "Model default",
+    "on": "Think",
+    "off": "Don't think",
+}
+
+CHAT_THINKING_TOOLTIP: Final = (
+    "Sent as chat_template_kwargs.enable_thinking, which the model's own chat template "
+    "reads (Qwen3, Gemma 4 and most current thinking models). 'Model default' sends "
+    "nothing. Only offered when the template has the switch."
+)
+
+_STOP_MAX: Final = 16
+
+
+def thinking_toggle_supported(record: ModelRecord | None) -> bool:
+    """Whether the model's chat template reads ``enable_thinking``.
+
+    A template without the variable ignores the kwarg, so sending it would be
+    harmless -- but a switch that does nothing is worse than no switch.
+    """
+    if record is None or record.meta is None:
+        return False
+    return "enable_thinking" in (record.meta.chat_template or "")
+
+
+def _sampler_number(field_spec: SamplerField, raw: Any) -> float | int | None:
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, str):
+        raw = raw.strip()
+        if not raw:
+            return None
+    try:
+        number = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if number != number or number in (float("inf"), float("-inf")):
+        return None
+    if field_spec.key == "seed" and number < 0:
+        return None  # -1 is llama-server's "random"; omitting it says the same
+    if field_spec.key == "max_tokens" and number <= 0:
+        return None  # 0 = no cap
+    if field_spec.minimum is not None:
+        number = max(float(field_spec.minimum), number)
+    if field_spec.maximum is not None:
+        number = min(float(field_spec.maximum), number)
+    return int(round(number)) if field_spec.kind == "int" else round(number, 4)
+
+
+def parse_stop_sequences(raw: Any) -> list[str]:
+    """Stop sequences from the text box (one per line) or a list.
+
+    ``\\n`` and ``\\t`` are unescaped so a newline can be a stop. Leading and
+    trailing spaces are kept -- ``" User:"`` is a real stop -- but a line that
+    is only whitespace is dropped, as are duplicates; at most 16 are kept.
+    """
+    if raw is None:
+        return []
+    items = list(raw) if isinstance(raw, list | tuple) else str(raw).splitlines()
+    out: list[str] = []
+    for item in items:
+        text = str(item).rstrip("\r")
+        if not text.strip():
+            continue
+        text = text.replace("\\n", "\n").replace("\\t", "\t")
+        if text not in out:
+            out.append(text)
+        if len(out) >= _STOP_MAX:
+            break
+    return out
+
+
+def build_sampler_payload(values: Mapping[str, Any]) -> dict[str, Any]:
+    """The request-body fields for the Chat tab's settings, blanks left out.
+
+    ``values`` maps :data:`CHAT_SAMPLER_FIELDS` keys (plus ``"thinking"``, one
+    of :data:`CHAT_THINKING_CHOICES`) to raw form values. A blank, ``None`` or
+    unparseable value is omitted, so the model's recommendation and the
+    engine's defaults still apply; an explicit 0 is sent as 0 (greedy
+    temperature is a normal choice). Numbers are clamped to the field's bounds
+    and ints rounded. Merge the result into the payload with ``update``.
+    """
+    payload: dict[str, Any] = {}
+    for spec in CHAT_SAMPLER_FIELDS:
+        raw = values.get(spec.key)
+        if spec.kind == "text":
+            stops = parse_stop_sequences(raw)
+            if stops:
+                payload[spec.key] = stops
+            continue
+        number = _sampler_number(spec, raw)
+        if number is not None:
+            payload[spec.key] = number
+    thinking = values.get("thinking")
+    if thinking in ("on", "off"):
+        payload["chat_template_kwargs"] = {"enable_thinking": thinking == "on"}
+    return payload
+
+
+_SAMPLER_KEYS: Final = ("temperature", "top_p", "top_k", "min_p", "repeat_penalty")
+
+
+def recommended_sampling(
+    record: ModelRecord | None, base: ModelRecord | None = None
+) -> dict[str, float | int]:
+    """What a request that leaves a sampler blank is served with, where known.
+
+    Layered lowest to highest: the GGUF's ``general.sampling.*`` (read into
+    ``meta.extra["sampling"]``), then the model's saved launch defaults
+    (``settings.temperature`` ...), then a virtual model's preset -- which
+    also carries ``max_tokens``. ``base`` is the base record of a virtual
+    model: its file and, for a preset-only persona, its launch flags are the
+    ones actually serving. A key is absent when nothing sets it (the engine's
+    built-in default then applies, :attr:`SamplerField.engine_default`).
+
+    The preset layer is applied by the gateway, not by llama-server: a tab that
+    streams from the child must send those values itself (or call
+    ``record.preset.apply_to_payload(payload, chat=True)``).
+    """
+    if record is None:
+        return {}
+    out: dict[str, float | int] = {}
+    meta = record.meta if record.meta is not None else (base.meta if base else None)
+    if meta is not None:
+        sampling = meta.extra.get("sampling")
+        if isinstance(sampling, Mapping):
+            for key in _SAMPLER_KEYS:
+                value = sampling.get(key)
+                if isinstance(value, int | float) and not isinstance(value, bool):
+                    out[key] = value
+    launch = base.settings if (base is not None and shares_base_instance(record)) else None
+    for settings in (launch, record.settings):
+        if settings is None:
+            continue
+        for key in _SAMPLER_KEYS:
+            value = getattr(settings, key, None)
+            if value is not None:
+                out[key] = value
+    preset = record.preset
+    if preset is not None:
+        for key in (*_SAMPLER_KEYS, "max_tokens"):
+            value = getattr(preset, key, None)
+            if value is not None:
+                out[key] = value
+    return out
+
+
+def sampler_placeholder(spec: SamplerField, recommended: Mapping[str, Any]) -> str:
+    """Greyed-out text for a blank setting: what it will actually be."""
+    value = recommended.get(spec.key)
+    if value is None:
+        return f"engine: {spec.engine_default}"
+    return f"model: {value:g}" if isinstance(value, float) else f"model: {value}"
+
+
+# ---------------------------------------------------------------------------
+# Chat and the context window
+# ---------------------------------------------------------------------------
+
+#: Context used, as a share of the window, from which the readout warns.
+CONTEXT_WARN_FRACTION: Final = 0.8
+#: ... and from which it says the conversation is about to stop fitting.
+CONTEXT_FULL_FRACTION: Final = 0.95
+
+
+def chat_context_limit(instance: InstanceInfo | None) -> int | None:
+    """Tokens ONE conversation may occupy on this instance, or ``None``.
+
+    That is the per-slot context, not ``--ctx-size``: StudioForge launches a
+    partitioned KV pool (``ctx_per_slot x parallel``) and llama-server refuses
+    a request longer than its slot (D38). With ``--kv-unified`` a lone request
+    may use the whole pool. Read from what the child was really launched with
+    (D54), falling back to the plan while the argv is not parsed yet.
+    """
+    if instance is None:
+        return None
+    effective = instance.effective
+    if effective is not None:
+        if effective.kv_unified and effective.ctx_total > 0:
+            return int(effective.ctx_total)
+        if effective.ctx_per_slot > 0:
+            return int(effective.ctx_per_slot)
+    plan = instance.plan
+    if plan is not None:
+        value = plan.ctx_per_slot or plan.ctx_size
+        if value and value > 0:
+            return int(value)
+    return None
+
+
+@dataclass(frozen=True)
+class ContextUsage:
+    """How full the model's context is after a reply.
+
+    ``level`` is ``"unknown"`` (no numbers), ``"ok"``, ``"warn"`` (past
+    :data:`CONTEXT_WARN_FRACTION`, or the next reply's ``max_tokens`` would not
+    fit) or ``"full"`` (past :data:`CONTEXT_FULL_FRACTION`).
+    """
+
+    used: int | None
+    limit: int | None
+    level: str
+    text: str
+    tooltip: str
+
+    @property
+    def fraction(self) -> float | None:
+        if self.used is None or not self.limit:
+            return None
+        return min(1.0, self.used / self.limit)
+
+
+def chat_context_usage(
+    metrics: ChatRunMetrics | None, limit: int | None, *, max_tokens: int | None = None
+) -> ContextUsage:
+    """The context readout for a reply, from its metrics and the instance's window.
+
+    ``used`` is the whole prompt (cached tokens included) plus the reply --
+    llama-server's ``usage``, else its ``timings`` (``prompt_n + cache_n`` and
+    ``predicted_n``). It is an upper bound on the next prompt: thinking is not
+    sent back, so the next request is smaller by this reply's thinking. After a
+    Stop the engine sends no final chunk and the reading is unknown.
+    """
+    used: int | None = None
+    if metrics is not None:
+        prompt = metrics.prompt_tokens
+        if prompt is None and metrics.prefill_tokens is not None:
+            prompt = metrics.prefill_tokens + (metrics.cached_tokens or 0)
+        completion = metrics.completion_tokens
+        if completion is None:
+            completion = metrics.decode_tokens
+        if prompt is not None:
+            used = prompt + (completion or 0)
+    tooltip = (
+        "Tokens this conversation occupies in the model's context after this reply "
+        "(prompt + reply), against what one conversation may hold on the loaded "
+        "instance. Thinking is not sent back, so the next prompt is a little smaller. "
+        "When it is full, Clear, delete older messages, or reload the model with a "
+        "larger context."
+    )
+    if used is None:
+        shown = f" / {limit:,}" if limit else ""
+        return ContextUsage(None, limit, "unknown", f"context {UNKNOWN}{shown}", tooltip)
+    if not limit:
+        return ContextUsage(used, None, "unknown", f"context {used:,} tok", tooltip)
+    fraction = used / limit
+    level = "ok"
+    if fraction >= CONTEXT_FULL_FRACTION:
+        level = "full"
+    elif fraction >= CONTEXT_WARN_FRACTION or (max_tokens and used + max_tokens > limit):
+        level = "warn"
+    text = f"context {used:,} / {limit:,} ({fraction:.0%})"
+    if level == "full":
+        text += " · nearly full"
+    elif level == "warn" and max_tokens and used + max_tokens > limit:
+        text += f" · under {max_tokens:,} tok left for a reply"
+    return ContextUsage(used, limit, level, text, tooltip)
+
+
+@dataclass(frozen=True)
+class ContextOverflow:
+    """llama-server's "the prompt does not fit the slot" refusal, understood."""
+
+    #: The prompt's size as the engine counted it, when it said.
+    prompt_tokens: int | None
+    #: The window it had to fit, from the engine, else the caller's limit.
+    n_ctx: int | None
+    #: One plain sentence for the reply block, with what to do about it.
+    message: str
+
+
+#: The engine's own words for the same refusal: ``request (8240 tokens)
+#: exceeds the available context size (8192 tokens), try increasing it``.
+_OVERFLOW_NUMBERS: Final = re.compile(
+    r"\((\d+)\s+tokens?\)[^()]*?context size\s*\((\d+)\s+tokens?\)", re.IGNORECASE
+)
+
+
+def _error_object(body: Any) -> tuple[dict[str, Any], str]:
+    """``(error dict, message)`` from a response body, bytes, text or parsed frame."""
+    data: Any = body
+    if isinstance(data, bytes | bytearray):
+        data = data.decode("utf-8", "replace")
+    if isinstance(data, str):
+        text = data.strip()
+        try:
+            data = json.loads(text) if text else {}
+        except ValueError:
+            return {}, text
+    if isinstance(data, Mapping):
+        error = data.get("error")
+        if isinstance(error, Mapping):
+            return dict(error), str(error.get("message") or "")
+        if isinstance(error, str):
+            return {}, error
+        if isinstance(data.get("message"), str):
+            return dict(data), str(data["message"])
+        return dict(data), json.dumps(data, default=str) if data else ""
+    return {}, "" if data is None else str(data)
+
+
+def _positive_int(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if value > 0 else None
+
+
+def context_overflow(
+    status_code: int | None,
+    body: Any,
+    *,
+    n_ctx: int | None = None,
+    model_id: str | None = None,
+) -> ContextOverflow | None:
+    """The engine refusing a prompt longer than the slot, else ``None``.
+
+    ``status_code`` is the child's HTTP status, or ``None`` for a ``data:
+    {"error": ...}`` frame inside a stream; ``body`` is the raw body or the
+    parsed frame. Recognised exactly as the gateway recognises it (D53): the
+    typed ``exceed_context_size_error`` first, the engine's known phrases as a
+    fallback, and only on a 400 or an in-stream frame -- a 500 that mentions
+    context is the engine failing, not the prompt being long.
+    ``n_ctx`` (:func:`chat_context_limit`) fills the window when the engine's
+    body does not name it.
+    """
+    from studioforge.api.openai_routes import _CTX_OVERFLOW_ERROR_TYPE, _CTX_OVERFLOW_MARKERS
+
+    error, message = _error_object(body)
+    typed = error.get("type") == _CTX_OVERFLOW_ERROR_TYPE
+    if not typed:
+        if status_code not in (None, 400):
+            return None
+        lowered = message.lower()
+        if not any(marker in lowered for marker in _CTX_OVERFLOW_MARKERS):
+            return None
+    prompt = _positive_int(error.get("n_prompt_tokens"))
+    window = _positive_int(error.get("n_ctx"))
+    match = _OVERFLOW_NUMBERS.search(message)
+    if match is not None:
+        prompt = prompt or int(match.group(1))
+        window = window or int(match.group(2))
+    window = window or _positive_int(n_ctx)
+    who = model_id or "the model"
+    if prompt and window:
+        head = (
+            f"This conversation is {prompt:,} tokens, and {who} is loaded with room for "
+            f"{window:,} per conversation."
+        )
+    elif window:
+        head = f"This conversation no longer fits the {window:,} tokens {who} is loaded with."
+    else:
+        head = f"This conversation no longer fits the context {who} is loaded with."
+    return ContextOverflow(
+        prompt_tokens=prompt,
+        n_ctx=window,
+        message=(
+            f"{head} Clear the chat, delete older messages, or reload the model with a "
+            "larger context (its ctx_size setting, or fewer parallel slots)."
+        ),
+    )
+
+
+def chat_error_text(
+    status_code: int | None,
+    body: Any,
+    *,
+    n_ctx: int | None = None,
+    model_id: str | None = None,
+) -> str:
+    """One readable line for a failed Chat request.
+
+    The context refusal becomes :func:`context_overflow`'s advice; anything
+    else is the engine's own ``error.message`` (not the raw JSON), prefixed
+    with the status when there is one, and clipped to 600 characters.
+    """
+    overflow = context_overflow(status_code, body, n_ctx=n_ctx, model_id=model_id)
+    if overflow is not None:
+        return overflow.message
+    _error, message = _error_object(body)
+    message = " ".join(message.split())[:600] or "no details"
+    return f"HTTP {status_code}: {message}" if status_code is not None else message
+
+
+def stream_error(data: Mapping[str, Any] | None) -> bool:
+    """Whether a parsed stream frame is an error (``data: {"error": ...}``).
+
+    llama-server reports a failure that happens after the 200 this way, with
+    no ``choices``; a reader that only looks at ``choices`` ends the reply
+    quietly as if the model had finished. Pass the frame to
+    :func:`chat_error_text` with ``status_code=None``.
+    """
+    return isinstance(data, Mapping) and data.get("error") not in (None, "", {})
+
+
+@dataclass(frozen=True)
+class PrefillProgress:
+    """A ``prompt_progress`` frame: how far prompt processing has got."""
+
+    total: int
+    processed: int
+    cached: int
+
+    @property
+    def fraction(self) -> float:
+        return min(1.0, self.processed / self.total) if self.total else 0.0
+
+    @property
+    def text(self) -> str:
+        return f"reading the prompt… {self.fraction:.0%} of {self.total:,} tok"
+
+
+def prefill_progress(data: Mapping[str, Any] | None) -> PrefillProgress | None:
+    """The progress block llama-server streams when the request sets ``return_progress``.
+
+    ``{"prompt_progress": {"total", "cache", "processed", "time_ms"}}``, on
+    frames with no text. On a long conversation prefill is the wait, and these
+    frames are the only bytes on the wire until the first token -- which is
+    also what lets a Stop checked per frame take effect during it. ``None`` for
+    any other frame or an unexpected shape.
+    """
+    if not isinstance(data, Mapping):
+        return None
+    block = data.get("prompt_progress")
+    if not isinstance(block, Mapping):
+        return None
+    total = _positive_int(block.get("total"))
+    processed = block.get("processed")
+    if total is None or isinstance(processed, bool) or not isinstance(processed, int):
+        return None
+    cached = block.get("cache")
+    cached = cached if isinstance(cached, int) and not isinstance(cached, bool) else 0
+    return PrefillProgress(total=total, processed=max(0, processed), cached=max(0, cached))
 
 
 # ---------------------------------------------------------------------------
