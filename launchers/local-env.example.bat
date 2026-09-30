@@ -10,4 +10,4 @@ set "SF_DATA_DIR=C:\Users\%USERNAME%\StudioForge-data"
 
 REM Other knobs the launchers honour (uncomment to use):
 REM set "SF_CONFIG=C:\somewhere\config.yaml"      a specific config file
-REM set "SF_TEST_MODELS_DIR=E:\LLM\Models"         where the contract tests find GGUFs
+REM set "SF_TEST_MODELS_DIR=D:\models"             where the contract tests find GGUFs

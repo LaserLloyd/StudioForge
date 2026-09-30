@@ -22,7 +22,7 @@ pip install studioforge-companion
 Then point it at a rig:
 
 ```bash
-sfctl servers add rig http://100.64.0.3:1234 --api-key sf-your-key --use
+sfctl servers add rig http://100.x.y.z:1234 --api-key sf-your-key --use
 sfctl status
 ```
 
@@ -36,9 +36,9 @@ an API key. The key is never printed: everything that renders it redacts it firs
 default = "rig"
 
 [servers.rig]
-url = "http://100.64.0.3:1234"
+url = "http://100.x.y.z:1234"
 api_key = "sf-..."
-watchdog_url = "http://100.64.0.3:1235"   # optional; derived from url + port 1235
+watchdog_url = "http://100.x.y.z:1235"   # optional; derived from url + port 1235
 
 [servers.laptop]
 url = "http://192.168.1.50:1234"
@@ -192,7 +192,7 @@ killing the session.
 Also point the agent's inference at the same box:
 
 ```
-OPENAI_BASE_URL=http://100.64.0.3:1234/v1
+OPENAI_BASE_URL=http://100.x.y.z:1234/v1
 OPENAI_API_KEY=sf-your-key
 ```
 

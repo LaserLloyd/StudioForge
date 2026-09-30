@@ -323,7 +323,7 @@ class _StoppableSupervisor(FakeSupervisor):
 def _install(app: Any, instances: list[InstanceInfo]) -> _StoppableSupervisor:
     supervisor = _StoppableSupervisor(
         instances,
-        log_dir=Path("C:/Users/operator/Desktop/_UserData/StudioForge/logs"),  # scrub-ok: fixture
+        log_dir=Path("C:/Users/operator/StudioForge-data/logs"),  # scrub-ok: fixture
     )
     app.state.supervisor = supervisor
     app.state.manager.supervisor = supervisor
@@ -582,13 +582,13 @@ def test_vram_holders_hide_every_command_line_from_a_lan_reader(
 
     def fake_view(probe: Any, engines_dir: Any, *, own_pids: Any = ()) -> dict[str, Any]:
         return {
-            "engines_dir": PROFILE + "\\_UserData\\StudioForge\\engines",
+            "engines_dir": PROFILE + "\\StudioForge-data\\engines",
             "orphan_count": 0,
             "holders": [
                 {
                     "pid": 11104,
                     "classification": "foreign",
-                    "exe": "E:\\SD\\ComfyUI\\venv\\Scripts\\python.exe",
+                    "exe": "D:\\apps\\ComfyUI\\venv\\Scripts\\python.exe",
                     "parent_name": "C:\\Windows\\explorer.exe",
                     "parent_cmdline": "docker run -e TOKEN=hunter2 image",
                     "detail": "--alias secret-alias --port 41001",
@@ -659,7 +659,7 @@ class _FakeWatchdog:
             "summary": "1 child up",
             "children_total": 1,
             "children_unhealthy": 0,
-            "config_path": PROFILE + "\\_UserData\\StudioForge\\config.yaml",
+            "config_path": PROFILE + "\\StudioForge-data\\config.yaml",
             "children": [{"pid": 4242, "alias": "vendor/Model-Q8_0", "port": 41000}],
             "server": {"status": "ok"},
         }

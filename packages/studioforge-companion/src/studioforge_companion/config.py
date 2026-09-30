@@ -78,7 +78,7 @@ def redact(value: str | None) -> str | None:
 def normalize_url(raw: str, *, field: str = "url") -> str:
     """Return ``scheme://host[:port]`` or raise :class:`CompanionConfigError`.
 
-    Accepts what people actually type (``100.64.0.3:1234``), rejects what
+    Accepts what people actually type (``192.168.1.50:1234``), rejects what
     silently breaks path joining later (a trailing path component), and strips
     the trailing slash so ``f"{url}/api"`` never produces a double slash.
     """

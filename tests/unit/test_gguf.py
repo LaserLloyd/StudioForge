@@ -5,9 +5,10 @@ Two halves:
 * **Synthetic** -- tiny GGUF files assembled byte-by-byte in ``tmp_path``. These
   own the format contract (every value type, array truncation, tensor byte
   math, malformed input) because they can express cases no real file does.
-* **Real library** -- every ``*.gguf`` under ``E:\\LLM\\Models``, skipped when
-  that drive is absent. These catch what synthetic tests structurally cannot:
-  metadata conventions that quantisers actually emit.
+* **Real library** -- every ``*.gguf`` under ``SF_TEST_MODELS_DIR`` (else the
+  auto-detected LM Studio library), skipped when there is none. These catch
+  what synthetic tests structurally cannot: metadata conventions that
+  quantisers actually emit.
 """
 
 from __future__ import annotations
