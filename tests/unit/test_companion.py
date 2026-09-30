@@ -1916,6 +1916,78 @@ def test_no_readback_at_all_without_persist(monkeypatch: Any) -> None:
     assert "did not persist" not in _all_output(result)
 
 
+async def test_load_recommended_sends_the_slot_shape_only_when_asked() -> None:
+    """D72: `min_slots` and `kv_unified` follow the same rule as the D48 keys --
+    absent unless set -- so an older server sees the request it always saw.
+    An explicit `kv_unified: false` is an opinion ("partitioned") and is sent."""
+    seen: list[Any] = []
+
+    async with StudioForgeClient(STUB_PROFILE) as client:
+        client.http._transport = _recording_transport(seen)  # noqa: SLF001 - shape the wire
+        await client.load_recommended("m", ctx_size=8192, min_slots=None, kv_unified=None)
+        await client.load_recommended("m", ctx_size=8192, min_slots=2, kv_unified=True)
+        await client.load_recommended("m", ctx_size=8192, kv_unified=False)
+
+    assert seen == [
+        {"ctx_size": 8192},
+        {"ctx_size": 8192, "min_slots": 2, "kv_unified": True},
+        {"ctx_size": 8192, "kv_unified": False},
+    ]
+
+
+def test_the_slot_shape_flags_reach_the_client(monkeypatch: Any) -> None:
+    captured = _load_recommended_kwargs(monkeypatch, "--min-slots", "2", "--kv-unified")
+    assert captured["min_slots"] == 2
+    assert captured["kv_unified"] is True
+    assert _load_recommended_kwargs(monkeypatch, "--kv-partitioned")["kv_unified"] is False
+    unset = _load_recommended_kwargs(monkeypatch)
+    assert unset["min_slots"] is None
+    assert unset["kv_unified"] is None, "no flag is no opinion, not 'partitioned'"
+
+
+def _run_shape(monkeypatch: Any, launched: dict[str, Any], *flags: str) -> Any:
+    """`load-recommended` against a server that launched ``launched``."""
+
+    class _Recorder:
+        async def load_recommended(self, model: str, **kwargs: Any) -> Any:
+            return {"plan": dict(launched)}
+
+    monkeypatch.setattr(cli_module, "with_client", lambda work: asyncio.run(work(_Recorder())))
+    return runner.invoke(
+        cli_module.app,
+        [
+            "--url",
+            "http://rig:1234",
+            "--no-color",
+            "models",
+            "load-recommended",
+            "big/model",
+            "--ctx",
+            "8192",
+            *flags,
+        ],
+        catch_exceptions=False,
+    )
+
+
+def test_a_slot_shape_an_old_server_dropped_is_a_warning_not_a_failure(monkeypatch: Any) -> None:
+    """A pre-D72 server ignores both body fields and loads its usual one slot."""
+    one_slot = {"ctx_size": 8192, "ctx_per_slot": 8192, "parallel": 1}
+    result = _run_shape(monkeypatch, one_slot, "--min-slots", "2", "--kv-unified")
+    assert result.exit_code == 0, _all_output(result)
+    assert "did not load in the slot shape asked for" in result.stderr
+    assert "--kv-unified asked for one shared pool" in result.stderr
+    assert "--min-slots asked for at least 2 slots; it has 1" in result.stderr
+    assert "slot shape" not in result.stdout
+
+
+def test_the_slot_shape_that_launched_says_nothing(monkeypatch: Any) -> None:
+    pool = {"ctx_size": 8192, "ctx_per_slot": 8192, "parallel": 2, "kv_unified": True}
+    result = _run_shape(monkeypatch, pool, "--min-slots", "2", "--kv-unified")
+    assert result.exit_code == 0, _all_output(result)
+    assert "slot shape" not in _all_output(result)
+
+
 def _busy_response(payload: Any, *, headers: dict[str, str] | None = None) -> httpx.Response:
     request = httpx.Request("POST", "http://rig:1234/api/models/beta/load")
     return httpx.Response(503, json=payload, headers=headers, request=request)

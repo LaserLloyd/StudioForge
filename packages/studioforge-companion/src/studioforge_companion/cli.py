@@ -1007,7 +1007,10 @@ def models_load_recommended(
     ``--min-slots`` is a floor on the slot count, and ``--kv-unified`` makes
     ``--ctx`` ONE pool the slots share -- each may use all of it, for the VRAM
     of about one slot (D72). Two slots over one pool is the shape for "one
-    main conversation plus quick side requests". It cannot be persisted.
+    main conversation plus quick side requests". It cannot be persisted. The
+    shape that launched is checked the same way ``--persist`` is: a server
+    that predates the two flags drops them and answers 200, and the mismatch
+    is a warning on stderr.
     """
     readback: dict[str, Any] = {}
 
@@ -1040,6 +1043,8 @@ def models_load_recommended(
         _print_plan(payload.get("plan") or payload)
     if persist:
         _warn_if_not_persisted(model, payload, readback.get("settings"))
+    if min_slots is not None or kv_unified:
+        _warn_if_shape_ignored(payload, min_slots=min_slots, kv_unified=kv_unified)
 
 
 #: What ``--persist`` writes, as ``settings field -> plan field``. ``ctx_size``
@@ -1119,6 +1124,38 @@ def _persist_warning(model: str, details: Sequence[str]) -> None:
     )
     for line in details:
         STATE.err.print(f"  - {line}")
+
+
+def _warn_if_shape_ignored(payload: Any, *, min_slots: int | None, kv_unified: bool | None) -> None:
+    """Warn when the load did not come back in the slot shape it asked for (D72).
+
+    ``min_slots`` and ``kv_unified`` are body fields a server before D72 has
+    never heard of: it drops them and answers 200 with its usual slots. So
+    the shape is read off what launched rather than assumed. As with
+    ``--persist``, this is a warning on stderr, never the exit code.
+    """
+    plan = payload.get("plan") if isinstance(payload, dict) else None
+    if not isinstance(plan, dict):
+        return
+    problems: list[str] = []
+    if kv_unified and plan.get("kv_unified") is not True:
+        problems.append("--kv-unified asked for one shared pool; the slots are partitioned")
+    parallel = plan.get("parallel")
+    if (
+        min_slots is not None
+        and isinstance(parallel, int)
+        and not isinstance(parallel, bool)
+        and parallel < min_slots
+    ):
+        problems.append(f"--min-slots asked for at least {min_slots} slots; it has {parallel}")
+    if problems:
+        STATE.err.print(
+            "warning: the model did not load in the slot shape asked for -- the server "
+            "may predate --min-slots/--kv-unified (its /api/capabilities lists "
+            "'shared_kv_pool' when it has them)"
+        )
+        for line in problems:
+            STATE.err.print(f"  - {line}")
 
 
 def _mtp_cell(entry: dict[str, Any]) -> str:
