@@ -356,10 +356,11 @@ existing clients; `estimate_bytes` beside it is the same breakdown in bytes, the
 
 `plan_load` and `/plan` preview **`load_model`**. To preview **`load_recommended`** -- the strict
 exact-context mode walk -- use `GET /api/models/{id}/plan-recommended` with the same inputs as
-query parameters (`ctx_size`, `prefer_mode`, `kv_min`, `max_slots`, `allowed_devices`,
-`priority`). It runs the very decision the real call acts on and answers `200` with either the
-placement (`mode`, `devices`, `ctx_size`, KV types, `parallel`, `evict_model_ids`, `notes`,
-`estimate_bytes`) or `fits: false` plus the exact `error` body, `status_code`, `code`,
+query parameters (`ctx_size`, `prefer_mode`, `kv_min`, `max_slots`, `min_slots`, `kv_unified`,
+`allowed_devices`, `priority`). It runs the very decision the real call acts on and answers `200`
+with either the placement (`mode`, `devices`, `ctx_size`, `ctx_per_slot`, `ctx_total`,
+`kv_unified`, KV types, `parallel`, `evict_model_ids`, `notes`, `estimate_bytes`) or
+`fits: false` plus the exact `error` body, `status_code`, `code`,
 `retry_after_s`, `shortfall_bytes`, `largest_term` and `max_ctx_that_fits` the real call would
 return. Nothing is loaded or evicted. See [CATALOG.md](CATALOG.md) for the full shape (D64).
 
@@ -561,6 +562,8 @@ Everything else about the call is optional:
 | `prefer_mode` | Try this hardware mode first (`"dual_3090"`), instead of the headline order. |
 | `kv_min` | The lowest KV cache quality this load may accept — `"f16"`, `"q8_0"` or `"q4_0"`. A floor on the quality-first ladder, not a choice: `"f16"` means "do not quantize the cache to reach this window at all", and a window that would need a worse cache is refused rather than reached quietly at lower quality. |
 | `max_slots` | Ceiling on the slot count this load may choose (>= 1). The server's own number is what the placement *could* sustain; if you know only three bots will ever talk to it, cap it here and the KV cache for the slots you will not use is never priced into the fit — which often buys a larger window instead. Below 1 is a `400` naming the parameter. |
+| `min_slots` | The fewest slots this load may have (>= 1, not above `max_slots`). The server still picks the count, never below this, and judges the fit AT this count: a window that only fits with fewer slots is the same structured refusal, naming the largest context this many slots would get (`max_ctx_that_fits`) and the most slots that fit at this window (`max_parallel_that_fits`). Above the model's `max_parallel_cap` it is a `400`. |
+| `kv_unified` | `true` makes `ctx_size` ONE pool the slots share (D72): each conversation may use the whole window, all of them together may not exceed it, and the pool costs about what one slot of that window costs. Right for one main conversation plus short side requests on other slots — `{"min_slots": 2, "max_slots": 2, "kv_unified": true}` — so a side request never pushes the conversation's cached prompt out. Wrong for several long conversations at once: a pool they fill fails the request that runs out of room mid-generation. Omitted or `false`: `ctx_size` per slot, each slot its own. Cannot be combined with `persist`. |
 | `allowed_devices` | The CUDA indices this walk may use, for this call only — `[1, 2, 3]` to keep off card 0. A bound, not a placement: the server still walks the placements over those cards, still picks the KV cache type and the slot count, and still refuses with the same structured error if the window does not fit on any of them. `prefer_mode` then names one of the modes over *those* cards. Never saved (`persist` included), and it only narrows — a card a saved setting, an exclusion or a lease forbids stays forbidden. Empty list is a `400`. |
 | `persist` | Write the profile this call resolved into the model's saved settings (below). |
 | `priority` | The load's tier, exactly as on `load_model`: `1` chat, `2` agent, `3` or omitted background. |
@@ -584,9 +587,11 @@ clears the field whatever it currently holds. Devices are
 deliberately **not** persisted: a placement is a one-shot load argument, so the cards are still
 chosen fresh on every load.
 
-Two calls are refused outright, before anything loads: `persist` on a preset-only virtual model
-(the write would land on the base model and every persona sharing it — call it on the base id), and
-`persist` while that model is being benchmarked (the run rewrites those very fields). Afterwards
+Three calls are refused outright, before anything loads: `persist` on a preset-only virtual model
+(the write would land on the base model and every persona sharing it — call it on the base id),
+`persist` with `kv_unified: true` (the saved settings keep `ctx_size` per slot and cannot hold a
+shared pool, D72), and `persist` while that model is being benchmarked (the run rewrites those
+very fields). Afterwards
 the write is best-effort: if a benchmark starts *during* the load, or the settings validation
 rejects the resolved row, the load stands and only the write is skipped, with a warning in the
 server log. So a success means the model is loaded; it does not by itself prove the profile was

@@ -88,8 +88,10 @@ for an iSWA model was 20x the real figure — every Gemma-4 row read `max_parall
 * `CTX_FILL_FRACTION = 0.5` assumes slots sit half full. Real workloads vary enormously.
 * The MoE derate of 0.5 is an approximation of experts fanning out with batch size, not a
   measurement. No benchmark on this rig has located a real knee yet.
-* `--ctx-checkpoints` defaults to **32 per slot** and is **not modelled**, so predicted-vs-actual
-  should be expected to drift upward at high slot counts. Watch it before trusting 8 slots.
+* Context checkpoints live in **host RAM**, not VRAM (D72), so they do not move predicted-vs-actual
+  VRAM. Their RAM is not modelled either: about 800 MiB each at f16 for a Gemma-4 31B, 8 per slot
+  on sliding-window and hybrid models (the engine's default is 32). Watch host RAM before
+  trusting 8 slots of such a model.
 
 Both approximations err toward *fewer* slots, which is the direction that cannot cause an OOM.
 
@@ -332,6 +334,14 @@ conversation can use the whole `--ctx-size`. The cost is measured and real — t
 exceeded"** *mid-generation*, where the partitioned pool had refused them cleanly before any work
 started. Turn it on for a single-user long-context model; leave it off for an agent host.
 
+`load-recommended` with `kv_unified: true` builds the same kind of pool for one load (D72), with
+`ctx_size` as the pool itself. It carries the same risk, bounded by its intended use: one main
+conversation plus short side requests, capped with `max_slots`. The main conversation's prompt
+plus the largest side request must fit in `ctx_size` together. When they do not, the request
+that runs out of room fails mid-generation. A pool is also only built by `load-recommended`:
+an on-demand load, a restart or an engine activation reloads from the saved settings, which
+cannot express one.
+
 ## Load tiers, and what a restart keeps
 
 A load's tier (D46 — `1` chat, `2` agent, `3` background) lives in two places with different
@@ -372,7 +382,8 @@ freeze, not a hint, and it is the price of not repeating a multi-minute walk.
 
 The placement is deliberately **not** part of it: devices are never persisted, so the cards are
 still chosen fresh on every load (D36). A profile saved while two GPUs happened to be free does not
-pin the model to them.
+pin the model to them. Nor is a shared pool: `persist` with `kv_unified: true` is a `400`, because
+the saved `ctx_size` is per slot and the next plain load would build the pool once per slot (D72).
 
 The write is also best-effort once the load has succeeded: **any** save-time failure is a logged
 skip rather than an error — a benchmark that starts during the load, the settings validation
@@ -472,10 +483,13 @@ That guarantees a non-empty reply, but it means:
   prompt-cache benefit.
 * **No prefix sharing across slots.** A slot reuses only the prompt *it* last held, so at
   `parallel: N` the first N concurrent requests each prefill the whole prompt. And on hybrid or
-  recurrent models (`attention_kind: hybrid` — every Qwen3.5-family model here) prefix reuse is
-  quantised to *context checkpoints*: user-message starts at least `--checkpoint-min-step` (8192)
-  tokens apart, the last user message, and the prompt tail. The part of a prompt that differs
-  per request must begin a user message. Arithmetic and recipe in
+  recurrent models (`attention_kind: hybrid` — every Qwen3.5-family model here) and on
+  sliding-window models (`iswa` — Gemma 3/4) prefix reuse is quantised to *context checkpoints*:
+  user-message starts at least `--checkpoint-min-step` (8192) tokens apart, the last user message,
+  and the prompt tail. The part of a prompt that differs per request must begin a user message; a
+  change inside the system prompt re-reads everything. `--cache-reuse` does nothing on a
+  sliding-window model (the engine turns it off), and StudioForge no longer passes it there (D72).
+  Arithmetic and recipe in
   [`OPENCLAW-LONG-CONTEXT.md` §4](OPENCLAW-LONG-CONTEXT.md#4-concurrent-requests-that-share-a-prefix).
 * Image token cost is read from mmproj metadata where present, otherwise a documented default of
   1024 tokens/image. That is a context-budget estimate, not a VRAM one.

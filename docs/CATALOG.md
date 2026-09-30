@@ -570,8 +570,9 @@ GET /api/models/{id}/plan-recommended?ctx_size=262144&kv_min=f16&allowed_devices
 ```
 
 What `load-recommended` would do right now, without doing it. It takes the same inputs as query
-parameters -- `ctx_size` (required), `prefer_mode`, `kv_min`, `max_slots`, `allowed_devices`
-(repeated per index) and `priority` -- refuses bad ones with the same `400`, and runs **the same
+parameters -- `ctx_size` (required), `prefer_mode`, `kv_min`, `max_slots`, `min_slots`,
+`kv_unified`, `allowed_devices` (repeated per index) and `priority` -- refuses bad ones with the
+same `400`, and runs **the same
 decision function** the real call acts on, so the two cannot disagree (the lesson of CR-9, where two
 paths answered one question two ways). Nothing is loaded, evicted, leased, held, re-tiered or
 persisted. Same auth as `/plan`: a GET, ungated. It is a separate route rather than
@@ -583,14 +584,16 @@ It always answers `200`:
 | Field | On a fit (`fits: true`) | On a refusal (`fits: false`) |
 | --- | --- | --- |
 | `mode`, `label`, `devices`, `ctx_size`, `kv_cache_type`, `kv_cache_type_v`, `parallel` | the placement the call would load | -- |
+| `ctx_per_slot`, `ctx_total`, `kv_unified` | what one conversation may use, what reaches `--ctx-size`, and whether the slots share one pool (all three equal `ctx_size` for a pool, D72) | -- |
 | `evict_model_ids` | the idle models the load would stop | `[]` |
 | `notes`, `lease_skipped_modes`, `placement_tier` | the plan's notes, incl. a lease routed around | -- |
 | `estimate_bytes` | every estimate term in **bytes**, plus `total` | -- |
 | `already_loaded` | `true` when the call would hand back the resident unchanged | -- |
 | `status_code`, `code`, `message`, `error` | -- | the status and the exact error body the call would answer with (`507` / `503`) |
 | `retry_after_s`, `shortfall_bytes`, `largest_term`, `max_ctx_that_fits` | -- | lifted from the refusal |
-| `modes` | every mode tried, with `fits`, `reason`, `leased_devices` | the same |
-| `dry_run`, `model_id`, `requested_ctx`, `priority`, `allowed_devices` | always | always |
+| `kv_unified`, `max_parallel_that_fits` | -- | the pool shape the refusal was judged in, and the most slots any mode holds at the window when a `min_slots` floor was the obstacle (D72) |
+| `modes` | every mode tried, with `fits`, `reason`, `leased_devices`, `max_parallel_that_fits` | the same |
+| `dry_run`, `model_id`, `requested_ctx`, `priority`, `allowed_devices`, `min_slots` | always | always |
 
 Not previewed: the D46 `503 priority_hold` (a transient admission wait while a better-tier load is
 in flight, not a placement decision), and the D51 observed correction the real load may apply to the
@@ -613,8 +616,9 @@ priority leaves the saved tier untouched rather than freezing the tier the load 
 at. The placement is deliberately not written (a set of cards is a one-shot load argument, D36).
 The trade is that it freezes the KV ladder and the slot estimator for that model until those
 fields are nulled again through `PATCH /api/models/{id}/settings`. It is refused
-outright for a preset-only virtual model (the write would land on the base and every persona) and
-while that model is being benchmarked; after a successful load **any** failed write — a refusal, a
+outright for a preset-only virtual model (the write would land on the base and every persona),
+with `kv_unified: true` (the settings cannot hold a shared pool, D72) and while that model is
+being benchmarked; after a successful load **any** failed write — a refusal, a
 record deleted mid-walk, a storage error — is skipped with a warning rather than failing the load.
 Over REST the flag needs the D32 admin credential when the caller is not on the box, even though
 the route itself is open — see
@@ -624,6 +628,42 @@ Measured live on the scratch instance, 2026-08-19: `{"ctx_size": 32768}` loaded 
 `[0, 1]` with 2 slots and an f16 cache; `{"ctx_size": 65536}` against a 32768-token model returned
 the `400` above; `{"ctx_size": 12345, "prefer_mode": "dual_3090"}` loaded at exactly 12345 on
 `[2, 3]` with 6 slots.
+
+### Two slots over one pool: `min_slots` and `kv_unified` (D72)
+
+```
+POST /api/models/{id}/load-recommended {"ctx_size": 200000, "min_slots": 2, "max_slots": 2, "kv_unified": true}
+```
+
+This is for one main conversation plus short side requests (titles, memory, summaries) on the
+same model. The two run on different slots, so a side request never replaces the conversation's
+cached prompt, and the second slot costs about what one slot does.
+
+- **`min_slots`** is a floor on the slot count the walk picks. The fit, the KV cache type and any
+  refusal are judged AT the floor. A window that only fits with fewer slots is a `507` carrying
+  `max_ctx_that_fits` (for that many slots) and `max_parallel_that_fits` (the most slots any mode
+  holds at the window), never a load with fewer slots. Above `max_slots` or above the model's
+  `max_parallel_cap` it is a `400`.
+- **`kv_unified: true`** makes `ctx_size` ONE pool that the slots share. The child runs
+  `--ctx-size ctx_size --parallel N --kv-unified --no-cache-idle-slots`. Each slot may use the
+  whole pool; together they may not exceed it. The planner charges one pool of `ctx_size` plus
+  what really grows with the slots: each extra slot's sliding-window cells (+800 MiB at f16 for a
+  Gemma-4 31B's second slot) and recurrent state. Partitioned slots would cost `ctx_size` of KV
+  each. `ctx_per_slot`, `ctx_total` and `ctx_size` are then the same number everywhere they are
+  reported, and `/v1/models` says `kv_unified: true`.
+- **`--no-cache-idle-slots`** is there because with a unified cache the engine otherwise clears
+  every idle slot when another slot starts a task, and the chat would lose its prompt to every
+  side request.
+- **A resident is "already exactly that"** only at or above `min_slots`, and only in the pool
+  shape the caller named, if it named one. A caller that names neither field gets exactly the
+  answer it got before D72.
+- **The limit is the pool.** When several long conversations run at once and fill it, the request
+  that runs out of room fails mid-generation (the D38 measurement). Keep the main conversation
+  plus the largest side request within `ctx_size`, and cap the count with `max_slots`.
+- **`persist` cannot save a pool.** The saved settings keep `ctx_size` per slot, so `persist`
+  with `kv_unified: true` is a `400`. An on-demand load, a restart or an engine activation
+  reloads from the saved settings; the next `load-recommended` puts the pool back.
+- Without `kv_unified`, `min_slots` asks for partitioned slots of `ctx_size` each.
 
 ---
 

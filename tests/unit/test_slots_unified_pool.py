@@ -772,3 +772,14 @@ def test_the_manager_takes_the_fields_with_no_opinion_as_the_default() -> None:
         params = inspect.signature(method).parameters
         assert params["min_slots"].default is None
         assert params["kv_unified"].default is None
+
+
+def test_a_client_can_gate_on_the_pool_before_asking_for_one() -> None:
+    """A server without D72 answers 200 and ignores the two body fields, so a
+    400 never tells a client it asked too early -- the feature name does."""
+    from studioforge.core import capabilities
+
+    report = capabilities.implemented_report()
+    assert report["feature_decisions"]["shared_kv_pool"] == "D72"
+    assert report["feature_decisions"]["context_checkpoint_settings"] == "D72"
+    assert "D72" in report["decisions"]

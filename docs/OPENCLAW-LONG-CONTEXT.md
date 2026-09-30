@@ -73,9 +73,12 @@ vendor bandwidth and FLOPS — an order of magnitude, not a promise).
 The story-drafter pattern: one long shared bible, N per-chapter requests sent together. What the
 prompt cache does for it, what it cannot do, and how to tell the difference (D54).
 
-**What is on.** Every multi-slot launch on this server carries `--cache-reuse 256`, a share of the
-host-RAM prompt cache (`--cache-ram`, a 32 GiB pool split between residents), prefix-aware slot
-routing (`--slot-prompt-similarity 0.3`) and a partitioned KV pool (`--no-kv-unified`). Prompt
+**What is on.** Every multi-slot launch on this server carries `--cache-reuse 256` (except on a
+sliding-window model, whose cache cannot shift, D72), a share of the host-RAM prompt cache
+(`--cache-ram`, a 32 GiB pool split between residents), prefix-aware slot routing
+(`--slot-prompt-similarity 0.3`) and a partitioned KV pool (`--no-kv-unified`) unless the load
+asked for a shared one (`load-recommended` with `kv_unified: true`, which launches
+`--kv-unified --no-cache-idle-slots`). Prompt
 caching and continuous batching are the engine's own defaults and are on unless a setting turns
 them off. A `null` in a model's `settings` (`cache_reuse`, `cont_batching`, `kv_unified`) means
 **inherit**, not off. Do not read the settings to learn what a child is doing — read `effective`,
@@ -104,14 +107,18 @@ fully warm cache leaves it exactly where it was. The truthful signals:
    `P + 6·0.14·P ≈ 1.9·P`, and Σ `usage.prompt_tokens` is 68,511 either way. Warming the prefix
    first does not change the total: one warm slot serves one first-wave request and the other
    two still prefill cold. No setting beats `parallel × prefix`.
-2. **Hybrid models reuse back to a checkpoint.** On `attention_kind: hybrid` (every Qwen3.5/3.6/3.8
-   here) the recurrent state cannot be rolled back to an arbitrary token, so reuse rolls back to
-   the newest *context checkpoint* at or before the point of divergence — and if none exists the
-   prompt is processed from scratch. Checkpoints sit at the start of user messages at least
-   `--checkpoint-min-step` (8192) tokens apart, at the start of the **last** user message, and near
-   the end of the prompt. So the part that differs per request must **begin a user message**. A
-   template with `{chapter}` in the middle of the shared bible message diverges before the last
-   checkpoint and loses most of the prefix.
+2. **Hybrid and sliding-window models reuse back to a checkpoint.** On `attention_kind: hybrid`
+   (every Qwen3.5/3.6/3.8 here) the recurrent state cannot be rolled back to an arbitrary token,
+   and on `iswa` (Gemma 3/4) the sliding-window layers have already dropped the cells behind
+   their window. So reuse rolls back to the newest *context checkpoint* at or before the point of
+   divergence, and if none exists the prompt is processed from scratch. (On a sliding-window
+   model, a divergence within a few hundred tokens of the end of what the slot holds needs none:
+   the window still covers it.) Checkpoints sit at the
+   start of user messages at least `--checkpoint-min-step` (8192) tokens apart, at the start of
+   the **last** user message, and near the end of the prompt, 8 per slot at most on these models
+   (D72). So the part that differs per request must **begin a user message**. A template with
+   `{chapter}` in the middle of the shared bible message diverges before the last checkpoint and
+   loses most of the prefix.
 
 **The recipe.**
 

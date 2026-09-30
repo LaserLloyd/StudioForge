@@ -121,10 +121,29 @@ not an approximation of it):
 
 **Two limits that no setting removes.** A slot only reuses what *it* holds — there is no sharing
 across slots, so at `parallel: N` the first N concurrent requests each prefill the whole prompt.
-And a hybrid or recurrent model (`attention_kind: hybrid`) reuses back to the nearest *context
-checkpoint* (`--ctx-checkpoints 32`, `--checkpoint-min-step 8192`), which sit at user-message
-starts; the part of a prompt that differs must begin a user message. The arithmetic and the
-recipe are in [OPENCLAW-LONG-CONTEXT.md §4](OPENCLAW-LONG-CONTEXT.md#4-concurrent-requests-that-share-a-prefix).
+And a model whose cache cannot be rolled back — hybrid/recurrent (`attention_kind: hybrid`) or
+sliding-window (`iswa`, Gemma 3/4) — reuses back to the nearest *context checkpoint*, which sit
+at user-message starts at least `--checkpoint-min-step` (8192) apart, at the last user message
+and near the end of the prompt. The part of a prompt that differs must begin a user message. The
+arithmetic and the recipe are in [OPENCLAW-LONG-CONTEXT.md §4](OPENCLAW-LONG-CONTEXT.md#4-concurrent-requests-that-share-a-prefix).
+
+**Checkpoints are per-model settings (D72).** Each checkpoint is a copy of the slot's
+sliding-window cells or recurrent state, and it lives in **host RAM**: about 800 MiB at f16 for a
+Gemma-4 31B, so the engine's default of 32 per slot can hold ~25 GiB. StudioForge passes
+`--ctx-checkpoints 8` to iswa/hybrid models (`models.auto_ctx_checkpoints`) and keeps the
+engine's spacing (`models.auto_checkpoint_min_step: null`). A denser spacing buys nothing for a
+chat, whose next turn diverges at the last user message, and that message always has a
+checkpoint. A model's own `ctx_checkpoints` / `checkpoint_min_step` wins (`0` = none / no
+minimum), `extra_flags` win last, and `effective.checkpoint_sources` says which one applied.
+Full-attention models never make checkpoints and get no flag.
+
+**`--cache-reuse` on a sliding-window model** is switched off by the engine itself ("cache_reuse
+is not supported by this context"; chunk reuse shifts cached tokens, and a sliding-window cache
+cannot be shifted). StudioForge no longer passes the default to such a model, and an explicit
+per-model value is listed in `effective.inert`. **`settings.slots_debug: true`** starts the child
+with `LLAMA_SERVER_SLOTS_DEBUG=1`, so its log names the tokens on both sides of every point where
+a new prompt stopped matching the cache. That is conversation text in the log, so it is off by
+default.
 
 **What a child is really running with.** A per-model setting of `null` means *inherit*, and
 inherit is not off. Every instance view carries `effective` (D54) — `cache_prompt`,
@@ -207,6 +226,16 @@ literally true, and an over-long request is refused before any work starts. For 
 long-context model, `kv_unified: true` per model doubles (or `parallel`-times) the window a lone
 conversation can reach for free. The failure mode of unified is a 500 *during* generation, which is
 the worst moment to find out.
+
+**A pool per load (D72).** `load-recommended` with `kv_unified: true` makes `ctx_size` the pool
+itself: `--ctx-size ctx_size --parallel N --kv-unified`. That is the shape for one conversation
+plus side requests on a second slot (`min_slots: 2, max_slots: 2`), for about the VRAM of one
+slot. The second slot adds only its sliding-window cells and recurrent state, which the planner
+charges from the model's geometry. Every unified multi-slot launch — this one and the per-model
+switch — also gets `--no-cache-idle-slots`. With a unified cache, the engine's idle-slot snapshot
+otherwise **clears** every idle slot whenever another slot starts a task, even when the copy to
+host RAM failed. `effective` reports `ctx_per_slot == ctx_total` for any unified launch, and its
+summary says whether idle slots are kept.
 
 ---
 

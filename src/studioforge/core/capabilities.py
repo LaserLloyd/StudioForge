@@ -74,7 +74,7 @@ FEATURE_NOTES: dict[str, str] = {
 #: on instead. **Bump it in the same commit that appends a decision**:
 #: ``tests/unit/test_capabilities_implemented.py`` reads the headings of
 #: ``DECISIONS.md`` and fails until the two agree.
-LATEST_DECISION = 71
+LATEST_DECISION = 72
 
 #: Every decision number this build includes, ``"D1"`` .. ``"D<LATEST_DECISION>"``.
 IMPLEMENTED_DECISIONS: tuple[str, ...] = tuple(f"D{n}" for n in range(1, LATEST_DECISION + 1))
@@ -106,6 +106,11 @@ SERVER_FEATURES: dict[str, str] = {
     "build_identity": "D70",
     "unsupported_architecture_refusal": "D66",
     "quant_mtp_detection": "D67",
+    # load-recommended / plan-recommended take min_slots and kv_unified, and
+    # /v1/models reports kv_unified. A server without this ignores the two
+    # body fields and answers 200 with its usual slots -- gate on the name.
+    "shared_kv_pool": "D72",
+    "context_checkpoint_settings": "D72",
 }
 
 

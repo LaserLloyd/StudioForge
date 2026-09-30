@@ -6913,3 +6913,147 @@ many-slots micro-batch (D40) was applied as the child ran it.
   uncounted MoE byte-identical to before.
 
 `test_gguf_capture.py` now pins `>= 3`: D69 needed the bump, D71 moved it on.
+
+## D72 -- Two slots over one KV pool, and context checkpoints that are settings
+
+**Status.** Landed on 2026-09-30 for a companion-chat client that wants a chat slot and a utility
+slot on one model. It reaches the running server with the next serve restart. A caller that sends
+neither new field gets the plan it got before, byte for byte. The one default that moves is the
+checkpoint count of sliding-window and hybrid models (item 9).
+
+**Context.** The client's chat model (Gemma-4 31B, interleaved sliding-window attention) ran one
+slot, and consecutive turns re-read the whole prompt: "0/6150 prompt tokens reused", about 4 s to
+the first token at 6k tokens. Two causes were stacked:
+
+- **One slot.** Every other request the client sends to the same model -- titles, memory,
+  summaries, compaction -- ran in the chat's slot and replaced its cached prompt.
+- **A cache that cannot roll back.** A sliding-window layer has already dropped the cells behind
+  its window, and a recurrent layer keeps one state per sequence. Such a model can only resume a
+  changed prompt from a *context checkpoint*, a copy of that state taken while a prompt was
+  processed. With none at or before the point of divergence, the engine re-reads from token 0.
+
+Two partitioned slots at the chat's 200k window would double its KV cache. `--kv-unified` does
+not: it makes one pool of `--ctx-size` cells that every slot may use whole (llama-context.cpp:
+`n_ctx_seq = n_ctx` when unified). D38 measured the same pool at the same VRAM, and measured how an
+over-committed pool fails: a 500 "Context size has been exceeded" mid-generation. What the b11037
+source says about the rest:
+
+- **What a second slot of a pool costs.** Full-attention layers hold `n_ctx` cells whatever the
+  slot count. A unified sliding-window cache is `GGML_PAD(min(n_ctx, n_swa x n_seq_max + n_ubatch),
+  256)` cells in one stream (llama-kv-cache-iswa.cpp). So the second slot adds `n_swa` cells per
+  window layer: 1,024 cells x 50 layers x 16 KV heads x (256 + 256) at f16 is 800 MiB for the
+  Gemma-4 31B. Recurrent state is per sequence. A MoE's attention mask spans the pool.
+- **Idle slots.** With a unified cache, `--cache-idle-slots` (on by default) copies every idle
+  slot into the host cache whenever another slot starts a task, then CLEARS it, even when the copy
+  failed (`[TAG_IDLE_SLOT_CLEAR]`). A long chat can be larger than the child's share of the host
+  cache, so every utility request could throw the chat's prompt away. When the copy does succeed,
+  the chat's next turn waits for the prompt to be restored.
+- **Checkpoints.** The engine makes them only for a memory that cannot roll back: `n_swa > 0`
+  without `--swa-full`, or a recurrent state. It makes one at the first user-message start, at
+  each later one at least `--checkpoint-min-step` (8192) past the last, always at the last user
+  message, and at N-(4+n_ubatch) and N-4. Each one is the slot's window in HOST RAM, about 800
+  MiB at f16 for the 31B, and the default 32 per slot is ~25 GiB. A chat's next turn diverges at
+  the previous user message, which always has a checkpoint. So a denser spacing buys nothing and
+  costs RAM; the count is what needs a bound.
+- **`--cache-reuse`** shifts cached tokens, so it needs a cache that can shift, and the engine
+  turns it off for iSWA ("cache_reuse is not supported by this context"). `effective` still said
+  `reuse 256`.
+- **`id_slot`** is read from the request body on `/v1/chat/completions` and `/v1/completions`,
+  and the proxy forwards every body field except `ttl` and `priority`.
+
+**Decision.**
+
+1. **`min_slots` and `kv_unified` on load-recommended and its dry run.** They are REST body /
+   query fields, arguments of the MCP `load_recommended` tool, and `sfctl models load-recommended
+   --min-slots N --kv-unified`. Omitted means "no opinion", never `false`.
+   - `kv_unified: true` makes `ctx_size` ONE pool. The plan carries `kv_unified`, its `ctx_total`
+     is `ctx_size`, and the child runs `--ctx-size ctx_size --parallel N --kv-unified`.
+   - `min_slots` is a floor on the slot count the walk picks. Each mode's first planner call is
+     made AT the floor, so the KV rung and the fit are the floor's. The count is `max(min_slots,
+     recommended)` capped by `max_slots`, and the descent stops at the floor.
+   - A mode that cannot hold the floor is a `507`. It carries `max_ctx_that_fits` (for that many
+     slots, in that shape) and `max_parallel_that_fits` (the most slots any mode holds at the
+     window). `min_slots` above `max_slots`, above the model's `max_parallel_cap`, or not a whole
+     number >= 1 is a `400`.
+   - Without `kv_unified`, `min_slots` means partitioned slots of `ctx_size` each, as before.
+2. **Pricing.** `Planner.estimate(kv_unified=True)` charges `kv_alloc_bytes(ctx_total=ctx_size,
+   parallel=N)`, which is the formula above: one pool of full-attention cells, every slot's window
+   cells, recurrent state per slot. The MoE mask spans the pool (D38's 997 -> 1005 MiB at
+   `--ctx-size 16384 --parallel 2`). The slot sizer, the refusal's `max_ctx_that_fits` and the
+   catalog's `slots_for_plan` all price a pool as a pool. The analytic `max_parallel_for`
+   quotient is partitioned arithmetic, so it is not used as a bound for a pool.
+3. **The shortcut.** A resident is "already exactly that" only at or above `min_slots`, and only
+   in the pool shape the caller named, if it named one. A caller that names none takes either.
+4. **`--no-cache-idle-slots`** goes on every unified launch with more than one slot, when the
+   engine advertises the flag; this includes the older per-model `kv_unified` switch. `extra_flags`
+   can still turn the snapshot back on, and `effective` then says "idle slots cleared".
+5. **Every replay keeps the pool:** `reload_settings` (the D42 rebalancer), the D46 restore entry,
+   the transient-OOM re-plan, D50's fold (which never folds a forced reload that asks for a
+   pool), and the D37 slot sweep's restore of the resident it displaced. The sweep also never
+   reuses a resident pool as its own partitioned slots, whose numbers it records.
+6. **Not persisted.** `persist` with `kv_unified: true` is a `400`. The saved settings keep
+   `ctx_size` per slot, so the next plain load would build a pool as many times larger as there
+   are slots. A resident pool handed back to a caller that named no shape is not written either.
+   The older per-model `kv_unified` switch keeps its meaning: ctx per slot, pool = ctx x slots.
+7. **D51 keeps the shapes apart.** A pool's observation row carries `kv_unified: true` in
+   `per_gpu_planned` (the key is absent on every other row), `matching_observation` compares it,
+   and the correction keys include it. A pool of `ctx` at two slots weighs about what one slot of
+   `ctx` does, half a partitioned pair.
+8. **Reported.** `/v1/models` has `studioforge.kv_unified` beside `parallel` and `ctx_per_slot`.
+   plan-recommended adds `ctx_per_slot`, `ctx_total`, `kv_unified`, `min_slots` and
+   `max_parallel_that_fits`. Under `--kv-unified`, `effective.ctx_per_slot == ctx_total` (it was
+   the pool divided by the slots, which no slot is limited to), and the summary reads "unified KV
+   (idle slots kept)". The Chat tab reads "131,072 shared by 2 slots".
+9. **Checkpoints are settings.** `ModelSettings.ctx_checkpoints` and `.checkpoint_min_step`: null
+   means automatic, `0` means none / no minimum. The automatic values are
+   `models.auto_ctx_checkpoints: 8` and `models.auto_checkpoint_min_step: null` (the engine's
+   8192), for models whose `attention_kind` is `iswa` or `hybrid` -- the only ones the engine
+   checkpoints. A per-model value wins, and `extra_flags` still win last. A flag the engine does
+   not advertise is not passed (D38), and a saved value it cannot take is named in
+   `effective.inert`. `effective.checkpoint_sources` says where each value came from: `model`,
+   `auto`, `extra_flags` or `engine_default`. Checkpoints live in host RAM, so the planner prices
+   no VRAM for them.
+10. **`--cache-reuse` is no longer passed by default to an iSWA model.** An explicit per-model value
+    is still passed, and `effective` reports it inert with `cache_reuse: 0`. Hybrid models can
+    shift and keep the default.
+11. **`settings.slots_debug`** starts the child with `LLAMA_SERVER_SLOTS_DEBUG=1` and
+    `LLAMA_SERVER_SLOTS_N_DIFF=32`. The engine then logs the tokens on both sides of every prompt
+    divergence, which names what broke the prefix instead of leaving it to be guessed. It is off
+    by default and per model, because it writes conversation text into the child's log.
+    `effective.slots_debug` and the summary say so while it is on.
+12. **Clients gate on** `"shared_kv_pool"` and `"context_checkpoint_settings"` in
+    `/api/capabilities` `implemented.features`. An older server ignores unknown body fields and
+    answers `200` with its usual slots, so a client reads `parallel` and `kv_unified` back rather
+    than waiting for a `400`.
+
+**Known limits, left honest.**
+- **A pool is shared.** Each slot may use the whole window, and all of them together may not
+  exceed it. If they do, the request that runs out of room fails mid-generation (D38). The shape
+  is for one main conversation plus short side requests, and the chat's prompt plus the largest
+  side request must fit in the pool.
+- **Partitioned iSWA slots are still under-priced.** llama.cpp gives each partitioned stream
+  `GGML_PAD(n_swa + n_ubatch, 256)` window cells, and the planner charges `n_swa x N + n_ubatch`
+  for all of them together. For the 31B at two slots that is 512 cells (~400 MiB at f16) short.
+  It is left as is here because this change keeps every existing plan byte-identical, and D51's
+  observed correction catches it after a first load.
+- **Checkpoint RAM is not modelled.** At worst it is two slots x 8 x ~800 MiB, ~12.5 GiB of host
+  RAM for the 31B at f16.
+- **Only load-recommended builds a pool**, because the saved settings cannot express one. An
+  on-demand (JIT) load, `POST /api/models/{id}/restart` and the reload of residents after an
+  engine activation all load from the saved settings, as they do for every load-recommended
+  shape. The client's next load-recommended reloads the pool.
+- **`id_slot` aimed at a busy slot is queued by the engine, not refused**, and since upstream PR
+  24755 the host-cache save/load may run on that slot first. A client should keep one request in
+  flight per slot.
+
+**Tests.**
+- `tests/unit/test_slots_unified_pool.py`: pricing against the llama.cpp formula and D38's mask
+  figure, the walk and its refusal, dry-run parity, the shortcut, the 400s, the launch and
+  `effective`, every replay path, D51 separation, and REST / MCP / `/v1/models`.
+- `test_context_checkpoints.py`: the automatic default by attention kind, per-model and
+  `extra_flags` precedence, D38 gating and inert naming, `--cache-reuse` on iSWA, and the debug
+  environment.
+- `test_proxy_id_slot.py`: `id_slot` 0 and 1 reach the child, plain and streamed, chat and
+  completions.
+- A pool case in `test_gui_chat.py`, and the sweep's restore and reuse in
+  `test_parallel_bench.py`.
