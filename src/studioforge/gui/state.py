@@ -3388,7 +3388,7 @@ def chat_target_facts(
                 )
             )
         if plan is not None:
-            kv = plan.kv_cache_type
+            kv: str = plan.kv_cache_type
             if plan.kv_cache_type_v and plan.kv_cache_type_v != kv:
                 kv = f"{kv} / {plan.kv_cache_type_v}"
             facts.append(("KV cache", str(kv)))
