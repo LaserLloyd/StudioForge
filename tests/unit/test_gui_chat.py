@@ -965,3 +965,419 @@ def test_chat_css_colours_the_context_readout_by_level() -> None:
         assert f".sfc-ctx-{level}" in css
     assert ".sfc-root" in css
     assert "fit" in chat_assets.CHAT_JS
+
+
+# ---------------------------------------------------------------------------
+# Review fixes: request accounting, Stop in every phase, off-loop rendering
+# ---------------------------------------------------------------------------
+
+
+async def test_a_painter_that_raises_still_ends_the_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import httpx
+
+    _patch_transport(
+        monkeypatch, lambda request: httpx.Response(200, content=_sse(_delta(content="x")))
+    )
+    supervisor = _Supervisor()
+
+    def paint(content: str, reasoning: str, final: bool) -> None:
+        if final:
+            raise RuntimeError("element gone")
+
+    with pytest.raises(RuntimeError, match="element gone"):
+        await chat._stream(
+            _stream_ctx(supervisor), "m", "http://127.0.0.1:1", {}, paint, {"stop": False}
+        )
+    assert [call[0] for call in supervisor.calls] == ["start", "end"]
+
+
+async def test_stoppable_reports_a_stop_that_lands_before_the_task_runs() -> None:
+    ran: list[bool] = []
+
+    async def work() -> str:
+        ran.append(True)
+        return "done"
+
+    run: dict[str, Any] = {"stop": False}
+    waiting = asyncio.create_task(chat._stoppable(work(), run))
+    await asyncio.sleep(0)  # _stoppable has created the task, which has not stepped yet
+    run["stop"] = True
+    run["task"].cancel()
+    assert await waiting is chat._STOPPED
+    assert ran == []
+    assert "task" not in run
+
+
+async def test_stop_during_a_load_abandons_the_wait_not_the_load() -> None:
+    gate = asyncio.Event()
+    finished: list[str] = []
+
+    async def load() -> str:
+        await gate.wait()
+        finished.append("loaded")
+        return "instance"
+
+    shared = asyncio.ensure_future(load())  # other clients may be queued on it
+    run: dict[str, Any] = {"stop": False}
+    waiting = asyncio.create_task(chat._stoppable(asyncio.shield(shared), run))
+    await asyncio.sleep(0.01)
+    run["stop"] = True
+    run["task"].cancel()
+    assert await waiting is chat._STOPPED
+    assert not shared.cancelled()
+    gate.set()
+    assert await shared == "instance"
+    assert finished == ["loaded"]
+
+
+async def test_stoppable_propagates_a_cancel_that_is_not_a_stop() -> None:
+    run: dict[str, Any] = {"stop": False}
+    waiting = asyncio.create_task(chat._stoppable(asyncio.sleep(3600), run))
+    await asyncio.sleep(0.01)
+    run["task"].cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiting
+
+    # The handler's own cancel (shutdown) propagates even after a Stop.
+    run = {"stop": False}
+    waiting = asyncio.create_task(chat._stoppable(asyncio.sleep(3600), run))
+    await asyncio.sleep(0.01)
+    run["stop"] = True
+    waiting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiting
+
+
+async def test_the_renderer_works_off_the_loop_and_the_newest_text_wins() -> None:
+    import threading
+    import time as _time
+
+    loop_thread = threading.get_ident()
+    rendered: list[tuple[str, int]] = []
+    applied: list[tuple[str, str]] = []
+
+    def render(text: str) -> str:
+        rendered.append((text, threading.get_ident()))
+        _time.sleep(0.05)
+        return f"<p>{text}</p>"
+
+    renderer = chat._ReplyRenderer(
+        lambda html, reasoning: applied.append((html, reasoning)), render
+    )
+    for n in range(20):
+        renderer.submit(f"t{n}", "r")
+        await asyncio.sleep(0.005)
+    renderer.submit("final", "thought", final=True)
+    await renderer.drain()
+    assert applied[-1] == ("<p>final</p>", "thought")
+    assert len(rendered) < 21  # paints that arrived mid-render collapsed
+    assert all(thread != loop_thread for _, thread in rendered)
+
+
+async def test_a_slow_render_spaces_out_the_next_one_but_not_the_final() -> None:
+    import time as _time
+
+    def slow(text: str) -> str:
+        _time.sleep(0.3)
+        return text
+
+    applied: list[str] = []
+    renderer = chat._ReplyRenderer(lambda html, reasoning: applied.append(html), slow)
+    started = _time.perf_counter()
+    renderer.submit("a", "")
+    await asyncio.sleep(0.05)
+    renderer.submit("b", "")  # mid-stream: waits ~2x the last render first
+    await renderer.drain()
+    assert applied == ["a", "b"]
+    assert _time.perf_counter() - started >= 1.1
+
+    applied.clear()
+    renderer = chat._ReplyRenderer(lambda html, reasoning: applied.append(html), slow)
+    started = _time.perf_counter()
+    renderer.submit("a", "")
+    await asyncio.sleep(0.05)
+    renderer.submit("end", "", final=True)  # the end of the stream is never held back
+    await renderer.drain()
+    assert applied == ["a", "end"]
+    assert _time.perf_counter() - started < 1.0
+
+
+# ---------------------------------------------------------------------------
+# The whole tab, driven through NiceGUI's user simulation
+# ---------------------------------------------------------------------------
+#
+# ``user_simulation`` resets NiceGUI's process-wide globals (routes included),
+# which would take the panel's "/" page away from every later test in this
+# process -- so the simulation runs in a child interpreter and reports back.
+# Nothing in it can reach a real server: the supervisor's base URL is port 1
+# and every HTTP request goes to an in-memory transport.
+
+
+class _SimRig:
+    def __init__(self) -> None:
+        self.ready = True
+        self.gate = asyncio.Event()
+        self.gate.set()
+        self.calls: list[str] = []
+        self.requests: list[dict[str, Any]] = []
+        self.hang = False
+        self.stream_started = asyncio.Event()
+        self.stream_closed = False
+        self.load_finished = False
+        record = rec("m")
+        instance = inst("m", started_at=1.0)
+        rig = self
+
+        class Supervisor:
+            def list(self) -> list[InstanceInfo]:
+                return [instance] if rig.ready else []
+
+            def get(self, model_id: str) -> InstanceInfo | None:
+                return instance if rig.ready and model_id == "m" else None
+
+            def base_url(self, model_id: str) -> str:
+                return "http://127.0.0.1:1"
+
+            def mark_request_start(self, model_id: str, *, client: str) -> str:
+                rig.calls.append("start")
+                return "r"
+
+            def mark_request_end(self, model_id: str, **kwargs: Any) -> None:
+                rig.calls.append("end")
+
+        class Manager:
+            async def ensure_loaded(self, model_id: str, **kwargs: Any) -> Any:
+                rig.calls.append("ensure")
+                await rig.gate.wait()
+                rig.ready = True
+                rig.load_finished = True
+                return record, instance
+
+        self.ctx = SimpleNamespace(
+            registry=SimpleNamespace(all=lambda: [record]),
+            supervisor=Supervisor(),
+            manager=Manager(),
+            probe=None,
+            refresh_interval=60.0,
+        )
+
+    async def handler(self, request: Any) -> Any:
+        import httpx
+
+        self.requests.append(json.loads(request.content))
+        if not self.hang:
+            return httpx.Response(200, content=_sse(_delta(content="hello")))
+        rig = self
+
+        async def body() -> Any:
+            try:
+                yield f"data: {json.dumps(_delta(content='so far'))}\n\n".encode()
+                rig.stream_started.set()
+                await asyncio.sleep(3600)
+            finally:
+                rig.stream_closed = True
+
+        return httpx.Response(200, content=body())
+
+
+async def _until(condition: Any, within: float = 5.0) -> bool:
+    for _ in range(int(within / 0.01)):
+        if condition():
+            return True
+        await asyncio.sleep(0.01)
+    return bool(condition())
+
+
+async def _chat_simulation() -> dict[str, Any]:  # noqa: C901, PLR0915 - one script, many checks
+    import httpx
+    from nicegui import ui
+    from nicegui.testing.user_interaction import UserInteraction
+    from nicegui.testing.user_simulation import user_simulation
+
+    out: dict[str, Any] = {}
+    real_client = httpx.AsyncClient
+
+    async def scenario(rig: _SimRig, steps: Any) -> None:
+        async with user_simulation(lambda: chat.render(rig.ctx)) as user:
+            await user.open("/")
+
+            def client(*args: Any, **kwargs: Any) -> Any:
+                kwargs["transport"] = httpx.MockTransport(rig.handler)
+                return real_client(*args, **kwargs)
+
+            chat.httpx.AsyncClient = client  # type: ignore[misc]
+            try:
+                await steps(user)
+            finally:
+                chat.httpx.AsyncClient = real_client  # type: ignore[misc]
+
+    def elements(user: Any) -> list[Any]:
+        return list(user.client.elements.values())
+
+    def texts(user: Any) -> list[str]:
+        return [str(getattr(e, "text", "")) for e in elements(user)]
+
+    def button(user: Any, label: str) -> Any:
+        return next(e for e in elements(user) if isinstance(e, ui.button) and e.text == label)
+
+    def action(user: Any, tip: str) -> list[Any]:
+        return [e for e in elements(user) if e.props.get("aria-label") == tip]
+
+    def assistants(user: Any) -> int:
+        return sum(1 for e in elements(user) if "sfc-assistant" in e.classes)
+
+    def idle(user: Any) -> bool:
+        return bool(button(user, "Send").enabled)
+
+    async def send(user: Any, text: str) -> None:
+        composer = next(
+            e
+            for e in elements(user)
+            if isinstance(e, ui.textarea) and "Message" in str(e.props.get("placeholder"))
+        )
+        composer.set_value(text)
+        UserInteraction(user, {button(user, "Send")}, None).click()
+        await asyncio.sleep(0.02)
+
+    # 1. Stop during a cold load: the wait ends, the load does not.
+    rig = _SimRig()
+    rig.ready = False
+    rig.gate.clear()
+
+    async def stop_during_load(user: Any) -> None:
+        await send(user, "hi")
+        await _until(lambda: "ensure" in rig.calls)
+        UserInteraction(user, {button(user, "Stop")}, None).click()
+        out["load_stop_idle"] = await _until(lambda: idle(user))
+        out["load_stop_note"] = any("still loading" in t for t in texts(user))
+        rig.gate.set()
+        out["load_finished"] = await _until(lambda: rig.load_finished)
+        out["load_stop_calls"] = list(rig.calls)
+
+    await scenario(rig, stop_during_load)
+
+    # 2. Regenerate, double-clicked: one new request, the same question once.
+    rig = _SimRig()
+
+    async def regenerate(user: Any) -> None:
+        await send(user, "hi")
+        await _until(lambda: len(rig.requests) == 1 and idle(user))
+        clicks = UserInteraction(user, set(action(user, "Regenerate this reply")), None)
+        clicks.trigger("click")
+        clicks.trigger("click")
+        await asyncio.sleep(0.05)
+        await _until(lambda: idle(user))
+        out["regen_requests"] = len(rig.requests)
+        out["regen_messages"] = rig.requests[-1]["messages"]
+        out["regen_assistants"] = assistants(user)
+        out["regen_calls"] = list(rig.calls)
+
+    await scenario(rig, regenerate)
+
+    # 3. Delete / Clear are refused mid-stream; Stop keeps the partial reply,
+    #    which is then sent back as context.
+    rig = _SimRig()
+    rig.hang = True
+
+    async def stop_keeps_partial(user: Any) -> None:
+        await send(user, "first")
+        await asyncio.wait_for(rig.stream_started.wait(), 5)
+        UserInteraction(user, set(action(user, "Delete")), None).trigger("click")
+        UserInteraction(user, {button(user, "Clear all")}, None).trigger("click")
+        await asyncio.sleep(0.05)
+        out["busy_assistants"] = assistants(user)
+        UserInteraction(user, {button(user, "Stop")}, None).click()
+        out["partial_idle"] = await _until(lambda: idle(user))
+        out["partial_closed"] = await _until(lambda: rig.stream_closed)
+        rig.hang = False
+        await send(user, "second")
+        await _until(lambda: len(rig.requests) == 2 and idle(user))
+        out["partial_messages"] = rig.requests[-1]["messages"]
+        out["partial_calls"] = list(rig.calls)
+
+    await scenario(rig, stop_keeps_partial)
+
+    # 4. The viewer goes away mid-reply: the generation is stopped.
+    rig = _SimRig()
+    rig.hang = True
+
+    async def viewer_leaves(user: Any) -> None:
+        await send(user, "hi")
+        await asyncio.wait_for(rig.stream_started.wait(), 5)
+        user.client.delete()
+        out["gone_closed"] = await _until(lambda: rig.stream_closed)
+        out["gone_calls"] = list(rig.calls)
+
+    await scenario(rig, viewer_leaves)
+    return out
+
+
+@pytest.fixture(scope="module")
+def chat_simulation() -> dict[str, Any]:
+    import os
+    import subprocess
+    import sys
+
+    root = Path(__file__).resolve().parents[2]
+    code = (
+        "import asyncio, json\n"
+        "from tests.unit import test_gui_chat as t\n"
+        "print('SIM:' + json.dumps(asyncio.run(t._chat_simulation())))\n"
+    )
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(p for p in sys.path if p)}
+    done = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    line = next((x for x in done.stdout.splitlines() if x.startswith("SIM:")), None)
+    assert line is not None, done.stdout[-3000:] + done.stderr[-3000:]
+    result: dict[str, Any] = json.loads(line[4:])
+    return result
+
+
+def test_stop_during_a_cold_load_ends_the_wait_and_the_load_carries_on(
+    chat_simulation: dict[str, Any],
+) -> None:
+    assert chat_simulation["load_stop_idle"] is True
+    assert chat_simulation["load_stop_note"] is True
+    assert chat_simulation["load_finished"] is True
+    assert "start" not in chat_simulation["load_stop_calls"]  # nothing was sent
+
+
+def test_a_double_clicked_regenerate_sends_one_request_with_one_question(
+    chat_simulation: dict[str, Any],
+) -> None:
+    assert chat_simulation["regen_requests"] == 2
+    assert chat_simulation["regen_messages"] == [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "hi"},
+    ]
+    assert chat_simulation["regen_assistants"] == 1
+    assert chat_simulation["regen_calls"].count("start") == 2
+    assert chat_simulation["regen_calls"].count("end") == 2
+
+
+def test_a_stream_refuses_delete_and_clear_and_stop_keeps_the_partial_reply(
+    chat_simulation: dict[str, Any],
+) -> None:
+    assert chat_simulation["busy_assistants"] == 1
+    assert chat_simulation["partial_idle"] is True
+    assert chat_simulation["partial_closed"] is True
+    roles = [(m["role"], m["content"]) for m in chat_simulation["partial_messages"][1:]]
+    assert roles == [("user", "first"), ("assistant", "so far"), ("user", "second")]
+    calls = chat_simulation["partial_calls"]
+    assert calls.count("start") == calls.count("end") == 2
+
+
+def test_a_viewer_leaving_mid_reply_stops_the_generation(
+    chat_simulation: dict[str, Any],
+) -> None:
+    assert chat_simulation["gone_closed"] is True
+    assert chat_simulation["gone_calls"][-1] == "end"

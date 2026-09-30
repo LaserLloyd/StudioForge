@@ -23,6 +23,7 @@ HTML), never ``ui.markdown``, which would pass a reply's raw HTML through.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
 from collections.abc import Callable
@@ -429,7 +430,21 @@ def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one fl
             block.fold.manual = True
 
     def paint_reply(block: SimpleNamespace, message: ChatMessage) -> Callable[..., None]:
-        """The stream's painter for one reply block: thinking fold + answer."""
+        """The stream's painter for one reply block: thinking fold + answer.
+
+        The message and the fold's header change at once; the rendered answer
+        and the thinking text (the heavy parts) go through ``block.renderer``,
+        which the caller drains before the reply counts as finished.
+        """
+
+        def apply(html: str, reasoning: str) -> None:
+            if not element_alive(block.body):
+                return
+            if block.think_body is not None and reasoning:
+                block.think_body.set_text(reasoning)
+            block.body.set_content(html)
+
+        block.renderer = _ReplyRenderer(apply)
 
         def paint(content: str, reasoning_stream: str, final: bool) -> None:
             inline_reasoning, answer = st.split_reasoning(content)
@@ -444,11 +459,10 @@ def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one fl
                 )
                 block.think.set_visibility(True)
                 block.think.set_text(header)
-                block.think_body.set_text(reasoning)
                 if want_open is not None and bool(block.think.value) != want_open:
                     block.expected = want_open
                     block.think.set_value(want_open)
-            block.body.set_content(render_markdown(answer))
+            block.renderer.submit(answer, reasoning, final=final)
 
         return paint
 
@@ -779,12 +793,24 @@ def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one fl
         sync()
         clicked_at = time.perf_counter()
         load_s: float | None = None
+        painter = paint_reply(block, reply)
+
+        def stopped_early(note: str) -> None:
+            # Nothing was generated: a blank reply, which is never context.
+            reply.status = "stopped"
+            status(note)
+
         try:
             ticker = None
             if not was_ready:
                 ticker = asyncio.create_task(_tick_loading(block.status, clicked_at))
+            # Stop during a cold load abandons only *this* wait: the load is
+            # shielded, so it finishes (or fails) for every other client
+            # queued on it, and the manager never sees a cancel mid-start.
+            load = asyncio.ensure_future(_ensure(ctx, model_id))
+            load.add_done_callback(_retrieve)
             try:
-                _record, instance = await _ensure(ctx, model_id)
+                loaded = await _stoppable(asyncio.shield(load), run)
             except Exception as exc:  # noqa: BLE001
                 elapsed = time.perf_counter() - clicked_at
                 fail(reply, block, f"load failed after {st.format_latency(elapsed)}", exc)
@@ -793,6 +819,14 @@ def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one fl
             finally:
                 if ticker is not None:
                     ticker.cancel()
+            if loaded is _STOPPED:
+                stopped_early("stopped · the model is still loading")
+                return
+            _record, instance = loaded
+            if run["stop"]:
+                # Stop landed between the load and the request: send nothing.
+                stopped_early("stopped")
+                return
             if not was_ready:
                 load_s = time.perf_counter() - clicked_at
             limit = st.chat_context_limit(instance)
@@ -806,24 +840,24 @@ def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one fl
             status("waiting for the first token…")
             # A task, so Stop can cancel it even while the engine is still
             # reading the prompt and nothing arrives to check the flag against.
-            task = asyncio.create_task(
+            result = await _stoppable(
                 _stream(
                     ctx,
                     serving_id,
                     base,
                     payload,
-                    paint_reply(block, reply),
+                    painter,
                     run,
                     on_first=lambda: status("streaming…"),
                     on_progress=status,
                     n_ctx=limit,
-                )
+                ),
+                run,
             )
-            run["task"] = task
-            try:
-                result = await task
-            finally:
-                run.pop("task", None)
+            await block.renderer.drain()
+            if result is _STOPPED:
+                stopped_early("stopped")
+                return
             metrics = st.chat_run_metrics(
                 clicked_at=clicked_at,
                 sent_at=result.sent_at,
@@ -848,6 +882,8 @@ def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one fl
             fail(reply, block, "failed", exc)
             notify_error(exc, what="chat")
         finally:
+            # The last paint lands before the block can be edited or deleted.
+            await block.renderer.drain()
             run["active"] = False
             run["stop"] = False
             sync()
@@ -872,11 +908,13 @@ def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one fl
         await send(st.quick_test_prompt(key), test.display)
 
     def request_stop() -> None:
-        if run["active"]:
-            run["stop"] = True
-            task = run.get("task")
-            if task is not None and not task.done():
-                task.cancel()
+        # Once per reply: a second cancel would land in the stream's cleanup.
+        if not run["active"] or run["stop"]:
+            return
+        run["stop"] = True
+        task = run.get("task")
+        if task is not None and not task.done():
+            task.cancel()
 
     # --- per-message actions -----------------------------------------------------
 
@@ -1016,6 +1054,9 @@ def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one fl
     prompt.on("keydown.ctrl.enter", lambda: send())
     prompt.on("keydown.esc", request_stop)
     prompt.on("keydown.up.exact", edit_last_user)
+    # Event handlers outlive their page: without this a closed browser tab
+    # keeps its reply generating on the GPU until max_tokens or the timeout.
+    ui.context.client.on_delete(request_stop)
     refresh_actions()
 
 
@@ -1255,21 +1296,126 @@ async def _stream(
     finally:
         result.content = "".join(content)
         result.reasoning = "".join(reasoning)
-        paint(result.content, result.reasoning, True)
-        elapsed = (result.last_token_at or time.perf_counter()) - (
-            result.first_token_at or result.sent_at or time.perf_counter()
-        )
-        rate = None
-        if isinstance(result.timings, dict):
-            rate = result.timings.get("predicted_per_second")
-        ctx.supervisor.mark_request_end(
-            serving_id,
-            request_id=request_id,
-            tokens_per_second=round(float(rate), 2)
-            if isinstance(rate, int | float) and rate > 0
-            else st.tokens_per_second(max(0, result.chunks - 1), elapsed),
-        )
+        try:
+            paint(result.content, result.reasoning, True)
+        finally:
+            # Paired with mark_request_start on every path, a painter that
+            # raises included: a missed end leaves the instance "busy" forever.
+            elapsed = (result.last_token_at or time.perf_counter()) - (
+                result.first_token_at or result.sent_at or time.perf_counter()
+            )
+            rate = None
+            if isinstance(result.timings, dict):
+                rate = result.timings.get("predicted_per_second")
+            ctx.supervisor.mark_request_end(
+                serving_id,
+                request_id=request_id,
+                tokens_per_second=round(float(rate), 2)
+                if isinstance(rate, int | float) and rate > 0
+                else st.tokens_per_second(max(0, result.chunks - 1), elapsed),
+            )
     return result
+
+
+#: What :func:`_stoppable` returns when Stop cancelled the wait.
+_STOPPED: Any = object()
+
+
+async def _stoppable(awaitable: Any, run: dict[str, Any]) -> Any:
+    """Await ``awaitable`` as ``run["task"]``, so the Stop button can cancel it.
+
+    Returns :data:`_STOPPED` when Stop did -- including a Stop that lands before
+    a freshly created task has run a single step, where the coroutine never
+    gets the chance to catch its own cancel and ``await`` raises instead. Any
+    other cancel (this handler's own, at shutdown) propagates.
+    """
+    task = asyncio.ensure_future(awaitable)
+    run["task"] = task
+    try:
+        return await task
+    except asyncio.CancelledError:
+        current = asyncio.current_task()
+        outer = current is not None and current.cancelling() > 0
+        if run.get("stop") and task.cancelled() and not outer:
+            return _STOPPED
+        raise
+    finally:
+        if run.get("task") is task:
+            run.pop("task", None)
+
+
+def _retrieve(task: asyncio.Future[Any]) -> None:
+    """Done-callback for a load nobody awaits any more (Stop during a load)."""
+    if not task.cancelled():
+        task.exception()
+
+
+#: A render slower than this makes the next one wait (see :class:`_ReplyRenderer`).
+_RENDER_BACKOFF = 2.0
+_RENDER_MAX_GAP_S = 5.0
+
+
+class _ReplyRenderer:
+    """Renders a streaming reply's Markdown off the event loop, newest text wins.
+
+    ``render_markdown`` is pure Python (markdown2 + Pygments) and grows with the
+    reply: ~0.7 s for 100 KB of answer on the rig, ~2.3 s for 200 KB. Run on the
+    event loop every ``_REPAINT_S`` that froze the whole panel -- every tab of
+    every viewer -- for most of a long reply. So the HTML is built in a worker
+    thread, only one render is in flight per reply (paints that arrive meanwhile
+    collapse into the newest), and after a slow render the next one waits
+    ``_RENDER_BACKOFF`` times as long, which also caps what a long reply ships
+    over the websocket. A ``final`` submit skips that wait; :meth:`drain` returns
+    once the newest submitted text is on screen.
+    """
+
+    def __init__(
+        self,
+        apply: Callable[[str, str], None],
+        render: Callable[[str], str] = render_markdown,
+    ) -> None:
+        self._apply = apply
+        self._render = render
+        self._pending: tuple[str, str] | None = None
+        self._task: asyncio.Task[None] | None = None
+        self._wake: asyncio.Event | None = None
+        self._final = False
+
+    def submit(self, answer: str, reasoning: str, *, final: bool = False) -> None:
+        self._pending = (answer, reasoning)
+        if final:
+            self._final = True
+            if self._wake is not None:
+                self._wake.set()
+        if self._task is None or self._task.done():
+            self._task = asyncio.get_running_loop().create_task(self._run())
+
+    async def _run(self) -> None:
+        while self._pending is not None:
+            answer, reasoning = self._pending
+            self._pending = None
+            started = time.perf_counter()
+            html = await asyncio.to_thread(self._render, answer)
+            self._apply(html, reasoning)
+            cost = time.perf_counter() - started
+            if self._pending is None or self._final or cost * _RENDER_BACKOFF <= _REPAINT_S:
+                continue
+            self._wake = asyncio.Event()
+            try:
+                await asyncio.wait_for(
+                    self._wake.wait(), min(cost * _RENDER_BACKOFF, _RENDER_MAX_GAP_S)
+                )
+            except TimeoutError:
+                pass
+            finally:
+                self._wake = None
+
+    async def drain(self) -> None:
+        """Wait until the newest submitted text has been painted (never raises)."""
+        task = self._task
+        if task is not None:
+            with contextlib.suppress(Exception):
+                await task
 
 
 def _parse_sse(line: str) -> dict[str, Any] | None:
