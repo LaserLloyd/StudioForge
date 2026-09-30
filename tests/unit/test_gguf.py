@@ -577,6 +577,29 @@ def test_sampling_defaults_drops_values_of_the_wrong_type() -> None:
     assert sampling_defaults(kv) == {"min_p": 0.05}
 
 
+def test_sampling_defaults_survive_odd_publishers_and_the_json_cache() -> None:
+    """Arrays, infinities and swapped int/float kinds never break a scan.
+
+    The result lands in the SQLite / HF-header caches as JSON, so it must
+    round-trip through ``GgufMeta`` unchanged.
+    """
+    from studioforge.types import GgufMeta
+
+    kv = {
+        "general.sampling.temp": 1,  # an int where a float is expected
+        "general.sampling.top_k": 20.0,  # a float where an int is expected
+        "general.sampling.top_p": [0.9, 0.95],
+        "general.sampling.min_p": float("-inf"),
+        "general.sampling.penalty_repeat": None,
+    }
+    sampling = sampling_defaults(kv)
+    assert sampling == {"temperature": 1.0, "top_k": 20}
+    assert isinstance(sampling["temperature"], float) and isinstance(sampling["top_k"], int)
+    meta = GgufMeta(extra={"sampling": sampling})
+    assert GgufMeta.model_validate(meta.model_dump(mode="json")).extra == meta.extra
+    assert sampling_defaults({}) == {}
+
+
 def test_meta_basic_mapping(tmp_path: Path) -> None:
     kv: list[KvEntry] = [
         ("general.architecture", STRING, "llama"),
