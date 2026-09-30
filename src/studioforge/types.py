@@ -215,6 +215,30 @@ class ModelSettings(BaseModel):
     #: ``load_recommended(kv_unified=true)`` builds, where ``ctx_size`` IS the
     #: pool (D72); that one is a property of one load and lives on the plan.
     kv_unified: bool | None = None
+    #: ``--ctx-checkpoints``: how many context checkpoints each slot keeps (D72).
+    #: Only a model whose cache cannot be rolled back -- a sliding-window
+    #: ("iswa") or hybrid (recurrent) one -- ever makes them, and each is a copy
+    #: of the slot's sliding-window cells (or recurrent state) in HOST RAM:
+    #: about 800 MiB at f16 for a Gemma-4-shaped 31B. ``None`` = the automatic
+    #: default (``models.auto_ctx_checkpoints``, 8, for those models; the
+    #: engine's own 32 for the rest). ``0`` turns checkpoints off.
+    ctx_checkpoints: int | None = None
+    #: ``--checkpoint-min-step``: the fewest tokens between two checkpoints made
+    #: at user-message starts (D72). The engine always checkpoints the LAST user
+    #: message and the end of the prompt whatever this says, which is why the
+    #: automatic default keeps the engine's 8192. ``None`` = automatic
+    #: (``models.auto_checkpoint_min_step``); ``0`` = no minimum.
+    checkpoint_min_step: int | None = None
+    #: Start the child with ``LLAMA_SERVER_SLOTS_DEBUG=1`` and
+    #: ``LLAMA_SERVER_SLOTS_N_DIFF=32`` (D72): the engine then logs, at warning
+    #: level, the tokens on both sides of the point where a new prompt stopped
+    #: matching the slot's cache -- the answer to "why did this turn re-read
+    #: the whole prompt". The cost is privacy, not speed: the child's log then
+    #: holds conversation text around every divergence, and the child's
+    #: ``/slots`` report shows prompts; both are readable through this
+    #: server's log and introspection routes. Off by default; turn it on while
+    #: debugging and off again after.
+    slots_debug: bool = False
     # Default sampler params, applied by llama-server when a request omits them.
     temperature: float | None = None
     top_p: float | None = None
@@ -348,7 +372,7 @@ class ModelSettings(BaseModel):
             raise ValueError(f"{info.field_name} must be >= 1")
         return v
 
-    @field_validator("main_gpu", "cache_reuse")
+    @field_validator("main_gpu", "cache_reuse", "ctx_checkpoints", "checkpoint_min_step")
     @classmethod
     def _non_negative(cls, v: int | None, info: Any) -> int | None:
         if v is not None and v < 0:
@@ -981,6 +1005,14 @@ class EffectiveLaunch(BaseModel):
     ubatch_size: int = 512
     ctx_checkpoints: int | None = None
     checkpoint_min_step: int | None = None
+    #: Where the two checkpoint values came from (D72), finer than
+    #: :attr:`sources`: ``"model"`` (the per-model setting), ``"auto"`` (the
+    #: automatic default for a sliding-window or hybrid model), ``"extra_flags"``
+    #: (a hand-written flag won), or ``"engine_default"`` (nothing was passed).
+    checkpoint_sources: dict[str, str] = Field(default_factory=dict)
+    #: The child was started with ``LLAMA_SERVER_SLOTS_DEBUG`` set (D72): its log
+    #: names the tokens at every prompt divergence -- conversation text.
+    slots_debug: bool = False
     spec_type: str = "none"
     flash_attn: str = "auto"
     # --- the GPU-only policy, as launched (2026-09-09 review) ----------------

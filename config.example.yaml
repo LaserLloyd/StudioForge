@@ -102,6 +102,14 @@ models:
   ctx_per_slot_default: 32768
   default_flash_attn: 'on'
   default_cache_reuse: 256
+  # Context checkpoints for models whose cache cannot be rolled back
+  # (sliding-window "iswa" and hybrid ones; full-attention models never make
+  # them). Each checkpoint copies the slot's sliding-window cells into HOST RAM
+  # (~800 MiB at f16 for a 31B Gemma-4), so the count is capped below the
+  # engine's 32. A model's own ctx_checkpoints / checkpoint_min_step setting
+  # wins. null = pass nothing (the engine's defaults: 32, 8192 tokens apart).
+  auto_ctx_checkpoints: 8
+  auto_checkpoint_min_step: null
   default_reasoning_format: none
   thinking_default_ctx: 32768
   target_ctx: 1048576

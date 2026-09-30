@@ -268,6 +268,22 @@ class ModelsConfig(BaseModel):
     # "auto" if a pre-Ampere card is ever detected.
     default_flash_attn: FlashAttn = "on"
     default_cache_reuse: NonNegativeInt = 256  # prompt-cache reuse: the OpenClaw latency win
+    #: ``--ctx-checkpoints`` for a model whose cache cannot be rolled back -- a
+    #: sliding-window ("iswa") or hybrid (recurrent) model -- when its own
+    #: settings name none (D72). Such a model can only resume a changed
+    #: prompt from a checkpoint, and each one copies the slot's sliding-window
+    #: cells into HOST RAM: about 800 MiB at f16 for a Gemma-4-shaped 31B, so
+    #: the engine's 32 can hold ~25 GiB per slot. The engine already makes one
+    #: at every user-message start it needs, so 8 keeps the recent history
+    #: covered at a quarter of that. ``None`` passes nothing (the engine's 32);
+    #: full-attention models never make checkpoints and get no flag either way.
+    auto_ctx_checkpoints: NonNegativeInt | None = 8
+    #: ``--checkpoint-min-step`` for the same models (D72). ``None`` -- the
+    #: shipped value -- passes nothing and keeps the engine's 8192: the last
+    #: user message and the end of every prompt are checkpointed whatever the
+    #: spacing, which is where a chat's next turn diverges, so a denser spacing
+    #: buys little and costs host RAM per checkpoint.
+    auto_checkpoint_min_step: NonNegativeInt | None = None
     # "none" keeps a reasoning model's thoughts inline in message.content.
     # llama.cpp's default ("auto") splits them into reasoning_content and leaves
     # content empty, which reads as an empty reply to every OpenAI client.

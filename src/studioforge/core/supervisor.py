@@ -387,6 +387,10 @@ def effective_launch(
     features: EngineFeatures,
     plan: LoadPlan,
     settings: ModelSettings | None = None,
+    *,
+    checkpoints: CheckpointChoice | None = None,
+    attention: str | None = None,
+    slots_debug: bool = False,
 ) -> EffectiveLaunch:
     """What the child really runs with: the argv, then the engine's defaults.
 
@@ -396,6 +400,13 @@ def effective_launch(
     "advertises nothing" fallback D38 uses, applied to reporting rather than
     to emission. ``settings`` is only consulted to name what the child
     *cannot* see (:attr:`EffectiveLaunch.inert`).
+
+    D72 adds three optional facts the argv alone cannot tell: ``checkpoints``
+    (what :func:`resolve_checkpoints` chose, so the report can say whether a
+    checkpoint value came from the model, the automatic default or
+    ``extra_flags``), ``attention`` (the model's attention kind -- a
+    sliding-window cache cannot use ``--cache-reuse``) and ``slots_debug``
+    (whether the child's environment carries ``LLAMA_SERVER_SLOTS_DEBUG``).
 
     With ``--kv-unified`` the engine gives every slot the whole
     ``--ctx-size`` (llama-context.cpp: ``n_ctx_seq = n_ctx`` when unified), so
@@ -497,6 +508,31 @@ def effective_launch(
         checkpoint_min_step = None
     src("checkpoint_min_step", "checkpoint_min_step" in values)
 
+    # Finer than `sources` (D72): who chose each checkpoint value. The argv
+    # value is compared with what resolve_checkpoints chose -- a different
+    # one got there through extra_flags, which go last and win.
+    checkpoint_sources: dict[str, str] = {}
+    for field, chosen, chosen_source in (
+        (
+            "ctx_checkpoints",
+            checkpoints.ctx_checkpoints if checkpoints else None,
+            checkpoints.ctx_checkpoints_source if checkpoints else None,
+        ),
+        (
+            "checkpoint_min_step",
+            checkpoints.checkpoint_min_step if checkpoints else None,
+            checkpoints.checkpoint_min_step_source if checkpoints else None,
+        ),
+    ):
+        if field not in values:
+            checkpoint_sources[field] = "engine_default"
+        elif checkpoints is None:
+            checkpoint_sources[field] = "argv"
+        elif chosen is not None and _int_or(values[field], -1) == chosen:
+            checkpoint_sources[field] = str(chosen_source)
+        else:
+            checkpoint_sources[field] = "extra_flags"
+
     spec_type = values.get("spec_type") or SPEC_TYPE_NONE
     src("spec_type", "spec_type" in values)
     flash_attn = values.get("flash_attn") or "auto"
@@ -538,6 +574,22 @@ def effective_launch(
         and load_mode not in ("none", "mlock")
     ):
         inert.append("no_mmap")
+    # A per-model checkpoint value the engine could not take (D72): the
+    # supervisor logged setting_inert and passed nothing.
+    if checkpoints is not None:
+        for field, source in (
+            ("ctx_checkpoints", checkpoints.ctx_checkpoints_source),
+            ("checkpoint_min_step", checkpoints.checkpoint_min_step_source),
+        ):
+            if source == "model" and field not in values:
+                inert.append(field)
+    # Chunk reuse shifts cached tokens, which a sliding-window cache cannot
+    # do: the engine switches it off ("cache_reuse is not supported by this
+    # context") unless --swa-full keeps every cell (D72). Report what the
+    # child does, and name the flag that asked for more.
+    if attention == "iswa" and cache_reuse > 0 and "--swa-full" not in argv:
+        inert.append("cache_reuse")
+        cache_reuse = 0
 
     if cache_prompt:
         cache_bits = [f"reuse {cache_reuse}" if cache_reuse else "chunk reuse off"]
@@ -571,6 +623,15 @@ def effective_launch(
         kv_text,
         f"spec {spec_type}",
     ]
+    checkpoint_bits: list[str] = []
+    if "ctx_checkpoints" in values:
+        checkpoint_bits.append(f"{ctx_checkpoints} per slot")
+    if "checkpoint_min_step" in values:
+        checkpoint_bits.append(f"{checkpoint_min_step}-token spacing")
+    if checkpoint_bits:
+        parts.append("checkpoints " + ", ".join(checkpoint_bits))
+    if slots_debug:
+        parts.append("SLOTS DEBUG on (prompt text in the log)")
     if inert:
         parts.append("inert: " + ", ".join(inert))
     # Last, always: the one word an operator scans a status line for.
@@ -594,6 +655,8 @@ def effective_launch(
         ubatch_size=ubatch_size,
         ctx_checkpoints=ctx_checkpoints,
         checkpoint_min_step=checkpoint_min_step,
+        checkpoint_sources=checkpoint_sources,
+        slots_debug=slots_debug,
         spec_type=spec_type,
         flash_attn=flash_attn,
         n_gpu_layers=n_gpu_layers,
@@ -1256,6 +1319,93 @@ def resolve_launch_features(
     )
 
 
+#: Attention kinds whose cache the engine cannot roll back to an arbitrary
+#: position (D72). A sliding-window layer has already dropped the cells behind
+#: its window and a recurrent layer keeps one state per sequence, so a prompt
+#: that changes part-way through can only resume from a context checkpoint --
+#: the only models llama.cpp checkpoints at all (server-context.cpp,
+#: ``do_checkpoint``). A full-attention model rolls back for free and never
+#: makes one, so the flags are not passed to it.
+CHECKPOINTED_ATTENTION_KINDS: frozenset[str] = frozenset({"iswa", "hybrid"})
+
+#: The child environment ``settings.slots_debug`` adds (D72). The engine then
+#: logs, at warning level, the tokens on both sides of the point where a new
+#: prompt stopped matching a slot's cache (``LLAMA_SERVER_SLOTS_N_DIFF`` of
+#: them each way) and ``/slots`` reports prompts in full. Read by every build
+#: from b10425 to b11037.
+SLOTS_DEBUG_ENV: dict[str, str] = {
+    "LLAMA_SERVER_SLOTS_DEBUG": "1",
+    "LLAMA_SERVER_SLOTS_N_DIFF": "32",
+}
+
+
+@dataclass(frozen=True)
+class CheckpointChoice:
+    """What a launch passes for the two context-checkpoint flags, and why (D72).
+
+    ``None`` means "pass nothing", so the engine's own default applies. The
+    source is ``"model"`` (the per-model setting), ``"auto"`` (the automatic
+    default for a sliding-window or hybrid model, ``models.auto_*``) or
+    ``"engine_default"``.
+    """
+
+    ctx_checkpoints: int | None = None
+    checkpoint_min_step: int | None = None
+    ctx_checkpoints_source: str = "engine_default"
+    checkpoint_min_step_source: str = "engine_default"
+
+
+def resolve_checkpoints(record: ModelRecord, models: Any) -> CheckpointChoice:
+    """``--ctx-checkpoints`` / ``--checkpoint-min-step`` for one launch (D72).
+
+    Pure. A per-model value always wins, ``0`` included (llama.cpp: no
+    checkpoints / no minimum spacing). Otherwise a model whose cache can only
+    resume from a checkpoint (:data:`CHECKPOINTED_ATTENTION_KINDS`) gets
+    ``models.auto_ctx_checkpoints`` / ``models.auto_checkpoint_min_step`` when
+    those are set, and everything else gets nothing. ``extra_flags`` still
+    overrides both, last -- the existing rule.
+
+    Why a count at all, and why not a denser spacing: each checkpoint copies
+    the slot's sliding-window cells into host RAM -- ~800 MiB at f16 for a
+    Gemma-4-shaped 31B, 32 per slot being ~25 GiB -- and the engine already
+    makes one at the last user message and at the end of every prompt,
+    whatever the spacing, which is exactly where a chat's next turn diverges.
+    """
+    settings = record.settings
+    kind = attention_kind(record.meta) if record.meta is not None else "unknown"
+    needs_checkpoints = kind in CHECKPOINTED_ATTENTION_KINDS
+
+    def pick(explicit: int | None, automatic: Any) -> tuple[int | None, str]:
+        if explicit is not None:
+            return int(explicit), "model"
+        if needs_checkpoints and isinstance(automatic, int) and not isinstance(automatic, bool):
+            return int(automatic), "auto"
+        return None, "engine_default"
+
+    count, count_source = pick(
+        settings.ctx_checkpoints, getattr(models, "auto_ctx_checkpoints", None)
+    )
+    step, step_source = pick(
+        settings.checkpoint_min_step, getattr(models, "auto_checkpoint_min_step", None)
+    )
+    return CheckpointChoice(
+        ctx_checkpoints=count,
+        checkpoint_min_step=step,
+        ctx_checkpoints_source=count_source,
+        checkpoint_min_step_source=step_source,
+    )
+
+
+def slots_debug_env(settings: ModelSettings) -> dict[str, str]:
+    """The variables ``settings.slots_debug`` adds to the child's environment (D72)."""
+    return dict(SLOTS_DEBUG_ENV) if settings.slots_debug else {}
+
+
+def _is_sliding_window(record: ModelRecord) -> bool:
+    """Whether the model's cache has sliding-window layers (``attention_kind`` "iswa")."""
+    return record.meta is not None and attention_kind(record.meta) == "iswa"
+
+
 #: How many in-flight requests an instance describes (D70, S6). The COUNT
 #: (``active_requests``) is unbounded; the records are a window beside it,
 #: never longer than the count. 64 is well past any ``--parallel`` this
@@ -1600,6 +1750,7 @@ class Supervisor:
 
         argv += self._optional_args(record, plan, engine, cache_ram_mib=cache_ram_mib)
         argv += self._concurrency_args(record, plan, engine)
+        argv += self._checkpoint_args(record, engine)
 
         if record.kind == "embedding":
             argv.append("--embedding")
@@ -1817,6 +1968,14 @@ class Supervisor:
             if settings.cache_reuse is not None
             else self._config.models.default_cache_reuse
         )
+        if settings.cache_reuse is None and _is_sliding_window(record):
+            # Chunk reuse shifts cached tokens, and a sliding-window cache
+            # cannot be shifted: the engine turns it off itself ("cache_reuse
+            # is not supported by this context", D72). The default is not
+            # passed to such a model, so `effective` reports what the child
+            # really does; an explicit per-model value is still passed, and
+            # `effective` lists it as inert.
+            cache_reuse = 0
         if cache_reuse and cache_reuse > 0:
             args += ["--cache-reuse", str(cache_reuse)]
 
@@ -2045,6 +2204,50 @@ class Supervisor:
         elif slots > 1 and features.has("--no-kv-unified"):
             args.append("--no-kv-unified")
 
+        return args
+
+    def _checkpoint_args(self, record: ModelRecord, features: EngineFeatures) -> list[str]:
+        """``--ctx-checkpoints`` / ``--checkpoint-min-step``, as :func:`resolve_checkpoints` says.
+
+        D38's rule: a flag is passed only when the active engine advertises
+        it. A per-model value the engine cannot take is logged as
+        ``setting_inert`` and listed in ``effective.inert``, as
+        ``cont_batching: false`` is; an automatic default it cannot take is
+        simply not passed -- nobody asked for it by name.
+        """
+        choice = resolve_checkpoints(record, self._config.models)
+        args: list[str] = []
+        for value, source, flag, setting in (
+            (
+                choice.ctx_checkpoints,
+                choice.ctx_checkpoints_source,
+                "--ctx-checkpoints",
+                "ctx_checkpoints",
+            ),
+            (
+                choice.checkpoint_min_step,
+                choice.checkpoint_min_step_source,
+                "--checkpoint-min-step",
+                "checkpoint_min_step",
+            ),
+        ):
+            if value is None:
+                continue
+            if features.has(flag):
+                args += [flag, str(value)]
+            elif source == "model":
+                log.warning(
+                    "setting_inert",
+                    model_id=record.id,
+                    setting=setting,
+                    value=value,
+                    flag=flag,
+                    engine_known=features.known,
+                    detail=(
+                        f"the engine does not advertise {flag}, so the setting cannot be "
+                        "passed; the instance's `effective` block lists it as inert"
+                    ),
+                )
         return args
 
     def _spec_args(
@@ -2284,10 +2487,31 @@ class Supervisor:
             cache_ram_mib=inst.info.cache_ram_mib,
         )
         inst.argv = argv
+        # Enforcement point three of the GPU-only policy: the environment.
+        # b10689 reads an ``LLAMA_ARG_*`` variable for nearly every flag, and
+        # for a flag StudioForge never emits -- which is every CPU-offload
+        # flag -- the variable is wholly unopposed by the argv. The child
+        # gets our environment minus that surface (engine.child_environment),
+        # and the names stripped are logged below so an operator who set one
+        # on purpose learns why it did nothing. Built before the report so
+        # the report can say what the environment switches on (D72).
+        env, stripped = child_environment()
+        # settings.slots_debug (D72): the engine names the tokens at every
+        # prompt divergence -- a diagnostic that writes conversation text to
+        # the child's log, so it is per model and off unless asked for.
+        env.update(slots_debug_env(inst.record.settings))
         # What the child will REALLY run with, readable on every instance
         # view (D54). Parsed from the final argv rather than re-derived from
         # settings, so extra_flags and engine defaults are in the answer too.
-        inst.info.effective = effective_launch(argv, features, inst.plan, inst.record.settings)
+        inst.info.effective = effective_launch(
+            argv,
+            features,
+            inst.plan,
+            inst.record.settings,
+            checkpoints=resolve_checkpoints(inst.record, self._config.models),
+            attention=(attention_kind(inst.record.meta) if inst.record.meta is not None else None),
+            slots_debug=_int_or(env.get("LLAMA_SERVER_SLOTS_DEBUG"), 0) != 0,
+        )
         inst.info.launch_args = redact_argv(argv)
         if inst.info.effective.policy_violations:
             # build_command refuses these, so this cannot fire today; it is
@@ -2351,14 +2575,7 @@ class Supervisor:
         # RUNPATH instead: upstream's ubuntu archives carry one, and the
         # source build (engine.build_from_source) bakes the same one in.
         engine_dir = Path(argv[0]).parent
-        # Enforcement point three of the GPU-only policy: the environment.
-        # b10689 reads an ``LLAMA_ARG_*`` variable for nearly every flag, and
-        # for a flag StudioForge never emits -- which is every CPU-offload
-        # flag -- the variable is wholly unopposed by the argv. The child
-        # gets our environment minus that surface (engine.child_environment),
-        # and the names stripped are logged so an operator who set one on
-        # purpose learns why it did nothing.
-        env, stripped = child_environment()
+        # The environment was built above, before the report (D72).
         if stripped:
             log.warning(
                 "child_env_stripped",
