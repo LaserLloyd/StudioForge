@@ -179,7 +179,15 @@ class Conversation:
         if message.role == ASSISTANT:
             if position != len(self.messages) - 1:
                 return False
-            return any(m.role == USER for m in self.messages[:position])
+            # Everything between the question and this reply goes too, so it
+            # must be nothing worth keeping (a failed or blank reply). A real
+            # answer sitting there (its question deleted) would vanish.
+            for earlier in reversed(self.messages[:position]):
+                if earlier.role == USER:
+                    return True
+                if earlier.in_context:
+                    return False
+            return False
         if message.role == USER:
             return all(
                 m.role == ASSISTANT and not m.in_context for m in self.messages[position + 1 :]
@@ -426,18 +434,23 @@ def render_markdown(text: str) -> str:
 
 # -- plain text ---------------------------------------------------------------
 
-_IMAGE_MD = re.compile(r"!\[([^\]]*)\]\(([^)\s]*)[^)]*\)")
-_LINK_MD = re.compile(r"\[([^\]]+)\]\(([^)\s]*)[^)]*\)")
-_AUTOLINK = re.compile(r"<((?:https?:|mailto:)[^>\s]+)>", re.IGNORECASE)
+# Every span below has a length bound. Unbounded, each match attempt can scan
+# to the end of the line and the URL part used to backtrack against itself, so
+# a long line of ``[a](`` or ``*a _b`` took minutes -- on "Copy formatted",
+# inside the event loop the API gateway shares. Spans longer than the bound
+# keep their markers, which a clipboard approximation can afford.
+_IMAGE_MD = re.compile(r"!\[([^\]]{0,500})\]\(([^)\s]{0,2000}+)(?:\s[^)]{0,500})?\)")
+_LINK_MD = re.compile(r"\[([^\]]{1,500}+)\]\(([^)\s]{0,2000}+)(?:\s[^)]{0,500})?\)")
+_AUTOLINK = re.compile(r"<((?:https?:|mailto:)[^>\s]{1,2000})>", re.IGNORECASE)
 _HEADING = re.compile(r"^ {0,3}#{1,6}\s+(.*?)\s*#*\s*$")
 _BULLET = re.compile(r"^(\s*)[*+-]\s+")
 _QUOTE = re.compile(r"^\s{0,3}>\s?")
 _TABLE_RULE = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?\s*$")
 _HRULE = re.compile(r"^\s{0,3}([-*_])(\s*\1){2,}\s*$")
-_BOLD = re.compile(r"(\*\*|__)(?=\S)(.+?)(?<=\S)\1")
-_ITALIC = re.compile(r"(?<![\w*])\*(?=\S)(.+?)(?<=\S)\*(?![\w*])")
-_STRIKE = re.compile(r"~~(?=\S)(.+?)(?<=\S)~~")
-_INLINE_CODE = re.compile(r"(`+)(.+?)\1")
+_BOLD = re.compile(r"(\*\*|__)(?=\S)(.{1,300}?)(?<=\S)\1")
+_ITALIC = re.compile(r"(?<![\w*])\*(?=\S)(.{1,300}?)(?<=\S)\*(?![\w*])")
+_STRIKE = re.compile(r"~~(?=\S)(.{1,300}?)(?<=\S)~~")
+_INLINE_CODE = re.compile(r"(`{1,16})(.{1,2000}?)\1")
 
 
 def _plain_inline(line: str) -> str:

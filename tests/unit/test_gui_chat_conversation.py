@@ -7,6 +7,11 @@ model output can never inject HTML or script into the page.
 
 from __future__ import annotations
 
+import random
+import re
+import time
+from html.parser import HTMLParser
+
 import pytest
 
 from studioforge.gui.chat_conversation import (
@@ -392,3 +397,151 @@ def test_plain_text_keeps_snake_case_and_tables() -> None:
     assert plain_text("my_var_name stays") == "my_var_name stays"
     assert plain_text("| a | b |\n|---|---|\n| 1 | 2 |") == "| a | b |\n| 1 | 2 |"
     assert plain_text("") == ""
+
+
+# -- review regressions -------------------------------------------------------
+
+
+def test_regenerate_never_drops_a_real_answer_between_question_and_reply() -> None:
+    # u1's second answer is left after its question was deleted; regenerating
+    # the last reply truncates after u1 and would silently take a1 with it.
+    convo, (u1, a1, u2, a2) = _chat("q1", "a1", "q2", "a2")
+    convo.delete(u2.id)
+    assert convo.can_regenerate(a2.id) is False
+    assert convo.regenerate_point(a2.id) is None
+    # A failed or blank reply in between is what a regenerate replaces.
+    a1.failed = True
+    assert convo.can_regenerate(a2.id) is True
+    assert convo.regenerate_point(a2.id) is u1
+    a1.failed, a1.content = False, "   "
+    assert convo.can_regenerate(a2.id) is True
+
+
+class _Audit(HTMLParser):
+    """Parses render_markdown output the way a browser would see its tags."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.problems: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag not in ALLOWED:
+            self.problems.append(f"tag {tag}")
+        for name, value in attrs:
+            value = value or ""
+            if name.startswith("on") or name not in ATTRS:
+                self.problems.append(f"attr {tag}.{name}")
+            if name == "href" and not re.match(r"(https?|mailto):", value, re.I):
+                self.problems.append(f"href {value!r}")
+            if name == "src" and not re.match(r"https?:", value, re.I):
+                self.problems.append(f"src {value!r}")
+            if name == "style" and not re.fullmatch(r"text-align:(left|right|center);?", value):
+                self.problems.append(f"style {value!r}")
+
+
+ALLOWED = {
+    "p", "br", "hr", "strong", "b", "em", "i", "s", "del", "code", "pre", "div", "span",
+    "ul", "ol", "li", "blockquote", "h1", "h2", "h3", "h4", "h5", "h6",
+    "table", "thead", "tbody", "tr", "th", "td", "a", "img",
+}  # fmt: skip
+ATTRS = {"href", "title", "target", "rel", "src", "alt", "loading", "referrerpolicy", "class",
+         "style"}  # fmt: skip
+
+ATTACKS = [
+    "[x](jav&#x61;script:alert(1))",
+    "[x](jav&#97;script:alert(1))",
+    "[x](&#106;avascript:alert(1))",
+    '<a href="jav&#x61;script:alert(1)">x</a>',
+    "[x](data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==)",
+    "![x](data:image/svg+xml,<svg onload=alert(1)>)",
+    "[x](vbscript:msgbox(1))",
+    "[x]( javascript:alert(1))",
+    "[x](java\tscript:alert(1))",
+    "[x](java\nscript:alert(1))",
+    "[x](\x01javascript:alert(1))",
+    "[x](<javascript:alert(1)>)",
+    "[x](//evil.example/x)",
+    "<svg onload=alert(1)>",
+    "<svg><script>alert(1)</script></svg>",
+    "<style>body{display:none}</style>",
+    "<math><mi xlink:href=javascript:alert(1)>x</mi></math>",
+    '[t](https://a.com "a\\" onmouseover=\\"x")',
+    "[t](https://a.com 'a\" onmouseover=\"x')",
+    '![a" onerror="alert(1)](https://a.com/x.png)',
+    "![a' onerror=alert(1) x='](https://a.com/x.png)",
+    "[r][1]\n\n[1]: javascript:alert(1)",
+    '[r][1]\n\n[1]: https://ok.com "t\\" onclick=\\"x"',
+    "![r][1]\n\n[1]: javascript:alert(1)",
+    "<javascript:alert(1)>",
+    '<http://a.com/"onmouseover="alert(1)>',
+    "&lt;script&gt;alert(1)&lt;/script&gt;",
+    "&#60;img src=x onerror=alert(1)&#62;",
+    "&#x3C;script&#x3E;alert(1)&#x3C;/script&#x3E;",
+    "```html\n<script>alert(1)</script>\n```",
+    "```python\n'</code></pre><img src=x onerror=alert(1)>'\n```",
+    '```x" onclick="alert(1)\nhi\n```',
+    "```\n<script>alert(1)</script>",  # unclosed fence plus HTML
+    "text\n```\n<img src=x onerror=alert(1)>\n",
+    "`</code><script>alert(1)</script>`",
+    "<b><i>nested</b></i><div><span>unclosed",
+    '<a href="https://x"><a href="javascript:1">y</a></a>',
+    "[a [b](javascript:1)](https://ok)",
+    "[![img](javascript:1)](https://ok)",
+    "[![img](https://ok/i.png)](javascript:1)",
+    "**<img src=x onerror=1>**\n__<x>__",
+    "<!-- --><script>x</script> <![CDATA[<script>]]> <?php x ?> <!doctype html>",
+    "| a |\n|---|\n| <script>alert(1)</script> |",
+    "| a |\n|:--|\n| [x](javascript:1) |",
+    '<div markdown="1">*x*</div>',
+    "x\n<details open ontoggle=alert(1)>",
+    "    <script>indented</script>",
+    "[x](https://ok.com/</a><script>alert(1)</script>)",
+    "line1\n<script>\nline2\n</script>",
+    "a_<script>_b *<img src=x onerror=1>*",
+]
+
+
+@pytest.mark.parametrize("source", ATTACKS, ids=[f"attack{i}" for i in range(len(ATTACKS))])
+def test_render_markdown_output_passes_a_browser_eye_audit(source: str) -> None:
+    out = render_markdown(source)
+    audit = _Audit()
+    audit.feed(out)
+    audit.close()
+    assert audit.problems == [], (source, out)
+
+
+def test_render_markdown_fuzz_never_emits_active_html() -> None:
+    rng = random.Random(20260929)
+    alphabet = list("<>\"'`&#;:=/()[]!*_~|-\n ") + ["javascript:", "onerror", "script", "a", "x"]
+    for _ in range(300):
+        source = "".join(rng.choice(alphabet) for _ in range(rng.randint(1, 120)))
+        out = render_markdown(source)
+        audit = _Audit()
+        audit.feed(out)
+        audit.close()
+        assert audit.problems == [], (source, out)
+
+
+@pytest.mark.parametrize(
+    "source",
+    ["\ud800 lone surrogate", "nul \x00 byte <b>", "\x1b[31mred", ">" * 3000 + " deep",
+     "".join("  " * i + "- x\n" for i in range(200)), "\r\n\r\n", "```", "````\n```"],
+    ids=["surrogate", "nul", "ansi", "deep-quote", "deep-list", "crlf", "fence", "fence4"],
+)  # fmt: skip
+def test_render_markdown_odd_input_returns_safe_html(source: str) -> None:
+    out = render_markdown(source)
+    assert isinstance(out, str)
+    assert "<b>" not in out and "<script" not in out
+
+
+def test_plain_text_is_not_quadratic_on_pathological_lines() -> None:
+    # Unbounded, these lines took minutes (the event loop is the gateway's).
+    for line in ("[a](" * 5000, "![" * 10000, "*a _b " * 4000, "~~a " * 5000):
+        started = time.perf_counter()
+        assert plain_text(line)
+        assert time.perf_counter() - started < 2.0, line[:12]
+
+
+def test_plain_text_links_with_titles_and_images() -> None:
+    source = '[docs](https://e.com/x "Title") and ![cat](https://e.com/c.png "t") ok'
+    assert plain_text(source) == "docs (https://e.com/x) and cat ok"
