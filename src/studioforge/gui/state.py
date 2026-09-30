@@ -3377,15 +3377,21 @@ def chat_target_facts(
         slots = (effective.parallel if effective is not None else None) or (
             plan.parallel if plan is not None else None
         )
+        # Slots over ONE pool (D72) each may use the whole window, so
+        # "131,072 × 2 slots" would read as two windows of it.
+        shared = (
+            effective.kv_unified
+            if effective is not None
+            else bool(plan is not None and plan.kv_unified)
+        )
         if per_slot:
-            facts.append(
-                (
-                    "Context",
-                    f"{int(per_slot):,} × {slots} slot{'s' if (slots or 1) != 1 else ''}"
-                    if slots
-                    else f"{int(per_slot):,}",
-                )
-            )
+            if slots and slots > 1 and shared:
+                context = f"{int(per_slot):,} shared by {slots} slots"
+            elif slots:
+                context = f"{int(per_slot):,} × {slots} slot{'s' if slots != 1 else ''}"
+            else:
+                context = f"{int(per_slot):,}"
+            facts.append(("Context", context))
         if plan is not None:
             kv = plan.kv_cache_type
             if plan.kv_cache_type_v and plan.kv_cache_type_v != kv:

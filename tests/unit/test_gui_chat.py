@@ -284,6 +284,28 @@ def test_facts_for_a_loaded_model_say_where_and_how_it_runs() -> None:
     assert facts["Features"] == "thinking · MTP ×1"
 
 
+def test_slots_over_one_pool_read_as_one_shared_window() -> None:
+    """D72: each slot of a pool may use the whole window, so "x 2 slots" would
+    read as two of them. Partitioned slots keep the old wording."""
+    pool = LoadPlan(
+        model_id="m",
+        devices=[0, 1],
+        ctx_size=131072,
+        ctx_per_slot=131072,
+        parallel=2,
+        kv_unified=True,
+    )
+    launched = EffectiveLaunch(parallel=2, ctx_per_slot=131072, ctx_total=131072, kv_unified=True)
+    facts = dict(st.chat_target_facts(rec("m"), inst("m", plan=pool, effective=launched), []))
+    assert facts["Context"] == "131,072 shared by 2 slots"
+    # Before the argv is read, the plan says the same thing.
+    facts = dict(st.chat_target_facts(rec("m"), inst("m", plan=pool), []))
+    assert facts["Context"] == "131,072 shared by 2 slots"
+    split = pool.model_copy(update={"kv_unified": False, "ctx_size": 65536, "ctx_per_slot": 65536})
+    facts = dict(st.chat_target_facts(rec("m"), inst("m", plan=split), []))
+    assert facts["Context"] == "65,536 × 2 slots"
+
+
 def test_facts_for_a_model_that_is_not_loaded_describe_the_download() -> None:
     record = rec("m", vision=True, mtime=500.0)
     facts = dict(st.chat_target_facts(record, None, _gpus(), now=530.0))
