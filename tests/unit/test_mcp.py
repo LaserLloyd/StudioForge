@@ -672,7 +672,8 @@ async def test_load_model_accepts_a_placements_row_load_args_shape(state: State)
 
 async def test_load_recommended_offers_every_knob_the_rest_route_does(state: State) -> None:
     """Parity, deliberately: an agent that can only reach the MCP plane must
-    not be missing a knob a REST caller has (D48 added the last three)."""
+    not be missing a knob a REST caller has (D48 added the last three, D72
+    the slot floor and the shared pool)."""
     server = build_management_mcp(state)
     tool = next(t for t in await server.list_tools() if t.name == "load_recommended")
     assert {
@@ -683,6 +684,8 @@ async def test_load_recommended_offers_every_knob_the_rest_route_does(state: Sta
         "priority",
         "max_slots",
         "persist",
+        "min_slots",
+        "kv_unified",
     } <= set(tool.input_schema["properties"])
     assert tool.input_schema["properties"]["persist"]["default"] is False
 

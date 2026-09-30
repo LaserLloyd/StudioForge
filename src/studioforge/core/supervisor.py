@@ -396,6 +396,12 @@ def effective_launch(
     "advertises nothing" fallback D38 uses, applied to reporting rather than
     to emission. ``settings`` is only consulted to name what the child
     *cannot* see (:attr:`EffectiveLaunch.inert`).
+
+    With ``--kv-unified`` the engine gives every slot the whole
+    ``--ctx-size`` (llama-context.cpp: ``n_ctx_seq = n_ctx`` when unified), so
+    ``ctx_per_slot`` is reported as ``ctx_total`` there, not ``ctx_total /
+    parallel`` -- measured in D38 (``n_ctx_slot`` 16384 at ``--ctx-size
+    16384 --parallel 2 -kvu``).
     """
     values, switches = _parse_launch_argv(argv)
     sources: dict[str, str] = {}
@@ -407,9 +413,12 @@ def effective_launch(
     if parallel < 1:  # llama.cpp's -1 = auto; StudioForge always passes a count
         parallel = max(1, plan.parallel)
     src("parallel", "parallel" in values)
-    ctx_total = _int_or(values.get("ctx_total"), plan.ctx_size * max(1, plan.parallel))
+    ctx_total = _int_or(values.get("ctx_total"), plan.ctx_total)
     src("ctx_total", "ctx_total" in values)
-    ctx_per_slot = ctx_total // max(1, parallel)
+    # Read here, ahead of its report below, because it decides the per-slot
+    # window: a unified pool is available whole to each slot.
+    unified_switch = switches.get("kv_unified", False)
+    ctx_per_slot = ctx_total if unified_switch else ctx_total // max(1, parallel)
 
     cache_prompt = switches.get("cache_prompt", features.cache_prompt_default)
     src("cache_prompt", "cache_prompt" in switches)
@@ -549,11 +558,17 @@ def effective_launch(
     else:
         cache_text = "prefix cache OFF"
     slots_word = "slot" if parallel == 1 else "slots"
+    if kv_unified and parallel > 1:
+        # Whether an idle slot keeps its prompt while another one works (D72):
+        # with a unified cache the idle-slot snapshot clears it.
+        kv_text = "unified KV (idle slots " + ("cleared" if cache_idle_slots else "kept") + ")"
+    else:
+        kv_text = "unified KV" if kv_unified else "partitioned KV"
     parts = [
         cache_text,
         "continuous batching " + ("on" if cont_batching else "OFF"),
         f"{parallel} {slots_word} x {ctx_per_slot}",
-        "unified KV" if kv_unified else "partitioned KV",
+        kv_text,
         f"spec {spec_type}",
     ]
     if inert:
@@ -1566,9 +1581,11 @@ class Supervisor:
             CHILD_HOST,
             "--port",
             str(port),
-            # TOTAL context across all slots -- see module docstring.
+            # TOTAL context across all slots -- see module docstring. A shared
+            # pool (D72) is launched at its own size: every slot may use all of
+            # it, so it is not multiplied.
             "--ctx-size",
-            str(plan.ctx_size * plan.parallel),
+            str(plan.ctx_size if plan.kv_unified else plan.ctx_size * plan.parallel),
             "--parallel",
             str(plan.parallel),
         ]
@@ -2010,8 +2027,21 @@ class Supervisor:
         # pool stays the default and `--no-kv-unified` is passed *explicitly*:
         # the engine's own default is "enabled if the slot count is auto", and a
         # guarantee that depends on a flag we happen to pass is not a guarantee.
-        if settings.kv_unified:
+        #
+        # A shared pool is asked for per load (plan.kv_unified, D72: --ctx-size
+        # is then the pool) or per model (settings.kv_unified, the older opt-in:
+        # ctx_size per slot, pool = ctx_size x slots). Either way a unified
+        # multi-slot launch also gets `--no-cache-idle-slots`: with a unified
+        # cache the engine's idle-slot snapshot CLEARS every idle slot whenever
+        # another slot starts a task -- even when the copy into the host cache
+        # failed -- so a chat slot would lose its prompt every time a background
+        # request used the second slot, which is the one thing a second slot is
+        # for (b10425-b11037 server-context.cpp, [TAG_IDLE_SLOT_CLEAR]).
+        # Gated like --no-kv-unified; `extra_flags` can still turn it back on.
+        if plan.kv_unified or settings.kv_unified:
             args.append("--kv-unified")
+            if slots > 1 and features.has("--no-cache-idle-slots"):
+                args.append("--no-cache-idle-slots")
         elif slots > 1 and features.has("--no-kv-unified"):
             args.append("--no-kv-unified")
 

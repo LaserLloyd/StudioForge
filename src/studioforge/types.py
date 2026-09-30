@@ -209,6 +209,11 @@ class ModelSettings(BaseModel):
     #: llama.cpp only defaults it on when ``--parallel`` is auto, and we always
     #: pass an explicit slot count -- so turning it on is a real behaviour
     #: change that must be verified by a real load before it is recommended.
+    #:
+    #: This switch keeps ``ctx_size`` PER SLOT, so the pool it launches is
+    #: ``ctx_size * parallel`` tokens. It is not the shared pool
+    #: ``load_recommended(kv_unified=true)`` builds, where ``ctx_size`` IS the
+    #: pool (D72); that one is a property of one load and lives on the plan.
     kv_unified: bool | None = None
     # Default sampler params, applied by llama-server when a request omits them.
     temperature: float | None = None
@@ -766,7 +771,20 @@ class LoadPlan(BaseModel):
     #: ``ctx_per_slot * parallel``. Named separately because "context" means
     #: the per-conversation number to every client, and an API payload that
     #: says only ``ctx_size`` next to ``parallel`` is genuinely ambiguous.
+    #: On a shared pool (:attr:`kv_unified`) it is still :attr:`ctx_size`: the
+    #: most one conversation may use, which is the whole pool.
     ctx_per_slot: int = 0
+    #: The slots share ONE KV pool of :attr:`ctx_size` tokens (D72): launched
+    #: as ``--ctx-size ctx_size --parallel N --kv-unified``, so each slot may
+    #: use up to ``ctx_size`` and all of them together may not exceed it. The
+    #: pool costs what one slot of ``ctx_size`` costs, plus each extra slot's
+    #: sliding-window cells and recurrent state. ``False`` -- every plan before
+    #: D72 and every load that does not ask -- keeps D4: ``ctx_size`` per slot,
+    #: ``ctx_size * parallel`` in all. Set only by a load that asked for it
+    #: (``load_recommended(kv_unified=true)``); the per-model
+    #: ``settings.kv_unified`` switch keeps its older meaning and leaves this
+    #: ``False``.
+    kv_unified: bool = False
     #: Bytes of state one token of context costs, at this model's shape, KV
     #: type and :attr:`ctx_per_slot`. The single number every concurrency and
     #: context estimate divides by.
@@ -811,7 +829,10 @@ class LoadPlan(BaseModel):
 
     @property
     def ctx_total(self) -> int:
-        """What actually reaches ``--ctx-size``: per-slot context x slots (D4)."""
+        """What actually reaches ``--ctx-size``: per-slot context x slots (D4),
+        or the pool itself when the slots share one (D72)."""
+        if self.kv_unified:
+            return max(1, self.ctx_size)
         return max(1, self.ctx_size) * max(1, self.parallel)
 
 

@@ -817,6 +817,7 @@ def max_ctx_for_budget_geometry(
     kv_k: str,
     kv_v: str,
     parallel: int = 1,
+    kv_unified: bool = False,
 ) -> int:
     """Largest ladder context per slot whose *real* allocation fits ``budget_bytes``.
 
@@ -830,12 +831,17 @@ def max_ctx_for_budget_geometry(
     unknown; callers fall back to the uniform figure for the latter. A model
     sized by :func:`fallback_kv_layers` is walked against that same fallback,
     so the context a refusal offers is one the next plan accepts (D69 §11).
+
+    ``kv_unified`` asks the question of a shared pool (D72): the rung is the
+    POOL, which every slot may use, so the cache holds ``ctx`` cells rather
+    than ``ctx * parallel`` -- plus each slot's sliding window and state.
     """
     if budget_bytes <= 0 or kv_geometry_unknown(meta):
         return 0
     slots = max(1, int(parallel))
     for ctx in _CTX_LADDER:
-        needed = kv_alloc_bytes(meta, ctx_total=ctx * slots, kv_k=kv_k, kv_v=kv_v, parallel=slots)
+        total = ctx if kv_unified else ctx * slots
+        needed = kv_alloc_bytes(meta, ctx_total=total, kv_k=kv_k, kv_v=kv_v, parallel=slots)
         if 0 < needed <= budget_bytes:
             return ctx
     return 0
@@ -1230,6 +1236,7 @@ class Planner:
         draft_ctx_size: int | None = None,
         adapters: Sequence[AdapterRecord] = (),
         ubatch: int | None = None,
+        kv_unified: bool = False,
     ) -> VramEstimate:
         """Project VRAM for one load.
 
@@ -1237,7 +1244,12 @@ class Planner:
 
         * weights -- summed tensor bytes across every shard
         * KV cache + recurrent state -- sized per layer on the *total* context
-          (``ctx_size * parallel``); see :func:`kv_alloc_bytes`
+          (``ctx_size * parallel``); see :func:`kv_alloc_bytes`. With
+          ``kv_unified`` (D72) the slots share ONE pool of ``ctx_size`` cells:
+          the full-attention layers hold ``ctx_size`` whatever the slot count,
+          and what each extra slot adds is its sliding window
+          (``window * parallel + ubatch`` cells, as llama.cpp sizes a unified
+          SWA cache) and its recurrent state
         * compute/graph buffers -- scratch that scales with model width, plus
           the growth a micro-batch above the engine's 512 costs on every
           device (:func:`ubatch_scratch_bytes`, D40); for a MoE, sized from
@@ -1260,7 +1272,9 @@ class Planner:
             )
 
         planner_cfg = self.config.planner
-        ctx_total = max(1, ctx_size) * max(1, parallel)
+        # One pool (D72): --ctx-size IS the pool every slot shares. Otherwise
+        # --ctx-size is the per-slot window times the slots (D4).
+        ctx_total = max(1, ctx_size) if kv_unified else max(1, ctx_size) * max(1, parallel)
         micro_batch = (
             int(ubatch) if ubatch is not None else self.ubatch_for(record, max(1, parallel))
         )
@@ -1292,7 +1306,14 @@ class Planner:
             # compute buffer (the floor, per device) and each device's copy
             # of the attention mask, which grows with the context.
             n_dev = max(1, n_devices)
-            mask_cells = max(1, ctx_size) * (max(1, parallel) if record.settings.kv_unified else 1)
+            if kv_unified:
+                # A shared pool's mask spans the whole pool (D72): the same
+                # [n_kv, n_ubatch] one slot of ctx_size would reserve.
+                mask_cells = ctx_total
+            else:
+                mask_cells = max(1, ctx_size) * (
+                    max(1, parallel) if record.settings.kv_unified else 1
+                )
             compute = (
                 max(
                     planner_cfg.compute_overhead_floor_mb * MB * n_dev,
@@ -1329,8 +1350,9 @@ class Planner:
         if draft is not None and draft.meta is not None:
             draft_weights = int(draft.meta.tensor_bytes) or int(draft.size_bytes)
             # The draft shares the target's context window in practice; sizing its
-            # KV on the same total is the conservative choice.
-            draft_ctx_total = (draft_ctx_size or ctx_size) * max(1, parallel)
+            # KV on the same total is the conservative choice. llama-server gives
+            # the draft the target's slot layout, a shared pool included (D72).
+            draft_ctx_total = (draft_ctx_size or ctx_size) * (1 if kv_unified else max(1, parallel))
             draft_kv = estimate_kv_bytes(
                 n_layer=draft.meta.n_layer,
                 n_head_kv=draft.meta.n_head_kv or draft.meta.n_head,
@@ -1492,6 +1514,7 @@ class Planner:
         parallel_auto: bool = False,
         priority: int = PRIORITY_BACKGROUND,
         override_chosen_by_server: bool = False,
+        kv_unified: bool = False,
     ) -> PlanResult:
         """Decide where (and whether) a model can be loaded.
 
@@ -1540,6 +1563,12 @@ class Planner:
         only the words of a lease refusal: "load without the device override"
         is advice for a caller who sent one, and addressed to one who did not
         it cost the 2026-09-12 incident most of its diagnosis time (D64).
+
+        ``kv_unified`` plans the slots as ONE shared KV pool of ``ctx_size``
+        tokens rather than ``ctx_size`` each (D72): the plan carries
+        ``kv_unified=True``, the child is launched with ``--ctx-size ctx_size
+        --kv-unified``, and the estimate charges one pool plus each extra
+        slot's sliding window and recurrent state. Off, nothing changes.
         """
         blocked = self._leased_away(record)
         forced = set(record.settings.device_override or ())
@@ -1641,6 +1670,7 @@ class Planner:
                 source=source,
                 parallel_auto=parallel_auto,
                 priority=priority,
+                kv_unified=kv_unified,
             )
         if isinstance(result, LoadPlan):
             if reload_of is not None and resident is not None:
@@ -1926,6 +1956,7 @@ class Planner:
         source: str | None = None,
         parallel_auto: bool = False,
         priority: int = PRIORITY_BACKGROUND,
+        kv_unified: bool = False,
     ) -> PlanResult:
         """:meth:`plan_load` proper; ``gpus``/``extra_own_pids`` are the reload view."""
         if kv_geometry_unknown(record.meta):
@@ -1988,6 +2019,7 @@ class Planner:
                     extra_own_pids=extra_own_pids,
                     evict_busy=evict_busy,
                     priority=priority,
+                    kv_unified=kv_unified,
                     extra_notes=self._rung_notes(
                         ctx, aim, floor, thinking=thinking, kv_k=cand_k, kv_options=kv_options
                     ),
@@ -2018,6 +2050,7 @@ class Planner:
                     evict_busy=evict_busy,
                     source=source,
                     priority=priority,
+                    kv_unified=kv_unified,
                 ),
             )
 
@@ -2047,6 +2080,7 @@ class Planner:
                     extra_own_pids=extra_own_pids,
                     evict_busy=evict_busy,
                     priority=priority,
+                    kv_unified=kv_unified,
                     extra_notes=self._rung_notes(
                         ctx, aim, floor, thinking=thinking, kv_k=cand_k, kv_options=kv_options
                     ),
@@ -2103,6 +2137,7 @@ class Planner:
                 evict_busy=evict_busy,
                 source=source,
                 priority=priority,
+                kv_unified=kv_unified,
             ),
         )
 
@@ -2214,6 +2249,7 @@ class Planner:
         evict_busy: bool = False,
         source: str | None = None,
         priority: int = PRIORITY_BACKGROUND,
+        kv_unified: bool = False,
     ) -> PlanResult:
         """Recompute the floor rung as the *terminal* refusal, and log it.
 
@@ -2239,6 +2275,7 @@ class Planner:
             gpus=gpus,
             extra_own_pids=extra_own_pids,
             priority=priority,
+            kv_unified=kv_unified,
             extra_notes=(
                 [
                     f"wanted up to {aim} tokens of context but not even the {floor} "
@@ -2291,7 +2328,11 @@ class Planner:
             # share; "a 262144-token model appeared on three GPUs" with no
             # requester is not a diagnosable event.
             source=source,
-            chosen=f"ctx={plan.ctx_size} kv={plan.kv_cache_type} parallel={plan.parallel}",
+            chosen=(
+                f"ctx={plan.ctx_size} kv={plan.kv_cache_type} parallel={plan.parallel}"
+                # A shared pool reads differently from N slots of ctx (D72).
+                + (" kv_unified" if plan.kv_unified else "")
+            ),
             devices=plan.devices,
             rungs_tried=len(tried),
             rungs=list(tried),
@@ -2416,6 +2457,7 @@ class Planner:
         extra_own_pids: Sequence[int] = (),
         evict_busy: bool = False,
         priority: int = PRIORITY_BACKGROUND,
+        kv_unified: bool = False,
     ) -> PlanResult:
         """Plan a load at one specific context size.
 
@@ -2429,13 +2471,24 @@ class Planner:
         The eviction-fallback round below still tries single-card placements
         before splits regardless of the flag: there the alternative is refusing
         the load outright, so the cheap option is always worth a try.
+
+        ``kv_unified`` plans the slots as one shared pool of ``ctx`` (D72).
         """
         settings = record.settings
 
         gpus = list(gpus) if gpus is not None else self.probe.list_gpus()
         if not gpus:
             estimate = self._safe_estimate(
-                record, ctx, slots, kv_k, kv_v, 1, draft, settings.draft_ctx_size, adapters
+                record,
+                ctx,
+                slots,
+                kv_k,
+                kv_v,
+                1,
+                draft,
+                settings.draft_ctx_size,
+                adapters,
+                kv_unified=kv_unified,
             )
             return LoadRejected(
                 model_id=record.id,
@@ -2501,6 +2554,7 @@ class Planner:
                 extra_own_pids=extra_own_pids,
                 evict_busy=evict_busy,
                 priority=priority,
+                kv_unified=kv_unified,
             )
 
         order = self._candidate_order(gpus)
@@ -2535,6 +2589,7 @@ class Planner:
                         adapters,
                         extra_free={},
                         auto_parallel=auto_parallel,
+                        kv_unified=kv_unified,
                     )
                     if result is None:
                         continue
@@ -2553,6 +2608,7 @@ class Planner:
                         draft,
                         adapters,
                         auto_parallel=auto_parallel,
+                        kv_unified=kv_unified,
                     )
                     chosen = wider if wider is not None else result
                     chosen.notes.extend(notes)
@@ -2581,6 +2637,7 @@ class Planner:
                         adapters,
                         extra_free={},
                         auto_parallel=auto_parallel,
+                        kv_unified=kv_unified,
                     )
                     if result is not None:
                         result.notes.extend(notes)
@@ -2623,6 +2680,7 @@ class Planner:
                                 adapters,
                                 extra_free=freed,
                                 auto_parallel=auto_parallel,
+                                kv_unified=kv_unified,
                             )
                             if result is not None:
                                 result.evict_model_ids = list(evicted)
@@ -2663,6 +2721,7 @@ class Planner:
             extra_own_pids=extra_own_pids,
             evict_busy=evict_busy,
             priority=priority,
+            kv_unified=kv_unified,
         )
 
     def _wider_split_for_parallel(
@@ -2679,6 +2738,7 @@ class Planner:
         adapters: Sequence[AdapterRecord],
         *,
         auto_parallel: bool,
+        kv_unified: bool = False,
     ) -> LoadPlan | None:
         """A split placement worth taking over ``single``, or ``None``.
 
@@ -2726,6 +2786,7 @@ class Planner:
                     adapters,
                     extra_free={},
                     auto_parallel=True,
+                    kv_unified=kv_unified,
                 )
                 if candidate is None or candidate.parallel < 2:
                     continue
@@ -2767,6 +2828,8 @@ class Planner:
         draft: ModelRecord | None,
         draft_ctx: int | None,
         adapters: Sequence[AdapterRecord],
+        *,
+        kv_unified: bool = False,
     ) -> VramEstimate:
         """The formula estimate, corrected by what this configuration measured (D51).
 
@@ -2785,6 +2848,11 @@ class Planner:
         The metadata-less fallback is deliberately left alone: an on-disk file
         size is not a formula, so there is no band to clamp a measurement
         against and nothing the correction could honestly say about it.
+
+        ``kv_unified`` prices a shared pool (D72) and keys the correction
+        apart: a pool of ``ctx`` at two slots weighs about what ONE slot of
+        ``ctx`` does, and roughly half a partitioned pair, so a measurement of
+        either shape must never be spent on the other.
         """
         try:
             estimate = self.estimate(
@@ -2797,6 +2865,7 @@ class Planner:
                 draft=draft,
                 draft_ctx_size=draft_ctx,
                 adapters=adapters,
+                kv_unified=kv_unified,
             )
         except PlannerError:
             # No metadata: fall back to the on-disk size so the rejection still
@@ -2810,6 +2879,7 @@ class Planner:
             kv_v=kv_v,
             n_devices=n_devices,
             formula_bytes=estimate.total_bytes,
+            kv_unified=kv_unified,
         )
         if correction is None:
             return estimate
@@ -2818,7 +2888,7 @@ class Planner:
         # corrected numbers, and the formula they replaced is what the
         # planner's error and the calibrator are measured against.
         self._remember_applied(
-            _correction_key(record.id, ctx, slots, kv_k, kv_v, n_devices),
+            _correction_key(record.id, ctx, slots, kv_k, kv_v, n_devices, kv_unified),
             AppliedCorrection(correction=correction, formula=estimate, corrected=corrected),
         )
         return corrected
@@ -2849,6 +2919,7 @@ class Planner:
         note takes in :meth:`_try_devices`).
         """
         estimate = plan.estimate
+        unified = bool(plan.kv_unified)
         for candidate in dict.fromkeys((model_id, plan.model_id)):
             exact = self._applied_corrections.get(
                 _correction_key(
@@ -2858,6 +2929,7 @@ class Planner:
                     plan.kv_cache_type,
                     plan.kv_cache_type_v,
                     len(plan.devices),
+                    unified,
                 )
             )
             if exact is not None and exact.corrected == estimate:
@@ -2869,6 +2941,7 @@ class Planner:
                     and key[3] == str(plan.kv_cache_type)
                     and key[4] == str(plan.kv_cache_type_v)
                     and key[5] == len(plan.devices)
+                    and key[6] == unified
                 )
                 if same_shape and applied.corrected == estimate:
                     return applied
@@ -2884,6 +2957,7 @@ class Planner:
         kv_v: KvCacheType,
         n_devices: int,
         formula_bytes: int,
+        kv_unified: bool = False,
     ) -> ObservedCorrection | None:
         """Look up what this configuration last really weighed, and by how much
         the formula should move because of it (D51).
@@ -2898,6 +2972,10 @@ class Planner:
         A lookup that raises disables itself for the rest of the pass after one
         warning. The correction is an accuracy improvement; a broken database
         must never be able to turn it into a refused load.
+
+        A shared pool (D72) is its own configuration: ``kv_unified=True`` is
+        passed to the lookup only for such a plan, so every partitioned lookup
+        keeps the exact call shape it always had.
         """
         memo = self._obs_memo
         if memo is None or memo.failed:
@@ -2906,9 +2984,10 @@ class Planner:
             return None
         if not self.config.planner.observed_correction:
             return None
-        key = _correction_key(record.id, ctx, slots, kv_k, kv_v, n_devices)
+        key = _correction_key(record.id, ctx, slots, kv_k, kv_v, n_devices, kv_unified)
         if key in memo.rows:
             return memo.rows[key]
+        shape: dict[str, Any] = {"kv_unified": True} if kv_unified else {}
         try:
             row = self._observation_lookup(
                 record.id,
@@ -2917,6 +2996,7 @@ class Planner:
                 kv_cache_type=kv_k,
                 kv_cache_type_v=kv_v,
                 device_count=int(n_devices),
+                **shape,
             )
         except Exception as exc:  # noqa: BLE001 -- any failure means "no history"
             memo.failed = True
@@ -2964,6 +3044,7 @@ class Planner:
         kv_k: KvCacheType,
         kv_v: KvCacheType,
         n_devices: int,
+        kv_unified: bool = False,
     ) -> ObservedCorrection | None:
         """The correction already spent on this configuration's estimate, for the note.
 
@@ -2975,7 +3056,9 @@ class Planner:
         memo = self._obs_memo
         if memo is None:
             return None
-        return memo.rows.get(_correction_key(model_id, ctx, slots, kv_k, kv_v, n_devices))
+        return memo.rows.get(
+            _correction_key(model_id, ctx, slots, kv_k, kv_v, n_devices, kv_unified)
+        )
 
     def _try_devices(
         self,
@@ -2993,14 +3076,27 @@ class Planner:
         extra_free: dict[int, int],
         forced: bool = False,
         auto_parallel: bool = False,
+        kv_unified: bool = False,
     ) -> LoadPlan | None:
-        """Return a plan if the model fits on exactly ``devices``, else None."""
+        """Return a plan if the model fits on exactly ``devices``, else None.
+
+        ``kv_unified`` plans the slots as one shared pool of ``ctx`` (D72).
+        """
         gpus = [gpu_map[d] for d in devices if d in gpu_map]
         if len(gpus) != len(devices):
             return None
 
         estimate = self._safe_estimate(
-            record, ctx, slots, kv_k, kv_v, len(devices), draft, draft_ctx, adapters
+            record,
+            ctx,
+            slots,
+            kv_k,
+            kv_v,
+            len(devices),
+            draft,
+            draft_ctx,
+            adapters,
+            kv_unified=kv_unified,
         )
 
         capacities = {
@@ -3037,6 +3133,7 @@ class Planner:
                 adapters=adapters,
                 base_estimate=estimate,
                 total_capacity=total_capacity,
+                kv_unified=kv_unified,
             )
 
         total_needed = estimate.total_bytes
@@ -3050,7 +3147,10 @@ class Planner:
             "estimate": estimate,
             "max_parallel": max_parallel,
             "parallel_limited_by": bound,
+            # On a shared pool (D72) still ``ctx``: the most one conversation
+            # may use is the whole pool.
             "ctx_per_slot": ctx,
+            "kv_unified": kv_unified,
             "kv_bytes_per_token": per_token,
             # The bound this placement was chosen within (D59). It travels on
             # the plan because the record copy that carried it is thrown away
@@ -3084,6 +3184,7 @@ class Planner:
                 kv_k=kv_k,
                 kv_v=kv_v,
                 n_devices=len(devices),
+                kv_unified=kv_unified,
             )
             if correction is not None:
                 break
@@ -3204,6 +3305,7 @@ class Planner:
         draft: ModelRecord | None = None,
         draft_ctx: int | None = None,
         adapters: Sequence[AdapterRecord] = (),
+        kv_unified: bool = False,
     ) -> tuple[int, VramEstimate]:
         """Largest slot count in ``[1, cap]`` that really fits, and its estimate.
 
@@ -3219,14 +3321,35 @@ class Planner:
         can only ever add concurrency (D17), never turn a working load into a
         rejection; the one-slot estimate comes back with it so the caller always
         has a number to report.
+
+        ``kv_unified`` walks a shared pool of ``ctx`` (D72), where a slot costs
+        its window and state rather than ``ctx`` tokens of KV.
         """
         cap = max(1, int(cap))
         floor_estimate = self._safe_estimate(
-            record, ctx, 1, kv_k, kv_v, n_devices, draft, draft_ctx, adapters
+            record,
+            ctx,
+            1,
+            kv_k,
+            kv_v,
+            n_devices,
+            draft,
+            draft_ctx,
+            adapters,
+            kv_unified=kv_unified,
         )
         for slots in range(cap, 1, -1):
             candidate = self._safe_estimate(
-                record, ctx, slots, kv_k, kv_v, n_devices, draft, draft_ctx, adapters
+                record,
+                ctx,
+                slots,
+                kv_k,
+                kv_v,
+                n_devices,
+                draft,
+                draft_ctx,
+                adapters,
+                kv_unified=kv_unified,
             )
             if candidate.total_bytes <= capacity_bytes:
                 return slots, candidate
@@ -3245,6 +3368,7 @@ class Planner:
         draft: ModelRecord | None = None,
         draft_ctx: int | None = None,
         adapters: Sequence[AdapterRecord] = (),
+        kv_unified: bool = False,
     ) -> tuple[VramEstimate, int, int, str]:
         """Pick the slot count for a placement already known to fit as requested.
 
@@ -3264,6 +3388,11 @@ class Planner:
         The knee is evaluated at ``ctx * CTX_FILL_FRACTION`` because slots
         rarely sit at their maximum; assuming they do puts the knee at one or
         two slots for every model on the box.
+
+        On a shared pool (``kv_unified``, D72) a slot does not cost ``ctx``
+        tokens of KV, so the analytic VRAM quotient -- partitioned arithmetic
+        -- is not a bound at all: the exact walk (priced as a pool) is the VRAM
+        answer and the knee the only other one.
         """
         meta = record.meta
         n_devices = len(devices) or 1
@@ -3290,10 +3419,16 @@ class Planner:
             draft=draft,
             draft_ctx=draft_ctx,
             adapters=adapters,
+            kv_unified=kv_unified,
         )
         fixed = base_estimate.total_bytes - base_estimate.kv_bytes
+        kv_budget = max(0, capacity_bytes - fixed)
+        if kv_unified:
+            # Room for every slot at the partitioned price, so the analytic
+            # quotient never binds: by_vram above already priced the pool.
+            kv_budget = max(kv_budget, per_token * ctx * cap)
         wanted, bound = max_parallel_for(
-            kv_budget_bytes=max(0, capacity_bytes - fixed),
+            kv_budget_bytes=kv_budget,
             kv_per_token=per_token,
             ctx_per_slot=ctx,
             active_weight_bytes=active_weight_bytes(meta, base_estimate.weights_bytes),
@@ -3310,7 +3445,16 @@ class Planner:
             bound = "vram"
         elif slots != by_vram:
             estimate = self._safe_estimate(
-                record, ctx, slots, kv_k, kv_v, n_devices, draft, draft_ctx, adapters
+                record,
+                ctx,
+                slots,
+                kv_k,
+                kv_v,
+                n_devices,
+                draft,
+                draft_ctx,
+                adapters,
+                kv_unified=kv_unified,
             )
         return estimate, slots, slots, bound
 
@@ -3327,6 +3471,7 @@ class Planner:
         adapters: Sequence[AdapterRecord],
         base_estimate: VramEstimate,
         total_capacity: int,
+        kv_unified: bool = False,
     ) -> tuple[VramEstimate, int, int, str]:
         """Internal alias for :meth:`size_slots`, which is the public surface."""
         return self.size_slots(
@@ -3340,6 +3485,7 @@ class Planner:
             draft=draft,
             draft_ctx=draft_ctx,
             adapters=adapters,
+            kv_unified=kv_unified,
         )
 
     def _plan_on_devices(
@@ -3363,12 +3509,22 @@ class Planner:
         terminal: bool = True,
         extra_own_pids: Sequence[int] = (),
         priority: int = PRIORITY_BACKGROUND,
+        kv_unified: bool = False,
     ) -> PlanResult:
         gpu_map = {gpu.index: gpu for gpu in gpus}
         unknown = [d for d in devices if d not in gpu_map]
         if unknown:
             estimate = self._safe_estimate(
-                record, ctx, slots, kv_k, kv_v, len(devices), draft, None, adapters
+                record,
+                ctx,
+                slots,
+                kv_k,
+                kv_v,
+                len(devices),
+                draft,
+                None,
+                adapters,
+                kv_unified=kv_unified,
             )
             return LoadRejected(
                 model_id=record.id,
@@ -3396,6 +3552,7 @@ class Planner:
             extra_free={},
             forced=forced,
             auto_parallel=auto_parallel,
+            kv_unified=kv_unified,
         )
         if result is not None:
             result.notes.extend(notes)
@@ -3422,6 +3579,7 @@ class Planner:
                     extra_free=freed,
                     forced=forced,
                     auto_parallel=auto_parallel,
+                    kv_unified=kv_unified,
                 )
                 if result is not None:
                     result.evict_model_ids = list(evicted)
@@ -3435,6 +3593,7 @@ class Planner:
             slots=slots,
             kv_k=kv_k,
             kv_v=kv_v,
+            kv_unified=kv_unified,
             draft=draft,
             adapters=adapters,
             loaded=loaded,
@@ -3472,6 +3631,7 @@ class Planner:
         extra_own_pids: Sequence[int] = (),
         evict_busy: bool = False,
         priority: int = PRIORITY_BACKGROUND,
+        kv_unified: bool = False,
     ) -> LoadRejected:
         estimate = self._safe_estimate(
             record,
@@ -3483,6 +3643,7 @@ class Planner:
             draft,
             record.settings.draft_ctx_size,
             adapters,
+            kv_unified=kv_unified,
         )
         per_gpu_free = {gpu.index: self.usable_bytes(gpu, forced=forced) for gpu in gpus}
         available = sum(per_gpu_free.values())
@@ -3518,13 +3679,15 @@ class Planner:
                     draft=draft,
                     draft_ctx=record.settings.draft_ctx_size,
                     adapters=adapters,
+                    kv_unified=kv_unified,
                 )
                 if at_fewer.total_bytes <= capacity and fewer > (max_parallel or 0):
                     max_parallel = fewer
             if max_parallel is not None:
+                shape = f"sharing a {ctx}-token pool" if kv_unified else f"at {ctx} tokens"
                 suggestions.append(
-                    f"reduce parallel from {slots} to {max_parallel}: {max_parallel} slot(s) at "
-                    f"{ctx} tokens fit in the VRAM usable right now (a catalog row's parallel is "
+                    f"reduce parallel from {slots} to {max_parallel}: {max_parallel} slot(s) "
+                    f"{shape} fit in the VRAM usable right now (a catalog row's parallel is "
                     f"the most that placement sustained when the row was built, not a "
                     f"requirement)"
                 )
@@ -3537,7 +3700,12 @@ class Planner:
             fixed = estimate.total_bytes - estimate.kv_bytes
             budget = available - fixed
             raw = max_ctx_for_budget_geometry(
-                meta, budget_bytes=budget, kv_k=kv_k, kv_v=kv_v, parallel=slots
+                meta,
+                budget_bytes=budget,
+                kv_k=kv_k,
+                kv_v=kv_v,
+                parallel=slots,
+                kv_unified=kv_unified,
             )
             if raw <= 0 and not kv_layers(meta):
                 raw = _round_ctx_down(
@@ -3549,7 +3717,8 @@ class Planner:
                         head_dim_v=meta.head_dim_v,
                         kv_type_k=kv_k,
                         kv_type_v=kv_v,
-                        parallel=slots,
+                        # A shared pool divides by nothing: every slot may use it.
+                        parallel=1 if kv_unified else slots,
                     )
                 )
             max_ctx = raw or None
@@ -4103,6 +4272,7 @@ class Planner:
             "overhead_fraction": fraction,
             "ctx_size": plan.ctx_size,
             "parallel": plan.parallel,
+            "kv_unified": bool(plan.kv_unified),
             "kv_cache_type": plan.kv_cache_type,
             "kv_cache_type_v": plan.kv_cache_type_v,
             "devices": list(plan.devices),
@@ -4128,6 +4298,13 @@ class Planner:
             planned_shares: dict[str, Any] = {
                 str(d): int(b) for d, b in sorted(plan.per_gpu_bytes.items())
             }
+            if plan.kv_unified:
+                # A shared pool (D72) is its own configuration: this metadata
+                # key is what keeps db.matching_observation from spending the
+                # row on a partitioned plan of the same (ctx, slots), or one of
+                # those on a pool. Absent -- not false -- on every other row,
+                # so those read exactly as before.
+                planned_shares[OBSERVATION_KV_UNIFIED_KEY] = True
             if formula is not None:
                 planned_shares[OBSERVATION_FORMULA_KEY] = {
                     "total_bytes": int(formula.total_bytes),
@@ -4288,13 +4465,29 @@ class AppliedCorrection:
 
 #: ``(model_id, ctx, slots, kv_k, kv_v, n_devices)``: one configuration as
 #: the D51 lookup and :attr:`Planner._applied_corrections` key it.
-_CorrectionKey = tuple[str, int, int, str, str, int]
+_CorrectionKey = tuple[str, int, int, str, str, int, bool]
 
 
 def _correction_key(
-    model_id: str, ctx: int, slots: int, kv_k: str, kv_v: str, n_devices: int
+    model_id: str,
+    ctx: int,
+    slots: int,
+    kv_k: str,
+    kv_v: str,
+    n_devices: int,
+    kv_unified: bool = False,
 ) -> _CorrectionKey:
-    return (model_id, int(ctx), int(slots), str(kv_k), str(kv_v), int(n_devices))
+    # ``kv_unified`` last (D72): a shared pool and a partitioned load of the
+    # same (ctx, slots) are different footprints and never share a correction.
+    return (
+        model_id,
+        int(ctx),
+        int(slots),
+        str(kv_k),
+        str(kv_v),
+        int(n_devices),
+        bool(kv_unified),
+    )
 
 
 #: How many configurations' corrections a planner remembers for
@@ -4412,9 +4605,7 @@ class _ObservationMemo:
     else -- never a refused load, and never the same warning once per rung.
     """
 
-    rows: dict[tuple[str, int, int, str, str, int], ObservedCorrection | None] = field(
-        default_factory=dict
-    )
+    rows: dict[_CorrectionKey, ObservedCorrection | None] = field(default_factory=dict)
     failed: bool = False
 
 
@@ -4464,6 +4655,13 @@ OBSERVATION_NOTE_PER_PID_DEVICE = "per_pid_v2"
 #: cannot be mistaken for the band. Non-numeric keys in this column are
 #: metadata; the per-card shares are the numeric ones.
 OBSERVATION_FORMULA_KEY = "formula"
+
+#: Metadata key in the same column, ``true`` on a load whose slots shared one
+#: KV pool (D72). ``db.matching_observation`` compares it -- a pool of ``ctx``
+#: at two slots weighs about what one slot of ``ctx`` does, half a partitioned
+#: pair -- and it is absent on every other row. Duplicated there as a literal
+#: for the same leaf-module reason as :data:`OBSERVATION_NOTE_PER_PID_DEVICE`.
+OBSERVATION_KV_UNIFIED_KEY = "kv_unified"
 
 #: Bounds the auto-calibrated ``compute_overhead_fraction`` may move between.
 #: Below the floor the compute term stops covering real graph buffers on small

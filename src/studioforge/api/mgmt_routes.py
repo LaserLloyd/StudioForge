@@ -772,14 +772,26 @@ async def plan_recommended(
     priority: int | None = Query(
         None, description="Load tier: 1 active chat, 2 dispatched agent, 3 (or omitted) background."
     ),
+    min_slots: int | None = Query(
+        None, description="The fewest slots this load may have (>= 1, <= max_slots)."
+    ),
+    kv_unified: bool | None = Query(
+        None,
+        description=(
+            "true: the slots share ONE KV pool of ctx_size tokens. Omitted or false: "
+            "ctx_size per slot."
+        ),
+    ),
 ) -> dict[str, Any]:
     """The dry run of ``POST /api/models/{id}/load-recommended`` (D64).
 
     What that call would do right now, without doing it: nothing is loaded,
     evicted, leased, held, re-tiered or persisted. It takes the same inputs
-    (``ctx_size``, ``prefer_mode``, ``kv_min``, ``max_slots``,
-    ``allowed_devices`` repeated per index, ``priority``; ``persist`` has no
-    meaning for a dry run) and refuses a bad one with the same 400.
+    (``ctx_size``, ``prefer_mode``, ``kv_min``, ``max_slots``, ``min_slots``,
+    ``kv_unified``, ``allowed_devices`` repeated per index, ``priority``;
+    ``persist`` has no meaning for a dry run) and refuses a bad one with the
+    same 400. A fit also reports ``kv_unified``, ``ctx_per_slot`` and
+    ``ctx_total`` -- all equal to ``ctx_size`` for a shared pool (D72).
 
     **It is the same decision, not a model of it.** The real call and this
     route run one function -- the mode walk, leases included -- so the answer
@@ -818,6 +830,8 @@ async def plan_recommended(
         max_slots=max_slots,
         allowed_devices=allowed_devices,
         priority=priority,
+        min_slots=min_slots,
+        kv_unified=kv_unified,
     )
 
 
@@ -974,6 +988,21 @@ async def load_recommended(
             "MCP PIN."
         ),
     ),
+    min_slots: int | None = Body(
+        None,
+        description=(
+            "The fewest slots this load may have (>= 1, <= max_slots). The fit is judged "
+            "at this count; a window it cannot reach is refused, never loaded short."
+        ),
+    ),
+    kv_unified: bool | None = Body(
+        None,
+        description=(
+            "true: the slots share ONE KV pool of ctx_size tokens -- each may use all of "
+            "it, together they may not exceed it -- for the VRAM of one slot plus each "
+            "extra slot's sliding window. Omitted or false: ctx_size per slot."
+        ),
+    ),
 ) -> dict[str, Any]:
     """Load at exactly ``ctx_size`` per slot; the server picks everything else.
 
@@ -1037,6 +1066,21 @@ async def load_recommended(
     ``priority`` is the load's tier (D46): 1 the active chat model, 2 a
     dispatched agent, 3 (or omitted) background.
 
+    ``min_slots`` and ``kv_unified`` shape the slots (D72). ``min_slots`` is a
+    floor on the count the walk picks -- the fit, the KV cache type and any
+    refusal are all judged at it, so a mode that reaches the window only with
+    fewer slots is a 507 carrying ``max_ctx_that_fits`` and
+    ``max_parallel_that_fits``, never a shorter load. ``kv_unified: true``
+    makes ``ctx_size`` ONE shared pool: the child runs ``--parallel N
+    --kv-unified --ctx-size ctx_size --no-cache-idle-slots``, every slot may
+    use the whole pool, and VRAM is one slot's KV plus each extra slot's
+    sliding window and recurrent state. ClawChat asks for ``min_slots: 2,
+    max_slots: 2, kv_unified: true``: one slot for the chat, one for
+    everything else, at the price of one. A resident is "already exactly
+    that" only at or above the floor and, when the caller names a pool shape,
+    in that shape. ``persist`` with ``kv_unified: true`` is a 400: the saved
+    settings keep ``ctx_size`` per slot and cannot hold a shared pool.
+
     **Auth.** The route itself is ungated (residency is open, LM Studio
     parity), but ``persist: true`` writes settings -- the same box change
     ``PUT /settings`` is gated for (D32) -- so that field alone needs
@@ -1068,6 +1112,8 @@ async def load_recommended(
         persist=persist,
         source=attributed_source("api:/api/models/{id}/load-recommended", client_of(request)),
         priority=priority,
+        min_slots=min_slots,
+        kv_unified=kv_unified,
     )
     return instance.model_dump(mode="json")
 

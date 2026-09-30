@@ -419,6 +419,9 @@ def slots_for_plan(planner: Planner, record: ModelRecord, plan: LoadPlan) -> tup
     The VRAM figure comes back **at the chosen slot count**, so ``vram_mb``
     describes the load ``load_args`` would actually produce rather than the one
     the planner happened to size while checking the fit.
+
+    A plan whose slots share one KV pool (``plan.kv_unified``, D72) is sized as
+    one: another slot costs its sliding window and state, not ``ctx`` of KV.
     """
     forced = bool(record.settings.device_override)
     capacity = _capacity_for(planner, plan.devices, forced=forced)
@@ -430,6 +433,7 @@ def slots_for_plan(planner: Planner, record: ModelRecord, plan: LoadPlan) -> tup
         devices=plan.devices,
         capacity_bytes=capacity,
         base_estimate=plan.estimate,
+        kv_unified=plan.kv_unified,
     )
     return slots, bound, estimate.total_bytes
 

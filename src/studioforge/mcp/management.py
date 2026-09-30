@@ -1300,6 +1300,8 @@ def build_management_mcp(state: Any) -> MCPServer:
         max_slots: int | None = None,
         allowed_devices: list[int] | None = None,
         persist: bool = False,
+        min_slots: int | None = None,
+        kv_unified: bool | None = None,
     ) -> dict[str, Any]:
         """**The easy way to load.** Say the model and the context you need.
 
@@ -1397,6 +1399,23 @@ def build_management_mcp(state: Any) -> MCPServer:
                 the load standing and skips only the write, so a success here
                 means the model is loaded but does not by itself prove the
                 profile was saved.
+            min_slots: The fewest concurrent slots this load may have, >= 1
+                and not above ``max_slots``. The server still picks the count,
+                but never below this, and it judges the fit AT this count: if
+                the window only fits with fewer slots, the answer is the same
+                structured refusal, naming the largest context that would fit
+                with this many slots and the most slots that fit at this
+                context -- never a load with fewer slots than you asked for.
+            kv_unified: ``true`` makes ``ctx_size`` ONE memory pool that every
+                slot shares: each conversation may use the whole window, all of
+                them together may not exceed it, and the pool costs about what
+                ONE slot of that window costs (plus a little per extra slot).
+                Right for "one main conversation plus quick side requests" --
+                two slots so the side requests never push the conversation's
+                cached prompt out, for the price of one. Wrong for several
+                long conversations at once, which would run out of room
+                mid-reply. Omitted or ``false``: ``ctx_size`` per slot, each
+                slot's own. Cannot be combined with ``persist``.
 
         Returns:
             The running instance: port, pid, devices, the KV cache type chosen,
@@ -1413,6 +1432,8 @@ def build_management_mcp(state: Any) -> MCPServer:
             persist=persist,
             source="mcp:load_recommended",
             priority=priority,
+            min_slots=min_slots,
+            kv_unified=kv_unified,
         )
         return {
             "ok": True,

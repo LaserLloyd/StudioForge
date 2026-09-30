@@ -130,6 +130,29 @@ _OBSERVATION_COLUMNS: tuple[str, ...] = (
 #: ``tests/unit/test_planner_observed.py`` asserts the two agree.
 OBSERVATION_NOTE_TRUSTED: str = "per_pid_v2"
 
+#: The ``per_gpu_planned`` metadata key a shared-pool load carries (D72). The
+#: authority is :data:`studioforge.core.planner.OBSERVATION_KV_UNIFIED_KEY`;
+#: duplicated as a literal for the same reason as the note above.
+OBSERVATION_KV_UNIFIED_KEY: str = "kv_unified"
+
+
+def _observation_is_unified(row: dict[str, Any]) -> bool:
+    """Whether an observation row describes a shared-pool load (D72).
+
+    ``per_gpu_planned`` is JSON text as stored (or an already-decoded mapping).
+    Anything unreadable, and every row written before D72, is a partitioned
+    load: that is what those loads were.
+    """
+    raw = row.get("per_gpu_planned")
+    data: Any = raw
+    if isinstance(raw, (str, bytes)):
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return False
+    return isinstance(data, dict) and data.get(OBSERVATION_KV_UNIFIED_KEY) is True
+
+
 #: How many of a model's newest observations :meth:`Database.matching_observation`
 #: scans for one matching configuration. A model is loaded at a handful of
 #: distinct (context, slots, cache, device-count) shapes at most, and the
@@ -793,6 +816,7 @@ class Database:
         kv_cache_type: str | None,
         kv_cache_type_v: str | None,
         device_count: int,
+        kv_unified: bool = False,
     ) -> dict[str, Any] | None:
         """The newest trustworthy load of *this exact configuration*, or ``None``.
 
@@ -834,6 +858,13 @@ class Database:
         Newest first; the first clean match wins. An older row is not averaged
         in: the newest measurement is the one taken against the engine build
         and driver in use now.
+
+        * ``kv_unified`` -- whether the slots shared one KV pool (D72), read
+          from the ``kv_unified`` metadata key in ``per_gpu_planned`` (absent
+          means a partitioned load, which every row before D72 was). A pool of
+          ``ctx`` at two slots weighs about what one slot of ``ctx`` does and
+          half a partitioned pair, so the two shapes never stand in for each
+          other.
         """
         for row in self.load_observations(model_id, limit=_OBSERVATION_MATCH_WINDOW):
             if not row.get("ok"):
@@ -859,6 +890,8 @@ class Database:
             devices = str(row.get("devices") or "")
             row_count = len([part for part in devices.split(",") if part.strip()])
             if row_count != device_count:
+                continue
+            if _observation_is_unified(row) != bool(kv_unified):
                 continue
             return row
         return None

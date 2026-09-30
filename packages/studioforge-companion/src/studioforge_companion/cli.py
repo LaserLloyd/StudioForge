@@ -968,6 +968,16 @@ def models_load_recommended(
         "--priority",
         help="Load tier: 1 active chat, 2 dispatched agent, 3 (default) background.",
     ),
+    min_slots: int | None = typer.Option(
+        None,
+        "--min-slots",
+        help="The fewest slots to accept (>= 1); the fit is judged at this count.",
+    ),
+    kv_unified: bool | None = typer.Option(
+        None,
+        "--kv-unified/--kv-partitioned",
+        help="Share ONE pool of --ctx across the slots, or give each slot its own.",
+    ),
     json_out: bool = JSON_OPTION,
 ) -> None:
     """Load at EXACTLY this context, or refuse and say why.
@@ -993,6 +1003,11 @@ def models_load_recommended(
     what actually launched, because a server that predates the flag answers
     200 and drops it silently. A disagreement is a warning on stderr, not a
     failure: the load itself succeeded.
+
+    ``--min-slots`` is a floor on the slot count, and ``--kv-unified`` makes
+    ``--ctx`` ONE pool the slots share -- each may use all of it, for the VRAM
+    of about one slot (D72). Two slots over one pool is the shape for "one
+    main conversation plus quick side requests". It cannot be persisted.
     """
     readback: dict[str, Any] = {}
 
@@ -1005,6 +1020,8 @@ def models_load_recommended(
             max_slots=max_slots,
             persist=persist,
             priority=priority,
+            min_slots=min_slots,
+            kv_unified=kv_unified,
         )
         if persist:
             try:

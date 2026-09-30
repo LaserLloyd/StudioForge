@@ -487,6 +487,8 @@ class StudioForgeClient:
         max_slots: int | None = None,
         persist: bool = False,
         priority: int | None = None,
+        min_slots: int | None = None,
+        kv_unified: bool | None = None,
     ) -> Any:
         """Load at exactly ``ctx_size`` per slot, or refuse with a 507.
 
@@ -500,6 +502,11 @@ class StudioForgeClient:
         slot estimator until those fields are cleared. Both keys are omitted
         from the body when unset, so a pre-D48 server sees exactly the request
         it saw before rather than a 422 for an unknown field.
+
+        ``min_slots`` is a floor on that count and ``kv_unified`` asks for ONE
+        shared pool of ``ctx_size`` across the slots (D72); both are omitted
+        when unset too. A server that predates them answers 200 and ignores
+        them, so read ``parallel`` and ``kv_unified`` back off the result.
         """
         body: dict[str, Any] = {"ctx_size": ctx_size}
         if prefer_mode is not None:
@@ -512,6 +519,10 @@ class StudioForgeClient:
             body["persist"] = True
         if priority is not None:
             body["priority"] = priority
+        if min_slots is not None:
+            body["min_slots"] = min_slots
+        if kv_unified is not None:
+            body["kv_unified"] = kv_unified
         return await self.post(f"models/{_path_segment(model)}/load-recommended", body)
 
     # -- GPU leases (D43) --------------------------------------------------

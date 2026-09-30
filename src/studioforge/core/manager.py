@@ -143,13 +143,21 @@ def reload_settings(plan: LoadPlan) -> dict[str, Any]:
     reloading a 4-slot model at its *total* context quadruples the ask. One
     implementation, because the D42 rebalancer and the D46 restore must never
     drift on it.
+
+    A shared pool (D72) adds ``kv_unified: True``: its ``ctx_size`` is the
+    pool, and replayed without the flag it would launch ``ctx_size`` per slot
+    -- the pool times the slots, twice the KV cache of a two-slot pool. The
+    key is absent for every other plan, so their replay is unchanged.
     """
-    return {
+    settings: dict[str, Any] = {
         "ctx_size": int(plan.ctx_per_slot or plan.ctx_size),
         "kv_cache_type": plan.kv_cache_type,
         "kv_cache_type_v": plan.kv_cache_type_v,
         "parallel": int(plan.parallel),
     }
+    if plan.kv_unified:
+        settings["kv_unified"] = True
+    return settings
 
 
 @dataclass
@@ -169,6 +177,8 @@ class _RestoreEntry:
     kv_cache_type_v: Any
     parallel: int
     evicted_at: float
+    #: The slots shared one KV pool of ``ctx_size`` (D72).
+    kv_unified: bool = False
 
 
 #: Sanity ceilings for per-request load arguments. Not policy -- the planner
@@ -393,8 +403,10 @@ def _validate_recommended_args(
     max_slots: int | None,
     allowed_devices: Sequence[int] | None,
     known_devices: Sequence[int] | None,
+    min_slots: int | None = None,
+    kv_unified: bool | None = None,
 ) -> None:
-    """The 400s ``load_recommended`` and its dry run share (D64)."""
+    """The 400s ``load_recommended`` and its dry run share (D64, D72)."""
     validate_load_args(
         ctx_size=ctx_size,
         parallel=None,
@@ -407,6 +419,30 @@ def _validate_recommended_args(
             f"max_slots must be at least 1 slot (got {max_slots}); omit it to let "
             f"the server size the slot count itself",
             param="max_slots",
+        )
+    if min_slots is not None:
+        if isinstance(min_slots, bool) or not isinstance(min_slots, int):
+            raise BadRequestError(
+                f"min_slots must be a whole number of slots (got {min_slots!r})",
+                param="min_slots",
+            )
+        if not 1 <= int(min_slots) <= MAX_REQUEST_PARALLEL:
+            raise BadRequestError(
+                f"min_slots must be between 1 and {MAX_REQUEST_PARALLEL} slots (got "
+                f"{min_slots}); omit it to let the server size the slot count itself",
+                param="min_slots",
+            )
+        if max_slots is not None and int(min_slots) > int(max_slots):
+            raise BadRequestError(
+                f"min_slots ({min_slots}) is above max_slots ({max_slots}): no slot count "
+                f"satisfies both. Send equal values to ask for exactly that many slots.",
+                param="min_slots",
+                details={"min_slots": int(min_slots), "max_slots": int(max_slots)},
+            )
+    if kv_unified is not None and not isinstance(kv_unified, bool):
+        raise BadRequestError(
+            f"kv_unified must be true, false or omitted (got {kv_unified!r})",
+            param="kv_unified",
         )
 
 
@@ -438,6 +474,9 @@ def _attempt_summary(attempt: Mapping[str, Any]) -> dict[str, Any]:
         "busy_models": list(attempt.get("busy_models") or []),
         "leased_devices": attempt.get("leased_devices"),
         "fits_once_lease_released": attempt.get("fits_once_lease_released"),
+        # The most slots this mode holds at the asked context when a
+        # ``min_slots`` floor did not fit (D72); None otherwise.
+        "max_parallel_that_fits": attempt.get("max_parallel_that_fits"),
     }
 
 
@@ -450,6 +489,11 @@ class _RecommendedPrep:
     narrowed: frozenset[int] | None
     asked_tier: int | None
     tier: int
+    #: The fewest slots this call accepts (D72); ``None`` = one, as before.
+    min_slots: int | None = None
+    #: ``True``: one shared pool of ``ctx_size``; ``False``: explicitly not;
+    #: ``None``: the caller did not say (D72).
+    kv_unified: bool | None = None
 
 
 @dataclass
@@ -469,6 +513,9 @@ class RecommendedDecision:
     asked_tier: int | None
     narrowed: frozenset[int] | None
     trained: int = 0
+    #: The call's own slot floor and pool shape (D72), as asked.
+    min_slots: int | None = None
+    kv_unified: bool | None = None
     resident: InstanceInfo | None = None
     already_loaded: bool = False
     winner: dict[str, Any] | None = None
@@ -1429,6 +1476,7 @@ class ModelManager:
         priority: int | None = None,
         hold_traffic: bool = True,
         enforce_parallel_cap: bool = True,
+        kv_unified: bool = False,
     ) -> InstanceInfo:
         """Explicit load (GUI/CLI/MCP). ``force`` reloads an already-running model.
 
@@ -1511,6 +1559,12 @@ class ModelManager:
         folds instead of restarting a child seconds old (D50) -- see
         :meth:`_reload_already_done` for exactly when, and for the double-click
         that made it necessary.
+
+        ``kv_unified`` launches the slots as ONE shared KV pool of
+        ``ctx_size`` tokens rather than ``ctx_size`` each (D72). It is how
+        :meth:`load_recommended` builds the pool it chose, and how the restore
+        and the rebalancer (:func:`reload_settings`) put one back; it is not a
+        field of the ``/load`` route.
         """
         validate_load_args(
             ctx_size=ctx_size,
@@ -1616,6 +1670,7 @@ class ModelManager:
                         parallel=parallel,
                         devices=devices,
                         allowed_devices=allowed_devices,
+                        kv_unified=kv_unified,
                     ):
                         if explicit_tier:
                             # The reload folds; the tier the caller stated does
@@ -1646,6 +1701,7 @@ class ModelManager:
                     require_resident=require_resident,
                     priority=tier,
                     hold=hold,
+                    kv_unified=kv_unified,
                 )
                 if explicit_tier:
                     self._model_priority[record.id] = tier
@@ -1759,6 +1815,7 @@ class ModelManager:
         parallel: int | None,
         devices: Sequence[int] | None,
         allowed_devices: Sequence[int] | None = None,
+        kv_unified: bool = False,
     ) -> bool:
         """Did somebody already do the forced reload this call queued for? (D50)
 
@@ -1791,7 +1848,8 @@ class ModelManager:
           That test also excludes, for free,
           every internal caller that replays a placement -- the D42 rebalancer
           and the D46 restore both pass ``devices`` -- so a fold can never
-          quietly cancel a move.
+          quietly cancel a move. ``kv_unified`` (D72) counts too: a shared
+          pool is a shape of its own.
         * The child must already be on the active engine. An engine activation
           is precisely the reload that must never be swallowed: skipping it
           leaves a superseded build serving, which is a worse version of the bug
@@ -1808,7 +1866,7 @@ class ModelManager:
         """
         if instance.state != "ready" or instance.spawn_seq <= seq_before:
             return False
-        if any(
+        if kv_unified or any(
             arg is not None
             for arg in (
                 ctx_size,
@@ -1922,6 +1980,8 @@ class ModelManager:
         persist: bool = False,
         source: str = "api",
         priority: int | None = None,
+        min_slots: int | None = None,
+        kv_unified: bool | None = None,
     ) -> InstanceInfo:
         """Load at **exactly** ``ctx_size`` per slot, letting the server pick the rest.
 
@@ -2004,16 +2064,44 @@ class ModelManager:
                 from the first round, so the best mode wins even when
                 background models must be displaced for it; the recently
                 active ones are reloaded afterwards where they fit.
+            min_slots: the fewest slots this load may have (D72). The walk
+                sizes the slot count as always and raises it to this floor;
+                the fit, the KV rung and the refusal are all judged AT the
+                floor, so a mode that only reaches the window with fewer slots
+                is refused with the largest context the floor fits in
+                (``max_ctx_that_fits``) and the most slots that fit
+                (``max_parallel_that_fits``) rather than loaded short. Must be
+                within ``max_slots`` and the model's ``max_parallel_cap``.
+            kv_unified: ``True`` loads the slots as ONE shared KV pool of
+                ``ctx_size`` tokens (D72): ``--ctx-size ctx_size --parallel N
+                --kv-unified``, each slot may use the whole pool, and the pool
+                costs one slot of ``ctx_size`` plus each extra slot's sliding
+                window and recurrent state -- where partitioned slots cost
+                ``ctx_size`` of KV each. ``False`` or omitted keeps partitioned
+                slots of ``ctx_size`` each. The "already exactly that" answer
+                compares the pool shape when the caller names one (a resident
+                pool is not "exactly" a partitioned ask, nor the reverse), and
+                ``persist`` is refused with it: the saved ``kv_unified``
+                setting keeps ``ctx_size`` per slot, so a later plain load
+                would build a pool as many times larger as there are slots.
         """
         _validate_recommended_args(
             ctx_size=ctx_size,
             max_slots=max_slots,
             allowed_devices=allowed_devices,
             known_devices=self._known_devices(),
+            min_slots=min_slots,
+            kv_unified=kv_unified,
         )
         await self._await_boot()
         prep = self._recommended_prep(
-            name, ctx_size, allowed_devices=allowed_devices, persist=persist, priority=priority
+            name,
+            ctx_size,
+            allowed_devices=allowed_devices,
+            persist=persist,
+            priority=priority,
+            min_slots=min_slots,
+            kv_unified=kv_unified,
         )
         record = prep.record
         self._refuse_if_held(record.id, priority=prep.tier)
@@ -2080,6 +2168,7 @@ class ModelManager:
                     devices=winner["devices"],
                     kv_cache_type=winner["kv_cache_type"],
                     parallel=winner["parallel"],
+                    kv_unified=bool(winner.get("kv_unified")),
                     evicting=winner["would_evict"],
                     skipped_for_leases=[a["mode"] for a in decision.lease_skipped],
                     source=source,
@@ -2100,6 +2189,7 @@ class ModelManager:
                         source=source,
                         evict_busy=False,
                         priority=prep.tier,
+                        kv_unified=bool(winner.get("kv_unified")),
                     )
                 except InsufficientVramError as exc:
                     if exc.code != "gpu_leased":
@@ -2143,6 +2233,8 @@ class ModelManager:
         max_slots: int | None = None,
         allowed_devices: Sequence[int] | None = None,
         priority: int | None = None,
+        min_slots: int | None = None,
+        kv_unified: bool | None = None,
     ) -> dict[str, Any]:
         """What :meth:`load_recommended` would do right now, without doing it (D64).
 
@@ -2164,16 +2256,28 @@ class ModelManager:
         formula estimate; the real load re-plans onto the chosen devices and
         may apply a D51 observed correction on top, so the chosen placement is
         what is guaranteed to agree, not the last megabyte.
+
+        ``min_slots`` and ``kv_unified`` (D72) are the real call's, with the
+        same 400s; a fit reports ``kv_unified``, ``ctx_per_slot`` and
+        ``ctx_total`` -- all three equal to ``ctx_size`` for a shared pool.
         """
         _validate_recommended_args(
             ctx_size=ctx_size,
             max_slots=max_slots,
             allowed_devices=allowed_devices,
             known_devices=self._known_devices(),
+            min_slots=min_slots,
+            kv_unified=kv_unified,
         )
         await self._await_boot()
         prep = self._recommended_prep(
-            name, ctx_size, allowed_devices=allowed_devices, persist=False, priority=priority
+            name,
+            ctx_size,
+            allowed_devices=allowed_devices,
+            persist=False,
+            priority=priority,
+            min_slots=min_slots,
+            kv_unified=kv_unified,
         )
         decision = self._decide_recommended(
             prep, prefer_modes=prefer_modes, kv_min=kv_min, max_slots=max_slots
@@ -2188,16 +2292,40 @@ class ModelManager:
         allowed_devices: Sequence[int] | None,
         persist: bool,
         priority: int | None,
+        min_slots: int | None = None,
+        kv_unified: bool | None = None,
     ) -> _RecommendedPrep:
         """Resolve the model and the call's own settings; raise the 400s/404 (D64).
 
         Pure: shared by the real call and the dry run, so both refuse a bad
         request with the same error before anything is planned.
         """
+        if persist and kv_unified:
+            # Before the model is even resolved: nothing about which model it
+            # is changes the answer (D72).
+            raise BadRequestError(
+                "persist cannot save a shared KV pool: the saved kv_unified setting keeps "
+                "ctx_size PER SLOT, so the next plain load would build a pool as many "
+                "times larger as there are slots. Send kv_unified without persist; a "
+                "caller that wants the pool names it on every load-recommended call.",
+                param="persist",
+            )
         requested = self.registry.resolve(name)
         if requested is None:
             raise ModelNotFoundError(name, known=self.registry.known_ids())
         record = self.serving_record(requested)
+        cap = record.settings.max_parallel_cap
+        if min_slots is not None and cap is not None and int(min_slots) > int(cap):
+            # D48: a stated per-model ceiling is an answer, not advice, and an
+            # explicit count above it is refused rather than clamped.
+            raise BadRequestError(
+                f"'{record.id}' caps its slot count at {int(cap)} "
+                f"(settings.max_parallel_cap) and this load asked for at least "
+                f"{int(min_slots)}. Ask for {int(cap)} slots or fewer, or raise the cap "
+                f"in the model's settings.",
+                param="min_slots",
+                details={"max_parallel_cap": int(cap), "min_slots": int(min_slots)},
+            )
         # D66: before the mode walk, the hold and any eviction -- and the dry
         # run refuses identically. A ready resident is exempt here because the
         # walk may hand it back as already loaded; a walk that reloads it goes
@@ -2219,6 +2347,8 @@ class ModelManager:
             narrowed=narrowed,
             asked_tier=normalise_priority(priority),
             tier=self._resolve_tier(record.id, priority),
+            min_slots=int(min_slots) if min_slots is not None else None,
+            kv_unified=kv_unified,
         )
 
     def _decide_recommended(
@@ -2243,12 +2373,16 @@ class ModelManager:
 
         record = prep.record
         ctx_size = prep.ctx_size
+        min_slots = prep.min_slots
+        unified = bool(prep.kv_unified)
         decision = RecommendedDecision(
             record=record,
             ctx_size=ctx_size,
             tier=prep.tier,
             asked_tier=prep.asked_tier,
             narrowed=prep.narrowed,
+            min_slots=min_slots,
+            kv_unified=prep.kv_unified,
         )
         if record.meta is None:
             raise ModelLoadError(
@@ -2313,6 +2447,14 @@ class ModelManager:
                 # own profile. An over-cap resident falls through to a real
                 # reload, which is what max_slots asked for.
                 and (max_slots is None or int(plan_now.parallel) <= int(max_slots))
+                # ...and at or above the slot floor (D72): a one-slot resident
+                # is not "exactly" an ask for two.
+                and (min_slots is None or int(plan_now.parallel) >= int(min_slots))
+                # ...and in the pool shape this call named, when it named one
+                # (D72): a shared pool is not a partitioned ask, nor the
+                # reverse. A caller that names none takes either, which keeps
+                # every pre-D72 caller's answer where it was.
+                and (prep.kv_unified is None or bool(plan_now.kv_unified) == unified)
                 # ...and standing on cards this call is allowed to use (D59).
                 # Without this the shortcut answered "already loaded at that
                 # context" with an instance sitting on exactly the card the
@@ -2379,6 +2521,8 @@ class ModelManager:
                     placements_mod=placements_mod,
                     priority=prep.tier,
                     max_slots=max_slots,
+                    min_slots=min_slots,
+                    kv_unified=unified,
                 )
                 for mode in modes
             ]
@@ -2417,10 +2561,18 @@ class ModelManager:
                     placements_mod=placements_mod,
                     priority=prep.tier,
                     max_slots=max_slots,
+                    min_slots=min_slots,
+                    kv_unified=unified,
                 )
                 attempt["fits_once_lease_released"] = bool(unleased["fits"])
         decision.refusal = self._recommendation_refused(
-            record, ctx_size, attempts, trained=trained, planner=planner
+            record,
+            ctx_size,
+            attempts,
+            trained=trained,
+            planner=planner,
+            min_slots=min_slots,
+            kv_unified=unified,
         )
         return decision
 
@@ -2485,6 +2637,8 @@ class ModelManager:
             "allowed_devices": (
                 sorted(decision.narrowed) if decision.narrowed is not None else None
             ),
+            # The slot floor this call named, echoed (D72); None = one.
+            "min_slots": decision.min_slots,
             "modes": [_attempt_summary(a) for a in decision.attempts],
         }
         if decision.refusal is not None:
@@ -2501,6 +2655,10 @@ class ModelManager:
                 "shortfall_bytes": details.get("shortfall_bytes"),
                 "largest_term": details.get("largest_term"),
                 "max_ctx_that_fits": details.get("max_ctx_that_fits"),
+                # The shape the refusal was judged in, and the most slots any
+                # mode holds at the window when a slot floor was the obstacle.
+                "kv_unified": bool(decision.kv_unified),
+                "max_parallel_that_fits": details.get("max_parallel_that_fits"),
                 "evict_model_ids": [],
                 "notes": [],
             }
@@ -2515,6 +2673,9 @@ class ModelManager:
                 "label": None,
                 "devices": list(standing.devices),
                 "ctx_size": int(standing.ctx_per_slot or standing.ctx_size),
+                "ctx_per_slot": int(standing.ctx_per_slot or standing.ctx_size),
+                "ctx_total": standing.ctx_total,
+                "kv_unified": bool(standing.kv_unified),
                 "kv_cache_type": standing.kv_cache_type,
                 "kv_cache_type_v": standing.kv_cache_type_v,
                 "parallel": standing.parallel,
@@ -2541,6 +2702,17 @@ class ModelManager:
             "label": winner["label"],
             "devices": list(winner["devices"]),
             "ctx_size": winner["ctx_size"],
+            # What each conversation may use, and what --ctx-size will be: the
+            # same number for a shared pool, the window times the slots for
+            # partitioned ones (D72).
+            "ctx_per_slot": winner["ctx_size"],
+            "ctx_total": (
+                walk_plan.ctx_total
+                if walk_plan is not None
+                else int(winner["ctx_size"])
+                * (1 if winner.get("kv_unified") else int(winner["parallel"]))
+            ),
+            "kv_unified": bool(winner.get("kv_unified")),
             "kv_cache_type": winner["kv_cache_type"],
             "kv_cache_type_v": winner["kv_cache_type_v"],
             "parallel": winner["parallel"],
@@ -2627,6 +2799,8 @@ class ModelManager:
         placements_mod: Any,
         priority: int = PRIORITY_BACKGROUND,
         max_slots: int | None = None,
+        min_slots: int | None = None,
+        kv_unified: bool = False,
     ) -> dict[str, Any]:
         """Can this mode hold ``ctx_size`` per slot, and if not, what is in the way?
 
@@ -2639,9 +2813,20 @@ class ModelManager:
 
         ``max_slots`` caps the capacity the recommendation is drawn from, so
         the descent loop verifies the capped count rather than a larger one.
+
+        ``min_slots`` (D72) moves that first call from one slot to the floor:
+        the fit and the KV rung are decided AT the floor -- a rung chosen at
+        one slot could be one the second slot cannot afford -- the count is
+        raised to it and the descent stops at it, and a mode that cannot hold
+        the floor is a refusal carrying the largest context the floor fits in
+        (``max_ctx_that_fits``) and the most slots that fit
+        (``max_parallel_that_fits``). ``kv_unified`` plans every call as one
+        shared pool of ``ctx_size``. With neither, the calls are exactly the
+        pre-D72 ones.
         """
         from studioforge.core.kv_sensitivity import kv_quality_label, kv_quality_rank
 
+        floor = max(1, int(min_slots)) if min_slots else 1
         pinned = placements_mod.forced_onto(record, mode.devices)
         attempt: dict[str, Any] = {
             "mode": mode.key,
@@ -2653,7 +2838,7 @@ class ModelManager:
         result = planner.plan_load(
             pinned,
             ctx_size=ctx_size,
-            parallel=1,
+            parallel=floor,
             loaded=loaded,
             draft=self._draft_for(record),
             adapters=[a for a, _ in self._adapters_for(record)],
@@ -2661,6 +2846,7 @@ class ModelManager:
             priority=priority,
             # The override is this walk's candidate, not the caller's (D64).
             override_chosen_by_server=True,
+            kv_unified=kv_unified,
         )
         if not isinstance(result, LoadPlan):
             attempt["reason"] = result.reason
@@ -2673,6 +2859,33 @@ class ModelManager:
                 # the walk moves on, and says why it did (D64).
                 held = {int(d) for lease in result.leases for d in lease.get("devices") or ()}
                 attempt["leased_devices"] = sorted(held & set(mode.devices)) or list(mode.devices)
+            elif floor > 1:
+                # The most slots this mode DOES hold at the window, asked the
+                # way the floor was -- the whole KV ladder, this call's kv_min
+                # -- because the planner's own figure is taken at the
+                # best-quality rung alone, where a pair that fits on a cheaper
+                # cache reads as "not even one" (D72). Refusal path only.
+                attempt["max_parallel_that_fits"] = None
+                for fewer in range(floor - 1, 0, -1):
+                    trial = planner.plan_load(
+                        pinned,
+                        ctx_size=ctx_size,
+                        parallel=fewer,
+                        loaded=loaded,
+                        draft=self._draft_for(record),
+                        adapters=[a for a, _ in self._adapters_for(record)],
+                        allow_evict=allow_evict,
+                        priority=priority,
+                        override_chosen_by_server=True,
+                        kv_unified=kv_unified,
+                    )
+                    if isinstance(trial, LoadPlan) and (
+                        kv_min is None
+                        or kv_quality_rank(trial.kv_cache_type, trial.kv_cache_type_v)
+                        <= kv_quality_rank(kv_min, kv_min)
+                    ):
+                        attempt["max_parallel_that_fits"] = fewer
+                        break
             return attempt
 
         if kv_min is not None and kv_quality_rank(
@@ -2697,8 +2910,12 @@ class ModelManager:
             slots = min(slots, int(max_slots))
         wanted = catalog_mod.recommended_slots(record, result, slots, observations=observations)
         plan = result
-        parallel = int(wanted["value"])
-        while parallel > 1:
+        # Never below the floor (D72); ``min_slots <= max_slots`` is a 400
+        # before any of this, so the ceiling cannot cut under it either.
+        parallel = max(int(wanted["value"]), floor)
+        if max_slots is not None:
+            parallel = min(parallel, int(max_slots))
+        while parallel > floor:
             candidate = planner.plan_load(
                 pinned,
                 ctx_size=ctx_size,
@@ -2714,6 +2931,7 @@ class ModelManager:
                 # tier load's re-check silently walks down to one slot (D46).
                 priority=priority,
                 override_chosen_by_server=True,
+                kv_unified=kv_unified,
             )
             if isinstance(candidate, LoadPlan):
                 plan = candidate
@@ -2726,6 +2944,7 @@ class ModelManager:
             kv_cache_type=plan.kv_cache_type,
             kv_cache_type_v=plan.kv_cache_type_v,
             parallel=parallel,
+            kv_unified=kv_unified,
             recommended_parallel_basis=wanted["basis"],
             devices=list(plan.devices),
             would_evict=list(plan.evict_model_ids),
@@ -2743,6 +2962,8 @@ class ModelManager:
         *,
         trained: int,
         planner: Planner | None = None,
+        min_slots: int | None = None,
+        kv_unified: bool = False,
     ) -> InsufficientVramError:
         """The structured "no", with the largest context each mode *would* take.
 
@@ -2759,6 +2980,11 @@ class ModelManager:
         that needs one would have fitted without it. When the modes that avoid
         the lease are simply too small and the leased ones would be too, the
         lease is context and the code stays ``insufficient_vram`` (D53).
+
+        With ``min_slots`` or ``kv_unified`` (D72) the largest context is the
+        one the FLOOR fits in, in the pool shape asked for, and a floor that is
+        the obstacle gets its own line: the most slots any mode holds at the
+        requested window (``max_parallel_that_fits``).
         """
         busy: list[dict[str, Any]] = []
         for attempt in attempts:
@@ -2767,6 +2993,11 @@ class ModelManager:
                     busy.append(dict(entry))
         best_ctx = max(
             (int(a.get("max_ctx_that_fits") or 0) for a in attempts),
+            default=0,
+        )
+        floor = int(min_slots) if min_slots else 1
+        best_slots = max(
+            (int(a.get("max_parallel_that_fits") or 0) for a in attempts),
             default=0,
         )
         modes = [
@@ -2780,11 +3011,23 @@ class ModelManager:
             }
             for a in attempts
         ]
+        if floor > 1:
+            for entry, attempt in zip(modes, attempts, strict=True):
+                entry["max_parallel_that_fits"] = attempt.get("max_parallel_that_fits")
         suggestions: list[str] = []
-        if best_ctx:
+        if floor > 1 and best_slots:
             suggestions.append(
+                f"ask for fewer slots: {best_slots} slot(s) at {ctx_size} tokens fit on one "
+                f"of these placements right now, and this call asked for at least {floor}"
+            )
+        if best_ctx:
+            what = ""
+            if floor > 1:
+                what = f" with {floor} slots" + (" sharing one pool" if kv_unified else "")
+            suggestions.insert(
+                0,
                 f"ask for {best_ctx} tokens instead -- that is the largest context "
-                f"that fits on any of these placements right now"
+                f"that fits on any of these placements right now{what}",
             )
         leased_attempts = [a for a in attempts if a.get("leased_devices")]
         leased_devs = sorted({int(d) for a in leased_attempts for d in a["leased_devices"]})
@@ -2855,6 +3098,12 @@ class ModelManager:
             "shortfall_bytes": None,
             "largest_term": None,
         }
+        if min_slots or kv_unified:
+            # The shape this refusal was judged in (D72); absent otherwise, so a
+            # pre-D72 caller's refusal body is exactly what it was.
+            details["min_slots"] = int(min_slots) if min_slots else None
+            details["kv_unified"] = bool(kv_unified)
+            details["max_parallel_that_fits"] = best_slots or None
         code: str | None = None
         if rejected is not None:
             details.update(
@@ -2898,9 +3147,15 @@ class ModelManager:
                         )
             elif code == "gpu_leased":
                 code = None
+        if kv_unified and floor > 1:
+            shape = f"as {floor} or more slots sharing one {ctx_size}-token pool"
+        elif floor > 1:
+            shape = f"at exactly {ctx_size} tokens per slot with at least {floor} slots"
+        else:
+            shape = f"at exactly {ctx_size} tokens per slot"
         return InsufficientVramError(
-            f"Cannot load '{record.id}' at exactly {ctx_size} tokens per slot on any "
-            f"placement of this box. " + " ".join(suggestions),
+            f"Cannot load '{record.id}' {shape} on any placement of this box. "
+            + " ".join(suggestions),
             code=code,
             details=details,
         )
@@ -2933,6 +3188,7 @@ class ModelManager:
         require_resident: bool = False,
         priority: int = PRIORITY_BACKGROUND,
         hold: bool = False,
+        kv_unified: bool = False,
     ) -> InstanceInfo:
         """Plan, evict if needed, launch. Caller must hold the per-model lock.
 
@@ -2986,6 +3242,7 @@ class ModelManager:
                     allow_evict=allow_evict,
                     require_resident=require_resident,
                     priority=priority,
+                    kv_unified=kv_unified,
                 )
             finally:
                 self._load_gate.release()
@@ -3012,6 +3269,7 @@ class ModelManager:
         allow_evict: bool | None = None,
         require_resident: bool = False,
         priority: int = PRIORITY_BACKGROUND,
+        kv_unified: bool = False,
     ) -> InstanceInfo:
         existing = self.supervisor.get(record.id)
         if require_resident and (existing is None or existing.state != "ready"):
@@ -3120,6 +3378,7 @@ class ModelManager:
             allow_evict=allow_evict,
             source=source,
             priority=priority,
+            kv_unified=kv_unified,
         )
 
         if isinstance(plan_result, LoadRejected):
@@ -3184,6 +3443,7 @@ class ModelManager:
                 parallel_auto=parallel_auto,
                 allow_evict=allow_evict,
                 priority=priority,
+                kv_unified=kv_unified,
             )
         except ModelLoadError as exc:
             # D66: "unknown model architecture" / "unknown pre-tokenizer type"
@@ -3361,6 +3621,7 @@ class ModelManager:
                     kv_cache_type=entry.kv_cache_type,
                     kv_cache_type_v=entry.kv_cache_type_v,
                     parallel=entry.parallel,
+                    kv_unified=entry.kv_unified,
                     source="priority-restore",
                     evict_busy=False,
                     allow_evict=False,
@@ -3476,6 +3737,7 @@ class ModelManager:
         parallel_auto: bool = False,
         allow_evict: bool | None = None,
         priority: int = PRIORITY_BACKGROUND,
+        kv_unified: bool = False,
     ) -> InstanceInfo:
         """Launch the child, retrying **once** after a transient OOM.
 
@@ -3552,7 +3814,8 @@ class ModelManager:
         # Re-plan: free VRAM has changed, so placement and context may too.
         # The caller's explicit overrides (ctx_size/kv/parallel) must survive
         # the retry -- replanning without them would silently load the model
-        # with a different context than the one the user asked for.
+        # with a different context than the one the user asked for -- and so
+        # must a shared pool (D72), or the retry would launch ctx_size per slot.
         replanned = self.planner.plan_load(
             record,
             ctx_size=ctx_size,
@@ -3565,6 +3828,7 @@ class ModelManager:
             parallel_auto=parallel_auto,
             allow_evict=allow_evict,
             priority=priority,
+            kv_unified=kv_unified,
         )
         if isinstance(replanned, LoadRejected):
             raise self._vram_error(replanned)
@@ -3788,6 +4052,20 @@ class ModelManager:
         plan = instance.plan
         if plan is None:  # pragma: no cover - a ready instance always has a plan
             log.warning("nothing to persist: the instance carries no plan", model_id=record.id)
+            return
+        if plan.kv_unified:
+            # The saved settings cannot express a shared pool (D72): written
+            # as ctx_size + parallel, the next plain load would launch the pool
+            # once per slot. The call refuses persist with kv_unified up front;
+            # this covers a pool reached any other way (a resident handed back
+            # to a caller that did not name the shape).
+            log.warning(
+                "not persisting a shared-pool load profile: the saved settings keep "
+                "ctx_size per slot",
+                model_id=record.id,
+                ctx_size=int(plan.ctx_size),
+                parallel=int(plan.parallel),
+            )
             return
         if self._benchmark_owns(record.id):
             # A benchmark that started during this (multi-minute) load. Skipped

@@ -160,6 +160,15 @@ def _decorate_openai_entry(
         entry["studioforge"]["max_parallel"] = plan.max_parallel
         entry["studioforge"]["parallel"] = plan.parallel
         entry["studioforge"]["parallel_limited_by"] = plan.parallel_limited_by
+        # Whether the slots share one KV pool (D72) -- the launch's own answer
+        # when the argv has been read, else the plan's. With it and
+        # `parallel`, a client can tell "two slots, each with its own cache"
+        # (a background request cannot evict the chat's prompt) from one slot.
+        entry["studioforge"]["kv_unified"] = (
+            instance.effective.kv_unified
+            if instance.effective is not None
+            else bool(plan.kv_unified)
+        )
         # The tier this instance was loaded at (D46): 1 active chat, 2
         # dispatched agent, 3 background. A client that meets a 503
         # `priority_hold` reads it to see which side of the hold it is on.

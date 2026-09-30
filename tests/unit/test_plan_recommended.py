@@ -249,6 +249,8 @@ def test_the_route_forwards_every_load_recommended_input(app: Any) -> None:  # n
                 "prefer_mode": "dual_3090",
                 "allowed_devices": [2, 3],
                 "priority": 1,
+                "min_slots": 2,
+                "kv_unified": "true",
             },
         )
     assert response.status_code == 200, response.text
@@ -260,6 +262,9 @@ def test_the_route_forwards_every_load_recommended_input(app: Any) -> None:  # n
         "max_slots": 3,
         "allowed_devices": [2, 3],
         "priority": 1,
+        # D72: the slot floor and the pool shape reach the decision too.
+        "min_slots": 2,
+        "kv_unified": True,
     }
 
 
