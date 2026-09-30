@@ -15,7 +15,10 @@ Two invariants are load-bearing and covered by tests:
 * **Model output is untrusted.** :func:`render_markdown` escapes every piece of
   raw HTML in the source and re-emits markdown2's own output through a tag and
   attribute allowlist, so neither a prompt-injected ``<script>`` nor a
-  ``javascript:`` link can reach the browser.
+  ``javascript:`` link can reach the browser. Nor can a Markdown image: one
+  the browser fetched on its own would carry whatever a prompt-injected reply
+  put in its URL (the conversation, say) to someone else's server, so images
+  are shown as text and fetched only if the reader clicks the link.
 * **Only real turns are context.** Failed assistant turns, empty placeholders
   and the model's reasoning never travel back to the model.
 """
@@ -370,13 +373,17 @@ class _Sanitizer(HTMLParser):
             kept += [("target", "_blank"), ("rel", "noopener noreferrer nofollow")]
             self._skipped.append("")
         elif tag == "img":
+            # Never an <img>: an image loads without a click, so its URL is an
+            # exfiltration channel. The alt text stands in, plus the address
+            # as plain text when it is an http(s) one.
             src = values.get("src", "").strip()
-            if not _SAFE_IMAGE.match(src):
-                self.out.append(html.escape(values.get("alt", ""), quote=False))
-                return
-            kept.append(("src", src))
-            kept.append(("alt", values.get("alt", "")))
-            kept += [("loading", "lazy"), ("referrerpolicy", "no-referrer")]
+            alt = values.get("alt", "").strip()
+            if _SAFE_IMAGE.match(src):
+                text = f"[image: {alt}] ({src})" if alt else f"[image] ({src})"
+            else:
+                text = alt
+            self.out.append(html.escape(text, quote=False))
+            return
         elif tag in _CLASS_TAGS and values.get("class"):
             kept.append(("class", values["class"]))
         elif tag in ("th", "td") and _TEXT_ALIGN.match(values.get("style", "")):
@@ -413,7 +420,8 @@ def render_markdown(text: str) -> str:
 
     Raw HTML in ``text`` is shown as text, links keep only ``http(s):`` and
     ``mailto:`` targets (others become plain text) and open in a new tab, and
-    images load only over ``http(s):``. Any failure falls back to the source in
+    images are never loaded: an image becomes ``[image: alt] (url)`` text (the
+    alt alone for a non-http(s) source). Any failure falls back to the source in
     an escaped ``<pre>`` -- a chat must never lose a reply to a renderer bug.
     """
     try:

