@@ -107,6 +107,11 @@ FORBIDDEN_IF_COMMITTED = [
      "a reaction image from a real install"),
 ]
 
+#: The `why` of the tailnet-address rule. Named because HEURISTIC_IN_FIXTURES
+#: exempts it under tests/ by exactly this string.
+CGNAT_HOST_WHY = ("a CGNAT/Tailscale host address "
+                  "(the range 100.64.0.0/10 itself is fine)")
+
 # Content patterns. Each is (regex, human explanation).
 CONTENT_RULES: list[tuple[re.Pattern, str]] = [
     # --- Credentials -------------------------------------------------------
@@ -143,6 +148,14 @@ CONTENT_RULES: list[tuple[re.Pattern, str]] = [
     # private transcript of this machine, so they are a leak, not just noise.
     (re.compile(r"claude\.ai/code/session[_/][A-Za-z0-9_\-]+"),
      "a link to a private assistant session transcript"),
+    # The rule above only knew the Code-session form. A chat, share, project
+    # or artifact link points at the same private account, and is what gets
+    # pasted into a design note ("see the conversation at ..."). The bare
+    # words `claude.ai/code/session` in prose that DESCRIBES this rule carry
+    # no id and stay legal.
+    (re.compile(r"claude\.ai/(?:chat|share|projects?|artifacts?|public/artifacts"
+                r"|code/artifacts?)/[A-Za-z0-9_\-]{6,}"),
+     "a link to a private claude.ai conversation, share, project or artifact"),
     (re.compile(r"(?im)^\s*Claude-Session\s*:"),
      "a Claude-Session trailer (no assistant trailers in the public log)"),
     (re.compile(r"(?im)^\s*Co-Authored-By\s*:.*\b(Claude|Anthropic|Copilot|Cursor)\b"),
@@ -181,6 +194,18 @@ CONTENT_RULES: list[tuple[re.Pattern, str]] = [
      "a real Tailscale MagicDNS hostname (use example.ts.net in docs)"),
     (re.compile(r"\btail[0-9a-f]{6,}\b"),
      "a Tailscale tailnet id"),
+    # CGNAT 100.64.0.0/10 is where Tailscale puts every node, so an address in
+    # it is one specific machine on somebody's tailnet -- CONTRIBUTING's "no
+    # tailnet addresses" rule, which nothing enforced until this pattern. Docs
+    # legitimately name the RANGE, so the x.y.0.0 network form and anything
+    # followed by a CIDR suffix are exempt; tests are exempt as fixtures (the
+    # SSRF and bind-address suites need tailnet-shaped addresses), and the
+    # maintainer's REAL node addresses belong in scrub-rules.local.txt, which
+    # applies everywhere, tests included.
+    (re.compile(r"\b(?!100\.\d{1,3}\.0\.0\b)"
+                r"100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}\b"
+                r"(?!\s*/\s*\d)"),
+     CGNAT_HOST_WHY),
     (re.compile(r"[A-Za-z0-9._%+-]+"
                 # noreply@ / no-reply@ are unroutable by convention and are what
                 # a git author line SHOULD say, so they are never a disclosure.
@@ -370,6 +395,10 @@ def _is_copyright_notice(rel: str, line: str) -> bool:
 HEURISTIC_IN_FIXTURES = {
     "a hard-coded credential",
     "a real Tailscale MagicDNS hostname (use example.ts.net in docs)",
+    # The SSRF guard, bind-address notes and peer attribution are tested with
+    # tailnet-shaped addresses (CONTRIBUTING: "exempt under tests/"). A REAL
+    # node address is a local rule, and local rules are never exempt here.
+    CGNAT_HOST_WHY,
 }
 FIXTURE_PATH = re.compile(r"(^|/)tests?/|(^|/)scripts/e2e_")
 
@@ -678,8 +707,14 @@ def selftest() -> int:
             "pem-pgp":            "-----BEGIN PGP PRIVATE KEY BLOCK-----",  # scrub-ok: selftest fixture
             "pem-openssh":        "-----BEGIN OPENSSH PRIVATE KEY-----",  # scrub-ok: selftest fixture
             "session-url":        "see https://claude.ai/code/session_01ABCdef",  # scrub-ok: selftest fixture
+            "claude-chat-url":    "notes in https://claude.ai/chat/0b7e2c4a-1f2d-4e5b-9a8c-0123456789ab",  # scrub-ok: selftest fixture
+            "claude-share-url":   "shared at claude.ai/share/5f2e8c1d-0000-4bbb-8ccc-0123456789ab",  # scrub-ok: selftest fixture
+            "claude-project-url": "https://claude.ai/project/0199aabb-ccdd-7eef-8000-0123456789ab",  # scrub-ok: selftest fixture
+            "claude-artifact-url": "https://claude.ai/code/artifact/5d0c9e8f-aaaa-bbbb",  # scrub-ok: selftest fixture
             "session-trailer":    "Claude-Session: https://example.invalid/x",  # scrub-ok: selftest fixture
             "ai-coauthor":        "Co-Authored-By: Claude <noreply@anthropic.com>",  # scrub-ok: selftest fixture
+            "tailnet-host":       "the rig answers on http://100.101.102.103:1234",  # scrub-ok: selftest fixture
+            "tailnet-host-bare":  "gateway at 100.100.10.7",  # scrub-ok: selftest fixture
         }
         negatives = {
             "docs-tailnet":       "assert host == 'chat-host.example.ts.net'",
@@ -701,6 +736,11 @@ def selftest() -> int:
             "human-coauthor":     "Co-Authored-By: A Contributor <a@example.com>",
             "word-tailed":        "the log is tailed by the mirror poller",
             "sk-word":            "the task sk-eleton is not a key",
+            # Prose that DESCRIBES the session rule carries no id.
+            "session-prose":      "no `claude.ai/code/session` URLs anywhere in the log",
+            "claude-home":        "sign in at https://claude.ai/ first",
+            "cgnat-network-form": "the tailnet lives in 100.100.0.0 and up",
+            "cgnat-cidr-subnet":  "allow 100.101.12.0/24 through the firewall",
         }
         fixtures = root / "fixtures"
         fixtures.mkdir()
