@@ -637,7 +637,7 @@ POST /api/models/{id}/load-recommended {"ctx_size": 200000, "min_slots": 2, "max
 
 This is for one main conversation plus short side requests (titles, memory, summaries) on the
 same model. The two run on different slots, so a side request never replaces the conversation's
-cached prompt, and the second slot costs about what one slot does.
+cached prompt, and the two slots together cost about what one slot of that window does.
 
 - **`min_slots`** is a floor on the slot count the walk picks. The fit, the KV cache type and any
   refusal are judged AT the floor. A window that only fits with fewer slots is a `507` carrying

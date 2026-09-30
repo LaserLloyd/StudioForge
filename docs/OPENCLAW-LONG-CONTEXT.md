@@ -80,7 +80,8 @@ sliding-window model, whose cache cannot shift, D72), a share of the host-RAM pr
 asked for a shared one (`load-recommended` with `kv_unified: true`, which launches
 `--kv-unified --no-cache-idle-slots`). Prompt
 caching and continuous batching are the engine's own defaults and are on unless a setting turns
-them off. A `null` in a model's `settings` (`cache_reuse`, `cont_batching`, `kv_unified`) means
+them off. A `null` in a model's `settings` (`cache_reuse`, `cont_batching`, `kv_unified`,
+`ctx_checkpoints`, `checkpoint_min_step`) means
 **inherit**, not off. Do not read the settings to learn what a child is doing — read `effective`,
 which is parsed from the argv the child was really started with and is on every instance view:
 `/api/status loaded[]`, the `GET /api/models` row, `/introspect`, and the MCP `server_status` /

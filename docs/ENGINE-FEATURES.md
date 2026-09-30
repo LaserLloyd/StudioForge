@@ -148,8 +148,9 @@ default.
 **What a child is really running with.** A per-model setting of `null` means *inherit*, and
 inherit is not off. Every instance view carries `effective` (D54) — `cache_prompt`,
 `cache_reuse`, `cache_ram_mib`, `cache_idle_slots`, `cont_batching`, `kv_unified`,
-`slot_prompt_similarity`, `parallel`, `ctx_per_slot`, batch sizes, checkpoints, `spec_type`,
-`flash_attn` — parsed from the final argv (last occurrence wins, so `extra_flags` are in the
+`slot_prompt_similarity`, `parallel`, `ctx_per_slot`, batch sizes, checkpoints (and where each
+value came from, `checkpoint_sources`), `slots_debug`, `spec_type`, `flash_attn` — parsed from
+the final argv (last occurrence wins, so `extra_flags` are in the
 answer) with the engine's own defaults filled in and a `sources` map saying which is which.
 `inert` names a saved setting the child could not see; `summary` is the one-line version. It is on
 `/api/status loaded[]` (with the redacted `launch_args`), the `GET /api/models` row, `/introspect`,
