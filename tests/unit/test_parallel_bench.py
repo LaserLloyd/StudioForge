@@ -464,6 +464,56 @@ async def test_a_resident_instance_that_already_serves_the_sweep_is_not_reloaded
     assert manager.supervisor.instances[rec.id].plan is not None
 
 
+async def test_a_resident_pool_is_put_back_as_a_pool(monkeypatch: Any) -> None:
+    """D72: two slots over one 16384-token pool, replayed without kv_unified,
+    would come back as two 16384-token windows -- twice the KV cache."""
+    runner, manager, rec, _engine = make_runner(monkeypatch=monkeypatch)
+    pool = LoadPlan(
+        model_id=rec.id,
+        devices=[0, 1],
+        ctx_size=16384,
+        ctx_per_slot=16384,
+        parallel=2,
+        kv_unified=True,
+    )
+    manager.supervisor.instances[rec.id] = InstanceInfo(
+        model_id=rec.id, state="ready", port=18100, plan=pool
+    )
+
+    report = await runner.run(rec, streams=(1, 2), max_tokens=8)
+    assert report.restored is True
+    sweep, restore = manager.loads[0], manager.loads[-1]
+    assert "kv_unified" not in sweep, "the sweep measures partitioned slots"
+    assert restore["kv_unified"] is True
+    assert (restore["ctx_size"], restore["parallel"]) == (16384, 2)
+
+
+async def test_a_resident_pool_never_stands_in_for_the_sweeps_slots(monkeypatch: Any) -> None:
+    """Same cards, context and slot count, but one shared window: the numbers
+    would be filed as partitioned slots, so the sweep loads its own."""
+    runner, manager, rec, _engine = make_runner(monkeypatch=monkeypatch)
+    probe_report = await runner.run(rec, streams=(1,), max_tokens=8)
+    manager.loads.clear()
+    manager.supervisor.instances[rec.id] = InstanceInfo(
+        model_id=rec.id,
+        state="ready",
+        port=18100,
+        plan=LoadPlan(
+            model_id=rec.id,
+            devices=list(probe_report.devices),
+            ctx_size=probe_report.ctx_per_slot,
+            ctx_per_slot=probe_report.ctx_per_slot,
+            parallel=probe_report.parallel_launched,
+            kv_cache_type=probe_report.kv_cache_type,
+            kv_cache_type_v=probe_report.kv_cache_type_v,
+            kv_unified=True,
+        ),
+    )
+    report = await runner.run(rec, streams=(1,), max_tokens=8)
+    assert report.loaded_for_benchmark is True
+    assert manager.loads and "kv_unified" not in manager.loads[0]
+
+
 async def test_a_failed_sweep_still_puts_the_rig_back(monkeypatch: Any) -> None:
     """The teardown is in a finally, so an engine that dies mid-sweep is not a leak."""
 

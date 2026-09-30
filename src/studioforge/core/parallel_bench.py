@@ -950,17 +950,26 @@ def for_state(state: Any) -> ParallelBenchmarker:
 
 
 def _plan_args(instance: InstanceInfo) -> dict[str, Any] | None:
-    """The ``manager.load`` keywords that would reproduce this instance."""
+    """The ``manager.load`` keywords that would reproduce this instance.
+
+    A shared pool (D72) is put back as one. Replayed without ``kv_unified``
+    its ``ctx_size`` would be launched per slot: the pool times the slots,
+    twice the KV cache of a two-slot pool, which then either fails to fit
+    or displaces a neighbour to do it.
+    """
     plan = instance.plan
     if plan is None:
         return None
-    return {
+    args: dict[str, Any] = {
         "ctx_size": int(plan.ctx_per_slot or plan.ctx_size),
         "parallel": int(plan.parallel),
         "kv_cache_type": plan.kv_cache_type,
         "kv_cache_type_v": plan.kv_cache_type_v,
         "devices": list(plan.devices),
     }
+    if plan.kv_unified:
+        args["kv_unified"] = True
+    return args
 
 
 def _plan_serves(instance: InstanceInfo | None, report: ParallelReport) -> bool:
@@ -970,9 +979,13 @@ def _plan_serves(instance: InstanceInfo | None, report: ParallelReport) -> bool:
     as the top level asks for. Anything less and the top levels would queue
     behind slots that do not exist, which is the one thing this measurement must
     not silently do.
+
+    Never a shared pool (D72): the sweep measures and records partitioned
+    slots of ``ctx_per_slot`` each, and a pool's slots share one window -- a
+    different shape that the recorded numbers would then be filed under.
     """
     plan = instance.plan if instance is not None else None
-    if plan is None:
+    if plan is None or plan.kv_unified:
         return False
     return (
         sorted(plan.devices) == sorted(report.devices)
