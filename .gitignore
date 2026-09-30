@@ -26,7 +26,10 @@ local-env.bat
 # machine that ran it: absolute model paths, pids, GPU temperatures and the
 # other tenants' leases. Keep results local and quote the numbers you need in
 # DECISIONS.md or bench/rejected.md. results/.gitkeep keeps the directory.
-/bench/results/*.json
+# Every extension, not only .json: a CSV or a notes file written next to the
+# runs is the same snapshot of the same machine.
+/bench/results/*
+!/bench/results/.gitkeep
 
 # Change-request triage notes written against a local clone. They quote
 # private paths and unreleased findings, so they stay out of the repository.
@@ -65,6 +68,29 @@ desktop.ini
 
 # --- agent scratch -------------------------------------------------------
 .claude/worktrees/
+.claude/settings.local.json
+CLAUDE.local.md
+
+# --- never repository content ---------------------------------------------
+# GitHub Desktop offers every untracked, non-ignored file for the next commit.
+# These are the ones that would be a leak or a multi-GB accident if clicked
+# through: model weights dropped into the checkout, crash dumps (process
+# memory, prompts included), key material, browser captures, patch bundles
+# carried between machines, and screenshots saved at the top level before
+# they are cropped into docs/images/.
+*.gguf
+*.safetensors
+*.dmp
+*.pem
+*.key
+*.pfx
+*.p12
+*.har
+*.zip
+*.7z
+/*.png
+/*.jpg
+/*.jpeg
 
 # Per-fork private identifiers for scripts/scrub_check.py — never published.
 scripts/scrub-rules.local.txt
