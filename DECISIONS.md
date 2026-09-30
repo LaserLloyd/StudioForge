@@ -714,8 +714,8 @@ not restart the server. Both of its paths were broken, and each hid the other.
 
 *The handoff was refused.* `_ask_watchdog_to_restart` sent `Authorization: Bearer
 <server.api_key>` and nothing else. The watchdog enforces auth when **either** `server.api_key` or
-the MCP pairing PIN is set, and accepts either -- so on the default install (key null, PIN set,
-which is this box) the app sent no credential at all and was answered `401` by the watchdog's ASGI
+the MCP pairing PIN is set, and accepts either -- so on the default install (key null, PIN set)
+the app sent no credential at all and was answered `401` by the watchdog's ASGI
 wrapper. That reply is generated *before any watchdog code runs*, which is why `watchdog.log` was
 empty at the time and the failure read as silent. The `ERROR` line existed in `studioforge.log`, one
 second before the drain that followed it.
@@ -2749,7 +2749,7 @@ same way: single-flight task, so a multi-minute reload never stalls the sweeper.
    churn, removing a standing misplacement is not.
 2. **Quiet box only, and really idle.** The pass runs only when nothing is serving, loading,
    testing or benchmarking (`_busy_reason`), and only for a model idle >= 300 s -- because a
-   relocation is a reload, and a reload drops the child's prompt cache. On this rig's RP
+   relocation is a reload, and a reload drops the child's prompt cache. On a long-conversation
    workload that cache was 93% of a 98k-token prompt; moving a model between turns would trade
    a permanent contention win for a multi-minute reprocess loss. Five minutes idle means the
    conversation has plausibly gone away.
@@ -3109,8 +3109,8 @@ open inference port whose abusers cannot be named. Landed together:
    while one runs: the job table stops being job_id-or-nothing.
 7. **Request attribution**: every inference request is counted against its
    peer IP or self-declared ``X-SF-Client`` label, rolled up in
-   `/api/status.clients` over the trailing hour. On 2026-08-24 naming one
-   abuser took rig-side netstat and four hours; the ring is the whole
+   `/api/status.clients` over the trailing hour. Without it, naming one
+   heavy client took host-side netstat and hours; the ring is the whole
    defence until ``server.api_key`` is set.
 8. **`GET /api/models/{id}/options`**: the MCP ``model_options`` capacity
    table over plain REST -- read-only math a planning agent without MCP
@@ -4499,7 +4499,7 @@ arithmetic with `achieved_batch`, the report). The b10425 help excerpt gained th
 ## D55 -- The open install is open for inference, not for the operator's desk
 
 **Problem.** The 2026-09-04 hardening audit read both services the way a peer on the tailnet sees
-them. On an open install (`server.api_key` unset -- the shipped default, and this rig's) the D32
+them. On an open install (`server.api_key` unset -- the shipped default) the D32
 line was drawn in the wrong place seven times over, ranked by reach:
 
 1. The control panel's origin gate keyed on `scope["type"] == "websocket"`. NiceGUI's socket.io
@@ -4608,10 +4608,10 @@ line was drawn in the wrong place seven times over, ranked by reach:
    the full exception text goes to the log under the same `ref`, one grep away. The `openai` client
    reads `type` and `code` only, so nothing downstream changes.
 
-**Not done here, on purpose -- operator decisions (audit §7/§8).** Setting real credentials on both
-services (five clients change; the order that avoids an outage is in the audit); loopback-only
-binds (neither service multi-binds; needs a tunnel or a proxy); the firewall rules (written, not
-run); gating `/api/benchmark*` (breaks CrucibleForge until the credential lands); per-peer slot
+**Not done here, on purpose -- operator decisions.** Setting real credentials on both services
+(every client changes with them, so the switch-over needs an order that avoids an outage);
+loopback-only binds (neither service multi-binds; needs a tunnel or a proxy); host firewall
+rules; gating `/api/benchmark*` (breaks CrucibleForge until the credential lands); per-peer slot
 caps on `/v1` (changes the LM Studio parity); defaulting `watchdog.host`/`gui.host` to `127.0.0.1`
 (removes remote admin); whether `unload-all` should exist on an open install; `redact()`'s
 first-4/last-2 mask (fix before setting a key); `register_secret(mcp.pin)`; length caps on lease
@@ -4923,8 +4923,8 @@ not change.
   touches the registry's alias table), because a synthetic catalogue entry breaks any client that
   enumerates `/v1/models` and loads each one in turn.
 
-**Provenance.** The alias arrived as two patches from the bluefin box, shipped in <!-- scrub-ok: pre-existing provenance note, already in the published history; names a build box, not a person or a credential -->
-`rig-update-2026-09-06.zip`, claimed to have been "built and tested" there against `6a7c89c`. A
+**Provenance.** The alias arrived as two patches prepared on a second development machine,
+claimed to have been "built and tested" there against `6a7c89c`. A
 follow-up audit found that claim provably wrong: the patches' own pre-image blob for
 `openai_routes.py` is `bfef2d7`, and that blob is the one actually present at `4393cb2` -- the
 v1.26-08-31 line -- not at `6a7c89c`, whose `openai_routes.py` blob is `459de77`. So the patches were
@@ -5104,9 +5104,8 @@ today.
 2026-09-09 against a build spec whose Phases 3 and 5 asked for a "computed VRAM planner" and "one
 VRAM arbiter". Both already existed here (D14–D19, D36–D43, D46–D48, D51–D56); what the review found
 were gaps between what the decisions promised and what the code enforced, plus two owner-stated
-policies. This entry records what changed and why. The audit that drove it is
-`Projects/docs/FIX_AUDIT.md` (Part A); the survey that ruled out a backend change is
-`Projects/docs/BACKEND_SURVEY.md`.
+policies. This entry records what changed and why. The audit that drove it (Part A)
+and the survey that ruled out a backend change are internal working documents, not published.
 
 **The owner's two rules, now shipped defaults.**
 
@@ -5202,7 +5201,7 @@ because it occupies the chat model for half an hour.
 
 **Left honest.** The full baseline has not been run, so no throughput claim is made anywhere in this
 round. `Planner._gpus_without`, `_thinking_ctx`, `evictable_ids`, `run_stdio` and the other
-callerless definitions the audit listed stay (`Projects/docs/DEFERRED.md`); removing dead code is
+callerless definitions the audit listed stay (tracked outside this repository); removing dead code is
 out of this round's scope. D10 still has no unit test. `plan_load` plans at the requested tier
 without the D48 "only upwards" rule a real load applies to a resident, because a preview has no
 resident to re-tier.
@@ -5371,7 +5370,7 @@ smoke-tested under `engines/` beside it and is not active; moving to it is one `
 (or the panel's Install and activate) away and is the operator's call, not this entry's.
 
 **Context.** Two findings of the 2026-09-09 review round (D60) that belong to the engine manager,
-and the one recommendation of `Projects/docs/BACKEND_SURVEY.md` (its rec. 4) that is not a backend
+and the one recommendation of the internal backend survey (its rec. 4) that is not a backend
 change.
 
 1. *Review finding 5.* `child_environment` passed every `CUDA_*` variable through "by design". But
@@ -6856,7 +6855,7 @@ unload routes, `_peer_host`, the evictions docstring. `management.py`: imports, 
 ## D71 -- A MoE's compute term is sized from the weights that run, with a per-device floor and mask
 
 **Status.** Landed on 2026-09-24 at the owner's request ("Fix the moe computation, no other
-changes"). This was item 12 of the 2026-09-22 Fable review, where the formula change was held for
+changes"). This was item 12 of the 2026-09-22 review, where the formula change was held for
 sign-off. Dense models are unchanged byte for byte. `META_FORMAT_VERSION` 3 -> 4, so every model
 re-reads its header once at the next boot scan (33 models took 1.8 s on the D69 bump).
 
