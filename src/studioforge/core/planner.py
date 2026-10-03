@@ -940,6 +940,24 @@ def active_weight_bytes(meta: Any, weights_bytes: int) -> int:
     return weights
 
 
+def device_weight_bytes(meta: Any, weights_bytes: int) -> int:
+    """The weight bytes a load puts on GPUs: the file minus its host tables (D73).
+
+    ``meta.extra['host_tensor_bytes']`` is what llama.cpp keeps in host memory
+    whatever ``-ngl`` says (:data:`studioforge.core.gguf.HOST_RESIDENT_TENSOR_NAMES`).
+    Without a sane count -- none recorded, not an integer, or not smaller than
+    the weights -- the answer is the whole file: the old, conservative charge.
+    """
+    weights = max(0, int(weights_bytes))
+    extra = getattr(meta, "extra", None)
+    if not isinstance(extra, Mapping):
+        return weights
+    raw = extra.get("host_tensor_bytes")
+    if isinstance(raw, int) and not isinstance(raw, bool) and 0 < raw < weights:
+        return weights - raw
+    return weights
+
+
 def compute_basis_bytes(meta: Any, weights_bytes: int) -> int:
     """The weight bytes the compute term is a fraction of (D71).
 
@@ -1279,7 +1297,9 @@ class Planner:
             int(ubatch) if ubatch is not None else self.ubatch_for(record, max(1, parallel))
         )
 
-        weights = int(meta.tensor_bytes) or int(record.size_bytes)
+        # A host-resident table (D73) never reaches a GPU: it is neither
+        # weights on a device nor part of the width the compute term tracks.
+        weights = device_weight_bytes(meta, int(meta.tensor_bytes) or int(record.size_bytes))
         # One call for all four shapes: uniform, iSWA, hybrid, per-layer array.
         # Picking between two formulas here is what let the hybrid case fall
         # through the gap and be charged as if it were uniform.

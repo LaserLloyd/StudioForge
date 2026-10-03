@@ -1231,7 +1231,11 @@ def _throwaway_record(
     # we happen to own (a 52 GB BF16 was reported fitting one 32 GB card that
     # way). Pin the metadata's byte count to THIS option's weights.
     if meta is not None and int(getattr(meta, "tensor_bytes", 0) or 0) != int(weights_bytes):
-        meta = meta.model_copy(update={"tensor_bytes": max(0, int(weights_bytes))})
+        # The sibling's host-resident table (D73) is the sibling's quant of it,
+        # not this option's -- drop it rather than guess, so a picker estimate
+        # can only over-charge.
+        extra = {k: v for k, v in (meta.extra or {}).items() if k != "host_tensor_bytes"}
+        meta = meta.model_copy(update={"tensor_bytes": max(0, int(weights_bytes)), "extra": extra})
     return ModelRecord(
         id=model_id,
         name=model_id,

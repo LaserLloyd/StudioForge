@@ -85,7 +85,10 @@ GGUF_MAGIC_SWAPPED: Final = b"FUGG"  # big-endian writers emit the magic reverse
 #: 4 -> 5: sampling -- the publisher's recommended sampler defaults
 #:         (``general.sampling.*``), so the Chat tab can show what a request
 #:         that leaves them blank will actually be served with.
-META_FORMAT_VERSION: Final = 5
+#: 5 -> 6: host_tensor_bytes -- the bytes llama.cpp keeps in host memory
+#:         whatever ``-ngl`` says (the per-layer token-embedding table), so
+#:         the planner stops charging them to a GPU (D73).
+META_FORMAT_VERSION: Final = 6
 
 #: ``general.sampling.*`` keys llama.cpp's converter writes from a model's
 #: ``generation_config.json``, mapped to the OpenAI/llama-server request names.
@@ -1232,6 +1235,7 @@ def _sum_shard_bytes(
     """
     total = 0
     experts = 0
+    host = 0
     counted: list[str] = []
     missing: list[str] = []
     for candidate in shard_paths:
@@ -1239,6 +1243,7 @@ def _sum_shard_bytes(
         if _same_file(shard, path):
             total += main.total_tensor_bytes
             experts += expert_tensor_bytes(main.tensors)
+            host += host_tensor_bytes(main.tensors)
             counted.append(shard.name)
             continue
         if not shard.is_file():
@@ -1247,6 +1252,7 @@ def _sum_shard_bytes(
         parsed = read_gguf(shard)
         total += parsed.total_tensor_bytes
         experts += expert_tensor_bytes(parsed.tensors)
+        host += host_tensor_bytes(parsed.tensors)
         counted.append(shard.name)
     if missing:
         extra["missing_shards"] = missing
@@ -1255,6 +1261,10 @@ def _sum_shard_bytes(
     # the shards would make a MoE's trunk look bigger than it is (D71).
     if experts and not missing:
         extra["expert_tensor_bytes"] = experts
+    # The same for the host-resident bytes (D73): the shard that holds the
+    # table may be the missing one, and charging it is the safe direction.
+    if host and not missing:
+        extra["host_tensor_bytes"] = host
     return total
 
 
@@ -1268,6 +1278,22 @@ EXPERT_TENSOR_MARKER: Final = "_exps."
 def expert_tensor_bytes(tensors: Sequence[TensorInfo]) -> int:
     """Bytes held by a MoE's routed experts; 0 for a dense model (D71)."""
     return sum(t.n_bytes for t in tensors if EXPERT_TENSOR_MARKER in t.name)
+
+
+#: Tensors llama.cpp keeps in host memory whatever ``-ngl`` says (D73). The
+#: per-layer token-embedding table (Gemma-3n/E4B's PLE, Qwen3.8-Flash-Next's
+#: n-gram PLE) is ``LLM_TENSOR_LAYER_INPUT`` / ``GGML_OP_GET_ROWS`` in
+#: llama-arch.cpp, so ``load_tensors`` gives it the CPU buffer exactly as it
+#: does ``token_embd``, and only the rows a batch gathers ever reach a GPU.
+#: It is 27-36 GiB of a 177B Qwen3.8-Flash-Next file. ``token_embd`` is
+#: deliberately NOT listed: a tied model duplicates it onto the output device,
+#: and at under 1 GiB the over-charge is the safe direction.
+HOST_RESIDENT_TENSOR_NAMES: Final = frozenset({"per_layer_token_embd.weight"})
+
+
+def host_tensor_bytes(tensors: Sequence[TensorInfo]) -> int:
+    """Bytes llama.cpp places in host memory, never on a GPU (D73)."""
+    return sum(t.n_bytes for t in tensors if t.name in HOST_RESIDENT_TENSOR_NAMES)
 
 
 def _same_file(left: Path, right: Path) -> bool:
@@ -1487,6 +1513,9 @@ def meta_from_gguf(
         experts = expert_tensor_bytes(gguf.tensors)
         if experts:
             extra["expert_tensor_bytes"] = experts
+        host = host_tensor_bytes(gguf.tensors)
+        if host:
+            extra["host_tensor_bytes"] = host
     if local and not shard_paths:
         implied_missing = missing_shard_names(path)
         if implied_missing:

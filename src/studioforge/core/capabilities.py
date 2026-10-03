@@ -74,7 +74,7 @@ FEATURE_NOTES: dict[str, str] = {
 #: on instead. **Bump it in the same commit that appends a decision**:
 #: ``tests/unit/test_capabilities_implemented.py`` reads the headings of
 #: ``DECISIONS.md`` and fails until the two agree.
-LATEST_DECISION = 72
+LATEST_DECISION = 73
 
 #: Every decision number this build includes, ``"D1"`` .. ``"D<LATEST_DECISION>"``.
 IMPLEMENTED_DECISIONS: tuple[str, ...] = tuple(f"D{n}" for n in range(1, LATEST_DECISION + 1))
@@ -111,6 +111,7 @@ SERVER_FEATURES: dict[str, str] = {
     # body fields and answers 200 with its usual slots -- gate on the name.
     "shared_kv_pool": "D72",
     "context_checkpoint_settings": "D72",
+    "host_resident_tensors": "D73",
 }
 
 

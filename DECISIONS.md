@@ -7094,3 +7094,45 @@ source says about the rest:
   completions.
 - A pool case in `test_gui_chat.py`, and the sweep's restore and reuse in
   `test_parallel_bench.py`.
+
+## D73 -- Host-resident tensors are not charged to a GPU
+
+**Status.** Landed on 2026-10-03 so a 177B Qwen3.8-Flash-Next quant (`qwen4exp`) could be planned
+on a three-card split. `META_FORMAT_VERSION` 5 -> 6, so every model re-reads
+its header once at the next scan.
+
+**Context.** `Planner.estimate` charged every tensor in the file to the GPUs, as weights and (for
+a MoE, through the trunk) as compute basis. llama.cpp does not place every tensor on a GPU: the
+per-layer token-embedding table `per_layer_token_embd` is `LLM_TENSOR_LAYER_INPUT` /
+`GGML_OP_GET_ROWS` in `llama-arch.cpp`, so `load_tensors` gives it the CPU buffer as it does
+`token_embd`, and only the rows a batch gathers cross to a device (`qwen4exp` also creates it
+`TENSOR_READ_LAZY`). In Qwen3.8-Flash-Next it is an n-gram table of 320M x 160 rows: 26.8 GiB
+(IQ4_NL) to 35.8 GiB (Q5_1) of a 83-125 GiB file. Its i1-Q4_K_S (104.08 GiB) was planned at
+~113 GiB (weights 104.1 + compute 6.8, its 15 % fraction taken of a trunk the table inflated) and
+"won't fit" on three cards, when the GPUs hold ~71 GiB. The same table is the "5 GB phantom" D51
+measured on Gemma-4-E4B (8,202 MB actual vs 13,377 predicted).
+
+**Decision.**
+
+1. `gguf.HOST_RESIDENT_TENSOR_NAMES` = `{"per_layer_token_embd.weight"}`; `read_meta` records the
+   sum as `extra["host_tensor_bytes"]`. A split model sums every shard and drops the count if a
+   shard is missing; the remote reader (no tensor table) records none.
+2. `planner.device_weight_bytes(meta, weights)` = weights minus that count, and `estimate` uses it
+   for the weights term and the compute basis. No count, a non-integer, or a count not below the
+   weights charges the whole file, as before.
+3. `token_embd` stays charged on purpose: a tied model duplicates it onto the output device, and at
+   under 1 GiB the over-charge is the safe direction.
+4. The repo picker's throwaway record drops `host_tensor_bytes` whenever it re-pins `tensor_bytes`
+   to another quant: the sibling's table is the sibling's quant of it, so the picker can only
+   over-charge.
+
+**Consequences.** D51's observed correction is a clamp of the measured bytes to a band around the
+formula, so a smaller formula cannot talk a repeat load below what was measured. Host RAM is not
+modelled (as with D72's checkpoints): the table lives in the page cache via mmap. The throughput
+estimate (`throughput.active_params`) still counts the table as trunk, so its t/s estimate for a
+PLE model runs low; display only.
+
+**Tests.** `tests/unit/test_planner_host_tensors.py`: the parser's count (single file, split,
+missing shard, header-only read), `device_weight_bytes` and its nonsense inputs, the estimate's
+weights and compute both dropping on the real Q4_K_S numbers, and the picker dropping a sibling's
+count.
