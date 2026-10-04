@@ -43,6 +43,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
 from studioforge.config import Config, FlashAttn, KvCacheType, QuantAffinity, SplitMode
+from studioforge.core.gguf import is_mtp_draft
 from studioforge.core.gpu import vram_processes
 from studioforge.core.kv_sensitivity import KV_QUALITY_LADDER
 from studioforge.core.leases import LeaseBook, lease_view
@@ -1373,8 +1374,16 @@ class Planner:
             # KV on the same total is the conservative choice. llama-server gives
             # the draft the target's slot layout, a shared pool included (D72).
             draft_ctx_total = (draft_ctx_size or ctx_size) * (1 if kv_unified else max(1, parallel))
+            # An MTP-only draft head (D74) caches its MTP block(s) alone: the
+            # engine's MTP context filters its KV to the layers past the trunk
+            # (llama-model.cpp, ``il >= n_layer()``). Its header still says
+            # block_count = trunk + nextn, which priced a 49-block head at 49
+            # full layers (~20 GB at 200k) for ~0.4 GB of real cache.
+            draft_layers = int(draft.meta.n_layer)
+            if is_mtp_draft(draft.meta):
+                draft_layers = int((draft.meta.extra or {}).get("nextn_predict_layers") or 1)
             draft_kv = estimate_kv_bytes(
-                n_layer=draft.meta.n_layer,
+                n_layer=draft_layers,
                 n_head_kv=draft.meta.n_head_kv or draft.meta.n_head,
                 head_dim_k=draft.meta.head_dim_k,
                 head_dim_v=draft.meta.head_dim_v,

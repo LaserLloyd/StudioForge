@@ -942,6 +942,23 @@ class Registry:
         except ValueError as exc:
             raise BadRequestError(str(exc), param="chat_template_file") from exc
 
+        # An MTP draft head is checked against THIS model's geometry (D74), and
+        # only when the save changes it, so a head deleted later cannot brick
+        # unrelated edits of the row.
+        if validated.mtp_draft_file is not None:
+            if validated.draft_model_id:
+                raise BadRequestError(
+                    "mtp_draft_file and draft_model_id are exclusive: a launch has one draft",
+                    param="mtp_draft_file",
+                )
+            if validated.mtp_draft_file != record.settings.mtp_draft_file:
+                try:
+                    validated.mtp_draft_file = gguf.validate_mtp_draft_file(
+                        validated.mtp_draft_file, record.meta
+                    )
+                except ValueError as exc:
+                    raise BadRequestError(str(exc), param="mtp_draft_file") from exc
+
         # The parallel/cap cross-check lives here rather than in a pydantic
         # model_validator for the same reason as the filesystem check above,
         # only sharper: ``_settings_from`` falls back to ``ModelSettings()``

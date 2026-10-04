@@ -151,6 +151,17 @@ class ModelSettings(BaseModel):
     #: it (D13; the exclusions live in core/manager.py and gui/state.py).
     priority: int | None = None
     draft_model_id: str | None = None
+    #: A multi-token-prediction draft head in its own GGUF (D74): the MTP block,
+    #: the token embedding and the LM head, and no trunk -- the shape unsloth
+    #: and others publish under ``MTP/`` for a model whose quants were made
+    #: without their heads. Loaded as ``--spec-draft-model`` under
+    #: ``--spec-type draft-mtp``; ``spec_type`` ``auto`` picks that whenever the
+    #: engine offers it. A path, not a registry id, because the scanner keeps
+    #: these files out of the library on purpose (they cannot serve on their
+    #: own). Checked at save time by :func:`studioforge.core.gguf.validate_mtp_draft_file`
+    #: against this model's architecture, width and vocabulary; exclusive with
+    #: ``draft_model_id``.
+    mtp_draft_file: Path | None = None
     device_override: list[int] | None = None
     #: The set of CUDA devices the planner MAY choose among for this model --
     #: softer than ``device_override``, which forces an exact placement. A
@@ -253,12 +264,15 @@ class ModelSettings(BaseModel):
     #:    the model's own multi-token-prediction head, no draft model, no extra
     #:    VRAM. Measured on Qwen3.8-27B Q5_K_S: 37.8 -> 50.7 tok/s (+34%) at
     #:    53% draft acceptance (DECISIONS.md D38).
-    #: 2. ``draft-simple`` when a ``draft_model_id`` is set (the pre-WP20
+    #: 2. ``draft-mtp`` when an ``mtp_draft_file`` is attached and the engine
+    #:    offers it (D74); never ``draft-simple`` for such a file, which the
+    #:    engine cannot run as an ordinary draft.
+    #: 3. ``draft-simple`` when a ``draft_model_id`` is set (the pre-WP20
     #:    behaviour).
-    #: 3. ``ngram-mod`` for thinking and MoE models -- llama.cpp recommends it
+    #: 4. ``ngram-mod`` for thinking and MoE models -- llama.cpp recommends it
     #:    for output that repeats itself (reasoning, code iteration). Measured
     #:    free on unseen prose (+0.4%, and it emits no drafts at all there).
-    #: 4. ``none`` otherwise.
+    #: 5. ``none`` otherwise.
     #:
     #: Every value is distribution-preserving: speculative decoding proposes
     #: tokens and the full model verifies them, so the sampled distribution is

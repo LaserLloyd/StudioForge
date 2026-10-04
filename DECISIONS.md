@@ -7136,3 +7136,49 @@ PLE model runs low; display only.
 missing shard, header-only read), `device_weight_bytes` and its nonsense inputs, the estimate's
 weights and compute both dropping on the real Q4_K_S numbers, and the picker dropping a sibling's
 count.
+
+## D74 -- An MTP draft head can be attached by file
+
+**Status.** Landed on 2026-10-04 to run multi-token-prediction drafting for a 177B
+Qwen3.8-Flash-Next quant made without its heads, on engine b11370 (upstream #29761 added
+`draft-mtp` for `qwen4exp`).
+
+**Context.** Publishers ship a model's MTP block as its own GGUF for quants that dropped it
+(unsloth `MTP/mtp-Qwen3.8-Flash-Next-Q8_0.gguf`: block 48's `nextn.*` and layer tensors,
+`token_embd`, `output`, header `block_count` 49, `nextn_predict_layers` 1, no trunk). llama.cpp
+loads one as `--spec-draft-model` under `--spec-type draft-mtp` (`qwen4exp.cpp` `mtp_only`), and
+its MTP context caches the nextn layer alone (`llama-model.cpp`, layer filter
+`il >= n_layer()`). StudioForge could not use one: a draft had to be a registry model, the scanner
+keeps `mtp-*`/`MTP/` files out of the library on purpose (they cannot serve), `auto` chose
+`draft-mtp` only for in-model heads and `draft-simple` for any attached draft (which would hand an
+MTP head to the engine as an ordinary draft and fail the load), and the planner priced a draft's
+KV as `block_count` full layers -- 49 x ~410 MB = ~20 GB at 200k f16 for ~0.4 GB of real cache.
+
+**Decision.**
+
+1. `ModelSettings.mtp_draft_file` (a path, like `chat_template_file`), exclusive with
+   `draft_model_id`. `gguf.validate_mtp_draft_file` runs at save time, and only when the save
+   changes it: a readable GGUF with `nextn_predict_layers >= 1`, MTP-only, the model's
+   architecture, and its embedding width and vocabulary when both are known. Each failure is a
+   400 naming `mtp_draft_file`.
+2. The parser flags such a file `extra["mtp_only"]` when its tensor table holds MTP block(s) and
+   no trunk index (`gguf.is_mtp_only_tensors`; a header-only read never claims it).
+3. `ModelManager._draft_for` turns the file into an unlisted draft record
+   (`id = "mtp-draft:<file name>"`), memoised on (path, size, mtime). A head that went missing or
+   stopped being a head loads the model without it, as a missing `draft_model_id` does.
+4. `resolve_spec_type(..., mtp_draft=True)`: `auto` picks `draft-mtp` when the engine offers it,
+   else drafts from the text (never `draft-simple`); an unknown engine gets `none`; an explicit
+   draft-model type other than `draft-mtp` is refused. `_spec_args` emits the head as
+   `--spec-draft-model` only under `draft-mtp`.
+5. The planner charges an MTP-only draft's KV for its nextn layer(s) only. Its weights are
+   charged whole (`token_embd` included, though the engine keeps it in host memory: the safe
+   direction, ~0.6 GiB).
+
+**Consequences.** The draft's compute buffer is not modelled, as for every draft; D51 absorbs it
+after the first load (draft composition is not in the observation key, a known D51 limit).
+The head's own KV type follows the engine default (f16), not the model's.
+
+**Tests.** `tests/unit/test_mtp_draft_file.py`: the parser flag, the tensor rule, every save-time
+refusal and the round trip, exclusivity, a deleted head not bricking later saves, spec resolution
+on engines with and without `draft-mtp` and an unknown one, the argv, the one-layer KV price
+against the real 49-block header, and the manager's record (memoised, missing, not-a-head).

@@ -71,6 +71,7 @@ from studioforge.core.engine import (
     probe_engine_features,
     refuse_policy_flags,
 )
+from studioforge.core.gguf import is_mtp_draft
 from studioforge.core.planner import attention_kind, effective_ubatch, is_moe
 from studioforge.errors import ModelLoadError, ModelUnloadError
 from studioforge.logging import get_logger
@@ -1121,7 +1122,12 @@ def _nextn_heads(record: ModelRecord) -> int:
 
 
 def resolve_spec_type(
-    record: ModelRecord, features: EngineFeatures, *, has_draft: bool, slots: int = 1
+    record: ModelRecord,
+    features: EngineFeatures,
+    *,
+    has_draft: bool,
+    slots: int = 1,
+    mtp_draft: bool = False,
 ) -> tuple[str, str]:
     """Pick the ``--spec-type`` for this model. Returns ``(type, reason)``.
 
@@ -1134,6 +1140,11 @@ def resolve_spec_type(
     speculation trades spare compute for latency and a saturated multi-slot
     batch has none to spare (see the constant). An explicit ``spec_type`` is
     still honoured at any slot count -- the caller chose it.
+
+    ``mtp_draft`` says the attached draft is an MTP-only head file (D74). Such a
+    file can only run under ``draft-mtp``: ``auto`` picks that when the engine
+    offers it and otherwise drafts from the text (never ``draft-simple``), and
+    an explicit draft-model type other than ``draft-mtp`` is refused.
 
     Raises :class:`ModelLoadError` when an explicitly configured type is not one
     the active engine offers -- b10425 accepts unknown values on some flags and
@@ -1156,6 +1167,15 @@ def resolve_spec_type(
                 ),
             )
             return requested, "set on this model (engine feature list unavailable)"
+        wanted = [part.strip() for part in requested.split(",")]
+        if mtp_draft and any(
+            part.startswith("draft-") and part != SPEC_TYPE_MTP for part in wanted
+        ):
+            raise ModelLoadError(
+                f"'{record.id}' has an MTP draft head attached (mtp_draft_file) but asks "
+                f"for --spec-type {requested}; an MTP head only runs under {SPEC_TYPE_MTP}.",
+                details={"model_id": record.id, "spec_type": requested},
+            )
         if not features.supports_spec(requested):
             offered = ", ".join(features.spec_types) or "none"
             raise ModelLoadError(
@@ -1177,15 +1197,18 @@ def resolve_spec_type(
             f"{slots} slots: speculation is a single-stream win and hurts a saturated batch",
         )
     if not features.known:
-        # Unknown engine: keep exactly the pre-gating behaviour, no guesses.
-        if has_draft:
+        # Unknown engine: keep exactly the pre-gating behaviour, no guesses --
+        # except that an MTP head is not an ordinary draft (D74).
+        if has_draft and not mtp_draft:
             return SPEC_TYPE_DRAFT, "a draft model is attached"
         return SPEC_TYPE_NONE, "engine feature list unavailable"
 
     heads = _nextn_heads(record)
     if heads >= 1 and features.supports_spec(SPEC_TYPE_MTP):
         return SPEC_TYPE_MTP, f"the model carries {heads} multi-token-prediction head(s)"
-    if has_draft and features.supports_spec(SPEC_TYPE_DRAFT):
+    if mtp_draft and features.supports_spec(SPEC_TYPE_MTP):
+        return SPEC_TYPE_MTP, "an MTP draft head file is attached (mtp_draft_file)"
+    if has_draft and not mtp_draft and features.supports_spec(SPEC_TYPE_DRAFT):
         return SPEC_TYPE_DRAFT, "a draft model is attached"
     thinking = bool(record.capabilities.thinking)
     moe = is_moe(record.meta)
@@ -1304,10 +1327,11 @@ def resolve_launch_features(
     features: EngineFeatures,
     *,
     has_draft: bool,
+    mtp_draft: bool = False,
 ) -> ResolvedFeatures:
     """Resolve every ``auto``/gated knob for one launch. Pure; may raise."""
     spec_type, spec_reason = resolve_spec_type(
-        record, features, has_draft=has_draft, slots=max(1, plan.parallel)
+        record, features, has_draft=has_draft, slots=max(1, plan.parallel), mtp_draft=mtp_draft
     )
     split_mode, split_reason = resolve_split_mode(record, plan, features)
     return ResolvedFeatures(
@@ -1821,7 +1845,13 @@ class Supervisor:
         draft: ModelRecord | None = None,
     ) -> ResolvedFeatures:
         """Resolve the ``auto``/gated knobs for a launch. See D38."""
-        return resolve_launch_features(record, plan, features, has_draft=draft is not None)
+        return resolve_launch_features(
+            record,
+            plan,
+            features,
+            has_draft=draft is not None,
+            mtp_draft=draft is not None and is_mtp_draft(draft.meta),
+        )
 
     def _placement_args(self, plan: LoadPlan, decided: ResolvedFeatures) -> list[str]:
         """Device selection, split mode and main GPU.
@@ -2268,7 +2298,9 @@ class Supervisor:
         The draft-model flags are emitted only for a type that actually uses
         one: ``draft-mtp`` reads the base model's own heads and ``ngram-*`` read
         the generated text, so pointing either at a ``--spec-draft-model`` would
-        load a second model for nothing.
+        load a second model for nothing -- with one exception, an MTP-only head
+        file (D74), which is the ``--spec-draft-model`` of a ``draft-mtp`` launch
+        and of nothing else.
         """
         settings = record.settings
         if not decided.drafting:
@@ -2285,6 +2317,13 @@ class Supervisor:
             args += ["--spec-draft-p-min", _fmt_float(settings.spec_draft_p_min)]
 
         if draft is None:
+            return args
+        if is_mtp_draft(draft.meta) and SPEC_TYPE_MTP not in [
+            part.strip() for part in decided.spec_type.split(",")
+        ]:
+            # resolve_spec_type never pairs an MTP head with another draft
+            # type; this is the belt to that brace, because the engine would
+            # try to run the head as an ordinary draft and fail the load.
             return args
 
         args += ["--spec-draft-model", str(draft.path)]

@@ -15,9 +15,11 @@ import time
 from collections import deque
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from studioforge.config import Config, KvCacheType
+from studioforge.core import gguf
 from studioforge.core.arch_support import (
     ArchVerdict,
     StartupRejection,
@@ -567,6 +569,8 @@ class ModelManager:
         self._own_addresses: list[str] | None = None
         self._started_at = time.time()
         self._locks: dict[str, asyncio.Lock] = {}
+        # D74: parsed mtp_draft_file heads, keyed on (path, size, mtime_ns).
+        self._mtp_draft_cache: dict[tuple[str, int, int], ModelRecord] = {}
         self._locks_guard = asyncio.Lock()
         #: One load at a time, machine-wide. See :meth:`_load_locked` (D29):
         #: two cold loads planned side by side each see the VRAM the other has
@@ -5707,6 +5711,8 @@ class ModelManager:
     def _draft_for(self, record: ModelRecord) -> ModelRecord | None:
         draft_id = record.settings.draft_model_id
         if not draft_id:
+            if record.settings.mtp_draft_file is not None:
+                return self._mtp_draft_record(record, record.settings.mtp_draft_file)
             return None
         draft = self.registry.resolve(draft_id)
         if draft is None:
@@ -5715,6 +5721,48 @@ class ModelManager:
                 model_id=record.id,
                 draft_model_id=draft_id,
             )
+        return draft
+
+    def _mtp_draft_record(self, record: ModelRecord, path: Path) -> ModelRecord | None:
+        """The ``mtp_draft_file`` head as a draft record nobody else can see (D74).
+
+        Built from the file's own header rather than the registry, which keeps
+        draft-head files out of the library on purpose. Memoised on (path,
+        size, mtime) so the planner's per-rung estimates do not re-parse it. A
+        head that went missing or stopped being one after it was saved loads
+        the model without it, as a missing ``draft_model_id`` does.
+        """
+        try:
+            st = path.stat()
+            key = (str(path), st.st_size, st.st_mtime_ns)
+            cached = self._mtp_draft_cache.get(key)
+            if cached is not None:
+                return cached
+            meta = gguf.read_meta(path)
+        except Exception as exc:  # noqa: BLE001 - a broken head must not break the load
+            log.warning(
+                "MTP draft head unreadable, loading without it",
+                model_id=record.id,
+                mtp_draft_file=str(path),
+                error=str(exc),
+            )
+            return None
+        if not gguf.is_mtp_draft(meta):
+            log.warning(
+                "mtp_draft_file is not an MTP-only head, loading without it",
+                model_id=record.id,
+                mtp_draft_file=str(path),
+            )
+            return None
+        draft = ModelRecord(
+            id=f"mtp-draft:{path.name}",
+            name=path.stem,
+            path=path,
+            size_bytes=int(st.st_size),
+            architecture=meta.architecture,
+            meta=meta,
+        )
+        self._mtp_draft_cache[key] = draft
         return draft
 
     def _adapters_for(self, record: ModelRecord) -> list[tuple[AdapterRecord, float]]:

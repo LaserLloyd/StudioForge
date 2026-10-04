@@ -1296,6 +1296,84 @@ def host_tensor_bytes(tensors: Sequence[TensorInfo]) -> int:
     return sum(t.n_bytes for t in tensors if t.name in HOST_RESIDENT_TENSOR_NAMES)
 
 
+def is_mtp_only_tensors(tensors: Sequence[TensorInfo], *, n_layer: int, nextn: int) -> bool:
+    """True when the table holds MTP block(s) and no trunk block (D74).
+
+    The trunk is ``blk.0`` .. ``blk.<n_layer - nextn - 1>``; the MTP blocks
+    follow it. llama.cpp's own test (``qwen4exp.cpp``, ``mtp_only``) is the
+    absence of a block-0 tensor; this checks every trunk index, so a file that
+    lost only its first block is not mistaken for a draft head.
+    """
+    trunk = n_layer - nextn
+    if nextn < 1 or trunk < 0:
+        return False
+    has_mtp = False
+    for t in tensors:
+        if not t.name.startswith("blk."):
+            continue
+        head, _, _rest = t.name[4:].partition(".")
+        if not head.isdigit():
+            continue
+        if int(head) < trunk:
+            return False
+        has_mtp = True
+    return has_mtp
+
+
+def is_mtp_draft(meta: Any) -> bool:
+    """Whether ``meta`` describes an MTP-only draft head file (D74)."""
+    extra = getattr(meta, "extra", None)
+    return isinstance(extra, dict) and extra.get("mtp_only") is True
+
+
+def validate_mtp_draft_file(value: Path | str | None, base: Any) -> Path | None:
+    """Check an ``mtp_draft_file`` at *save* time against the model it drafts for.
+
+    A plain function for the same reason as ``validate_chat_template_file``:
+    it touches the filesystem, and a file deleted after saving must not make
+    the stored settings row invalid. ``base`` is the drafting model's
+    ``GgufMeta`` (or ``None`` when it has none, which is refused -- there is
+    nothing to check the head against). Raises ``ValueError`` naming the
+    mismatch; returns the resolved path.
+    """
+    if value is None:
+        return None
+    path = Path(value).expanduser()
+    if not path.is_file():
+        raise ValueError(f"mtp_draft_file {path} does not exist or is not a file")
+    try:
+        meta = read_meta(path)
+    except Exception as exc:  # noqa: BLE001 - any parse failure is the user's to fix
+        raise ValueError(f"mtp_draft_file {path} is not a readable GGUF: {exc}") from exc
+    if base is None:
+        raise ValueError("the model has no parsed GGUF metadata to check an MTP draft against")
+    nextn = int((meta.extra or {}).get("nextn_predict_layers") or 0)
+    if nextn < 1:
+        raise ValueError(
+            f"mtp_draft_file {path.name} carries no multi-token-prediction block "
+            "(nextn_predict_layers is missing)"
+        )
+    if not is_mtp_draft(meta):
+        raise ValueError(
+            f"mtp_draft_file {path.name} also carries trunk blocks; it is a full model, "
+            "not a draft head. Use the model itself (its heads are found automatically) "
+            "or draft_model_id."
+        )
+    if meta.architecture != getattr(base, "architecture", None):
+        raise ValueError(
+            f"mtp_draft_file {path.name} is {meta.architecture!r}, but the model is "
+            f"{getattr(base, 'architecture', None)!r}"
+        )
+    for field_name, label in (("n_embd", "embedding width"), ("n_vocab", "vocabulary")):
+        mine = int(getattr(meta, field_name, 0) or 0)
+        theirs = int(getattr(base, field_name, 0) or 0)
+        if mine and theirs and mine != theirs:
+            raise ValueError(
+                f"mtp_draft_file {path.name} has {label} {mine}, but the model has {theirs}"
+            )
+    return path
+
+
 def _same_file(left: Path, right: Path) -> bool:
     if left == right:
         return True
@@ -1440,6 +1518,11 @@ def meta_from_gguf(
     nextn = _as_int(kv.get(f"{prefix}nextn_predict_layers"))
     if nextn:
         extra["nextn_predict_layers"] = int(nextn)
+        # A draft-head file (D74): the MTP block(s), the embeddings and the LM
+        # head, and not one trunk block. Only provable from the tensor table,
+        # so a header-only read never claims it.
+        if gguf.tensors and is_mtp_only_tensors(gguf.tensors, n_layer=n_layer, nextn=int(nextn)):
+            extra["mtp_only"] = True
 
     # Captured for a later sizing change and read by nothing yet (D69 §13).
     # How llama.cpp sizes the KV cache for these shapes is unverified here, so
