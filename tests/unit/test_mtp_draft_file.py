@@ -381,3 +381,25 @@ def test_a_file_that_stopped_being_a_head_loads_without_it(tmp_path: Path) -> No
     full = write_gguf(tmp_path / "full.gguf", _kv(), _TRUNK + _HEAD)
     record = _moe_record(tmp_path, mtp_draft_file=full)
     assert ModelManager._draft_for(_manager_stub(), record) is None
+
+
+# ---------------------------------------------------------------------------
+# The library scan does not list a head as a model
+# ---------------------------------------------------------------------------
+
+
+def test_the_scan_skips_a_head_in_the_library(tmp_path: Path) -> None:
+    library = tmp_path / "models"
+    head_dir = library / "ggml-org" / "Model-GGUF" / "MTP"
+    head_dir.mkdir(parents=True)
+    write_gguf(head_dir / "mtp-Model-Q8_0.gguf", _kv(), _HEAD)
+    full_dir = library / "pub" / "Model-GGUF"
+    full_dir.mkdir(parents=True)
+    write_gguf(full_dir / "Model-Q4_K_S.gguf", _kv(nextn=None, blocks=2), _TRUNK)
+    db = Database(tmp_path / "data" / "registry.sqlite3")
+    db.migrate()
+    reg = Registry(Config(data_dir=tmp_path / "data", models=ModelsConfig(dir=library)), db)
+    reg.scan()
+    ids = reg.known_ids()
+    assert any(i.endswith("Model-Q4_K_S") for i in ids)
+    assert not any("mtp-Model" in i for i in ids)

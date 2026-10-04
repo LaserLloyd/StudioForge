@@ -558,6 +558,12 @@ class Registry:
             if self._is_mmproj(entry):
                 mmprojs[model_id] = entry
                 continue
+            if gguf.is_mtp_draft(meta):
+                # An MTP-only draft head (D74) cannot serve on its own: it is
+                # attached to the model it drafts for via mtp_draft_file, and a
+                # library row for it would only be a model that crashes on load.
+                log.debug("registry.mtp_head_skipped", model_id=model_id, path=str(path))
+                continue
             if model_id in bases:
                 result.errors.append((model_id, "duplicate model id across model directories"))
                 log.warning("registry.duplicate_id", model_id=model_id, path=str(path))

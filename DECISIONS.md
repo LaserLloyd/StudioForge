@@ -7174,6 +7174,20 @@ KV as `block_count` full layers -- 49 x ~410 MB = ~20 GB at 200k f16 for ~0.4 GB
    charged whole (`token_embd` included, though the engine keeps it in host memory: the safe
    direction, ~0.6 GiB).
 
+6. **The library scan skips MTP-only heads** (amended the same day). `looks_like_auxiliary_gguf`
+   only ever filtered the Download tab; a head placed in the library (where this decision tells
+   people to keep it) was indexed as a model that crashes on load. The registry now drops any
+   file whose parsed header is `mtp_only`; `META_FORMAT_VERSION` 6 -> 7 so cached rows re-parse.
+
+**Measured on the rig (2026-10-04, ggml-org `mtp-Qwen3.8-Flash-Next-Q8_0.gguf`, b11370, 4 GPUs,
+the abliterated 177B i1-Q4_K_S).** unsloth's heads crash b11370 (`GGML_ASSERT(buffer)`, upstream
+#29811: their MTP layer lacks the QSA compress ratio / `recurrent_layers`); ggml-org's load.
+Best setting `spec_draft_n_max` 2 + `--spec-draft-sampling probabilistic` (extra_flags):
+decode vs no drafting 75 vs 57 tok/s at 2k context, 73 vs 62 at 8.6k, 63.5 vs 61 at 24k, 50 vs
+56 at 50k, 26 vs 48 at 122k (acceptance 0.56-0.72). `spec_draft_p_min` 0.5 collapsed decode to
+15 tok/s. Verification batches leave the single-token attention path, so MTP is a short-context
+win only; the owner's 200k profile runs without it.
+
 **Consequences.** The draft's compute buffer is not modelled, as for every draft; D51 absorbs it
 after the first load (draft composition is not in the observation key, a known D51 limit).
 The head's own KV type follows the engine default (f16), not the model's.

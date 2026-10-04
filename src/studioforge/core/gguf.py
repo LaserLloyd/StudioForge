@@ -88,7 +88,9 @@ GGUF_MAGIC_SWAPPED: Final = b"FUGG"  # big-endian writers emit the magic reverse
 #: 5 -> 6: host_tensor_bytes -- the bytes llama.cpp keeps in host memory
 #:         whatever ``-ngl`` says (the per-layer token-embedding table), so
 #:         the planner stops charging them to a GPU (D73).
-META_FORMAT_VERSION: Final = 6
+#: 6 -> 7: mtp_only -- an MTP draft-head file, which the registry no longer
+#:         lists as a model (D74).
+META_FORMAT_VERSION: Final = 7
 
 #: ``general.sampling.*`` keys llama.cpp's converter writes from a model's
 #: ``generation_config.json``, mapped to the OpenAI/llama-server request names.
