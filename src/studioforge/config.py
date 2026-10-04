@@ -245,6 +245,17 @@ class ModelsConfig(BaseModel):
     #: while today's render was refused for VRAM. Set a tier to 0 to pin a
     #: whole tier; set ``settings.ttl_s`` on one model to price it alone.
     ttl_by_priority: dict[int, int] = Field(default_factory=lambda: {1: 900, 2: 900, 3: 600})
+    #: One idle timer for every model whose duration nobody stated (D75). Off
+    #: (``None``) by default, which keeps the ladder above exactly as it was.
+    #: Set, it replaces BOTH ``ttl_by_priority`` and ``default_ttl_s`` for any
+    #: model with no ``settings.ttl_s`` and no pin -- whatever tier it loaded
+    #: at -- and a request's own ``ttl`` is honoured as stated, past the tier
+    #: ceiling D61 put on it: a duration somebody specified always wins over
+    #: this default, and only an unspecified one falls back to it. Seconds of
+    #: idle time since the last request, as for every other timer; 0 is not
+    #: accepted (it would mean "never", the opposite of the setting's point --
+    #: leave it unset, or pin the model).
+    auto_unload_idle_s: PositiveInt | None = None
     # "auto": the planner picks per model rather than forcing one type on the
     # whole library. At long context the KV cache dwarfs the weights, so the
     # right trade differs per model -- a 27B reaches native 262144 on f16 and

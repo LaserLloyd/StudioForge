@@ -37,6 +37,10 @@
 #                           agent's model idle out after 15 minutes,
 #                           background (and any load that named no tier)
 #                           after 10. Empty = default_ttl_s for every tier.
+#   models.auto_unload_idle_s  null = off. Seconds: every model with no
+#                           per-model ttl_s and no pin unloads after that much
+#                           idle time, whatever its tier (replaces the two
+#                           timers above); a request's own ttl still wins (D75).
 #   engine.pinned_tag       the llama.cpp build in use. `studioforge engine
 #                           --update` moves this on only after a smoke test.
 #   engine.cuda_variant     "auto" picks the CUDA build matching your driver;
@@ -97,6 +101,7 @@ models:
     '1': 900
     '2': 900
     '3': 600
+  auto_unload_idle_s: null
   default_kv_cache_type: auto
   default_parallel: auto
   ctx_per_slot_default: 32768

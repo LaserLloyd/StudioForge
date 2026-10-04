@@ -79,6 +79,7 @@ COVERED_KEYS: tuple[str, ...] = (
     "models.ctx_per_slot_default",
     "models.default_kv_cache_type",
     "models.default_ttl_s",
+    "models.auto_unload_idle_s",
     "models.auto_load_pinned",
     "models.default_model",
     "models.preload_default_model",
@@ -579,6 +580,10 @@ def _library_body(ctx: GuiContext, refresh: Any) -> None:
     fields.row("models.default_kv_cache_type", label="KV cache type")
     fields.row("models.default_ttl_s", label="Idle unload after (s)")
     ttl_widgets = _ttl_by_priority_rows(ctx)
+    fields.row(
+        "models.auto_unload_idle_s",
+        label="Auto-unload any model with no stated duration after (s) -- blank = off",
+    )
     fields.row(
         "models.auto_load_pinned", label="Load pinned models at startup and keep them loaded"
     )

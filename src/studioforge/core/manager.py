@@ -3915,7 +3915,9 @@ class ModelManager:
         rather than the stale one.
         """
         instance.priority = tier
-        if self.config.models.ttl_by_priority:
+        # Under D75 the tier no longer prices the timer, so a re-tier must not
+        # throw away a duration a request stated.
+        if self.config.models.ttl_by_priority and self.config.models.auto_unload_idle_s is None:
             self.apply_effective_ttl(record, instance)
 
     def effective_priority(self, model_id: str) -> int:
@@ -4973,6 +4975,11 @@ class ModelManager:
             return 0
         if record.settings.ttl_s is not None:
             return record.settings.ttl_s
+        # D75: one timer for every model nobody gave a duration -- it outranks
+        # the tier map and the default, both of which are defaults too.
+        auto = self.config.models.auto_unload_idle_s
+        if auto is not None:
+            return int(auto)
         by_tier = self.config.models.ttl_by_priority
         if by_tier:
             tier = (
@@ -5006,6 +5013,10 @@ class ModelManager:
         record = self.registry.resolve(model_id)
         instance = self.supervisor.get(record.id) if record else None
         if record is None or instance is None:
+            return None
+        if self.config.models.auto_unload_idle_s is not None:
+            # D75: a duration the caller states overrides the auto-unload
+            # default, in both directions -- there is no tier price to cap at.
             return None
         if record.settings.pinned or record.settings.ttl_s is not None:
             return None

@@ -6430,6 +6430,11 @@ CONFIG_FIELD_HELP: Final[Mapping[str, str]] = {
         "'auto' keeps full-quality KV where it is affordable and quantizes only where it is not."
     ),
     "models.default_ttl_s": "Idle unload timer, in seconds. 0 means never idle-unload.",
+    "models.auto_unload_idle_s": (
+        "D75. Blank = off. Set, every model with no duration of its own (no per-model ttl_s, "
+        "not pinned) unloads after this many idle seconds, whatever its tier -- it replaces "
+        "the per-tier timers and the default above. A request's own ttl still wins."
+    ),
     "models.ttl_by_priority": (
         "Per-tier idle timers, consulted between a model's own ttl_s and the default "
         "above (D48). Blank rows fall through to the default, so leaving all three empty "

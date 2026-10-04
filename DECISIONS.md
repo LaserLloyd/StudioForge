@@ -7196,3 +7196,38 @@ The head's own KV type follows the engine default (f16), not the model's.
 refusal and the round trip, exclusivity, a deleted head not bricking later saves, spec resolution
 on engines with and without `draft-mtp` and an unknown one, the argv, the one-layer KV price
 against the real 49-block header, and the manager's record (memoised, missing, not-a-head).
+
+## D75 -- One auto-unload timer for every model whose duration nobody stated
+
+**Status.** Landed on 2026-10-04 at the owner's request: "unless otherwise specified, models need
+to unload automatically at 10 min. Add an optional setting for this, default off, but turn on on
+my system. If any duration is specified it will override this."
+
+**Context.** The D48 ladder prices a model's idle timer as: pin -> `settings.ttl_s` ->
+`models.ttl_by_priority[tier]` -> `models.default_ttl_s`, and D61 caps a request's `ttl` at its
+tier's price. With the shipped tier map a chat- or agent-tier model idles for 15 minutes, and the
+tier a model ends up at depends on which client loaded it last -- so "how long does this stay
+loaded" had no single answer an owner running the cards all day could state.
+
+**Decision.**
+
+1. `models.auto_unload_idle_s: PositiveInt | None = None`. Unset (the shipped default) changes
+   nothing. Set, `ModelManager.ttl_for` returns it for any model with no pin and no
+   `settings.ttl_s`, ahead of `ttl_by_priority` and `default_ttl_s` (both are defaults too). 0 is
+   refused: it would mean "never", the opposite of the setting; leave it unset or pin the model.
+2. A stated duration wins. Per model (`settings.ttl_s`, a pin) as before, and per request: while
+   the setting is on, `request_ttl_cap` returns no ceiling, so a request's `ttl` is honoured as
+   stated in both directions, and a re-tier no longer restamps the timer (the tier does not price
+   it) and so no longer discards a request's stated duration.
+3. Surfaces: Setup tab row beside the idle timers (in `COVERED_KEYS`), `CONFIG_FIELD_HELP`,
+   `config.example.yaml`, capability `auto_unload_idle`.
+
+**Consequences.** On the owner's rig (set to 600) chat- and agent-tier models now idle out after
+10 minutes instead of 15. A client that sends `ttl` keeps whatever it asked for: the D61 ceiling
+(written after a background turn's `ttl: 3600` kept a tier-3 model an hour) does not apply while
+the setting is on -- that is the owner's stated rule, and the per-request duration is the
+client's explicit statement.
+
+**Tests.** `tests/unit/test_auto_unload_idle.py`: off leaves every tier's price, on gives every
+tier the one timer and outranks `default_ttl_s`, per-model `ttl_s` and pins override it, a
+request's `ttl` overrides it both ways with no cap, a re-tier keeps it, 0 is refused.
