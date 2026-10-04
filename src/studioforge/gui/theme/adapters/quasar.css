@@ -1,8 +1,7 @@
-/* GENERATED adapter quasar.css: unifyingTheme V26-09-16 drop-in bundle (ui-theme/),
-   the same in every app. Do not edit this copy: change the package's src/
-   or adapters/, run `python tools/sync_theme.py build`, then copy ui-theme/
-   into each app (or run `python tools/sync_theme.py install`).
-   body sha256: 489688d9edb97e7a */
+/* GENERATED adapter quasar.css: unifyingTheme 1.0.0, drop-in bundle (ui-theme/).
+   https://github.com/LaserLloyd/UnifyingTheme . Do not edit this copy: update the whole
+   folder (python ui-theme/update.py) and keep app styles in the app.
+   body sha256: 90952938c17de7b0 */
 
 /* ============================================================================
    adapter: quasar.css — contract tokens onto Quasar (NiceGUI 3.x)
@@ -127,8 +126,8 @@ a:focus-visible {
 
 /* ---- cards ---------------------------------------------------------------
    Quasar's only built-in dark treatment is `.q-card--dark`'s border/shadow
-   (the base .q-card has no dark background rule at all — NiceGUI's own
-   `dark:bg-white/5` classes exist in gui/ precisely to paper over that). One
+   (the base .q-card has no dark background rule at all, which is why NiceGUI
+   apps end up adding `dark:bg-white/5`-style classes to paper over it). One
    rule now covers both: `.q-card--dark` only ever appears alongside `.q-card`
    on the same element, so it needs no separate values of its own here.
    Dialog cards get the raised "overlay" surface instead, since they float
@@ -308,7 +307,7 @@ a:focus-visible {
   box-shadow: var(--shadow-2);
 }
 
-/* ---- uploader (chat "Attach image") -----------------------------------
+/* ---- uploader ------------------------------------------------------------
    Quasar paints the header on --q-primary (the accent) with a hard-coded
    white label, and the header's add button is an <a>, so the base layer's
    link colour reached it: 4.00:1 and 1.29:1 on Night Red's red plate, and
@@ -329,7 +328,7 @@ a:focus-visible {
   background: var(--surface-4);
 }
 
-/* ---- linear progress (VRAM bars, download rows, benchmark) ------------ */
+/* ---- linear progress ------------------------------------------------------ */
 
 /* Progress tracks follow the specimen board: the fill (--accent via
    --q-primary) sits on --surface-4. --control-track is for control
@@ -342,7 +341,7 @@ a:focus-visible {
   opacity: 1;
 }
 
-/* ---- slider (LoRA adapter scale) --------------------------------------- */
+/* ---- slider ---------------------------------------------------------------- */
 
 .q-slider__track,
 .q-slider__inner {
@@ -353,45 +352,99 @@ a:focus-visible {
   color: var(--slider-color);
 }
 
-/* ---- toggle (chat "use loaded model", setup switches) ------------------
-   Track/thumb are recoloured directly rather than through `currentColor`,
-   which sidesteps Quasar's separate --dark variant entirely (off and on
-   states look the same regardless of Quasar's own dark/light class). */
+/* ---- toggle ------------------------------------------------------------------
+   On and off differ in fill, knob size, knob colour and a mark, never in hue
+   alone (an accent "on" beside a --control-track "off" is 1.0-1.6:1 in most
+   themes). Off: a hollow track outlined in --unselected-border, a small
+   --unselected-fg knob, a ring mark. On: a filled --selected track, a full
+   --on-selected knob, a bar mark. Quasar's geometry is kept (thumb .5em,
+   from .25em to .65em); the track is thickened to hold the knob. */
 
 .q-toggle__track {
-  background: var(--control-track);
+  height: .5em;
+  margin-top: -.075em;
+  border-radius: .25em;
   opacity: 1;
+  background: transparent;
+  box-shadow: inset 0 0 0 2px var(--unselected-border);
+  position: relative;
 }
 
-.q-toggle__inner--truthy .q-toggle__track {
-  background: var(--accent);
-  opacity: 1;
+.q-toggle__track::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  inset-inline-end: .1em;
+  width: .16em;
+  height: .16em;
+  margin-top: -.08em;
+  border: 2px solid var(--unselected-fg);
+  border-radius: 50%;
 }
 
 .q-toggle__thumb:after {
-  background: var(--surface-2);
+  background: var(--unselected-fg);
+  box-shadow: none;
+  transform: scale(.6);
+  transition: transform var(--dur-fast) var(--ease-out), background-color var(--dur-fast) var(--ease-standard);
+}
+
+.q-toggle__inner--truthy .q-toggle__track {
+  opacity: 1;
+  background: var(--selected);
+  box-shadow: none;
+}
+
+.q-toggle__inner--truthy .q-toggle__track::after {
+  inset-inline-end: auto;
+  inset-inline-start: .17em;
+  width: 2px;
+  height: .2em;
+  margin-top: -.1em;
+  border: 0;
+  border-radius: 1px;
+  background: var(--on-selected);
 }
 
 .q-toggle__inner--truthy .q-toggle__thumb:after {
-  background: var(--on-accent);
+  background: var(--on-selected);
+  transform: scale(.72);
+}
+
+.q-toggle__thumb .q-icon,
+.q-toggle__inner--truthy .q-toggle__thumb .q-icon {
+  color: var(--selected);
+  opacity: 1;
 }
 
 /* ---- checkbox ----------------------------------------------------------- */
 
 .q-checkbox__inner,
 .q-checkbox--dark .q-checkbox__inner {
-  color: var(--border-strong);
+  color: var(--unselected-border);
 }
 
+/* Checked takes --selected (3:1+ on every surface in every theme) with the
+   tick in --on-selected; unchecked is the --unselected-border outline. */
 .q-checkbox__inner--truthy,
 .q-checkbox__inner--indet,
 .q-checkbox--dark .q-checkbox__inner--truthy,
 .q-checkbox--dark .q-checkbox__inner--indet {
-  color: var(--accent);
+  color: var(--selected);
 }
 
 .q-checkbox__svg {
-  color: var(--on-accent);
+  color: var(--on-selected);
+}
+
+.q-radio__inner,
+.q-radio--dark .q-radio__inner {
+  color: var(--unselected-border);
+}
+
+.q-radio__inner--truthy,
+.q-radio--dark .q-radio__inner--truthy {
+  color: var(--selected);
 }
 
 /* ---- separator ---------------------------------------------------------- */
@@ -405,7 +458,7 @@ a:focus-visible {
    The clickable header is a .q-item internally, so the hover/active rules
    above already apply to it -- nothing extra needed here. */
 
-/* ---- table (benchmark history) ------------------------------------------ */
+/* ---- table ----------------------------------------------------------------- */
 
 .q-table__card,
 .q-table__card--dark,
@@ -441,7 +494,8 @@ a:focus-visible {
 }
 
 /* ============================================================================
-   Tailwind v4 (browser runtime) utility classes used in gui/tabs/*.py.
+   Tailwind v4 (NiceGUI's browser runtime) utility classes that NiceGUI apps
+   commonly use for dark-mode tints.
    These land in the `utilities` layer, so the same unlayered-beats-layered
    rule applies: no !important needed here either.
    ============================================================================ */
@@ -474,8 +528,8 @@ a:focus-visible {
   background-color: color-mix(in srgb, var(--accent) 20%, transparent);
 }
 
-/* Dimmed text. The GUI makes its secondary text quieter with an opacity
-   utility on a text-sized label (`text-xs opacity-70`, about 165 labels).
+/* Dimmed text. NiceGUI apps often make secondary text quieter with an opacity
+   utility on a text-sized label (`text-xs opacity-70` and similar).
    Opacity multiplies the theme's own text colour: that still leaves about
    6:1 in the dark core themes, but 60% of Night Red's #ff5800 is 2.9:1.
    TEXT.md's rule is "a tier, never opacity", so these labels are drawn at
@@ -563,15 +617,14 @@ a:focus-visible {
     color: var(--on-info) !important;
   }
 
-  /* Named Quasar palette classes used via color= props (dashboard/download
-     badges, setup/server icons) and gui/state.py's CAPABILITY_ICONS /
-     STATUS_COLOURS maps. These are deliberately mapped to distinct
+  /* Named Quasar palette classes used via color= props (badges, icons,
+     status maps). These are deliberately mapped to distinct
      categorical tokens, not to hue-matched colours -- .text-orange lands on
      --cat-2 (teal), .text-purple on --cat-3 (gold), and so on. The contract
      only promises the --cat-* set is distinguishable from itself and >=3:1 on
      --surface-0 (they're a foreground/text-strength colour, not a fill);
-     making "orange" look orange isn't a goal, and the distinctness between
-     the five hues is test-enforced, so don't "fix" this to be hue-accurate.
+     making "orange" look orange isn't a goal, so don't "fix" this to be
+     hue-accurate.
      "grey" is the one honestly-named exception, mapped to --offline. */
   .text-grey {
     color: var(--text-tertiary) !important;
@@ -621,7 +674,7 @@ a:focus-visible {
     background-color: var(--cat-5) !important;
   }
 
-  /* R17: --cat-* are tuned to be legible as a foreground colour on
+  /* --cat-* are tuned to be legible as a foreground colour on
      --surface-0, not as a fill guaranteed to hold Quasar's literal white
      label -- white on --cat-1 measures ~2:1 in some themes. Route the
      pairing through --text-inverse (the theme's flipped page ink, always
@@ -643,7 +696,98 @@ a:focus-visible {
   .bg-grey.text-white {
     color: var(--on-offline) !important;
   }
+
+  /* Disabled controls. Quasar dims them to 60-75% opacity, which in a dim
+     theme makes a disabled control look like a quiet enabled one (and dims
+     an "on" toggle into something that still reads as on). Instead: full
+     opacity, the disabled text tier, no accent or --selected fill, and a
+     dashed edge, so disabled reads as disabled in every theme, on or off.
+     Quasar also sets `.disabled, .disabled * { outline: 0 !important }` in
+     its last layer, so every outline here is !important too (an !important
+     in this earlier layer wins). Last in this layer on purpose: the label
+     fixes above (.bg-primary.text-white ...) have the same specificity. */
+  .q-btn.disabled,
+  .q-btn[disabled] {
+    opacity: 1 !important;
+    background: transparent !important;
+    color: var(--text-disabled) !important;
+    box-shadow: none !important;
+    outline: 1px dashed var(--text-disabled) !important;
+    outline-offset: -1px;
+  }
+
+  /* Quasar draws a raised button's shadow on ::before. */
+  .q-btn.disabled::before,
+  .q-btn[disabled]::before {
+    box-shadow: none !important;
+  }
+
+  .q-toggle.disabled,
+  .q-checkbox.disabled,
+  .q-radio.disabled,
+  .q-field--disabled,
+  .q-slider--disabled {
+    opacity: 1 !important;
+    color: var(--text-disabled) !important;
+  }
+
+  .q-toggle.disabled .q-toggle__track,
+  .q-toggle.disabled .q-toggle__inner--truthy .q-toggle__track {
+    background: transparent !important;
+    box-shadow: none !important;
+    outline: 2px dashed var(--text-disabled) !important;
+    outline-offset: -2px;
+  }
+
+  .q-toggle.disabled .q-toggle__thumb:after {
+    background: var(--text-disabled) !important;
+  }
+
+  /* The mark keeps its shape: a hollow ring when off, a bar when on. */
+  .q-toggle.disabled .q-toggle__track::after {
+    border-color: var(--text-disabled) !important;
+  }
+
+  .q-toggle.disabled .q-toggle__inner--truthy .q-toggle__track::after {
+    background: var(--text-disabled) !important;
+  }
+
+  .q-checkbox.disabled .q-checkbox__inner,
+  .q-radio.disabled .q-radio__inner {
+    color: var(--text-disabled) !important;
+  }
+
+  /* A disabled box is never filled, checked or not: Quasar paints a checked
+     box with currentColor, which would read as "on". Dashed edge, tick in
+     the disabled tier. */
+  .q-checkbox.disabled .q-checkbox__bg {
+    background: transparent !important;
+    border: 2px dashed var(--text-disabled) !important;
+  }
+
+  .q-checkbox.disabled .q-checkbox__svg {
+    color: var(--text-disabled) !important;
+  }
+
+  .q-field--disabled .q-field__control {
+    outline: 1px dashed var(--text-disabled) !important;
+    outline-offset: -1px;
+  }
+
+  /* Quasar also dims the field's contents to 60%; the tier already does it. */
+  .q-field--disabled .q-field__control > div {
+    opacity: 1 !important;
+  }
+
+  .q-field--disabled .q-field__native,
+  .q-field--disabled .q-field__label {
+    color: var(--text-disabled) !important;
+  }
 }
+
+/* StudioForge-only helper classes, appended to its copy of adapters/quasar.css
+   by the private app registry (extra_files append). Moved out of the public
+   adapter on 2026-10-04. */
 
 /* ============================================================================
    sf-* helper classes — StudioForge-specific, kept to a minimum. Used only

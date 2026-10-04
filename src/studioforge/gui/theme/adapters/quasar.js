@@ -1,7 +1,6 @@
-/* GENERATED adapter quasar.js: unifyingTheme V26-09-16 drop-in bundle (ui-theme/),
-   the same in every app. Do not edit this copy: change the package's src/
-   or adapters/, run `python tools/sync_theme.py build`, then copy ui-theme/
-   into each app (or run `python tools/sync_theme.py install`).
+/* GENERATED adapter quasar.js: unifyingTheme 1.0.0, drop-in bundle (ui-theme/).
+   https://github.com/LaserLloyd/UnifyingTheme . Do not edit this copy: update the whole
+   folder (python ui-theme/update.py) and keep app styles in the app.
    body sha256: a558aa540d7d0947 */
 
 /* ---- adapter: quasar.js — Quasar / NiceGUI ----

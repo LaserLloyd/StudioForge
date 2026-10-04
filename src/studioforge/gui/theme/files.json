@@ -1,0 +1,22 @@
+{
+  "name": "unifyingTheme",
+  "version": "1.0.0",
+  "hash": "68bd24d58a9c",
+  "repo": "LaserLloyd/UnifyingTheme",
+  "files": {
+    "README.md": "84ec9fe633487bdea462961df8753508fda16cb5646c9f3ad954b798542c50ac",
+    "VERSION": "0baf45c3225f2f3690d9ba515eb50ade5ea08fc6928792a413b3ded790ee3b32",
+    "adapters/quasar.css": "e7ac02a0917e40d03fa54edaca1c4ba46cd3013a90186125e245ff34b35eed51",
+    "adapters/quasar.js": "fbb367cf55a0be572c50627cc817bc416673b27a0a026902010ea9ade31892e0",
+    "adapters/tailwind-v3.preset.js": "10b53e580e3e36ab5104de6c181b7348c3a195a1be5f7934e5c3417efc19804b",
+    "adapters/tailwind.css": "9e9879e6a4351f97b937ed31a7870a81dad3298720b59a6c1e8268ca30bd64d3",
+    "themes.json": "4b8f3b8dca9ea97542f0d4cf3782a646207e223cf56c1eed803145dcee8b4e49",
+    "ui-components.css": "f0230aac7156743808381a170cff37a8984631a7d0c79ae8bf7dbf1272193670",
+    "ui-components.js": "60e22e4420079b17531a2ae8bc900192e00d5d80ef80ac583c971f7db30c71e7",
+    "ui-theme-base.css": "fd2219002ca6091b08c0e82944415eaf153a707ac24e290d14f82aa4672e91fa",
+    "ui-theme.css": "3607586bc301f9b00b3ca2376ed6387161c6ad6525e7d37ec3207cc8e07f722d",
+    "ui-theme.d.ts": "62700aff753856fcebed609d2f7490a28316738198cf7f3ee6665bc8bb248113",
+    "ui-theme.js": "fb2b749c479a8007cc09e8f85da637bb6c7a9db02af20885020c9ca0df2ab733",
+    "update.py": "7c2357a73eaf705cf78a262f3c778e3e07a5d9dd442135a638ff09becd0df7ee"
+  }
+}

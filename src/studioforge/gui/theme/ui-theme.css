@@ -1,22 +1,37 @@
-/* GENERATED theme tokens: unifyingTheme V26-09-16 drop-in bundle (ui-theme/),
-   the same in every app. Do not edit this copy: change the package's src/
-   or adapters/, run `python tools/sync_theme.py build`, then copy ui-theme/
-   into each app (or run `python tools/sync_theme.py install`).
-   body sha256: ea480d6c47815866 */
+/* GENERATED theme tokens: unifyingTheme 1.0.0, drop-in bundle (ui-theme/).
+   https://github.com/LaserLloyd/UnifyingTheme . Do not edit this copy: update the whole
+   folder (python ui-theme/update.py) and keep app styles in the app.
+   body sha256: 2447a7108667201e */
 /* ============================================================================
-   theme-base.css — CORE. Purple (base theme) + theme-agnostic layer.
+   theme-base.css — the token contract, Purple (the base theme), and the
+   theme-agnostic element layer.
    ----------------------------------------------------------------------------
-   Purple is the base: its values ARE the :root defaults. Purple is selected by
-   the ABSENCE of a data-palette attribute. Every other theme is a
-   theme-<slug>.css file containing one [data-palette="<slug>"] block.
+   Purple is the base: its values ARE the :root defaults, and Purple is
+   selected by the ABSENCE of a data-palette attribute. Every other theme is a
+   theme-<slug>.css file holding one [data-palette="<slug>"] block that
+   overrides these tokens.
 
    This file never names a slug.
 
    Sections
-     A. Contract — Purple token values (:root)
+     A. Contract — Purple's token values (:root)
      B. Theme-invariant tokens (geometry, layers, motion, type scale)
      C. Theme-agnostic layer (body type, selection, scrollbars, focus,
         reduced motion, highlight.js mapping, locale overrides)
+
+   Token groups in section A (docs/TOKENS.md lists every token):
+     Core, used by any app: Surfaces, Text, Accent, Call to action, Lines,
+       Control states, Status (success, warning, danger, info), Overlays,
+       Elevation, Browser, Type families.
+     Extensions, for apps that need them (every theme defines them, so they
+     are safe to use, but most apps never will):
+       presence statuses (live, idle, offline, heartbeat = scheduled or
+       ambient activity); chat and prose (bubbles, quote bar, mark, the
+       --md-* emphasis colours); narrative text roles (--rp-*: speech,
+       action, thought, whisper, out-of-character, shout, critical) for chat,
+       fiction and transcript views; syntax and diff colours and the code
+       block chrome; categorical and chart colours; canvas and media
+       overlays.
    ============================================================================ */
 
 /* ==========================================================================
@@ -45,7 +60,7 @@
 
   /* ---- Text ---- */
   --text-primary:    #e8e8f0;
-  --text-secondary:  #a0a0bd;  /* core fix 2026-09-25, was #9a9ab8 */
+  --text-secondary:  #a0a0bd;
   --text-tertiary:   #8d8db0;
   --text-disabled:   #717195;
   --text-inverse:    #0e0e1b;
@@ -60,7 +75,7 @@
 
   /* ---- Accent ---- */
   --accent:          #7c3aed;
-  --accent-hover:    #8250f0;  /* core fix 2026-09-25, was #8b5cf6 */
+  --accent-hover:    #8250f0;
   --accent-pressed:  #6d28d9;
   --accent-subtle:   rgba(124,58,237,.16);
   --accent-muted:    rgba(124,58,237,.26);
@@ -71,7 +86,7 @@
 
   /* ---- Call to action ---- */
   --cta:               #7c3aed;
-  --cta-hover:         #8250f0;  /* core fix 2026-09-25, was #8b5cf6 */
+  --cta-hover:         #8250f0;
   --cta-pressed:       #6d28d9;
   --on-cta:            #ffffff;
   --cta-shadow:        0 6px 20px rgba(124,58,237,.28);
@@ -83,13 +98,24 @@
   /* ---- Lines ---- */
   --border-subtle:      #21213b;
   --border:             #292945;
-  --border-strong:      #6f6f9c;  /* core fix 2026-09-25, was #38385c */
+  --border-strong:      #6f6f9c;
   --divider:            #21213b;
   --focus-ring:         #a78bfa;
   --focus-ring-width:   2px;
   --focus-ring-offset:  2px;
   --glass-stroke:        rgba(255,255,255,.08);
   --glass-stroke-strong: rgba(255,255,255,.16);
+
+  /* ---- Control states ----
+     On, checked, pressed and current all use --selected, with --on-selected
+     for the tick, knob or label drawn on it. The off state is an outline
+     (--unselected-border) with an --unselected-fg knob, so on and off differ
+     in shape and fill, not only in hue. Defined once here from tokens every
+     theme sets; a theme overrides them only if its own check fails. */
+  --selected:          var(--text-link);
+  --on-selected:       var(--text-inverse);
+  --unselected-border: var(--border-strong);
+  --unselected-fg:     var(--text-tertiary);
 
   /* ---- Status ---- */
   --success:         #34d399;
@@ -155,6 +181,9 @@
   --scrim-light:   rgba(6,6,14,.44);
   --scrim-media:   linear-gradient(to top, rgba(8,8,15,.88), rgba(8,8,15,0));
   --backdrop-blur: 14px;
+  /* Applied to images and video that opt in with .ui-media. A night theme
+     may shift them toward its own hue; every other theme leaves them alone. */
+  --media-filter:  none;
 
   /* ---- Chat and content ---- */
   --bubble-user-bg:        #3b2b6e;
@@ -169,10 +198,10 @@
   --md-bolditalic:         #fde68a;
   --md-bolditalic-glow:    rgba(253,230,138,.40);
   --rp-speech:             #e8e8f0;
-  --rp-action:             #a0a0bd;  /* core fix 2026-09-25: follows --text-secondary */
+  --rp-action:             #a0a0bd;  /* follows --text-secondary */
   --rp-thought:            #a5f3ea;
   --rp-whisper:            #8d8db0;
-  --rp-ooc:                #7d7da0;
+  --rp-ooc:                var(--text-tertiary);
   --rp-shout:              #ff9a6c;
   --rp-shout-glow:         rgba(255,154,108,.45);
   --rp-critical:           #ff7a90;
@@ -202,6 +231,10 @@
   --syn-punctuation: #b6b6cf;
   --syn-deletion:    #ffa0a0;
   --syn-addition:    #7ee7bc;
+  /* Code block chrome: the bar above the slab and its strokes. Mixed from
+     the syntax pair so they stay dark wherever the slab is (every theme). */
+  --code-header-bg:  color-mix(in srgb, var(--syn-fg) 7%, var(--syn-bg));
+  --code-stroke:     color-mix(in srgb, var(--syn-fg) 16%, var(--syn-bg));
 
   /* ---- Categorical / data ---- */
   --cat-1:  #a78bfa;
@@ -217,18 +250,21 @@
   --cat-11: #f0abfc;
   --cat-12: #93c5fd;
 
-  --kind-transfer:     var(--cat-5);
-  --kind-announcement: var(--cat-3);
-  --kind-escalation:   var(--cat-6);
-  --kind-modification: var(--cat-1);
-  --kind-thread:       var(--cat-9);
-  --kind-meeting:      var(--cat-2);
-  --kind-checkin:      var(--cat-7);
-  --kind-schedule:     var(--cat-12);
-  --kind-scene:        var(--cat-11);
+  /* Ramps for heatmaps and scales, mixed from each theme's own colours:
+     sequential (low to high) and diverging (bad, neutral, good). */
+  --seq-1: color-mix(in srgb, var(--selected) 20%, var(--surface-2));
+  --seq-2: color-mix(in srgb, var(--selected) 40%, var(--surface-2));
+  --seq-3: color-mix(in srgb, var(--selected) 60%, var(--surface-2));
+  --seq-4: color-mix(in srgb, var(--selected) 80%, var(--surface-2));
+  --seq-5: var(--selected);
+  --div-1: var(--danger-text);
+  --div-2: color-mix(in srgb, var(--danger-text) 50%, var(--surface-3));
+  --div-3: var(--surface-3);
+  --div-4: color-mix(in srgb, var(--success-text) 50%, var(--surface-3));
+  --div-5: var(--success-text);
 
   --chart-grid: rgba(255,255,255,.07);
-  --chart-axis: #5c5c7d;
+  --chart-axis: #66668a;
 
   /* ---- Canvas ---- */
   --canvas-mask:    rgba(6,6,14,.72);
@@ -296,7 +332,7 @@
   --bar-h:       60px;
   --content-max: 1200px;
 
-  /* Component tokens (defaults derived from layer 2) */
+  /* Component tokens */
   --slider-track-h: 4px;
   --slider-thumb-d: 16px;
   --slider-color:   var(--accent);
@@ -344,7 +380,7 @@
   --dur-slow:       320ms;
   --dur-deliberate: 520ms;
 
-  /* Layers — fixed */
+  /* Layers: fixed; themes and apps never change these. */
   --z-base:     1;
   --z-sticky:   40;
   --z-banner:   50;
@@ -360,10 +396,9 @@
 }
 
 
-/* theme-midnight-gold.css — CORE · opt-out: none
+/* theme-midnight-gold.css — CORE
    Ground: oled · family: midnight-gold · color-scheme: dark
    theme-color: #000000 · fonts: Inter, JetBrains Mono (shared with base)
-   Extracted from the project's existing [data-palette="midnight-gold"] block.
    Values marked (D) are derived from this theme's own palette. */
 
 [data-palette="midnight-gold"] {
@@ -523,7 +558,6 @@
 
 /* theme-glacier.css — CORE
    Ground: oled · family: glacier · color-scheme: dark · theme-color: #000000
-   Extracted from the project's existing [data-palette="glacier"] block.
    (D) = derived from this theme's own palette. */
 
 [data-palette="glacier"] {
@@ -678,46 +712,34 @@
      so the slider track / toggle off-track role gets its own token.
      3.17:1 on surface-2, 3.64:1 on surface-0. */
   --control-track: #5f676b;
-  /* Core fix 2026-09-25 (review T25-7): the accent fill was darker than
+  /* The slider fill is the ice highlight: the dark accent fill was darker than
      the empty track, so the slider read inverted. Ice fill, 3.81:1 above
      the track. */
   --slider-color: var(--highlight);
 
 }
 
-/* theme-forest.css — CORE · owner-approved redesign 2026-09-25
+/* theme-forest.css — CORE
    Ground: oled · family: forest · color-scheme: dark · theme-color: #000000
 
-   Moss on bark, at night. The first Forest (the design import) was cream
-   text, orange links and a brown accent: warm on warm, close to Midnight
-   Gold. The owner asked for an earthy, mossy theme built like Glacier
-   ("pale green and browns instead of pale blue"), so this one follows
-   Glacier's structure with forest colours:
-   - true black wherever a pane is big: page, nav, cards, wells, glass, code
+   Moss on bark, at night: an earthy theme built like Glacier, with pale
+   green and browns where Glacier has pale blue.
+   - True black wherever a pane is big: page, nav, cards, wells, glass, code
      and the assistant bubble are all #000000, so an OLED panel leaves those
      pixels off. Lines carry the structure instead (border 2.27:1 on black,
      glass strokes at .24/.40); only hover, active and menus keep a faint
-     lift;
-   - one text family: pale sage stepping down to moss grey, the way
-     Glacier's text steps from ice to slate, at Glacier's colourfulness;
-   - one signature, soft lichen #b5d59b: links, focus ring, highlight,
-     quote bar, glass strokes, slider fill;
-   - a deep moss accent plate (#396237) with a white label;
-   - browns for everything woody: bark borders, your own chat bubbles,
+     lift.
+   - One text family: pale sage stepping down to moss grey, the way
+     Glacier's text steps from ice to slate, at Glacier's colourfulness
+     (16.8 / 10.6 / 7.5:1 on black).
+   - One signature, soft lichen #b5d59b: links, focus ring, highlight,
+     quote bar, glass strokes, slider fill.
+   - A deep moss accent plate (#396237) with a white label (7.1:1).
+   - Browns for everything woody: bark borders, the user's chat bubbles,
      italics, the secondary accent (#c4a684) and the scrollbars.
    Statuses keep Glacier's clear set (emerald success, amber warning, coral
-   danger, sky-blue info, and Glacier's calm mint for live, far from the
-   sage signature).
-
-   Revision 2 (same day): the owner found revision 1 "a bit too punchy" and
-   wanted "more pure black OLED off area". Chroma came down toward Glacier's
-   at the same OKLCH lightness (so every contrast ratio stayed within a few
-   hundredths), and every large surface went to black.
-
-   Review of revision 1: reports/review-2026-09-25-themes.md.
-
-   design/output/theme-forest.css still holds the imported values; this file
-   diverges from it on purpose ("redesign" in src/themes.json). */
+   danger, sky-blue info, and a calm mint for live, far from the sage
+   signature). */
 
 [data-palette="forest"] {
   color-scheme: dark;
@@ -871,7 +893,6 @@
 /* theme-paper.css — CORE
    Ground: light (warm) · family: paper · color-scheme: light
    theme-color: #e6d2a8
-   Extracted from the project's existing [data-palette="paper"] block.
    (D) = derived from this theme's own palette.
 
    Type rule: Paper is the one core theme that uses a real serif. --font-serif
@@ -879,11 +900,10 @@
    and blockquotes here; headings stay on --font-display (sans). */
 
 /* Status fills: Paper's two grounds (#e6d2a8 page, #efdfb8 card) are only
-   Δ16 apart, and its status inks are extracted core values, so no single fill
-   can be hue-visible, Δ-separated from BOTH grounds, and clear 4.5:1 for dark
-   ink at once. The fill here is therefore a modest hue wash and is NOT the
-   role signal — Paper's status components always render --{status}-border,
-   which measures ≥3:1, as the carrier. See the contrast report. */
+   Δ16 apart, so no single fill can be hue-visible, Δ-separated from BOTH
+   grounds, and clear 4.5:1 for dark ink at once. The fill here is therefore a
+   modest hue wash and is NOT the role signal: Paper's status components carry
+   --{status}-border (3:1 or more) as the signal. */
 [data-palette="paper"] {
   color-scheme: light;
 
@@ -902,12 +922,11 @@
   --code-bg:         #2a1e10;  /* D — code blocks stay dark in every theme */
 
   --text-primary:    #2e2013;
-  --text-secondary:  #4a3722;  /* core fix 2026-09-25, was #5a4429 */
-  --text-tertiary:   #4f3e26;  /* D — see report: extracted --text-muted
-                                  (#5b472b) duplicated --text-secondary */
+  --text-secondary:  #4a3722;
+  --text-tertiary:   #4f3e26;  /* D */
   --text-disabled:   #69573d;  /* D */
   --text-inverse:    #f4e8c8;  /* D */
-  --text-link:       #8a1f18;
+  --text-link:       #781a14;
   --text-link-hover: #6b1611;  /* D */
   --on-accent:       #ffffff;
   --on-danger:       #2a0808;  /* D */
@@ -945,13 +964,13 @@
   --glass-stroke-strong: rgba(46,32,19,.24);  /* D */
 
   --success: #34d399; --success-hover: #5fe0b0;
-  --success-subtle: #d1ddb3; --success-text: #0e4a2e;  /* core fix 2026-09-25, was #13643e */
+  --success-subtle: #d1ddb3; --success-text: #0e4a2e;
   --success-border: rgba(19,100,62,.34);
   --warning: #fbbf24; --warning-hover: #fcd34d;
-  --warning-subtle: #f1daa0; --warning-text: #5a3a00;  /* core fix 2026-09-25, was #7a4f00 */
+  --warning-subtle: #f1daa0; --warning-text: #5a3a00;
   --warning-border: rgba(122,79,0,.34);
   --danger: #f87171; --danger-hover: #fca5a5;
-  --danger-subtle: #f1c4a6; --danger-text: #8a1a15;  /* core fix 2026-09-25, was #aa211c */
+  --danger-subtle: #f1c4a6; --danger-text: #8a1a15;
   --danger-border: rgba(170,33,28,.34);
   --info: #2b3a66; --info-hover: #3a4d84;
   --info-subtle: #d0c5ab; --info-text: #2b3a66;
@@ -991,7 +1010,7 @@
   --rp-action:  #5a4429;  /* D */
   --rp-thought: #1c274a;  /* D */
   --rp-whisper: #6b5433;  /* D */
-  --rp-ooc:     #7d6641;  /* D */
+  --rp-ooc:     var(--text-tertiary);
   --rp-shout:   #9c3a00;  /* D */
   --rp-shout-glow: rgba(156,58,0,.24);  /* D */
   --rp-critical: #8f1512;  /* D */
@@ -1016,7 +1035,7 @@
   --chart-axis: #8a7350;             /* D */
 
   --canvas-mask:    rgba(46,32,19,.58);  /* D */
-  --canvas-handle:  #a3241c;             /* D */
+  --canvas-handle:  #ffffff;             /* light: it sits on the dark mask */
   --canvas-guide:   rgba(163,36,28,.60); /* D */
   --canvas-outline: #2e2013;             /* D */
 
@@ -1040,12 +1059,15 @@
      3.46:1 on surface-2, 3.07:1 on surface-0. */
   --control-track: #897347;
 
+  /* The off outline of checkboxes, radios and switches. The nav ground
+     (surface-1) is darker than the page here, and --border-strong drops to
+     about 2.8:1 on it; the tertiary ink clears 5.5:1 on every surface. */
+  --unselected-border: var(--text-tertiary);
 }
 
 /* theme-daylight.css — CORE
    Ground: light · family: daylight · color-scheme: light
    theme-color: #ffffff
-   Extracted from the project's existing [data-palette="daylight"] block.
    (D) = derived from this theme's own palette. */
 
 [data-palette="daylight"] {
@@ -1179,7 +1201,7 @@
   --chart-axis: #8c95a3;             /* D */
 
   --canvas-mask:    rgba(20,25,40,.55);  /* D */
-  --canvas-handle:  #2c56c9;             /* D */
+  --canvas-handle:  #ffffff;             /* light: it sits on the dark mask */
   --canvas-guide:   rgba(44,86,201,.60); /* D */
   --canvas-outline: #14181f;             /* D */
 
@@ -1201,6 +1223,10 @@
      3.09:1 on surface-2, 3.09:1 on surface-0. */
   --control-track: #909397;
 
+  /* The off outline of checkboxes, radios and switches. The nav ground
+     (surface-1) is darker than the page here, and --border-strong drops to
+     about 2.8:1 on it; the tertiary ink clears 5.5:1 on every surface. */
+  --unselected-border: var(--text-tertiary);
 }
 
 /* theme-electric-yellow.css — OPT-IN
@@ -1328,7 +1354,7 @@
   --rp-action:  #a8acb6;
   --rp-thought: #a3e8ff;
   --rp-whisper: #828794;
-  --rp-ooc:     #74798a;
+  --rp-ooc:     var(--text-tertiary);
   --rp-shout:   #ffa24a;
   --rp-shout-glow: rgba(255,162,74,.45);
   --rp-critical: #ff8585;
@@ -1742,7 +1768,7 @@
   --rp-action:  #506270;  /* D */
   --rp-thought: #076e62;  /* D */
   --rp-whisper: #627585;  /* D */
-  --rp-ooc:     #6f8192;  /* D */
+  --rp-ooc:     var(--text-tertiary);
   --rp-shout:   #b4520c;  /* D */
   --rp-shout-glow: rgba(180,82,12,.22);  /* D */
   --rp-critical: #b62f2f;  /* D */
@@ -1764,10 +1790,10 @@
   --cat-5: #3a56b0; --cat-6: #15803d; --cat-7: #b4520c; --cat-8: #076e62;
   --cat-9: #6b3fa0; --cat-10: #c03636; --cat-11: #4f6b13; --cat-12: #2c5670;
   --chart-grid: rgba(22,33,44,.09);  /* D */
-  --chart-axis: #8b9aa7;             /* D */
+  --chart-axis: #788794;             /* D */
 
   --canvas-mask:    rgba(20,35,50,.52);  /* D */
-  --canvas-handle:  #0b78d0;             /* D */
+  --canvas-handle:  #ffffff;             /* light: it sits on the dark mask */
   --canvas-guide:   rgba(11,120,208,.58);/* D */
   --canvas-outline: #16212c;             /* D */
 
@@ -1822,25 +1848,20 @@
    fonts: Inter, JetBrains Mono (shared with base)
 
    A low-blue-light night theme for a dark room and an OLED screen: warm
-   red-orange text on true black, red structure, zero blue. New in this
-   package (not from the design import).
+   red-orange text on true black, red structure, zero blue.
 
-   REVISION 2 (2026-09-23). The first cut (2026-09-22) followed the
-   astronomy night modes literally: every text tier pure red, near-black
-   surfaces, faint strokes. In daily use it was hard to read and its boxes
-   disappeared. Measured causes:
+   Why it is not simply "everything pure red", as astronomy night modes are:
    - Pure red text has almost no luma. #ff0000 carries 54/255 of BT.709
      luma, and luma is the signal that keeps glyph edges sharp. Chroma is
      halved (4:2:0 remote desktop and video coding) or sampled on a sparse
      red grid (PenTile/diamond OLED phones), so red-only text smears. It
      also tops out at 5.25:1, and APCA puts it at Lc 37, below the level
      APCA sets even for large headings.
-   - The text ladder was flat: primary, secondary and tertiary were three
-     reds within 1.4:1, so nothing stood forward, and the tiers the apps
-     use most for labels and small print were the dimmest reds.
-   - Lines were near-invisible: --border #3d0000 was 1.2:1 and
-     --glass-stroke .16 was 1.1:1. The surfaces carried about a quarter of
-     Midnight Gold's luminance, so a dimmed OLED crushed them to black.
+   - A flat ladder of three reds within 1.4:1 lets nothing stand forward,
+     and apps put real content (labels, hints, small print) in the lower
+     tiers.
+   - Faint lines vanish: a dark-red border at 1.2:1 and strokes at 1.1:1
+     disappear on a dimmed OLED, and so do the boxes they draw.
 
    Rules this file keeps (tools/check_contrast.py audits 1, 4, 5 and 6):
    1. Zero blue. No colour here has a blue channel. The display's blue
@@ -1853,10 +1874,8 @@
       only (green = 0).
    3. Text is an ember ladder. Every tier adds some green, which is what
       restores luma: primary #ff5800 carries 117/255 (pure red: 54),
-      secondary #ff3000 88, tertiary #f01c00 71. This matters because the
-      apps put real content in every tier: ClawForge2's labels and hints
-      are secondary and tertiary, and so is most of ClawChat's small print.
-      It is the one place usability outranks purity.
+      secondary #ff3000 88, tertiary #f01c00 71. It is the one place
+      usability outranks purity.
    4. A hierarchy of heat and brightness. The more important the text, the
       hotter and brighter it is: primary 6.65:1 (hue 21), secondary 5.68
       (hue 11), tertiary 4.87 (hue 7), disabled 2.34. Each step is at least
@@ -1874,21 +1893,24 @@
    7. Calm: black shadows, opaque glass, and glow only on shout, critical
       and bold-italic text. Accent fills are bright red with a black label
       (5.25:1).
+   8. On is amber, off is red. A red "on" next to a red "off" differs by
+      1.6:1 at most, so the control states (--selected, from the base) use
+      the amber link colour: a filled amber switch or box with a black knob
+      or tick, against a hollow red outline when off.
 
-   Templates it still follows: Apple Watch Ultra Night Mode (one hue family
-   on true black), KStars "Night Vision" (red ladder, amber and gold
-   accents), N.I.N.A.'s night schema (oxblood surfaces, amber warning) and
-   f.lux "Ember" (white becomes a 1200 K red-orange; #ff5800 sits beside
-   it). Legibility floors come from WCAG 2.2 and APCA.
+   Templates it follows: Apple Watch Ultra Night Mode (one hue family on
+   true black), KStars "Night Vision" (red ladder, amber and gold accents),
+   N.I.N.A.'s night schema (oxblood surfaces, amber warning) and f.lux
+   "Ember" (white becomes a 1200 K red-orange; #ff5800 sits beside it).
+   Legibility floors come from WCAG 2.2 and APCA.
 
    Contrast profile "night" (src/themes.json): text-primary 5.5:1 on every
    ground, secondary 4.5, tertiary 4, disabled 2, md-bold 6, plus the
    structure, ladder and separation checks in tools/check_contrast.py. The
    surface ramp is sized so --text-tertiary stays above 4:1 on
    --surface-4; lift a surface and it fails first. Text dimmed with
-   opacity is the one thing this file can't fix: 60% of #ff5800 is 2.9:1.
-   TEXT.md bans it and the Quasar adapter maps StudioForge's dimmed
-   labels onto the tiers. */
+   opacity is the one thing this file can't fix: 60% of #ff5800 is 2.9:1,
+   which is why docs/TEXT.md bans dimming text with opacity. */
 
 [data-palette="night-red"] {
   color-scheme: dark;
@@ -2003,7 +2025,7 @@
   --rp-critical: #ff9a00;
   --rp-critical-glow: rgba(255,154,0,.55);
   --diff-add-bg: rgba(110,158,0,.16); --diff-add-text: #6e9e00;
-  --diff-remove-bg: rgba(255,0,0,.16); --diff-remove-text: #ff0000;
+  --diff-remove-bg: rgba(255,0,0,.16); --diff-remove-text: #ff3000;
 
   /* Syntax, on --code-bg. Plain code is the body ember; token kinds take
      the warm accents, and the reds carry keywords, comments and
@@ -2023,7 +2045,7 @@
   --cat-5: #b04000; --cat-6: #909000; --cat-7: #c88400; --cat-8: #7a9a00;
   --cat-9: #d40000; --cat-10: #c8b400; --cat-11: #a89400; --cat-12: #ff3300;
   --chart-grid: rgba(255,0,0,.18);
-  --chart-axis: #a00000;
+  --chart-axis: #bc0000;
 
   --canvas-mask:    rgba(0,0,0,.78);
   --canvas-handle:  #ff0000;
@@ -2042,10 +2064,15 @@
   --scrollbar-track: transparent;
   --scrollbar-thumb: #5a0000;
   --scrollbar-hover: #850000;
-  /* Control-boundary fill (slider track, toggle off-track): 3.08:1 on
-     surface-2, 3.24:1 on surface-0. The on-state (the red accent) sits
-     1.62:1 above it, and the knob position carries the state. */
+  /* Control-boundary fill (slider track): 3.08:1 on surface-2, 3.24:1 on
+     surface-0. Switches and checkboxes take --selected (amber) when on and
+     an outline when off: see rule 8 in the header. */
   --control-track: #c00000;
+
+  /* Images and video marked .ui-media drop to a red monochrome, close to
+     what the theme allows on screen (a CSS filter cannot remove every
+     trace of blue, but it takes it near zero). */
+  --media-filter: grayscale(1) sepia(1) saturate(9) hue-rotate(-38deg) brightness(.72);
 
 }
 
@@ -2058,5 +2085,19 @@
 :lang(ja) h1, :lang(ja) h2, :lang(ja) h3, :lang(ja) h4,
 :lang(zh) h1, :lang(zh) h2, :lang(zh) h3, :lang(zh) h4 {
   letter-spacing: normal;
+}
+
+/* ---- More contrast — every theme ----
+   When the system asks for more contrast, lines take the control-edge
+   strength and the quietest text tier steps up to the secondary one. Placed
+   after every theme block, so it wins over them. */
+@media (prefers-contrast: more) {
+  :root, [data-palette] {
+    --border-subtle: var(--border-strong);
+    --border: var(--border-strong);
+    --divider: var(--border-strong);
+    --glass-stroke: var(--border-strong);
+    --text-tertiary: var(--text-secondary);
+  }
 }
 

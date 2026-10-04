@@ -1,8 +1,7 @@
-/* GENERATED theme base layer: unifyingTheme V26-09-16 drop-in bundle (ui-theme/),
-   the same in every app. Do not edit this copy: change the package's src/
-   or adapters/, run `python tools/sync_theme.py build`, then copy ui-theme/
-   into each app (or run `python tools/sync_theme.py install`).
-   body sha256: 839cb87992a55603 */
+/* GENERATED base layer: unifyingTheme 1.0.0, drop-in bundle (ui-theme/).
+   https://github.com/LaserLloyd/UnifyingTheme . Do not edit this copy: update the whole
+   folder (python ui-theme/update.py) and keep app styles in the app.
+   body sha256: 1ad601afe0bfdc37 */
 /* ==========================================================================
    C. THEME-AGNOSTIC LAYER
    ========================================================================== */
@@ -85,10 +84,13 @@ a:hover { color: var(--text-link-hover); text-decoration-color: currentColor; }
 /* Scrollbars — Firefox */
 * { scrollbar-width: thin; scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track); }
 
-/* Native control tinting fallback */
-input[type="range"], input[type="checkbox"], input[type="radio"], progress {
-  accent-color: var(--accent);
-}
+/* Native control tinting. A checked native box or radio takes --selected,
+   which clears 3:1 on every surface in every theme (the accent does not in
+   the themes with a dark accent), and the browser picks a tick colour that
+   reads on it. The slider fill takes --slider-color. */
+input[type="checkbox"], input[type="radio"] { accent-color: var(--selected); }
+input[type="range"] { accent-color: var(--slider-color); }
+progress { accent-color: var(--accent); }
 
 /* ---- Keyframes — theme-neutral names ---- */
 @keyframes ui-fade-up    { from { opacity:0; transform: translateY(8px);  } to { opacity:1; transform:none; } }
@@ -156,8 +158,8 @@ input[type="range"], input[type="checkbox"], input[type="radio"], progress {
    for nothing. That beats the base layer's own bare element rules (h1-h4
    { margin: 0 }, a { ... }); among these rules, a later one wins a tie
    (so bold-italic and pre code override strong, em and code); and an app
-   rule of the same shape, such as ClawChat's .md-content strong, loads
-   later still and wins. The exception is
+   rule of the same shape (say, .chat-message strong) loads later still and
+   wins. The exception is
    deliberate: .ui-markdown h1-h3 set a chat-sized scale (1.35/1.2/1.08em)
    that beats an app's bare page-heading rule (h1 { font-size: 1.75rem }).
 
@@ -178,10 +180,10 @@ input[type="range"], input[type="checkbox"], input[type="radio"], progress {
 /* ---- Markdown ---------------------------------------------------------------
    Rendered prose: chat replies, notes, previews. Put .ui-markdown on the
    element that holds the rendered HTML. The emphasis colours are the
-   contract's --md-* tokens; ClawChat layers its roleplay rules on top. */
+   contract's --md-* tokens; an app can layer its own rules on top. */
 
 /* No colour on the container itself: it inherits from its bubble or panel,
-   which may set its own (ClawChat's --bubble-user-text). */
+   which may set its own (a user bubble's --bubble-user-text). */
 .ui-markdown {
   line-height: 1.7;
   overflow-wrap: break-word;
@@ -215,7 +217,7 @@ input[type="range"], input[type="checkbox"], input[type="radio"], progress {
   margin-bottom: 0;
 }
 
-.ui-markdown ul, .ui-markdown ol { padding-left: 1.4em; }
+.ui-markdown ul, .ui-markdown ol { padding-inline-start: 1.4em; }
 .ui-markdown li { margin: 0 0 .25em; }
 .ui-markdown :where(li)::marker { color: var(--text-tertiary); }
 .ui-markdown li > :where(ul, ol) { margin: .25em 0 0; }
@@ -270,8 +272,9 @@ input[type="range"], input[type="checkbox"], input[type="radio"], progress {
 .ui-markdown blockquote {
   color: var(--text-secondary);
   background: var(--surface-sunken);
-  border-left: 3px solid var(--quote-bar);
-  border-radius: 0 var(--radius-md) var(--radius-md) 0;
+  border-inline-start: 3px solid var(--quote-bar);
+  border-start-end-radius: var(--radius-md);
+  border-end-end-radius: var(--radius-md);
   padding: 4px 14px;
 }
 
@@ -286,7 +289,7 @@ input[type="range"], input[type="checkbox"], input[type="radio"], progress {
 .ui-markdown th, .ui-markdown td {
   border: 1px solid var(--border);
   padding: 6px 10px;
-  text-align: left;
+  text-align: start;
 }
 .ui-markdown th {
   color: var(--text-primary);

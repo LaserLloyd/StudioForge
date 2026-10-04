@@ -1,0 +1,104 @@
+/* GENERATED adapter tailwind.css: unifyingTheme 1.0.0, drop-in bundle (ui-theme/).
+   https://github.com/LaserLloyd/UnifyingTheme . Do not edit this copy: update the whole
+   folder (python ui-theme/update.py) and keep app styles in the app.
+   body sha256: 9eb224b682dc878e */
+/* ============================================================================
+   adapter: tailwind.css — the contract tokens as Tailwind CSS v4 utilities
+   ----------------------------------------------------------------------------
+   In your Tailwind entry CSS (path relative to that file):
+
+     @import "tailwindcss";
+     @import "./static/ui-theme/adapters/tailwind.css";
+
+   and load the ui-theme files in the page as usual (ui-theme.js, the base
+   and component layers, ui-theme.css): they carry the values, this file
+   only names them for Tailwind. `@theme inline` makes each utility read the
+   live custom property, so a theme switch restyles every utility at once.
+
+   Colour utilities:
+     bg-surface-0 ... bg-surface-4, bg-surface-sunken, bg-surface-overlay
+     text-fg, text-fg-muted, text-fg-subtle, text-fg-disabled, text-link
+     bg-accent text-on-accent, bg-selected text-on-selected
+     border-line, border-line-subtle, border-line-strong, divide-divider,
+     ring-focus, bg-success-subtle text-success-text border-success-border, ...
+     bg-cat-1 ... bg-cat-12
+
+   Text colours are named fg-* because --text-* is Tailwind's font-size
+   namespace: `text-fg-muted` is a colour, `text-sm` stays a size.
+
+   Shared names: Tailwind's own theme also defines --radius-xs ... --radius-xl,
+   --font-sans, --font-mono, --ease-in and --ease-out. ui-theme.css declares
+   the same names outside any cascade layer, so the theme's values win and
+   rounded-md, font-sans or ease-in follow the active theme. That is intended.
+   ============================================================================ */
+
+@theme inline {
+  --color-surface-void: var(--surface-void);
+  --color-surface-0: var(--surface-0);
+  --color-surface-1: var(--surface-1);
+  --color-surface-2: var(--surface-2);
+  --color-surface-3: var(--surface-3);
+  --color-surface-4: var(--surface-4);
+  --color-surface-sunken: var(--surface-sunken);
+  --color-surface-overlay: var(--surface-overlay);
+
+  --color-fg: var(--text-primary);
+  --color-fg-muted: var(--text-secondary);
+  --color-fg-subtle: var(--text-tertiary);
+  --color-fg-disabled: var(--text-disabled);
+  --color-fg-inverse: var(--text-inverse);
+  --color-link: var(--text-link);
+  --color-link-hover: var(--text-link-hover);
+
+  --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-accent-pressed: var(--accent-pressed);
+  --color-accent-subtle: var(--accent-subtle);
+  --color-on-accent: var(--on-accent);
+  --color-cta: var(--cta);
+  --color-on-cta: var(--on-cta);
+  --color-highlight: var(--highlight);
+  --color-on-highlight: var(--on-highlight);
+  --color-selected: var(--selected);
+  --color-on-selected: var(--on-selected);
+
+  --color-line: var(--border);
+  --color-line-subtle: var(--border-subtle);
+  --color-line-strong: var(--border-strong);
+  --color-divider: var(--divider);
+  --color-focus: var(--focus-ring);
+
+  --color-success: var(--success);
+  --color-success-text: var(--success-text);
+  --color-success-subtle: var(--success-subtle);
+  --color-success-border: var(--success-border);
+  --color-on-success: var(--on-success);
+  --color-warning: var(--warning);
+  --color-warning-text: var(--warning-text);
+  --color-warning-subtle: var(--warning-subtle);
+  --color-warning-border: var(--warning-border);
+  --color-on-warning: var(--on-warning);
+  --color-danger: var(--danger);
+  --color-danger-text: var(--danger-text);
+  --color-danger-subtle: var(--danger-subtle);
+  --color-danger-border: var(--danger-border);
+  --color-on-danger: var(--on-danger);
+  --color-info: var(--info);
+  --color-info-text: var(--info-text);
+  --color-info-subtle: var(--info-subtle);
+  --color-info-border: var(--info-border);
+  --color-on-info: var(--on-info);
+
+  --color-cat-1: var(--cat-1);
+  --color-cat-2: var(--cat-2);
+  --color-cat-3: var(--cat-3);
+  --color-cat-4: var(--cat-4);
+  --color-cat-5: var(--cat-5);
+  --color-cat-6: var(--cat-6);
+  --color-cat-7: var(--cat-7);
+  --color-cat-8: var(--cat-8);
+  --color-cat-9: var(--cat-9);
+  --color-cat-10: var(--cat-10);
+  --color-cat-11: var(--cat-11);
+  --color-cat-12: var(--cat-12);
+}

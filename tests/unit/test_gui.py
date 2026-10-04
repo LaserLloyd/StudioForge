@@ -540,7 +540,9 @@ URL_ALLOWLIST = frozenset({"https://huggingface.co"})
 
 def _gui_sources() -> list[Path]:
     root = Path(st.__file__).parent
-    return sorted(root.rglob("*.py"))
+    # gui/theme/ is the vendored unifyingTheme bundle, copied verbatim; its
+    # update.py is a command-line installer that never runs in the panel.
+    return sorted(p for p in root.rglob("*.py") if p.relative_to(root).parts[0] != "theme")
 
 
 def _string_constants(tree: ast.AST) -> list[str]:
