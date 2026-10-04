@@ -496,6 +496,15 @@ class _RecommendedPrep:
     #: ``True``: one shared pool of ``ctx_size``; ``False``: explicitly not;
     #: ``None``: the caller did not say (D72).
     kv_unified: bool | None = None
+    #: The model's saved ``device_override``, in its saved order (D76): when
+    #: set, the only placement the walk offers.
+    saved_override: tuple[int, ...] | None = None
+    #: The cards every mode is built from (D76): this call's ``allowed_devices``
+    #: already narrowed by the model's saved one (``narrowed``), or the saved
+    #: one alone when the call named none. ``None``: no bound.
+    bound: frozenset[int] | None = None
+    #: Where ``bound`` came from, for the words of a refusal (D76).
+    bound_label: str = "this call's allowed_devices"
 
 
 @dataclass
@@ -527,6 +536,12 @@ class RecommendedDecision:
     #: Lease-routing notes for the plan the caller gets back.
     notes: list[str] = field(default_factory=list)
     refusal: StudioForgeError | None = None
+    #: The model's saved placement, as the walk applied it (D76).
+    saved_override: tuple[int, ...] | None = None
+    bound: frozenset[int] | None = None
+    #: What the saved placement did to the walk, in words, for the plan's
+    #: notes and the refusal (D76). Empty when the model saves none.
+    placement_notes: list[str] = field(default_factory=list)
 
 
 class ModelManager:
@@ -2002,6 +2017,15 @@ class ModelManager:
         wins; if none does, the same walk runs with eviction of **idle** models
         allowed -- never a busy one (D36) -- and only then does it refuse.
 
+        **The model's saved placement is honoured as ``/load`` honours it**
+        (D76). A saved ``settings.device_override`` is the placement: the walk
+        offers that exact device set alone (its key is the matching hardware
+        mode's, else ``device_override``) and the plan's notes say so. A saved
+        ``settings.allowed_devices`` bounds every mode, intersected with this
+        call's ``allowed_devices`` when it names one. Before D76 every mode
+        replaced both, so the path ClawChat loads through could put a model
+        pinned to three cards on the fourth.
+
         **This is the one load path that is strict about context.** Everywhere
         else, a context that does not fit steps down a ladder (D14) because a
         roomier window is a nicety. Here the window is the request: an agent
@@ -2043,7 +2067,8 @@ class ModelManager:
                 and a card outside the set is unreachable rather than merely
                 unpreferred. Narrows only: it is intersected with the model's
                 own ``settings.allowed_devices`` and contradicts a
-                ``device_override`` loudly, exactly as in :meth:`load`.
+                ``device_override`` loudly (a 400 naming the excluded card),
+                exactly as in :meth:`load`.
             persist: write the *resolved* profile -- context per slot, both KV
                 cache types and the slot count -- into the model's saved
                 settings once the load succeeds, so the next plain load (a JIT
@@ -2264,6 +2289,12 @@ class ModelManager:
         ``min_slots`` and ``kv_unified`` (D72) are the real call's, with the
         same 400s; a fit reports ``kv_unified``, ``ctx_per_slot`` and
         ``ctx_total`` -- all three equal to ``ctx_size`` for a shared pool.
+
+        The model's saved placement shapes the walk exactly as it shapes the
+        real call's (D76): ``device_override`` echoes a saved override that
+        pinned the walk to its one placement, ``allowed_devices`` is the bound
+        every mode was built from (the call's, narrowed by the saved one, or
+        the saved one alone), and ``notes`` say which, on a fit and a refusal.
         """
         _validate_recommended_args(
             ctx_size=ctx_size,
@@ -2345,6 +2376,30 @@ class ModelManager:
             # minutes, and a refusal the caller could have had immediately is
             # worse the later it arrives.
             self._refuse_unpersistable(requested, record)
+        # The model's own saved placement, honoured the way /load honours it
+        # (D76). A saved device_override IS the placement -- the walk offers
+        # that set alone -- and a saved allowed_devices bounds every mode
+        # whether or not this call named a bound of its own. Until D76 both
+        # were replaced per mode, so this path alone could put a model on the
+        # card its owner had kept it off.
+        saved = record.settings
+        saved_override = (
+            tuple(int(d) for d in saved.device_override) if saved.device_override else None
+        )
+        saved_allowed = (
+            frozenset(int(d) for d in saved.allowed_devices)
+            if saved.allowed_devices is not None
+            else None
+        )
+        bound = narrowed if narrowed is not None else saved_allowed
+        if narrowed is not None and saved_allowed is not None:
+            bound_label = (
+                "this call's allowed_devices, narrowed by the model's saved allowed_devices"
+            )
+        elif saved_allowed is not None:
+            bound_label = "the model's saved allowed_devices"
+        else:
+            bound_label = "this call's allowed_devices"
         return _RecommendedPrep(
             record=record,
             ctx_size=int(ctx_size),
@@ -2353,7 +2408,35 @@ class ModelManager:
             tier=self._resolve_tier(record.id, priority),
             min_slots=int(min_slots) if min_slots is not None else None,
             kv_unified=kv_unified,
+            saved_override=saved_override,
+            bound=bound,
+            bound_label=bound_label,
         )
+
+    @staticmethod
+    def _saved_placement_notes(prep: _RecommendedPrep) -> list[str]:
+        """What the model's saved placement did to the walk, in words (D76).
+
+        Without a line the caller sees a placement that is not the headline
+        mode -- or a refusal on fewer cards than the box has -- with no reason
+        attached, and the reason is a setting it may never have read.
+        """
+        record = prep.record
+        if prep.saved_override is not None:
+            return [
+                f"'{record.id}' saves settings.device_override = CUDA "
+                f"{list(prep.saved_override)}, so load-recommended walked that placement "
+                f"alone, as /load and an on-demand load would: the hardware modes were not "
+                f"considered. Clear the override to let the walk choose among them."
+            ]
+        saved_allowed = record.settings.allowed_devices
+        if saved_allowed is not None and prep.bound is not None:
+            return [
+                f"'{record.id}' saves settings.allowed_devices = CUDA "
+                f"{sorted(int(d) for d in saved_allowed)}, so every hardware mode was built "
+                f"from CUDA {sorted(prep.bound)} only."
+            ]
+        return []
 
     def _decide_recommended(
         self,
@@ -2387,6 +2470,9 @@ class ModelManager:
             narrowed=prep.narrowed,
             min_slots=min_slots,
             kv_unified=prep.kv_unified,
+            saved_override=prep.saved_override,
+            bound=prep.bound,
+            placement_notes=self._saved_placement_notes(prep),
         )
         if record.meta is None:
             raise ModelLoadError(
@@ -2409,10 +2495,21 @@ class ModelManager:
             )
 
         try:
-            modes = self._modes_for_recommendation(prefer_modes, allowed=prep.narrowed)
+            modes = self._modes_for_recommendation(
+                prefer_modes,
+                allowed=prep.bound,
+                saved_override=prep.saved_override,
+                allowed_label=prep.bound_label,
+                model_id=record.id,
+            )
         except InsufficientVramError as exc:
             decision.refusal = exc
             return decision
+        # The cards a resident may stand on for the shortcut below: the saved
+        # override's when there is one (it IS the placement), else the bound.
+        permitted: frozenset[int] | None = (
+            frozenset(prep.saved_override) if prep.saved_override is not None else prep.bound
+        )
         observations = self.parallel_observations(record.id)
 
         # A model that is already resident is about to be RELOADED at the new
@@ -2465,8 +2562,11 @@ class ModelManager:
                 # request asked it to keep off -- the one outcome the
                 # parameter exists to prevent, reached by the fastest path
                 # through the function. A resident outside the set falls
-                # through to the mode walk, which relocates it.
-                and (prep.narrowed is None or set(plan_now.devices) <= prep.narrowed)
+                # through to the mode walk, which relocates it. Since D76 the
+                # set includes the model's saved placement: a resident that
+                # predates a saved override (or allowed_devices) and stands on
+                # a card it excludes is moved, not handed back.
+                and (permitted is None or set(plan_now.devices) <= permitted)
             ):
                 # Already exactly that. Reloading would cost a cold start and
                 # a window of "loading" for every client, to arrive where we are.
@@ -2537,7 +2637,10 @@ class ModelManager:
             decision.winner = winner
             before = attempts[: attempts.index(winner)]
             decision.lease_skipped = [a for a in before if a.get("leased_devices")]
-            decision.notes = self._lease_skip_notes(planner, winner, decision.lease_skipped)
+            decision.notes = [
+                *decision.placement_notes,
+                *self._lease_skip_notes(planner, winner, decision.lease_skipped),
+            ]
             return decision
 
         decision.attempts = attempts
@@ -2577,6 +2680,8 @@ class ModelManager:
             planner=planner,
             min_slots=min_slots,
             kv_unified=unified,
+            placement_notes=decision.placement_notes,
+            saved_override=prep.saved_override,
         )
         return decision
 
@@ -2638,8 +2743,13 @@ class ModelManager:
             "requested_ctx": decision.ctx_size,
             "n_ctx_train": decision.trained or None,
             "priority": decision.tier,
-            "allowed_devices": (
-                sorted(decision.narrowed) if decision.narrowed is not None else None
+            # The bound every mode was built from: this call's allowed_devices
+            # narrowed by the model's saved one, or the saved one alone (D76).
+            "allowed_devices": (sorted(decision.bound) if decision.bound is not None else None),
+            # The model's saved device_override, when it pinned the walk to
+            # that one placement (D76); None otherwise.
+            "device_override": (
+                list(decision.saved_override) if decision.saved_override is not None else None
             ),
             # The slot floor this call named, echoed (D72); None = one.
             "min_slots": decision.min_slots,
@@ -2664,7 +2774,7 @@ class ModelManager:
                 "kv_unified": bool(decision.kv_unified),
                 "max_parallel_that_fits": details.get("max_parallel_that_fits"),
                 "evict_model_ids": [],
-                "notes": [],
+                "notes": list(decision.placement_notes),
             }
         resident = decision.resident
         if decision.already_loaded and resident is not None and resident.plan is not None:
@@ -2730,28 +2840,50 @@ class ModelManager:
         }
 
     def _modes_for_recommendation(
-        self, prefer_modes: Sequence[str] | None, *, allowed: frozenset[int] | None = None
+        self,
+        prefer_modes: Sequence[str] | None,
+        *,
+        allowed: frozenset[int] | None = None,
+        saved_override: Sequence[int] | None = None,
+        allowed_label: str = "this call's allowed_devices",
+        model_id: str | None = None,
     ) -> list[Any]:
         """The hardware modes to walk, in the order to walk them.
 
-        ``allowed`` is a one-shot ``allowed_devices`` already narrowed by
-        :meth:`_effective_allowed_devices` (D59). It joins
+        ``allowed`` is the bound on the cards (D59, D76): a one-shot
+        ``allowed_devices`` already narrowed by
+        :meth:`_effective_allowed_devices`, or the model's saved
+        ``allowed_devices`` when the call named none. It joins
         ``planner.excluded_devices`` as a card the mode builder never sees,
         rather than a filter over the modes it produced, so the walk is offered
         real modes over the permitted cards -- ``[1, 2, 3]`` on this rig yields
-        the 3090 pair and the three-card set, not "the 5090 pair, minus one".
-        The reason it has to happen here is WP22's: every mode is planned
-        through a ``device_override`` copy of the record, and an override is
-        precisely the thing that outranks an allow-list, so a card left in the
-        mode list is a card this load can still land on.
+        the 3090 pair and the three-card set, not "the 5090 pair, minus one";
+        no mode can come out empty or twice. The reason it has to happen here
+        is WP22's: every mode is planned through a ``device_override`` copy of
+        the record, and an override is precisely the thing that outranks an
+        allow-list, so a card left in the mode list is a card this load can
+        still land on. ``allowed_label`` names where the bound came from.
+
+        ``saved_override`` is the model's saved ``device_override`` (D76), and
+        it replaces the list: the one mode offered is that exact device set,
+        in its saved order (:func:`placements.saved_override_mode`). It is the
+        model's own explicit placement, so it outranks ``excluded_devices`` as
+        it does on ``/load`` (D19, with the planner's note saying so) and an
+        allow-list as it does in the planner (D59; a request bound that
+        excludes one of its cards was already a 400). Leases still refuse it
+        inside the walk (D43/D64). A ``prefer_mode`` naming anything else is a
+        400 naming the override.
         """
         from studioforge.core import placements as placements_mod
 
         gpus = list(self.planner.probe.list_gpus())
-        excluded = set(self.config.planner.excluded_devices)
-        if allowed is not None:
-            excluded |= {g.index for g in gpus} - allowed
-        modes = placements_mod.hardware_modes(gpus, excluded=excluded)
+        if saved_override is not None:
+            modes = [placements_mod.saved_override_mode(gpus, saved_override)]
+        else:
+            excluded = set(self.config.planner.excluded_devices)
+            if allowed is not None:
+                excluded |= {g.index for g in gpus} - allowed
+            modes = placements_mod.hardware_modes(gpus, excluded=excluded)
         if not modes:
             suggestions = [
                 "check the driver and `nvidia-smi`",
@@ -2761,12 +2893,12 @@ class ModelManager:
             if allowed is not None:
                 suggestions.insert(
                     0,
-                    f"this call's allowed_devices ({sorted(allowed)}) leaves no card "
+                    f"{allowed_label} ({sorted(allowed)}) leaves no card "
                     f"this server may place on -- widen it, or clear the exclusion "
                     f"standing on the cards it names",
                 )
                 message = (
-                    f"no usable GPU is left once this call's allowed_devices "
+                    f"no usable GPU is left once {allowed_label} "
                     f"({sorted(allowed)}) and planner.excluded_devices are both applied, "
                     f"and this server is GPU-only"
                 )
@@ -2776,8 +2908,22 @@ class ModelManager:
         by_key = {m.key: m for m in modes}
         unknown = [key for key in prefer_modes if key not in by_key]
         if unknown:
+            if saved_override is not None:
+                whose = f"'{model_id}'" if model_id else "this model"
+                raise BadRequestError(
+                    f"unknown hardware mode(s) for this call: {', '.join(unknown)}. "
+                    f"{whose} saves settings.device_override = CUDA "
+                    f"{[int(d) for d in saved_override]}, so the only placement "
+                    f"load-recommended walks is '{modes[0].key}' ({modes[0].label}); omit "
+                    f"prefer_mode, or clear the override to choose among the hardware modes",
+                    param="prefer_modes",
+                    details={
+                        "device_override": [int(d) for d in saved_override],
+                        "modes": list(by_key),
+                    },
+                )
             narrowed_note = (
-                f" (narrowed to CUDA {sorted(allowed)} by this call's allowed_devices)"
+                f" (narrowed to CUDA {sorted(allowed)} by {allowed_label})"
                 if allowed is not None
                 else ""
             )
@@ -2832,6 +2978,10 @@ class ModelManager:
 
         floor = max(1, int(min_slots)) if min_slots else 1
         pinned = placements_mod.forced_onto(record, mode.devices)
+        # The override on ``pinned`` is this walk's candidate (D64) -- unless
+        # the mode IS the model's saved device_override (D76), whose lease
+        # refusal rightly tells the owner it is their override in the way.
+        chosen_by_server = not bool(getattr(mode, "saved_override", False))
         attempt: dict[str, Any] = {
             "mode": mode.key,
             "label": mode.label,
@@ -2848,8 +2998,7 @@ class ModelManager:
             adapters=[a for a, _ in self._adapters_for(record)],
             allow_evict=allow_evict,
             priority=priority,
-            # The override is this walk's candidate, not the caller's (D64).
-            override_chosen_by_server=True,
+            override_chosen_by_server=chosen_by_server,
             kv_unified=kv_unified,
         )
         if not isinstance(result, LoadPlan):
@@ -2880,7 +3029,7 @@ class ModelManager:
                         adapters=[a for a, _ in self._adapters_for(record)],
                         allow_evict=allow_evict,
                         priority=priority,
-                        override_chosen_by_server=True,
+                        override_chosen_by_server=chosen_by_server,
                         kv_unified=kv_unified,
                     )
                     if isinstance(trial, LoadPlan) and (
@@ -2934,7 +3083,7 @@ class ModelManager:
                 # judged in the same world (preemption credit included), or a
                 # tier load's re-check silently walks down to one slot (D46).
                 priority=priority,
-                override_chosen_by_server=True,
+                override_chosen_by_server=chosen_by_server,
                 kv_unified=kv_unified,
             )
             if isinstance(candidate, LoadPlan):
@@ -2968,6 +3117,8 @@ class ModelManager:
         planner: Planner | None = None,
         min_slots: int | None = None,
         kv_unified: bool = False,
+        placement_notes: Sequence[str] = (),
+        saved_override: Sequence[int] | None = None,
     ) -> InsufficientVramError:
         """The structured "no", with the largest context each mode *would* take.
 
@@ -2989,6 +3140,12 @@ class ModelManager:
         one the FLOOR fits in, in the pool shape asked for, and a floor that is
         the obstacle gets its own line: the most slots any mode holds at the
         requested window (``max_parallel_that_fits``).
+
+        A walk the model's saved placement shaped (D76) says so: the
+        ``placement_notes`` close the suggestions, the details carry
+        ``device_override`` / ``settings_allowed_devices``, and a walk pinned
+        to a saved override is described as that placement rather than as
+        "any placement of this box".
         """
         busy: list[dict[str, Any]] = []
         for attempt in attempts:
@@ -3076,6 +3233,7 @@ class ModelManager:
                 )
             lease_lines.extend(asker.lease_lines(leased_devs))
             suggestions[:0] = lease_lines
+        suggestions.extend(note for note in placement_notes if note not in suggestions)
 
         estimated = next((a.get("rejected") for a in others if a.get("rejected") is not None), None)
         rejected = estimated or next(
@@ -3108,6 +3266,14 @@ class ModelManager:
             details["min_slots"] = int(min_slots) if min_slots else None
             details["kv_unified"] = bool(kv_unified)
             details["max_parallel_that_fits"] = best_slots or None
+        # The model's saved placement, when it shaped the walk (D76); absent
+        # otherwise, for the same reason.
+        if saved_override is not None:
+            details["device_override"] = [int(d) for d in saved_override]
+        if record.settings.allowed_devices is not None:
+            details["settings_allowed_devices"] = sorted(
+                int(d) for d in record.settings.allowed_devices
+            )
         code: str | None = None
         if rejected is not None:
             details.update(
@@ -3157,9 +3323,14 @@ class ModelManager:
             shape = f"at exactly {ctx_size} tokens per slot with at least {floor} slots"
         else:
             shape = f"at exactly {ctx_size} tokens per slot"
+        where = (
+            f"on CUDA {[int(d) for d in saved_override]}, the placement its saved "
+            f"device_override names"
+            if saved_override is not None
+            else "on any placement of this box"
+        )
         return InsufficientVramError(
-            f"Cannot load '{record.id}' {shape} on any placement of this box. "
-            + " ".join(suggestions),
+            f"Cannot load '{record.id}' {shape} {where}. " + " ".join(suggestions),
             code=code,
             details=details,
         )

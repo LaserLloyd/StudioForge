@@ -551,6 +551,19 @@ getting 131072 and finding out mid-conversation. So:
 `kv_min` ("give me 262144, but not at the cost of the cache") refuses a placement that only reaches
 the window by quantizing, and walks on to one that can afford it.
 
+**The model's saved placement is honoured as `/load` honours it (D76).** A saved
+`settings.device_override` is the only placement walked -- that exact device set, in its saved
+order, keyed as the matching hardware mode or `device_override` -- and a `prefer_mode` naming any
+other is a `400`. A saved `settings.allowed_devices` bounds every mode (intersected with the call's
+`allowed_devices`), so `all_gpus` over `[0, 1, 2]` is three cards. A call bound that excludes a card
+the saved override names is the same `400` as on `/load`. The plan's `notes` say which applied; a
+refusal carries `device_override` / `settings_allowed_devices`. A resident standing off the saved
+placement is relocated rather than handed back as "already loaded".
+
+A refusal's `max_ctx_that_fits` is the largest ladder window **below** the one asked for that the
+planner accepts right now, judged on the estimate a load there is really charged -- the D51
+correction where that exact window was measured, the formula elsewhere (D76).
+
 **GPU leases are part of the walk (D64).** A mode that needs a card leased to someone else (D43) is
 refused inside the walk and the next mode that fits is loaded; nothing ever lands on a leased card.
 When the walk passed a better mode over for a lease, the plan's `notes` say which mode, which card,

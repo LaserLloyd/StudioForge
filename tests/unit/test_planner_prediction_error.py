@@ -3,9 +3,11 @@ and the last observation per model is readable without a database (2026-09-09
 review: "prediction error >5% is a bug", so it must be visible as one).
 
 The error is the FORMULA's (D63): a plan D51 sized from the last measurement
-plus ``OBS_SAFETY`` lands about 9% under its own total on every repeat load by
-construction, and that band is reported as the plan's *margin*, never as the
-planner's error and never as a warning.
+plus its ``OBS_SAFETY`` margin lands under its own total on every repeat load by
+construction -- about 9% when the whole measurement carries the margin (a
+measurement below the weights), less since D76 exempts the weights: the margin
+is then 10% of the bytes above them -- and that band is reported as the plan's
+*margin*, never as the planner's error and never as a warning.
 
 The bar has two sides (D69 §6): 5% for an under-estimate (the child holds
 MORE than the formula said, the OOM direction) and 10% for an over-estimate,
@@ -131,18 +133,34 @@ def test_a_large_over_estimate_is_still_a_warning(recorder: RecordingLog) -> Non
 
 
 def test_the_over_estimate_bar_covers_the_uncorrectable_band() -> None:
-    """D69 §6. ``observed_correction`` makes no correction when ``ratio *
-    OBS_SAFETY`` lands within ``OBS_NOOP_TOLERANCE`` of 1, so every repeat of
-    such a load stays uncorrected. The over-estimate bar must sit past the far
-    edge of that band, or those loads warn forever with nothing to fix them."""
+    """D69 §6. ``observed_correction`` makes no correction when the corrected
+    total lands within ``OBS_NOOP_TOLERANCE`` of the formula, so every repeat
+    of such a load stays uncorrected. The over-estimate bar must sit past the
+    far edge of that band, or those loads warn forever with nothing to fix them.
+
+    Since D76 the band depends on the weights' share of the formula: with
+    ``w`` held exact, no correction is made at an over-estimate of about
+    ``(1 - w/F) * (1 - 1/OBS_SAFETY)`` -- nearer zero than the whole-total
+    rule's 9.1%, never past its far edge. Walked at every share from none (the
+    whole-total rule) to 95%."""
     far_edge_pct = (1 - (1 - OBS_NOOP_TOLERANCE) / OBS_SAFETY) * 100
     assert far_edge_pct <= PREDICTION_OVER_ESTIMATE_WARN_PCT
     # The same fact, walked: every uncorrectable ratio is inside the bar.
     formula = 20 * GB
-    for per_mille in range(880, 1001):
-        ratio = per_mille / 1000
-        if observed_correction(formula_bytes=formula, observed_bytes=int(formula * ratio)) is None:
-            assert (1 - ratio) * 100 <= PREDICTION_OVER_ESTIMATE_WARN_PCT, ratio
+    for share in (0.0, 0.25, 0.5, 0.8, 0.95):
+        weights = int(formula * share)
+        uncorrectable = 0
+        for per_mille in range(880, 1001):
+            ratio = per_mille / 1000
+            correction = observed_correction(
+                formula_bytes=formula,
+                observed_bytes=int(formula * ratio),
+                weights_bytes=weights,
+            )
+            if correction is None:
+                uncorrectable += 1
+                assert (1 - ratio) * 100 <= PREDICTION_OVER_ESTIMATE_WARN_PCT, (share, ratio)
+        assert uncorrectable, f"the walk never met the no-op band at weight share {share}"
     # ...and the under-estimate side, the OOM direction, keeps the tight bar.
     assert PREDICTION_ERROR_WARN_PCT < PREDICTION_OVER_ESTIMATE_WARN_PCT
 
@@ -195,14 +213,23 @@ def corrected_planner(
         log_plans=False,
     )
     plan = plan_at(planner)
-    assert plan.estimate.total_bytes == pytest.approx(measured * OBS_SAFETY, rel=1e-3)
+    weights = baseline.estimate.weights_bytes
+    # D76: the margin is spent above the weights when the measurement covers
+    # them, and on the whole measurement (D51's rule) when it does not.
+    expected = (
+        weights + (measured - weights) * OBS_SAFETY
+        if measured >= weights
+        else measured * OBS_SAFETY
+    )
+    assert plan.estimate.total_bytes == pytest.approx(expected, rel=1e-3)
     return planner, plan, baseline.estimate
 
 
 def test_a_corrected_plan_landing_in_its_band_is_not_a_warning(recorder: RecordingLog) -> None:
-    """D51 plans a repeat load at the last measurement times OBS_SAFETY, so the
-    child lands ~9% under the plan by construction. Twelve of twelve repeat
-    loads on the reference rig were warned at exactly -9.1% for it."""
+    """D51 plans a repeat load of a measurement below the weights at that
+    measurement times OBS_SAFETY, so the child lands ~9% under the plan by
+    construction. Twelve of twelve repeat loads on the reference rig were
+    warned at exactly -9.1% for it (all before D76 narrowed the margin)."""
     planner, plan, formula = corrected_planner()
     actual = round(plan.estimate.total_bytes / OBS_SAFETY)  # exactly what D51 planned from
     planner.observe(model_id=plan.model_id, plan=plan, actual_bytes=actual)
@@ -226,6 +253,25 @@ def test_a_corrected_plan_landing_in_its_band_is_not_a_warning(recorder: Recordi
     assert info["error_pct"] == pytest.approx(formula_error, abs=0.1)
     assert info["predicted_mb"] == round(formula.total_bytes / MB)
     assert info["planned_mb"] == round(plan.estimate.total_bytes / MB)
+
+
+def test_a_weights_exact_repeat_lands_inside_its_narrower_band(recorder: RecordingLog) -> None:
+    """D76: measured above its weights, a repeat is planned at the weights plus
+    10% of the rest, so the child lands under the plan by that 10% of the rest
+    alone -- about -2% for this weights-heavy model, not -9.1% -- and that is
+    the band, reported as the margin and never warned about."""
+    planner, plan, formula = corrected_planner(ratio=1.032)
+    measured = int(formula.total_bytes * 1.032)
+    assert plan.estimate.weights_bytes == formula.weights_bytes
+    planner.observe(model_id=plan.model_id, plan=plan, actual_bytes=measured)
+
+    assert recorder.warnings == []
+    last = planner.last_observation(plan.model_id)
+    assert last is not None and last["corrected"] is True
+    band = -(OBS_SAFETY - 1) * (measured - formula.weights_bytes) / plan.estimate.total_bytes * 100
+    assert last["margin_pct"] == pytest.approx(band, abs=0.05)
+    assert -(1 - 1 / OBS_SAFETY) * 100 < last["margin_pct"] < 0
+    assert last["predicted_bytes"] == formula.total_bytes
 
 
 def test_a_child_over_the_corrected_total_by_the_bar_is_a_warning(recorder: RecordingLog) -> None:

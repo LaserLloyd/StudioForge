@@ -1337,6 +1337,11 @@ def build_management_mcp(state: Any) -> MCPServer:
             prefer_mode: A hardware-mode key from a ``placements[]`` row
                 (``dual_5090``, ``dual_3090``, ``all_gpus``, ``single_5090`` on
                 this rig) to try that placement instead of the default order.
+                A model whose saved settings pin its cards
+                (``device_override``) is loaded on exactly those and nowhere
+                else, as every other load of it is; naming another mode for it
+                is an error that says so. Its saved ``allowed_devices`` bounds
+                every mode the same way.
             kv_min: The lowest KV cache quality this load may accept -- "f16",
                 "q8_0" or "q4_0", those three only. It is a floor on the
                 quality-first ladder, not a choice: pass "f16" to mean "do not

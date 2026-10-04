@@ -7231,3 +7231,128 @@ client's explicit statement.
 **Tests.** `tests/unit/test_auto_unload_idle.py`: off leaves every tier's price, on gives every
 tier the one timer and outranks `default_ttl_s`, per-model `ttl_s` and pins override it, a
 request's `ttl` overrides it both ways with no cap, a re-tier keeps it, 0 is refused.
+
+## D76 -- load-recommended honours the saved placement; D51's margin skips the weights; a refusal walks down to a window that fits
+
+**Status.** Written on 2026-10-04 from a code review of why the 177B chat model
+(`mradermacher/Qwen3.8-Flash-Next-Uncensored-i1-GGUF` i1-Q4_K_S, ~71.3 GiB of GPU weights after
+D73) could not be kept on CUDA 0, 1 and 2 -- leaving CUDA 3 for ComfyUI -- on the path ClawChat
+loads it through, and why a load that had just run on those three cards could never be planned
+again. ClawChat asks `POST /api/models/{id}/load-recommended` with `ctx_size` (per slot,
+exactly), `min_slots` 2, `max_slots` 2, `kv_unified` true.
+
+**Context.** Three faults, one incident.
+
+1. *load-recommended replaced the saved placement.* Every hardware mode is planned as a
+   `device_override` copy of the record (`placements.forced_onto`), so a saved override was
+   replaced per mode, and the mode list (`dual_5090`, `dual_3090`, `all_gpus`, `single_5090`)
+   has no three-card set. A saved `settings.allowed_devices` was never consulted by the walk:
+   only a request's `allowed_devices` and `planner.excluded_devices` narrowed the cards. `/load`
+   and every on-demand load honour both (D36/D59); the one path ClawChat uses could put the
+   model on CUDA 3.
+2. *D51 put its margin on the weights.* `observed_correction` charged a repeat
+   `observed * OBS_SAFETY`, on top of the 10% per-card headroom (`usable_bytes`). The weights are
+   the file's own tensor bytes (less D73's host table) and cannot grow between loads, yet they
+   carried 7.1 GiB of the 177B's 7.9 GiB "margin". Any load measured above `1 / OBS_SAFETY`
+   (~91%) of usable capacity could never be planned again.
+3. *A refusal after a correction named no window.* `_reject` derived `max_ctx_that_fits` as
+   `budget = available - (total - kv)` at the refused window, from the corrected estimate; with
+   10% on the weights the fixed cost alone exceeded the cards, so the answer was `None`.
+   ClawChat's one re-ask at "the largest window that fits" could not fire and the turn fell
+   through to a JIT load of the saved profile.
+
+Numbers on the reference rig (3 cards, parallel 2, `kv_unified`, f16 KV): planner formula
+~76.1 GiB at 98k and ~77.0 GiB at 131k; measured ~ formula x 1.032; usable capacity at the 10%
+headroom 77.65 GiB, raw free 86.42 GiB. At 122k the child measured 79.2 GiB; D51 planned the
+repeat at 79.2 x 1.10 = 87.1 GiB (its weights term alone 78.4 GiB), refused with no window named.
+
+**Decision.**
+
+1. **The saved placement is the walk's.** `_recommended_prep` reads the model's saved
+   `device_override` and `allowed_devices`; `load_recommended`, `plan_recommended` and the MCP
+   `load_recommended` share it (one `_decide_recommended`, D64).
+   * A saved `device_override` makes that exact device set, in its saved order, the only mode
+     offered (`placements.saved_override_mode`): its key is the matching hardware mode's
+     (`[2, 3]` stays `dual_3090`), else `device_override`. It outranks `excluded_devices` and an
+     allow-list exactly as on `/load` (D19/D59); leases still refuse it inside the walk, and
+     because the override is the owner's own the lease advice is "clear it"
+     (`override_chosen_by_server=False`). A `prefer_mode` naming any other mode is a 400 naming
+     the override.
+   * A saved `allowed_devices` bounds every mode, intersected with a request's bound. It is
+     applied where D59 applies a request's -- the mode builder never sees the other cards -- so
+     the modes are real modes over the permitted cards: no mode comes out empty, none twice, and
+     `all_gpus` over `[0, 1, 2]` is the three-card set.
+   * A request `allowed_devices` that excludes a card the saved override names stays the
+     `/load` 400 (`_effective_allowed_devices`); a request bound disjoint from the saved one is
+     the D59 400. Leases and `excluded_devices` behave as before.
+   * The "already loaded" shortcut accepts a resident only on the saved override's cards (else
+     within the bound); a resident standing off them is relocated, not handed back.
+   * The response says so: a line in the plan's `notes` (and the dry run's), and on a refusal
+     the same line in `suggestions`, `details.device_override` / `details.settings_allowed_devices`,
+     and a message naming "the placement its saved device_override names". The dry run echoes
+     `device_override`, and `allowed_devices` is now the bound actually walked.
+2. **D51's margin is spent above the weights.**
+   `corrected = clamp(weights + (observed - weights) * OBS_SAFETY, formula * 0.60, formula * 1.30)`,
+   with `weights` the CURRENT formula's `estimate.weights_bytes` -- never the row's: rows written
+   before D73 carry the host-resident table (32.8 GiB on the 177B) in `weights_bytes`. When the
+   measurement is below the weights (the Gemma-4-E4B shape: the formula's weights are the term
+   it disproves) the rule is the old whole-total one. `corrected_estimate` keeps the weights term
+   exact and spreads the correction over the other terms in proportion; `scaled_estimate`'s
+   uniform spreading is kept for the whole-total case. `ObservedCorrection.weights_bytes` says
+   which rule ran, and the note says "the 10% margin covers the X MB above the W MB of weights,
+   which are exact". The 177B at 122k: 71.3 + (79.2 - 71.3) x 1.1 = 80.0 GiB, not 87.1.
+3. **A refusal walks the ladder down.** `Planner._largest_ctx_that_fits` replaces the
+   subtraction: it walks `_CTX_LADDER` from the rung below the refused window and returns the
+   first rung whose `_safe_estimate` -- corrected where a measurement of that exact configuration
+   exists, the formula elsewhere -- fits the placement's usable bytes. Only rungs below the
+   refused window: a measurement pins one window, and the formula may fit a LARGER rung, which a
+   refusal must not hand back (ClawChat re-asks only below its own window). A rung whose formula
+   is beyond what the band's floor could bring inside is skipped without a lookup, and the walk
+   stops at the first fit, so the observation table is asked about one or two windows.
+4. `LATEST_DECISION` 76; capabilities `load_recommended_saved_placement` and
+   `max_ctx_that_fits_walk`.
+
+**Consequences.**
+
+* On the reference rig, a model whose owner pins it with a saved `device_override` stays on those
+  cards whichever client loads it; ComfyUI's card is no longer reachable through load-recommended.
+* D76 makes a repeat plannable whenever `measured <= weights + (usable - weights) / 1.1`: on the
+  three cards, measured <= 77.07 GiB (formula <= ~74.7 GiB, about a 46k pool for this model). The
+  whole-total rule admitted no repeat at all (77.65 / 1.1 = 70.6 GiB, below the weights alone).
+  The 98k-131k windows the owner uses still measure above that (79.2-80.3 GiB charged against
+  77.65 usable), so after one load of such a window a repeat of it is refused and the refusal
+  names the largest smaller rung that plans -- typically one never measured, whose formula fits.
+  That is the 10% headroom binding, not D51: the child fits the 86.42 GiB raw free with ~7 GiB to
+  spare. Keeping 98k+ repeatable on three cards needs a smaller `planner.headroom_fraction` (about
+  0.08 for 98k, 0.07 for 122k on this rig), which is the owner's call and is not changed here.
+* The load-recommended walk still plans on a planner without the observation lookup (D64's
+  documented "the placement agrees, the last megabyte may not"): the walk can choose a placement
+  the real load then refuses on its D51 correction. With a saved override there is one mode, so
+  the refusal (now carrying a `max_ctx_that_fits`) is the answer; with several modes the walk does
+  not move on to the next mode. Not changed here.
+* A corrected plan's margin (D63) is now `(OBS_SAFETY - 1) x (measured - weights)` -- about -2% on
+  a weights-heavy repeat -- instead of a flat -9.1%; the whole-total case keeps -9.1%. The D69
+  over-estimate bar still covers the uncorrectable band at every weight share.
+* `max_ctx_that_fits` is never at or above the requested window any more; a refusal not about
+  context (slots, a split's per-card share) can name a smaller rung that fits by total.
+* `/profiles`, the catalog's per-mode rows and the parallel benchmark still use the plain hardware
+  modes; only the load-recommended walk honours the saved placement.
+
+**Tests.** `tests/unit/test_load_recommended_saved_placement.py`: the control (no saved placement,
+headline pair), the saved override as the only placement in the real call and the dry run, its
+saved order, a matching hardware mode's name, the `prefer_mode` 400, the `/load` 400 for a request
+bound excluding an override card, a covering bound taking the override, the refusal naming it, a
+resident off it relocated (and one on it handed back), a lease on an override card, an override
+naming an excluded card agreeing with `/load`; a saved `allowed_devices` narrowing every mode
+(`all_gpus` = three cards), intersected with a request bound, disjoint = 400, a one-card bound
+leaving one mode, `excluded_devices` still narrowing it, a resident outside it relocated.
+`tests/unit/test_mcp.py`: the MCP tool's two 400s. `tests/unit/test_planner_d76.py`: the
+incident's arithmetic (80.0 vs 87.1 GiB), the whole-total fallback below the weights, the clamp,
+the no-op tolerance, `corrected_estimate` keeping the weights; on a 64 GiB model pinned to three
+cards: a repeat measured at 97.8% of usable plans again with exact weights and a viable split, a
+pre-D73 row's weights figure never read (real database), a refusal naming a window that then
+plans, a measured lower rung skipped, never a window at or above the refused one, the table
+asked only about the refused window and the first fitting rung, `None` when nothing fits.
+`test_planner_observed.py` / `test_planner_prediction_error.py`: the `measured x OBS_SAFETY`
+pins now state they are the below-the-weights rule, beside weights-exact versions (plan, note,
+margin band), and the uncorrectable-band walk runs at weight shares 0-95%.

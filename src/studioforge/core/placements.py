@@ -53,10 +53,16 @@ class HardwareMode:
     #: ``all_gpus``. Derived from the card's performance class rather than from
     #: CUDA indices, which move when a card is added or the driver reorders
     #: them -- the same reasoning D22 applied to calibration's ``gpu_class``.
+    #: ``device_override`` for a model's saved placement that is none of those
+    #: (D76, :func:`saved_override_mode`).
     key: str
     #: ``"2x RTX 5090"`` / ``"all 4 GPUs (2x RTX 5090 + 2x RTX 3090)"``.
     label: str
     devices: tuple[int, ...]
+    #: The model's own saved ``device_override`` rather than a set this server
+    #: chose (D76). A lease refusal then gives the advice for an override the
+    #: owner wrote -- clear it -- instead of the walk's (D64).
+    saved_override: bool = False
 
 
 def _class_of(gpu: GpuInfo) -> throughput.GpuPerf:
@@ -156,6 +162,41 @@ def hardware_modes(gpus: Sequence[GpuInfo], *, excluded: Iterable[int] = ()) -> 
         seen.add(mode.devices)
         modes.append(mode)
     return modes
+
+
+def saved_override_mode(gpus: Sequence[GpuInfo], devices: Sequence[int]) -> HardwareMode:
+    """The one placement a model's saved ``device_override`` allows (D76).
+
+    ``load_recommended`` used to replace a saved override with each hardware
+    mode in turn (every mode is planned as a :func:`forced_onto` copy), so a
+    model its owner had pinned to three cards to keep the fourth for ComfyUI
+    was walked onto ``all_gpus`` -- the fourth card included -- by the one
+    load path ClawChat uses. ``/load`` and every JIT load honour the override
+    exactly (D36/D59); the walk now does too, by offering this mode alone.
+
+    The devices keep the saved ORDER, as ``/load`` does: llama.cpp puts the
+    output layer on the last device of the list and splits in list order. The
+    key and label are a hardware mode's when the set is one (``[0, 1]`` stays
+    ``dual_5090``, so a ``prefer_mode`` naming it still matches), else
+    ``device_override`` with the cards and their mix spelled out.
+    """
+    pinned = tuple(int(d) for d in devices)
+    for mode in hardware_modes(gpus):
+        if sorted(mode.devices) == sorted(pinned):
+            return HardwareMode(
+                key=mode.key,
+                label=f"{mode.label} (the model's saved device_override)",
+                devices=pinned,
+                saved_override=True,
+            )
+    present = sorted((g for g in gpus if g.index in set(pinned)), key=lambda g: g.index)
+    mix = f" ({_mix(present)})" if present else ""
+    return HardwareMode(
+        key="device_override",
+        label=f"CUDA {list(pinned)}{mix}, the model's saved device_override",
+        devices=pinned,
+        saved_override=True,
+    )
 
 
 class _ModeProbe:

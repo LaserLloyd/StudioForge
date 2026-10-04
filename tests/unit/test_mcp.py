@@ -1954,3 +1954,26 @@ async def test_connection_info_reports_whether_a_pin_is_needed(state: State) -> 
     # The PIN itself is not echoed here: this tool answers "where", and the
     # caller already had to authenticate to ask.
     assert "12345678" not in str(result)
+
+
+async def test_load_recommended_honours_the_models_saved_device_override(state: State) -> None:
+    """D76 on the MCP plane: the tool walks the same decision as the route, so a
+    saved ``device_override`` is the only placement it offers. Both
+    contradictions -- a ``prefer_mode`` naming another placement, a bound that
+    excludes an override card -- are 400s before anything is planned."""
+    record = state.registry.resolve(TINY)
+    state.registry.save_settings(TINY, record.settings.model_copy(update={"device_override": [1]}))
+    server = build_management_mcp(state)
+
+    other_mode = await call(
+        server, "load_recommended", model_id=TINY, ctx_size=4096, prefer_mode="single_5090"
+    )
+    assert other_mode["ok"] is False
+    assert "device_override" in other_mode["error"]["message"]
+
+    excluded = await call(
+        server, "load_recommended", model_id=TINY, ctx_size=4096, allowed_devices=[0]
+    )
+    assert excluded["ok"] is False
+    assert "device_override" in excluded["error"]["message"]
+    assert state.supervisor.get(TINY) is None

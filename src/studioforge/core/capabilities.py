@@ -74,7 +74,7 @@ FEATURE_NOTES: dict[str, str] = {
 #: on instead. **Bump it in the same commit that appends a decision**:
 #: ``tests/unit/test_capabilities_implemented.py`` reads the headings of
 #: ``DECISIONS.md`` and fails until the two agree.
-LATEST_DECISION = 75
+LATEST_DECISION = 76
 
 #: Every decision number this build includes, ``"D1"`` .. ``"D<LATEST_DECISION>"``.
 IMPLEMENTED_DECISIONS: tuple[str, ...] = tuple(f"D{n}" for n in range(1, LATEST_DECISION + 1))
@@ -114,6 +114,12 @@ SERVER_FEATURES: dict[str, str] = {
     "host_resident_tensors": "D73",
     "mtp_draft_file": "D74",
     "auto_unload_idle": "D75",
+    # load-recommended / plan-recommended / MCP load_recommended walk the
+    # model's saved device_override (alone) and saved allowed_devices; a
+    # refusal's max_ctx_that_fits is a ladder window below the one asked for
+    # that the planner accepts, corrections included.
+    "load_recommended_saved_placement": "D76",
+    "max_ctx_that_fits_walk": "D76",
 }
 
 

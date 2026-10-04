@@ -176,7 +176,13 @@ def lookup_key(**overrides: Any) -> dict[str, Any]:
 
 
 def test_the_two_live_cases_from_the_log() -> None:
-    """The numbers this feature was written from, both signs, neither clamped."""
+    """The numbers this feature was written from, both signs, neither clamped.
+
+    Asked without ``weights_bytes``, which is D51's original whole-total rule
+    (``observed * OBS_SAFETY``): still the rule for a measurement below the
+    formula's weights, and for a caller that does not know them (D76). The
+    weights-exact rule the planner now asks with is pinned in
+    ``test_planner_d76.py``."""
     # Dark-Scarlett-27B: measured ABOVE its estimate, so the correction is the
     # conservative direction -- exactly the one that prevents an OOM.
     scarlett = observed_correction(formula_bytes=35742 * MB, observed_bytes=37258 * MB)
@@ -209,10 +215,21 @@ def test_a_wild_row_is_clamped_at_both_edges() -> None:
 
 
 def test_the_safety_margin_is_applied_before_the_clamp() -> None:
-    """A measurement is trusted as itself plus 10%, not as itself."""
+    """A measurement is trusted as itself plus 10% of what may move, not as itself.
+
+    With the weights unknown that is the whole measurement (D51's rule). With
+    them known it is only the bytes above them (D76): 6 GB of weights in a
+    9 GB measurement are the file's own tensor bytes, so the margin is 10% of
+    the other 3 GB -- 9.3 GB, not 9.9."""
     correction = observed_correction(formula_bytes=10 * GB, observed_bytes=9 * GB)
     assert correction is not None
     assert correction.factor == pytest.approx(0.9 * OBS_SAFETY)
+    assert correction.weights_bytes == 0
+
+    held = observed_correction(formula_bytes=10 * GB, observed_bytes=9 * GB, weights_bytes=6 * GB)
+    assert held is not None
+    assert held.weights_bytes == 6 * GB
+    assert held.factor == pytest.approx((6 + 3 * OBS_SAFETY) / 10)
 
 
 def test_nothing_to_correct_returns_none() -> None:
@@ -249,11 +266,15 @@ def test_scaling_moves_every_term_so_the_total_is_the_corrected_one() -> None:
 
 
 def test_the_correction_reaches_the_plan_and_its_note() -> None:
+    """The Gemma shape: a child holding less than the formula's own weights
+    (8 GB here) disproves that term, so the whole measurement carries the
+    margin -- D51's original rule, which D76 keeps for exactly this case."""
     baseline = plan_at(Planner(make_config(), rig_5090x2_3090x2()))
     formula = baseline.estimate.total_bytes
 
     # The live Gemma ratio, against whatever this synthetic model computes to.
     measured = int(formula * 0.613)
+    assert measured < baseline.estimate.weights_bytes, "below the weights: whole-total rule"
     lookup = StubLookup(actual_bytes=measured, key=key_of(baseline))
     planner = Planner(make_config(), rig_5090x2_3090x2(), observation_lookup=lookup)
     corrected = plan_at(planner)
@@ -265,11 +286,31 @@ def test_the_correction_reaches_the_plan_and_its_note() -> None:
     note = next(n for n in corrected.notes if "estimate corrected" in n)
     assert f"{round(measured / MB)} MB" in note
     assert f"{round(formula / MB)} MB" in note
+    assert "below the formula's" in note
+
+
+def test_a_measurement_above_the_weights_keeps_them_exact_on_the_plan() -> None:
+    """D76 on the same plan: measured above the 8 GB of weights, the plan keeps
+    the formula's weights and charges the margin on the rest only."""
+    baseline = plan_at(Planner(make_config(), rig_5090x2_3090x2()))
+    formula = baseline.estimate
+    measured = int(formula.total_bytes * 1.042)  # Dark-Scarlett's ratio
+    lookup = StubLookup(actual_bytes=measured, key=key_of(baseline))
+    corrected = plan_at(Planner(make_config(), rig_5090x2_3090x2(), observation_lookup=lookup))
+
+    assert corrected.estimate.weights_bytes == formula.weights_bytes
+    expected = formula.weights_bytes + (measured - formula.weights_bytes) * OBS_SAFETY
+    assert corrected.estimate.total_bytes == pytest.approx(expected, rel=1e-6)
+    assert corrected.estimate.total_bytes < measured * OBS_SAFETY
+    note = next(n for n in corrected.notes if "estimate corrected" in n)
+    assert "weights, which are exact" in note
 
 
 def test_a_split_placements_per_card_shares_scale_with_the_total() -> None:
     """Per-card fit checks have to be asked against the corrected number too,
-    or a plan is sized against a measurement and refused against a formula."""
+    or a plan is sized against a measurement and refused against a formula.
+    (A measurement below the weights, so the whole-total rule; the
+    weights-exact split is pinned in ``test_planner_d76.py``.)"""
     forced = make_record(settings=ModelSettings(device_override=[0, 1]))
     baseline = plan_at(Planner(make_config(), rig_5090x2_3090x2()), forced)
     assert baseline.devices == [0, 1]

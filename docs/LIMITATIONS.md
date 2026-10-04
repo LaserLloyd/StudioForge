@@ -29,9 +29,11 @@ is undone by a restart. It is *not* re-tuned per load: a planner whose arithmeti
 running server is harder to reason about than one that is wrong in a fixed way.
 
 What is measured is the **formula's** error (D63). A repeat load of a configuration is planned from
-its last measurement plus a 10% safety band (D51), so the child lands about 9% under that plan by
-construction; the observation reports that as the plan's *margin* and the formula-vs-actual miss as
-its *error*, and only an uncorrected plan can earn the ">5% prediction error" warning (a corrected
+its last measurement (D51): the formula's weights exactly, plus a 10% safety band on the measured
+bytes above them (D76) -- or on the whole measurement when it is below the weights. The child lands
+under that plan by the band by construction (about 2% for a weights-heavy model, up to 9% in the
+whole-measurement case); the observation reports that as the plan's *margin* and the
+formula-vs-actual miss as its *error*, and only an uncorrected plan can earn the ">5% prediction error" warning (a corrected
 plan is warned only when the child holds *more* than even the corrected total). Each row in
 `load_observations` stores the formula's `predicted_bytes` / `weights_bytes` and a `formula` block
 inside `per_gpu_planned` (total, weights, the overhead fraction it was computed with, and

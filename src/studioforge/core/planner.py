@@ -14,9 +14,13 @@ Two feedback loops read that history, and they must not be confused (D63):
 
 * **D51, per configuration.** The next plan of the *same* model at the same
   context, slots, cache types and device count is sized from what it measured
-  last time, plus :data:`OBS_SAFETY`. A plan corrected that way is expected to
-  land about ``1 - 1/OBS_SAFETY`` (9%) under its own estimate on every repeat
-  -- that is the safety band, not an error, and :meth:`Planner.observe` never
+  last time: the formula's weights as they are, plus :data:`OBS_SAFETY` on
+  everything the measurement holds above them (D76). A plan corrected that
+  way is expected to land under its own estimate on every repeat by
+  ``(OBS_SAFETY - 1) * (measured - weights)`` -- a few percent for a model
+  whose weights dominate, at most ``1 - 1/OBS_SAFETY`` (9.1%) when the
+  measurement is below the weights and the whole total carries the margin.
+  That is the safety band, not an error, and :meth:`Planner.observe` never
   warns about it.
 * **Calibration, global.** ``compute_overhead_fraction`` is tuned once per
   process from the FORMULA's misses. So every observation carries the formula
@@ -103,8 +107,9 @@ BUSY_RETRY_AFTER_S = 15.0
 #: to fix in the formula, not to keep absorbing from history.
 #:
 #: It is the formula's error that is measured, never a corrected plan's (D63):
-#: a plan D51 sized from the last measurement plus :data:`OBS_SAFETY` lands
-#: about 9% under its own total on every repeat by construction, and 12 of 12
+#: a plan D51 sized from the last measurement plus its :data:`OBS_SAFETY`
+#: margin lands under its own total on every repeat by construction (up to
+#: 9.1%; less since D76 held the weights out of the margin), and 12 of 12
 #: repeat loads on the reference rig were "warned" at exactly -9.1% before the
 #: distinction existed. A corrected plan's formula error is still recorded
 #: (:meth:`Planner.last_observation` says ``corrected: true``); the only
@@ -116,17 +121,20 @@ PREDICTION_ERROR_WARN_PCT = 5.0
 #: said. It is wider than the bar for an under-estimate on purpose (D69 §6).
 #: An over-estimate costs headroom, never an OOM, and up to
 #: ``1 - 1/OBS_SAFETY`` (9.1%) of headroom is what D51 reserves deliberately
-#: on every corrected plan: a formula that far over already sits where a
-#: measured plan would put the load. With one bar, that band was also a trap.
+#: on a corrected plan: a formula that far over already sits where a measured
+#: plan would put the load. With one bar, that band was also a trap.
 #: :func:`observed_correction` makes no correction when the factor lands
-#: within :data:`OBS_NOOP_TOLERANCE` of 1, which is every over-estimate
-#: between 8.6% and 9.5%, so a model in that band was warned on EVERY load and
-#: could never be corrected: 52 warnings between 2026-09-13 and 09-22 (Hy-MT2
-#: at -8.9%, Precog-123B -9.2%, Dark-Scarlett Q5_K_M -9.1%, Orion-26B -9.4%).
-#: 10% covers that whole band. ``test_planner_prediction_error.py`` pins it
-#: against ``OBS_SAFETY`` and ``OBS_NOOP_TOLERANCE``, so the three constants
-#: cannot drift apart. An under-estimate, the direction that OOMs, keeps the
-#: 5% bar and stays loud.
+#: within :data:`OBS_NOOP_TOLERANCE` of 1, which under the whole-total rule is
+#: every over-estimate between 8.6% and 9.5%, so a model in that band was
+#: warned on EVERY load and could never be corrected: 52 warnings between
+#: 2026-09-13 and 09-22 (Hy-MT2 at -8.9%, Precog-123B -9.2%, Dark-Scarlett
+#: Q5_K_M -9.1%, Orion-26B -9.4%). Since D76 holds the weights out of the
+#: margin, that uncorrectable band sits at ``(1 - w/F)`` of the old one for a
+#: weights share ``w/F`` -- closer to zero, never past its far edge. 10% covers
+#: it either way. ``test_planner_prediction_error.py`` pins it against
+#: ``OBS_SAFETY`` and ``OBS_NOOP_TOLERANCE`` across weight shares, so the three
+#: constants cannot drift apart. An under-estimate, the direction that OOMs,
+#: keeps the 5% bar and stays loud.
 PREDICTION_OVER_ESTIMATE_WARN_PCT = 10.0
 
 # Context sizes we are willing to suggest as a fallback, descending.
@@ -2882,6 +2890,12 @@ class Planner:
         apart: a pool of ``ctx`` at two slots weighs about what ONE slot of
         ``ctx`` does, and roughly half a partitioned pair, so a measurement of
         either shape must never be spent on the other.
+
+        The safety margin is spent on the measured bytes above THIS estimate's
+        weights term (D76), never on the weights themselves and never on a
+        stored row's weights figure (pre-D73 rows count the host-resident
+        table the child never held); :func:`corrected_estimate` keeps the
+        weights exact and moves the other terms.
         """
         try:
             estimate = self.estimate(
@@ -2908,11 +2922,12 @@ class Planner:
             kv_v=kv_v,
             n_devices=n_devices,
             formula_bytes=estimate.total_bytes,
+            weights_bytes=estimate.weights_bytes,
             kv_unified=kv_unified,
         )
         if correction is None:
             return estimate
-        corrected = scaled_estimate(estimate, correction.factor)
+        corrected = corrected_estimate(estimate, correction)
         # Remembered for :meth:`observe` (D63): the plan will carry only the
         # corrected numbers, and the formula they replaced is what the
         # planner's error and the calibrator are measured against.
@@ -2986,10 +3001,15 @@ class Planner:
         kv_v: KvCacheType,
         n_devices: int,
         formula_bytes: int,
+        weights_bytes: int = 0,
         kv_unified: bool = False,
     ) -> ObservedCorrection | None:
         """Look up what this configuration last really weighed, and by how much
         the formula should move because of it (D51).
+
+        ``weights_bytes`` is the formula's own weights term for this
+        configuration, held out of the safety margin (D76). The row's stored
+        ``weights_bytes`` is deliberately never read.
 
         Inert -- returning ``None`` without touching the database -- unless all
         three are true: ``planner.observed_correction`` is on, a lookup is
@@ -3043,7 +3063,9 @@ class Planner:
         actual = row.get("actual_bytes") if row is not None else None
         if isinstance(actual, (int, float)) and actual > 0:
             correction = observed_correction(
-                formula_bytes=formula_bytes, observed_bytes=int(actual)
+                formula_bytes=formula_bytes,
+                observed_bytes=int(actual),
+                weights_bytes=int(weights_bytes),
             )
         memo.rows[key] = correction
         if correction is not None:
@@ -3058,7 +3080,8 @@ class Planner:
                 devices=n_devices,
                 formula_mb=round(correction.formula_bytes / MB),
                 observed_mb=round(correction.observed_bytes / MB),
-                corrected_mb=round(correction.formula_bytes * correction.factor / MB),
+                weights_held_mb=round(correction.weights_bytes / MB),
+                corrected_mb=round(correction.corrected_bytes / MB),
                 factor=round(correction.factor, 3),
                 clamped=correction.clamped,
             )
@@ -3640,6 +3663,85 @@ class Planner:
             )
         return rejection
 
+    def _largest_ctx_that_fits(
+        self,
+        record: ModelRecord,
+        *,
+        below: int,
+        slots: int,
+        kv_k: KvCacheType,
+        kv_v: KvCacheType,
+        n_devices: int,
+        draft: ModelRecord | None,
+        adapters: Sequence[AdapterRecord],
+        available: int,
+        kv_unified: bool = False,
+    ) -> int:
+        """The largest ladder context under ``below`` this placement would accept (D76).
+
+        Walks :data:`_CTX_LADDER` down from the rung under the refused window
+        and asks, at each rung, for the estimate a load there would really be
+        charged: :meth:`_safe_estimate`, which is the formula unless a
+        measurement of that exact configuration exists (D51). The first rung
+        whose total fits ``available`` is the answer; 0 when none does.
+
+        It replaces ``budget = available - (total - kv)`` at the REFUSED
+        window, which went wrong twice once D51 had corrected that window: the
+        fixed cost it subtracted was the corrected one -- under the
+        whole-total rule it carried 10% on the weights, so for a 177B on three
+        cards the weights term alone was 78.4 GiB against 77.65 usable and the
+        refusal named no window at all (ClawChat's one re-ask at
+        ``max_ctx_that_fits`` then never fired) -- and the rung it named was
+        then planned on whatever estimate that rung really gets, which the
+        arithmetic had not asked about.
+
+        Only rungs below the refused window: a refusal answers "what smaller
+        window would load", and a measurement at one exact window can leave a
+        LARGER rung fitting on the formula -- naming that would hand the
+        caller a window bigger than the one just refused. A rung whose formula
+        is beyond what even the band's floor (:data:`OBS_BAND_MIN`) could bring
+        inside ``available`` is skipped without a lookup, so the walk touches
+        the observation table only for rungs a correction could decide.
+        """
+        if available <= 0:
+            return 0
+        draft_ctx = record.settings.draft_ctx_size
+        for rung in _CTX_LADDER:
+            if rung >= below:
+                continue
+            try:
+                formula = self.estimate(
+                    record,
+                    ctx_size=rung,
+                    parallel=slots,
+                    kv_cache_type=kv_k,
+                    kv_cache_type_v=kv_v,
+                    n_devices=n_devices,
+                    draft=draft,
+                    draft_ctx_size=draft_ctx,
+                    adapters=adapters,
+                    kv_unified=kv_unified,
+                )
+            except PlannerError:
+                return 0
+            if formula.total_bytes * OBS_BAND_MIN > available:
+                continue
+            charged = self._safe_estimate(
+                record,
+                rung,
+                slots,
+                kv_k,
+                kv_v,
+                n_devices,
+                draft,
+                draft_ctx,
+                adapters,
+                kv_unified=kv_unified,
+            )
+            if charged.total_bytes <= available:
+                return rung
+        return 0
+
     def _reject(
         self,
         record: ModelRecord,
@@ -3721,22 +3823,30 @@ class Planner:
                     f"requirement)"
                 )
 
-        # 1. A smaller context that would actually fit. Per-layer geometry
-        #    first (the number a load is really charged, D22); the uniform
-        #    formula only when the metadata cannot support a per-layer answer.
+        # 1. A smaller context that would actually fit, walked down the ladder
+        #    with the estimate a load at each rung is really charged -- the
+        #    per-layer geometry (D22), corrected where a measurement of that
+        #    exact configuration exists (D51) and the formula elsewhere (D76).
+        #    The uniform formula only when the metadata cannot support a
+        #    per-layer answer.
         max_ctx: int | None = None
         if meta is not None:
-            fixed = estimate.total_bytes - estimate.kv_bytes
-            budget = available - fixed
-            raw = max_ctx_for_budget_geometry(
-                meta,
-                budget_bytes=budget,
-                kv_k=kv_k,
-                kv_v=kv_v,
-                parallel=slots,
-                kv_unified=kv_unified,
-            )
+            raw = 0
+            if not kv_geometry_unknown(meta):
+                raw = self._largest_ctx_that_fits(
+                    record,
+                    below=ctx,
+                    slots=slots,
+                    kv_k=kv_k,
+                    kv_v=kv_v,
+                    n_devices=len(gpus) or 1,
+                    draft=draft,
+                    adapters=adapters,
+                    available=available,
+                    kv_unified=kv_unified,
+                )
             if raw <= 0 and not kv_layers(meta):
+                budget = available - (estimate.total_bytes - estimate.kv_bytes)
                 raw = _round_ctx_down(
                     max_ctx_for_budget(
                         budget_bytes=budget,
@@ -4145,13 +4255,16 @@ class Planner:
         (D63). The *formula* estimate is what the planner computed from GGUF
         geometry and ``compute_overhead_fraction``; the *planned* total is
         what the plan reserved, which D51 may have sized from the last
-        measurement of the same configuration plus :data:`OBS_SAFETY`. The
-        planner's error -- ``error_pct``, the bar, the warning -- is always
-        formula-vs-actual. A corrected plan reports actual-vs-planned as its
-        ``margin_pct``; a margin near ``-9%`` is the band working as designed
-        and is never warned about, while a child holding more than the
-        corrected total by the bar is, because that is the direction the band
-        exists to cover. A corrected plan whose correction this process cannot
+        measurement of the same configuration: the weights exact plus
+        :data:`OBS_SAFETY` on the rest (D76). The planner's error --
+        ``error_pct``, the bar, the warning -- is always formula-vs-actual. A
+        corrected plan reports actual-vs-planned as its ``margin_pct``; a
+        negative margin of ``(OBS_SAFETY - 1)`` times the measured bytes above
+        the weights (a few percent for a weights-heavy model, at most ``-9.1%``
+        under the whole-total rule) is the band working as designed and is
+        never warned about, while a child holding more than the corrected
+        total by the bar is, because that is the direction the band exists to
+        cover. A corrected plan whose correction this process cannot
         account for (:meth:`_correction_spent_on`) is recorded with the formula
         unknown rather than with the corrected total dressed up as it.
 
@@ -4277,10 +4390,11 @@ class Planner:
                 devices=plan.devices,
                 detail=(
                     "D51 sized this plan from the last measurement of this configuration "
-                    f"plus {round((OBS_SAFETY - 1) * 100)}%, and the child holds more than "
-                    "even that: the earlier measurement did not describe this placement "
-                    "(the device set or split moved) or the footprint grew; the next plan "
-                    "of this configuration is corrected from this measurement"
+                    f"(the weights exact, {round((OBS_SAFETY - 1) * 100)}% on the rest), and "
+                    "the child holds more than even that: the earlier measurement did not "
+                    "describe this placement (the device set or split moved) or the "
+                    "footprint grew; the next plan of this configuration is corrected from "
+                    "this measurement"
                 ),
             )
         self._last_observations[model_id] = {
@@ -4416,14 +4530,24 @@ def per_device_overruns(
 
 #: --- observed-footprint correction (D51) --------------------------------
 #:
-#: What a measured child is multiplied by before the planner will spend it as
-#: an estimate. The observation is one sample of a placement the planner is
-#: about to make again but not identically: tensor-split proportions are
-#: recomputed from live free VRAM on every load, so the same model on the same
-#: two cards can land a little differently, and the compute buffers move with
-#: the batch the child happens to be serving when it is measured. 10% is the
-#: price of keeping the error direction pointed at "refuse", which costs a load
-#: that would have fit, rather than at "OOM", which costs a child mid-request.
+#: What the measured bytes ABOVE the model's weights are multiplied by before
+#: the planner will spend a measurement as an estimate (D51, narrowed by D76).
+#: The observation is one sample of a placement the planner is about to make
+#: again but not identically: tensor-split proportions are recomputed from live
+#: free VRAM on every load, so the same model on the same cards can land a
+#: little differently, and the compute buffers move with the batch the child
+#: happens to be serving when it is measured. 10% is the price of keeping the
+#: error direction pointed at "refuse", which costs a load that would have fit,
+#: rather than at "OOM", which costs a child mid-request.
+#:
+#: The weights are exempt (D76): they are the summed tensor bytes of the file
+#: (less D73's host-resident table), the one term that does not move between
+#: loads. Until D76 the margin multiplied the WHOLE measurement, so a 177B
+#: whose ~71 GiB of weights sat on three cards was charged ~7 GiB of margin on
+#: bytes that cannot grow, and any load measured above ~91% of usable capacity
+#: (``1 / OBS_SAFETY`` of it) could never be planned again. A measurement below
+#: the formula's own weights keeps the whole-total rule: the formula's weights
+#: are then the term the measurement disproves, not one it can lean on.
 OBS_SAFETY = 1.10
 
 #: A correction whose factor is this close to 1 is no correction at all, and
@@ -4463,10 +4587,16 @@ CORRECTION_NOTE_PREFIX = "estimate corrected x"
 class ObservedCorrection:
     """A measured footprint the planner has decided to trust, and by how much.
 
-    ``factor`` is what every term of the formula estimate is multiplied by;
-    ``note`` is the sentence the chosen plan carries into the ``load planned``
-    log and the API response, because a plan whose numbers were silently
-    overridden by history is a plan nobody can debug.
+    ``factor`` is the corrected total over the formula's total; ``note`` is
+    the sentence the chosen plan carries into the ``load planned`` log and the
+    API response, because a plan whose numbers were silently overridden by
+    history is a plan nobody can debug.
+
+    ``weights_bytes`` is what the safety margin was NOT applied to (D76): the
+    current formula's weights term when the measurement covers it, else ``0``
+    (the whole-total rule). :func:`corrected_estimate` keeps exactly that many
+    bytes as the corrected estimate's weights and spends the correction on the
+    other terms; with ``0`` every term is scaled by ``factor``, as before D76.
     """
 
     factor: float
@@ -4474,6 +4604,12 @@ class ObservedCorrection:
     formula_bytes: int
     clamped: bool
     note: str
+    weights_bytes: int = 0
+
+    @property
+    def corrected_bytes(self) -> int:
+        """The total the planner charges for this configuration."""
+        return int(round(self.formula_bytes * self.factor))
 
 
 @dataclass(frozen=True)
@@ -4481,7 +4617,7 @@ class AppliedCorrection:
     """A correction as it was spent on one estimate (D63).
 
     ``formula`` is the estimate the formula produced and ``corrected`` is what
-    :func:`scaled_estimate` made of it -- the estimate the plan then carried.
+    :func:`corrected_estimate` made of it -- the estimate the plan then carried.
     :meth:`Planner.observe` matches a plan against ``corrected`` term by term
     before it will report ``formula`` as the number the child was predicted
     from.
@@ -4527,19 +4663,38 @@ def _correction_key(
 _APPLIED_CORRECTIONS_CAP = 4096
 
 
-def observed_correction(*, formula_bytes: int, observed_bytes: int) -> ObservedCorrection | None:
-    """Trust a measured footprint over the formula, within a band (D51).
+def observed_correction(
+    *, formula_bytes: int, observed_bytes: int, weights_bytes: int = 0
+) -> ObservedCorrection | None:
+    """Trust a measured footprint over the formula, within a band (D51, D76).
 
-    ``corrected = clamp(observed * OBS_SAFETY, formula * OBS_BAND_MIN,
-    formula * OBS_BAND_MAX)``, and the returned ``factor`` is
-    ``corrected / formula``.
+    ``corrected = clamp(weights + (observed - weights) * OBS_SAFETY,
+    formula * OBS_BAND_MIN, formula * OBS_BAND_MAX)``, and the returned
+    ``factor`` is ``corrected / formula``.
+
+    ``weights_bytes`` is the CURRENT formula's weights term -- never a stored
+    row's: rows written before D73 carry the host-resident table in their
+    ``weights_bytes`` (32.8 GiB on the 177B), which the child never held. The
+    margin is spent only on what the measurement says sits above those bytes
+    (D76). When the measurement is below the weights (or they are unknown,
+    ``0``), the rule is D51's original whole-total one,
+    ``observed * OBS_SAFETY``: a child that holds less than the formula's own
+    weights has disproved that term, so it cannot be held exact.
+
+    On the reference rig (2026-10-04), the 177B on three cards at 2 slots
+    sharing a 122880-token pool: weights 71.3 GiB, measured 79.2 GiB. The
+    whole-total rule charged 87.1 GiB against 77.65 GiB usable (86.42 GiB raw
+    free) for a load that had just run in 79.2, and its 78.4 GiB of
+    margin-inflated weights alone exceeded the cards. This rule charges
+    ``71.3 + 7.9 * 1.1`` = 80.0 GiB.
 
     The formula is a good general estimator and a poor specific one. It is
     built from GGUF geometry that every architecture reports slightly its own
     way, so it is systematically wrong per *model family* while being roughly
     right across the library -- and one global ``compute_overhead_fraction``
     (:func:`calibrated_overhead_fraction`) cannot be two signs at once. The
-    live rig on 2026-08-30 had both signs open simultaneously:
+    live rig on 2026-08-30 had both signs open simultaneously (figures under
+    the whole-total rule D51 shipped with):
 
     * Dark-Scarlett-27B: formula 35742 MB, measured 37258 MB. Corrected to
       40984 MB, a factor of 1.147 -- MORE conservative, which is this model's
@@ -4560,7 +4715,11 @@ def observed_correction(*, formula_bytes: int, observed_bytes: int) -> ObservedC
     """
     if formula_bytes <= 0 or observed_bytes <= 0:
         return None
-    trusted = observed_bytes * OBS_SAFETY
+    weights = int(weights_bytes or 0)
+    # Held exact only when the measurement covers them (D76); otherwise the
+    # whole-total rule, which is this same expression with nothing held.
+    exact = weights if 0 < weights <= min(int(observed_bytes), int(formula_bytes)) else 0
+    trusted = exact + (observed_bytes - exact) * OBS_SAFETY
     low = formula_bytes * OBS_BAND_MIN
     high = formula_bytes * OBS_BAND_MAX
     corrected = min(high, max(low, trusted))
@@ -4568,11 +4727,24 @@ def observed_correction(*, formula_bytes: int, observed_bytes: int) -> ObservedC
     factor = corrected / formula_bytes
     if abs(factor - 1.0) < OBS_NOOP_TOLERANCE:
         return None
+    margin_pct = round((OBS_SAFETY - 1) * 100)
     note = (
         f"{CORRECTION_NOTE_PREFIX}{factor:.2f} from the last load of this exact "
         f"configuration (observed {round(observed_bytes / MB)} MB against a formula "
-        f"estimate of {round(formula_bytes / MB)} MB)"
+        f"estimate of {round(formula_bytes / MB)} MB"
     )
+    if exact:
+        note += (
+            f"; the {margin_pct}% margin covers the {round((observed_bytes - exact) / MB)} MB "
+            f"above the {round(exact / MB)} MB of weights, which are exact)"
+        )
+    elif weights:
+        note += (
+            f"; it is below the formula's {round(weights / MB)} MB of weights, so the "
+            f"{margin_pct}% margin covers all of it)"
+        )
+    else:
+        note += ")"
     if clamped:
         note += (
             f"; clamped to the {OBS_BAND_MIN:.2f}-{OBS_BAND_MAX:.2f} band around the "
@@ -4584,6 +4756,41 @@ def observed_correction(*, formula_bytes: int, observed_bytes: int) -> ObservedC
         formula_bytes=int(formula_bytes),
         clamped=clamped,
         note=note,
+        weights_bytes=exact,
+    )
+
+
+def corrected_estimate(estimate: VramEstimate, correction: ObservedCorrection) -> VramEstimate:
+    """``estimate`` moved to ``correction``'s total (D51), its weights kept exact (D76).
+
+    When the correction held the weights out of its margin
+    (``correction.weights_bytes`` equal to this estimate's weights term), the
+    weights stay the formula's own bytes and the rest of the correction is
+    spread over the OTHER terms in proportion -- KV, compute, CUDA context,
+    mmproj, draft. That keeps every number downstream honest: a refusal's
+    "the weights alone need X GiB" is the file's real figure rather than a
+    margin-inflated one, the slot sizer's weight traffic is the real traffic,
+    and ``_reject``'s context walk is not starting from a fixed cost that
+    already contains 10% of the weights.
+
+    Otherwise -- the whole-total rule -- every term is scaled uniformly, as
+    :func:`scaled_estimate` always did.
+    """
+    held = int(correction.weights_bytes)
+    rest = estimate.total_bytes - estimate.weights_bytes
+    if held <= 0 or held != estimate.weights_bytes or rest <= 0:
+        return scaled_estimate(estimate, correction.factor)
+    target = estimate.total_bytes * correction.factor
+    rest_factor = max(0.0, (target - held) / rest)
+    return VramEstimate(
+        **{
+            field_name: (
+                int(value)
+                if field_name == "weights_bytes"
+                else max(0, int(round(value * rest_factor)))
+            )
+            for field_name, value in estimate.model_dump().items()
+        }
     )
 
 
@@ -4595,15 +4802,14 @@ def scaled_estimate(estimate: VramEstimate, factor: float) -> VramEstimate:
     rather than dumped into ``compute_bytes`` -- the term that exists to absorb
     unmodelled overhead -- for one blunt reason: the Gemma-4-E4B correction is
     -4.3 GB and ``compute_bytes`` is a fraction of that, so the fudge term
-    physically cannot hold it. Uniform scaling also keeps the arithmetic
-    downstream self-consistent: ``_reject`` computes its "largest context that
-    would fit" as ``total - kv``, and a total corrected without its KV term
-    would make that subtraction describe a placement that does not exist.
+    physically cannot hold it.
 
-    The cost is that ``weights_bytes`` and ``kv_bytes`` on a corrected estimate
-    are shares of a measured whole rather than the formula's own answers for
-    those terms. That is honest -- the measurement cannot say which term was
-    wrong, only that their sum was -- but it is why the per-device split in
+    Since D76 this is the whole-total rule's spreading only: a correction that
+    held the weights exact goes through :func:`corrected_estimate`, which
+    keeps them and scales the rest. Here ``weights_bytes`` and ``kv_bytes``
+    are shares of a measured whole rather than the formula's own answers --
+    honest, since a measurement below the weights cannot say which term was
+    wrong, only that their sum was -- which is why the per-device split in
     :meth:`Planner._try_devices` keeps charging the output layer at its real
     size and takes the corrected total as the body to divide.
     """
