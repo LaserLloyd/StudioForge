@@ -1,5 +1,5 @@
-/* GENERATED adapter quasar.js: unifyingTheme 1.0.0, drop-in bundle (ui-theme/).
-   https://github.com/LaserLloyd/UnifyingTheme . Do not edit this copy: update the whole
+/* GENERATED adapter quasar.js: ThemeForge 1.0.0, drop-in bundle (ui-theme/).
+   https://github.com/LaserLloyd/ThemeForge . Do not edit this copy: update the whole
    folder (python ui-theme/update.py) and keep app styles in the app.
    body sha256: a558aa540d7d0947 */
 

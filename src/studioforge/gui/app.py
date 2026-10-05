@@ -363,7 +363,7 @@ class GuiAuthGate:
 # Theme assets
 # ---------------------------------------------------------------------------
 #
-# gui/theme/ is the unifyingTheme drop-in bundle, copied verbatim from the
+# gui/theme/ is the ThemeForge drop-in bundle, copied verbatim from the
 # theme repo: the same folder every app gets (see docs/DEVELOPMENT.md's "GUI
 # theming" section). Never hand-edited; a theme update is copying the new
 # folder over this one. What is StudioForge's own is THEME_SETTINGS below.

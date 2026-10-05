@@ -1,9 +1,9 @@
-/* GENERATED component helpers: unifyingTheme 1.0.0, drop-in bundle (ui-theme/).
-   https://github.com/LaserLloyd/UnifyingTheme . Do not edit this copy: update the whole
+/* GENERATED component helpers: ThemeForge 1.0.0, drop-in bundle (ui-theme/).
+   https://github.com/LaserLloyd/ThemeForge . Do not edit this copy: update the whole
    folder (python ui-theme/update.py) and keep app styles in the app.
-   body sha256: 65c2cb64c1db357a */
+   body sha256: 48cec7393720860e */
 /* ============================================================================
-   ui-components.js — themed dialogs and toasts (optional) · unifyingTheme
+   ui-components.js — themed dialogs and toasts (optional) · ThemeForge
    ----------------------------------------------------------------------------
    Drop-in replacements for the browser's confirm()/alert()/prompt(), which
    ignore the theme, plus toast notifications. Uses the .ui-dialog and

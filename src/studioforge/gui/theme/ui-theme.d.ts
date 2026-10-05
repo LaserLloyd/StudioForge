@@ -1,4 +1,4 @@
-// TypeScript declarations for the unifyingTheme globals.
+// TypeScript declarations for the ThemeForge globals.
 // Add this file to tsconfig.json's "include" (or reference it with
 // /// <reference path="..."/>) to type window.UITheme and window.UIComponents.
 

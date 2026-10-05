@@ -112,10 +112,11 @@ depends on nothing above it. A change that makes `core` import from `api` is a c
 
 ## GUI theming
 
-The panel's colours, type and component skin come from the **unifyingTheme** package
-(`_unifyingTheme`, a sibling checkout — not part of this repo), not from anything hand-written
-here. `gui/theme/` is that repo's **drop-in bundle** (`_unifyingTheme/ui-theme/`), copied
-verbatim: the same folder every app gets. It is never hand-edited:
+The panel's colours, type and component skin come from **ThemeForge**
+([LaserLloyd/ThemeForge](https://github.com/LaserLloyd/ThemeForge), a separate repository — not
+part of this one), not from anything hand-written here. `gui/theme/` is ThemeForge's **drop-in
+bundle** (its `ui-theme/` folder), copied verbatim: the same folder every app gets. It is never
+hand-edited:
 
 ```
 gui/theme/ui-theme.js            the runtime and the full theme registry
@@ -138,9 +139,9 @@ with the active theme's ground, so `ui.run_with(dark=True)` stays fixed in Pytho
 which theme is active.
 
 To change how a Quasar component looks, edit `adapters/quasar.css` (and, for the runtime's JS
-behaviour, `adapters/quasar.js`) in the theme package — never `gui/theme/*` directly, it is
-replaced wholesale. A theme update is: build the bundle in the theme repo, then copy it over
-`gui/theme/`, by hand or from the theme package's folder:
+behaviour, `adapters/quasar.js`) in ThemeForge — never `gui/theme/*` directly, it is replaced
+wholesale. A theme update is: build the bundle in a ThemeForge checkout, then install it over
+`gui/theme/` with ThemeForge's own tool, from that checkout:
 
 ```bash
 python tools/sync_theme.py build

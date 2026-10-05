@@ -263,7 +263,7 @@ def test_a_failing_lease_book_is_a_stale_note_not_an_error_card(config: Config) 
 
 
 # ---------------------------------------------------------------------------
-# Theme assets: gui/theme/ is the unifyingTheme drop-in bundle, served at
+# Theme assets: gui/theme/ is the ThemeForge drop-in bundle, served at
 # /sf-theme/, injected once into every page's <head> and the login page, and
 # configured by THEME_SETTINGS on the ui-theme.js script tag.
 # ---------------------------------------------------------------------------
@@ -540,7 +540,7 @@ URL_ALLOWLIST = frozenset({"https://huggingface.co"})
 
 def _gui_sources() -> list[Path]:
     root = Path(st.__file__).parent
-    # gui/theme/ is the vendored unifyingTheme bundle, copied verbatim; its
+    # gui/theme/ is the vendored ThemeForge bundle, copied verbatim; its
     # update.py is a command-line installer that never runs in the panel.
     return sorted(p for p in root.rglob("*.py") if p.relative_to(root).parts[0] != "theme")
 

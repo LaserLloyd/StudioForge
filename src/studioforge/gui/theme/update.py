@@ -46,11 +46,14 @@ import urllib.error
 import urllib.request
 from pathlib import Path, PurePosixPath
 
-REPO = "LaserLloyd/UnifyingTheme"
+REPO = "LaserLloyd/ThemeForge"
 BUNDLE = "ui-theme"
 MANIFEST = "files.json"
 TIMEOUT = 60
-NAME = "unifyingTheme"
+NAME = "ThemeForge"
+#: Names this bundle shipped under before; a folder whose VERSION carries one is
+#: still recognised as this bundle (ThemeForge was released as unifyingTheme).
+LEGACY_NAMES = ("unifyingTheme",)
 
 
 class UpdateError(Exception):
@@ -213,8 +216,9 @@ def local_state(folder: Path, new_files: dict):
     manifest = read_manifest(folder)
     if manifest is None:
         version_file = folder / "VERSION"
+        names = tuple(n + " " for n in (NAME, *LEGACY_NAMES))
         is_bundle = version_file.is_file() and \
-            version_file.read_text(encoding="utf-8", errors="replace").startswith(NAME + " ")
+            version_file.read_text(encoding="utf-8", errors="replace").startswith(names)
         if have and not is_bundle:
             raise UpdateError(f"{folder} is not empty and is not a ui-theme folder (no VERSION/files.json); "
                               "pick an empty or new folder")

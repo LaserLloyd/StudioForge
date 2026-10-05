@@ -3,7 +3,7 @@
 A drop-in theme for web apps: ten colour themes, a theme picker, design tokens, a base
 element layer, a text standard and ready-made component classes. Plain CSS and two small
 scripts; no build step, no dependencies. Source and full docs:
-https://github.com/LaserLloyd/UnifyingTheme
+https://github.com/LaserLloyd/ThemeForge
 
 **Do not edit anything in this folder.** It is replaced whole on every update. Keep your
 app's own styles in your app's own CSS files.

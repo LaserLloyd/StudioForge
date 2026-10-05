@@ -88,7 +88,7 @@ packages = ["src/studioforge"]
 include = [
     "src/studioforge/migrations/*.sql",
     "src/studioforge/data/*.json",
-    # The unifyingTheme drop-in bundle, copied verbatim from the theme repo;
+    # The ThemeForge drop-in bundle, copied verbatim from the theme repo;
     # see docs/DEVELOPMENT.md's "GUI theming" section. Everything in it ships.
     "src/studioforge/gui/theme/**",
 ]
