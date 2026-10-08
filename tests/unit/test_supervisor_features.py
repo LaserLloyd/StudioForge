@@ -550,6 +550,9 @@ def test_the_floor_pushing_past_the_pool_is_said_out_loud(
 ) -> None:
     """Past the floor the pool is an intention rather than a bound, and the
     operator staring at a swapping box needs the numbers to see that."""
+    # Pinned like the tests above: `pool` is the real pool only when it is bigger than the floor,
+    # and 25% of a 16 GiB runner's RAM is not (there the floor answers, and `pool_mib` is lower).
+    monkeypatch.setattr(supervisor_module, "resolve_cache_ram_mb", lambda _v: 32768)
     supervisor = sup(config, make_binary(tmp_path))
     pool = supervisor._cache_ram_grant()
     assert pool is not None
@@ -616,6 +619,9 @@ def test_a_changed_holder_set_or_a_recovered_pool_is_warned_about_again(
     config: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """De-duplicated on the state, not silenced: a new situation is a new WARNING."""
+    # Pinned like the tests above: "the pool is free again: nothing to say" needs a pool bigger
+    # than the floor, and on a 16 GiB runner even an empty table is already over-committed.
+    monkeypatch.setattr(supervisor_module, "resolve_cache_ram_mb", lambda _v: 32768)
     supervisor = sup(config, make_binary(tmp_path))
     pool = supervisor._cache_ram_grant()
     assert pool is not None
@@ -635,12 +641,15 @@ def test_a_changed_holder_set_or_a_recovered_pool_is_warned_about_again(
 
 
 def test_an_arriving_child_does_not_have_to_share_with_itself(
-    config: Config, tmp_path: Path
+    config: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """``start`` inserts the instance before ``_spawn`` runs, so its own row is
     in the table by the time the grant is computed. A reload re-grants correctly
     for the same reason from the other side: the outgoing child is stopped, and
     out of the table, before the replacement spawns."""
+    # Pinned like the tests above: it only sees its regression with a pool bigger than the floor.
+    # On a 16 GiB runner `pool` is the floor, so a grant that ignored `exclude=` reads the same.
+    monkeypatch.setattr(supervisor_module, "resolve_cache_ram_mb", lambda _v: 32768)
     supervisor = sup(config, make_binary(tmp_path))
     pool = supervisor._cache_ram_grant()
     assert pool is not None
@@ -669,10 +678,13 @@ def test_the_disabling_values_are_passed_through_untouched(
 
 
 def test_an_unlimited_grant_is_not_counted_as_a_negative_share(
-    config: Config, tmp_path: Path
+    config: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """You cannot subtract "all of it" from a pool, and nobody may end up with
     MORE than the pool because somebody else holds -1."""
+    # Pinned like the tests above: it only sees its regression with a pool bigger than the floor.
+    # On a 16 GiB runner `pool` is the floor, so counting -1 as a negative share reads the same.
+    monkeypatch.setattr(supervisor_module, "resolve_cache_ram_mb", lambda _v: 32768)
     supervisor = sup(config, make_binary(tmp_path))
     pool = supervisor._cache_ram_grant()
     hold_cache_ram(supervisor, tmp_path, unlimited=-1)

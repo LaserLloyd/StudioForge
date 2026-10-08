@@ -857,6 +857,7 @@ def test_opening_a_folder_on_the_servers_desktop_takes_the_d32_rule(
     config: Config, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     import os
+    import subprocess
 
     from studioforge.gui import tabs
     from studioforge.gui.tabs import setup as setup_mod
@@ -869,6 +870,9 @@ def test_opening_a_folder_on_the_servers_desktop_takes_the_d32_rule(
     )
     opened: list[str] = []
     monkeypatch.setattr(os, "startfile", lambda p: opened.append(p), raising=False)
+    # Off Windows the opener is `xdg-open`, which a container or CI image need not have; faking
+    # it too keeps "not installed here" from turning into a failure (CONTRIBUTING.md).
+    monkeypatch.setattr(subprocess, "Popen", lambda argv, *_a, **_kw: opened.append(argv[-1]))
     ctx = tabs.GuiContext(config=config, api_state=_FakeState(config))
     target = tmp_path / "opened-from-afar"
 
@@ -880,8 +884,7 @@ def test_opening_a_folder_on_the_servers_desktop_takes_the_d32_rule(
     monkeypatch.setattr(tabs, "viewer_host", lambda: "127.0.0.1")
     setup_mod._open_path(ctx, target)
     assert target.is_dir()
-    if sys.platform == "win32":
-        assert opened == [str(target)]
+    assert opened == [str(target)]
     assert notified[-1][1]["type"] == "positive"
 
 

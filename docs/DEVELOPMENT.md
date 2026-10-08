@@ -125,6 +125,8 @@ gui/theme/ui-theme.css           contract tokens for every theme
 gui/theme/adapters/quasar.js     keeps Quasar's dark-mode flag in step with the theme's ground
 gui/theme/adapters/quasar.css    contract tokens onto Quasar's components
 gui/theme/themes.json            the registry (app.py reads it for the picker's names)
+gui/theme/update.py              installs/updates the bundle; a command-line tool, no page loads it
+gui/theme/files.json             sha256 of every bundle file; what update.py checks against
 gui/theme/VERSION, README.md     bundle version and plug-in notes
 ```
 
@@ -140,8 +142,10 @@ which theme is active.
 
 To change how a Quasar component looks, edit `adapters/quasar.css` (and, for the runtime's JS
 behaviour, `adapters/quasar.js`) in ThemeForge — never `gui/theme/*` directly, it is replaced
-wholesale. A theme update is: build the bundle in a ThemeForge checkout, then install it over
-`gui/theme/` with ThemeForge's own tool, from that checkout:
+wholesale. `ruff` skips `gui/theme/` (`extend-exclude` in `pyproject.toml`): the bundle follows
+ThemeForge's own style and `files.json` checksums every file in it, so a reformat here would be both
+a hand edit and undone by the next install. A theme update is: build the bundle in a ThemeForge
+checkout, then install it over `gui/theme/` with ThemeForge's own tool, from that checkout:
 
 ```bash
 python tools/sync_theme.py build
