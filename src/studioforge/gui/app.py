@@ -442,7 +442,8 @@ def _theme_registry() -> Mapping[str, Mapping[str, Any]]:
     try:
         data = json.loads((_THEME_DIR / "themes.json").read_text(encoding="utf-8"))
         return {theme["slug"]: theme for theme in data["themes"]}
-    except (OSError, ValueError, KeyError, TypeError):  # pragma: no cover - only if the copy is missing/corrupt
+    except (OSError, ValueError, KeyError, TypeError):  # pragma: no cover
+        # Only if the vendored copy is missing or corrupt.
         return {}
 
 

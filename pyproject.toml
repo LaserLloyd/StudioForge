@@ -97,6 +97,14 @@ include = [
 line-length = 100
 target-version = "py312"
 src = ["src", "tests"]
+# gui/theme/ is the ThemeForge drop-in bundle, vendored verbatim and
+# checksummed by its files.json (its update.py refuses to update a copy that
+# was edited by hand, and the next install overwrites the folder anyway), so
+# it is never reformatted to this project's rules: ruff skips it, lint and
+# format alike. force-exclude keeps that true when a file is named explicitly
+# (editors, pre-commit).
+extend-exclude = ["src/studioforge/gui/theme"]
+force-exclude = true
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "C4", "RET", "PTH", "ASYNC", "TID"]
@@ -104,6 +112,14 @@ ignore = ["B008", "SIM108"]
 
 [tool.mypy]
 python_version = "3.12"
+# Windows is the reference platform, and the typed core uses Windows-only
+# attributes (subprocess.CREATE_NEW_PROCESS_GROUP, socket.SO_EXCLUSIVEADDRUSE,
+# winreg, ctypes.WinDLL) on paths only Windows takes: `os.name == "nt"`
+# branches and Windows-only helpers. mypy narrows only on sys.platform, so
+# without this pin a Linux run reports 21 attr-defined errors there and
+# `just lint` cannot pass off Windows. On Windows mypy already assumes win32,
+# so nothing changes there.
+platform = "win32"
 mypy_path = "src"
 packages = ["studioforge"]
 warn_unused_configs = true
@@ -133,6 +149,14 @@ ignore_missing_imports = true
 [[tool.mypy.overrides]]
 module = ["studioforge.gui.*"]
 disallow_untyped_defs = false
+
+[[tool.mypy.overrides]]
+# The vendored ThemeForge bundle again (see [tool.ruff] above): a bare `mypy`
+# walks the whole package and would report the bundle's own update.py, which
+# is never edited here. `just lint` names the typed modules explicitly and
+# never reaches it either way.
+module = ["studioforge.gui.theme.*"]
+ignore_errors = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

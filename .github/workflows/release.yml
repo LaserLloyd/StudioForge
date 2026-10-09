@@ -16,14 +16,16 @@ jobs:
     name: build and publish the release assets
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           # git archive below reads the tag object, and a shallow clone of a
           # tag push does not necessarily have it.
           fetch-depth: 0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        # Pinned exactly, for the reason ci.yml gives: setup-uv publishes no
+        # moving major tag, so a bare major ref fails at "Set up job".
+        uses: astral-sh/setup-uv@v10.0.1
 
       - name: Set up Python
         run: uv python install 3.12

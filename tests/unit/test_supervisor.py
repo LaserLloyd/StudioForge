@@ -1426,11 +1426,14 @@ async def test_a_child_records_the_host_cache_it_was_granted(
 
 
 async def test_the_second_resident_shares_the_automatic_pool_rather_than_repeating_it(
-    config: Config, tmp_path: Path, fake_binary: Path
+    config: Config, tmp_path: Path, fake_binary: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The pre-D50 reading handed the full 25%-of-RAM allowance to every child,
     so N residents promised N times a cap whose comment said it could never make
     the box swap."""
+    # Pinned: the second resident gets less than the first only when the pool is bigger than the
+    # floor, and 25% of a 16 GiB runner's RAM is not, so there both are handed the floor.
+    monkeypatch.setattr(supervisor_module, "resolve_cache_ram_mb", lambda _v: 32768)
     supervisor = Supervisor(
         config,
         resolve_binary=resolver(fake_binary),
