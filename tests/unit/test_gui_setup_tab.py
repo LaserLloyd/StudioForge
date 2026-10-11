@@ -270,13 +270,16 @@ def test_field_specs_cover_every_scalar_key_of_every_section() -> None:
             key = f"{section_name}.{info.alias or name}"
             if key not in generated:
                 missing.append(key)
-    # All three are mappings -- keyed by CUDA index, quant family and load
-    # tier. They get row widgets of their own, not a text box, and rendering
-    # one as a text box would silently destroy the other entries.
+    # Three are mappings -- keyed by CUDA index, quant family and load tier --
+    # and one is a list of nested models (the tenant registry, D77). They get
+    # row widgets of their own (the registry is read on the Dashboard's Tenants
+    # card and written in config.yaml), not a text box, because rendering one
+    # as a text box would silently destroy the other entries.
     assert sorted(missing) == [
         "models.ttl_by_priority",
         "planner.quant_affinity",
         "planner.reserved_mb",
+        "tenants.registry",
     ]
     assert set(missing) <= st.CUSTOM_WIDGET_KEYS
 

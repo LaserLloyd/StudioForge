@@ -74,7 +74,7 @@ FEATURE_NOTES: dict[str, str] = {
 #: on instead. **Bump it in the same commit that appends a decision**:
 #: ``tests/unit/test_capabilities_implemented.py`` reads the headings of
 #: ``DECISIONS.md`` and fails until the two agree.
-LATEST_DECISION = 76
+LATEST_DECISION = 79
 
 #: Every decision number this build includes, ``"D1"`` .. ``"D<LATEST_DECISION>"``.
 IMPLEMENTED_DECISIONS: tuple[str, ...] = tuple(f"D{n}" for n in range(1, LATEST_DECISION + 1))
@@ -120,6 +120,14 @@ SERVER_FEATURES: dict[str, str] = {
     # that the planner accepts, corrections included.
     "load_recommended_saved_placement": "D76",
     "max_ctx_that_fits_walk": "D76",
+    # The VRAM Tenant Protocol vt.1 (docs/TENANTS.md): the tenant registry
+    # (/api/tenants, self-registration, health polling, the warm relay) and
+    # the MCP read-only gpu_tenants / gpu_leases tools.
+    "tenant_registry": "D77",
+    "tenant_protocol_vt1": "D77",
+    # POST /api/leases takes devices "auto" (or none) with min_free_gib,
+    # prefer, avoid; a refusal carries details.considered.
+    "lease_auto_placement": "D78",
 }
 
 

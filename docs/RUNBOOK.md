@@ -207,6 +207,21 @@ opens one on every visible card, so a two-GPU model looks like a four-GPU one (D
 classified `other-instance` is a `llama-server` from a different install; its `detail` gives the
 `--alias`, `--port` and directory to go and stop it, and nothing here will ever kill it for you.
 
+## A tenant is missing, unhealthy, or holding a card
+
+The Tenants card (Dashboard), `GET /api/tenants`, `sfctl tenants list` and the MCP `gpu_tenants`
+tool list every other program that shares the GPUs: the ones declared in `tenants.registry` and the
+ones that registered themselves (D77, [TENANTS.md](TENANTS.md)).
+
+| Signal | Meaning | Do |
+| --- | --- | --- |
+| `health.state: unreachable` | its health URL did not answer; the program is down or on another port | start it yourself — StudioForge never launches a tenant (D79); check its own logs |
+| `health.state: unhealthy` with a `status_code` | it answered, not 2xx; `302` means its URL moved (redirects are never followed) | fix the tenant or its `health_url` |
+| `registered: false` on a declared row | the program has not announced itself since this server started (it may still be fine: registration is optional) | nothing, unless its leases look stale |
+| `leases[]` standing with `state: idle` for long | the program crashed holding a card; the idle TTL will release it | `sfctl leases release <id>` if you know it is gone; a well-behaved tenant releases its own stale leases at boot |
+| a `module` you want warm | its models are not loaded yet | the **Warm** button, `sfctl tenants warm <name>` or `POST /api/tenants/<name>/warm` — one relayed POST to the module's own endpoint; `tenant_unreachable` means it is not running |
+| `400 tenant_url_refused` on register | the URL names a host this server will not call | loopback, a tailnet address, or add the host to `tenants.allowed_hosts` |
+
 ## The server is up but wedged
 
 The watchdog on `:1235` answers when the server does not: `sfctl recover --restart` (or `POST

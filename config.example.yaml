@@ -208,6 +208,36 @@ leases:
   vacate_timeout_s: 180.0
   vacate_retry_after_s: 15.0
   vacate_callback_timeout_s: 30.0
+tenants:
+  # The tenant registry (D77, docs/TENANTS.md): other programs that share
+  # these GPUs. Declaring one here puts it on the Tenants card with live health
+  # before it has registered itself; a program may also announce itself at
+  # runtime with POST /api/tenants/register (the two merge by name).
+  # StudioForge never starts or stops a tenant (D79): `kind: module` only
+  # means it may be ASKED to warm through its own warm_url.
+  #
+  # Every URL must be loopback, a tailnet address (100.64.0.0/10) or a host in
+  # allowed_hosts below; nothing else is ever called, and names are never
+  # resolved. Two examples, commented out:
+  #
+  # registry:
+  #   # SpeechForge, a speech module on the same box: one card, class 2.
+  #   - name: speechforge
+  #     kind: module
+  #     health_url: http://127.0.0.1:1236/health
+  #     warm_url: http://127.0.0.1:1236/v1/speech/warm
+  #     default_priority: 2
+  #     notes: speech-to-text and text-to-speech; leases one card while a session is open
+  #   # ClawForge2, the image gateway: a plain tenant that leases ComfyUI's card.
+  #   - name: clawforge2
+  #     kind: tenant
+  #     health_url: http://127.0.0.1:8700/health
+  #     status_url: http://127.0.0.1:8700/ui/api/status
+  #     default_priority: 3
+  registry: []
+  health_interval_s: 30.0
+  health_timeout_s: 2.0
+  allowed_hosts: []
 benchmark:
   # The D46 class this server's own benchmark leases carry: 2 may ask a
   # background render tenant to vacate; 3 asks nobody (pre-D56 behaviour).

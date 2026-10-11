@@ -32,7 +32,14 @@ from studioforge.core.gpu import vram_processes
 from studioforge.core.leases import (
     DEFAULT_IDLE_TTL_S,
     LEASE_OPEN_ENDED_RETRY_S,
+    VERDICT_BETTER_TIER,
+    VERDICT_BUSY,
+    VERDICT_LEASED,
+    VERDICT_PINNED,
+    VERDICT_TOO_LITTLE_FREE,
+    AutoPlacement,
     LeaseBook,
+    choose_auto_devices,
     lease_store_for,
     lease_view,
     send_vacate_request,
@@ -4607,7 +4614,7 @@ class ModelManager:
 
     async def acquire_lease(
         self,
-        devices: Sequence[int],
+        devices: Sequence[int] | str | None,
         *,
         holder: str,
         model_ids: Sequence[str] = (),
@@ -4618,8 +4625,18 @@ class ModelManager:
         vacate_url: str | None = None,
         vacate_token: str | None = None,
         holder_peer: str | None = None,
+        min_free_gib: float | None = None,
+        prefer: Sequence[int] = (),
+        avoid: Sequence[int] = (),
     ) -> GpuLease:
         """Give ``devices`` to ``model_ids`` (or to nobody) until released or idle.
+
+        ``devices`` may be ``"auto"`` (or ``None``) to have the card chosen
+        (D78): :meth:`auto_lease_placement` picks one the way this grant would
+        judge it and the lease is then taken on exactly that card; the
+        placement's ``considered`` rows ride on any refusal. Explicit devices
+        behave exactly as before. :meth:`acquire_lease_auto` returns the
+        placement beside the lease for a caller that wants to show it.
 
         Idle residents on those cards that are not the new owners are unloaded
         -- that is what "the card is yours" means. A resident mid-request is
@@ -4635,12 +4652,30 @@ class ModelManager:
         marked ``vacating``, and the answer is 409 ``lease_vacating`` with a
         re-ask interval until the holder releases or the window lapses.
         """
-        wanted = sorted({int(d) for d in devices})
-        if not wanted:
-            raise BadRequestError("a lease must name at least one CUDA device", param="devices")
         tier = normalise_priority(priority)
         if tier is None:
             tier = PRIORITY_BACKGROUND
+        if devices is None or isinstance(devices, str):
+            placement = self.auto_lease_placement(
+                devices,
+                priority=tier,
+                model_ids=model_ids,
+                force=force,
+                min_free_gib=min_free_gib,
+                prefer=prefer,
+                avoid=avoid,
+            )
+            wanted = list(placement.devices or [])
+        else:
+            if min_free_gib is not None or prefer or avoid:
+                raise BadRequestError(
+                    "min_free_gib, prefer and avoid steer an automatic placement; with explicit "
+                    'devices they have nothing to decide -- send devices "auto" or drop them',
+                    param="devices",
+                )
+            wanted = sorted({int(d) for d in devices})
+        if not wanted:
+            raise BadRequestError("a lease must name at least one CUDA device", param="devices")
         if vacate_url is not None:
             vacate_url = validate_vacate_url(vacate_url)
             if await self._vacate_url_is_ours(vacate_url):
@@ -4818,6 +4853,166 @@ class ModelManager:
             vacate_target=vacate_target,
         )
         return lease
+
+    async def acquire_lease_auto(self, **kwargs: Any) -> tuple[GpuLease, AutoPlacement]:
+        """:meth:`acquire_lease` with the card chosen, returning the placement too (D78).
+
+        Takes :meth:`acquire_lease`'s keyword arguments except ``devices``.
+        The placement is computed once and the grant is made on its card; a
+        resident that became busy between the two is the grant's usual 503.
+        """
+        tier = normalise_priority(kwargs.get("priority"))
+        placement = self.auto_lease_placement(
+            "auto",
+            priority=PRIORITY_BACKGROUND if tier is None else tier,
+            model_ids=kwargs.get("model_ids") or (),
+            force=bool(kwargs.get("force", False)),
+            min_free_gib=kwargs.pop("min_free_gib", None),
+            prefer=kwargs.pop("prefer", ()) or (),
+            avoid=kwargs.pop("avoid", ()) or (),
+        )
+        lease = await self.acquire_lease(list(placement.devices or []), **kwargs)
+        return lease, placement
+
+    def auto_lease_placement(
+        self,
+        devices: str | None,
+        *,
+        priority: int,
+        model_ids: Sequence[str] = (),
+        force: bool = False,
+        min_free_gib: float | None = None,
+        prefer: Sequence[int] = (),
+        avoid: Sequence[int] = (),
+    ) -> AutoPlacement:
+        """Choose the card for an automatic lease, or raise the refusal (D78).
+
+        The decision is :func:`choose_auto_devices` over the probe's cards, the
+        supervisor's residents and the lease book. Nothing fitting raises the
+        code a tenant already knows how to read, chosen by what stood in the
+        way: ``model_busy`` (503) when a busy resident did and waiting may help;
+        ``lease_conflict`` (409, the book's own phrasing) when leases did;
+        ``lease_conflict`` on ``force`` when only pins or better tiers did;
+        ``insufficient_vram`` (507) when ``min_free_gib`` did; else a 400. Every
+        refusal carries ``details.considered``.
+        """
+        if devices is not None and str(devices).strip().lower() != "auto":
+            raise BadRequestError(
+                'devices must be a list of CUDA indices, "auto", or omitted', param="devices"
+            )
+        for name, values in (("prefer", prefer), ("avoid", avoid)):
+            if any(isinstance(v, bool) or not isinstance(v, int) for v in values):
+                raise BadRequestError(f"{name} must be a list of CUDA indices", param=name)
+        if min_free_gib is not None and (
+            isinstance(min_free_gib, bool) or float(min_free_gib) <= 0
+        ):
+            raise BadRequestError("min_free_gib must be a positive number", param="min_free_gib")
+        try:
+            gpus = list(self.planner.probe.list_gpus())
+        except Exception as exc:  # noqa: BLE001 - a sick probe cannot place anything
+            raise BadRequestError(
+                f"automatic placement needs the GPU probe and it did not answer "
+                f"({type(exc).__name__}); name the devices explicitly",
+                code="placement_unavailable",
+                param="devices",
+            ) from exc
+        if not gpus:
+            raise BadRequestError(
+                "automatic placement found no GPUs on this box",
+                code="placement_unavailable",
+                param="devices",
+            )
+        known = {int(g.index) for g in gpus}
+        for name, values in (("prefer", prefer), ("avoid", avoid)):
+            unknown = sorted({int(v) for v in values} - known)
+            if unknown:
+                raise BadRequestError(
+                    f"{name} names unknown CUDA device(s) {unknown}; this box has {sorted(known)}",
+                    param=name,
+                )
+        owners: list[str] = []
+        for name in model_ids:
+            record = self.registry.resolve(name)
+            if record is not None:
+                owners.append(self.serving_record(record).id)
+        placement = choose_auto_devices(
+            gpus,
+            self.supervisor.list(),
+            self.leases,
+            priority=priority,
+            owners=owners,
+            force=force,
+            min_free_gib=min_free_gib,
+            prefer=prefer,
+            avoid=avoid,
+        )
+        if not placement.refused:
+            log.info(
+                "gpu lease placed automatically",
+                devices=placement.devices,
+                priority=priority,
+                prefer=list(prefer) or None,
+                avoid=list(avoid) or None,
+                min_free_gib=min_free_gib,
+            )
+            return placement
+        raise self._auto_placement_refusal(placement, priority=priority)
+
+    def _auto_placement_refusal(
+        self, placement: AutoPlacement, *, priority: int
+    ) -> StudioForgeError:
+        verdicts = placement.verdicts()
+        considered: dict[str, Any] = {"considered": list(placement.considered), "placement": "auto"}
+        rows = placement.considered
+        if VERDICT_BUSY in verdicts:
+            busy = [row for row in rows if row["verdict"] == VERDICT_BUSY]
+            return ModelBusyError(
+                "no card is free for an automatic lease: "
+                + "; ".join(f"CUDA {row['device']}: {row['detail']}" for row in busy)
+                + ". A lease never interrupts a stream (D36); retry when one is idle, or "
+                "name a card.",
+                details={**considered, "retry_after_s": BUSY_RETRY_AFTER_S},
+            )
+        if VERDICT_LEASED in verdicts:
+            leased = [int(row["device"]) for row in rows if row["verdict"] == VERDICT_LEASED]
+            error = self.leases.conflict_error(leased, self.leases.conflicts(leased))
+            error.message = (
+                "no card is free for an automatic lease; the ones not otherwise ruled out are "
+                "leased: " + error.message + " Automatic placement never asks a holder to "
+                "vacate -- name the card to invoke D56."
+            )
+            error.details.update(considered)
+            return error
+        if VERDICT_PINNED in verdicts or VERDICT_BETTER_TIER in verdicts:
+            held = [
+                f"CUDA {row['device']}: {row['detail']} ({row['verdict']})"
+                for row in rows
+                if row["verdict"] in (VERDICT_PINNED, VERDICT_BETTER_TIER)
+            ]
+            return LeaseConflictError(
+                "no card is free for an automatic lease without evicting a pinned or "
+                f"better-tier resident: {'; '.join(held)}. Pass force=true to evict them "
+                f"(the pin reconciler brings a pinned one back elsewhere), or lease other "
+                f"cards; the claim's class is {priority}.",
+                param="force",
+                details={**considered, "priority": priority},
+            )
+        if VERDICT_TOO_LITTLE_FREE in verdicts:
+            short = [
+                f"CUDA {row['device']}: {row['detail']}"
+                for row in rows
+                if row["verdict"] == VERDICT_TOO_LITTLE_FREE
+            ]
+            return InsufficientVramError(
+                "no card would have the free VRAM asked for: " + "; ".join(short),
+                param="min_free_gib",
+                details=considered,
+            )
+        return BadRequestError(
+            "no card is left to place onto: every GPU is named in avoid",
+            param="avoid",
+            details=considered,
+        )
 
     def _vacate_or_conflict(
         self, wanted: list[int], clash: list[GpuLease], *, holder: str, priority: int

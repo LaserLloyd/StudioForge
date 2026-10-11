@@ -125,6 +125,7 @@ def render(ctx: GuiContext) -> None:
         _gpu_panel(ctx)
         _vram_holders_panel(ctx)
         _leases_panel(ctx)
+        _tenants_panel(ctx)
         _loaded_panel(ctx)
         _log_panel(ctx)
 
@@ -341,6 +342,106 @@ def _release_lease(ctx: GuiContext, lease_id: str, refresh: Any) -> None:
         return
     ui.notify(f"lease {lease_id} released", type="positive")
     refresh()
+
+
+# ---------------------------------------------------------------------------
+# Tenants (D77)
+# ---------------------------------------------------------------------------
+
+
+def _tenant_rows(ctx: GuiContext) -> list[dict[str, Any]]:
+    registry = ctx.tenants
+    if registry is None:
+        return []
+    return list(registry.views(reveal_urls=viewer_may_change_box(ctx)))
+
+
+def _tenants_panel(ctx: GuiContext) -> None:
+    """The other programs on these GPUs: declared or self-registered, with live health.
+
+    Shown, never run: StudioForge has no launcher for a tenant (D79). A
+    ``module`` row gets a Warm button that relays one POST to the module's own
+    endpoint behind the same confirmation the other box-changing buttons use.
+    """
+    ui.label("Tenants").classes("text-lg font-medium")
+    note = ui.label("").classes("text-xs opacity-70")
+    container = ui.column().classes("w-full gap-1")
+
+    def refresh() -> None:
+        if not element_alive(container):
+            return
+        try:
+            rows = _tenant_rows(ctx)
+        except Exception as exc:  # noqa: BLE001 - a registry that will not answer is a stale note
+            note.set_text(st.poll_failure_note(exc))
+            return
+        note.set_text(st.tenants_note(rows))
+        container.clear()
+        with container:
+            for row in rows:
+                with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                    ui.label(str(row.get("name"))).classes("font-medium text-sm")
+                    label, colour = st.tenant_health_badge(row)
+                    ui.badge(label, color=colour).classes("text-xs")
+                    if row.get("registered"):
+                        ui.badge("registered", color="accent").classes("text-xs").tooltip(
+                            "This tenant announced itself over POST /api/tenants/register"
+                        )
+                    ui.label(st.tenant_line(row)).classes(
+                        "text-xs font-mono opacity-80 grow truncate"
+                    ).tooltip(str(row.get("notes") or ""))
+                    if row.get("kind") == "module" and row.get("warm_registered"):
+                        admin_control(
+                            ui.button(
+                                "Warm",
+                                icon="local_fire_department",
+                                on_click=lambda row=row: _warm_tenant_dialog(ctx, row, refresh),
+                            ).props("outline dense"),
+                            may_change=viewer_may_change_box(ctx),
+                            what="warm a module",
+                            tooltip=(
+                                "Ask this module to load its models now, through its own warm "
+                                "endpoint. StudioForge never starts the module itself."
+                            ),
+                        )
+
+    refresh()
+    ui.timer(max(2.0, ctx.refresh_interval), refresh)
+
+
+def _warm_tenant_dialog(ctx: GuiContext, row: dict[str, Any], refresh: Any) -> None:
+    """Confirm, then relay one warm request to the module (D77); never launch (D79)."""
+    name = str(row.get("name"))
+    with ui.dialog() as dialog, ui.card().classes("min-w-[28rem]"):
+        ui.label(f"Warm {name}?").classes("font-medium")
+        ui.label(st.tenant_warm_prompt(row)).classes("text-sm whitespace-pre-wrap opacity-80")
+
+        async def confirm() -> None:
+            page = _Page.capture()  # before the await (D69 §17)
+            dialog.close()
+            with page, single_flight(f"tenants.warm:{name}", f"warm of {name}") as claimed:
+                if not claimed:
+                    return
+                with busy(message=f"Asking {name} to warm…"):
+                    try:
+                        require_local_admin(ctx, "warm a module")
+                        registry = ctx.tenants
+                        if registry is None:
+                            raise RuntimeError("no tenant registry in this process")
+                        payload = await registry.warm(name, requested_by="gui")
+                    except Exception as exc:  # noqa: BLE001
+                        page.error(exc, what="warm a module")
+                        return
+                page.notify(
+                    f"{name} answered {payload.get('status_code')} to the warm request",
+                    type="positive",
+                )
+                refresh()
+
+        with ui.row().classes("justify-end gap-2 w-full"):
+            ui.button("Cancel", on_click=dialog.close).props("flat")
+            ui.button("Warm", on_click=confirm).props("color=primary")
+    dialog.open()
 
 
 def _loaded_panel(ctx: GuiContext) -> None:

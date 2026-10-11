@@ -503,6 +503,9 @@ def test_require_local_admin_is_the_one_rule_every_box_changing_action_uses(
             "_toggle_pin",
             "_restart_engines",
             "_restart_server_dialog",
+            # D77: warming a module relays a POST to another program's
+            # endpoint; a box change by any reading.
+            "_warm_tenant_dialog",
         ],
         "models.py": ["_toggle_pin", "_delete_dialog", "_settings_dialog"],
         # ``smoke_engine`` joined the list in D49-9: it reads like a read, but

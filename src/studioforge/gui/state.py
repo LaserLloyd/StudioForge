@@ -1129,6 +1129,77 @@ def leases_note(leases: Sequence[Any]) -> str:
     )
 
 
+def tenants_note(tenants: Sequence[Any]) -> str:
+    """The one-line summary above the Tenants card (D77)."""
+    if not tenants:
+        return (
+            "None known. A tenant is another program sharing these GPUs -- an image or speech "
+            "server -- declared in tenants.registry or self-registered over "
+            "POST /api/tenants/register (docs/TENANTS.md). StudioForge never starts one."
+        )
+    up = sum(1 for row in tenants if (row.get("health") or {}).get("state") == "healthy")
+    registered = sum(1 for row in tenants if row.get("registered"))
+    return (
+        f"{len(tenants)} tenant(s): {up} healthy, {registered} registered this session. "
+        f"StudioForge shows and asks; it never launches or stops one (D79)."
+    )
+
+
+def tenant_health_badge(row: Mapping[str, Any]) -> tuple[str, str]:
+    """``(label, colour)`` for the health chip of one tenant row."""
+    state = str((row.get("health") or {}).get("state") or "unpolled")
+    colour = {
+        "healthy": "positive",
+        "unhealthy": "warning",
+        "unreachable": "negative",
+    }.get(state, "secondary")
+    return state, colour
+
+
+def tenant_line(row: Mapping[str, Any]) -> str:
+    """One tenant, compactly: kind, version, class, leases/devices, health clock, last seen."""
+    version = row.get("version") or UNKNOWN
+    health = row.get("health") or {}
+    checked = health.get("checked_at")
+    if isinstance(checked, int | float):
+        clock = f"checked {_span_text(time.time() - float(checked))} ago"
+    elif row.get("health_registered"):
+        clock = "not polled yet"
+    else:
+        clock = "no health URL"
+    code = health.get("status_code")
+    if code is not None:
+        clock += f" ({code})"
+    elif health.get("error"):
+        clock += f" ({health['error']})"
+    devices = row.get("devices") or []
+    held = f"CUDA {list(devices)}" if devices else "no cards leased"
+    leases = row.get("lease_count") or 0
+    seen = row.get("last_seen")
+    seen_text = (
+        f"seen {_span_text(time.time() - float(seen))} ago"
+        if isinstance(seen, int | float)
+        else "never seen"
+    )
+    target = row.get("health_target")
+    where = f" · {target}" if target else ""
+    return (
+        f"{row.get('kind', 'tenant')} · v{version} · class {row.get('default_priority', 3)}"
+        f" · {held} ({leases} lease(s)) · {clock} · {seen_text}{where}"
+    )
+
+
+def tenant_warm_prompt(row: Mapping[str, Any]) -> str:
+    """Confirmation text for the Warm button, naming what it does and does not do."""
+    name = row.get("name", "?")
+    return (
+        f"Ask {name} to warm up?\n\nStudioForge relays one POST to the module's own warm "
+        f"endpoint; the module decides what warming means (usually loading its models onto a "
+        f"card it leases here). Nothing is launched: a module that is not running answers "
+        f"'unreachable', and starting it is yours to do."
+    )
+
+
 def lease_line(lease: Any) -> str:
     """One lease, compactly: cards, owner, holder, clock, id."""
     who = (
@@ -6148,6 +6219,11 @@ CUSTOM_WIDGET_KEYS: Final = frozenset(
         "planner.reserved_mb",
         "planner.quant_affinity",
         "models.ttl_by_priority",
+        # A list of nested models (D77): a text box would destroy the other
+        # entries on save. Its "widget" is the Tenants card on the Dashboard,
+        # which shows what the file declares; the file itself is edited by
+        # hand, or tenants register themselves at runtime.
+        "tenants.registry",
     }
 )
 
@@ -6219,6 +6295,11 @@ def _spec_kind(annotation: Any) -> tuple[str, tuple[str, ...]]:
         # typed and rejects the rest.
         return "text", ()
     if origin in (list, Sequence):
+        inner = typing.get_args(annotation)
+        if inner and isinstance(inner[0], type) and issubclass(inner[0], BaseModel):
+            # A list of nested models (``tenants.registry``) has no honest
+            # text rendering either: it is edited in config.yaml.
+            return "unsupported", ()
         return "list", ()
     if origin is not None:
         # A parametrised generic that is not a list -- ``dict[int, int]``,

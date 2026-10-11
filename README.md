@@ -54,6 +54,11 @@ another machine with no shell on it.
 home: a model runs entirely in VRAM or is refused with the numbers, and the only outbound requests
 are the ones you ask for.
 
+**Sharing the GPUs.** Other programs on the same box -- an image server, a speech server -- take
+GPU **leases** from StudioForge before they allocate, and StudioForge plans around them. The
+contract they follow, the registry that lists them with live health, and the SDK they adopt are
+the [VRAM Tenant Protocol](docs/TENANTS.md). StudioForge never starts or stops one of them.
+
 <p align="center"><img src="docs/images/architecture.svg" alt="StudioForge — what runs where: client machines reach the gateway's four surfaces (/v1 OpenAI API, /mcp MCP server, /api REST, :8080 control panel); on the host the gateway indexes the GGUF model library, plans VRAM and supervises one llama-server backend per loaded model; a separate watchdog sidecar with its own MCP server restarts the gateway and kills stuck backends" width="1100"></p>
 
 ### Components
@@ -61,7 +66,7 @@ are the ones you ask for.
 | Component | Runs on | Role |
 | --- | --- | --- |
 | **Host machine** | The box with the NVIDIA GPUs and the GGUF library | Runs everything below. The only machine that installs anything. |
-| **Gateway** (`:1234`, one process) | Host | Four surfaces: `/v1` the OpenAI-compatible API; `/mcp` an MCP server with 21 management tools; `/api` the management REST; `:8080` the control panel (plus a system tray on Windows). Inside: the registry, the VRAM planner and the supervisor. |
+| **Gateway** (`:1234`, one process) | Host | Four surfaces: `/v1` the OpenAI-compatible API; `/mcp` an MCP server with 23 management tools; `/api` the management REST; `:8080` the control panel (plus a system tray on Windows). Inside: the registry, the VRAM planner and the supervisor. |
 | **Backends** — `llama-server` | Host, one process per loaded model, each on its own internal port | [llama.cpp](https://github.com/ggml-org/llama.cpp)'s server, pinned to a tested build and fetched automatically. Spawned on demand, placed by the planner, idled out on a TTL, kept resident when pinned, given a card of their own when leased. A crash takes down one model, never the gateway. |
 | **Model library** | Host, on disk (`models.dir`) | Your GGUF Transformer models, indexed in place — the same folder LM Studio uses; nothing is copied or moved. |
 | **Watchdog sidecar** (`:1235`) | Host, a separate process | Its **own MCP server** with 10 recovery tools — restart the gateway, kill a stuck backend, reclaim VRAM, tail logs — reachable when the gateway is wedged, because it is not the gateway. |
@@ -107,7 +112,7 @@ are the ones you ask for.
   ([`DECISIONS.md`](DECISIONS.md) D46, D48).
 - **Drop-in for LM Studio.** Same port, same `/v1/models` behaviour, same library on disk —
   switching a client is a host change.
-- **Built for agents.** 31 MCP tools with a catalog that hands an agent the exact load
+- **Built for agents.** 33 MCP tools with a catalog that hands an agent the exact load
   arguments, a benchmarking playbook it can follow, and recovery tools that survive a wedged server.
 - **One call answers "do I even need to load anything?"** `check_loaded_model(min_params="20b",
   vision=true)` asks whether what is *already* resident clears the bar — size, and capabilities
@@ -262,7 +267,7 @@ Claude Code, Cline, LibreChat and other clients that take the generic map want t
 { "mcpServers": { "studioforge": { "command": "sfctl", "args": ["mcp"] } } }
 ```
 
-That gives the agent 31 tools: the server's 21 management tools plus the watchdog's 10 recovery
+That gives the agent 33 tools: the server's 23 management tools plus the watchdog's 10 recovery
 tools, so it still holds `restart_server` when the main server is wedged. The step-by-step
 two-machine install with a check after each step is
 [`docs/OPENCLAW-SETUP.md`](docs/OPENCLAW-SETUP.md); the loop an agent actually runs is
@@ -294,8 +299,9 @@ server dependencies — and is the remote control for the host: `sfctl status` (
 any standing GPU lease), `models load/unload/pin`, `models options` and `models load-recommended` (the
 planner's per-mode table, and a load that refuses rather than silently shrinking your context),
 `search` and `models repo` (find a GGUF on Hugging Face, then read its headers for a real fit verdict),
-`leases` (claim cards so nothing else is planned onto them), `download`, `logs`, `config`, `update`,
-and `sfctl recover` for when the server is wedged.
+`leases` (claim cards so nothing else is planned onto them), `tenants` (the other GPU programs on
+the box, with live health), `download`, `logs`, `config`, `update`, and `sfctl recover` for when the
+server is wedged.
 `sfctl mcp` is the stdio MCP bridge from path C.
 
 ## Ports
@@ -348,8 +354,9 @@ The same from a terminal, on any platform: `studioforge serve --open`, `studiofo
 
 | Path | What lives there |
 | --- | --- |
-| `src/studioforge/` | The app: `api/` (gateway + management routes), `core/` (registry, VRAM planner, supervisor, engine, leases, benchmarks, downloader), `gui/`, `mcp/` (21 tools), `tray/`, `watchdog/` (10 tools), `migrations/` |
+| `src/studioforge/` | The app: `api/` (gateway + management routes), `core/` (registry, VRAM planner, supervisor, engine, leases, benchmarks, downloader), `gui/`, `mcp/` (23 tools), `tray/`, `watchdog/` (10 tools), `migrations/` |
 | `packages/studioforge-companion/` | `sfctl` and the `sfctl mcp` bridge |
+| `packages/studioforge-tenant/` | The tenant SDK: lease a card, register, honour a vacate request ([`docs/TENANTS.md`](docs/TENANTS.md)) |
 | `launchers/` | Windows double-click launchers |
 | `deploy/` | Linux systemd user units |
 | `docs/` | Setup, OpenClaw, the catalog, benchmarking, the runbook, limitations |
@@ -363,6 +370,7 @@ The same from a terminal, on any platform: `studioforge serve --open`, `studiofo
 - [`docs/OPENCLAW-SETUP.md`](docs/OPENCLAW-SETUP.md) — two-machine install, verified step by step
 - [`docs/OPENCLAW.md`](docs/OPENCLAW.md) — the tool list and the loop an agent runs; pins and leases
 - [`docs/OPENCLAW-RIG.md`](docs/OPENCLAW-RIG.md) — the whole rig for one agent: identity, priority, leases, every failure code
+- [`docs/TENANTS.md`](docs/TENANTS.md) — the VRAM Tenant Protocol (`vt.1`): how other GPU programs on the box lease cards, register, and stand down
 - [`docs/CATALOG.md`](docs/CATALOG.md) — the model catalog an agent picks from, every column explained
 - [`docs/BENCHMARKING.md`](docs/BENCHMARKING.md) — the benchmarking playbook
 - [`docs/OPENCLAW-LONG-CONTEXT.md`](docs/OPENCLAW-LONG-CONTEXT.md) — what a long window really costs

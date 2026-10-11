@@ -85,6 +85,12 @@ EXPECTED_TOOLS = {
     # and an agent that only sees reserve_gpus does not know release exists.
     "reserve_gpus",
     "release_gpus",
+    # The tenant plane, read-only (D77): the lease book on its own, and the
+    # registry of programs sharing the cards. Two tools because an agent that
+    # only sees server_status does not know the registry exists, and neither
+    # may start, stop or warm anything -- warming is the GUI's and REST's.
+    "gpu_leases",
+    "gpu_tenants",
     # The HuggingFace pair, split for the same reason list_models and
     # model_options are: browsing is cheap and knows nothing about sizes,
     # choosing costs a remote GGUF header read and answers exactly.
@@ -297,6 +303,66 @@ async def test_tool_list_is_exactly_the_management_tools(state: State) -> None:
     server = build_management_mcp(state)
     names = {tool.name for tool in await server.list_tools()}
     assert names == EXPECTED_TOOLS
+
+
+async def test_gpu_leases_mirrors_the_lease_route_without_the_vacate_url(state: State) -> None:
+    """The MCP view is server_status's: ``vacate_registered`` yes, the URL never."""
+    server = build_management_mcp(state)
+    lease = state.manager.leases.acquire(
+        [1],
+        holder="speechforge",
+        priority=2,
+        vacate_url="http://127.0.0.1:1236/v1/speech/vacate",
+        vacate_token="vt_abcdef0123456789",  # scrub-ok: test fixture bearer
+    )
+    payload = await call(server, "gpu_leases")
+    assert payload["ok"] is True and payload["count"] == 1
+    (row,) = payload["leases"]
+    assert row["id"] == lease.id and row["holder_family"] == "speechforge"
+    assert row["vacate_registered"] is True and "vacate_url" not in row
+    assert "vt_abcdef" not in json.dumps(payload)
+    assert {"state", "kind", "priority", "retry_after_s", "expires_at"} <= set(row)
+
+
+async def test_gpu_tenants_mirrors_the_registry_with_urls_withheld(state: State) -> None:
+    from studioforge.config import TenantEntry, TenantsConfig
+    from studioforge.core.tenants import TenantRegistry
+
+    state.tenants = TenantRegistry(
+        TenantsConfig(
+            registry=[
+                TenantEntry(
+                    name="speechforge",
+                    kind="module",
+                    health_url="http://127.0.0.1:1236/health",
+                    warm_url="http://127.0.0.1:1236/v1/speech/warm",
+                    default_priority=2,
+                )
+            ]
+        ),
+        leases=state.manager.leases,
+    )
+    state.manager.leases.acquire([1], holder="speechforge-session", priority=2)
+    server = build_management_mcp(state)
+    payload = await call(server, "gpu_tenants")
+    assert payload["ok"] is True and payload["protocol"] == "vt.1" and payload["count"] == 1
+    (row,) = payload["tenants"]
+    assert row["name"] == "speechforge" and row["kind"] == "module"
+    assert row["health"]["state"] == "unpolled" and row["devices"] == [1]
+    assert row["health_target"] == "127.0.0.1:1236"
+    assert "health_url" not in row and "warm_url" not in row
+    assert "/v1/speech/warm" not in json.dumps(payload)
+    tools = {tool.name: tool for tool in await server.list_tools()}
+    for name in ("gpu_tenants", "gpu_leases"):
+        dumped = tools[name].model_dump(by_alias=True)
+        schema = dumped.get("inputSchema") or dumped.get("input_schema") or {}
+        assert schema.get("properties", {}) == {}, "read-only, no arguments"
+
+
+async def test_gpu_tenants_answers_empty_on_a_state_without_a_registry(state: State) -> None:
+    server = build_management_mcp(state)
+    payload = await call(server, "gpu_tenants")
+    assert payload == {"ok": True, "tenants": [], "count": 0, "protocol": "vt.1"}
 
 
 async def test_no_inference_tool_exists(state: State) -> None:

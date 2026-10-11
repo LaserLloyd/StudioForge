@@ -64,6 +64,7 @@ api/         FastAPI app and routes
   admin_routes.py  restart, update, connection info, /api/mcp/info
   health_routes.py /health
   auth.py          one dependency: API key, MCP pin, the D32 admin gate
+netguard.py    which hosts a tenant URL may name (loopback, tailnet, allowed_hosts)
   vision.py        image fetching for multimodal requests (SSRF guard)
 core/
   registry.py      scans model dirs, owns the sqlite records
@@ -72,7 +73,8 @@ core/
   catalog.py       the rows an agent picks from (docs/CATALOG.md)
   model_gate.py    "is what is loaded good enough?" — the routing gate (D52)
   manager.py       load/unload, pin reconciler (D41), rebalancer (D42)
-  leases.py        GPU leases (D43)
+  leases.py        GPU leases (D43), automatic placement (D78)
+  tenants.py       the tenant registry and its health poller (D77)
   supervisor.py    llama-server children: launch args, health, kill
   engine.py        versioned engine artifacts, download, source build, smoke test
   benchmark.py / parallel_bench.py   the two benchmarks (docs/BENCHMARKING.md)
@@ -80,7 +82,7 @@ core/
   gpu.py           NVML probe
 gui/           NiceGUI panel; tabs/ is one module per tab (dashboard, models, download,
                benchmark, chat, logs, server, setup)
-mcp/           management-plane MCP server (21 tools)
+mcp/           management-plane MCP server (23 tools)
 tray/          Windows notification-area app
 watchdog/      recovery sidecar: its own process, port and MCP server (10 tools)
 ```
@@ -106,9 +108,10 @@ depends on nothing above it. A change that makes `core` import from `api` is a c
    "`<kind>`, default `<x>`" is not explanation enough, and promote it out of Advanced into a named
    section by adding a `fields.row(...)` in `gui/tabs/setup.py` **and** listing it in that module's
    `COVERED_KEYS` — a test asserts every key has exactly one control.
-5. A key whose type is a mapping (`dict[int, int]`) is deliberately *not* generated: it needs a row
-   widget, like `planner.reserved_mb` has on the GPU card. Add it to
-   `gui/state.CUSTOM_WIDGET_KEYS` along with the widget, or the same test fails.
+5. A key whose type is a mapping (`dict[int, int]`) or a list of nested models
+   (`tenants.registry`) is deliberately *not* generated: it needs a row widget, like
+   `planner.reserved_mb` has on the GPU card. Add it to `gui/state.CUSTOM_WIDGET_KEYS` along with
+   the widget, or the same test fails.
 
 ## GUI theming
 

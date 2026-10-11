@@ -58,6 +58,7 @@ from studioforge.errors import (
     BadRequestError,
     ModelBusyError,
     ModelNotFoundError,
+    NotSupportedError,
     StudioForgeError,
 )
 from studioforge.logging import RING_BUFFER, get_logger
@@ -188,6 +189,9 @@ async def status(request: Request) -> dict[str, Any]:
     # /api/leases showed both, and `sfctl status` rendered "-" in the two
     # columns that answer "is this lease alive?". One projection, everywhere.
     data["leases"] = [lease_view(lease) for lease in state.manager.leases.all()]
+    # The tenant registry (D77): who shares the cards and whether each is up.
+    # Same projection GET /api/tenants gives a LAN reader -- URLs withheld.
+    data["tenants"] = _tenant_views(state, request)
     # A running benchmark was invisible here -- REST clients had to learn of
     # it from a 503 on their next POST. Present while one runs, null after.
     running = _benchmark_jobs(state).running()
@@ -437,7 +441,7 @@ async def list_leases(request: Request) -> dict[str, Any]:
 @router.post("/leases")
 async def create_lease(
     request: Request,
-    devices: list[int] = Body(...),
+    devices: list[int] | str | None = Body(None),
     model_ids: list[str] | None = Body(None),
     holder: str | None = Body(None),
     reason: str = Body(""),
@@ -446,8 +450,24 @@ async def create_lease(
     priority: int | None = Body(None),
     vacate_url: str | None = Body(None),
     vacate_token: str | None = Body(None),
+    min_free_gib: float | None = Body(None),
+    prefer: list[int] | None = Body(None),
+    avoid: list[int] | None = Body(None),
+    exclusive: bool = Body(True),
 ) -> dict[str, Any]:
     """Give CUDA ``devices`` to ``model_ids`` -- or, with none, to something outside this server.
+
+    ``devices`` may be ``"auto"`` or omitted (D78): the server picks ONE card the
+    way this grant judges a card -- never one with a busy resident, never a
+    leased one (automatic placement asks nobody to vacate), never a pinned or
+    better-tier idle resident without ``force``; then fewest evictions first,
+    the caller's ``prefer`` order, most free VRAM, lowest index. ``min_free_gib``
+    is measured against the card once its evictable idle residents are gone;
+    ``avoid`` rules cards out. The reply carries the chosen ``devices`` and a
+    ``placement`` block with every card ``considered``; so does a refusal, in
+    ``error.studioforge.considered``, under the usual codes. ``exclusive`` must
+    be ``true``: a lease is a whole card (the partial-card share lease is the
+    documented extension point, docs/TENANTS.md).
 
     While the lease stands nothing else is planned onto those cards; the named
     models are loaded onto exactly them, sized for as many slots as their
@@ -471,23 +491,40 @@ async def create_lease(
     ``Retry-After`` now. ``force`` never overrides a standing lease.
     """
     state = _state(request)
+    if exclusive is not True:
+        raise NotSupportedError(
+            "exclusive=false (a partial-card share lease) is not implemented: a lease is a "
+            "whole card. See docs/TENANTS.md, 'Extension point: share leases'.",
+            param="exclusive",
+        )
     client_label = (request.headers.get("x-sf-client") or "").strip()
     # The registering peer is the holder's proof on the open unload routes
     # (D55, ``may_unload_lease_held``): stored on the lease, never shown.
     peer = str(getattr(getattr(request, "client", None), "host", None) or "") or None
+    common: dict[str, Any] = {
+        "holder": (holder or "").strip() or client_label or "api",
+        "model_ids": model_ids or [],
+        "reason": reason,
+        "idle_ttl_s": idle_ttl_s,
+        "force": force,
+        "priority": priority,
+        "vacate_url": vacate_url,
+        "vacate_token": vacate_token,
+        "holder_peer": peer,
+    }
+    if devices is None or isinstance(devices, str):
+        if isinstance(devices, str) and devices.strip().lower() != "auto":
+            raise BadRequestError(
+                'devices must be a list of CUDA indices, "auto", or omitted', param="devices"
+            )
+        lease, placement = await state.manager.acquire_lease_auto(
+            min_free_gib=min_free_gib, prefer=prefer or [], avoid=avoid or [], **common
+        )
+        # The registrant just sent the URL: echoing it back tells it what was stored.
+        return {**lease_view(lease, reveal_vacate_url=True), "placement": placement.view()}
     lease = await state.manager.acquire_lease(
-        devices,
-        holder=(holder or "").strip() or client_label or "api",
-        model_ids=model_ids or [],
-        reason=reason,
-        idle_ttl_s=idle_ttl_s,
-        force=force,
-        priority=priority,
-        vacate_url=vacate_url,
-        vacate_token=vacate_token,
-        holder_peer=peer,
+        devices, min_free_gib=min_free_gib, prefer=prefer or [], avoid=avoid or [], **common
     )
-    # The registrant just sent the URL: echoing it back tells it what was stored.
     return lease_view(lease, reveal_vacate_url=True)
 
 
@@ -502,6 +539,133 @@ async def touch_lease(lease_id: str, request: Request) -> dict[str, Any]:
     """Restart the idle clock -- for a holder outside this server that is still busy."""
     state = _state(request)
     return lease_view(state.manager.touch_lease(lease_id))
+
+
+# ---------------------------------------------------------------------------
+# Tenants (D77): the programs that share this rig's cards
+# ---------------------------------------------------------------------------
+
+
+def _tenants(state: Any) -> Any:
+    registry = getattr(state, "tenants", None)
+    if registry is None:
+        # A state composed without one (older callers, some test harnesses):
+        # an empty registry rather than a 500 on every status read.
+        from studioforge.core.tenants import TenantRegistry
+
+        registry = TenantRegistry(leases=getattr(getattr(state, "manager", None), "leases", None))
+        state.tenants = registry
+    return registry
+
+
+def _tenant_views(state: Any, request: Request) -> list[dict[str, Any]]:
+    try:
+        reveal = is_admin_caller(request, state.config)
+        return list(_tenants(state).views(reveal_urls=reveal))
+    except Exception as exc:  # noqa: BLE001 - status must answer even when this cannot
+        log.debug("tenant views failed", error=str(exc))
+        return []
+
+
+@router.get("/tenants")
+async def list_tenants(request: Request) -> dict[str, Any]:
+    """Every known tenant: the operator's declarations merged with self-registrations.
+
+    Each row carries ``kind`` (``module`` = an optional add-on this server may
+    ask to warm, ``tenant`` = anything else that leases cards here), ``family``
+    (the ``holder_family`` its leases carry), ``registered`` and ``version``
+    (from its own ``POST /api/tenants/register``), ``health`` (the last probe of
+    its ``health_url``: ``healthy`` / ``unhealthy`` / ``unreachable`` /
+    ``unpolled``), its standing ``leases`` and the ``devices`` they cover. The
+    URLs themselves travel only to an admin caller (D32 as ``is_admin_caller``);
+    everyone else sees ``*_registered`` and the health endpoint's ``host:port``.
+    """
+    state = _state(request)
+    rows = _tenant_views(state, request)
+    return {"tenants": rows, "count": len(rows), "protocol": "vt.1"}
+
+
+@router.get("/tenants/{name}")
+async def get_tenant(name: str, request: Request) -> dict[str, Any]:
+    state = _state(request)
+    registry = _tenants(state)
+    return registry.view(registry.require(name), reveal_urls=is_admin_caller(request, state.config))
+
+
+@router.post("/tenants/register")
+async def register_tenant(
+    request: Request,
+    name: str = Body(...),
+    family: str | None = Body(None),
+    kind: str = Body("tenant"),
+    version: str | None = Body(None),
+    protocol: str | None = Body(None),
+    health_url: str | None = Body(None),
+    status_url: str | None = Body(None),
+    warm_url: str | None = Body(None),
+    vacate_url: str | None = Body(None),
+    default_priority: int = Body(3),
+    capabilities: list[str] | None = Body(None),
+    notes: str = Body(""),
+) -> dict[str, Any]:
+    """A tenant announces itself (D77). Re-sent at every boot; idempotent.
+
+    Same gate as ``POST /api/leases`` (D32): this machine, the MCP PIN, or a
+    key. ``name`` is the registry key and should be the tenant's
+    ``holder_family`` (lower-case); a name the operator declared in
+    ``tenants.registry`` keeps its declared ``kind``/``family``/``notes`` and
+    takes the URLs sent here. Every URL must be loopback, a tailnet address or
+    a host in ``tenants.allowed_hosts`` (``400 tenant_url_refused`` otherwise);
+    ``health_url`` is then polled every ``tenants.health_interval_s``.
+    ``protocol`` may be sent and must be ``vt.1``. StudioForge never starts or
+    stops the registrant (D79); registering says "I exist, here is where to
+    look", nothing more. The reply is the row as stored, URLs included.
+    """
+    state = _state(request)
+    peer = str(getattr(getattr(request, "client", None), "host", None) or "") or None
+    payload: dict[str, Any] = {
+        "name": name,
+        "family": family,
+        "kind": kind,
+        "version": version,
+        "protocol": protocol,
+        "health_url": health_url,
+        "status_url": status_url,
+        "warm_url": warm_url,
+        "vacate_url": vacate_url,
+        "default_priority": default_priority,
+        "capabilities": capabilities or [],
+        "notes": notes,
+    }
+    registry = _tenants(state)
+    record = registry.register(payload, peer=peer)
+    return registry.view(record, reveal_urls=True)
+
+
+@router.delete("/tenants/{name}")
+async def deregister_tenant(name: str, request: Request) -> dict[str, Any]:
+    """The tenant says goodbye. A row the operator declared stays, unregistered."""
+    state = _state(request)
+    registry = _tenants(state)
+    record = registry.deregister(name)
+    return {"deregistered": registry.view(record, reveal_urls=True)}
+
+
+@router.post("/tenants/{name}/warm")
+async def warm_tenant(name: str, request: Request) -> dict[str, Any]:
+    """Ask a ``module`` to warm up, by relaying one POST to its ``warm_url``.
+
+    The module decides what that means (load its models, open its session) and
+    answers; this returns its status and a bounded summary of its JSON body.
+    A tenant that is not a module, or registered no ``warm_url``, is a 400
+    ``tenant_not_warmable``; a module that does not answer 2xx is a 502
+    ``tenant_unreachable``. Nothing is launched: a module that is not running
+    is unreachable, and starting it is the operator's (D79).
+    """
+    state = _state(request)
+    registry = _tenants(state)
+    client_label = (request.headers.get("x-sf-client") or "").strip() or "studioforge"
+    return await registry.warm(name, requested_by=client_label)
 
 
 # ---------------------------------------------------------------------------
@@ -2000,7 +2164,7 @@ async def openclaw_setup(request: Request) -> JSONResponse:
                 "New model: search_models -> repo_details(repo_id) -> download_model.",
                 "VRAM missing: server_status names every holder; reclaim_orphan_engines "
                 "(watchdog) kills leaked engine processes and nothing else.",
-                "`sfctl mcp` merges the app's 21 management tools with the "
+                "`sfctl mcp` merges the app's 23 management tools with the "
                 "watchdog's 10 recovery tools into one stdio tool list (31).",
             ],
         }
