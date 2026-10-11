@@ -57,7 +57,7 @@ entirely — handy in CI.
 
 | Command | What it does |
 | --- | --- |
-| `sfctl status` | VRAM per GPU, loaded models with ctx/port/TTL countdown, queue depth, engine, uptime |
+| `sfctl status` | VRAM per GPU, loaded models with ctx/port/TTL countdown, standing leases, tenants, queue depth, engine, uptime |
 | `sfctl models list [--loaded] [--vision] [--kind K]` | Registry listing with capability badges |
 | `sfctl models info <model>` | Details, plus **requested** settings beside the **actual** running values from `llama-server` |
 | `sfctl models load <model> [--ctx N] [--kv-type T] [--parallel N] [--force]` | Shows the fit plan, then loads |
@@ -74,6 +74,8 @@ entirely — handy in CI.
 | `sfctl config-local set k=v` / `sfctl config-local path` | The **local** companion config |
 | `sfctl update [--engine TAG] [--check]` | Engine install / self-update; `--check` only reports |
 | `sfctl chat <model> [--system TEXT] [--temp F]` | Streaming terminal chat with a running tok/s |
+| `sfctl leases list\|add\|release\|touch` | The GPU lease book: who holds which card, for what, until when |
+| `sfctl tenants list` / `sfctl tenants warm <name>` | The other GPU programs on the box, with live health; ask a module to warm (never start it) |
 | `sfctl recover [--restart] [--kill MODEL] [--nuke]` | Talks to the **watchdog**, so it works when the server is wedged |
 | `sfctl openclaw-setup [--reveal-key]` | The snippets to paste into OpenClaw |
 | `sfctl mcp` | The stdio MCP server (see below) |
@@ -138,7 +140,7 @@ Add `"args": ["-s", "rig", "mcp"]` to pin a profile.
 
 `sfctl mcp` merges **two** upstream MCP servers into one list of **30 tools**.
 
-**Management** (the main app, `<url>/mcp`) — 20 tools:
+**Management** (the main app, `<url>/mcp`) — 23 tools:
 
 | Tool | What it does |
 | --- | --- |
@@ -152,6 +154,8 @@ Add `"args": ["-s", "rig", "mcp"]` to pin a profile.
 | `pin_model` | Keep a model loaded at all times (no idle TTL, never evicted, auto-loaded and reloaded); `pinned=false` unpins |
 | `reserve_gpus` | Give specific GPUs to one model (loaded there at its measured-fastest settings, auto-sized slots) or hold them for an outside program; auto-releases after `idle_ttl_s` |
 | `release_gpus` | End a reservation early by its lease id |
+| `gpu_leases` | Every standing lease with its clocks, class and `kind` — read-only |
+| `gpu_tenants` | Who shares the rig's GPUs (the tenant registry, docs/TENANTS.md): kind, health, version, leases — read-only |
 | `test_model` | Smoke-test end to end on an idle server and report tokens/second |
 | `benchmark_parallel` | Measure how many concurrent slots a model is worth running on a set of cards |
 | `search_models` | Browse HuggingFace. One thin row per repo — **no sizes**, HF publishes none at search time |

@@ -97,10 +97,14 @@ models_app = typer.Typer(help="Inspect and control models.", no_args_is_help=Tru
 config_app = typer.Typer(help="Read and change server-side configuration.", no_args_is_help=True)
 servers_app = typer.Typer(help="Manage local server profiles.", no_args_is_help=True)
 leases_app = typer.Typer(help="Claim and release GPUs (D43).", no_args_is_help=True)
+tenants_app = typer.Typer(
+    help="The programs sharing the rig's GPUs, with live health (D77).", no_args_is_help=True
+)
 app.add_typer(models_app, name="models")
 app.add_typer(config_app, name="config")
 app.add_typer(servers_app, name="servers")
 app.add_typer(leases_app, name="leases")
+app.add_typer(tenants_app, name="tenants")
 
 
 # ---------------------------------------------------------------------------
@@ -564,6 +568,12 @@ def status(json_out: bool = JSON_OPTION) -> None:
                 fmt_duration(expires - time.time()) if isinstance(expires, (int, float)) else "-",
             )
         console.print(lease_table)
+
+    # The tenant registry (D77) rides on the same payload: who else is on these
+    # cards and whether each is up. Older servers send no key; nothing printed.
+    tenants = payload.get("tenants") or []
+    if tenants:
+        console.print(_tenants_table(tenants))
 
     engine = payload.get("engine") or {}
     summary = _table("Field", "Value", title="Server")
@@ -2193,6 +2203,88 @@ def leases_release(lease_id: str, json_out: bool = JSON_OPTION) -> None:
     STATE.console.print(
         f"released {released.get('id', lease_id)}: GPU "
         f"{','.join(str(d) for d in released.get('devices') or [])} free"
+    )
+
+
+# ---------------------------------------------------------------------------
+# tenants (D77)
+# ---------------------------------------------------------------------------
+
+
+def _tenants_table(tenants: list[dict[str, Any]]) -> Table:
+    table = _table(
+        "Tenant", "Kind", "Health", "Version", "Class", "GPUs", "Leases", "Checked", title="Tenants"
+    )
+    for row in tenants:
+        health = row.get("health") or {}
+        checked = health.get("checked_at")
+        state = str(health.get("state") or "unpolled")
+        code = health.get("status_code")
+        if code is not None:
+            state = f"{state} ({code})"
+        elif health.get("error"):
+            state = f"{state} ({health['error']})"
+        table.add_row(
+            str(row.get("name") or "?"),
+            str(row.get("kind") or "tenant") + (" *" if row.get("registered") else ""),
+            state,
+            str(row.get("version") or "-"),
+            str(row.get("default_priority") or "-"),
+            ",".join(str(d) for d in row.get("devices") or []) or "-",
+            str(row.get("lease_count") or 0),
+            (
+                f"{fmt_duration(time.time() - checked)} ago"
+                if isinstance(checked, (int, float))
+                else "-"
+            ),
+        )
+    return table
+
+
+@tenants_app.command("list")
+def tenants_list(json_out: bool = JSON_OPTION) -> None:
+    """Every known tenant: kind, health, version, the cards it leases.
+
+    A ``*`` after the kind means the program registered itself this session
+    (``POST /api/tenants/register``); the others are the operator's declarations
+    in ``tenants.registry``. StudioForge never starts or stops one (D79): an
+    ``unreachable`` tenant is not running, and starting it is yours.
+    """
+
+    async def work(client: StudioForgeClient) -> Any:
+        return await client.tenants()
+
+    payload = with_client(work)
+    if want_json(json_out):
+        emit(payload)
+        return
+    tenants = payload.get("tenants") or []
+    if not tenants:
+        STATE.console.print(
+            "no tenants known (declare one in tenants.registry, or have it register itself)"
+        )
+        return
+    STATE.console.print(_tenants_table(tenants))
+
+
+@tenants_app.command("warm")
+def tenants_warm(name: str, json_out: bool = JSON_OPTION) -> None:
+    """Ask a module to warm up (load its models) through its own warm endpoint.
+
+    Relayed by the server; nothing is launched. A tenant that is not a module,
+    or registered no warm URL, is refused; a module that does not answer is
+    reported as unreachable.
+    """
+
+    async def work(client: StudioForgeClient) -> Any:
+        return await client.warm_tenant(name)
+
+    payload = with_client(work)
+    if want_json(json_out):
+        emit(payload)
+        return
+    STATE.console.print(
+        f"{payload.get('tenant', name)} answered {payload.get('status_code')} to the warm request"
     )
 
 

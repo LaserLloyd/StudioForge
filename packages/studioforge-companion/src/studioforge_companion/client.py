@@ -562,6 +562,22 @@ class StudioForgeClient:
     async def touch_lease(self, lease_id: str) -> Any:
         return await self.post(f"leases/{_path_segment(lease_id)}/touch")
 
+    # -- Tenants (D77) --------------------------------------------------------
+    #
+    # The programs sharing the rig's GPUs, with their live health. Read-only
+    # here except for ``warm_tenant``, which relays one POST to a module's own
+    # endpoint; the companion never starts a tenant any more than the server
+    # does (D79).
+
+    async def tenants(self) -> Any:
+        return await self.get("tenants")
+
+    async def tenant(self, name: str) -> Any:
+        return await self.get(f"tenants/{_path_segment(name)}")
+
+    async def warm_tenant(self, name: str) -> Any:
+        return await self.post(f"tenants/{_path_segment(name)}/warm")
+
     # -- Hugging Face -------------------------------------------------------
 
     async def hf_search(
