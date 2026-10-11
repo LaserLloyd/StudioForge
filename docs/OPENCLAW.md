@@ -88,11 +88,11 @@ others — want this shape:
 }
 ```
 
-`sfctl mcp` merges **two** upstream toolsets into one list of 31 tools:
+`sfctl mcp` merges **two** upstream toolsets into one list of 33 tools:
 
 | Tools | Source | Available when the main server is wedged? |
 | --- | --- | --- |
-| `list_models`, `model_options`, `model_info`, `plan_load`, `check_loaded_model`, `load_model`, `load_recommended`, `unload_model`, `pin_model`, `reserve_gpus`, `release_gpus`, `test_model`, `benchmark_parallel`, `search_models`, `repo_details`, `download_model`, `delete_model`, `server_status`, `connection_info`, `get_config`, `set_config` | main app | no |
+| `list_models`, `model_options`, `model_info`, `plan_load`, `check_loaded_model`, `load_model`, `load_recommended`, `unload_model`, `pin_model`, `reserve_gpus`, `release_gpus`, `gpu_leases`, `gpu_tenants`, `test_model`, `benchmark_parallel`, `search_models`, `repo_details`, `download_model`, `delete_model`, `server_status`, `connection_info`, `get_config`, `set_config` | main app | no |
 | `restart_server`, `kill_model`, `nuke_all_models`, `reclaim_orphan_engines`, `tail_logs`, `gpu_status`, `rollback_update`, `recovery_health`, `recovery_get_config`, `recovery_set_config` | watchdog sidecar | **yes** |
 
 That split is the point: when the main server locks up, OpenClaw still holds working tools to

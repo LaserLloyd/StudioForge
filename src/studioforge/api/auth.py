@@ -138,6 +138,9 @@ _ADMIN_MUTATION_PREFIXES: tuple[str, ...] = (
     "/api/vram/reclaim",
     "/api/downloads",
     "/api/leases",
+    # D77: registering, deregistering or warming a tenant is the same class of
+    # change as taking a lease -- it names URLs this server will then call.
+    "/api/tenants",
     # D55: creating one persists a registry row carrying a ``system_prompt``
     # that the gateway then applies to every request routed to that id, and the
     # id appears in ``/v1/models``. Deleting one was already gated by

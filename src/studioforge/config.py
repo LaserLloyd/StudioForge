@@ -19,6 +19,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import time
 from collections.abc import Sequence
 from pathlib import Path
@@ -804,6 +805,113 @@ class LeasesConfig(BaseModel):
     vacate_callback_timeout_s: PositiveFloat = 30.0
 
 
+#: The two shapes a tenant takes in the registry (D77). A ``module`` is an
+#: optional add-on this server shows in its GUI and may ASK to warm; a
+#: ``tenant`` is any other program that leases cards here. Neither is ever
+#: started or stopped by StudioForge (D79).
+TenantKind = Literal["module", "tenant"]
+#: Lower-case, starts with a letter or digit, dots/dashes/underscores inside.
+#: The same alphabet a lease ``holder`` uses, so a tenant's ``family`` and the
+#: ``holder_family`` of its leases are spelled the same way.
+TENANT_NAME_PATTERN = r"^[a-z0-9][a-z0-9._-]{0,63}$"
+
+
+class TenantEntry(BaseModel):
+    """One program the operator declares in ``tenants.registry`` (D77).
+
+    Declaring a tenant here puts it on the Tenants card with live health before
+    it has registered itself; a runtime ``POST /api/tenants/register`` under the
+    same ``name`` then adds its version, capabilities and vacate endpoint on
+    top. Every URL is validated against :mod:`studioforge.netguard` at load:
+    loopback, the tailnet range, or a host in ``tenants.allowed_hosts`` -- a
+    config file may not turn this server into a fetcher of arbitrary URLs any
+    more than a remote caller may.
+    """
+
+    name: str = Field(pattern=TENANT_NAME_PATTERN)
+    #: The ``holder_family`` this tenant's leases carry. Defaults to the name.
+    family: str | None = None
+    kind: TenantKind = "tenant"
+    #: GET every ``tenants.health_interval_s``; any 2xx is healthy.
+    health_url: str | None = None
+    #: A richer status document, shown as a link; never fetched by this server.
+    status_url: str | None = None
+    #: ``module`` only: ``POST /api/tenants/<name>/warm`` relays one POST here.
+    warm_url: str | None = None
+    #: The D46 class this tenant's leases are expected to carry.
+    default_priority: int = 3
+    notes: str = ""
+
+    @field_validator("default_priority")
+    @classmethod
+    def _check_priority(cls, v: int) -> int:
+        if isinstance(v, bool) or v not in (1, 2, 3):
+            raise ValueError("default_priority must be 1, 2 or 3 (the D46 tiers)")
+        return v
+
+    @field_validator("family")
+    @classmethod
+    def _check_family(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        text = v.strip().lower()
+        if not re.fullmatch(TENANT_NAME_PATTERN, text):
+            raise ValueError("family must be lower-case: letters, digits, '.', '-' or '_'")
+        return text
+
+    @property
+    def effective_family(self) -> str:
+        return self.family or self.name
+
+
+class TenantsConfig(BaseModel):
+    """The tenant registry's static half and its health poller (D77)."""
+
+    #: Tenants the operator declares. ``POST /api/tenants/register`` adds to
+    #: this at runtime; the two are merged by ``name``.
+    registry: list[TenantEntry] = Field(default_factory=list)
+    #: How often every registered ``health_url`` is polled.
+    health_interval_s: PositiveFloat = 30.0
+    #: Per-poll HTTP timeout. Two seconds: a health route that takes longer is
+    #: unhealthy for this purpose, and the poller must never pile up.
+    health_timeout_s: PositiveFloat = 2.0
+    #: Hosts, beyond loopback and the tailnet range, a tenant URL may name --
+    #: as IP literals or as names compared verbatim (never resolved).
+    allowed_hosts: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _check_urls(self) -> TenantsConfig:
+        from studioforge.netguard import TenantUrlError, validate_tenant_url
+
+        seen: set[str] = set()
+        for entry in self.registry:
+            if entry.name in seen:
+                raise ValueError(f"tenants.registry names {entry.name!r} twice")
+            seen.add(entry.name)
+            for field in ("health_url", "status_url", "warm_url"):
+                value = getattr(entry, field)
+                if value is None:
+                    continue
+                try:
+                    setattr(
+                        entry,
+                        field,
+                        validate_tenant_url(
+                            value,
+                            field=f"tenants.registry[{entry.name}].{field}",
+                            allowed_hosts=self.allowed_hosts,
+                        ),
+                    )
+                except TenantUrlError as exc:
+                    raise ValueError(str(exc)) from exc
+            if entry.warm_url and entry.kind != "module":
+                raise ValueError(
+                    f"tenants.registry[{entry.name}].warm_url is set but kind is "
+                    f"{entry.kind!r}; only a module may be asked to warm"
+                )
+        return self
+
+
 class BenchmarkConfig(BaseModel):
     #: The D46 class this server's OWN benchmark leases carry (D56). 2 = a
     #: dispatched agent's work: a benchmark may ask a background (class 3)
@@ -904,6 +1012,7 @@ class Config(BaseSettings):
     planner: PlannerConfig = Field(default_factory=PlannerConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     leases: LeasesConfig = Field(default_factory=LeasesConfig)
+    tenants: TenantsConfig = Field(default_factory=TenantsConfig)
     benchmark: BenchmarkConfig = Field(default_factory=BenchmarkConfig)
     hf: HfConfig = Field(default_factory=HfConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)

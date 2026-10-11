@@ -184,6 +184,22 @@ class LeaseNotFoundError(StudioForgeError):
     code = "lease_not_found"
 
 
+class TenantNotFoundError(StudioForgeError):
+    """No tenant of that name in the registry (D77)."""
+
+    status_code = 404
+    error_type = "invalid_request_error"
+    code = "tenant_not_found"
+
+
+class TenantUnreachableError(StudioForgeError):
+    """A relayed request to a tenant (its ``warm_url``) did not get a 2xx (D77)."""
+
+    status_code = 502
+    error_type = "server_error"
+    code = "tenant_unreachable"
+
+
 class UpstreamError(StudioForgeError):
     """llama-server returned an error or died mid-request."""
 

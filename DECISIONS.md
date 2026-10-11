@@ -7356,3 +7356,206 @@ asked only about the refused window and the first fitting rung, `None` when noth
 `test_planner_observed.py` / `test_planner_prediction_error.py`: the `measured x OBS_SAFETY`
 pins now state they are the below-the-weights rule, beside weights-exact versions (plan, note,
 margin band), and the uncorrectable-band walk runs at weight shares 0-95%.
+
+## D77 -- The VRAM Tenant Protocol (vt.1) and the tenant registry
+
+**Problem.** By D61 StudioForge was already the arbiter of the GPUs: leases (D43), the vacate ask
+(D56), persistence across its own restarts (D61), one failure-code table for two services
+(OPENCLAW-RIG.md). But every program that leased a card here was anonymous beyond a holder string,
+and every one of them had re-derived the same client from the route docstrings: ClawForge2's
+`comfy/lease.py` (adopt at boot, fail open, never force, a vacate route with a per-process token),
+SpeechForge's `lease.py` (S3: class 2, never force; S16: on an unreachable StudioForge load only
+onto a clearly free card), CrucibleForge's harness. Three implementations of one unwritten
+contract, three places for it to drift, and an operator who could see *that* CUDA 3 was leased by
+`speechforge` but not whether SpeechForge was up, what version it was, or where to look. The owner's
+request on 2026-10-11 named the gap: a generic interface that lets DisPatch, ClawForge and
+StudioForge "operate independently but work in conjunction and juggle based on priority".
+
+**Decision.** The contract is written down, versioned and named -- `docs/TENANTS.md`, the **VRAM
+Tenant Protocol `vt.1`** -- and the server gains the one piece it lacked, a registry of who the
+tenants are.
+
+1. **The protocol is the existing lease plane, named.** Concepts (tenant, module, holder family,
+   the three classes as `PRIORITY_CHAT` / `PRIORITY_AGENT` / `PRIORITY_BACKGROUND` -- a voice
+   session is class 2, SpeechForge S3's reasoning adopted verbatim), the lifecycle (acquire, touch,
+   release, expiry, restore), vacate (the callback body and headers, the drain budget
+   `leases.vacate_timeout_s`, the cooldown, `lease_vacating` vs `lease_conflict` with
+   `timed_out` / `undeliverable`), what StudioForge promises (no JIT placement onto a leased card; a
+   busy resident is never interrupted; idle residents are weighed against the claim's class; a lease
+   is never taken away), what a tenant must do (release its own stale leases at boot, never `force`,
+   keep its footprint on its leased cards, honour a vacate within the budget, register, fail open
+   only onto a clearly free card -- S16 is the reference), the exact HTTP contract with every code,
+   and the one rule that is new in print: **StudioForge never starts or stops a tenant** (D79).
+   Nothing in the lease semantics changed to write it; D43/D53/D56/D61 are cited, not amended.
+2. **A registry** (`core/tenants.py`, `TenantRegistry`). Two sources merged by `name`: the
+   operator's `tenants.registry` in config (`{name, family, kind, health_url, status_url,
+   warm_url, default_priority, notes}`) and runtime self-registration, `POST /api/tenants/register`
+   (`{name, family, kind, version, protocol, health_url, status_url, warm_url, vacate_url,
+   default_priority, capabilities, notes}`). A declared row keeps the operator's identity (`kind`,
+   `family`, `notes`, `default_priority`); the program may fill in its version, capabilities and
+   where it can be reached, never promote itself to a module. `DELETE /api/tenants/{name}` removes a
+   self-registered row and marks a declared one unregistered. Each row carries the tenant's slice
+   of the lease book -- every lease whose `holder_family` is the tenant's `family` -- so "who is on
+   CUDA 3 and are they up" is one read. `GET /api/tenants`, `/api/tenants/{name}`, and `tenants[]`
+   on `/api/status`.
+3. **Live health.** Every `health_url` is polled on `tenants.health_interval_s` (30 s) with
+   `tenants.health_timeout_s` (2 s), concurrently, on the primary instance only: any 2xx is
+   `healthy`, an answer that is not 2xx (a redirect included -- never followed) is `unhealthy`, no
+   answer is `unreachable` with the exception's class name (never its text, D6), no URL is
+   `unpolled`. A bounded `summary` lifts `status`/`state`/`ok`/`ready`/`version`/`loaded`/
+   `can_serve`/`device` from a JSON body and nothing else. Transitions are logged once; a steady
+   state is not. `last_seen` is the later of the last registration and the last healthy probe.
+4. **The host rule (SSRF).** Every URL the registry stores is one this process will later call, so
+   `netguard.py` closes the set of hosts: loopback in every spelling (`127.1`, `0x7f000001`,
+   IPv4-mapped IPv6 -- the same list D56 taught the vacate check), the tailnet range
+   `100.64.0.0/10`, and `tenants.allowed_hosts` (literals, or names compared verbatim). **DNS names
+   other than `localhost` are never resolved** -- a name that resolves elsewhere later is the
+   classic rebinding hole -- and `169.254.169.254` is refused like any other address. The rule
+   applies to the config file at load (a `config.yaml` may not turn the server into a fetcher any
+   more than a remote caller may) and to every registration (`400 tenant_url_refused`, naming the
+   field). Probes and relays run with `trust_env=False`, no redirects, and `X-SF-Client:
+   studioforge-tenants`.
+5. **`kind: module` and the warm relay.** A module is an optional add-on the GUI shows and may
+   *ask* to warm: `POST /api/tenants/{name}/warm` relays one `POST {requested_by, protocol}` to the
+   module's own `warm_url` (30 s) and returns its status and summary; `400 tenant_not_warmable`
+   for a plain tenant or a module without a URL, `502 tenant_unreachable` when it does not answer
+   2xx. That is the whole of the control StudioForge has over a module (D79). `warm_url` on a
+   `kind: tenant` row is refused in both the config and the registration.
+6. **Auth and exposure.** `/api/tenants` joins `_ADMIN_MUTATION_PREFIXES`: registering,
+   deregistering and warming take the same D32 gate as taking a lease (this machine, the PIN, a
+   key); reads stay open. URLs travel only to `is_admin_caller`; a LAN reader sees `*_registered`
+   booleans and `health_target` (`host:port`), exactly as `lease_view` treats `vacate_url`. The
+   registering `peer` is stored like `holder_peer` (D55) and shown to nobody. The registry is
+   in-memory: a restart loses self-registrations, which is why the protocol says "register at
+   every boot" and why the operator's declarations live in config -- the row that must survive a
+   restart is the operator's, and the program's half is a liveness fact that should be re-stated.
+7. **Surfaces.** The Dashboard's **Tenants** card (name, kind, health chip, registered badge,
+   version, class, cards and lease count, health clock, last seen; a **Warm** button on modules
+   behind the same confirm dialog and `require_local_admin` as every other box-changing button);
+   `sfctl tenants list`, `sfctl tenants warm <name>`, a Tenants table in `sfctl status`; the MCP
+   read-only tools `gpu_tenants` and `gpu_leases` (23 management tools now; both mirror the REST
+   rows with URLs withheld, as `server_status` withholds a vacate URL); `GET /api/capabilities`
+   features `tenant_registry`, `tenant_protocol_vt1`; `config.example.yaml` carries SpeechForge
+   (a module on `127.0.0.1:1236`) and ClawForge2 (a tenant) commented out, loopback only.
+8. **The SDK**: `packages/studioforge-tenant/` -- pure Python 3.12, `httpx` only, never imports
+   `studioforge`. `TenantClient(url, holder, priority, vacate_url=, vacate_token=, api_key=)`
+   with `acquire(devices="auto" | [n], *, min_free_gib, prefer, avoid, idle_ttl_s)` answering a
+   value -- `Granted` / `Refused(code, retry_after_s, considered)` / `Unreachable` /
+   `Unsupported` -- never an exception; `touch`, `release`, `ours`, `release_stale`, `touch_loop`
+   (touches only on activity, ends when the lease is gone), `register` / `deregister`,
+   `features` (D64 gating); and `vacate_asgi_route(token_matcher, on_vacate)` -- POST only,
+   loopback only, constant-time token compare, a 64 KiB body cap, `202 {accepted, lease_id}`, a
+   handler failure reported without its text. Its README says how SpeechForge and ClawForge2
+   would adopt it; neither repository is changed by this decision.
+
+**Tests.** `tests/unit/test_tenants.py` (the host rule table including every loopback spelling,
+the tailnet bounds, the metadata address, verbatim-only names; the config section and its refusals;
+registration, merge, deregistration, field-by-field validation; polling over `httpx.MockTransport`
+with all four states, the summary bound, the never-followed redirect, the interval loop and a clean
+stop; the warm relay and its two refusals; the REST gate from a LAN peer vs loopback, URLs withheld
+from a LAN reader, `/api/status` carrying the rows, a state without a registry still answering;
+the example config's two commented tenants). `tests/unit/test_mcp.py` (the two tools, their
+read-only schemas, the vacate URL and token absent). `tests/unit/test_tenant_sdk.py` (the wire body
+of every call, each server answer as its outcome value, stale release by family and never another
+family's lease, the touch loop's cadence and its end, registration without the token, the ASGI
+route's checks in order). `tests/unit/test_gui.py` pins `_warm_tenant_dialog` to
+`require_local_admin`; `test_docs.py` counts 23 and 33.
+
+## D78 -- `devices: "auto"`: the card chosen the way the grant judges one
+
+**Problem.** A tenant that wants "a card" had to pick one itself and discover the answer by
+refusal: SpeechForge walks `gpu.devices` in order and re-asks on a 503 or 409; ClawForge2 retries
+up to three alternative cards after a 503. Each walk re-implements, badly, the judgement
+`acquire_lease` already makes per card -- is a resident busy, is one pinned, is one a better class,
+is the card leased -- and none of them can see free VRAM after the evictions the grant would make.
+The result is several round trips per claim, each one evicting nothing and learning one fact.
+
+**Decision.** `POST /api/leases` takes `devices: "auto"` (or no `devices` at all), with optional
+`min_free_gib`, `prefer: [..]`, `avoid: [..]` and `exclusive: true`; the MCP `reserve_gpus` and
+explicit devices are unchanged.
+
+1. **One decision, the grant's own.** `choose_auto_devices` (`core/leases.py`) judges every card
+   the probe reports with the rules `acquire_lease` applies after the fact: a card in `avoid` is
+   out; a card any standing lease holds is out; a card with a busy or loading resident is out
+   (D36); a pinned idle resident rules a card out unless `force`; an idle resident of a strictly
+   better class than the claim rules it out unless `force` (D46 as D56 item 6 applies it -- an
+   equal class is displaceable, exactly as on named cards); `min_free_gib` is measured against the
+   probe's free bytes **plus the planner's own per-card estimate of each evictable idle resident**,
+   because that is what the card will have once the grant has run. What remains is ranked: fewest
+   evictions first (an empty card over one whose idle resident would have to reload later), then
+   the caller's `prefer` order, then most projected free VRAM, then the lowest index. One card is
+   chosen -- a lease is exclusive and a tenant that wants two asks twice or names them.
+2. **Automatic placement never asks anyone to vacate.** D56 is for a claim on *named* cards; an
+   ask for a card the asker did not need is noise, and a vacate's drain costs the holder real
+   work. If the only cards left are leased by a worse class with a vacate URL, the answer is the
+   book's `409 lease_conflict` saying so, and the tenant may name the card to invoke D56.
+3. **The refusal is the code a tenant already reads, chosen by what stood in the way.**
+   `503 model_busy` with `retry_after_s` when a busy resident did (waiting may help);
+   `409 lease_conflict` -- the book's own phrasing, `Retry-After` and all -- when leases did;
+   `409 lease_conflict` with `param: force` when only pins or better classes did;
+   `507 insufficient_vram` when `min_free_gib` did; a 400 when `avoid` named every card; and
+   `400 placement_unavailable` when the probe itself did not answer (name the devices). Every one
+   carries `error.studioforge.considered`: one row per card with its `verdict` (`chosen`,
+   `candidate`, `avoided`, `leased`, `busy`, `pinned`, `better_tier_resident`, `too_little_free`),
+   `free_gib`, `reclaimable_gib`, `projected_free_gib`, `residents`, `evictions`, `detail` -- so a
+   tenant can show its user why there was no card instead of "409".
+4. **The grant is the same grant.** `acquire_lease_auto` computes the placement once and calls
+   `acquire_lease` on the chosen card; a resident that became busy in between meets the grant's
+   usual 503. The reply carries the chosen `devices` and a `placement` block with the same
+   `considered` rows. `min_free_gib`/`prefer`/`avoid` beside explicit devices are a 400: they
+   steer a choice, and there is none.
+5. **`exclusive` is the marked seam.** A lease is a whole card; `exclusive: false` is
+   `400 unsupported` naming the extension point (TENANTS.md §10). The partial-card share lease --
+   "N GiB on card 3" -- was considered by SpeechForge's design (S3) and declined there because a
+   speech model and an LLM on one card compete for compute as well as memory and the jitter has
+   not been measured. When it is built, the request gains `reserve_gib`, the planner learns a
+   per-card reservation, and nothing in a tenant changes but one field.
+6. `LATEST_DECISION` 79 (with D79); capability `lease_auto_placement`.
+
+**Tests.** `tests/unit/test_lease_auto_placement.py`: table-driven over fake GPU states and
+resident tiers -- the empty-rig pick by free VRAM, an empty card over a fuller card with an idle
+resident (and the reclaimable estimate in the row), `prefer` within an eviction class and never
+over an empty card, `avoid`, leased/busy/pinned/better-tier verdicts with and without `force`, the
+claim's class against idle residents at 1/2/3, `min_free_gib` after evictions, an owner resident
+counting for nothing; the manager's grant on the chosen card evicting only there, each refusal's
+code and `considered`, no vacate clock touched, the steering validations and the explicit-devices
+400, the sick-probe 400; the route's `auto` and omitted forms with `placement`, the share-lease
+400, the bad-word 400, a refusal with `considered` and `Retry-After`. `test_leases.py` and
+`test_lease_vacate.py` untouched and green: explicit devices are byte-identical.
+
+## D79 -- StudioForge never starts or stops a tenant
+
+**Problem.** Once a server lists other programs with their health and offers a Warm button, the
+next request is obvious: "start SpeechForge from the StudioForge tray", "restart ClawForge2 when it
+goes unhealthy", "install the speech module from the Setup tab". Each of those turns StudioForge
+into a supervisor of processes it did not write, with their launchers, virtualenvs, update paths,
+crash loops and data directories -- the exact coupling the owner's request ruled out ("at the end
+each of these should operate independently"), and the exact failure that took ClawForge2 down for
+three hours on 2026-09-02 when an agent ran another program's launchers from the wrong place.
+
+**Decision.** StudioForge **shows and asks; it never launches, stops, restarts, installs or updates
+a tenant.** Concretely:
+
+1. The registry stores where to *look* (`health_url`, `status_url`) and where to *ask*
+   (`warm_url`, `vacate_url`). It stores no command line, no working directory, no launcher path,
+   and the config model has no field for one.
+2. A `module`'s only control is the warm relay -- one POST to the module's own endpoint, which the
+   module may answer with "no". A module that is not running is `unreachable`, and the Tenants
+   card, `sfctl tenants list` and the runbook all say the same thing: start it yourself.
+3. A tenant's health is reported, never acted on: no restart on `unhealthy`, no kill on
+   `unreachable`, no reclaim of a tenant's VRAM (D23 already promises foreign holders are never
+   killed from here). The only thing StudioForge ever does about a tenant's state is release its
+   leases when they idle out (D43) -- and that is the lease's clock, not a judgement about the
+   process.
+4. The symmetric rule holds for the tenants: the protocol gives them no route to start, stop or
+   restart StudioForge, and the SDK has no such call. Each program keeps its own repo, port,
+   launcher and update path; `vt.1` is only how they share the cards.
+5. **Why the rule is written down rather than assumed.** It is the kind of boundary that erodes
+   one reasonable feature at a time. A future "start module" button is a decision to supersede
+   this one, to be argued in a D-entry of its own, not a PR that adds a `command` field.
+
+**Surfaces.** `docs/TENANTS.md` (the rule in §0, §5 and §9), the Tenants card's note and warm
+dialog text, `sfctl tenants list --help`, the runbook's tenant section, the MCP `gpu_tenants`
+docstring, `TenantEntry`'s docstring. No code implements a launch, and `test_tenants.py` asserts
+that the config model carries no command, launcher, argv or working-directory field -- the shape a
+"start it for me" feature would need -- so adding one fails a test before it can be wired.

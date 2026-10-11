@@ -78,6 +78,11 @@ class GuiContext:
         return self._part("db")
 
     @property
+    def tenants(self) -> Any:
+        """The tenant registry (D77); ``None`` on a state composed without one."""
+        return self._part("tenants")
+
+    @property
     def refresh_interval(self) -> float:
         return max(0.5, float(self.config.gui.refresh_interval_s))
 

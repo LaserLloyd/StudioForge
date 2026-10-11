@@ -106,6 +106,8 @@ QUICK RECIPES -- copy these exact calls; every argument name is literal:
   give a model its own GPU(s)   reserve_gpus(devices=[0], model_id="<id>")
   release that reservation      release_gpus(lease_id="<lease id>")
   who is holding the cards?     server_status()  -> leases[].kind
+  every lease, with its clocks  gpu_leases()
+  who shares this rig's GPUs    gpu_tenants()    -> tenants[].health, .leases
   does it actually work?        test_model(model_id="<id>")
 Model ids come from list_models -- copy the `id` field exactly, slashes and
 all. The argument is always called model_id, never model or name.
@@ -1639,6 +1641,66 @@ def build_management_mcp(state: Any) -> MCPServer:
         return {"ok": True, "released": lease_view(lease)}
 
     @_guard
+    async def gpu_leases() -> dict[str, Any]:
+        """Every standing GPU lease, with its clocks and class -- read-only (D77).
+
+        The same records ``GET /api/leases`` publishes and ``server_status``
+        carries under ``leases``, on their own so a tenant-aware agent can read
+        the lease book without the rest of the status payload. Each row has
+        ``id``, ``devices``, ``holder``, ``holder_family``, ``kind``
+        (``benchmark`` / ``render`` / ``agent`` / ``other`` -- descriptive, not
+        policy), ``priority`` (the D46 class of the claim), ``state``
+        (``active`` / ``idle`` / ``expiring`` / ``vacating``), ``idle_s``,
+        ``expires_at`` and ``retry_after_s``. A holder's ``vacate_url`` is
+        never in this view (``vacate_registered`` says whether one exists) and
+        its token is never shown to anyone.
+
+        Branch on ``kind`` the way docs/OPENCLAW-RIG.md says: ``benchmark``
+        means stand down; ``render`` and ``agent`` mean wait ``retry_after_s``
+        and re-ask; ``vacating`` means that holder has been asked to leave.
+
+        Returns:
+            ``{"ok": true, "leases": [...], "count": n}``.
+        """
+        rows = [lease_view(lease) for lease in state.manager.leases.all()]
+        return {"ok": True, "leases": rows, "count": len(rows)}
+
+    @_guard
+    async def gpu_tenants() -> dict[str, Any]:
+        """Who shares this rig's GPUs, and whether each one is up -- read-only (D77).
+
+        The tenant registry: every program the operator declared in
+        ``tenants.registry`` plus every one that registered itself through
+        ``POST /api/tenants/register`` (the VRAM Tenant Protocol, vt.1,
+        docs/TENANTS.md). Per row: ``name``, ``family`` (the ``holder_family``
+        its leases carry, so you can match it against ``gpu_leases``), ``kind``
+        (``module`` = an optional add-on this server may be asked to warm,
+        ``tenant`` = anything else that leases cards here), ``registered`` and
+        ``version`` (from its own registration), ``capabilities``,
+        ``default_priority`` (the D46 class its claims normally carry),
+        ``health`` (``state`` is ``healthy`` / ``unhealthy`` / ``unreachable`` /
+        ``unpolled``, with ``checked_at``, ``status_code``, ``latency_ms`` and a
+        bounded ``summary`` of its health body), ``last_seen``, its standing
+        ``leases`` and the ``devices`` they cover.
+
+        What this never does: start or stop a tenant (D79). A tenant whose
+        health is ``unreachable`` is simply not running, and starting it is the
+        operator's. URLs are withheld in this view, as ``server_status``
+        withholds a lease's ``vacate_url``; ``health_target`` gives the
+        ``host:port`` of the health endpoint.
+
+        Returns:
+            ``{"ok": true, "tenants": [...], "count": n, "protocol": "vt.1"}``.
+        """
+        registry = getattr(state, "tenants", None)
+        if registry is None:
+            from studioforge.core.tenants import TenantRegistry
+
+            registry = TenantRegistry(leases=state.manager.leases)
+        rows = registry.views(reveal_urls=False)
+        return {"ok": True, "tenants": rows, "count": len(rows), "protocol": "vt.1"}
+
+    @_guard
     async def test_model(
         model_id: str, prompt: str | None = None, keep_loaded: bool = False
     ) -> dict[str, Any]:
@@ -2336,6 +2398,8 @@ def build_management_mcp(state: Any) -> MCPServer:
         pin_model,
         reserve_gpus,
         release_gpus,
+        gpu_leases,
+        gpu_tenants,
         search_models,
         repo_details,
         download_model,

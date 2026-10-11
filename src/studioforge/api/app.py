@@ -524,6 +524,13 @@ async def _boot(state: Any, *, start_background: bool) -> None:
                 await asyncio.to_thread(state.engine_manager.architecture_table, None)
             boot.set_phase("starting model manager")
             await state.manager.start()
+            # The tenant health poller (D77): one GET per tenant per interval,
+            # loopback/tailnet only. Primary instance only, like every other
+            # background worker here.
+            tenants = getattr(state, "tenants", None)
+            if tenants is not None:
+                with contextlib.suppress(Exception):
+                    tenants.start()
             # Resumes anything a crash left half-downloaded. Never fatal --
             # but never silent either: a queue that could not be read stays
             # "running" with no task behind it, and the log is the only place
@@ -611,6 +618,12 @@ def build_state(config: Config, *, version: str = __version__) -> Any:
     state.supervisor = supervisor  # type: ignore[attr-defined]
     state.manager = manager  # type: ignore[attr-defined]
     state.leases = leases  # type: ignore[attr-defined]
+    # The tenant registry (D77): the operator's declared tenants, joined at
+    # runtime by whatever registers itself. Shares the lease book so each
+    # tenant's row can show the leases its family holds.
+    from studioforge.core.tenants import TenantRegistry
+
+    state.tenants = TenantRegistry(config.tenants, leases=leases)  # type: ignore[attr-defined]
     downloader = Downloader(config, db)
     # A finished download must show up in /v1/models without a manual scan.
     downloader.subscribe(rescan_when_group_completes(downloader, registry))
@@ -723,6 +736,10 @@ def create_app(
                     await boot_task
             with contextlib.suppress(Exception):
                 await app.state.downloader.stop()
+            tenants = getattr(app.state, "tenants", None)
+            if tenants is not None:
+                with contextlib.suppress(Exception):
+                    await tenants.stop()
             with contextlib.suppress(Exception):
                 await app.state.manager.stop()
             # After the manager has stopped every model: the supervisor's own

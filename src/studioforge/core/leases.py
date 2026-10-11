@@ -1022,3 +1022,163 @@ async def send_vacate_request(
         return False, type(exc).__name__
     status = int(response.status_code)
     return 200 <= status < 300, str(status)
+
+
+# ---------------------------------------------------------------------------
+# Auto placement (D78): "a card", chosen the way the planner would
+# ---------------------------------------------------------------------------
+
+GIB = 1024**3
+
+#: Why a card was or was not chosen; every ``considered[]`` row carries one.
+VERDICT_CHOSEN = "chosen"
+VERDICT_CANDIDATE = "candidate"
+VERDICT_AVOIDED = "avoided"
+VERDICT_LEASED = "leased"
+VERDICT_BUSY = "busy"
+VERDICT_PINNED = "pinned"
+VERDICT_BETTER_TIER = "better_tier_resident"
+VERDICT_TOO_LITTLE_FREE = "too_little_free"
+
+
+class AutoPlacement:
+    """What ``devices: "auto"`` decided, and why, card by card.
+
+    ``devices`` is the chosen card as a one-element list, or ``None`` when
+    nothing fit; ``considered`` has one row per card the box has, in the order
+    they were ranked (the chosen card first), each with a ``verdict`` from the
+    ``VERDICT_*`` set and the numbers the verdict rests on. A tenant that is
+    refused can show its user exactly this list.
+    """
+
+    __slots__ = ("considered", "devices")
+
+    def __init__(self, devices: list[int] | None, considered: list[dict[str, Any]]) -> None:
+        self.devices = devices
+        self.considered = considered
+
+    @property
+    def refused(self) -> bool:
+        return self.devices is None
+
+    def verdicts(self) -> set[str]:
+        return {str(row["verdict"]) for row in self.considered}
+
+    def view(self) -> dict[str, Any]:
+        return {"mode": "auto", "devices": self.devices, "considered": list(self.considered)}
+
+
+def choose_auto_devices(
+    gpus: Iterable[Any],
+    residents: Iterable[Any],
+    book: LeaseBook,
+    *,
+    priority: int = PRIORITY_BACKGROUND,
+    owners: Iterable[str] = (),
+    force: bool = False,
+    min_free_gib: float | None = None,
+    prefer: Iterable[int] = (),
+    avoid: Iterable[int] = (),
+) -> AutoPlacement:
+    """Pick ONE card for an exclusive lease, the way the grant itself would judge it (D78).
+
+    The rules are the grant's own (:meth:`ModelManager.acquire_lease`), applied
+    per card before anything is touched:
+
+    * a card in ``avoid`` is out;
+    * a card any standing lease holds is out -- auto placement never asks a
+      holder to vacate (D56 is for a claim on *named* cards; an ask for a card
+      the asker did not need is noise);
+    * a card with a resident mid-request or still loading is out (D36);
+    * a card with a pinned idle resident is out unless ``force``;
+    * a card with an idle resident of a strictly better tier than ``priority``
+      is out unless ``force`` (D46, as D56 item 6 applies it);
+    * ``min_free_gib`` is measured against what the card would have once its
+      evictable idle residents were unloaded: the probe's free bytes plus the
+      planner's own per-card estimate for each of them.
+
+    What is left is ranked: fewest evictions first (an empty card over one whose
+    idle resident would have to reload later), then the caller's ``prefer``
+    order, then the most free VRAM, then the lowest index. ``owners`` are the
+    models the lease will name; a resident that IS an owner counts for nothing
+    against its card.
+    """
+    owner_ids = set(owners)
+    prefer_rank = {int(d): i for i, d in enumerate(prefer)}
+    avoid_set = {int(d) for d in avoid}
+    by_device: dict[int, list[Any]] = {}
+    for instance in residents:
+        plan = getattr(instance, "plan", None)
+        if plan is None or getattr(instance, "model_id", None) in owner_ids:
+            continue
+        for device in plan.devices:
+            by_device.setdefault(int(device), []).append(instance)
+    rows: list[dict[str, Any]] = []
+    for gpu in gpus:
+        device = int(gpu.index)
+        here = by_device.get(device, [])
+        free_now = int(getattr(gpu, "free_bytes", 0))
+        row: dict[str, Any] = {
+            "device": device,
+            "name": getattr(gpu, "name", None),
+            "free_gib": round(free_now / GIB, 2),
+            "reclaimable_gib": 0.0,
+            "residents": [i.model_id for i in here],
+            "verdict": VERDICT_CANDIDATE,
+            "detail": None,
+        }
+        rows.append(row)
+        if device in avoid_set:
+            row["verdict"] = VERDICT_AVOIDED
+            row["detail"] = "named in avoid"
+            continue
+        clash = book.conflicts([device])
+        if clash:
+            row["verdict"] = VERDICT_LEASED
+            row["detail"] = "; ".join(f"lease {lease.id} ({lease.holder})" for lease in clash)
+            row["leases"] = [lease.id for lease in clash]
+            continue
+        busy = [i for i in here if i.state == "loading" or i.active_requests > 0]
+        if busy:
+            row["verdict"] = VERDICT_BUSY
+            row["detail"] = ", ".join(f"{i.model_id} ({i.active_requests} in flight)" for i in busy)
+            continue
+        pinned = [i for i in here if i.ttl_s == 0]
+        if pinned and not force:
+            row["verdict"] = VERDICT_PINNED
+            row["detail"] = ", ".join(i.model_id for i in pinned)
+            continue
+        better = [i for i in here if i.priority < priority]
+        if better and not force:
+            row["verdict"] = VERDICT_BETTER_TIER
+            row["detail"] = ", ".join(f"{i.model_id} (priority {i.priority})" for i in better)
+            continue
+        reclaimable = 0
+        for instance in here:
+            per_gpu = getattr(instance.plan, "per_gpu_bytes", None) or {}
+            reclaimable += int(per_gpu.get(device) or per_gpu.get(str(device)) or 0)
+        row["reclaimable_gib"] = round(reclaimable / GIB, 2)
+        projected = free_now + reclaimable
+        row["projected_free_gib"] = round(projected / GIB, 2)
+        if min_free_gib is not None and projected < float(min_free_gib) * GIB:
+            row["verdict"] = VERDICT_TOO_LITTLE_FREE
+            row["detail"] = (
+                f"{projected / GIB:.1f} GiB would be free, {float(min_free_gib):.1f} asked"
+            )
+            continue
+        row["evictions"] = len(here)
+    candidates = [row for row in rows if row["verdict"] == VERDICT_CANDIDATE]
+    candidates.sort(
+        key=lambda row: (
+            int(row.get("evictions", 0)),
+            prefer_rank.get(int(row["device"]), len(prefer_rank)),
+            -float(row.get("projected_free_gib", row["free_gib"])),
+            int(row["device"]),
+        )
+    )
+    rejected = [row for row in rows if row["verdict"] != VERDICT_CANDIDATE]
+    chosen: list[int] | None = None
+    if candidates:
+        candidates[0]["verdict"] = VERDICT_CHOSEN
+        chosen = [int(candidates[0]["device"])]
+    return AutoPlacement(chosen, candidates + rejected)

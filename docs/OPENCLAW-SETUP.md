@@ -271,11 +271,11 @@ others — want this shape:
 `sfctl mcp` is a **stdio** server — OpenClaw launches it as a child process, and it reads the
 profile you created in Step 4 to find the rig. No ports, no extra credentials in the JSON.
 
-It merges two upstream tool sets into one list of **31 tools**:
+It merges two upstream tool sets into one list of **33 tools**:
 
 | Source | Tools | Works when the main server is wedged? |
 | --- | --- | --- |
-| Main app (20) | `list_models`, `model_options`, `model_info`, `check_loaded_model`, `load_model`, `load_recommended`, `unload_model`, `pin_model`, `reserve_gpus`, `release_gpus`, `test_model`, `benchmark_parallel`, `search_models`, `repo_details`, `download_model`, `delete_model`, `server_status`, `connection_info`, `get_config`, `set_config` | no |
+| Main app (23) | `list_models`, `model_options`, `model_info`, `plan_load`, `check_loaded_model`, `load_model`, `load_recommended`, `unload_model`, `pin_model`, `reserve_gpus`, `release_gpus`, `gpu_leases`, `gpu_tenants`, `test_model`, `benchmark_parallel`, `search_models`, `repo_details`, `download_model`, `delete_model`, `server_status`, `connection_info`, `get_config`, `set_config` | no |
 | Watchdog (10) | `restart_server`, `kill_model`, `nuke_all_models`, `reclaim_orphan_engines`, `tail_logs`, `gpu_status`, `rollback_update`, `recovery_health`, `recovery_get_config`, `recovery_set_config` | **yes** |
 
 That split is the entire point of the separate sidecar: when the main server locks up, OpenClaw
