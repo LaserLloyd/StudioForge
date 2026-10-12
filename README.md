@@ -3,6 +3,8 @@
 [![CI](https://github.com/LaserLloyd/StudioForge/actions/workflows/ci.yml/badge.svg)](https://github.com/LaserLloyd/StudioForge/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
+Run a computer as an AI server: a llama.cpp backend with an MCP control plane in front that automatically optimizes, loads and evicts models. Designed for a dedicated server machine or for other programs to call. OpenAI-compatible.
+
 A self-hosted, **GPU-only** LLM server: an OpenAI-compatible gateway over
 [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server`, with a model registry, a VRAM
 planner, a web control panel, a system tray, and an MCP control plane for agents. Built to replace
@@ -286,6 +288,10 @@ Every number in the panel is the *actual* one the engine reports — context, sl
 | Setup — a checklist, not a YAML file | Models — the library, indexed in place |
 | --- | --- |
 | ![Setup checklist](docs/images/setup.png) | ![Model library](docs/images/models.png) |
+
+![Download: search Hugging Face and queue GGUF downloads straight into your model directory](docs/images/download.png)
+
+![Server: health, bind address, gateway port, and every runtime setting in one place](docs/images/server.png)
 
 On Windows, the tray starts the server, restarts it if it crashes, and keeps the everyday actions
 one right-click away:
