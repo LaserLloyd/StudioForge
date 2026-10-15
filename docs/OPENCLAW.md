@@ -311,7 +311,7 @@ OpenClaw version, they have moved before):
 ```
 
 Use **one identity string per agent** and reuse it as the image service's `client` tag and as the
-`holder` of any lease that agent takes — see [OPENCLAW-RIG.md](OPENCLAW-RIG.md#identity-one-string-per-agent).
+`holder` of any lease that agent takes — see [OPENCLAW-RIG.md](OPENCLAW-RIG.md#4-identity-one-string-per-agent).
 
 **And say what the work is:** send `"priority": 2` in the body of every dispatched-agent request.
 Omitted means **3, background**, which a chat-tier or agent-tier load can hold off with a
@@ -965,7 +965,7 @@ smaller context that would fit, a cheaper KV cache type, or a smaller quant; ret
 cannot succeed. A `507 gpu_leased` never got as far as arithmetic and carries no suggestions: it
 has `error.studioforge.lease` (`kind`, `holder_family`, `retry_after_s`, `expires_at`) and a
 `Retry-After` header instead, and `kind` is the branch — see
-[the whole-rig page](OPENCLAW-RIG.md#leases-who-stands-down-for-whom) for the etiquette both
+[the whole-rig page](OPENCLAW-RIG.md#6-leases-who-stands-down-for-whom) for the etiquette both
 services share.
 
 **Loads are one at a time.** Two agents asking for two cold models at once do not race for the

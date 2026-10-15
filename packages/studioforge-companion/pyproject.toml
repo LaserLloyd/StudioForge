@@ -17,7 +17,19 @@ requires-python = ">=3.11"
 # root lands in the wheel as `dist-info/licenses/../../LICENSE`.
 license = "MIT"
 license-files = ["LICENSE"]
-keywords = ["llm", "llama.cpp", "mcp", "cli", "studioforge"]
+keywords = [
+    "llm", "llama.cpp", "mcp", "mcp-server", "cli", "studioforge", "remote-control", "openclaw",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 
 # Deliberately does NOT depend on `studioforge`. The companion is a pure
 # client: every piece of state (registry, planner, engine, config) lives on the
@@ -42,9 +54,11 @@ dev = [
 [project.scripts]
 sfctl = "studioforge_companion.cli:main"
 
-# [project.urls] is deliberately absent: the project has no public home yet,
-# and a placeholder URL is baked into every published wheel's metadata. Add
-# `Homepage = "https://github.com/<owner>/<repo>"` when there is one.
+[project.urls]
+Homepage = "https://www.laserlloyd.com/projects/studioforge-gpu-only-llm-server/"
+Repository = "https://github.com/LaserLloyd/StudioForge"
+Issues = "https://github.com/LaserLloyd/StudioForge/issues"
+Changelog = "https://github.com/LaserLloyd/StudioForge/blob/main/CHANGELOG.md"
 
 [build-system]
 requires = ["hatchling"]

@@ -5,14 +5,19 @@
 
 Run a computer as an AI server: a llama.cpp backend with an MCP control plane in front that automatically optimizes, loads and evicts models. Designed for a dedicated server machine or for other programs to call. OpenAI-compatible.
 
-A self-hosted, **GPU-only** LLM server: an OpenAI-compatible gateway over
-[llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server`, with a model registry, a VRAM
-planner, a web control panel, a system tray, and an MCP control plane for agents. Built to replace
-LM Studio as the backend for [OpenClaw](docs/OPENCLAW.md) — it listens on LM Studio's port, so
+**StudioForge is a self-hosted, GPU-only llama.cpp server for Windows and Linux**: an
+OpenAI-compatible gateway over [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server`,
+with a model registry, a VRAM planner, GPU leases for the other programs sharing the cards, a web
+control panel, a system tray, and MCP tools so an agent can run it from another machine. Built to
+replace LM Studio as the backend for [OpenClaw](docs/OPENCLAW.md) — it listens on LM Studio's port, so
 switching is a host change, not a rewrite.
 
-**Status:** v1.26-09-23. Windows is the reference platform and runs it daily; Linux is supported (CI
-runs both) and less battle-tested. Questions and bug reports: [Contact](#contact).
+**Status:** v1.26-09-23. `main` has moved on since (D71 to D79, see [`CHANGELOG.md`](CHANGELOG.md)).
+Windows is the reference platform and runs it daily; Linux is supported (CI runs both) and less
+battle-tested. Questions and bug reports: [Contact](#contact).
+
+**Read more:** [the StudioForge write-up](https://www.laserlloyd.com/projects/studioforge-gpu-only-llm-server/)
+on LaserLloyd.com, and the author's other [AI projects](https://www.laserlloyd.com/ai/).
 
 **On versions.** StudioForge is calendar-versioned: a major, then the release date. The display
 version lives in `src/studioforge/__init__.py` — `1.26-09-23` — and is what `GET /api/version`,
@@ -386,6 +391,19 @@ The same from a terminal, on any platform: `studioforge serve --open`, `studiofo
 - [`docs/RELEASING.md`](docs/RELEASING.md) — the version scheme, cutting a tag, what the updater expects
 - [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) · [`docs/COMPARISON.md`](docs/COMPARISON.md) — known limits; what was borrowed from Ollama, oobabooga, KoboldCpp, vLLM
 - [`DECISIONS.md`](DECISIONS.md) — architectural decisions, each with the measurement behind it
+- [`CHANGELOG.md`](CHANGELOG.md): releases, and which decisions each one carries
+
+## Related projects
+
+Same author, built to share one GPU box with StudioForge:
+
+- [ClawForge](https://github.com/LaserLloyd/ClawForge): an image-generation gateway over ComfyUI.
+  It takes a StudioForge GPU lease before it renders, so the two never plan onto the same card.
+- [SpeechForge](https://github.com/LaserLloyd/SpeechForge): a GPU speech server (streaming
+  speech-to-text and text-to-speech) that takes its card through a StudioForge GPU lease.
+- [DisPatch](https://github.com/LaserLloyd/DisPatch_Chat): a self-hosted AI chat app.
+- [ThemeForge](https://github.com/LaserLloyd/ThemeForge): the drop-in UI theme the control panel
+  uses ([`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md)).
 
 ## Contact
 

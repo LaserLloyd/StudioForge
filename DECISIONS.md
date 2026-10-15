@@ -21,7 +21,7 @@ one process hosting many) gives per-model crash isolation, per-model engine vers
 ## D2. Engine pinned to llama.cpp `b10425`, verified against the real binary
 
 **Decision:** pin `b10425` and download the official `llama-b10425-bin-win-cuda-13.3-x64` build
-(Linux: the matching `ubuntu-cuda` asset). Update path documented in [D3](#d3).
+(Linux: the matching `ubuntu-cuda` asset). Update path documented in [D3](#d3-engines-are-versioned-artifacts-under-enginestag-never-whatever-is-on-path).
 
 **Why:** the box has 2×RTX 5090 (Blackwell, sm_120) + 2×RTX 3090 (Ampere, sm_86). The prebuilt
 CUDA 13.3 binary was verified to enumerate all four devices:

@@ -13,7 +13,16 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
 license-files = ["LICENSE"]
-keywords = ["studioforge", "gpu", "vram", "lease", "tenant"]
+keywords = ["studioforge", "gpu", "vram", "lease", "gpu-lease", "tenant", "multi-gpu"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
 
 # httpx and nothing else. The SDK is a thin client over documented HTTP routes
 # (docs/TENANTS.md); it must install into any tenant's virtualenv without
@@ -22,6 +31,12 @@ keywords = ["studioforge", "gpu", "vram", "lease", "tenant"]
 dependencies = [
     "httpx>=0.27",
 ]
+
+[project.urls]
+Homepage = "https://www.laserlloyd.com/projects/studioforge-gpu-only-llm-server/"
+Repository = "https://github.com/LaserLloyd/StudioForge"
+Issues = "https://github.com/LaserLloyd/StudioForge/issues"
+Changelog = "https://github.com/LaserLloyd/StudioForge/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 dev = [
