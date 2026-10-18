@@ -17,15 +17,21 @@
 #                           an LM Studio one (including the relocated
 #                           `downloadsFolder` in ~/.lmstudio/settings.json).
 #                           models.extra_dirs adds more, scanned after it.
+#   server.host             127.0.0.1 = this machine only (the default). To
+#                           serve the network set 0.0.0.0 (and gui.host,
+#                           watchdog.host) -- the server then refuses to start
+#                           until an owner account or admin key exists.
 #   server.port             1234, the port LM Studio uses, so pointing an
 #                           existing OpenAI client here is a host change.
-#   server.api_key          null = open on your LAN/tailnet. Set it and it is
-#                           required on /v1, /api, /mcp and the watchdog.
+#   server.api_key          DEPRECATED single shared key; null = none. Set, it
+#                           is required on /v1, /api, /mcp and the watchdog and
+#                           is mirrored into the key table as the admin key
+#                           "legacy". Prefer scoped keys: `studioforge keys`.
 #                           Minimum 6 characters so log redaction can catch it.
-#   mcp.pin                 pairing code for the /mcp endpoint ONLY, separate
-#                           from the API key. Auto-generated on first run and
-#                           printed in the startup banner. Blank here on
-#                           purpose -- never commit a real one.
+#   mcp.pin                 DEPRECATED pairing code for the /mcp endpoint ONLY,
+#                           separate from the API key. Auto-generated on first
+#                           run and printed in the startup banner. Blank here
+#                           on purpose -- never commit a real one.
 #   models.default_ctx      the context FLOOR. The planner never recommends
 #                           less than this to buy an extra parallel slot.
 #   models.target_ctx       what every load AIMS for, halving down to what
@@ -68,22 +74,34 @@
 # Layout version of this file. Older files without it load as 1; leave it alone.
 schema: 1
 server:
-  host: 0.0.0.0
+  # Loopback by default: nothing is reachable from the network until you choose
+  # to expose it (`studioforge setup`). A non-loopback bind (0.0.0.0, a LAN
+  # address) refuses to start unless an owner account or an admin API key exists.
+  host: 127.0.0.1
   port: 1234
+  # DEPRECATED (2.0). Still works, and is mirrored into the key table as an
+  # admin key named "legacy". Prefer `studioforge keys create`.
   api_key: null
-  cors_origins:
-  - '*'
+  # Origins allowed to call the API from a browser (and to reach /mcp from one).
+  # Empty = none; non-browser clients are unaffected.
+  cors_origins: []
   cors_allow_credentials: false
+  tls:
+    # off | self_signed | cert. self_signed generates a certificate into the data
+    # directory on first use and shows its SHA-256 fingerprint in the panel.
+    mode: 'off'
+    cert_file: null
+    key_file: null
   drain_timeout_s: 30.0
   request_timeout_s: 900.0
 gui:
   enabled: true
-  host: 0.0.0.0
+  host: 127.0.0.1
   port: 8080
   refresh_interval_s: 2.0
 watchdog:
   enabled: true
-  host: 0.0.0.0
+  host: 127.0.0.1
   port: 1235
   poll_interval_s: 10.0
   health_timeout_s: 5.0
@@ -273,6 +291,10 @@ logging:
   # 0 never rotates.
   file_max_mb: 20
   file_backups: 5
+  # The audit log (logs/audit.jsonl: every admin mutation and mutating MCP call)
+  # rotates at this size (MiB) and keeps this many copies.
+  audit_file_max_mb: 10
+  audit_file_backups: 10
 update:
   # GitHub `owner/name` that publishes StudioForge releases, or null when there
   # is none yet: the self-update check then reports "not configured" without

@@ -18,6 +18,33 @@
       "surface": "api"
     },
     {
+      "code": "api_key_expired",
+      "docs": "errors/api_key_expired",
+      "error_type": "invalid_request_error",
+      "fix": "Create a replacement with `studioforge keys create` (optionally with --expires-in-days) and update the client.",
+      "http_status": 401,
+      "message": "The API key '{name}' expired.",
+      "surface": "api"
+    },
+    {
+      "code": "api_key_revoked",
+      "docs": "errors/api_key_revoked",
+      "error_type": "invalid_request_error",
+      "fix": "Create a replacement with `studioforge keys create`, or in the panel under Users & Keys, and update the client.",
+      "http_status": 401,
+      "message": "The API key '{name}' was revoked.",
+      "surface": "api"
+    },
+    {
+      "code": "auth_required_for_remote_bind",
+      "docs": "errors/auth_required_for_remote_bind",
+      "error_type": "invalid_request_error",
+      "fix": "Run `studioforge setup` (creates the owner account) or `studioforge keys create --scope admin`, then start again. To stay local-only instead, set server.host, gui.host and watchdog.host to 127.0.0.1.",
+      "http_status": null,
+      "message": "Refusing to start: {services} would listen on a non-loopback address ({hosts}) but no owner account or admin API key exists, so anyone on the network could drive this server.",
+      "surface": "startup"
+    },
+    {
       "code": "autostart_failed",
       "docs": "errors/autostart_failed",
       "error_type": "server_error",
@@ -297,12 +324,30 @@
       "surface": "api"
     },
     {
+      "code": "invalid_tls_config",
+      "docs": "errors/invalid_tls_config",
+      "error_type": "invalid_request_error",
+      "fix": "Set server.tls.mode to off, self_signed, or cert; with cert, point server.tls.cert_file and key_file at readable PEM files.",
+      "http_status": null,
+      "message": "TLS is misconfigured: {reason}.",
+      "surface": "startup"
+    },
+    {
       "code": "job_not_found",
       "docs": "errors/job_not_found",
       "error_type": "invalid_request_error",
       "fix": "List jobs with GET /api/benchmark/jobs; finished jobs are pruned.",
       "http_status": 404,
       "message": "Unknown benchmark job '{job_id}'.",
+      "surface": "api"
+    },
+    {
+      "code": "key_rate_limited",
+      "docs": "errors/key_rate_limited",
+      "error_type": "invalid_request_error",
+      "fix": "Wait for the Retry-After interval, or raise the key's limit (`studioforge keys create --rate-limit-rpm`, or recreate it without one).",
+      "http_status": 429,
+      "message": "The API key '{name}' is limited to {limit_rpm} requests per minute. Retry in {seconds}s.",
       "surface": "api"
     },
     {
@@ -432,12 +477,30 @@
       "surface": "api"
     },
     {
+      "code": "origin_not_allowed",
+      "docs": "errors/origin_not_allowed",
+      "error_type": "invalid_request_error",
+      "fix": "Call MCP from a non-browser client (no Origin header) or from a loopback page, or add the page's origin to server.cors_origins. This check exists to stop DNS-rebinding and cross-site pages from driving the management tools.",
+      "http_status": 403,
+      "message": "Refused: the request's Origin '{origin}' is not allowed to reach the MCP endpoint.",
+      "surface": "mcp"
+    },
+    {
       "code": "part_file_locked",
       "docs": "errors/part_file_locked",
       "error_type": "invalid_request_error",
       "fix": "Wait for the other download to finish or cancel it; do not start a second one.",
       "http_status": 409,
       "message": "Another writer already holds this partial download.",
+      "surface": "api"
+    },
+    {
+      "code": "permission_denied",
+      "docs": "errors/permission_denied",
+      "error_type": "invalid_request_error",
+      "fix": "Use a key with the scope the message names (read < inference < admin). Create one with `studioforge keys create --scope admin`, or in the panel under Users & Keys.",
+      "http_status": 403,
+      "message": "This credential's scope ({scope}) is not enough for {action}; it needs {needed}.",
       "surface": "api"
     },
     {

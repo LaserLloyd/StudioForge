@@ -8,6 +8,7 @@ here -- it stays on the OpenAI endpoints.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import re
 import time
 from typing import Any
@@ -62,6 +63,7 @@ from studioforge.errors import (
     StudioForgeError,
 )
 from studioforge.logging import RING_BUFFER, get_logger
+from studioforge.tlsutil import scheme_for
 from studioforge.types import AdapterAttachment, ModelSettings, VirtualPreset
 
 log = get_logger(__name__)
@@ -214,6 +216,9 @@ async def status(request: Request) -> dict[str, Any]:
     # release, `build` the commit (`unknown` from a wheel). Here as well as
     # on /health because `sfctl status` renders this payload.
     data["build"] = build_id()
+    from studioforge.tlsutil import describe_tls
+
+    data["tls"] = describe_tls(state.config)
     _attach_child_metrics(state, data)
     # Names every VRAM holder, says which GPU each one's memory is actually on
     # (``device_bytes``/``per_gpu_bytes``), and collapses desktop noise. Off the
@@ -1971,6 +1976,15 @@ async def set_config(request: Request, updates: dict[str, Any] = Body(...)) -> d
     ):
         setattr(state.config, section, getattr(updated, section))
     state.config.server.api_key = updated.server.api_key
+    if "server.api_key" in updates:
+        accounts = getattr(state, "accounts", None)
+        if accounts is not None:
+            # The deprecated key is mirrored into the key table (and the watchdog's
+            # snapshot) the moment it changes, so `keys list` never lags the config.
+            accounts.adopt_legacy_key(updated.server.api_key)
+    # The panel calls this handler with a stand-in request that has no .state.
+    with contextlib.suppress(AttributeError):
+        request.state.audit_target = ", ".join(changed)
     state.config.server.cors_origins = updated.server.cors_origins
     state.config.server.drain_timeout_s = updated.server.drain_timeout_s
     state.config.server.request_timeout_s = updated.server.request_timeout_s
@@ -2144,7 +2158,8 @@ async def openclaw_setup(request: Request) -> JSONResponse:
     # BIND address and is normally 0.0.0.0, so echoing it produced a placeholder
     # the user had to substitute by hand -- and the Tailscale address is the one
     # that keeps working across network changes, so it goes first.
-    endpoints = reachable_urls(config.server.port, host=config.server.host)
+    scheme = scheme_for(config)
+    endpoints = reachable_urls(config.server.port, host=config.server.host, scheme=scheme)
     host = endpoints[0]["ip"] if endpoints else "127.0.0.1"
     key = config.server.api_key or "not-required"
     # Same rule as /api/mcp/info: the PIN only goes out when a credential was
@@ -2154,7 +2169,7 @@ async def openclaw_setup(request: Request) -> JSONResponse:
     return JSONResponse(
         {
             "inference": {
-                "OPENAI_BASE_URL": f"http://{host}:{config.server.port}/v1",
+                "OPENAI_BASE_URL": f"{scheme}://{host}:{config.server.port}/v1",
                 "OPENAI_API_KEY": key,
             },
             # Two spellings, because clients disagree. OpenClaw's key is
@@ -2178,7 +2193,7 @@ async def openclaw_setup(request: Request) -> JSONResponse:
                 },
             },
             "companion_config": {
-                "server.url": f"http://{host}:{config.server.port}",
+                "server.url": f"{scheme}://{host}:{config.server.port}",
                 "server.api_key": key,
             },
             "endpoints": endpoints,
@@ -2198,7 +2213,7 @@ async def openclaw_setup(request: Request) -> JSONResponse:
                 "-> send the work to /v1 with the model id it returns and load nothing.",
                 'answer "no" -> list_models, take the recommended row, load_model(**load_args) '
                 "(or load_recommended(model_id, ctx_size)) with priority=2 for a dispatched agent.",
-                f"Send prompts to http://{host}:{config.server.port}/v1/chat/completions with "
+                f"Send prompts to {scheme}://{host}:{config.server.port}/v1/chat/completions with "
                 "X-SF-Client: <your agent name> and priority in the body (omitted = background).",
                 "507 gpu_leased: read error.studioforge.lease.kind -- benchmark means stand down, "
                 "render/agent means wait retry_after_s. 400 context_exceeded: shorten the prompt "

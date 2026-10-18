@@ -24,8 +24,9 @@ from typing import Any
 #: Where an error is rendered. ``api`` = the OpenAI-shaped HTTP envelope,
 #: ``stream`` = an SSE ``error`` event after the 200 has gone out, ``mcp`` = an
 #: MCP tool result, ``watchdog`` = the recovery sidecar, ``panel`` = the control
-#: panel's own HTTP surface.
-SURFACES = ("api", "stream", "mcp", "watchdog", "panel")
+#: panel's own HTTP surface, ``startup`` = a refusal to start (printed on the
+#: console and logged, never an HTTP response).
+SURFACES = ("api", "stream", "mcp", "watchdog", "panel", "startup")
 
 
 @dataclass(frozen=True)
@@ -114,6 +115,68 @@ _ENTRIES: tuple[ErrorEntry, ...] = (
         "Open the panel at the address it is served from. Behind a reverse proxy, forward "
         "the original Host header (proxy_set_header Host $host).",
         "panel",
+    ),
+    _e(
+        "permission_denied",
+        403,
+        _INVALID,
+        "This credential's scope ({scope}) is not enough for {action}; it needs {needed}.",
+        "Use a key with the scope the message names (read < inference < admin). Create one "
+        "with `studioforge keys create --scope admin`, or in the panel under Users & Keys.",
+    ),
+    _e(
+        "api_key_revoked",
+        401,
+        _INVALID,
+        "The API key '{name}' was revoked.",
+        "Create a replacement with `studioforge keys create`, or in the panel under Users & "
+        "Keys, and update the client.",
+    ),
+    _e(
+        "api_key_expired",
+        401,
+        _INVALID,
+        "The API key '{name}' expired.",
+        "Create a replacement with `studioforge keys create` (optionally with --expires-in-days) "
+        "and update the client.",
+    ),
+    _e(
+        "key_rate_limited",
+        429,
+        _INVALID,
+        "The API key '{name}' is limited to {limit_rpm} requests per minute. Retry in {seconds}s.",
+        "Wait for the Retry-After interval, or raise the key's limit (`studioforge keys create "
+        "--rate-limit-rpm`, or recreate it without one).",
+    ),
+    _e(
+        "origin_not_allowed",
+        403,
+        _INVALID,
+        "Refused: the request's Origin '{origin}' is not allowed to reach the MCP endpoint.",
+        "Call MCP from a non-browser client (no Origin header) or from a loopback page, or add "
+        "the page's origin to server.cors_origins. This check exists to stop DNS-rebinding and "
+        "cross-site pages from driving the management tools.",
+        "mcp",
+    ),
+    _e(
+        "auth_required_for_remote_bind",
+        None,
+        _INVALID,
+        "Refusing to start: {services} would listen on a non-loopback address ({hosts}) but no "
+        "owner account or admin API key exists, so anyone on the network could drive this server.",
+        "Run `studioforge setup` (creates the owner account) or `studioforge keys create --scope "
+        "admin`, then start again. To stay local-only instead, set server.host, gui.host and "
+        "watchdog.host to 127.0.0.1.",
+        "startup",
+    ),
+    _e(
+        "invalid_tls_config",
+        None,
+        _INVALID,
+        "TLS is misconfigured: {reason}.",
+        "Set server.tls.mode to off, self_signed, or cert; with cert, point server.tls.cert_file "
+        "and key_file at readable PEM files.",
+        "startup",
     ),
     # --- request validation ------------------------------------------------
     _e(

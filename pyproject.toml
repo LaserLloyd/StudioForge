@@ -42,12 +42,16 @@ dependencies = [
     "nicegui>=2.7",
     "huggingface-hub>=0.26",
     "nvidia-ml-py>=12.560",
-    "mcp>=1.2",
+    "mcp>=2.3,<3",  # 2.x: mcp.server.extension (tool-call policy), mcp_types, the 2026-07-28 revision
     "pillow>=11.0",
     "psutil>=6.1",
     "pystray>=0.19",
     "typer>=0.15",
     "rich>=13.9",
+    # Accounts and keys (W3): argon2id password hashes for the owner account, and
+    # the self-signed certificate for `server.tls.mode: self_signed`.
+    "argon2-cffi>=23.1",
+    "cryptography>=43",
     # Windows-only: job objects (children die with the supervisor, D23) and PDH
     # per-process VRAM attribution. Both degrade gracefully when absent, but a
     # fresh install must get them without being told (WP17 F10).
@@ -62,6 +66,10 @@ Changelog = "https://github.com/LaserLloyd/StudioForge/blob/main/CHANGELOG.md"
 Decisions = "https://github.com/LaserLloyd/StudioForge/blob/main/DECISIONS.md"
 
 [project.optional-dependencies]
+# OS keyring for hf.token and the owner password hash. Optional and soft-imported:
+# without it (headless Linux, minimal installs) the same secrets live in an
+# owner-only (0600) file under <data-dir>/secrets/.
+keyring = ["keyring>=25"]
 dev = [
     # The test stack has an upper bound because pytest-asyncio 0.x -> 1.x
     # changed fixture loop scoping and pytest majors move collection rules;

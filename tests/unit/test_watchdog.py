@@ -1509,10 +1509,22 @@ FORBIDDEN_PREFIXES = ("studioforge.core", "studioforge.api", "studioforge.db")
 # `logfiles` (D69 §15) is the same kind of leaf: the size-rotating handler for
 # watchdog.log and the backup naming ``tail_logs`` reads, standard library only
 # -- which ``test_logfiles_is_a_stdlib_only_leaf`` below keeps true.
+#
+# W3 added five more, all of the same kind (no import of core/api/db): the key
+# primitives and snapshot reader (`authkeys`), the append-only audit writer
+# (`auditlog`), the shared MCP tool policy (`mcp_policy`, which needs only the MCP
+# SDK), owner-only file writes (`secure_files`) and the TLS helper (`tlsutil`).
+# The watchdog verifies scoped keys against `keys.snapshot.json`, never the
+# database, so it still opens nothing the wedged app could be holding.
 ALLOWED_STUDIOFORGE = (
+    "studioforge.auditlog",
+    "studioforge.authkeys",
     "studioforge.config",
     "studioforge.credential_guard",
     "studioforge.logfiles",
+    "studioforge.mcp_policy",
+    "studioforge.secure_files",
+    "studioforge.tlsutil",
     "studioforge.watchdog",
 )
 

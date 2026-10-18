@@ -78,6 +78,8 @@ import psutil
 import yaml
 from mcp.server.mcpserver import MCPServer
 
+from studioforge.auditlog import AuditLog
+from studioforge.authkeys import LOCAL_ADMIN, Principal, SnapshotVerifier, origin_allowed
 from studioforge.config import (
     RESTART_REQUIRED_KEYS,
     Config,
@@ -87,6 +89,9 @@ from studioforge.config import (
 )
 from studioforge.credential_guard import CredentialGuard, client_key
 from studioforge.logfiles import backups_of
+from studioforge.mcp_policy import PolicyExtension, annotations_for
+from studioforge.secure_files import write_private
+from studioforge.tlsutil import TlsError, resolve_tls, scheme_for
 
 log = logging.getLogger("studioforge.watchdog")
 
@@ -947,7 +952,9 @@ class Watchdog:
         payload = yaml.safe_dump(config.to_yaml_dict(), sort_keys=False, default_flow_style=False)
         tmp = target.with_name(target.name + f".watchdog-{os.getpid()}.tmp")
         try:
-            tmp.write_text(payload, encoding="utf-8")
+            # config.yaml carries server.api_key / mcp.pin: owner-only, like
+            # Config.save() writes it.
+            write_private(tmp, payload)
             tmp.replace(target)
         finally:
             with contextlib.suppress(OSError):
@@ -974,7 +981,12 @@ class Watchdog:
     ) -> tuple[bool, str | None, Any]:
         """One HTTP GET. Returns ``(ok, error, parsed_body)``; never raises."""
         try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
+            # An https URL here is always one of OUR listeners on this machine
+            # (server.tls), possibly with a self-signed certificate that names
+            # no address: nothing to verify, nobody on the path.
+            async with httpx.AsyncClient(
+                timeout=timeout, verify=not url.startswith("https://")
+            ) as client:
                 response = await client.get(url)
         except httpx.TimeoutException:
             return False, f"timed out after {timeout:g}s", None
@@ -991,7 +1003,7 @@ class Watchdog:
         host = config.server.host
         if host in ("0.0.0.0", "::", ""):
             host = "127.0.0.1"
-        return f"http://{host}:{config.server.port}/health"
+        return f"{scheme_for(config)}://{host}:{config.server.port}/health"
 
     # -- health ----------------------------------------------------------
 
@@ -1922,12 +1934,110 @@ class Watchdog:
 # ---------------------------------------------------------------------------
 
 
-def build_watchdog_mcp(watchdog: Watchdog) -> MCPServer:
+def _header(headers: Any, name: str) -> str | None:
+    """A header from a mapping, case-insensitively (Starlette's is; a plain dict is not)."""
+    getter = getattr(headers, "get", None)
+    value = getter(name) if callable(getter) else None
+    if value is None:
+        wanted = name.lower()
+        try:
+            for key in headers:
+                if str(key).lower() == wanted:
+                    value = headers[key]
+                    break
+        except TypeError:
+            return None
+    return str(value).strip() if value else None
+
+
+def _bearer(headers: Any) -> str | None:
+    authorization = _header(headers, "authorization")
+    if authorization:
+        prefix, _, token = authorization.partition(" ")
+        if prefix.lower() == "bearer" and token.strip():
+            return token.strip()
+        if " " not in authorization:
+            return authorization
+    return _header(headers, "x-api-key")
+
+
+def _pin_header(headers: Any) -> str | None:
+    return _header(headers, "x-mcp-pin") or _header(headers, "x-studioforge-pin")
+
+
+class _Access:
+    """What the watchdog accepts as a credential, re-read from disk on every call.
+
+    The legacy ``server.api_key``, the deprecated ``mcp.pin`` and the scoped keys
+    in ``keys.snapshot.json`` (written by the main app; the watchdog never opens
+    its database). One instance serves the HTTP wrapper and the MCP policy layer
+    so the two cannot disagree about who is who.
+    """
+
+    def __init__(self, watchdog: Watchdog) -> None:
+        self.watchdog = watchdog
+        self._verifier: SnapshotVerifier | None = None
+        self._audit: AuditLog | None = None
+
+    def config(self) -> Config:
+        try:
+            current, _ = self.watchdog.load_config()
+        except Exception:  # noqa: BLE001 - an unreadable config degrades to defaults
+            current = Config(data_dir=resolve_data_dir(self.watchdog.config_path, explicit=True))
+        return current
+
+    def verifier(self) -> SnapshotVerifier:
+        if self._verifier is None:
+            data_dir = resolve_data_dir(self.watchdog.config_path, explicit=True)
+            self._verifier = SnapshotVerifier(data_dir)
+        return self._verifier
+
+    def audit(self) -> AuditLog | None:
+        config = self.config()
+        if self._audit is None or self._audit.path.parent != config.logs_dir:
+            self._audit = AuditLog(
+                config.logs_dir,
+                max_mb=config.logging.audit_file_max_mb,
+                backups=config.logging.audit_file_backups,
+            )
+        return self._audit
+
+    def origins(self) -> list[str]:
+        return list(self.config().server.cors_origins)
+
+    def enforced(self, api_key: str | None, pin: str | None) -> bool:
+        return bool(api_key or pin or self.verifier().has_keys())
+
+    def principal(self, headers: Any) -> Principal | None:
+        """Who these headers belong to; ``None`` = nobody; open install = local."""
+        current = self.config()
+        api_key = current.server.api_key
+        mcp_config = getattr(current, "mcp", None)
+        pin = getattr(mcp_config, "pin", None) if mcp_config else None
+        provided = _bearer(headers)
+        header_pin = _pin_header(headers)
+        if api_key and provided and _constant_time_eq(provided, api_key):
+            return Principal("legacy", "", "legacy", "admin")
+        found = self.verifier().verify(provided)
+        if found is not None:
+            return found
+        candidate = header_pin or provided
+        if pin and candidate and _constant_time_eq(candidate, str(pin)):
+            return Principal("pin", "", "mcp-pin", "admin")
+        if not self.enforced(api_key, str(pin) if pin else None):
+            # Open install: the HTTP wrapper only lets this machine through.
+            return LOCAL_ADMIN
+        return None
+
+
+def build_watchdog_mcp(watchdog: Watchdog, access: _Access | None = None) -> MCPServer:
     """Wrap a :class:`Watchdog` in an MCP server exposing the recovery tools."""
+    access = access or _Access(watchdog)
     server: MCPServer = MCPServer(
         name=SERVER_NAME,
         title="StudioForge recovery watchdog",
         instructions=INSTRUCTIONS,
+        extensions=[PolicyExtension("watchdog", access.principal, access.audit)],
     )
 
     @_guard
@@ -2255,7 +2365,7 @@ def build_watchdog_mcp(watchdog: Watchdog) -> MCPServer:
         gpu_status,
         rollback_update,
     ):
-        server.add_tool(tool)
+        server.add_tool(tool, annotations=annotations_for("watchdog", tool.__name__))
 
     return server
 
@@ -2324,14 +2434,23 @@ async def _send_json(
     await send({"type": "http.response.body", "body": body})
 
 
+def _scope_header(scope: dict[str, Any], name: bytes) -> str | None:
+    for key, value in scope.get("headers") or []:
+        if key.lower() == name:
+            return str(value.decode("latin-1")).strip()
+    return None
+
+
 def wrap_asgi(
     inner: Any,
     watchdog: Watchdog,
     api_key: str | None = None,
     *,
     credentials: Callable[[], tuple[str | None, str | None]] | None = None,
+    access: _Access | None = None,
+    mcp_path: str = "/mcp",
 ) -> Any:
-    """Add a plain ``GET /health`` and optional bearer auth around the MCP app.
+    """Add a plain ``GET /health`` and the access rules around the MCP app.
 
     Written as a bare ASGI callable rather than Starlette middleware to keep the
     watchdog's own import surface as small as possible, and because the health
@@ -2347,7 +2466,30 @@ def wrap_asgi(
     surface until the watchdog restarted. The static ``api_key`` parameter is
     kept for callers (and tests) that want a fixed key. The MCP pairing PIN is
     accepted as an alternative bearer, mirroring the main app's ``/mcp``.
+
+    ``access`` adds the rest of the credential model: scoped API keys (verified
+    against ``keys.snapshot.json``, never the database), the Origin allowlist for
+    the MCP path and ``POST /restart``, and the audit line for ``POST /restart``.
+    Without it the wrapper behaves as it always did.
     """
+
+    def _audit(
+        action: str, *, actor: str, result: str, scope: dict[str, Any], detail: str = ""
+    ) -> None:
+        log_target = access.audit() if access is not None else None
+        if log_target is None:
+            return
+        client = scope.get("client")
+        peer = str(client[0]) if client else None
+        log_target.record(
+            actor=actor,
+            action=action,
+            target=scope.get("path", ""),
+            result=result,
+            surface="watchdog",
+            peer=peer,
+            detail=detail or None,
+        )
 
     async def app(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if scope["type"] != "http":
@@ -2357,6 +2499,8 @@ def wrap_asgi(
         method = scope.get("method", "GET")
         expected_key, expected_pin = credentials() if credentials else (api_key, None)
         local_peer = _peer_is_loopback(scope)
+        verifier = access.verifier() if access is not None else None
+        has_keys = bool(verifier and verifier.has_keys())
         if path.rstrip("/") in ("/health", "/healthz") and method == "GET":
             result = await watchdog.health()
             status = 200 if result.get("status") in ("up", "degraded") else 503
@@ -2366,20 +2510,52 @@ def wrap_asgi(
             # anyone who could reach 0.0.0.0:1235 with no credential at all.
             # Liveness stays open, because that is what /health is for; the
             # detail now takes the same proof every other route here takes.
-            if not local_peer and not _credential_ok(scope, expected_key, expected_pin):
+            if not local_peer and not _credential_ok(scope, expected_key, expected_pin, verifier):
                 result = _public_health(result)
             await _send_json(send, status, result)
             return
         restart_route = path.rstrip("/") == "/restart" and method == "POST"
-        # Enforce whenever EITHER credential exists. Gating on the key alone
+        on_mcp = path == mcp_path or path.startswith(mcp_path.rstrip("/") + "/")
+        # Origin gate: a browser page not on the allowlist (DNS rebinding, a
+        # drive-by cross-site page) never reaches the recovery tools, whatever
+        # credential it could present. Non-browser clients send no Origin.
+        if access is not None and method != "OPTIONS" and (on_mcp or restart_route):
+            origin = _scope_header(scope, b"origin")
+            if not origin_allowed(origin, access.origins()):
+                log.warning("watchdog request refused: Origin %r is not allowed (%s)", origin, path)
+                _audit(
+                    f"watchdog.{method} {path}",
+                    actor="anonymous",
+                    result="denied",
+                    scope=scope,
+                    detail=f"origin {origin}",
+                )
+                await _send_json(
+                    send,
+                    403,
+                    {
+                        "error": {
+                            "message": (
+                                f"Refused: the request's Origin '{origin}' is not allowed to "
+                                "reach the watchdog. Call it from a non-browser client or add "
+                                "the page's origin to server.cors_origins."
+                            ),
+                            "type": "invalid_request_error",
+                            "code": "origin_not_allowed",
+                        }
+                    },
+                )
+                return
+        principal: Principal | None = None
+        # Enforce whenever ANY credential exists. Gating on the key alone
         # left this surface wide open in the default install, where
         # `server.api_key` is unset and only the MCP pairing PIN is set: the
         # main app still demanded the PIN on /mcp, while the watchdog -- which
         # carries the destructive tools (nuke_all_models, kill_model,
         # restart_server, set_config) and POST /restart -- accepted anyone.
         # That inverted the rule that the control plane is never the
-        # least-protected surface. Open only when neither credential is set.
-        if expected_key or expected_pin:
+        # least-protected surface. Open only when none is set.
+        if expected_key or expected_pin or has_keys:
             provided = _bearer_from_headers(scope.get("headers") or [])
             pin_carrier = _pin_from_request(scope)
             peer = _peer_key(scope) if (provided or pin_carrier) else None
@@ -2417,9 +2593,16 @@ def wrap_asgi(
                 candidate is not None and _constant_time_eq(candidate, expected_pin)
                 for candidate in (provided, pin_carrier)
             )
-            if key_ok or pin_ok:
+            scoped = verifier.verify(provided) if (verifier is not None and provided) else None
+            if key_ok:
+                principal = Principal("legacy", "", "legacy", "admin")
+            elif scoped is not None:
+                principal = scoped
+            elif pin_ok:
+                principal = Principal("pin", "", "mcp-pin", "admin")
+            if principal is not None:
                 _CREDENTIAL_GUARD.record_success(peer)
-            if not key_ok and not pin_ok:
+            else:
                 if provided or pin_carrier:
                     _CREDENTIAL_GUARD.record_failure(peer)
                 query_note = (
@@ -2436,14 +2619,15 @@ def wrap_asgi(
                             "message": (
                                 "This endpoint needs a credential. The watchdog "
                                 "accepts the same server.api_key as the main server, "
-                                "or the MCP pairing PIN when no key is set -- as "
-                                "'Authorization: Bearer <credential>', as the "
+                                "a scoped API key (`studioforge keys create`), or the "
+                                "(deprecated) MCP pairing PIN -- as "
+                                "'Authorization: Bearer <credential>' or the "
                                 "'X-MCP-Pin' header. The PIN is "
                                 "on the control panel (Setup -> Network & access -> "
                                 "the eye button next to 'MCP pairing PIN'), in "
                                 "`studioforge config` on the host, and at GET "
                                 "/api/mcp/info from the host itself. For sfctl: "
-                                "`sfctl servers add rig <url> --api-key <PIN> --use`." + query_note
+                                "`sfctl servers add rig <url> --api-key <key> --use`." + query_note
                             ),
                             "type": "invalid_request_error",
                             "code": "invalid_api_key",
@@ -2476,7 +2660,8 @@ def wrap_asgi(
                         "message": (
                             "This watchdog has no credential configured, so it accepts "
                             "management requests only from the machine it runs on. Set "
-                            "server.api_key, or set an MCP pairing PIN (control panel -> "
+                            "server.api_key, create an API key (`studioforge keys create`), "
+                            "or set an MCP pairing PIN (control panel -> "
                             "Setup -> Network & access), and send it as "
                             "'Authorization: Bearer <credential>' or 'X-MCP-Pin'. "
                             "GET /health stays open."
@@ -2493,12 +2678,43 @@ def wrap_asgi(
         # tools/call over streamable-HTTP first needs an initialize handshake
         # and a session id -- machinery that is exactly what tends to be broken
         # when someone reaches for the recovery sidecar. Same auth as the rest
-        # of the surface; ``/health`` remains the only open route.
+        # of the surface; ``/health`` remains the only open route. Restarting is
+        # destructive, so a scoped key needs the admin scope for it.
         if restart_route:
+            actor = principal.actor if principal is not None else "local"
+            if principal is not None and not principal.allows("admin"):
+                _audit(
+                    "watchdog.restart",
+                    actor=actor,
+                    result="denied",
+                    scope=scope,
+                    detail="needs admin",
+                )
+                await _send_json(
+                    send,
+                    403,
+                    {
+                        "error": {
+                            "message": (
+                                f"This credential's scope ({principal.scope}) is not enough for "
+                                "POST /restart; it needs admin."
+                            ),
+                            "type": "invalid_request_error",
+                            "code": "permission_denied",
+                        }
+                    },
+                )
+                return
             log.warning("POST /restart accepted; restarting the main server")
             result = await watchdog.restart_server(confirm=True)
             log.warning(
                 "POST /restart finished: ok=%s new_pid=%s", result.get("ok"), result.get("new_pid")
+            )
+            _audit(
+                "watchdog.restart",
+                actor=actor,
+                result="ok" if result.get("ok") else "error",
+                scope=scope,
             )
             # The caller is normally the very process we just killed, so writing
             # the reply can fail on a closed connection. That is the successful
@@ -2593,7 +2809,10 @@ def _peer_is_loopback(scope: dict[str, Any]) -> bool:
 
 
 def _credential_ok(
-    scope: dict[str, Any], expected_key: str | None, expected_pin: str | None
+    scope: dict[str, Any],
+    expected_key: str | None,
+    expected_pin: str | None,
+    verifier: SnapshotVerifier | None = None,
 ) -> bool:
     """Whether this request carries a credential the watchdog accepts.
 
@@ -2605,6 +2824,8 @@ def _credential_ok(
     provided = _bearer_from_headers(scope.get("headers") or [])
     pin_carrier = _pin_from_request(scope)
     if expected_key and provided and _constant_time_eq(provided, expected_key):
+        return True
+    if verifier is not None and provided and verifier.verify(provided) is not None:
         return True
     return bool(
         expected_pin
@@ -2658,10 +2879,18 @@ def _constant_time_eq(left: str, right: str) -> bool:
 def create_asgi_app(watchdog: Watchdog, *, path: str = "/mcp") -> tuple[Any, MCPServer]:
     """Build the watchdog's ASGI application (streamable-HTTP MCP + /health)."""
     config, _ = watchdog.load_config()
-    server = build_watchdog_mcp(watchdog)
+    access = _Access(watchdog)
+    server = build_watchdog_mcp(watchdog, access)
+    # The SDK's own DNS-rebinding guard turns itself on for a loopback bind and
+    # would then 421 any Host it did not expect (a reverse proxy, `tailscale
+    # serve`); this wrapper's Origin allowlist is the protection that matters
+    # (a rebinding page always sends an Origin), so the SDK's is switched off.
+    from mcp.server.transport_security import TransportSecuritySettings
+
     inner = server.streamable_http_app(
         streamable_http_path=path,
         host=config.watchdog.host,
+        transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
     )
 
     def _current_credentials() -> tuple[str | None, str | None]:
@@ -2681,7 +2910,10 @@ def create_asgi_app(watchdog: Watchdog, *, path: str = "/mcp") -> tuple[Any, MCP
         # silently off".
         return current.server.api_key or config.server.api_key, (str(pin) if pin else None)
 
-    return wrap_asgi(inner, watchdog, credentials=_current_credentials), server
+    return (
+        wrap_asgi(inner, watchdog, credentials=_current_credentials, access=access, mcp_path=path),
+        server,
+    )
 
 
 async def serve(
@@ -2723,6 +2955,15 @@ async def serve(
     poll_task: asyncio.Task[None] | None = None
     if poll:
         poll_task = asyncio.create_task(watchdog.poll_loop(), name="studioforge-watchdog-poll")
+    ssl_kwargs: dict[str, Any] = {}
+    try:
+        tls = resolve_tls(config)
+    except TlsError as exc:
+        log.error("watchdog TLS is misconfigured (%s); serving plain HTTP on loopback only", exc)
+        tls = None
+        bind_host = "127.0.0.1"
+    if tls is not None:
+        ssl_kwargs = dict(tls.uvicorn_kwargs())
     uv = uvicorn.Server(
         uvicorn.Config(
             asgi,
@@ -2730,6 +2971,7 @@ async def serve(
             port=bind_port,
             log_level="warning",
             access_log=False,
+            **ssl_kwargs,
         )
     )
     try:

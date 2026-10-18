@@ -20,7 +20,10 @@ page is the walk-through, with a verification after every step.
 | GPU rig — runs StudioForge and the models | `<rig>` | `<rig-ip>` | Windows 11 |
 | OpenClaw box — runs the agent and `sfctl` | `<openclaw-host>` | `<openclaw-ip>` | Linux |
 
-Ports on the rig, all bound to `0.0.0.0` so they answer on the tailnet:
+Ports on the rig. The shipped default is `127.0.0.1`; this deployment sets all three hosts to
+`0.0.0.0` so they answer on the tailnet, which requires an owner account or admin key
+(`studioforge setup`) and, for OpenClaw, its own scoped key (`studioforge keys create --name
+openclaw --scope inference`):
 
 | Port | Surface | Who talks to it |
 | --- | --- | --- |

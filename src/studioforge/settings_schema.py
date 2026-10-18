@@ -384,14 +384,21 @@ def _source_comments() -> dict[str, str]:
 _FALLBACK_DESCRIPTIONS: dict[str, str] = {
     "schema": "Layout version of config.yaml. Older files without it load as version 1.",
     "server.host": "Address the OpenAI-compatible gateway (/v1, /api, /mcp) binds to. "
-    "0.0.0.0 listens on every interface; 127.0.0.1 keeps it on this machine.",
+    "127.0.0.1 (the default) keeps it on this machine; 0.0.0.0 listens on every interface "
+    "and requires an owner account or admin key.",
     "server.port": "TCP port of the gateway. 1234 is LM Studio's port, so pointing an existing "
     "client here is a host change.",
-    "server.api_key": "Shared API key required on /v1, /api, /mcp and the watchdog when set "
-    "(at least 6 characters). Empty means open to anyone who can reach the port.",
-    "server.cors_origins": 'Origins allowed to call the API from a browser. ["*"] allows any.',
+    "server.api_key": "Deprecated shared API key (at least 6 characters), mirrored into the "
+    "key table as the admin key 'legacy'. Prefer scoped keys (`studioforge keys create`).",
+    "server.cors_origins": "Origins allowed to call the API from a browser, and to reach the "
+    "MCP endpoints from one. Empty (the default) allows none.",
     "server.cors_allow_credentials": "Let browsers send credentials cross-origin. Requires "
     'explicit cors_origins (no "*").',
+    "server.tls.mode": "HTTPS for the gateway, panel and watchdog: off, self_signed (a "
+    "certificate generated into the data directory, fingerprint shown in the panel) or cert "
+    "(your own PEM files).",
+    "server.tls.cert_file": "PEM certificate (chain) served when server.tls.mode is cert.",
+    "server.tls.key_file": "PEM private key served when server.tls.mode is cert.",
     "server.drain_timeout_s": "Seconds to let in-flight requests finish when the server "
     "shuts down.",
     "server.request_timeout_s": "Seconds a single upstream request may take before it is "

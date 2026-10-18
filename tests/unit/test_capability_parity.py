@@ -24,6 +24,7 @@ from studioforge.capability_registry import (
     BY_ID,
     CAPABILITIES,
     export,
+    missing_cli,
     missing_surfaces,
 )
 
@@ -63,6 +64,28 @@ def _sfctl_commands() -> set[str]:
                 found.add(path)
 
     walk(typer.main.get_command(sfctl.app), "")
+    return found
+
+
+def _cli_root() -> Any:
+    from studioforge.__main__ import app
+
+    return typer.main.get_command(app)
+
+
+def _cli_commands() -> set[str]:
+    """Every registered ``studioforge`` command path, e.g. ``ls`` and ``keys create``."""
+    found: set[str] = set()
+
+    def walk(command: Any, prefix: str) -> None:
+        for name, sub in getattr(command, "commands", {}).items():
+            path = f"{prefix} {name}".strip()
+            if getattr(sub, "commands", None):
+                walk(sub, path)
+            else:
+                found.add(path)
+
+    walk(_cli_root(), "")
     return found
 
 
@@ -151,6 +174,46 @@ def test_sfctl_flag_selected_behaviours_are_real_options() -> None:
         assert set(flags) <= options, (c.id, flags, sorted(options))
 
 
+def test_every_declared_cli_command_exists() -> None:
+    commands = _cli_commands()
+    bad = [
+        f"{c.id}: {c.cli}"
+        for c in CAPABILITIES
+        if c.cli is not None and _command_path(c.cli) not in commands
+    ]
+    assert not bad, f"declared `studioforge` commands that are not registered: {bad}"
+
+
+def test_cli_flag_selected_behaviours_are_real_options() -> None:
+    """``unload --all`` must name a flag ``unload`` really has."""
+    for c in CAPABILITIES:
+        if c.cli is None:
+            continue
+        flags = [p for p in c.cli.split() if p.startswith("--")]
+        if not flags:
+            continue
+        command: Any = _cli_root()
+        for part in _command_path(c.cli).split():
+            command = command.commands[part]
+        options = {opt for param in command.params for opt in getattr(param, "opts", [])}
+        assert set(flags) <= options, (c.id, flags, sorted(options))
+
+
+def test_the_security_and_operations_capabilities_have_an_api_and_a_cli() -> None:
+    for cap_id in (
+        "keys.list",
+        "keys.create",
+        "keys.revoke",
+        "users.create",
+        "users.password",
+        "doctor.run",
+        "support_bundle.create",
+        "server.stop",
+    ):
+        capability = BY_ID[cap_id]
+        assert capability.api is not None and capability.cli is not None, cap_id
+
+
 def test_no_two_capabilities_claim_the_same_route() -> None:
     seen: dict[tuple[str, str], str] = {}
     for c in CAPABILITIES:
@@ -165,7 +228,12 @@ def test_report_surfaces_that_do_not_exist_yet() -> None:
     gaps = missing_surfaces()
     total = sum(len(v) for v in gaps.values())
     lines = [f"  {cap_id}: {', '.join(missing)}" for cap_id, missing in sorted(gaps.items())]
-    report = f"{total} missing surfaces across {len(gaps)} capabilities:\n" + "\n".join(lines)
+    no_cli = missing_cli()
+    report = (
+        f"{total} missing surfaces across {len(gaps)} capabilities:\n"
+        + "\n".join(lines)
+        + f"\n{len(no_cli)} capabilities have no `studioforge` command yet: {', '.join(no_cli)}"
+    )
     print("\n" + report)  # visible with -s
     if gaps:
         warnings.warn(report, UserWarning, stacklevel=1)

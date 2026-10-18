@@ -130,6 +130,19 @@ def render(ctx: GuiContext) -> None:
         _log_panel(ctx)
 
 
+def overview_panels(ctx: GuiContext) -> None:
+    """What the GPUs and the loaded models are doing now (the Overview page)."""
+    _gpu_panel(ctx)
+    _vram_holders_panel(ctx)
+    _loaded_panel(ctx)
+
+
+def placement_panels(ctx: GuiContext) -> None:
+    """Who holds GPU memory on purpose: leases and registered tenants (the Placement page)."""
+    _leases_panel(ctx)
+    _tenants_panel(ctx)
+
+
 # ---------------------------------------------------------------------------
 # GPUs
 # ---------------------------------------------------------------------------

@@ -30,6 +30,11 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from studioforge.errors import ConfigError
+from studioforge.secret_store import SecretStore
+from studioforge.secure_files import write_private
+
+#: Name under which ``hf.token`` is kept in the secret store.
+HF_TOKEN_SECRET = "hf.token"
 
 #: "auto" is resolved by the planner per model: it takes the best-quality KV
 #: cache that still reaches the chosen context on the hardware available.
@@ -186,15 +191,53 @@ PositiveFloat = Annotated[float, Field(gt=0)]
 NonNegativeFloat = Annotated[float, Field(ge=0)]
 
 
+TlsMode = Literal["off", "self_signed", "cert"]
+
+
+class TlsConfig(BaseModel):
+    """HTTPS for the gateway, the control panel and the watchdog (one setting for all three)."""
+
+    #: ``off`` serves plain HTTP (fine on loopback). ``self_signed`` generates a
+    #: certificate into the data directory on first use and shows its SHA-256
+    #: fingerprint in the panel and `/api/status`. ``cert`` serves the PEM files
+    #: named by ``cert_file`` and ``key_file``.
+    mode: TlsMode = "off"
+    #: PEM certificate (chain) for ``mode: cert``.
+    cert_file: Path | None = None
+    #: PEM private key for ``mode: cert``.
+    key_file: Path | None = None
+
+    @model_validator(mode="after")
+    def _cert_needs_files(self) -> TlsConfig:
+        if self.mode == "cert" and (self.cert_file is None or self.key_file is None):
+            raise ValueError(
+                "server.tls.mode=cert needs both server.tls.cert_file and server.tls.key_file"
+            )
+        return self
+
+
 class ServerConfig(BaseModel):
-    host: str = "0.0.0.0"
+    #: Address the OpenAI-compatible gateway (/v1, /api, /mcp) binds to. The
+    #: default is loopback: nothing is reachable from the network until you
+    #: choose to expose it (`studioforge setup`, or set this to 0.0.0.0), and a
+    #: non-loopback bind refuses to start without an owner account or admin key.
+    host: str = "127.0.0.1"
     port: Port = 1234  # LM Studio's default port: OpenClaw only changes the host
-    # >= 6 chars so the log-redaction processor will register it: shorter
-    # values are ignored there, and an unredactable key can surface inside a
-    # logged command line or an httpx error repr.
+    #: DEPRECATED (2.0): the single shared key. It keeps working and is mirrored
+    #: into the key table as an admin key named "legacy"; create named, scoped,
+    #: revocable keys with `studioforge keys create` instead.
+    #:
+    #: At least 6 characters so the log-redaction processor will register it:
+    #: shorter values are ignored there, and an unredactable key can surface
+    #: inside a logged command line or an httpx error repr.
     api_key: str | None = Field(default=None, min_length=6)
-    cors_origins: list[str] = Field(default_factory=lambda: ["*"])
+    #: Origins allowed to call the API from a browser. Empty (the default) allows
+    #: none: non-browser clients are unaffected. Also the Origin allowlist for the
+    #: MCP endpoints, together with loopback pages.
+    cors_origins: list[str] = Field(default_factory=list)
     cors_allow_credentials: bool = False
+    #: HTTPS settings shared by the gateway, the panel and the watchdog.
+    tls: TlsConfig = Field(default_factory=TlsConfig)
     drain_timeout_s: NonNegativeFloat = 30.0
     request_timeout_s: PositiveFloat = 900.0
 
@@ -202,9 +245,9 @@ class ServerConfig(BaseModel):
     def _no_credentialed_wildcard_cors(self) -> ServerConfig:
         """``["*"]`` + ``allow_credentials`` is the one CORS pair browsers treat
         as "any website may make credentialed requests here". The shipped default
-        (wildcard, credentials off) is safe; flipping credentials on without
-        narrowing the origins would silently open the API to every page the
-        operator visits. Refuse the pair at load time (WP17 review, open item 1).
+        (empty allowlist, credentials off) is safe; flipping credentials on with
+        a wildcard would silently open the API to every page the operator
+        visits. Refuse the pair at load time (WP17 review, open item 1).
         """
         if self.cors_allow_credentials and any(o.strip() == "*" for o in self.cors_origins):
             raise ValueError(
@@ -216,14 +259,14 @@ class ServerConfig(BaseModel):
 
 class GuiConfig(BaseModel):
     enabled: bool = True
-    host: str = "0.0.0.0"
+    host: str = "127.0.0.1"
     port: Port = 8080
     refresh_interval_s: PositiveFloat = 2.0
 
 
 class WatchdogConfig(BaseModel):
     enabled: bool = True
-    host: str = "0.0.0.0"
+    host: str = "127.0.0.1"
     port: Port = 1235
     poll_interval_s: PositiveFloat = 10.0
     health_timeout_s: PositiveFloat = 5.0
@@ -705,8 +748,11 @@ class McpConfig(BaseModel):
 
     enabled: bool = True
     path: str = "/mcp"
-    #: Auto-generated on first run when empty. Set to null / pin_required=False
-    #: to fall back to the API key alone.
+    #: DEPRECATED (2.0): the eight-digit pairing code. Still accepted on the MCP
+    #: endpoints (as an admin credential, with a logged warning) so existing
+    #: clients keep working; use a scoped API key instead
+    #: (`studioforge keys create --scope admin`). Auto-generated on first run
+    #: when empty.
     pin: str | None = None
     pin_required: bool = True
     #: Print the reachable MCP URLs (and the PIN) in the startup banner.
@@ -994,6 +1040,11 @@ class LoggingConfig(BaseModel):
     #: Rotated copies kept per log file, newest first; the oldest is deleted
     #: when a new one is made. At least 1.
     file_backups: int = Field(default=5, ge=1, le=100)
+    #: Size in MiB at which the audit log (logs/audit.jsonl, every admin mutation
+    #: and every mutating MCP call) is rotated. 0 never rotates.
+    audit_file_max_mb: int = Field(default=10, ge=0)
+    #: Rotated audit logs kept, newest first.
+    audit_file_backups: int = Field(default=10, ge=1, le=1000)
 
     @field_validator("level", mode="before")
     @classmethod
@@ -1168,6 +1219,29 @@ class Config(BaseSettings):
         # by_alias so LoggingConfig.json_logs round-trips as the `json` key.
         return self.model_dump(mode="json", exclude=set(self.UNPERSISTED_KEYS), by_alias=True)
 
+    def _park_hf_token(self, data: dict[str, Any]) -> None:
+        """Keep ``hf.token`` out of config.yaml when the OS keyring can hold it.
+
+        With a keyring the token is stored there and the YAML carries ``null``;
+        ``load_config`` reads it back. Without one the token stays in the (now
+        0600) file, which is the documented fallback. Clearing the token clears
+        both places. Best effort: a secret store that fails must not stop a save.
+        """
+        hf = data.get("hf")
+        if not isinstance(hf, dict):
+            return
+        try:
+            store = SecretStore(self.data_dir)
+            token = hf.get("token")
+            if not token:
+                store.delete(HF_TOKEN_SECRET)
+            elif store.backend == "keyring" and store.set(HF_TOKEN_SECRET, str(token)) == "keyring":
+                hf["token"] = None
+            else:
+                store.delete(HF_TOKEN_SECRET)
+        except Exception:  # noqa: BLE001 - never let secret storage break a settings save
+            return
+
     def save(self, path: Path | None = None) -> Path:
         """Write the config atomically, tolerating a concurrent reader.
 
@@ -1181,20 +1255,24 @@ class Config(BaseSettings):
         """
         target = path or self.config_path
         target.parent.mkdir(parents=True, exist_ok=True)
-        payload = yaml.safe_dump(self.to_yaml_dict(), sort_keys=False, default_flow_style=False)
+        data = self.to_yaml_dict()
+        self._park_hf_token(data)
+        payload = yaml.safe_dump(data, sort_keys=False, default_flow_style=False)
         tmp = target.with_suffix(target.suffix + ".tmp")
         # fsync before the rename: without it a power loss in the rename window
         # can leave a zero-length config.yaml, which loads as "{}" and silently
         # reverts every setting to its default (WP17 R5). The previous file is
         # kept as .bak so a truncated one is recoverable by hand.
-        with tmp.open("w", encoding="utf-8") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
+        #
+        # config.yaml and its .bak hold server.api_key, mcp.pin and (without a
+        # keyring) hf.token, so both are written owner-only: 0600 on POSIX, an
+        # owner-only ACL on Windows. The temp file is created that way before
+        # the secrets go in, and the rename carries the permissions along.
+        write_private(tmp, payload)
         if target.is_file():
             with contextlib.suppress(OSError):
                 backup = target.with_suffix(target.suffix + ".bak")
-                backup.write_bytes(target.read_bytes())
+                write_private(backup, target.read_bytes())
         last: OSError | None = None
         for attempt in range(_SAVE_RETRIES):
             try:
@@ -1349,6 +1427,15 @@ def load_config(path: Path | str | None = None, *, create: bool = False) -> Conf
         raise ConfigError(f"invalid configuration in {config_path}: {exc}") from exc
 
     config.source_path = config_path if file_present else None
+
+    if config.hf.token is None:
+        # A keyring-held token (see Config._park_hf_token) is not in the file.
+        try:
+            stored = SecretStore(data_dir).get(HF_TOKEN_SECRET)
+        except Exception:  # noqa: BLE001 - an unreadable keyring is "no token", not a crash
+            stored = None
+        if stored:
+            config.hf.token = stored
 
     if config.models.dir is None:
         detected = detect_model_dir()
@@ -1507,6 +1594,10 @@ RESTART_REQUIRED_KEYS = frozenset(
         # MCP path decides where the app mounts -- neither can change in place.
         "server.cors_origins",
         "server.cors_allow_credentials",
+        # Certificates are loaded when the listeners are created.
+        "server.tls.mode",
+        "server.tls.cert_file",
+        "server.tls.key_file",
         "mcp.path",
         "mcp.enabled",
         # The log file handlers are built once, at start (D69 §15).

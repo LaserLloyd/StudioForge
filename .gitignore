@@ -70,6 +70,7 @@ desktop.ini
 .claude/worktrees/
 .claude/settings.local.json
 CLAUDE.local.md
+.scratch-*/
 
 # --- never repository content ---------------------------------------------
 # GitHub Desktop offers every untracked, non-ignored file for the next commit.

@@ -163,7 +163,11 @@ class Updater:
         #: Handle of the most recent detached respawn, so a caller that is
         #: about to exit can check the replacement actually came up.
         self._last_child: subprocess.Popen[bytes] | None = None
-        self._health_url = health_url or (f"http://127.0.0.1:{config.server.port}/health")
+        from studioforge.tlsutil import scheme_for
+
+        self._health_url = health_url or (
+            f"{scheme_for(config)}://127.0.0.1:{config.server.port}/health"
+        )
         #: How long the replacement may wait for our ports before giving up.
         #: Must comfortably exceed uvicorn's graceful-shutdown budget, which is
         #: ``server.drain_timeout_s`` -- that is the time between us deciding to
@@ -576,7 +580,9 @@ class Updater:
         await asyncio.sleep(1.0)
         while time.time() < deadline:
             try:
-                async with httpx.AsyncClient(timeout=5.0) as client:
+                async with httpx.AsyncClient(
+                    timeout=5.0, verify=not self._health_url.startswith("https://")
+                ) as client:
                     response = await client.get(self._health_url)
                 if response.status_code == 200:
                     body = response.json()

@@ -36,6 +36,52 @@ LEVELS = ("ALL", "DEBUG", "INFO", "WARNING", "ERROR")
 LINE_CHOICES = (100, 200, 500, 1000, 2000)
 
 
+async def _metrics_text(ctx: GuiContext) -> str:
+    from studioforge.core.metrics import render_metrics
+
+    return str(await render_metrics(ctx.api_state))
+
+
+def metrics_panel(ctx: GuiContext) -> None:
+    """The Prometheus text the ``/metrics`` endpoint serves, collapsed by default."""
+    from studioforge.gui.tabs.overview import server_root
+
+    scrape = f"{server_root(ctx)}/metrics"
+    with ui.expansion("Metrics (Prometheus text)", icon="query_stats").classes("w-full") as panel:
+        ui.label(
+            "Point Prometheus (or any scraper) at this address. It needs a read key when sign-in "
+            "is required."
+        ).classes("text-xs opacity-70")
+        ui.label(scrape).classes("font-mono text-xs")
+        body = ui.label("").classes(
+            "w-full font-mono text-xs whitespace-pre-wrap sf-well p-2 rounded "
+            "overflow-auto max-h-[40vh]"
+        )
+        holder = {"text": ""}
+
+        async def refresh() -> None:
+            try:
+                holder["text"] = await _metrics_text(ctx)
+            except Exception as exc:  # noqa: BLE001 - the panel reports, never crashes
+                holder["text"] = ""
+                body.set_text(f"Metrics are unavailable: {exc}")
+                return
+            body.set_text(holder["text"] or "(no metrics yet)")
+
+        def copy_metrics() -> None:
+            ui.clipboard.write(holder["text"])
+            ui.notify("Copied metrics")
+
+        with ui.row().classes("items-center gap-2"):
+            ui.button("Refresh", icon="refresh", on_click=refresh).props("outline dense")
+            ui.button(icon="content_copy", on_click=copy_metrics).props(
+                'flat dense aria-label="Copy metrics"'
+            )
+        # Read when opened, not on every page load: building the text asks each
+        # loaded model for its own counters.
+        panel.on_value_change(lambda event: refresh() if event.value else None)
+
+
 def render(ctx: GuiContext) -> None:
     if not viewer_may_change_box(ctx):
         with ui.column().classes("w-full gap-2 p-2"):

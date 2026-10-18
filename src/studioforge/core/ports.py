@@ -61,6 +61,13 @@ ENV_ADOPT_WATCHDOG = "SF_ADOPT_WATCHDOG"
 #: crash, and respawning it cannot help -- the port is still taken (D28).
 EXIT_PORT_CONFLICT = 3
 
+#: Exit code ``studioforge serve`` uses when it refuses to start because a listener
+#: would be reachable from the network with no owner account or admin key
+#: (``auth_required_for_remote_bind``). Like a port conflict it is not a crash and
+#: a respawn cannot fix it: the tray reads it and stops, telling the owner to run
+#: ``studioforge setup``.
+EXIT_AUTH_REQUIRED = 4
+
 #: Exit code ``studioforge serve`` uses when it was asked to restart and is
 #: leaving the respawn to the process that launched it (the tray). EX_TEMPFAIL
 #: in sysexits terms: "try again". The tray respawns immediately and does not
@@ -448,7 +455,10 @@ def inspect_running_watchdog(config: Config, *, timeout_s: float = 3.0) -> Watch
     still be adoptable.
     """
     port = config.watchdog.port
-    url = f"http://127.0.0.1:{port}/health"
+    from studioforge.tlsutil import scheme_for
+
+    scheme = scheme_for(config)
+    url = f"{scheme}://127.0.0.1:{port}/health"
     # Connect, do not bind: see port_has_listener for the Windows wildcard trap.
     if not port_has_listener(port, "127.0.0.1"):
         return WatchdogPresence(reason=f"nothing is listening on port {port}")
@@ -456,7 +466,8 @@ def inspect_running_watchdog(config: Config, *, timeout_s: float = 3.0) -> Watch
     import httpx
 
     try:
-        response = httpx.get(url, timeout=timeout_s)
+        # https is our own watchdog on loopback (server.tls): nothing to verify.
+        response = httpx.get(url, timeout=timeout_s, verify=scheme == "http")
     except Exception as exc:  # noqa: BLE001 - any failure means "not adoptable"
         return WatchdogPresence(
             reason=f"whatever holds port {port} did not answer {url} ({exc.__class__.__name__})"

@@ -33,6 +33,7 @@ from studioforge.api.auth import (
 from studioforge.core.ports import EXIT_RESTART_REQUESTED, supervised_by, supervising_tray_is_alive
 from studioforge.errors import BadRequestError, ModelNotFoundError
 from studioforge.logging import get_logger
+from studioforge.tlsutil import scheme_for
 
 log = get_logger(__name__)
 
@@ -99,7 +100,7 @@ def _record(state: Any, outcome: str, detail: str, **extra: Any) -> dict[str, An
     return status
 
 
-def _watchdog_credential(config: Any) -> tuple[str | None, str]:
+def _watchdog_credential(config: Any, accounts: Any = None) -> tuple[str | None, str]:
     """The bearer token the watchdog will accept from us, and what it is called.
 
     **This is the bug that made every watchdog restart fall through.** The
@@ -113,6 +114,16 @@ def _watchdog_credential(config: Any) -> tuple[str | None, str]:
     key = getattr(config.server, "api_key", None)
     if key:
         return key, "api_key"
+    if accounts is not None:
+        # Scoped keys only (no legacy key): the watchdog verifies them against the
+        # key snapshot, so this process presents its own admin key, the one the
+        # local CLI uses. Only when keys exist at all -- otherwise the watchdog
+        # is open to this machine and needs nothing.
+        try:
+            if accounts.has_active_keys():
+                return accounts.local_cli_key(), "local_key"
+        except Exception as exc:  # noqa: BLE001 - fall back to the PIN below
+            log.warning("could not obtain the local admin key for the watchdog", error=str(exc))
     mcp = getattr(config, "mcp", None)
     pin = getattr(mcp, "pin", None) if mcp is not None else None
     if pin:
@@ -183,6 +194,34 @@ async def restart_backend(
     )
 
 
+@router.post("/server/stop")
+async def stop_server(request: Request, confirm: bool = Body(False, embed=True)) -> dict[str, Any]:
+    """Shut the server down gracefully (what ``studioforge server stop`` asks for).
+
+    Drains in-flight requests, unloads every model and ends the process; nothing
+    restarts it. A server run by the tray is restarted by the tray, as always --
+    quit the tray to stop it for good. Only available when the server was started
+    by ``studioforge serve`` (which installs the shutdown hook).
+    """
+    state = _state(request)
+    if not confirm:
+        raise BadRequestError(
+            "stopping drops in-flight requests and unloads every model; pass confirm=true",
+            param="confirm",
+            code="confirmation_required",
+        )
+    shutdown = getattr(state, "request_shutdown", None)
+    if shutdown is None:
+        raise BadRequestError(
+            "this server was not started by `studioforge serve`, so it has no shutdown hook",
+            code="invalid_request",
+        )
+    _record(state, "stop", "stopping on request")
+    state.handing_over = False
+    asyncio.get_running_loop().call_later(0.5, shutdown)
+    return {"stopping": True, "note": "the server will be unavailable in a moment"}
+
+
 @router.post("/restart/server")
 async def restart_server(
     request: Request, confirm: bool = Body(False, embed=True)
@@ -202,7 +241,7 @@ async def restart_server(
         )
 
     config = state.config
-    watchdog_url = f"http://127.0.0.1:{config.watchdog.port}"
+    watchdog_url = f"{scheme_for(config)}://127.0.0.1:{config.watchdog.port}"
     supervisor = supervised_by()
     log.info(
         "restart requested",
@@ -241,7 +280,7 @@ async def restart_server(
     if config.watchdog.enabled:
         reachable, detail = await _watchdog_is_reachable(watchdog_url)
         if reachable:
-            credential, kind = _watchdog_credential(config)
+            credential, kind = _watchdog_credential(config, getattr(state, "accounts", None))
             log.info(
                 "handing the restart to the watchdog",
                 watchdog_url=watchdog_url,
@@ -311,7 +350,10 @@ async def _watchdog_is_reachable(watchdog_url: str) -> tuple[bool, str]:
     that can take the handoff.
     """
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        # https here is our own watchdog on loopback (server.tls): nothing to verify.
+        async with httpx.AsyncClient(
+            timeout=10.0, verify=not watchdog_url.startswith("https://")
+        ) as client:
             health = await client.get(f"{watchdog_url}/health")
     except httpx.HTTPError as exc:
         return False, f"{exc.__class__.__name__}: {exc}"
@@ -339,7 +381,7 @@ async def _ask_watchdog_to_restart(state: Any, watchdog_url: str) -> None:
     because the caller has already been told the process is going down.
     """
     await asyncio.sleep(0.5)
-    credential, kind = _watchdog_credential(state.config)
+    credential, kind = _watchdog_credential(state.config, getattr(state, "accounts", None))
     headers = {"Authorization": f"Bearer {credential}"} if credential else {}
     try:
         # Strictly longer than the watchdog's own restart budget (it waits up
@@ -347,7 +389,9 @@ async def _ask_watchdog_to_restart(state: Any, watchdog_url: str) -> None:
         # equal timeout a slow cold start -- a large library scan -- timed OUR
         # client out first, we "fell back" to a self-respawn, and two
         # replacements raced for the ports.
-        async with httpx.AsyncClient(timeout=WATCHDOG_RESTART_BUDGET_S + 60.0) as client:
+        async with httpx.AsyncClient(
+            timeout=WATCHDOG_RESTART_BUDGET_S + 60.0, verify=not watchdog_url.startswith("https://")
+        ) as client:
             response = await client.post(f"{watchdog_url}/restart", headers=headers)
         if response.status_code < 400:
             log.info("watchdog accepted the restart handoff", status=response.status_code)
@@ -565,7 +609,8 @@ async def mcp_info(request: Request) -> dict[str, Any]:
     config = state.config
     mcp = config.mcp
 
-    endpoints = reachable_urls(config.server.port, mcp.path, host=config.server.host)
+    scheme = scheme_for(config)
+    endpoints = reachable_urls(config.server.port, mcp.path, host=config.server.host, scheme=scheme)
     tailscale = [e for e in endpoints if e["kind"] == "tailscale"]
     lan = [e for e in endpoints if e["kind"] in {"lan", "bound"}]
     loopback = [e for e in endpoints if e["kind"] == "loopback"]
@@ -605,7 +650,9 @@ async def mcp_info(request: Request) -> dict[str, Any]:
         "loopback": loopback,
         "watchdog": {
             "enabled": config.watchdog.enabled,
-            "endpoints": reachable_urls(config.watchdog.port, "/mcp", host=config.watchdog.host),
+            "endpoints": reachable_urls(
+                config.watchdog.port, "/mcp", host=config.watchdog.host, scheme=scheme
+            ),
         },
     }
     if not reveal and pin_needed:

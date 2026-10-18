@@ -271,14 +271,16 @@ def test_field_specs_cover_every_scalar_key_of_every_section() -> None:
             if key not in generated:
                 missing.append(key)
     # Three are mappings -- keyed by CUDA index, quant family and load tier --
-    # and one is a list of nested models (the tenant registry, D77). They get
-    # row widgets of their own (the registry is read on the Dashboard's Tenants
-    # card and written in config.yaml), not a text box, because rendering one
+    # and two are nested models: the tenant registry (D77), a list of them, and
+    # ``server.tls`` (HTTPS), one. They get widgets of their own (the registry is
+    # read on the Placement page's Tenants card and written in config.yaml; HTTPS
+    # is the Serving page's HTTPS card), not a text box, because rendering one
     # as a text box would silently destroy the other entries.
     assert sorted(missing) == [
         "models.ttl_by_priority",
         "planner.quant_affinity",
         "planner.reserved_mb",
+        "server.tls",
         "tenants.registry",
     ]
     assert set(missing) <= st.CUSTOM_WIDGET_KEYS
@@ -353,10 +355,13 @@ def test_consequential_keys_have_hand_written_help() -> None:
     for key in sorted(MUST_HAVE_HELP):
         assert key in specs, key
         assert specs[key].help.strip(), f"{key} ships as '{specs[key].summary}'"
-    # The SSRF guard and the sweep cadence say what they gate, not just a type.
-    assert "SSRF" in specs["gateway.allow_private_image_hosts"].help
+    # The panel now shows the settings schema's descriptions first; the SSRF guard
+    # and the sweep cadence still say what they gate in the hand-written fallback
+    # table that backs any key the registry has no text for.
+    fallback = st.CONFIG_FIELD_HELP
+    assert "SSRF" in fallback["gateway.allow_private_image_hosts"]
     for d_number in ("D41", "D42", "D43"):
-        assert d_number in specs["gateway.ttl_sweep_interval_s"].help
+        assert d_number in fallback["gateway.ttl_sweep_interval_s"]
 
 
 def test_every_help_entry_names_a_real_config_key() -> None:
@@ -482,6 +487,9 @@ def test_a_number_typed_into_the_parallel_field_round_trips_as_an_int() -> None:
 
 
 def test_a_list_field_round_trips_through_the_comma_separated_widget(config: Config) -> None:
+    # The shipped default is now an empty allowlist (nothing may call from a
+    # browser until the owner says so); a configured one shows comma-separated.
+    config.server.cors_origins = ["*"]
     payload = st.redacted_config(config)
     spec = st.spec_by_key(st.config_field_specs())["server.cors_origins"]
     assert st.spec_display_value(payload, spec) == "*"
@@ -935,30 +943,40 @@ def test_no_secret_reaches_the_rendered_page(config: Config) -> None:
     assert MCP_PIN not in response.text
 
 
-def test_setup_is_a_tab_and_is_deep_linkable() -> None:
-    from studioforge.gui.app import TAB_NAMES
+def test_setup_is_part_of_the_overview_and_old_links_still_open_it() -> None:
+    """The Setup tab became the Overview's checklist and the ``/setup`` wizard; the
+    old ``?tab=setup`` link is translated in the app, not in ``gui/state.py``."""
+    from studioforge.gui.app import LEGACY_TABS, TAB_NAMES, resolve_section
 
-    assert TAB_NAMES[1] == "Setup"
-    assert st.DEEP_LINK_TABS["setup"] == "Setup"
-    assert st.initial_tab(st.deep_link_params({"tab": "setup"})) == "Setup"
+    assert "Setup" not in TAB_NAMES
+    assert st.DEEP_LINK_TABS["setup"] == "Setup"  # the link grammar is unchanged
+    assert LEGACY_TABS["Setup"] == ("Overview", None)
+    params = st.deep_link_params({"tab": "setup"})
+    assert st.initial_tab(params) == "Setup"
+    assert resolve_section(params, {"tab": "setup"}, "Overview") == ("Overview", None)
 
 
-def test_a_fresh_install_lands_on_setup_and_a_working_one_on_the_dashboard(
+def test_every_install_lands_on_the_overview_and_only_a_fresh_one_shows_the_banner(
     config: Config,
 ) -> None:
     from studioforge.gui.app import _default_tab
     from studioforge.gui.tabs import GuiContext
+    from studioforge.gui.tabs.overview import needs_setup
 
     state = _State(config)
-    # No models indexed yet: the Dashboard would be four empty panels.
-    assert _default_tab(GuiContext(config=config, api_state=state)) == "Setup"
+    ctx = GuiContext(config=config, api_state=state)
+    # No models indexed yet: the Overview has nothing to show but the banner.
+    assert _default_tab(ctx) == "Overview"
+    assert needs_setup(ctx) is True
 
     state.registry = _Registry([object()])
     state.engine_manager = None
-    assert _default_tab(GuiContext(config=config, api_state=state)) == "Dashboard"
+    assert _default_tab(ctx) == "Overview"
+    assert needs_setup(ctx) is False
 
     config.models.dir = None
-    assert _default_tab(GuiContext(config=config, api_state=state)) == "Setup"
+    assert _default_tab(ctx) == "Overview"
+    assert needs_setup(ctx) is True
 
 
 # ---------------------------------------------------------------------------
