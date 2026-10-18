@@ -4,10 +4,12 @@ OCI images: `ghcr.io/laserlloyd/studioforge:<version>-{cuda,rocm,vulkan}` (plus 
 see below). One `Dockerfile`, one build argument (`BACKEND`), three runtime bases. Works with
 Docker and with Podman.
 
-> **Status of the backends.** StudioForge is GPU-only and today only drives **NVIDIA/CUDA**
-> (`core/gpu.py` probes NVML only). The `rocm` and `vulkan` images build, boot and answer
-> `/health`, but report `can_serve=false` until the multi-backend engine work (W1) lands. They
-> exist so the packaging is ready when it does. Use `-cuda` for real work.
+> **Status of the backends.** StudioForge is GPU-only. NVIDIA/CUDA is the verified path. The
+> `rocm` and `vulkan` images carry the ROCm (amd-smi / rocm-smi / rocminfo) and Vulkan
+> (vulkaninfo) probes and the backend-aware engine installer from [`ENGINES.md`](../ENGINES.md),
+> which were tested with recorded probe output, not on real AMD/Intel hardware yet. Without a
+> GPU passed through, every image boots, answers `/health` and reports `can_serve=false`
+> (a software Vulkan device such as llvmpipe is refused: STRICT_GPU).
 
 - [Quick start](#quick-start)
 - [Which image](#which-image)
@@ -27,9 +29,25 @@ cp env.example .env                       # optional; set SF_MODELS to your GGUF
 docker compose -f compose.yml -f compose.cuda.yml up -d
 ```
 
-Open <http://localhost:8080> (control panel). The OpenAI-compatible base URL for clients is
-`http://localhost:1234/v1`. Ports are published to `127.0.0.1` only; set `SF_BIND=0.0.0.0` to
-share on your LAN (and set `server.api_key` first, on the panel's Setup tab).
+Open <http://localhost:8080> (control panel) and sign in as the owner. The account is created on
+the first start of a fresh volume: with `SF_OWNER_PASSWORD` from `.env` if you set it (10+
+characters, user `SF_OWNER_USER`, default `owner`), otherwise with a generated password saved
+owner-only on the volume -- read it, then change it under **Users & Keys** and delete the file:
+
+```bash
+docker compose exec studioforge \
+  cat /data/owner-password.initial
+```
+
+Why an account at all: the app refuses to listen beyond loopback with nothing to log in with
+(`auth_required_for_remote_bind`), and inside a container "beyond loopback" is the only way a
+published port can reach it. With the account in place every API request needs a key: create one
+per client on the Users & Keys page, or from a shell in the container
+(`docker compose exec studioforge bash`, then `studioforge keys create --name openclaw --scope
+inference`; the token is printed once). `/health` stays public. The OpenAI-compatible base URL for clients is
+`http://localhost:1234/v1`. Ports are published to `127.0.0.1` only; set `SF_BIND=0.0.0.0` to share
+on your LAN, and put TLS in front (`server.tls.mode: self_signed`, a reverse proxy, or
+`tailscale serve`; see [`SECURITY.md`](../SECURITY.md)).
 
 | Port | What | Env var to remap the host side |
 | --- | --- | --- |
@@ -45,8 +63,8 @@ Without compose:
 docker run -d --name studioforge --init --gpus all \
   -p 127.0.0.1:1234:1234 -p 127.0.0.1:8080:8080 -p 127.0.0.1:1235:1235 \
   -v studioforge-data:/data -v /path/to/gguf:/models:ro \
-  -e SF_MODELS__DIR=/models \
-  ghcr.io/laserlloyd/studioforge:1.26-09-23-cuda
+  -e SF_MODELS__DIR=/models -e SF_OWNER_PASSWORD=choose-10-plus-characters \
+  ghcr.io/laserlloyd/studioforge:2.0.0-cuda
 ```
 
 `--init` matters: `serve` spawns a watchdog and one `llama-server` per loaded model, and PID 1
@@ -97,7 +115,7 @@ The llama.cpp engine is **not** in the image: it is downloaded or built by the a
 - **Offline / air-gapped:** populate the volume while online, then block the network:
 
   ```bash
-  docker run --rm -v studioforge-data:/data ghcr.io/laserlloyd/studioforge:1.26-09-23-cuda-devel engine --update
+  docker run --rm -v studioforge-data:/data ghcr.io/laserlloyd/studioforge:2.0.0-cuda-devel engine --update
   # later, on the offline host, run the slim -cuda image against the same volume
   ```
 
@@ -170,8 +188,8 @@ be. For Podman, replace `docker` with `podman` (add `:z` to the bind mount on SE
 ## Build it yourself
 
 ```bash
-docker build --build-arg BACKEND=cuda --build-arg VERSION=1.26-09-23 \
-  -t ghcr.io/laserlloyd/studioforge:1.26-09-23-cuda .
+docker build --build-arg BACKEND=cuda --build-arg VERSION=2.0.0 \
+  -t ghcr.io/laserlloyd/studioforge:2.0.0-cuda .
 ```
 
 This repository does not track `uv.lock` (`.gitignore`), so the image resolves dependencies from
@@ -182,7 +200,9 @@ switch the two `uv sync` lines to `--locked` for reproducible images.
 
 | Symptom | Cause / fix |
 | --- | --- |
-| `/health` says `can_serve=false`, `gpu_count=0` | No GPU passed through, or the image is `-rocm`/`-vulkan` (NVIDIA-only today). Check `docker run --gpus all … nvidia-smi -L`. |
+| `/health` says `can_serve=false`, `gpu_count=0` | No GPU passed through (`/api/gpus` lists what each probe tried). Check `docker run --gpus all … nvidia-smi -L`; for ROCm/Vulkan pass `/dev/kfd` / `/dev/dri` and the `video`/`render` gids. |
+| Container exits with code 4, log says `auth_required_for_remote_bind` | The volume has no owner account or admin key and the entrypoint could not create one (for example `SF_OWNER_PASSWORD` shorter than 10 characters). Fix the password, or run `docker compose run --rm studioforge users create owner --password-stdin`. |
+| `401 invalid_api_key` from a client | Expected once the owner account exists: give each client a key (`studioforge keys create`, or Users & Keys). |
 | `no usable llama-server engine … 'git'` | `-cuda` runtime image cannot build the engine. Use `-cuda-devel` or mount a built `engines/`. |
 | `cannot build llama.cpp from source: no CUDA compute capability` | No GPU visible when the engine was needed. |
 | `… is not writable by uid 1000` | Bind-mounted data dir with the wrong owner; see above. |

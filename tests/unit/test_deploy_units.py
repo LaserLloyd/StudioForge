@@ -57,3 +57,41 @@ def test_deploy_readme_documents_the_recipe() -> None:
     text = (DEPLOY / "README.md").read_text(encoding="utf-8")
     for needle in ("systemctl --user enable --now", "loginctl enable-linger", "SF_DATA_DIR"):
         assert needle in text
+
+
+# --- container image ---------------------------------------------------------
+# Since 2.0.0 the app binds 127.0.0.1 by default and refuses a network bind
+# without an owner account or admin key. Inside a container a loopback bind is
+# unreachable from the published ports (the 2026-10-18 review found every
+# `-p` dead while the in-container HEALTHCHECK said "healthy"), so the image
+# must bind the container's interfaces AND bootstrap a credential.
+
+REPO = DEPLOY.parent
+
+
+def test_the_image_binds_the_container_interfaces() -> None:
+    dockerfile = (REPO / "Dockerfile").read_text(encoding="utf-8")
+    for var in ("SF_SERVER__HOST=0.0.0.0", "SF_GUI__HOST=0.0.0.0", "SF_WATCHDOG__HOST=0.0.0.0"):
+        assert var in dockerfile, f"{var} missing: published ports would be unreachable"
+
+
+def test_the_entrypoint_bootstraps_the_owner_account() -> None:
+    script = (DEPLOY / "compose" / "entrypoint.sh").read_text(encoding="utf-8")
+    assert "studioforge users create" in script
+    assert "--password-env SF_OWNER_PASSWORD" in script
+    assert "owner-password.initial" in script, "the generated password must land on the volume"
+    assert "umask 077" in script, "the generated password file must be owner-only"
+    # The password is never echoed into the container log.
+    for line in script.splitlines():
+        if line.strip().startswith("log ") and "SF_OWNER_PASSWORD" in line:
+            assert "$SF_OWNER_PASSWORD" not in line and "${SF_OWNER_PASSWORD" not in line, line
+    # Only a fresh volume is touched: the app's own posture check decides, so an
+    # existing account, an admin key or the legacy server.api_key all win.
+    assert "has_admin_credential" in script
+
+
+def test_the_compose_env_example_documents_the_owner_password() -> None:
+    env = (DEPLOY / "compose" / "env.example").read_text(encoding="utf-8")
+    assert "SF_OWNER_PASSWORD" in env
+    docs = (REPO / "docs" / "deploy" / "docker.md").read_text(encoding="utf-8")
+    assert "SF_OWNER_PASSWORD" in docs and "owner-password.initial" in docs

@@ -12,19 +12,20 @@ control panel, a system tray, and MCP tools so an agent can run it from another 
 replace LM Studio as the backend for [OpenClaw](docs/OPENCLAW.md) — it listens on LM Studio's port, so
 switching is a host change, not a rewrite.
 
-**Status:** v1.26-09-23. `main` has moved on since (D71 to D79, see [`CHANGELOG.md`](CHANGELOG.md)).
-Windows is the reference platform and runs it daily; Linux is supported (CI runs both) and less
-battle-tested. Questions and bug reports: [Contact](#contact).
+**Status:** v2.0.0. The first release on the new scheme: secure-by-default binds, scoped keys,
+multi-backend engines and the LM Studio native API (see [`CHANGELOG.md`](CHANGELOG.md), **BREAKING**
+first). Windows is the reference platform and runs it daily; Linux is supported (CI runs both) and
+less battle-tested. Questions and bug reports: [Contact](#contact).
 
 **Read more:** [the StudioForge write-up](https://www.laserlloyd.com/projects/studioforge-gpu-only-llm-server/)
 on LaserLloyd.com, and the author's other [AI projects](https://www.laserlloyd.com/ai/).
 
-**On versions.** StudioForge is calendar-versioned: a major, then the release date. The display
-version lives in `src/studioforge/__init__.py` — `1.26-09-23` — and is what `GET /api/version`,
-`GET /health`, the MCP `server_status` tool and `sfctl status` report. PEP 440 has no way to spell
-a hyphenated date, so both `pyproject.toml` files carry the same date as `1.26.9.23`, which is what
-`pip`/`uv` see in the wheel metadata; the `sfctl` companion ships from the same release and carries
-the same version, and release tags are `v1.26-09-23`. Check what a server is actually running with
+**On versions.** StudioForge uses semantic versioning since 2.0.0. The version lives in
+`src/studioforge/__init__.py` — `2.0.0` — and is what `GET /api/version`, `GET /health`, the MCP
+`server_status` tool and `sfctl status` report; both `pyproject.toml` files carry the same string,
+the `sfctl` companion ships from the same release and carries the same version, and release tags are
+`v2.0.0`. Releases before 2.0.0 were calendar-versioned (`1.26-08-23` style); the updater reads both
+schemes, so a 1.x install sees 2.0.0 as the update it is. Check what a server is actually running with
 `curl -s <host>/api/version`. A server running a commit past its release still reports that release,
 but the `build` field beside `version` (on `/health`, `/api/version`, `/api/status`, `server_status`
 and the "starting" log line) names the checkout itself: the short commit SHA, `-dirty`
@@ -203,7 +204,10 @@ boot today; they serve once the multi-backend engine lands). Docker or Podman.
    (set `SF_MODELS` to your GGUF folder).
 2. **Start it:** `docker compose -f compose.yml -f compose.cuda.yml up -d`
    (Podman: `podman-compose -f compose.yml -f compose.cuda.podman.yml up -d`).
-3. **Open** <http://localhost:8080>. Clients use `http://localhost:1234/v1`.
+3. **Open** <http://localhost:8080> and sign in as the owner (`SF_OWNER_PASSWORD` from `.env`, or
+   the generated one in `/data/owner-password.initial` on the volume — `docker compose exec` into
+   the container and `cat` it). Create a key per client under **Users & Keys**; clients use
+   `http://localhost:1234/v1` with that key.
 
 | Port | What |
 | --- | --- |
@@ -227,10 +231,12 @@ Full guide: [docs/deploy/docker.md](docs/deploy/docker.md).
 
 ### First run, either platform
 
-The Setup tab asks you to confirm three things: the engine is installed, `models.dir` points at
-your GGUF library (**Detect LM Studio library** finds an existing one — models are indexed in
-place, never copied), and you have noted the MCP pairing PIN you will need for an agent. The full
-walkthrough, with the headless YAML/CLI equivalent, is [`docs/SETUP.md`](docs/SETUP.md).
+The panel opens on **Overview** with a *Finish setup* banner that leads to the setup guide
+(`/setup`, or `studioforge setup` in a terminal): owner account, hardware, engine, model library
+(**Detect LM Studio library** finds an existing one — models are indexed in place, never copied),
+a starter model, a test chat, integration snippets and network exposure. Every step is optional on a
+local-only install. The tab-by-tab reference, with the headless YAML/CLI equivalent, is
+[`docs/SETUP.md`](docs/SETUP.md).
 
 ---
 

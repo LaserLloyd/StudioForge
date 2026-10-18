@@ -9,7 +9,11 @@
 #      wrote this data dir, snapshot the databases and config.yaml to
 #      $SF_DATA_DIR/backups/<oldversion>-<UTC timestamp>/ BEFORE the new version
 #      runs its schema migrations. Keeps the newest 5 such snapshots.
-#   4. exec `studioforge "$@"` so signals reach the real process.
+#   4. (only for `serve`) create the owner account on a fresh volume, from
+#      SF_OWNER_PASSWORD or a generated password saved owner-only on the volume,
+#      because the container binds 0.0.0.0 and the app refuses a network bind
+#      with nothing to log in with (auth_required_for_remote_bind).
+#   5. exec `studioforge "$@"` so signals reach the real process.
 #
 # Everything else (`--help`, `version`, `config`, `engine ...`) goes straight to
 # the program untouched.
@@ -114,6 +118,60 @@ PY
         fi
     elif [ "$HAS_DATA" = "0" ]; then
         printf '%s\n' "$NEW_VERSION" > "$MARKER"
+    fi
+
+    # --- 4. owner account (the bind rule) --------------------------------------
+    # The image binds 0.0.0.0 inside the container (see the Dockerfile), and a
+    # non-loopback bind refuses to start without an owner account or an admin
+    # key (auth_required_for_remote_bind, exit 4). A fresh volume has neither,
+    # so create the owner account once: from SF_OWNER_PASSWORD when the user set
+    # it in .env, else from a generated password written to the volume as an
+    # owner-only file (never to this log). Nothing happens when an account, a
+    # key or the legacy server.api_key already exists.
+    # The app's own rule decides (an owner account, an active admin key or the
+    # legacy server.api_key all satisfy it). The answer goes to a file because
+    # the first CLI call on a fresh volume also logs migrations to stdout.
+    FLAG=/tmp/sf-has-admin-credential
+    python - "$FLAG" <<'PY' || log "WARNING: could not evaluate the credential posture; assuming one exists"
+import sys
+
+from studioforge.api.auth import has_admin_credential
+from studioforge.cli_commands import _config, _store
+
+config = _config(None)
+db, store = _store(config)
+try:
+    found = has_admin_credential(config, store)
+finally:
+    db.close()
+open(sys.argv[1], "w").write("yes" if found else "no")
+PY
+    if [ "$(cat "$FLAG" 2>/dev/null || echo yes)" = "no" ]; then
+        OWNER_USER="${SF_OWNER_USER:-owner}"
+        if [ -n "${SF_OWNER_PASSWORD:-}" ]; then
+            if studioforge users create "$OWNER_USER" --password-env SF_OWNER_PASSWORD; then
+                log "created the owner account '${OWNER_USER}' from SF_OWNER_PASSWORD (sign in on the panel)"
+            else
+                log "ERROR: could not create the owner account from SF_OWNER_PASSWORD (10+ characters?)"
+                exit 1
+            fi
+        else
+            PW_FILE="$DATA_DIR/owner-password.initial"
+            SF_OWNER_PASSWORD="$(python -c 'import secrets; print(secrets.token_urlsafe(18))')"
+            export SF_OWNER_PASSWORD
+            ( umask 077 && printf '%s\n' "$SF_OWNER_PASSWORD" > "$PW_FILE" )
+            if studioforge users create "$OWNER_USER" --password-env SF_OWNER_PASSWORD; then
+                log "created the owner account '${OWNER_USER}' with a generated password, stored"
+                log "owner-only at ${PW_FILE}. Read it with:"
+                log "    docker compose exec studioforge cat ${PW_FILE}"
+                log "then sign in on the panel, change it under Users & Keys, and delete the file."
+            else
+                rm -f "$PW_FILE"
+                log "ERROR: could not create the owner account; the server will refuse to start."
+                exit 1
+            fi
+            unset SF_OWNER_PASSWORD
+        fi
     fi
     log "data=${DATA_DIR} uid=$(id -u) gid=$(id -g) version=${NEW_VERSION}"
 fi

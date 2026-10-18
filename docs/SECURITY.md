@@ -9,7 +9,7 @@ vulnerability see [`SECURITY.md`](../SECURITY.md) at the repository root.
   `:1234`, the control panel on `:8080`, the recovery watchdog on `:1235`) bind `127.0.0.1`.
 - **A server that would listen on the network refuses to start** until an owner account or an
   admin API key exists. The message names the services and the two commands that fix it
-  (`studioforge setup`, `studioforge keys create --scope admin`).
+  (`studioforge setup`, `studioforge keys create --name admin --scope admin`).
 - **Credentials are named, scoped and hashed.** `read` < `inference` < `admin`; an optional expiry
   and requests-per-minute limit; last use is recorded; only a SHA-256 is stored.
 - **Everything an admin does is written to an append-only audit log.**
