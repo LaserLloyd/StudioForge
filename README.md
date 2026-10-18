@@ -194,6 +194,37 @@ the [VRAM Tenant Protocol](docs/TENANTS.md). StudioForge never starts or stops o
 4. To run it as a service that survives logout, use the systemd user units in
    [`deploy/`](deploy/README.md).
 
+### Run in Docker
+
+Images: `ghcr.io/laserlloyd/studioforge:<version>-cuda` (NVIDIA), `-rocm` and `-vulkan` (build and
+boot today; they serve once the multi-backend engine lands). Docker or Podman.
+
+1. **Get the compose files:** `git clone https://github.com/LaserLloyd/StudioForge.git && cd StudioForge/deploy/compose && cp env.example .env`
+   (set `SF_MODELS` to your GGUF folder).
+2. **Start it:** `docker compose -f compose.yml -f compose.cuda.yml up -d`
+   (Podman: `podman-compose -f compose.yml -f compose.cuda.podman.yml up -d`).
+3. **Open** <http://localhost:8080>. Clients use `http://localhost:1234/v1`.
+
+| Port | What |
+| --- | --- |
+| `1234` | Gateway: `/v1`, `/api`, `/mcp`, `/health` |
+| `8080` | Control panel |
+| `1235` | Watchdog sidecar |
+
+GPU passthrough: Docker `--gpus all`; Podman `--device nvidia.com/gpu=all` (after
+`sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml`); AMD `--device /dev/kfd --device /dev/dri`.
+The llama.cpp engine is downloaded or built by the app on first start into the data volume (the slim
+`-cuda` image cannot compile it: use `-cuda-devel` once, or mount a built `engines/`).
+
+**Your data survives updates.** Everything lives on the `studioforge-data` volume (`/data`), the image
+is read-only, and on the first start of a new version the entrypoint snapshots `registry.sqlite3` and
+`config.yaml` to `/data/backups/<oldversion>-<time>/` before migrations run (newest 5 kept).
+`docker compose pull && docker compose up -d` keeps it; **`docker compose down -v` deletes it**. Back
+it up with the app stopped:
+`docker run --rm -v studioforge-data:/data:ro -v "$PWD":/backup alpine tar czf /backup/studioforge-data.tgz -C /data .`
+(restore: extract into a fresh volume with the reverse `tar xzf`, then `chown -R 1000:1000 /data`).
+Full guide: [docs/deploy/docker.md](docs/deploy/docker.md).
+
 ### First run, either platform
 
 The Setup tab asks you to confirm three things: the engine is installed, `models.dir` points at

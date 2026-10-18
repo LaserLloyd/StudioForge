@@ -1,0 +1,36 @@
+# Keep the build context to what the Dockerfile COPYs: pyproject.toml, uv.lock,
+# README.md, LICENSE, src/. Everything else is noise (and some of it is private).
+.git
+.github
+.venv
+venv
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# runtime state (see .gitignore): never bake a data dir into an image
+data
+logs
+downloads
+engines
+releases
+config.yaml
+*.sqlite3*
+.instance.lock
+*.log
+.env
+.env.*
+local-env.bat
+
+tests
+bench
+docs
+launchers
+packages
+scripts
+deploy
+!deploy/compose/entrypoint.sh
+*.md
+!README.md

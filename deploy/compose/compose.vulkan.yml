@@ -1,0 +1,8 @@
+# Vulkan (AMD RADV / Intel ANV) through the DRM render node. SF_BACKEND=vulkan.
+services:
+  studioforge:
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - "${SF_VIDEO_GID:-44}"
+      - "${SF_RENDER_GID:-109}"

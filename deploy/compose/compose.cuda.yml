@@ -1,0 +1,11 @@
+# NVIDIA GPUs with Docker (needs the NVIDIA Container Toolkit on the host).
+# Also works with Docker Desktop's WSL2 GPU support.
+services:
+  studioforge:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
