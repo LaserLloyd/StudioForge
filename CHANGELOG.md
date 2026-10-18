@@ -167,6 +167,24 @@ Prosumer refactor, W1 (engines and hardware detection) -- see [`docs/ENGINES.md`
 - New error codes: `engine_checksum_mismatch`, `engine_unverified_refused`,
   `engine_benchmark_unconfirmed`.
 
+### Fixed
+
+- Engine archives keep their symlinks. The prebuilt Linux llama.cpp tarballs ship
+  `libllama.so -> libllama.so.0` style links; the extractor skipped every link member, so the
+  downloaded engine failed its own smoke test and `studioforge engine --update` was unusable on
+  Linux. Relative links that stay inside the engine directory are recreated (hard links and unix-zip
+  symlinks too; Windows copies the target); absolute and escaping targets are still refused.
+- `studioforge engine --update` / `engine update` no longer exit 1 on an empty model library. With no
+  GGUF to micro-load the smoke test runs `llama-server --version` and `--list-devices` only, records
+  `smoke_result: "binary-only (no model available)"` (was `partial`) and the build is activated; a
+  later check with a model present runs the full micro-load. A binary that does not run, or a model
+  that will not load, still fails. `POST /api/engine/smoke-test` gains `smoke_result`.
+- The Linux systemd units (`deploy/linux/install.sh` and `deploy/*.service`) carry
+  `SuccessExitStatus=130 143`, so a clean stop no longer leaves them `failed`. `install.sh
+  --uninstall` runs `systemctl reset-failed` before disabling (and again once the files are gone),
+  and a re-run over a live install stops the running units before replacing the venv, writes the
+  units atomically and restarts them from a cleared state.
+
 ## 1.26-09-23 (2026-09-23)
 
 - D58: the `loaded` model alias.
