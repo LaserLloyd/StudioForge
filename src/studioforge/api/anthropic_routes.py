@@ -88,9 +88,18 @@ def error_type_for(status: int) -> str:
 
 
 def error_body(message: str, status: int, code: str | None = None) -> dict[str, Any]:
+    """Anthropic's ``{"type": "error", "error": {type, message}}`` plus the catalog keys.
+
+    ``code``, ``fix`` and ``docs`` are additive: the Anthropic SDKs read ``type``
+    and ``message`` and ignore the rest, and every other StudioForge surface
+    carries the same three keys for a catalogued code (``error_catalog``).
+    """
+    from studioforge.error_catalog import envelope_extras
+
     error: dict[str, Any] = {"type": error_type_for(status), "message": message}
     if code:
         error["code"] = code
+        error.update(envelope_extras(code))
     return {"type": "error", "error": error}
 
 
