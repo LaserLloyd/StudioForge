@@ -1624,7 +1624,12 @@ def _within(path: Path, root: Path) -> bool:
 
 
 def _finish_links(
-    dest: Path, links: list[_PendingLink], binary: Path | None, *, kind: str
+    dest: Path,
+    links: list[_PendingLink],
+    binary: Path | None,
+    *,
+    kind: str,
+    copy_names: frozenset[tuple[str, ...]] = frozenset(),
 ) -> Path | None:
     """Recreate an archive's symlinks once every regular file is on disk.
 
@@ -1636,6 +1641,8 @@ def _finish_links(
     ones are skipped with a warning), and each created link is re-checked with
     ``resolve()`` against ``dest``. Where a real symlink cannot be made
     (Windows, a filesystem that refuses) the target file is copied instead.
+    Members named in ``copy_names`` (tar hard links) are always copied: a hard
+    link is a second name for the same data, not a pointer that can dangle.
     """
     root = dest.resolve()
     pending: list[tuple[Path, Path, str]] = []
@@ -1646,8 +1653,10 @@ def _finish_links(
             continue
         pending.append((dest.joinpath(*parts), dest.joinpath(*rel.split("/")), archive_name))
 
+    copy_paths = {dest.joinpath(*names) for names in copy_names}
+
     def _make(link: Path, target: Path) -> bool:
-        if os.name != "nt":
+        if os.name != "nt" and link not in copy_paths:
             try:
                 if link.is_symlink() or link.exists():
                     link.unlink()
@@ -1791,6 +1800,7 @@ def _extract_engine_tar(tar_path: Path, dest: Path) -> Path | None:
     dest.mkdir(parents=True, exist_ok=True)
     binary: Path | None = None
     links: list[_PendingLink] = []
+    hard_links: set[tuple[str, ...]] = set()
     with tarfile.open(tar_path, "r:*") as archive:
         members = archive.getmembers()
         prefix = _common_prefix([m.name for m in members if m.isfile()])
@@ -1819,6 +1829,7 @@ def _extract_engine_tar(tar_path: Path, dest: Path) -> Path | None:
                         )
                         continue
                     linkname = "/".join([".."] * (len(parts) - 1) + other_parts)
+                    hard_links.add(tuple(parts))
                 links.append((parts, linkname, member.name))
                 continue
             if not member.isfile():
@@ -1838,7 +1849,7 @@ def _extract_engine_tar(tar_path: Path, dest: Path) -> Path | None:
                     target.chmod(target.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
             if target.name == BIN_NAME:
                 binary = target
-    return _finish_links(dest, links, binary, kind="tar")
+    return _finish_links(dest, links, binary, kind="tar", copy_names=frozenset(hard_links))
 
 
 def _make_executable(directory: Path) -> None:
