@@ -21,6 +21,15 @@ The version string still reads `1.26-09-23`; the `build` field tells these commi
 - D77 to D79: the VRAM Tenant Protocol (`vt.1`), the tenant registry, `devices: "auto"`, and the
   `studioforge-tenant` SDK ([`docs/TENANTS.md`](docs/TENANTS.md)). StudioForge never starts or
   stops a tenant.
+- LM Studio compatibility ([`docs/API.md`](docs/API.md)): the native v1 REST API under `/api/v1`
+  (`GET /models`, `POST /models/load` and `/unload`, `POST /models/download` with
+  `GET /models/download/status`; `POST /chat` answers `501 not_implemented`), Anthropic-compatible
+  `POST /v1/messages` (streaming, tools, images; `x-api-key` and bearer both work), and a stateless
+  OpenAI `POST /v1/responses`. Per-request `ttl` and `priority` behave identically on all of them.
+  New error codes: `not_implemented`, `unsupported_parameter`, `instance_not_found`,
+  `download_not_found`. Wire fixtures in `tests/fixtures/lmstudio/` (derived from LM Studio's docs,
+  not captured), an offline suite in `tests/unit/compat/`, and an opt-in `tests/compat/` suite for a
+  running test instance.
 
 Contracts foundation (refactor workstream W0-SF). All additive; no serving behaviour changes.
 

@@ -137,6 +137,8 @@ _ADMIN_MUTATION_PREFIXES: tuple[str, ...] = (
     "/api/update/",
     "/api/vram/reclaim",
     "/api/downloads",
+    # LM Studio's native twin of POST /api/downloads: same disk write, same gate.
+    "/api/v1/models/download",
     "/api/leases",
     # D77: registering, deregistering or warming a tenant is the same class of
     # change as taking a lease -- it names URLs this server will then call.

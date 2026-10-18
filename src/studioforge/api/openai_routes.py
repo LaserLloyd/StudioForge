@@ -20,6 +20,7 @@ import asyncio
 import json
 import time
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -254,8 +255,57 @@ async def chat_completions(request: Request) -> Any:
     ``priority`` -- a float, a string, a 0-based scale -- stops working loudly
     rather than being silently demoted to background.
     """
-    state = _app_state(request)
     body = await _json_body(request)
+    prepared = await prepare_chat(request, body)
+    state = prepared.state
+    serving = prepared.serving
+    payload = prepared.payload
+    priority = prepared.priority
+    client = prepared.client
+
+    if payload.get("stream"):
+        admit_stream(prepared)
+        # Load inside the stream so a multi-minute cold start is covered by
+        # keep-alive comments rather than silence.
+        return StreamingResponse(
+            chat_stream(prepared, route="/v1/chat/completions"),
+            media_type="text/event-stream",
+            headers=SSE_HEADERS,
+        )
+
+    await state.manager.ensure_loaded(
+        serving.id, source=attributed_source("jit:/v1/chat/completions", client), priority=priority
+    )
+    _apply_ttl_override(state, serving.id, prepared.ttl_override)
+    return await _forward(state, serving, "/v1/chat/completions", payload, client=client)
+
+
+@dataclass
+class PreparedChat:
+    """A chat request that passed every check that needs no load.
+
+    Shared by ``/v1/chat/completions`` and the translated front doors
+    (``/v1/messages``, ``/v1/responses``): they must resolve, validate, tier,
+    attribute and TTL a request identically, so there is exactly one
+    implementation of "what happens before the load".
+    """
+
+    state: Any
+    record: ModelRecord
+    serving: ModelRecord
+    payload: dict[str, Any]
+    ttl_override: int | None
+    priority: int | None
+    client: str | None
+
+
+async def prepare_chat(request: Request, body: dict[str, Any]) -> PreparedChat:
+    """Resolve and validate an OpenAI chat body WITHOUT loading anything.
+
+    The front half of :func:`chat_completions`, unchanged: see that docstring
+    for the ordering argument (a bad request must be a real 4xx).
+    """
+    state = _app_state(request)
     model_name = _resolve_loaded_alias(state, _require_model(body, state.config), want="chat")
 
     # Resolve WITHOUT loading, so validation can happen up front.
@@ -295,36 +345,61 @@ async def chat_completions(request: Request) -> Any:
     # The X-SF-Client label (else the peer address) rides on the load's
     # ``source`` and on the in-flight record for this request (D70).
     client = client_of(request)
+    return PreparedChat(state, record, serving, payload, ttl_override, priority, client)
 
-    if payload.get("stream"):
-        # D66 first: a build that cannot load this architecture is a certain,
-        # permanent refusal -- a real HTTP 400 before the 200, never an error
-        # frame, and never behind a 503 that invites a retry.
-        state.manager.arch_check(serving.id)
-        # The D46 hold check runs BEFORE the 200 and the SSE stream begin: a
-        # held request must be a real HTTP 503 with Retry-After, not an
-        # in-band error frame most clients treat as fatal. ensure_loaded
-        # repeats the check inside the stream as the backstop.
-        state.manager.admission_check(serving.id, priority=priority)
-        # Same argument for a GPU lease (D53): when the cards this model would
-        # need are all leased away and it is not already serving, that is a
-        # real HTTP 507 with Retry-After, not an SSE frame inside a 200. Only
-        # the certain cases refuse here; the in-stream backstop below still
-        # catches everything else.
-        state.manager.lease_check(serving.id)
-        # Load inside the stream so a multi-minute cold start is covered by
-        # keep-alive comments rather than silence.
-        return StreamingResponse(
-            _stream_with_jit_load(state, serving, payload, ttl_override, priority, client=client),
-            media_type="text/event-stream",
-            headers=SSE_HEADERS,
-        )
 
-    await state.manager.ensure_loaded(
-        serving.id, source=attributed_source("jit:/v1/chat/completions", client), priority=priority
+def admit_stream(prepared: PreparedChat) -> None:
+    """The refusals that must be a real HTTP status BEFORE a 200 SSE begins."""
+    state, serving, priority = prepared.state, prepared.serving, prepared.priority
+    # D66 first: a build that cannot load this architecture is a certain,
+    # permanent refusal -- a real HTTP 400 before the 200, never an error
+    # frame, and never behind a 503 that invites a retry.
+    state.manager.arch_check(serving.id)
+    # The D46 hold check runs BEFORE the 200 and the SSE stream begin: a
+    # held request must be a real HTTP 503 with Retry-After, not an
+    # in-band error frame most clients treat as fatal. ensure_loaded
+    # repeats the check inside the stream as the backstop.
+    state.manager.admission_check(serving.id, priority=priority)
+    # Same argument for a GPU lease (D53): when the cards this model would
+    # need are all leased away and it is not already serving, that is a
+    # real HTTP 507 with Retry-After, not an SSE frame inside a 200. Only
+    # the certain cases refuse here; the in-stream backstop below still
+    # catches everything else.
+    state.manager.lease_check(serving.id)
+
+
+def chat_stream(prepared: PreparedChat, *, route: str) -> AsyncIterator[bytes]:
+    """The upstream chat SSE (OpenAI framing), JIT-loading inside the stream.
+
+    ``route`` is the front door's own path, used only for the load's ``source``.
+    """
+    return _stream_with_jit_load(
+        prepared.state,
+        prepared.serving,
+        prepared.payload,
+        prepared.ttl_override,
+        prepared.priority,
+        client=prepared.client,
+        route=route,
     )
-    _apply_ttl_override(state, serving.id, ttl_override)
-    return await _forward(state, serving, "/v1/chat/completions", payload, client=client)
+
+
+async def chat_json(prepared: PreparedChat, *, route: str) -> dict[str, Any]:
+    """Run a non-streamed chat to completion; return the OpenAI response dict."""
+    state, serving = prepared.state, prepared.serving
+    await state.manager.ensure_loaded(
+        serving.id,
+        source=attributed_source(f"jit:{route}", prepared.client),
+        priority=prepared.priority,
+    )
+    _apply_ttl_override(state, serving.id, prepared.ttl_override)
+    response = await _forward(
+        state, serving, "/v1/chat/completions", prepared.payload, client=prepared.client
+    )
+    data = json.loads(bytes(response.body)) if isinstance(response, JSONResponse) else response
+    if not isinstance(data, dict):
+        raise UpstreamError(f"llama-server for '{serving.id}' returned a non-object reply")
+    return data
 
 
 def _resolve_or_404(state: Any, name: str) -> ModelRecord:
@@ -341,6 +416,7 @@ async def _stream_with_jit_load(
     ttl_override: int | None,
     priority: int | None = None,
     client: str | None = None,
+    route: str = "/v1/chat/completions",
 ) -> AsyncIterator[bytes]:
     """Emit SSE keep-alives while a model loads, then proxy the real stream.
 
@@ -360,7 +436,7 @@ async def _stream_with_jit_load(
     loader = asyncio.ensure_future(
         state.manager.ensure_loaded(
             record.id,
-            source=attributed_source("jit:/v1/chat/completions", client),
+            source=attributed_source(f"jit:{route}", client),
             priority=priority,
         )
     )

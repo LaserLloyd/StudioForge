@@ -1,0 +1,10 @@
+{
+  "job_id": "g-qwen",
+  "status": "downloading",
+  "total_size_bytes": 21474836480,
+  "downloaded_bytes": 0,
+  "started_at": "2026-10-18T12:00:00.000Z",
+  "bytes_per_second": 0,
+  "model": "unsloth/Qwen3.8-27B-GGUF",
+  "quantization": "Q4_K_M"
+}
