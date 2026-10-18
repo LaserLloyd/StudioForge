@@ -1,0 +1,19 @@
+# NVIDIA GPUs with Podman, via CDI. One-time host setup:
+#   sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+#   nvidia-ctk cdi list            # must list nvidia.com/gpu=all
+#
+# Use with:  podman-compose -f compose.yml -f compose.cuda.podman.yml up -d
+#
+# Rootless podman maps container uid 1000 to a subordinate uid, so a BIND-mounted
+# SF_DATA owned by you is not writable. Either keep the default named volume (no
+# issue), or add the keep-id user namespace:
+#   podman-compose -f compose.yml -f compose.cuda.podman.yml \
+#       --podman-run-args="--userns=keep-id:uid=1000,gid=1000" up -d
+# (your host uid must be 1000, or set SF_UID/SF_GID to it and use keep-id:uid=<n>,gid=<n>).
+services:
+  studioforge:
+    devices:
+      - nvidia.com/gpu=all
+    security_opt:
+      - no-new-privileges:true
+      - label=disable   # SELinux: lets the container open the CDI device nodes
