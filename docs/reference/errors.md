@@ -418,7 +418,7 @@
 
 **Message.** This server requires its API key. Send it as 'Authorization: Bearer <key>' or 'X-API-Key'.
 
-**Fix.** Send the value of server.api_key (Setup tab, or `studioforge config`) as a bearer token. The panel and the watchdog use the same key.
+**Fix.** Send a scoped key (`studioforge keys create --name <client> --scope inference`, or the panel's Users & Keys page) as a bearer token; the deprecated server.api_key still works. A revoked or expired key says so with its own code.
 
 ## invalid_config
 
