@@ -13,7 +13,8 @@ replace LM Studio as the backend for [OpenClaw](docs/OPENCLAW.md) — it listens
 switching is a host change, not a rewrite.
 
 **Status:** v2.0.0. The first release on the new scheme: secure-by-default binds, scoped keys,
-multi-backend engines and the LM Studio native API (see [`CHANGELOG.md`](CHANGELOG.md), **BREAKING**
+backend-aware engines (CUDA verified; ROCm and Vulkan not yet tested on real hardware, see
+[`docs/ENGINES.md`](docs/ENGINES.md)) and the LM Studio native API (see [`CHANGELOG.md`](CHANGELOG.md), **BREAKING**
 first). Windows is the reference platform and runs it daily; Linux is supported (CI runs both) and
 less battle-tested. Questions and bug reports: [Contact](#contact).
 
@@ -198,8 +199,10 @@ the [VRAM Tenant Protocol](docs/TENANTS.md). StudioForge never starts or stops o
 
 ### Run in Docker
 
-Images: `ghcr.io/laserlloyd/studioforge:<version>-cuda` (NVIDIA), `-rocm` and `-vulkan` (build and
-boot today; they serve once the multi-backend engine lands). Docker or Podman.
+Images: `ghcr.io/laserlloyd/studioforge:<version>-cuda` (NVIDIA), `-rocm` and `-vulkan` (they boot and carry
+the AMD/Vulkan probes and the backend-aware engine installer, but are untested on real AMD or Intel
+hardware; NVIDIA/CUDA is the verified path, see the status note in
+[docs/deploy/docker.md](docs/deploy/docker.md)). Docker or Podman.
 
 1. **Get the compose files:** `git clone https://github.com/LaserLloyd/StudioForge.git && cd StudioForge/deploy/compose && cp env.example .env`
    (set `SF_MODELS` to your GGUF folder).
