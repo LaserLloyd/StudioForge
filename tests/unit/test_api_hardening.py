@@ -708,6 +708,31 @@ def test_wrong_pins_are_locked_out_with_a_doubling_backoff() -> None:
     _reset_guard()
 
 
+def test_a_wrong_pin_header_counts_toward_the_lockout_when_auth_is_enforced() -> None:
+    """Review 2026-10-18: with a credential required and ``mcp.pin_required`` off,
+    a wrong ``X-MCP-Pin`` header with no ``Authorization`` was refused *without*
+    recording a failure (only the bearer spelling counted), so the 10^8 PIN
+    space could be walked through the header at wire speed."""
+    _reset_guard()
+    from studioforge.api.auth import check_request
+
+    config = open_config()
+    config.server.api_key = "a-strong-enough-key"  # a credential is required
+    config.mcp.pin_required = False
+
+    def attempt(pin: str) -> int:
+        request = make_request("/mcp", method="POST", headers={"X-MCP-Pin": pin})
+        try:
+            check_request(request, config)
+        except AuthError as exc:
+            return exc.status_code
+        return 200
+
+    assert [attempt("00000000") for _ in range(4)] == [401, 401, 401, 401]
+    assert attempt("00000000") == 429, "the header spelling must arm the lockout too"
+    _reset_guard()
+
+
 def test_the_lockout_only_counts_callers_that_offered_a_credential() -> None:
     """An open install serves plenty of credential-free traffic (that is the
     LM Studio parity the product depends on). Counting those would let a

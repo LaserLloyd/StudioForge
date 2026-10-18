@@ -1,16 +1,18 @@
 # Changelog
 
-StudioForge is calendar-versioned: a major, then the release date (`1.26-09-23`; `1.26.9.23` in
-the wheel metadata, see [`docs/RELEASING.md`](docs/RELEASING.md)). Every change of substance is a
-numbered decision in [`DECISIONS.md`](DECISIONS.md), with the measurement behind it, so this file
-lists the releases and the decisions each one carries rather than repeating them.
+StudioForge is semantically versioned since 2.0.0 (see [`docs/RELEASING.md`](docs/RELEASING.md));
+releases before that were calendar-versioned (a major, then the release date: `1.26-09-23`,
+`1.26.9.23` in the wheel metadata). Every change of substance is a numbered decision in
+[`DECISIONS.md`](DECISIONS.md), with the measurement behind it, so this file lists the releases and
+the decisions each one carries rather than repeating them.
 
 To see what a running server includes, ask it: `GET /api/capabilities` lists every decision number
 the build implements, and the `build` field on `/health` names the exact commit.
 
-## Unreleased (on `main`)
+## 2.0.0 (unreleased; branch `refactor/prosumer-2026`)
 
-The version string still reads `1.26-09-23`; the `build` field tells these commits apart.
+The first release on the new version scheme: `2.0.0` follows `1.26-09-23`, and the updater orders
+the two schemes correctly (`tests/unit/test_version.py`). The `build` field tells commits apart.
 
 - D71: a MoE's compute term is sized from the weights that run.
 - D72: two slots over one KV pool; context checkpoints become settings.

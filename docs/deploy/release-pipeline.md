@@ -18,8 +18,8 @@ unchanged. `containers.yml` is new and sits beside it. Both trigger on a `v*` ta
 
 | Tag you push | Channel | Image tags |
 | --- | --- | --- |
-| `v1.26-09-23` | stable | `1.26-09-23-<variant>`, `stable-<variant>` |
-| `v1.26-09-23-beta.2` or `-rc.1` | beta | `1.26-09-23-beta.2-<variant>`, `beta-<variant>` |
+| `v2.0.0` | stable | `2.0.0-<variant>`, `stable-<variant>` |
+| `v2.0.0-beta.2` or `-rc.1` | beta | `2.0.0-beta.2-<variant>`, `beta-<variant>` |
 
 A hyphenated calendar version is a stable tag by itself; only a trailing `-beta.N` / `-rc.N` makes
 a beta. `workflow_dispatch` with `push=false` builds and smoke-tests without publishing.
@@ -27,7 +27,7 @@ a beta. `workflow_dispatch` with `push=false` builds and smoke-tests without pub
 ## Verifying what you pulled
 
 ```bash
-IMG=ghcr.io/laserlloyd/studioforge:1.26-09-23-cuda
+IMG=ghcr.io/laserlloyd/studioforge:2.0.0-cuda
 cosign verify "$IMG" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   --certificate-identity-regexp '^https://github.com/LaserLloyd/StudioForge/.github/workflows/containers.yml@refs/tags/'

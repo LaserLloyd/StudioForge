@@ -186,7 +186,18 @@ ENV PATH="/opt/studioforge/venv/bin:${PATH}" \
     PYTHONDONTWRITEBYTECODE=1 \
     SF_DATA_DIR=/data \
     SF_IMAGE_VERSION=${VERSION} \
-    HF_HOME=/data/huggingface
+    HF_HOME=/data/huggingface \
+    SF_SERVER__HOST=0.0.0.0 \
+    SF_GUI__HOST=0.0.0.0 \
+    SF_WATCHDOG__HOST=0.0.0.0
+# The three SF_*__HOST values are first-run defaults for the CONTAINER: the app
+# binds 127.0.0.1 by default (2.0.0), which inside a container network namespace
+# is unreachable from the published -p ports. 0.0.0.0 here means "the container's
+# interfaces"; what reaches the outside is still the -p / compose `ports:` line
+# (127.0.0.1 on the host by default). A non-loopback bind makes the app insist on
+# an owner account or admin key (auth_required_for_remote_bind, exit 4), so the
+# entrypoint creates the owner account on first start -- see sf-entrypoint.
+# config.yaml wins over these once it names a host (the panel saves every key).
 # Deliberately NO NVIDIA_VISIBLE_DEVICES / NVIDIA_DRIVER_CAPABILITIES here: the
 # nvidia/cuda base already sets both for the cuda variant, and baking them into
 # the vulkan/rocm variants makes an NVIDIA container hook try (and, with missing

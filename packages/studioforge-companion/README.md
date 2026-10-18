@@ -138,7 +138,7 @@ others — want this shape:
 
 Add `"args": ["-s", "rig", "mcp"]` to pin a profile.
 
-`sfctl mcp` merges **two** upstream MCP servers into one list of **30 tools**.
+`sfctl mcp` merges **two** upstream MCP servers into one list of **33 tools**.
 
 **Management** (the main app, `<url>/mcp`) — 23 tools:
 

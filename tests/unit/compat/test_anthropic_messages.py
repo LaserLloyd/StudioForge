@@ -482,6 +482,11 @@ def test_errors_use_the_anthropic_envelope_with_the_stable_code(
     assert unknown.status_code == 404
     assert unknown.json()["error"]["type"] == "not_found_error"
     assert unknown.json()["error"]["code"] == "model_not_found"
+    # The catalogue's "no dead ends" keys ride along inside Anthropic's envelope
+    # (additive: the SDKs read `type` and `message` only), like every other surface.
+    assert unknown.json()["error"]["docs"] == "errors/model_not_found"
+    assert "GET /v1/models" in unknown.json()["error"]["fix"]
+    assert no_vision.json()["error"]["docs"] == "errors/model_not_multimodal"
     assert bad_json.status_code == 400
     assert no_vision.status_code == 400
     assert no_vision.json()["error"]["code"] == "model_not_multimodal"
