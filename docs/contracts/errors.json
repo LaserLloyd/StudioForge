@@ -72,6 +72,15 @@
       "surface": "panel"
     },
     {
+      "code": "download_not_found",
+      "docs": "errors/download_not_found",
+      "error_type": "invalid_request_error",
+      "fix": "List active and recent downloads with GET /api/v1/models/download/status.",
+      "http_status": 404,
+      "message": "Unknown download job '{job_id}'.",
+      "surface": "api"
+    },
+    {
       "code": "downloads_active",
       "docs": "errors/downloads_active",
       "error_type": "invalid_request_error",
@@ -159,6 +168,15 @@
       "fix": "Downscale the image, or raise gateway.max_image_bytes.",
       "http_status": 400,
       "message": "The image is over the {limit} byte limit (gateway.max_image_bytes).",
+      "surface": "api"
+    },
+    {
+      "code": "instance_not_found",
+      "docs": "errors/instance_not_found",
+      "error_type": "invalid_request_error",
+      "fix": "List loaded instances with GET /api/v1/models (loaded_instances) and unload by that id.",
+      "http_status": 404,
+      "message": "No loaded instance matches '{instance}'.",
       "surface": "api"
     },
     {
@@ -378,6 +396,15 @@
       "surface": "api"
     },
     {
+      "code": "not_implemented",
+      "docs": "errors/not_implemented",
+      "error_type": "not_implemented_error",
+      "fix": "Use the OpenAI-compatible route instead (POST /v1/chat/completions for stateful /api/v1/chat); see docs/API.md for the compatibility matrix.",
+      "http_status": 501,
+      "message": "This endpoint is not supported by StudioForge.",
+      "surface": "api"
+    },
+    {
       "code": "part_file_locked",
       "docs": "errors/part_file_locked",
       "error_type": "invalid_request_error",
@@ -537,6 +564,15 @@
       "fix": "Install a newer engine build (Server tab -> Engine, or `sfctl update --engine <tag>`). Retrying unchanged fails the same way.",
       "http_status": 400,
       "message": "The installed llama.cpp build cannot load the '{architecture}' architecture.",
+      "surface": "api"
+    },
+    {
+      "code": "unsupported_parameter",
+      "docs": "errors/unsupported_parameter",
+      "error_type": "invalid_request_error",
+      "fix": "Remove the parameter or use the endpoint listed as supporting it in docs/API.md.",
+      "http_status": 400,
+      "message": "The request parameter '{param}' is not supported on this endpoint.",
       "surface": "api"
     },
     {
