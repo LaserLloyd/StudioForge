@@ -163,3 +163,38 @@ def test_uninstall_dry_run_is_green(tmp_path: Path) -> None:
     result = _run(tmp_path, "--uninstall", "--dry-run")
     assert result.returncode == 0, result.stderr
     assert "KEPT your data" in result.stdout
+
+
+# --- the "Next steps" text must act on THIS install's data (O-13) ---------------
+
+
+def _next_steps() -> str:
+    text = _script()
+    return text[text.rindex("Next steps") :]
+
+
+def test_next_steps_use_the_install_specific_command_not_a_bare_studioforge() -> None:
+    steps = _next_steps()
+    assert "$CLI engine --update" in steps and "$CLI scan" in steps
+    assert "  studioforge engine" not in steps and "  studioforge scan" not in steps
+    # system scope: run as the service account against the data dir only its unit sets
+    assert 'CLI="sudo -u studioforge env SF_DATA_DIR=$DATA_DIR $BIN_DIR/studioforge"' in _script()
+
+
+@needs_linux_bash
+def test_system_dry_run_prints_commands_for_the_service_data_dir(tmp_path: Path) -> None:
+    source = Path(__file__).resolve().parents[2]
+    result = _run(tmp_path, "--system", "--dry-run", "--from", str(source))
+    assert result.returncode == 0, result.stderr
+    out = result.stdout
+    cli = "sudo -u studioforge env SF_DATA_DIR=/var/lib/studioforge /usr/local/bin/studioforge"
+    assert f"{cli} engine --update" in out
+    assert f"{cli} scan" in out
+
+
+@needs_linux_bash
+def test_user_dry_run_keeps_the_plain_command(tmp_path: Path) -> None:
+    source = Path(__file__).resolve().parents[2]
+    out = _run(tmp_path, "--dry-run", "--from", str(source)).stdout
+    assert "Install an engine:        studioforge engine --update" in out
+    assert "sudo -u" not in out

@@ -20,6 +20,7 @@ URL, so label cardinality is bounded by the code, not by the traffic.
 
 from __future__ import annotations
 
+import asyncio
 import re
 import threading
 import time
@@ -165,7 +166,8 @@ async def render_metrics(state: Any, *, include_children: bool = True) -> str:
         [("", float(len(loaded)))],
     )
     try:
-        gpus = list(state.probe.list_gpus())
+        # Off the event loop: the ROCm / Vulkan / Metal probes wait on a vendor tool.
+        gpus = list(await asyncio.to_thread(state.probe.list_gpus))
     except Exception:  # noqa: BLE001
         gpus = []
     if gpus:

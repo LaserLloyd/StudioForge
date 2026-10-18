@@ -1,5 +1,5 @@
 {
-  "count": 114,
+  "count": 116,
   "env_nested_delimiter": "__",
   "env_prefix": "SF_",
   "levels": [
@@ -885,6 +885,36 @@
       "secret": false,
       "section": "gpu",
       "type": "\"auto\" | \"nvml\" | \"cuda\" | \"rocm\" | \"vulkan\" | \"metal\" | \"null\" | \"fake\""
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "ge": 0
+      },
+      "default": 2.0,
+      "description": "Seconds a ROCm / Vulkan / Metal probe result is reused before the vendor tool (amd-smi, vulkaninfo, system_profiler) runs again. NVML is not cached. 0 = query on every call. Restart required.",
+      "env": "SF_GPU__PROBE_CACHE_S",
+      "key": "gpu.probe_cache_s",
+      "level": "advanced",
+      "restart_required": true,
+      "secret": false,
+      "section": "gpu",
+      "type": "float"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "gt": 0
+      },
+      "default": 15.0,
+      "description": "Most seconds one call waits for a vendor tool; past it the last good answer (or no GPUs) is returned and the tool finishes in the background. Restart required.",
+      "env": "SF_GPU__PROBE_TIMEOUT_S",
+      "key": "gpu.probe_timeout_s",
+      "level": "advanced",
+      "restart_required": true,
+      "secret": false,
+      "section": "gpu",
+      "type": "float"
     },
     {
       "choices": null,

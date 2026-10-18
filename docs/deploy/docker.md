@@ -85,7 +85,7 @@ flavour exists for the cases that need a source build: runtime is ~5 GB, devel i
 
 Every image: Ubuntu 24.04, Python 3.12 from the distro in a uv-built venv (the builder and runtime
 share `/usr/bin/python3.12`, so the venv's interpreter path survives the copy), non-root user
-`studioforge` (uid/gid 1000), `SF_DATA_DIR=/data`, `HEALTHCHECK` on `/health`, `STOPSIGNAL SIGTERM`.
+`studioforge` (uid/gid 1000), `SF_DATA_DIR=/data`, `HEALTHCHECK` on `/health` (it reads `server.tls.mode` and `server.port` from the config, so it switches to `https`, unverified on loopback, when TLS is on), `STOPSIGNAL SIGTERM`.
 
 ## GPU passthrough
 

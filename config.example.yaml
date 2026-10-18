@@ -191,6 +191,14 @@ gpu:
   # GPU wins. Force nvml / cuda / rocm / vulkan / metal to skip the others.
   # Restart required. (`SF_GPU_PROBE` is the env equivalent while this is auto.)
   backend: auto
+  # Seconds a ROCm / Vulkan / Metal probe result is reused before the vendor tool
+  # (amd-smi, vulkaninfo, system_profiler) runs again. NVML is not cached.
+  # 0 = query on every call. Restart required.
+  probe_cache_s: 2.0
+  # Most seconds one call waits for a vendor tool; past it the last good answer
+  # (or no GPUs) is returned and the tool finishes in the background.
+  # Restart required.
+  probe_timeout_s: 15.0
 planner:
   headroom_fraction: 0.1
   on_insufficient: evict

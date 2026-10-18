@@ -217,8 +217,13 @@ EXPOSE 1234 8080 1235
 # /health is liveness. It answers 200 even with no GPU (can_serve=false), so a
 # GPU-less smoke test is healthy; read the body for readiness. start-period is
 # generous: first boot creates the registry and probes the engine.
+# The probe reads server.tls.mode and server.port from the effective config (the
+# data volume's config.yaml plus SF_*), so it asks over https, without verifying
+# the loopback certificate, once TLS is on (`setup --exposure lan` does that).
+# It cannot rely on a variable exported by the entrypoint: HEALTHCHECK runs in a
+# fresh exec that only sees the image/container environment.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
-  CMD ["python", "-c", "import json,sys,urllib.request as u; r=u.urlopen('http://127.0.0.1:1234/health',timeout=4); sys.exit(0 if r.status==200 and json.load(r).get('status')=='ok' else 1)"]
+  CMD ["python", "-m", "studioforge.healthcheck"]
 
 # SIGTERM -> drain, stop every llama-server child, release the data-dir lock.
 STOPSIGNAL SIGTERM

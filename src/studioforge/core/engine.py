@@ -2010,6 +2010,17 @@ class EngineManager:
         # first thing that runs on every path that can spawn one -- the server's
         # build_state and the engine CLI alike.
         warn_remapping_environment()
+        # The auto-selecting probe must know the active engine's backend, so a
+        # failing NVML next to a CUDA build is reported rather than papered over
+        # with a Vulkan device list the build cannot use.
+        bind = getattr(probe, "bind_engine_backend", None)
+        if callable(bind):
+            bind(self.active_backend)
+
+    def active_backend(self) -> str | None:
+        """The active engine's backend (``cuda``, ``rocm``, ``vulkan``, ``metal``), or ``None``."""
+        info = self.active()
+        return (info.backend or variant_backend(info.variant) or None) if info is not None else None
 
     def _install_lock(self, tag: str) -> asyncio.Lock:
         lock = self._install_locks.get(tag)

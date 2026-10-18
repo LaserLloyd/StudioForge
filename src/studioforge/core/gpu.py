@@ -605,14 +605,42 @@ class _ProbeFailure(Exception):
     """A backend that cannot list GPUs, with the reason to show the operator."""
 
 
+#: Defaults for ``gpu.probe_cache_s`` / ``gpu.probe_timeout_s`` (see config.py).
+DEFAULT_PROBE_CACHE_S = 2.0
+DEFAULT_PROBE_TIMEOUT_S = 15.0
+#: A timed-out probe may keep serving its last good answer for this long; past
+#: it the probe reports no GPUs rather than numbers it can no longer vouch for.
+_MAX_STALE_S = 30.0
+
+
+class _Flight:
+    """One in-progress vendor-tool query, shared by every caller that arrives meanwhile."""
+
+    __slots__ = ("abandoned", "done")
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        #: A caller gave up waiting. Later callers do not wait for it again.
+        self.abandoned = False
+
+
 class _CliProbe:
     """Shared plumbing for probes that shell out to a vendor tool.
 
     Subclasses implement :meth:`_query` returning ``(gpus, driver)`` or
     raising :class:`_ProbeFailure` with a reason. The result is cached for
-    ``ttl_s`` seconds (the tools take 50-500 ms and the planner polls), and a
-    failure is remembered in :attr:`failure_reason` so the auto-selector can
-    say why a backend was skipped.
+    ``ttl_s`` seconds (the tools take 50-500 ms and the planner, ``/metrics``
+    and the status page poll about once a second), and a failure is remembered
+    in :attr:`failure_reason` so the auto-selector can say why a backend was
+    skipped.
+
+    The tool never runs on the caller's thread: a refresh runs on a worker
+    thread and the caller waits at most ``timeout_s`` for it. Callers that
+    arrive while a refresh is running share it (one subprocess per TTL window,
+    however many callers), and a tool that hangs costs one caller one timeout:
+    the call returns the last good answer (for up to 30 s) or "no GPUs", and
+    the stuck refresh finishes -- or is killed by its own deadline -- in the
+    background without anyone waiting for it again.
     """
 
     _BACKEND = "?"
@@ -622,17 +650,22 @@ class _CliProbe:
         *,
         runner: CommandRunner | None = None,
         which: Callable[[str], str | None] | None = None,
-        ttl_s: float = 1.0,
+        ttl_s: float = DEFAULT_PROBE_CACHE_S,
         clock: Callable[[], float] | None = None,
+        timeout_s: float = DEFAULT_PROBE_TIMEOUT_S,
     ) -> None:
         self._run: CommandRunner = runner or run_command
         self._which = which or shutil.which
         self._ttl = ttl_s
+        self._timeout = timeout_s
         self._clock = clock or time.monotonic
         self._lock = threading.Lock()
         self._gpus: list[GpuInfo] = []
         self._driver: str | None = None
         self._stamp: float | None = None
+        self._flight: _Flight | None = None
+        self._generation = 0
+        self._tls = threading.local()
         self.failure_reason: str | None = None
         #: Human-readable caveats from the last query (e.g. "free memory unknown").
         self.notes: list[str] = []
@@ -647,24 +680,60 @@ class _CliProbe:
         raise NotImplementedError
 
     # shared -----------------------------------------------------------
+    def _work(self, flight: _Flight, generation: int) -> None:
+        """Worker thread body: one query, then publish the result."""
+        reason: str | None = None
+        self._tls.deadline = time.monotonic() + self._timeout
+        try:
+            gpus, driver = self._query()
+        except _ProbeFailure as exc:
+            gpus, driver, reason = [], None, str(exc)
+            log.debug("gpu_probe_failed", backend=self._BACKEND, reason=reason)
+        except Exception as exc:  # noqa: BLE001 - a probe must never raise
+            gpus, driver, reason = [], None, f"unexpected error: {exc}"
+            log.warning("gpu_probe_error", backend=self._BACKEND, error=str(exc))
+        with self._lock:
+            if self._generation == generation:
+                self._gpus, self._driver, self._stamp = gpus, driver, self._clock()
+                self.failure_reason = reason
+                if self._flight is flight:
+                    self._flight = None
+        flight.done.set()
+
     def _refresh(self) -> list[GpuInfo]:
         with self._lock:
             now = self._clock()
             if self._stamp is not None and now - self._stamp < self._ttl:
                 return self._gpus
-            try:
-                gpus, driver = self._query()
-                self.failure_reason = None
-            except _ProbeFailure as exc:
-                gpus, driver = [], None
-                self.failure_reason = str(exc)
-                log.debug("gpu_probe_failed", backend=self._BACKEND, reason=str(exc))
-            except Exception as exc:  # noqa: BLE001 - a probe must never raise
-                gpus, driver = [], None
-                self.failure_reason = f"unexpected error: {exc}"
-                log.warning("gpu_probe_error", backend=self._BACKEND, error=str(exc))
-            self._gpus, self._driver, self._stamp = gpus, driver, now
+            flight = self._flight
+            if flight is None:
+                flight = self._flight = _Flight()
+                threading.Thread(
+                    target=self._work,
+                    args=(flight, self._generation),
+                    name=f"gpu-probe-{self._BACKEND}",
+                    daemon=True,
+                ).start()
+            elif flight.abandoned:
+                # A refresh already blew its budget and is still running: do
+                # not make this caller wait for it as well.
+                return self._served_stale(now)
+        # The tool's own timeouts are clamped to the same budget (_text), so the
+        # grace here only covers the worker's own bookkeeping.
+        if flight.done.wait(self._timeout + 0.5):
+            with self._lock:
+                return self._gpus
+        with self._lock:
+            flight.abandoned = True
+            self.failure_reason = f"{self._BACKEND} probe timed out after {self._timeout:g}s"
+            log.warning("gpu_probe_timeout", backend=self._BACKEND, timeout_s=self._timeout)
+            return self._served_stale(self._clock())
+
+    def _served_stale(self, now: float) -> list[GpuInfo]:
+        """The last good answer if recent enough to trust, else no GPUs (lock held)."""
+        if self._gpus and self._stamp is not None and now - self._stamp <= _MAX_STALE_S:
             return self._gpus
+        return []
 
     def available(self) -> bool:
         return bool(self._refresh())
@@ -690,12 +759,24 @@ class _CliProbe:
     def shutdown(self) -> None:
         with self._lock:
             self._gpus, self._driver, self._stamp = [], None, None
+            self._flight = None
+            self._generation += 1  # a refresh still running must not repopulate the cache
             self.failure_reason = None
 
     def _text(self, argv: Sequence[str], *, timeout: float = 20.0) -> str | None:
-        """stdout of ``argv`` when the tool exists and exits 0, else ``None``."""
+        """stdout of ``argv`` when the tool exists and exits 0, else ``None``.
+
+        The tool's timeout is clamped to what is left of this refresh's budget,
+        so a refresh never outlives ``timeout_s`` by more than one process kill.
+        """
         if self._which(argv[0]) is None:
             return None
+        deadline = getattr(self._tls, "deadline", None)
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            timeout = min(timeout, remaining)
         code, out = self._run(argv, timeout)
         return out if code == 0 and out.strip() else None
 
@@ -857,6 +938,17 @@ class MetalGpuProbe(_CliProbe):
 # ---------------------------------------------------------------------------
 
 
+def _nvml_blocked_reason(nvml_reason: str) -> str:
+    """The operator-facing message for "CUDA engine, NVML unavailable"."""
+    head = nvml_reason if "NVML" in nvml_reason else f"NVML unavailable: {nvml_reason}"
+    return (
+        f"{head}. The active llama.cpp engine is a CUDA build, which cannot drive a "
+        "Vulkan or ROCm device, so no other GPU backend was tried. Fix: make "
+        "`nvidia-smi` list the cards (reload or reinstall the NVIDIA driver, or reboot), "
+        "then restart StudioForge; or install a Vulkan engine build to use that backend."
+    )
+
+
 @dataclass(frozen=True)
 class ProbeAttempt:
     """One backend the auto-selector tried, and what came of it."""
@@ -878,21 +970,57 @@ class AutoGpuProbe:
     One backend per process: a box with an NVIDIA and an AMD card uses the
     first one that answers.
 
+    One exception to "first that lists a GPU wins": when the active llama.cpp
+    engine is a CUDA build (see :meth:`bind_engine_backend`) and NVML lists
+    nothing, the other backends are NOT tried. Vulkan would list the very same
+    NVIDIA cards and the CUDA build would then be launched with
+    ``--device Vulkan0``, which it cannot honour. The probe reports no GPUs and
+    :attr:`blocked_reason` says why and how to fix it.
+
     Resolution is lazy and sticky until :meth:`shutdown`. :attr:`attempts`
     records every backend tried and why the failures failed, which is what
     ``/api/gpus`` and the setup wizard should show.
     """
 
-    def __init__(self, candidates: Sequence[GpuProbe] | None = None) -> None:
+    def __init__(
+        self,
+        candidates: Sequence[GpuProbe] | None = None,
+        *,
+        cache_s: float = DEFAULT_PROBE_CACHE_S,
+        timeout_s: float = DEFAULT_PROBE_TIMEOUT_S,
+        engine_backend: Callable[[], str | None] | None = None,
+    ) -> None:
+        cli: dict[str, Any] = {"ttl_s": cache_s, "timeout_s": timeout_s}
         self._candidates: list[GpuProbe] = (
             list(candidates)
             if candidates is not None
-            else [NvmlGpuProbe(), RocmGpuProbe(), VulkanGpuProbe(), MetalGpuProbe()]
+            else [NvmlGpuProbe(), RocmGpuProbe(**cli), VulkanGpuProbe(**cli), MetalGpuProbe(**cli)]
         )
         self._lock = threading.Lock()
         self._selected: GpuProbe | None = None
         self._resolved = False
+        self._engine_backend = engine_backend
         self.attempts: list[ProbeAttempt] = []
+        #: Why detection stopped at NVML instead of trying the other backends
+        #: (a CUDA engine with a failing NVML), or ``None``.
+        self.blocked_reason: str | None = None
+
+    def bind_engine_backend(self, getter: Callable[[], str | None]) -> None:
+        """Say how to ask which backend the active llama.cpp engine targets.
+
+        Late-bound because the engine manager is built from the probe. Takes
+        effect for a resolution that has not happened yet (resolution is
+        lazy, and a result is kept until :meth:`shutdown`).
+        """
+        self._engine_backend = getter
+
+    def _engine_is_cuda(self) -> bool:
+        if self._engine_backend is None:
+            return False
+        try:
+            return self._engine_backend() == "cuda"
+        except Exception:  # noqa: BLE001 - detection must not depend on the engine inventory
+            return False
 
     def _resolve(self) -> GpuProbe | None:
         with self._lock:
@@ -900,6 +1028,7 @@ class AutoGpuProbe:
                 return self._selected
             attempts: list[ProbeAttempt] = []
             selected: GpuProbe | None = None
+            blocked: str | None = None
             for probe in self._candidates:
                 reason = ""
                 try:
@@ -913,7 +1042,13 @@ class AutoGpuProbe:
                 if count > 0:
                     selected = probe
                     break
+                if probe.backend == "cuda" and self._engine_is_cuda():
+                    blocked = _nvml_blocked_reason(reason)
+                    break
             self.attempts, self._selected, self._resolved = attempts, selected, True
+            self.blocked_reason = blocked
+            if blocked is not None:
+                log.warning("gpu_probe_nvml_blocked", reason=blocked)
             log.info(
                 "gpu_probe_auto",
                 selected=selected.backend if selected else None,
@@ -942,6 +1077,7 @@ class AutoGpuProbe:
                 for a in self.attempts
             ],
             "notes": notes,
+            "blocked": self.blocked_reason,
         }
 
     def available(self) -> bool:
@@ -974,6 +1110,7 @@ class AutoGpuProbe:
                 with contextlib.suppress(Exception):
                     probe.shutdown()
             self._selected, self._resolved, self.attempts = None, False, []
+            self.blocked_reason = None
 
 
 # ---------------------------------------------------------------------------
@@ -999,14 +1136,21 @@ _BACKEND_FOR_CHOICE = {
 _probe_family: str | None = None
 
 
-def get_probe(*, force: str | None = None) -> GpuProbe:
+def get_probe(
+    *,
+    force: str | None = None,
+    cache_s: float = DEFAULT_PROBE_CACHE_S,
+    timeout_s: float = DEFAULT_PROBE_TIMEOUT_S,
+) -> GpuProbe:
     """The process-wide probe, created on first call and cached.
 
     ``force`` (or env ``SF_GPU_PROBE``) selects ``auto`` (the default: NVML ->
     ROCm -> Vulkan -> Metal), ``nvml``/``cuda``, ``rocm``, ``vulkan``,
     ``metal``, ``null`` or ``fake``; ``fake`` reads its synthetic GPUs from env
     ``SF_FAKE_GPUS``. A force that names a different family than the cached
-    probe rebuilds the cache.
+    probe rebuilds the cache. ``cache_s`` / ``timeout_s`` (``gpu.probe_cache_s``
+    / ``gpu.probe_timeout_s``) apply to the ROCm / Vulkan / Metal probes and
+    only when the probe is created.
     """
     global _probe, _probe_family
     choice = (force or os.environ.get(_ENV_PROBE, "")).strip().lower() or None
@@ -1019,16 +1163,17 @@ def get_probe(*, force: str | None = None) -> GpuProbe:
     with _probe_lock:
         if _probe is not None and (choice is None or _probe_family == family):
             return _probe
+        cli: dict[str, Any] = {"ttl_s": cache_s, "timeout_s": timeout_s}
         if family == "auto":
-            _probe = AutoGpuProbe()
+            _probe = AutoGpuProbe(cache_s=cache_s, timeout_s=timeout_s)
         elif family == "cuda":
             _probe = NvmlGpuProbe()
         elif family == "rocm":
-            _probe = RocmGpuProbe()
+            _probe = RocmGpuProbe(**cli)
         elif family == "vulkan":
-            _probe = VulkanGpuProbe()
+            _probe = VulkanGpuProbe(**cli)
         elif family == "metal":
-            _probe = MetalGpuProbe()
+            _probe = MetalGpuProbe(**cli)
         elif family == "null":
             _probe = NullGpuProbe()
         else:  # "fake"
@@ -1070,8 +1215,13 @@ def probe_for_config(config: Any) -> GpuProbe:
     ``auto`` defers to ``SF_GPU_PROBE`` (and then to auto-detection); any other
     value is an explicit choice and wins over the environment.
     """
-    choice = str(getattr(getattr(config, "gpu", None), "backend", "auto") or "auto")
-    return get_probe(force=None if choice == "auto" else choice)
+    gpu_cfg = getattr(config, "gpu", None)
+    choice = str(getattr(gpu_cfg, "backend", "auto") or "auto")
+    return get_probe(
+        force=None if choice == "auto" else choice,
+        cache_s=float(getattr(gpu_cfg, "probe_cache_s", DEFAULT_PROBE_CACHE_S)),
+        timeout_s=float(getattr(gpu_cfg, "probe_timeout_s", DEFAULT_PROBE_TIMEOUT_S)),
+    )
 
 
 def probe_diagnostics(probe: GpuProbe) -> dict[str, Any]:
