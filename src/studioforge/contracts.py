@@ -96,7 +96,7 @@ async def _collect(state: Any, config_path: Path) -> list[dict[str, Any]]:
 def live_surfaces() -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """``(openapi document, mcp tool rows)`` from an in-process app. Safe to call anywhere."""
     from studioforge.api.app import build_state, create_app
-    from studioforge.config import Config
+    from studioforge.config import Config, GuiConfig, LoggingConfig, ModelsConfig, WatchdogConfig
 
     with (
         _clean_environment(),
@@ -105,10 +105,10 @@ def live_surfaces() -> tuple[dict[str, Any], list[dict[str, Any]]]:
         root = Path(tmp)
         config = Config(
             data_dir=root / "data",
-            models={"dir": root / "models"},
-            gui={"enabled": False},
-            watchdog={"enabled": False},
-            logging={"level": "ERROR"},
+            models=ModelsConfig(dir=root / "models"),
+            gui=GuiConfig(enabled=False),
+            watchdog=WatchdogConfig(enabled=False),
+            logging=LoggingConfig(level="ERROR"),
         )
         config.ensure_dirs()
         config_path = config.save(root / "data" / "config.yaml")
