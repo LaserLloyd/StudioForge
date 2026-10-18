@@ -1,0 +1,37 @@
+{
+  "id": "resp_0123456789abcdef01234567",
+  "object": "response",
+  "created_at": 1760788800,
+  "status": "completed",
+  "error": null,
+  "incomplete_details": null,
+  "instructions": "You are terse.",
+  "max_output_tokens": 128,
+  "model": "vendor/thing-Q4_K_M",
+  "output": [
+    {
+      "id": "msg_0123456789abcdef01234567",
+      "type": "message",
+      "status": "completed",
+      "role": "assistant",
+      "content": [{"type": "output_text", "text": "Hello there.", "annotations": []}]
+    }
+  ],
+  "parallel_tool_calls": true,
+  "previous_response_id": null,
+  "store": false,
+  "temperature": 1.0,
+  "text": {"format": {"type": "text"}},
+  "tool_choice": "auto",
+  "tools": [],
+  "top_p": 1.0,
+  "truncation": "disabled",
+  "usage": {
+    "input_tokens": 11,
+    "input_tokens_details": {"cached_tokens": 0},
+    "output_tokens": 5,
+    "output_tokens_details": {"reasoning_tokens": 0},
+    "total_tokens": 16
+  },
+  "metadata": {}
+}

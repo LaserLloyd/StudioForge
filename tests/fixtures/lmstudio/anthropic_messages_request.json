@@ -1,0 +1,10 @@
+{
+  "model": "vendor/thing-Q4_K_M",
+  "max_tokens": 256,
+  "temperature": 0.2,
+  "system": "You are terse.",
+  "stop_sequences": ["END"],
+  "messages": [
+    {"role": "user", "content": [{"type": "text", "text": "Say hello."}]}
+  ]
+}

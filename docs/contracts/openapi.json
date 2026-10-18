@@ -4524,6 +4524,167 @@
         ]
       }
     },
+    "/api/v1/chat": {
+      "post": {
+        "description": "LM Studio's stateful chat -- not implemented, and says so.",
+        "operationId": "v1_chat_api_v1_chat_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "V1 Chat",
+        "tags": [
+          "lmstudio"
+        ]
+      }
+    },
+    "/api/v1/models": {
+      "get": {
+        "description": "Every downloaded model, loaded or not, in LM Studio's v1 shape.",
+        "operationId": "v1_list_models_api_v1_models_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "V1 List Models",
+        "tags": [
+          "lmstudio"
+        ]
+      }
+    },
+    "/api/v1/models/download": {
+      "post": {
+        "description": "Queue a download. ``model`` is a Hugging Face ``owner/repo`` id or link.\n\nBehind the same admin gate as ``POST /api/downloads`` (it writes to the\nbox's disk): on an install without ``server.api_key`` it needs a caller on\nthis machine or the pairing PIN.",
+        "operationId": "v1_download_model_api_v1_models_download_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "V1 Download Model",
+        "tags": [
+          "lmstudio"
+        ]
+      }
+    },
+    "/api/v1/models/download/status": {
+      "get": {
+        "description": "Every job (additive: LM Studio's endpoint is per ``job_id``).",
+        "operationId": "v1_download_status_all_api_v1_models_download_status_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "V1 Download Status All",
+        "tags": [
+          "lmstudio"
+        ]
+      }
+    },
+    "/api/v1/models/download/status/{job_id}": {
+      "get": {
+        "description": "One job's progress, in LM Studio's shape.",
+        "operationId": "v1_download_status_api_v1_models_download_status__job_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "V1 Download Status",
+        "tags": [
+          "lmstudio"
+        ]
+      }
+    },
+    "/api/v1/models/load": {
+      "post": {
+        "description": "Load a model, LM Studio style: ``{model, context_length?, ttl?, ...}``.\n\n``context_length`` is the per-conversation window (StudioForge's\n``ctx_size``). LM Studio's engine tuning knobs -- ``eval_batch_size``,\n``flash_attention``, ``num_experts`` -- have no per-request equivalent\nhere (the planner owns them) and are reported under ``ignored`` instead of\nfailing the preload. ``offload_kv_cache_to_gpu: false`` is refused: this\nserver is GPU-only.",
+        "operationId": "v1_load_model_api_v1_models_load_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "V1 Load Model",
+        "tags": [
+          "lmstudio"
+        ]
+      }
+    },
+    "/api/v1/models/unload": {
+      "post": {
+        "description": "Unload an instance by ``instance_id`` (or, additively, by ``model``).",
+        "operationId": "v1_unload_model_api_v1_models_unload_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "V1 Unload Model",
+        "tags": [
+          "lmstudio"
+        ]
+      }
+    },
     "/api/version": {
       "get": {
         "description": "What this server is: product, release, build and the API versions it speaks.\n\n``version`` and ``build`` are what this route has always returned; ``product``\nand ``api_versions`` were added alongside them.",
@@ -4837,6 +4998,28 @@
         ]
       }
     },
+    "/v1/messages": {
+      "post": {
+        "description": "Anthropic Messages API on top of the shared chat path.",
+        "operationId": "create_message_v1_messages_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Create Message V1 Messages Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Create Message",
+        "tags": [
+          "anthropic"
+        ]
+      }
+    },
     "/v1/models": {
       "get": {
         "description": "Every downloaded model, loaded or not -- LM Studio parity.",
@@ -4914,6 +5097,28 @@
           }
         },
         "summary": "Rerank",
+        "tags": [
+          "openai"
+        ]
+      }
+    },
+    "/v1/responses": {
+      "post": {
+        "description": "OpenAI Responses API on top of the shared chat path.",
+        "operationId": "create_response_v1_responses_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Create Response V1 Responses Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Create Response",
         "tags": [
           "openai"
         ]

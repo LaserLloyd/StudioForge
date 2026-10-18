@@ -496,6 +496,36 @@ _ENTRIES: tuple[ErrorEntry, ...] = (
         "Unknown benchmark job '{job_id}'.",
         "List jobs with GET /api/benchmark/jobs; finished jobs are pruned.",
     ),
+    # --- LM Studio / Anthropic / Responses compatibility front doors -------
+    _e(
+        "not_implemented",
+        501,
+        "not_implemented_error",
+        "This endpoint is not supported by StudioForge.",
+        "Use the OpenAI-compatible route instead (POST /v1/chat/completions for stateful "
+        "/api/v1/chat); see docs/API.md for the compatibility matrix.",
+    ),
+    _e(
+        "unsupported_parameter",
+        400,
+        _INVALID,
+        "The request parameter '{param}' is not supported on this endpoint.",
+        "Remove the parameter or use the endpoint listed as supporting it in docs/API.md.",
+    ),
+    _e(
+        "instance_not_found",
+        404,
+        _INVALID,
+        "No loaded instance matches '{instance}'.",
+        "List loaded instances with GET /api/v1/models (loaded_instances) and unload by that id.",
+    ),
+    _e(
+        "download_not_found",
+        404,
+        _INVALID,
+        "Unknown download job '{job_id}'.",
+        "List active and recent downloads with GET /api/v1/models/download/status.",
+    ),
     # --- downloads, engines, updates --------------------------------------
     _e(
         "downloads_unavailable",

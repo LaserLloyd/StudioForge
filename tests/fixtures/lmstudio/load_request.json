@@ -1,0 +1,7 @@
+{
+  "model": "vendor/thing-Q4_K_M",
+  "context_length": 16384,
+  "flash_attention": true,
+  "echo_load_config": true,
+  "ttl": 120
+}

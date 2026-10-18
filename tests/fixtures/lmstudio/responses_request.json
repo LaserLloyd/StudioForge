@@ -1,0 +1,18 @@
+{
+  "model": "vendor/thing-Q4_K_M",
+  "instructions": "You are terse.",
+  "input": [
+    {"role": "user", "content": [{"type": "input_text", "text": "Weather in Oslo?"}]},
+    {"type": "function_call", "call_id": "call_1", "name": "get_weather", "arguments": "{\"city\":\"Oslo\"}"},
+    {"type": "function_call_output", "call_id": "call_1", "output": "4 C, light rain"}
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "name": "get_weather",
+      "description": "Current weather for a city.",
+      "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
+    }
+  ],
+  "max_output_tokens": 128
+}
