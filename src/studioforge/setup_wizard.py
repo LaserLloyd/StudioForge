@@ -596,10 +596,14 @@ class LiveServices:
         async def work() -> dict[str, Any]:
             try:
                 info = await manager.install(wanted, force=False, activate=False)
-                ok, message = await manager.smoke_test(info.tag)
+                ok, smoke_result, message = await manager.smoke_check(info.tag)
                 if ok:
                     await manager.activate(info.tag)
-                return {"tag": info.tag, "smoke_tested": bool(ok), "message": message}
+                return {
+                    "tag": info.tag,
+                    "smoke_tested": smoke_result == "passed",
+                    "message": message,
+                }
             finally:
                 with contextlib.suppress(Exception):
                     await manager.aclose()

@@ -21,6 +21,9 @@ Environment=PYTHONUNBUFFERED=1
 ExecStart=%h/studioforge/.venv/bin/studioforge serve
 Restart=on-failure
 RestartSec=5
+# The server exits 130 (SIGINT) / 143 (SIGTERM) on a clean stop; without this
+# `systemctl --user stop` leaves the unit "failed".
+SuccessExitStatus=130 143
 # Long enough for a drain plus stopping every llama-server child.
 TimeoutStopSec=120
 KillMode=mixed

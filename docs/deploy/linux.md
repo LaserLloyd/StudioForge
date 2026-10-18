@@ -32,6 +32,11 @@ llama.cpp engine; it checks for `nvidia-smi`, `git`, `cmake`, `nvcc` and tells y
 | `--no-service`, `--no-start` | Skip the units / write and enable them but do not start. |
 | `--dry-run` | Print, change nothing. |
 
+The installer is safe to re-run: it stops the running units, rebuilds the venv, rewrites the units
+and starts them again, and your data directory is untouched. The units carry
+`SuccessExitStatus=130 143`, so a clean `systemctl --user stop` does not leave them `failed`;
+`--uninstall` also runs `systemctl --user reset-failed` so a unit from an older install does not linger.
+
 Keep the user service running while logged out: `sudo loginctl enable-linger "$USER"`.
 
 After installing: open <http://localhost:8080>, then `studioforge engine --update`. On Linux + NVIDIA

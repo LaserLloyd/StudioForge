@@ -220,8 +220,10 @@ The options of every command are in [`docs/CLI.md`](docs/CLI.md), and [`docs/SET
 through the same first run.
 
 A later `studioforge engine --update` installs the newest llama.cpp build your driver can run and
-smoke-tests it before activating; the smoke test needs one GGUF in your library, and without one the
-command exits 1 and keeps the current engine. Prefer double-clicking? `launchers\Update StudioForge.bat`
+smoke-tests it before activating. The full smoke test micro-loads one small GGUF from your library;
+with an empty library it runs `llama-server --version` and `--list-devices` only, records
+`binary-only (no model available)` and still activates, and the next engine check with a model
+present runs the real micro-load. Prefer double-clicking? `launchers\Update StudioForge.bat`
 does the venv, install and engine steps,
 `launchers\Start StudioForge.bat` starts the server, and `launchers\StudioForge Tray.bat` runs it from
 the notification area (see [Windows launchers](#windows-launchers)).

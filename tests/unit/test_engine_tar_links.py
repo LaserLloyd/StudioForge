@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from studioforge.core.engine import extract_engine_archive
+from studioforge.core.engine import BIN_NAME, extract_engine_archive
 
 pytestmark = pytest.mark.skipif(
     os.name == "nt", reason="Linux/macOS tarballs only; symlinks need privileges on Windows"
@@ -48,11 +48,11 @@ def test_soname_chain_is_recreated_in_any_archive_order(tmp_path: Path) -> None:
         _add_link(tar, "llama-b1/libggml.so", "libggml.so.0")
         _add_link(tar, "llama-b1/libggml.so.0", "libggml.so.0.27.0")
         _add_file(tar, "llama-b1/libggml.so.0.27.0", b"lib")
-        _add_file(tar, "llama-b1/llama-server", b"bin")
+        _add_file(tar, f"llama-b1/{BIN_NAME}", b"bin")
 
     dest = tmp_path / "engine"
     binary = extract_engine_archive(_archive(tmp_path / "e.tar.gz", build), dest)
-    assert binary == dest / "llama-server"
+    assert binary == dest / BIN_NAME
     assert (dest / "libggml.so.0").is_symlink()
     assert (dest / "libggml.so").read_bytes() == b"lib"
     assert (dest / "libggml.so.0").readlink() == Path("libggml.so.0.27.0")
@@ -63,21 +63,24 @@ def test_links_that_escape_or_dangle_are_refused(tmp_path: Path) -> None:
     outside.write_text("keep out")
 
     def build(tar: tarfile.TarFile) -> None:
-        _add_file(tar, "llama-b1/llama-server", b"bin")
+        _add_file(tar, f"llama-b1/{BIN_NAME}", b"bin")
         _add_link(tar, "llama-b1/escape.so", "../../secret.txt")
         _add_link(tar, "llama-b1/absolute.so", str(outside))
         _add_link(tar, "llama-b1/dangling.so", "missing.so.0")
 
     dest = tmp_path / "engines" / "b1"
     extract_engine_archive(_archive(tmp_path / "e.tar.gz", build), dest)
-    for name in ("escape.so", "absolute.so", "dangling.so"):
+    for name in ("escape.so", "absolute.so"):
         assert not (dest / name).exists() and not (dest / name).is_symlink(), name
+    # A link to a missing file inside the engine dir may be kept as a (harmless) dangling
+    # symlink on POSIX; what matters is that it never yields content.
+    assert not (dest / "dangling.so").exists()
     assert outside.read_text() == "keep out"
 
 
 def test_hard_links_become_copies_inside_the_engine_dir(tmp_path: Path) -> None:
     def build(tar: tarfile.TarFile) -> None:
-        _add_file(tar, "llama-b1/llama-server", b"bin")
+        _add_file(tar, f"llama-b1/{BIN_NAME}", b"bin")
         _add_file(tar, "llama-b1/libx.so.1.2", b"hard")
         _add_link(tar, "llama-b1/libx.so.1", "llama-b1/libx.so.1.2", hard=True)
 

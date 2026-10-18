@@ -198,12 +198,12 @@ class PanelServices:
 
             info = await manager.install(wanted, force=False, activate=False, progress=on_progress)
             self.progress.update(phase="smoke test", fraction=1.0)
-            ok, message = await manager.smoke_test(info.tag)
+            ok, smoke_result, message = await manager.smoke_check(info.tag)
             if ok:
                 from studioforge.api.mgmt_routes import engine_activate
 
                 await engine_activate(api_request(self.ctx), tag=info.tag)
-            return {"tag": info.tag, "smoke_tested": bool(ok), "message": message}
+            return {"tag": info.tag, "smoke_tested": smoke_result == "passed", "message": message}
 
         result: dict[str, Any] = self._await(work())
         self._audit("panel.engine.install", str(result.get("tag")))

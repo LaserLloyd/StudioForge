@@ -1871,8 +1871,11 @@ async def engine_smoke_test(request: Request, tag: str = Body(..., embed=True)) 
     which is why the route is D32-gated like the rest of ``/api/engine/``.
     """
     state = _state(request)
-    ok, detail = await state.engine_manager.smoke_test(tag)
-    return {"tag": tag, "ok": ok, "detail": detail}
+    ok, smoke_result, detail = await state.engine_manager.smoke_check(tag)
+    # ``ok`` is "acceptable to run": a full pass, or ``smoke_result`` =
+    # "binary-only (no model available)" when the library had no GGUF to
+    # micro-load (the binary itself ran). Read ``smoke_result`` to tell them apart.
+    return {"tag": tag, "ok": ok, "smoke_result": smoke_result, "detail": detail}
 
 
 @router.post("/engine/validate-flags")

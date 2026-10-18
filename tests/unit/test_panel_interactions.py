@@ -376,6 +376,10 @@ class _Engines:
         self.calls.append(f"smoke {tag}")
         return True, "ran"
 
+    async def smoke_check(self, tag: str) -> tuple[bool, str, str]:
+        ok, detail = await self.smoke_test(tag)
+        return ok, "passed" if ok else "failed", detail
+
 
 class _Manager:
     def __init__(self) -> None:

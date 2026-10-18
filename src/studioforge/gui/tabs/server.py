@@ -818,12 +818,15 @@ async def smoke_engine(ctx: GuiContext, tag: str) -> None:
             return
         with busy(message=f"Smoke testing {tag}…"):
             try:
-                ok, detail = await ctx.engine_manager.smoke_test(tag)
+                ok, smoke_result, detail = await ctx.engine_manager.smoke_check(tag)
             except Exception as exc:  # noqa: BLE001
                 notify_error(exc, what="smoke test")
                 return
+        verdict = (
+            "FAIL" if not ok else ("PASS" if smoke_result == "passed" else "PASS (binary-only)")
+        )
         ui.notify(
-            f"{tag}: {'PASS' if ok else 'FAIL'}\n{detail[:400]}",
+            f"{tag}: {verdict}\n{detail[:400]}",
             type="positive" if ok else "negative",
             multi_line=True,
             close_button=True,

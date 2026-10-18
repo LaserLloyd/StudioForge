@@ -2477,6 +2477,10 @@ class _EngineCliManager:
         type(self).calls.append(f"smoke_test({tag})")
         return type(self).smoke_ok, f"micro-load detail for {tag}"
 
+    async def smoke_check(self, tag: str, **kwargs: Any) -> tuple[bool, str, str]:
+        ok, detail = await self.smoke_test(tag, **kwargs)
+        return ok, "passed" if ok else "failed", detail
+
     async def activate(self, tag: str) -> Any:
         type(self).calls.append(f"activate({tag})")
         self._write_active(tag)

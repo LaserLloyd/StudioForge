@@ -39,6 +39,7 @@ import hashlib
 import json
 import os
 import platform
+import posixpath
 import re
 import shlex
 import shutil
@@ -78,6 +79,12 @@ ACTIVE_FILE = "active.json"
 META_FILE = "engine.json"
 FLAGS_FILE = "flags.txt"
 HELP_FILE = "help.txt"
+#: ``smoke_result`` of an engine whose binary runs (``--version``, ``--list-devices``) but
+#: that was never micro-loaded because the library had no GGUF to load. Not a full
+#: pass (``smoke_tested`` stays false, so the next boot or ``engine --smoke-test`` repeats
+#: the real micro-load once a model exists) but not a failure either: a fresh install has
+#: no models yet, and an engine install must not exit 1 over that.
+SMOKE_BINARY_ONLY = "binary-only (no model available)"
 
 ProgressFn = Callable[[str, float], None]
 
@@ -1569,6 +1576,99 @@ def _common_prefix(names: Sequence[str]) -> str:
     return "/".join(prefix) + "/" if prefix else ""
 
 
+#: ``(path parts inside the extraction root, link target text, archive name)``.
+_PendingLink = tuple[list[str], str, str]
+
+
+def _link_target(parts: list[str], linkname: str) -> str | None:
+    """Where a link at ``parts`` points, as a path relative to the extraction root.
+
+    ``None`` when the target is absolute, empty or climbs out of the root. The
+    check is lexical (the link's own directory plus ``linkname``, normalised);
+    :func:`_finish_links` repeats it against the real filesystem afterwards,
+    because a chain of links can make a lexically safe path leave the root.
+    """
+    text = linkname.replace("\\", "/")
+    if not text or text.startswith("/") or re.match(r"^[A-Za-z]:", text):
+        return None
+    joined = posixpath.normpath(posixpath.join(*parts[:-1], text))
+    if joined in ("", ".") or joined == ".." or joined.startswith("../"):
+        return None
+    return joined
+
+
+def _within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root)
+    except (ValueError, OSError, RuntimeError):
+        return False
+    return True
+
+
+def _finish_links(
+    dest: Path, links: list[_PendingLink], binary: Path | None, *, kind: str
+) -> Path | None:
+    """Recreate an archive's symlinks once every regular file is on disk.
+
+    Upstream's Linux llama.cpp tarballs ship ``libllama.so -> libllama.so.0``
+    style links; dropping them leaves a binary whose dynamic loader cannot
+    find its libraries, so the engine fails its own smoke test. Links are made
+    *after* all files so no later member's write can follow one; only relative
+    targets that stay inside ``dest`` are honoured (absolute or ``..``-escaping
+    ones are skipped with a warning), and each created link is re-checked with
+    ``resolve()`` against ``dest``. Where a real symlink cannot be made
+    (Windows, a filesystem that refuses) the target file is copied instead.
+    """
+    root = dest.resolve()
+    pending: list[tuple[Path, Path, str]] = []
+    for parts, linkname, archive_name in links:
+        rel = _link_target(parts, linkname)
+        if rel is None:
+            log.warning(f"engine.{kind}.skip_unsafe_link", member=archive_name, link=linkname)
+            continue
+        pending.append((dest.joinpath(*parts), dest.joinpath(*rel.split("/")), archive_name))
+
+    def _make(link: Path, target: Path) -> bool:
+        if os.name != "nt":
+            try:
+                if link.is_symlink() or link.exists():
+                    link.unlink()
+                link.symlink_to(os.path.relpath(target, link.parent))
+            except OSError:
+                pass
+            else:
+                if _within(link, root):
+                    return True
+                link.unlink()
+                log.warning(f"engine.{kind}.skip_unsafe_link", link=str(link))
+                return True  # handled: refused, not retried
+        if target.is_file():  # Windows, or a filesystem without symlinks
+            shutil.copyfile(target, link)
+            shutil.copymode(target, link)
+            return True
+        return False
+
+    # A copy-fallback link whose target is itself a link made later needs
+    # another pass; stop when a pass makes no progress.
+    remaining = pending
+    while remaining:
+        left: list[tuple[Path, Path, str]] = []
+        for link, target, archive_name in remaining:
+            link.parent.mkdir(parents=True, exist_ok=True)
+            if not _make(link, target):
+                left.append((link, target, archive_name))
+        if len(left) == len(remaining):
+            for _link, _target, archive_name in left:
+                log.warning(f"engine.{kind}.skip_unresolved_link", member=archive_name)
+            break
+        remaining = left
+    if binary is None:
+        for link, _target, _name in pending:
+            if link.name == BIN_NAME and link.is_file():
+                return link
+    return binary
+
+
 def extract_engine_zip(zip_path: Path, dest: Path) -> Path | None:
     """Extract ``zip_path`` into ``dest``, flattening a shared top-level dir.
 
@@ -1578,6 +1678,7 @@ def extract_engine_zip(zip_path: Path, dest: Path) -> Path | None:
     """
     dest.mkdir(parents=True, exist_ok=True)
     binary: Path | None = None
+    links: list[_PendingLink] = []
     with zipfile.ZipFile(zip_path) as archive:
         prefix = _common_prefix(archive.namelist())
         for member in archive.infolist():
@@ -1592,11 +1693,18 @@ def extract_engine_zip(zip_path: Path, dest: Path) -> Path | None:
                 continue
             target = dest.joinpath(*parts)
             target.parent.mkdir(parents=True, exist_ok=True)
+            if stat.S_ISLNK(member.external_attr >> 16):
+                # A unix zip stores a symlink as a file whose content is the
+                # link target. Writing that text out as a file leaves a
+                # ``libllama.so`` that is a 14-byte string, not a library.
+                text = archive.read(member).decode("utf-8", "replace")
+                links.append((parts, text, member.filename))
+                continue
             with archive.open(member) as src, target.open("wb") as out:
                 shutil.copyfileobj(src, out)
             if target.name == BIN_NAME:
                 binary = target
-    return binary
+    return _finish_links(dest, links, binary, kind="zip")
 
 
 def _swap_engine_dir(staged: Path, dest: Path) -> None:
@@ -1655,32 +1763,46 @@ def _extract_engine_tar(tar_path: Path, dest: Path) -> Path | None:
 
     Upstream's ubuntu/macos archives nest everything under ``llama-bNNNN/``
     (or ``build/bin/``); the shared prefix is stripped so ``engines/<tag>/``
-    holds the binary and its .so files directly, as the zip path does. Unsafe
-    paths are skipped. Link members are recreated only after every regular file
-    is written, and only when the link stays inside ``dest`` and ends at a file
-    that exists there (see :func:`_restore_engine_links`): upstream's Linux
-    archives ship the soname links (``libllama-common.so.0`` ->
-    ``libllama-common.so.0.7.0``) that the loader needs, so dropping them
-    leaves a ``llama-server`` that exits 127. A link pointing outside ``dest``
-    is still refused, because a later member's write would follow it. The
-    execute bit is carried over, because a tarball is the one archive kind that
-    has it and ``llama-server`` is useless without it.
+    holds the binary and its .so files directly, as the zip path does. Link
+    members are skipped along with unsafe paths: a symlink pointing outside
+    ``dest`` would be followed by a later member's write. The execute bit is
+    carried over, because a tarball is the one archive kind that has it and
+    ``llama-server`` is useless without it.
     """
     dest.mkdir(parents=True, exist_ok=True)
     binary: Path | None = None
+    links: list[_PendingLink] = []
     with tarfile.open(tar_path, "r:*") as archive:
         members = archive.getmembers()
         prefix = _common_prefix([m.name for m in members if m.isfile()])
-        links: list[tarfile.TarInfo] = []
         for member in members:
-            if not member.isfile():
-                if member.issym() or member.islnk():
-                    links.append(member)
-                continue
             name = member.name.replace("\\", "/")
             if prefix and name.startswith(prefix):
                 name = name[len(prefix) :]
             parts = [p for p in name.split("/") if p not in ("", ".")]
+            if member.issym() or member.islnk():
+                if not parts or any(p == ".." for p in parts) or Path(name).is_absolute():
+                    log.warning("engine.tar.skip_unsafe_member", member=member.name)
+                    continue
+                linkname = member.linkname.replace("\\", "/")
+                if member.islnk():
+                    # A hard link names another archive member by its full
+                    # archive path; re-express it relative to the link's own
+                    # directory so both kinds share one containment check.
+                    other = linkname
+                    if prefix and other.startswith(prefix):
+                        other = other[len(prefix) :]
+                    other_parts = [p for p in other.split("/") if p not in ("", ".")]
+                    if linkname.startswith("/") or not other_parts:
+                        log.warning(
+                            "engine.tar.skip_unsafe_link", member=member.name, link=member.linkname
+                        )
+                        continue
+                    linkname = "/".join([".."] * (len(parts) - 1) + other_parts)
+                links.append((parts, linkname, member.name))
+                continue
+            if not member.isfile():
+                continue
             if not parts or any(p == ".." for p in parts) or Path(name).is_absolute():
                 log.warning("engine.tar.skip_unsafe_member", member=member.name)
                 continue
@@ -1696,61 +1818,7 @@ def _extract_engine_tar(tar_path: Path, dest: Path) -> Path | None:
                     target.chmod(target.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
             if target.name == BIN_NAME:
                 binary = target
-        _restore_engine_links(links, dest, prefix)
-    return binary
-
-
-def _restore_engine_links(links: list[tarfile.TarInfo], dest: Path, prefix: str) -> None:
-    """Recreate the archive's link members inside ``dest``; log each one refused.
-
-    A symlink is made only when its target resolves to an existing regular file
-    under ``dest`` (no escape, nothing dangling); a hard link is copied under the
-    same rule. Passes repeat until nothing changes, so a chain such as
-    ``libggml.so`` -> ``libggml.so.0`` -> ``libggml.so.0.27.0`` resolves whatever
-    order the archive lists it in.
-    """
-    root = dest.resolve()
-    pending: list[tuple[tarfile.TarInfo, Path, str]] = []
-    for member in links:
-        name = member.name.replace("\\", "/")
-        if prefix and name.startswith(prefix):
-            name = name[len(prefix) :]
-        parts = [p for p in name.split("/") if p not in ("", ".")]
-        if not parts or any(p == ".." for p in parts) or Path(name).is_absolute():
-            log.warning("engine.tar.skip_unsafe_member", member=member.name)
-            continue
-        linkname = member.linkname.replace("\\", "/")
-        if member.islnk() and prefix and linkname.startswith(prefix):
-            linkname = linkname[len(prefix) :]
-        pending.append((member, dest.joinpath(*parts), linkname))
-    progress = True
-    while pending and progress:
-        progress = False
-        for item in list(pending):
-            member, link, linkname = item
-            base = root if member.islnk() else link.parent.resolve()
-            resolved = (base / linkname).resolve()
-            inside = resolved == root or root in resolved.parents
-            if Path(linkname).is_absolute() or not inside:
-                log.warning("engine.tar.skip_link_member", member=member.name, reason="outside")
-                pending.remove(item)
-                continue
-            if not resolved.is_file():
-                continue  # maybe a later link in a chain; retried while progress is made
-            pending.remove(item)
-            progress = True
-            if link.exists() or link.is_symlink():
-                continue
-            link.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                if member.islnk():
-                    shutil.copy2(resolved, link)
-                else:
-                    link.symlink_to(linkname)
-            except OSError as exc:
-                log.warning("engine.tar.skip_link_member", member=member.name, reason=str(exc))
-    for member, _link, _name in pending:
-        log.warning("engine.tar.skip_link_member", member=member.name, reason="no-target")
+    return _finish_links(dest, links, binary, kind="tar")
 
 
 def _make_executable(directory: Path) -> None:
@@ -1828,6 +1896,18 @@ class _SmokeResult:
     version_string: str | None = None
     model_used: Path | None = None
     no_model: bool = False
+
+    @property
+    def passed(self) -> bool:
+        """Acceptable for an install: a full pass, or a binary-only check with no model to load."""
+        return self.ok or self.no_model
+
+    @property
+    def label(self) -> str:
+        """The ``smoke_result`` string recorded in ``engine.json``."""
+        if self.ok:
+            return "passed"
+        return SMOKE_BINARY_ONLY if self.no_model else "failed"
 
 
 class _ProbeLike(Protocol):  # pragma: no cover - structural typing only
@@ -2510,6 +2590,8 @@ class EngineManager:
         smoke_result = meta.get("smoke_result")
         if not isinstance(smoke_result, str) or not smoke_result:
             smoke_result = "passed" if meta.get("smoke_tested") else "not_run"
+        elif smoke_result == "partial":  # the pre-2.0.0 spelling of binary-only
+            smoke_result = SMOKE_BINARY_ONLY
         return EngineInfo(
             tag=directory.name,
             path=directory,
@@ -2538,7 +2620,7 @@ class EngineManager:
         ``backend`` (cuda/rocm/vulkan/metal, ``""`` when unknowable),
         ``verified`` (``True`` = archive matched a published SHA-256, ``False``
         = installed without that guarantee, ``None`` = installed before
-        verification existed), ``smoke_result`` (passed / partial / failed /
+        verification existed), ``smoke_result`` (passed / binary-only / failed /
         not_run), ``installed_at`` (epoch seconds) and any install-time
         warnings. Oldest install first, like :meth:`installed`.
         """
@@ -3047,7 +3129,7 @@ class EngineManager:
                 f"engine {tag} ({asset.variant}) failed its smoke test: {smoke.detail}"
             )
         if smoke.no_model:
-            log.warning("engine.install.smoke_partial", tag=tag, detail=smoke.detail)
+            log.warning("engine.install.smoke_binary_only", tag=tag, detail=smoke.detail)
         _emit(progress, "done", 1.0)
         info = self._finalize(
             dest,
@@ -3253,7 +3335,7 @@ class EngineManager:
             verified_by=verification.by if verification else "",
             archive_sha256=verification.sha256 if verification else None,
             warnings=list(verification.warnings) if verification else [],
-            smoke_result="passed" if smoke.ok else ("partial" if smoke.no_model else "failed"),
+            smoke_result=smoke.label,
         )
         self._write_meta(info)
         self._notify_engine_change(info.tag, "install")
@@ -3601,7 +3683,9 @@ class EngineManager:
                 info.smoke_tested_at = time.time()
                 info.smoke_result = "passed"
             elif smoke.no_model:
-                info.smoke_result = "partial" if not info.smoke_tested else info.smoke_result
+                info.smoke_result = (
+                    SMOKE_BINARY_ONLY if not info.smoke_tested else info.smoke_result
+                )
             info.version_string = smoke.version_string or info.version_string
             self._write_meta(info)
             self._warn_driver_too_old(info)
@@ -3731,6 +3815,21 @@ class EngineManager:
         self._record_smoke(tag, result)
         return result.ok, result.detail
 
+    async def smoke_check(
+        self, tag: str, *, tiny_model: Path | None = None
+    ) -> tuple[bool, str, str]:
+        """:meth:`smoke_test` for callers that decide whether to *activate*.
+
+        Returns ``(acceptable, smoke_result, detail)``. ``acceptable`` is true
+        for a full pass and for the binary-only outcome (``smoke_result`` is
+        :data:`SMOKE_BINARY_ONLY`: the library had no model to micro-load), so
+        ``engine --update`` on a fresh box installs and activates instead of
+        exiting 1 over a missing GGUF. A real failure is still ``False``.
+        """
+        result = await self._smoke(tag, tiny_model)
+        self._record_smoke(tag, result)
+        return result.passed, result.label, result.detail
+
     def _record_smoke(self, tag: str, result: _SmokeResult) -> None:
         """Persist a manual smoke test's outcome so ``engine list`` shows it.
 
@@ -3748,7 +3847,7 @@ class EngineManager:
         if result.ok:
             info.smoke_tested, info.smoke_tested_at, info.smoke_result = True, time.time(), "passed"
         elif result.no_model:
-            info.smoke_result = "partial"
+            info.smoke_result = SMOKE_BINARY_ONLY
         else:
             info.smoke_result = "failed"
         self._write_meta(info)
@@ -3840,10 +3939,18 @@ class EngineManager:
 
         model = tiny_model or self.find_tiny_model()
         if model is None:
+            # An empty library (a fresh install) cannot micro-load anything.
+            # The binary-only checks are the whole smoke test then: --version
+            # above proved the libraries resolve, --list-devices shows what
+            # the build sees (informational: a CPU-only CI box lists none).
+            devices = await self.list_devices(tag)
+            seen = f"{len(devices)} device(s) listed" if devices else "no devices listed"
             return _SmokeResult(
                 False,
-                f"engine {tag} reports '{version}' but no GGUF model was available for the "
-                "micro-load, so only the --version check ran (this is NOT a full pass)",
+                f"engine {tag}: {version}; {SMOKE_BINARY_ONLY}: --version and --list-devices "
+                f"ran ({seen}) but no GGUF was available for the micro-load. This is not a "
+                "full pass; the next engine check with a model in the library (a restart, "
+                "or `studioforge engine --smoke-test`) runs the real micro-load",
                 version_ok=True,
                 version_string=version,
                 no_model=True,
