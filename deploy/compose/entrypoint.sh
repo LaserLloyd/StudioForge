@@ -174,6 +174,38 @@ PY
         fi
     fi
     log "data=${DATA_DIR} uid=$(id -u) gid=$(id -g) version=${NEW_VERSION}"
+
+    # --- 5. first run: the llama.cpp engine ------------------------------------
+    # The engine lives on the data volume, not in the image. On a fresh volume
+    # `serve` alone would try to BUILD the pinned engine from source, which the
+    # slim -cuda image cannot do (no git, no compiler: "No such file or
+    # directory: 'git'" and a server that boots but cannot load a model). Upstream
+    # ships a prebuilt Linux archive, so fetch the newest stable one once. It is
+    # checksum-verified and smoke-tested by the app. A failure (offline, no GPU
+    # visible) is not fatal: the server still starts and the log says how to
+    # retry. SF_ENGINE_BOOTSTRAP=0 turns this off (air-gapped: mount engines/).
+    if [ "${SF_ENGINE_BOOTSTRAP:-1}" != "0" ]        && ! ls "$DATA_DIR"/engines/*/llama-server >/dev/null 2>&1; then
+        log "no llama.cpp engine on this volume yet: installing the newest stable prebuilt one"
+        log "(needs network access to github.com once; SF_ENGINE_BOOTSTRAP=0 skips this)"
+        if studioforge engine --update; then
+            log "engine installed and active"
+        else
+            # With no GGUF on the volume yet the app can only run `llama-server --version`
+            # (a "partial" smoke test) and reports the install as failed, keeping the
+            # pinned source-build tag active. The download is verified and the binary
+            # starts, so activate the newest installed tag; the first model load is the
+            # real test.
+            TAG="$(ls -1 "$DATA_DIR/engines" 2>/dev/null | grep -E '^b[0-9]+$' | sort -V | tail -1)"
+            if [ -n "$TAG" ] && [ -x "$DATA_DIR/engines/$TAG/llama-server" ]                && studioforge engine --activate "$TAG"; then
+                log "engine ${TAG} installed and active (no model on this volume yet, so only"
+                log "its --version check ran; the first model load is the full test)"
+            else
+                log "WARNING: the engine install failed (offline? no GPU passed through?). The server"
+                log "starts but cannot load models until one is installed: docker compose exec"
+                log "studioforge studioforge engine --update, or mount a prebuilt engines/ directory."
+            fi
+        fi
+    fi
 fi
 
 exec studioforge "$@"

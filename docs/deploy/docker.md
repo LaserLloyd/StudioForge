@@ -74,14 +74,14 @@ has to reap them.
 
 | Tag | Base image (found on Docker Hub, 2026-10-18) | When |
 | --- | --- | --- |
-| `<v>-cuda` | `nvidia/cuda:13.4.3-runtime-ubuntu24.04` | NVIDIA, engine **mounted or pre-built** (no `nvcc` inside) |
-| `<v>-cuda-devel` | `nvidia/cuda:13.4.3-devel-ubuntu24.04` + `git cmake build-essential ninja-build` | NVIDIA, let the container **build the engine itself** on first run |
+| `<v>-cuda` | `nvidia/cuda:13.4.3-runtime-ubuntu24.04` | NVIDIA (the default). The first start downloads upstream's prebuilt engine once (no `nvcc` inside) |
+| `<v>-cuda-devel` | `nvidia/cuda:13.4.3-devel-ubuntu24.04` + `git cmake build-essential ninja-build` | NVIDIA, when you want the container to **build the engine itself** (a tag upstream has no prebuilt archive for) |
 | `<v>-rocm` | `rocm/dev-ubuntu-24.04:7.2.4` | AMD (forward-looking, see the status note) |
 | `<v>-vulkan` | `ubuntu:24.04` + `libvulkan1 mesa-vulkan-drivers vulkan-tools` | AMD/Intel via Mesa (forward-looking) |
 
 Override the bases at build time with `--build-arg CUDA_VERSION=… CUDA_FLAVOR=… ROCM_VERSION=…`.
-The Linux NVIDIA engine is a **source build** (upstream ships no Linux CUDA archive), which is why
-two CUDA flavours exist: runtime is ~5 GB, devel is ~14 GB.
+Upstream publishes prebuilt Linux CUDA archives, which the `-cuda` image downloads; the `-cuda-devel`
+flavour exists for the cases that need a source build: runtime is ~5 GB, devel is ~14 GB.
 
 Every image: Ubuntu 24.04, Python 3.12 from the distro in a uv-built venv (the builder and runtime
 share `/usr/bin/python3.12`, so the venv's interpreter path survives the copy), non-root user
@@ -107,11 +107,16 @@ SELinux hosts (Fedora, Bazzite): the compose files add `:z` to bind mounts; for 
 The llama.cpp engine is **not** in the image: it is downloaded or built by the app into
 `/data/engines/<tag>/` on first start, so it lives on the data volume and survives updates.
 
-- `-vulkan` / `-rocm`: the first start fetches an upstream prebuilt archive from `api.github.com`.
-- `-cuda`: needs a source build, which the slim runtime image cannot do. Either use `-cuda-devel`
-  (the first start clones llama.cpp and builds it, minutes of CPU), **or** supply a built engine:
-  build it once with `-cuda-devel`, then mount the resulting `engines/` directory into a `-cuda`
-  container.
+- **Every image, first start of a fresh volume:** the entrypoint runs `studioforge engine --update`
+  once: it downloads the newest stable prebuilt archive for the detected GPU backend from
+  `api.github.com` / `github.com` (checksum-verified, about 150 MB for CUDA), activates it and pins
+  it in `config.yaml`. With no model on the volume yet only `llama-server --version` can be checked
+  (the log says so); the first model load is the full test. If the download fails (offline, no GPU
+  passed through) the server still starts and the log tells you how to retry:
+  `docker compose exec studioforge studioforge engine --update`. Set `SF_ENGINE_BOOTSTRAP=0` to
+  skip the download (air-gapped hosts, or when you mount a prepared `engines/`).
+- `-cuda-devel`: can also build llama.cpp from source (it has `git`, `cmake` and `nvcc`), which only
+  matters for a tag without a prebuilt archive. The slim `-cuda` image cannot build.
 - **Offline / air-gapped:** populate the volume while online, then block the network:
 
   ```bash
@@ -203,7 +208,7 @@ switch the two `uv sync` lines to `--locked` for reproducible images.
 | `/health` says `can_serve=false`, `gpu_count=0` | No GPU passed through (`/api/gpus` lists what each probe tried). Check `docker run --gpus all … nvidia-smi -L`; for ROCm/Vulkan pass `/dev/kfd` / `/dev/dri` and the `video`/`render` gids. |
 | Container exits with code 4, log says `auth_required_for_remote_bind` | The volume has no owner account or admin key and the entrypoint could not create one (for example `SF_OWNER_PASSWORD` shorter than 10 characters). Fix the password, or run `docker compose run --rm studioforge users create owner --password-stdin`. |
 | `401 invalid_api_key` from a client | Expected once the owner account exists: give each client a key (`studioforge keys create`, or Users & Keys). |
-| `no usable llama-server engine … 'git'` | `-cuda` runtime image cannot build the engine. Use `-cuda-devel` or mount a built `engines/`. |
+| `engine not ready … No such file or directory: 'git'` in the log | The volume has no engine and the first-start download did not run or failed (`SF_ENGINE_BOOTSTRAP=0`, offline). Run `docker compose exec studioforge studioforge engine --update`, or use `-cuda-devel`, or mount a prepared `engines/`. |
 | `cannot build llama.cpp from source: no CUDA compute capability` | No GPU visible when the engine was needed. |
 | `… is not writable by uid 1000` | Bind-mounted data dir with the wrong owner; see above. |
 | Container `Exited (130)` after `docker stop` | Normal graceful stop. |

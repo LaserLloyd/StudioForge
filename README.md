@@ -25,7 +25,8 @@ replace LM Studio as the backend for [OpenClaw](docs/OPENCLAW.md) — it listens
 switching is a host change, not a rewrite.
 
 **Status:** v2.0.0. The first release on the new scheme: secure-by-default binds, scoped keys,
-multi-backend engines and the LM Studio native API (see [`CHANGELOG.md`](CHANGELOG.md), **BREAKING**
+backend-aware engines (CUDA verified; ROCm and Vulkan not yet tested on real hardware, see
+[`docs/ENGINES.md`](docs/ENGINES.md)) and the LM Studio native API (see [`CHANGELOG.md`](CHANGELOG.md), **BREAKING**
 first). Windows is the reference platform and runs it daily; Linux is supported (CI runs both) and
 less battle-tested. Questions and bug reports: [Contact](#contact).
 
@@ -34,8 +35,9 @@ on LaserLloyd.com, and the author's other [AI projects](https://www.laserlloyd.c
 
 **On versions.** StudioForge uses semantic versioning since 2.0.0. The version lives in
 `src/studioforge/__init__.py` — `2.0.0` — and is what `GET /api/version`, `GET /health`, the MCP
-`server_status` tool and `sfctl status` report; both `pyproject.toml` files carry the same string,
-the `sfctl` companion ships from the same release and carries the same version, and release tags are
+`server_status` tool and `sfctl status` report; all three `pyproject.toml` files (the app,
+`packages/studioforge-companion` for `sfctl`, and `packages/studioforge-tenant`) carry the same string,
+the companion ships from the same release and carries the same version, and release tags are
 `v2.0.0`. Releases before 2.0.0 were calendar-versioned (`1.26-08-23` style); the updater reads both
 schemes, so a 1.x install sees 2.0.0 as the update it is. Check what a server is actually running with
 `curl -s <host>/api/version`. A server running a commit past its release still reports that release,
@@ -169,7 +171,8 @@ With no usable GPU the server still starts and reports `can_serve=false`.
 
 **Ports:** `1234` gateway (`/v1`, `/api`, `/mcp`, `/health`), `8080` control panel, `1235` watchdog
 sidecar. All three bind `127.0.0.1` unless you change it (see [Ports](#ports)). LM Studio also uses
-`1234`: quit it first.
+`1234`: quit it first. In the Docker methods these are the container ports; change the host side with
+`SF_GATEWAY_PORT`, `SF_PANEL_PORT` and `SF_WATCHDOG_PORT` in `.env`.
 
 ### Windows
 
@@ -203,6 +206,18 @@ PowerShell window:
 ```powershell
 curl.exe -s http://127.0.0.1:1234/health
 ```
+
+The panel's setup guide creates the owner account in its first step. To do that from the terminal instead
+(pick your own password, 10 or more characters; this also downloads and smoke-tests the llama.cpp engine),
+run this before the first `serve`:
+
+```powershell
+$env:SF_OWNER_PASSWORD = "choose-a-password"
+.venv\Scripts\python.exe -m studioforge setup --non-interactive --username owner --password-env SF_OWNER_PASSWORD --skip-model --skip-chat --no-start
+```
+
+The options of every command are in [`docs/CLI.md`](docs/CLI.md), and [`docs/SETUP.md`](docs/SETUP.md) walks
+through the same first run.
 
 A later `studioforge engine --update` installs the newest llama.cpp build your driver can run and
 smoke-tests it before activating; the smoke test needs one GGUF in your library, and without one the
@@ -507,7 +522,10 @@ server is wedged.
 | Watchdog | `1235` | Recovery MCP sidecar (separate process) |
 | `llama-server` children | `18100–18200` | Internal, one port per loaded model |
 
-LM Studio also uses `1234`: quit it, or set `server.port`. All three services bind `127.0.0.1`
+LM Studio also uses `1234`: quit it, or set `server.port`. Change the ports with the config keys
+`server.port`, `gui.port` and `watchdog.port` (Setup tab or `config.yaml`; `SF_SERVER__PORT`-style
+environment variables only seed first-run defaults, and `studioforge serve --port` overrides the
+gateway port only). All three services bind `127.0.0.1`
 by default. Binding the network (`0.0.0.0`) requires an owner account or an admin key — the server
 refuses to start without one — and then every request needs a key: `read`, `inference` or `admin`
 (`studioforge keys create`). On a loopback-only install with no keys, anything that changes the *box*

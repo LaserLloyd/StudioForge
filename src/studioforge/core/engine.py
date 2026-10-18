@@ -1655,21 +1655,27 @@ def _extract_engine_tar(tar_path: Path, dest: Path) -> Path | None:
 
     Upstream's ubuntu/macos archives nest everything under ``llama-bNNNN/``
     (or ``build/bin/``); the shared prefix is stripped so ``engines/<tag>/``
-    holds the binary and its .so files directly, as the zip path does. Link
-    members are skipped along with unsafe paths: a symlink pointing outside
-    ``dest`` would be followed by a later member's write. The execute bit is
-    carried over, because a tarball is the one archive kind that has it and
-    ``llama-server`` is useless without it.
+    holds the binary and its .so files directly, as the zip path does. Unsafe
+    paths are skipped. Link members are recreated only after every regular file
+    is written, and only when the link stays inside ``dest`` and ends at a file
+    that exists there (see :func:`_restore_engine_links`): upstream's Linux
+    archives ship the soname links (``libllama-common.so.0`` ->
+    ``libllama-common.so.0.7.0``) that the loader needs, so dropping them
+    leaves a ``llama-server`` that exits 127. A link pointing outside ``dest``
+    is still refused, because a later member's write would follow it. The
+    execute bit is carried over, because a tarball is the one archive kind that
+    has it and ``llama-server`` is useless without it.
     """
     dest.mkdir(parents=True, exist_ok=True)
     binary: Path | None = None
     with tarfile.open(tar_path, "r:*") as archive:
         members = archive.getmembers()
         prefix = _common_prefix([m.name for m in members if m.isfile()])
+        links: list[tarfile.TarInfo] = []
         for member in members:
             if not member.isfile():
                 if member.issym() or member.islnk():
-                    log.warning("engine.tar.skip_link_member", member=member.name)
+                    links.append(member)
                 continue
             name = member.name.replace("\\", "/")
             if prefix and name.startswith(prefix):
@@ -1690,7 +1696,61 @@ def _extract_engine_tar(tar_path: Path, dest: Path) -> Path | None:
                     target.chmod(target.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
             if target.name == BIN_NAME:
                 binary = target
+        _restore_engine_links(links, dest, prefix)
     return binary
+
+
+def _restore_engine_links(links: list[tarfile.TarInfo], dest: Path, prefix: str) -> None:
+    """Recreate the archive's link members inside ``dest``; log each one refused.
+
+    A symlink is made only when its target resolves to an existing regular file
+    under ``dest`` (no escape, nothing dangling); a hard link is copied under the
+    same rule. Passes repeat until nothing changes, so a chain such as
+    ``libggml.so`` -> ``libggml.so.0`` -> ``libggml.so.0.27.0`` resolves whatever
+    order the archive lists it in.
+    """
+    root = dest.resolve()
+    pending: list[tuple[tarfile.TarInfo, Path, str]] = []
+    for member in links:
+        name = member.name.replace("\\", "/")
+        if prefix and name.startswith(prefix):
+            name = name[len(prefix) :]
+        parts = [p for p in name.split("/") if p not in ("", ".")]
+        if not parts or any(p == ".." for p in parts) or Path(name).is_absolute():
+            log.warning("engine.tar.skip_unsafe_member", member=member.name)
+            continue
+        linkname = member.linkname.replace("\\", "/")
+        if member.islnk() and prefix and linkname.startswith(prefix):
+            linkname = linkname[len(prefix) :]
+        pending.append((member, dest.joinpath(*parts), linkname))
+    progress = True
+    while pending and progress:
+        progress = False
+        for item in list(pending):
+            member, link, linkname = item
+            base = root if member.islnk() else link.parent.resolve()
+            resolved = (base / linkname).resolve()
+            inside = resolved == root or root in resolved.parents
+            if Path(linkname).is_absolute() or not inside:
+                log.warning("engine.tar.skip_link_member", member=member.name, reason="outside")
+                pending.remove(item)
+                continue
+            if not resolved.is_file():
+                continue  # maybe a later link in a chain; retried while progress is made
+            pending.remove(item)
+            progress = True
+            if link.exists() or link.is_symlink():
+                continue
+            link.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                if member.islnk():
+                    shutil.copy2(resolved, link)
+                else:
+                    link.symlink_to(linkname)
+            except OSError as exc:
+                log.warning("engine.tar.skip_link_member", member=member.name, reason=str(exc))
+    for member, _link, _name in pending:
+        log.warning("engine.tar.skip_link_member", member=member.name, reason="no-target")
 
 
 def _make_executable(directory: Path) -> None:
@@ -3594,13 +3654,26 @@ class EngineManager:
             return await self.install(tag, progress=progress, activate=True)
 
         if self.config.engine.allow_source_build:
+            if error:
+                # The release lookup failed (GitHub's anonymous rate limit, no network): say so
+                # BEFORE falling back, because a source build on a box without git/cmake/nvcc
+                # fails with an unrelated-looking message.
+                log.warning("engine.ensure.release_lookup_failed", tag=tag, detail=error)
             log.info("engine.ensure.source_build", tag=tag)
-            return await self.build_from_source(
-                tag,
-                arches=self.target_arches(detected_backend(self._gpus())),
-                progress=progress,
-                activate=True,
-            )
+            try:
+                return await self.build_from_source(
+                    tag,
+                    arches=self.target_arches(detected_backend(self._gpus())),
+                    progress=progress,
+                    activate=True,
+                )
+            except EngineError as exc:
+                if error:
+                    raise EngineError(
+                        f"{exc} (the prebuilt-engine lookup had failed first, so a source "
+                        f"build was tried: {error})"
+                    ) from exc
+                raise
 
         gpus = self._gpus()
         detected = ", ".join(f"{g.name} (sm_{g.sm_arch or '?'})" for g in gpus) or "no GPUs"
