@@ -777,7 +777,10 @@ def check_request(request: Request, config: Config, accounts: Any = None) -> Non
             else Principal("anonymous", "", "unauthenticated", "inference"),
         )
         return
-    if provided:
+    if provided or header_pin:
+        # A wrong X-MCP-Pin header is a failed credential too: without this a
+        # caller could walk the 8-digit PIN space through the header without
+        # ever tripping the per-address lockout (only the bearer form counted).
         GUARD.record_failure(client)
     if provided and looks_like_key(provided):
         message = "Incorrect API key provided."
