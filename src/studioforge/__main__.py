@@ -24,12 +24,13 @@ from typing import TYPE_CHECKING, Any
 
 import typer
 
-from studioforge import __version__
+from studioforge import __version__, cli_commands
 from studioforge.build import build_id
 from studioforge.config import Config, find_config_path, load_config
-from studioforge.errors import ConfigError
+from studioforge.errors import AuthError, ConfigError
 from studioforge.logfiles import MB
 from studioforge.logging import configure_logging, get_logger
+from studioforge.tlsutil import TlsError, resolve_tls, scheme_for
 
 if TYPE_CHECKING:
     from studioforge.core.ports import PortConflict
@@ -102,11 +103,51 @@ def serve(
         config.watchdog.enabled = False
 
     _preflight_ports(config)
+    _enforce_security_start(config)
     exit_code = asyncio.run(_serve(config, open_gui=open_gui))
     if exit_code:
         # A restart the server left to whoever launched it (D28): the tray
         # reads EXIT_RESTART_REQUESTED and respawns without counting a crash.
         raise typer.Exit(exit_code)
+
+
+def _enforce_security_start(config: Config) -> None:
+    """Refuse to start unsafe or broken: the bind rule, then the TLS settings.
+
+    * A listener reachable from the network with no owner account and no admin
+      key is not started (``auth_required_for_remote_bind``): the message names
+      the services and the two commands that fix it, and the exit code
+      (:data:`~studioforge.core.ports.EXIT_AUTH_REQUIRED`) tells the tray this is
+      not a crash to respawn.
+    * ``server.tls`` that cannot be honoured (a missing certificate file) stops
+      the start with ``invalid_tls_config`` instead of silently serving plain HTTP.
+    """
+    from studioforge.api.auth import check_bind_rule
+    from studioforge.core.accounts import AccountStore
+    from studioforge.core.ports import EXIT_AUTH_REQUIRED
+    from studioforge.db import Database
+
+    db = Database(config.db_path)
+    try:
+        db.migrate_with_recovery()
+        check_bind_rule(config, AccountStore(db, config.data_dir))
+    except AuthError as exc:
+        log.error("refusing to start", code=exc.code, error=exc.message)
+        _console(f"error: {exc.message}", err=True)
+        raise typer.Exit(EXIT_AUTH_REQUIRED) from exc
+    finally:
+        db.close()
+    try:
+        resolve_tls(config)
+    except TlsError as exc:
+        problem = ConfigError(
+            f"TLS is misconfigured: {exc}. Set server.tls.mode to off, self_signed or cert; with "
+            "cert, point server.tls.cert_file and key_file at readable PEM files.",
+            code="invalid_tls_config",
+        )
+        log.error("refusing to start", code=problem.code, error=problem.message)
+        _console(f"error: {problem.message}", err=True)
+        raise typer.Exit(2) from exc
 
 
 def _console(message: str, *, err: bool = False) -> None:
@@ -317,6 +358,9 @@ async def _serve(config: Config, *, open_gui: bool = False) -> int:
 
     api = create_app(config)
     servers: list[uvicorn.Server] = []
+    tls = resolve_tls(config)
+    ssl_kwargs: dict[str, str] = tls.uvicorn_kwargs() if tls is not None else {}
+    scheme = scheme_for(config)
     draining_server = _draining_server_class()
 
     def full_drain_s() -> float:
@@ -336,6 +380,7 @@ async def _serve(config: Config, *, open_gui: bool = False) -> int:
             log_config=None,
             access_log=False,
             timeout_graceful_shutdown=int(config.server.drain_timeout_s),
+            **ssl_kwargs,
         ),
         name="api",
         full_drain_s=full_drain_s,
@@ -365,6 +410,7 @@ async def _serve(config: Config, *, open_gui: bool = False) -> int:
                     # held the whole process (and the API's drain window never
                     # even started).
                     timeout_graceful_shutdown=int(config.server.drain_timeout_s),
+                    **ssl_kwargs,
                 ),
                 name="gui",
                 full_drain_s=full_drain_s,
@@ -408,11 +454,14 @@ async def _serve(config: Config, *, open_gui: bool = False) -> int:
         "studioforge starting",
         version=__version__,
         build=build_id(),
-        api=f"http://{config.server.host}:{config.server.port}",
-        gui=(f"http://{config.gui.host}:{config.gui.port}" if gui_server else "disabled"),
+        api=f"{scheme}://{config.server.host}:{config.server.port}",
+        gui=(f"{scheme}://{config.gui.host}:{config.gui.port}" if gui_server else "disabled"),
         watchdog=(
-            f"http://{config.watchdog.host}:{config.watchdog.port}" if watchdog_proc else "disabled"
+            f"{scheme}://{config.watchdog.host}:{config.watchdog.port}"
+            if watchdog_proc
+            else "disabled"
         ),
+        tls=(tls.fingerprint_sha256 if tls is not None else "off"),
         models_dir=str(config.models.dir),
         data_dir=str(config.data_dir),
     )
@@ -466,7 +515,9 @@ def _log_mcp_banner(config: Config) -> None:
 
     from studioforge.core.netinfo import reachable_urls
 
-    endpoints = reachable_urls(config.server.port, mcp.path, host=config.server.host)
+    endpoints = reachable_urls(
+        config.server.port, mcp.path, host=config.server.host, scheme=scheme_for(config)
+    )
     if not endpoints:
         return
 
@@ -481,7 +532,8 @@ def _log_mcp_banner(config: Config) -> None:
         marker = "->" if entry is endpoints[0] else "  "
         lines.append(f"  {marker} {entry['url']}  ({entry['label']})")
     if mcp.pin_required and mcp.pin:
-        lines.append(f"     PIN: {mcp.pin}    (header 'X-MCP-Pin', or bearer)")
+        lines.append(f"     PIN: {mcp.pin}    (header 'X-MCP-Pin', or bearer) - deprecated;")
+        lines.append("          prefer a scoped key: studioforge keys create --scope admin")
     else:
         lines.append("     PIN: not required")
     lines.append("     ask the 'connection_info' tool for a direct LAN address")
@@ -547,7 +599,7 @@ def gui_url(config: Config) -> str:
     host = config.gui.host
     if host in {"0.0.0.0", "::", ""}:
         host = "127.0.0.1"
-    return f"http://{host}:{config.gui.port}/"
+    return f"{scheme_for(config)}://{host}:{config.gui.port}/"
 
 
 async def _gui_is_up(config: Config, *, timeout_s: float = 120.0) -> bool:
@@ -558,7 +610,10 @@ async def _gui_is_up(config: Config, *, timeout_s: float = 120.0) -> bool:
     deadline = asyncio.get_running_loop().time() + timeout_s
     while asyncio.get_running_loop().time() < deadline:
         try:
-            async with httpx.AsyncClient(timeout=2.0) as client:
+            # https here is our own panel on this machine (server.tls): nothing to verify.
+            async with httpx.AsyncClient(
+                timeout=2.0, verify=scheme_for(config) == "http"
+            ) as client:
                 response = await client.get(url, follow_redirects=False)
             # A redirect to /login still means the GUI is serving.
             if response.status_code < 500:
@@ -1147,6 +1202,9 @@ def capabilities_cmd(
 def version() -> None:
     """Print the version."""
     typer.echo(__version__)
+
+
+cli_commands.register(app)
 
 
 def main() -> None:

@@ -18,6 +18,7 @@ import contextlib
 import json
 import os
 import socket
+import ssl
 import subprocess
 import sys
 import threading
@@ -37,6 +38,7 @@ from studioforge.core import autostart
 from studioforge.core.engine import kill_process_tree
 from studioforge.core.ports import (
     ENV_SUPERVISOR,
+    EXIT_AUTH_REQUIRED,
     EXIT_PORT_CONFLICT,
     EXIT_RESTART_REQUESTED,
     check_startup_ports,
@@ -100,6 +102,7 @@ STATE_CRASHED = "crashed"
 
 #: How :meth:`TrayApp.classify_exit` reads a supervised child's exit.
 KIND_RESTART_REQUESTED = "restart_requested"  # the watchdog is restarting it: respawn, no crash
+KIND_AUTH_REQUIRED = "auth_required"  # refused to listen on the network without an account
 KIND_PORT_TAKEN = "port_taken"  # someone else holds a port: adopt them or report, never respawn
 KIND_CRASH = "crash"  # anything else
 
@@ -168,7 +171,9 @@ def _browsable_host(host: str) -> str:
 
 def api_base_url(config: Config) -> str:
     """Root of the local API, derived from ``server.host`` / ``server.port``."""
-    return f"http://{_browsable_host(config.server.host)}:{config.server.port}"
+    from studioforge.tlsutil import scheme_for
+
+    return f"{scheme_for(config)}://{_browsable_host(config.server.host)}:{config.server.port}"
 
 
 def api_docs_url(config: Config) -> str:
@@ -195,8 +200,11 @@ def fallback_mcp_url(config: Config) -> str:
     resolving.
     """
     from studioforge.core.netinfo import primary_url
+    from studioforge.tlsutil import scheme_for
 
-    return primary_url(config.server.port, config.mcp.path, host=config.server.host)
+    return primary_url(
+        config.server.port, config.mcp.path, host=config.server.host, scheme=scheme_for(config)
+    )
 
 
 def models_folder(config: Config) -> Path:
@@ -264,7 +272,9 @@ def status_text(state: str, snapshot: ServerSnapshot, detail: str | None = None)
 
 def watchdog_health_url(config: Config) -> str:
     """The recovery watchdog's open ``/health``; it needs no credential."""
-    return f"http://127.0.0.1:{config.watchdog.port}/health"
+    from studioforge.tlsutil import scheme_for
+
+    return f"{scheme_for(config)}://127.0.0.1:{config.watchdog.port}/health"
 
 
 def port_conflict_detail(port: int) -> str:
@@ -473,12 +483,20 @@ class HttpApiClient:
 
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
-        key = self._config.server.api_key
+        key = self._config.server.api_key or self._local_key()
         if key:
             # Header only. The API key must never reach a URL, a log line, a
             # notification balloon or the clipboard.
             headers["Authorization"] = f"Bearer {key}"
         return headers
+
+    def _local_key(self) -> str | None:
+        """The local admin key (``cli.key``) when scoped keys are in force; else ``None``."""
+        try:
+            token = (self._config.data_dir / "cli.key").read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        return token or None
 
     def _call(
         self, method: str, path: str, payload: dict[str, Any] | None, timeout: float
@@ -491,7 +509,9 @@ class HttpApiClient:
         body = None if payload is None else json.dumps(payload).encode("utf-8")
         request = urlrequest.Request(url, data=body, method=method, headers=self._headers())
         try:
-            with urlrequest.urlopen(request, timeout=timeout) as response:
+            # https is our own server on this machine (server.tls): no name to verify.
+            context = ssl._create_unverified_context() if url.startswith("https://") else None
+            with urlrequest.urlopen(request, timeout=timeout, context=context) as response:
                 raw = response.read().decode("utf-8", "replace")
         except urlerror.HTTPError as exc:
             return ApiResult(False, error=_http_error_detail(exc))
@@ -862,6 +882,8 @@ class TrayApp:
         """
         if returncode == EXIT_RESTART_REQUESTED:
             return KIND_RESTART_REQUESTED
+        if returncode == EXIT_AUTH_REQUIRED:
+            return KIND_AUTH_REQUIRED
         if returncode == EXIT_PORT_CONFLICT:
             return KIND_PORT_TAKEN
         if self._watchdog_is_restarting():
@@ -938,6 +960,20 @@ class TrayApp:
         if self.user_stopped:
             self.state = STATE_STOPPED
             return False, None
+
+        if kind == KIND_AUTH_REQUIRED:
+            log.error(
+                "server refused to start: it would listen on the network with no owner account "
+                "or admin key",
+                returncode=rc,
+            )
+            self.state = STATE_CRASHED
+            self.user_stopped = True
+            self.detail = "Needs setup - run `studioforge setup` (network access needs an account)"
+            return False, (
+                "StudioForge will not listen on the network without an owner account. "
+                "Run `studioforge setup`."
+            )
 
         if kind == KIND_RESTART_REQUESTED:
             log.info("server exited for a requested restart; respawning", returncode=rc)
