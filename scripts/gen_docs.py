@@ -5,7 +5,7 @@
     uv run python scripts/gen_docs.py --check    # exit 1 if anything is stale (CI)
 
 Writes docs/contracts/{openapi,mcp-tools,errors,settings-schema,capabilities}.json
-and docs/reference/{settings,errors}.md from code. See studioforge.contracts.
+docs/reference/{settings,errors}.md and docs/CLI.md from code. See studioforge.contracts.
 Nothing here binds a port, starts an engine or touches a GPU.
 """
 

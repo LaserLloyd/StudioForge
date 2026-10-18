@@ -27,6 +27,7 @@ EXPECTED_FILES = {
     "docs/contracts/capabilities.json",
     "docs/reference/settings.md",
     "docs/reference/errors.md",
+    "docs/CLI.md",
 }
 
 

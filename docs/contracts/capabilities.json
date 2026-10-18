@@ -3,8 +3,35 @@
     {
       "api": {
         "method": "GET",
+        "path": "/api/audit"
+      },
+      "cli": null,
+      "description": "Read the append-only audit log of admin mutations.",
+      "id": "audit.read",
+      "mcp": null,
+      "notes": "The file itself is logs/audit.jsonl.",
+      "panel": "Users & Keys page: audit log",
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "GET",
+        "path": "/api/auth/status"
+      },
+      "cli": "doctor",
+      "description": "Is a credential required, who exists, and which listeners are on the network?",
+      "id": "auth.status",
+      "mcp": null,
+      "notes": "`studioforge doctor` reports the same posture as findings.",
+      "panel": "Users & Keys page: security posture",
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "GET",
         "path": "/api/config"
       },
+      "cli": "config",
       "description": "Read the effective configuration (secrets redacted).",
       "id": "config.get",
       "mcp": {
@@ -20,6 +47,7 @@
         "method": "GET",
         "path": "/api/settings/schema"
       },
+      "cli": null,
       "description": "Describe every configuration key: type, default, range, level, env override.",
       "id": "config.schema",
       "mcp": null,
@@ -32,6 +60,7 @@
         "method": "PATCH",
         "path": "/api/config"
       },
+      "cli": null,
       "description": "Change configuration keys (validated, persisted, restart needs reported).",
       "id": "config.set",
       "mcp": {
@@ -43,10 +72,34 @@
       "sfctl": "config set"
     },
     {
+      "api": null,
+      "cli": "migrate",
+      "description": "Preview (--dry-run) or apply pending database migrations, after a backup.",
+      "id": "db.migrate",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "GET",
+        "path": "/api/doctor"
+      },
+      "cli": "doctor",
+      "description": "Check ports, GPU, engine, disk, permissions, certificate, migrations and auth posture.",
+      "id": "doctor.run",
+      "mcp": null,
+      "notes": "",
+      "panel": "Diagnostics page: Run checks",
+      "sfctl": null
+    },
+    {
       "api": {
         "method": "POST",
         "path": "/api/engine/activate"
       },
+      "cli": "engine --activate",
       "description": "Make an installed llama.cpp build the active engine.",
       "id": "engine.activate",
       "mcp": null,
@@ -59,6 +112,7 @@
         "method": "POST",
         "path": "/api/engine/install"
       },
+      "cli": "engine --install",
       "description": "Download, verify and smoke-test a llama.cpp build.",
       "id": "engine.install",
       "mcp": null,
@@ -71,6 +125,7 @@
         "method": "GET",
         "path": "/api/engine"
       },
+      "cli": "engine --list",
       "description": "Show the installed llama.cpp builds and which is active.",
       "id": "engine.list",
       "mcp": null,
@@ -83,6 +138,7 @@
         "method": "GET",
         "path": "/health"
       },
+      "cli": "server status",
       "description": "Is the server up, and can it serve? (the watchdog diagnoses a wedged one).",
       "id": "health.get",
       "mcp": {
@@ -98,6 +154,7 @@
         "method": "GET",
         "path": "/api/hf/search"
       },
+      "cli": null,
       "description": "Search HuggingFace for GGUF repositories.",
       "id": "hf.search",
       "mcp": {
@@ -111,8 +168,48 @@
     {
       "api": {
         "method": "POST",
+        "path": "/api/keys"
+      },
+      "cli": "keys create",
+      "description": "Create a named, scoped (read | inference | admin) key; the token is shown once.",
+      "id": "keys.create",
+      "mcp": null,
+      "notes": "",
+      "panel": "Users & Keys page: Create key",
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "GET",
+        "path": "/api/keys"
+      },
+      "cli": "keys list",
+      "description": "List API keys (never the tokens).",
+      "id": "keys.list",
+      "mcp": null,
+      "notes": "Deliberately not an MCP tool: an agent must not manage the keys that bound it.",
+      "panel": "Users & Keys page: keys table",
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "DELETE",
+        "path": "/api/keys/{key_id}"
+      },
+      "cli": "keys revoke",
+      "description": "Revoke a key; it stops working immediately.",
+      "id": "keys.revoke",
+      "mcp": null,
+      "notes": "",
+      "panel": "Users & Keys page: Revoke",
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "POST",
         "path": "/api/leases"
       },
+      "cli": null,
       "description": "Reserve GPUs for a holder until released or expired.",
       "id": "leases.acquire",
       "mcp": {
@@ -128,6 +225,7 @@
         "method": "GET",
         "path": "/api/leases"
       },
+      "cli": null,
       "description": "List standing GPU leases.",
       "id": "leases.list",
       "mcp": {
@@ -143,6 +241,7 @@
         "method": "DELETE",
         "path": "/api/leases/{lease_id}"
       },
+      "cli": null,
       "description": "Release a GPU lease.",
       "id": "leases.release",
       "mcp": {
@@ -158,6 +257,7 @@
         "method": "GET",
         "path": "/api/logs"
       },
+      "cli": "log stream",
       "description": "Read the server log, or one model's llama-server log.",
       "id": "logs.read",
       "mcp": {
@@ -170,9 +270,23 @@
     },
     {
       "api": {
+        "method": "GET",
+        "path": "/metrics"
+      },
+      "cli": null,
+      "description": "Prometheus text: gateway counters, GPU memory and every loaded model's metrics.",
+      "id": "metrics.get",
+      "mcp": null,
+      "notes": "",
+      "panel": "Logs & Metrics page: Metrics",
+      "sfctl": null
+    },
+    {
+      "api": {
         "method": "DELETE",
         "path": "/api/models/{model_id}"
       },
+      "cli": null,
       "description": "Delete a model's files from disk (needs confirmation).",
       "id": "models.delete",
       "mcp": {
@@ -188,6 +302,7 @@
         "method": "POST",
         "path": "/api/downloads"
       },
+      "cli": "get",
       "description": "Download a GGUF from HuggingFace.",
       "id": "models.download",
       "mcp": {
@@ -203,6 +318,7 @@
         "method": "GET",
         "path": "/api/models"
       },
+      "cli": "ls",
       "description": "List the models in the library with their load state.",
       "id": "models.list",
       "mcp": {
@@ -218,6 +334,7 @@
         "method": "POST",
         "path": "/api/models/{model_id}/load"
       },
+      "cli": "load",
       "description": "Load a model onto the GPUs (planned, with a context and placement).",
       "id": "models.load",
       "mcp": {
@@ -233,6 +350,7 @@
         "method": "POST",
         "path": "/api/models/{model_id}/pin"
       },
+      "cli": null,
       "description": "Pin a model so it stays loaded.",
       "id": "models.pin",
       "mcp": {
@@ -248,6 +366,7 @@
         "method": "POST",
         "path": "/api/models/scan"
       },
+      "cli": null,
       "description": "Rescan the model directories.",
       "id": "models.scan",
       "mcp": null,
@@ -260,6 +379,7 @@
         "method": "POST",
         "path": "/api/models/{model_id}/test"
       },
+      "cli": null,
       "description": "Run one short completion against a model and report latency and tokens per second.",
       "id": "models.test",
       "mcp": {
@@ -275,6 +395,7 @@
         "method": "POST",
         "path": "/api/models/{model_id}/unload"
       },
+      "cli": "unload",
       "description": "Unload a model and free its VRAM.",
       "id": "models.unload",
       "mcp": {
@@ -290,6 +411,7 @@
         "method": "POST",
         "path": "/api/models/unload-all"
       },
+      "cli": "unload --all",
       "description": "Unload every loaded model.",
       "id": "models.unload_all",
       "mcp": null,
@@ -299,6 +421,7 @@
     },
     {
       "api": null,
+      "cli": null,
       "description": "Kill one model's llama-server child through the watchdog.",
       "id": "recovery.kill_model",
       "mcp": {
@@ -311,6 +434,7 @@
     },
     {
       "api": null,
+      "cli": null,
       "description": "Kill every model child through the watchdog.",
       "id": "recovery.nuke_all",
       "mcp": {
@@ -326,6 +450,7 @@
         "method": "POST",
         "path": "/api/vram/reclaim"
       },
+      "cli": null,
       "description": "Kill leaked llama-server processes that hold VRAM with no parent.",
       "id": "recovery.reclaim_orphans",
       "mcp": {
@@ -341,6 +466,7 @@
         "method": "POST",
         "path": "/api/restart/server"
       },
+      "cli": null,
       "description": "Restart the server process (drops in-flight requests and unloads every model).",
       "id": "server.restart",
       "mcp": {
@@ -352,10 +478,44 @@
       "sfctl": "recover --restart"
     },
     {
+      "api": null,
+      "cli": "server start",
+      "description": "Start the server in the background and wait until it answers.",
+      "id": "server.start",
+      "mcp": null,
+      "notes": "Starts a process, so it cannot be an API route of the process it starts.",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/api/server/stop"
+      },
+      "cli": "server stop",
+      "description": "Shut the server down gracefully.",
+      "id": "server.stop",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": null,
+      "cli": "setup",
+      "description": "First run: account, hardware, engine, library, starter model, test chat, exposure.",
+      "id": "setup.wizard",
+      "mcp": null,
+      "notes": "",
+      "panel": "/setup page",
+      "sfctl": null
+    },
+    {
       "api": {
         "method": "GET",
         "path": "/api/status"
       },
+      "cli": "ps",
       "description": "VRAM per GPU, loaded models, queue depth, engine and uptime.",
       "id": "status.get",
       "mcp": {
@@ -368,9 +528,23 @@
     },
     {
       "api": {
+        "method": "POST",
+        "path": "/api/support-bundle"
+      },
+      "cli": "support-bundle",
+      "description": "A zip for bug reports: redacted config, doctor, versions, GPUs and log tails.",
+      "id": "support_bundle.create",
+      "mcp": null,
+      "notes": "",
+      "panel": "Diagnostics page: Download support bundle",
+      "sfctl": null
+    },
+    {
+      "api": {
         "method": "GET",
         "path": "/api/tenants"
       },
+      "cli": null,
       "description": "List the registry of programs sharing the GPUs.",
       "id": "tenants.list",
       "mcp": {
@@ -386,6 +560,7 @@
         "method": "POST",
         "path": "/api/update/install"
       },
+      "cli": "update apply",
       "description": "Install the latest release (restarts the server).",
       "id": "update.apply",
       "mcp": null,
@@ -398,6 +573,7 @@
         "method": "GET",
         "path": "/api/update"
       },
+      "cli": "update check",
       "description": "Compare the running version with the latest release.",
       "id": "update.check",
       "mcp": null,
@@ -410,6 +586,7 @@
         "method": "POST",
         "path": "/api/update/rollback"
       },
+      "cli": "update rollback",
       "description": "Roll back to the previous release.",
       "id": "update.rollback",
       "mcp": {
@@ -419,12 +596,52 @@
       "notes": "",
       "panel": null,
       "sfctl": null
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/api/users"
+      },
+      "cli": "users create",
+      "description": "Create an account (the first is the owner, which satisfies the network-bind rule).",
+      "id": "users.create",
+      "mcp": null,
+      "notes": "",
+      "panel": "Users & Keys page: Create account",
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "GET",
+        "path": "/api/users"
+      },
+      "cli": "users list",
+      "description": "List the accounts that can sign in to the panel.",
+      "id": "users.list",
+      "mcp": null,
+      "notes": "",
+      "panel": "Users & Keys page: accounts table",
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/api/users/password"
+      },
+      "cli": "users passwd",
+      "description": "Change an account's password.",
+      "id": "users.password",
+      "mcp": null,
+      "notes": "",
+      "panel": "Users & Keys page: Change password",
+      "sfctl": null
     }
   ],
   "surfaces": [
     "api",
     "mcp",
     "sfctl",
-    "panel"
+    "panel",
+    "cli"
   ]
 }

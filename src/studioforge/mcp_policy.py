@@ -161,7 +161,7 @@ def _headers_of(ctx: Any) -> Mapping[str, str] | None:
     request = getattr(ctx, "request", None)
     headers = getattr(request, "headers", None)
     if headers is not None:
-        return headers  # type: ignore[no-any-return]
+        return headers
     session = getattr(ctx, "session", None)
     dispatch = getattr(session, "_dispatch_context", None) or getattr(session, "dctx", None)
     transport = getattr(dispatch, "transport", None)

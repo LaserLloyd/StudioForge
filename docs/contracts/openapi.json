@@ -606,6 +606,17 @@
         "title": "Body_start_download_api_downloads_post",
         "type": "object"
       },
+      "Body_stop_server_api_server_stop_post": {
+        "properties": {
+          "confirm": {
+            "default": false,
+            "title": "Confirm",
+            "type": "boolean"
+          }
+        },
+        "title": "Body_stop_server_api_server_stop_post",
+        "type": "object"
+      },
       "Body_test_model_api_models__model_id__test_post": {
         "properties": {
           "keep_loaded": {
@@ -675,6 +686,78 @@
           }
         },
         "title": "Body_vram_reclaim_api_vram_reclaim_post",
+        "type": "object"
+      },
+      "CreateKeyBody": {
+        "properties": {
+          "expires_in_days": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "maximum": 3650.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires In Days"
+          },
+          "name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "rate_limit_rpm": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rate Limit Rpm"
+          },
+          "scope": {
+            "default": "inference",
+            "enum": [
+              "read",
+              "inference",
+              "admin"
+            ],
+            "title": "Scope",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "CreateKeyBody",
+        "type": "object"
+      },
+      "CreateUserBody": {
+        "properties": {
+          "password": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Password",
+            "type": "string"
+          },
+          "username": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Username",
+            "type": "string"
+          }
+        },
+        "required": [
+          "username",
+          "password"
+        ],
+        "title": "CreateUserBody",
         "type": "object"
       },
       "HTTPValidationError": {
@@ -846,6 +929,78 @@
         "summary": "Delete Adapter",
         "tags": [
           "management"
+        ]
+      }
+    },
+    "/api/audit": {
+      "get": {
+        "description": "The last ``n`` audit entries, oldest first.",
+        "operationId": "audit_tail_api_audit_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "n",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 2000,
+              "minimum": 1,
+              "title": "N",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Audit Tail Api Audit Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Audit Tail",
+        "tags": [
+          "security"
+        ]
+      }
+    },
+    "/api/auth/status": {
+      "get": {
+        "description": "Whether credentials are required, who exists, and what is exposed.\n\nNo secrets: counts, scopes and the fingerprint of the TLS certificate (which is\npublic by nature). ``bind`` lists the listeners reachable from the network.",
+        "operationId": "auth_status_api_auth_status_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Auth Status Api Auth Status Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Auth Status",
+        "tags": [
+          "security"
         ]
       }
     },
@@ -1173,6 +1328,30 @@
         "summary": "Set Config",
         "tags": [
           "management"
+        ]
+      }
+    },
+    "/api/doctor": {
+      "get": {
+        "description": "The doctor report: ports, GPU, engine, disk, permissions, TLS, migrations, auth.",
+        "operationId": "doctor_api_doctor_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Doctor Api Doctor Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Doctor",
+        "tags": [
+          "security"
         ]
       }
     },
@@ -1891,6 +2070,117 @@
         "summary": "Hf Search",
         "tags": [
           "management"
+        ]
+      }
+    },
+    "/api/keys": {
+      "get": {
+        "description": "Every key (revoked ones included), without hashes or tokens.",
+        "operationId": "list_keys_api_keys_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Keys Api Keys Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Keys",
+        "tags": [
+          "security"
+        ]
+      },
+      "post": {
+        "description": "Create a named, scoped key. The ``token`` in the answer is shown only now.",
+        "operationId": "create_key_api_keys_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateKeyBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Create Key Api Keys Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Key",
+        "tags": [
+          "security"
+        ]
+      }
+    },
+    "/api/keys/{key_id}": {
+      "delete": {
+        "description": "Revoke a key by id (or by name when unambiguous). Idempotent.",
+        "operationId": "revoke_key_api_keys__key_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "key_id",
+            "required": true,
+            "schema": {
+              "title": "Key Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Revoke Key Api Keys  Key Id  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Revoke Key",
+        "tags": [
+          "security"
         ]
       }
     },
@@ -3975,6 +4265,49 @@
         ]
       }
     },
+    "/api/server/stop": {
+      "post": {
+        "description": "Shut the server down gracefully (what ``studioforge server stop`` asks for).\n\nDrains in-flight requests, unloads every model and ends the process; nothing\nrestarts it. A server run by the tray is restarted by the tray, as always --\nquit the tray to stop it for good. Only available when the server was started\nby ``studioforge serve`` (which installs the shutdown hook).",
+        "operationId": "stop_server_api_server_stop_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_stop_server_api_server_stop_post"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Stop Server Api Server Stop Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Stop Server",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
     "/api/settings/schema": {
       "get": {
         "description": "Every config key with its type, default, range, level and env override.\n\nRead-only metadata derived from the config model itself\n(:mod:`studioforge.settings_schema`); it carries defaults, never the\nrunning values, so it needs no more protection than the other ``GET /api``\nreads. The same body is committed as ``docs/contracts/settings-schema.json``.",
@@ -4020,6 +4353,26 @@
         "summary": "Status",
         "tags": [
           "management"
+        ]
+      }
+    },
+    "/api/support-bundle": {
+      "post": {
+        "description": "A zip for bug reports: redacted config, doctor, versions, GPUs, log tails.",
+        "operationId": "support_bundle_api_support_bundle_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Support Bundle",
+        "tags": [
+          "security"
         ]
       }
     },
@@ -4396,6 +4749,115 @@
         "summary": "Update Rollback",
         "tags": [
           "management"
+        ]
+      }
+    },
+    "/api/users": {
+      "get": {
+        "operationId": "list_users_api_users_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Users Api Users Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Users",
+        "tags": [
+          "security"
+        ]
+      },
+      "post": {
+        "description": "Create an account. The first one is the owner (what the bind rule asks for).",
+        "operationId": "create_user_api_users_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateUserBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Create User Api Users Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create User",
+        "tags": [
+          "security"
+        ]
+      }
+    },
+    "/api/users/password": {
+      "post": {
+        "description": "Set an account's password (``username`` + the new ``password``).",
+        "operationId": "change_password_api_users_password_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateUserBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Change Password Api Users Password Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Change Password",
+        "tags": [
+          "security"
         ]
       }
     },
@@ -4927,6 +5389,26 @@
           }
         },
         "summary": "Health",
+        "tags": [
+          "health"
+        ]
+      }
+    },
+    "/metrics": {
+      "get": {
+        "description": "Prometheus text: gateway counters, GPU memory and every loaded model's own metrics.",
+        "operationId": "metrics_metrics_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Metrics",
         "tags": [
           "health"
         ]

@@ -31,6 +31,80 @@ The version string still reads `1.26-09-23`; the `build` field tells these commi
   not captured), an offline suite in `tests/unit/compat/`, and an opt-in `tests/compat/` suite for a
   running test instance.
 
+Security, MCP hardening, CLI and first-run wizard (refactor workstream W3-SF; the security release
+that 2.0.0 carries). Read **BREAKING** first.
+
+### BREAKING
+
+- **All three services bind `127.0.0.1` by default** (`server.host`, `gui.host`, `watchdog.host`; they
+  were `0.0.0.0`). A `config.yaml` that already names a host keeps it: `save()` has always written
+  every key, so an existing install is unchanged by the new default.
+- **A network bind needs a credential.** If any enabled service listens on a non-loopback address and
+  no owner account, admin API key or `server.api_key` exists, `studioforge serve` refuses to start
+  with `auth_required_for_remote_bind` and exit code 4 (the tray shows "needs setup" and does not
+  respawn). With a credential in place every request needs one (`/health` stays public).
+- **`server.cors_origins` defaults to `[]`** (was `["*"]`); credentials stay off. A saved `["*"]` is
+  kept (and warned about at start), but it no longer lets a web page reach the MCP endpoints, which
+  now check `Origin` against loopback plus `cors_origins` and answer `403 origin_not_allowed`.
+- **Scopes are enforced.** `read` < `inference` < `admin` per route, by prefix (`/v1/`, `/api/v0/`,
+  `/api/v1/` need `inference` to write; the old D32 admin prefix list and every unclassified mutating
+  route need `admin`). MCP tools are annotated, and destructive tools need an `admin` key
+  (`permission_denied` otherwise).
+- **Deprecated, still working:** `server.api_key` (mirrored into the key table as the admin key
+  `legacy`; `keys revoke legacy` disables it) and `mcp.pin` (admin on the MCP endpoints only, with a
+  logged warning; once any scoped key exists it no longer opens the plain HTTP routes). Both warn in
+  `studioforge doctor`. Removal is planned no earlier than the next major.
+
+Migration for an existing user, exactly:
+
+1. Upgrade. Nothing changes if `server.host` was already `127.0.0.1`.
+2. If your `config.yaml` has `host: 0.0.0.0` for the gateway, panel or watchdog, the server stops
+   with the message above. Either run `studioforge setup` (creates the owner account; choose "my
+   local network" to get HTTPS and an admin key), or `studioforge keys create --name admin --scope
+   admin`, or set the three hosts to `127.0.0.1` to stay local.
+3. If you set `server.api_key`, you can leave everything as it is. When ready, create one key per
+   client (`studioforge keys create --name openclaw --scope inference`), switch the clients over, then
+   clear `server.api_key` and `mcp.pin`.
+4. Clients that call the API without a credential from another machine now get `401`. Give them a key.
+5. The database migrates to schema 9 on start (`studioforge migrate --dry-run` previews it; `migrate`
+   backs the database up first).
+
+### Added
+
+- Accounts and keys: owner account (argon2id; the hash lives in the secret store, not the database),
+  API keys `sf-<r|i|a>-...` (hashed at rest, optional expiry, per-key requests/min, last-used,
+  revocation), migration `009_accounts_keys.sql`, `studioforge keys|users ...`, `GET|POST /api/keys`,
+  `DELETE /api/keys/{key_id}`, `GET|POST /api/users`, `POST /api/users/password`,
+  `GET /api/auth/status`. New error codes `permission_denied`, `api_key_revoked`, `api_key_expired`,
+  `key_rate_limited`, `origin_not_allowed`, `auth_required_for_remote_bind`, `invalid_tls_config`.
+- TLS: `server.tls.mode` (`off` | `self_signed` | `cert`) with `cert_file` and `key_file`, for all three
+  listeners; the self-signed certificate's SHA-256 fingerprint is in `GET /api/status` and the panel.
+  New dependency `cryptography` (declared; it was already installed transitively).
+- Secrets at rest: `config.yaml` and its `.bak` are `0600` (owner-only ACL on Windows); `hf.token` and
+  the owner password hash use the OS keyring when the optional `keyring` extra is installed, else
+  owner-only files. New dependency `argon2-cffi`.
+- Audit log `logs/audit.jsonl` (append-only JSONL, rotated; `logging.audit_file_max_mb`,
+  `audit_file_backups`), `GET /api/audit`.
+- MCP: `readOnlyHint` / `destructiveHint` / `idempotentHint` on every tool, per-tool scopes, Origin
+  validation on `/mcp` and the watchdog, audit of every mutating call, both protocol revisions
+  (`2025-11-25` handshake and `2026-07-28` stateless) covered by tests.
+- Operations: `studioforge doctor [--json] [--strict]` and `GET /api/doctor`; `studioforge
+  support-bundle` and `POST /api/support-bundle` (credentials removed, grep-tested); Prometheus
+  `GET /metrics` (gateway counters plus every loaded model's own metrics); `studioforge migrate
+  [--dry-run]`; `POST /api/server/stop`.
+- CLI: `setup`, `ls`, `ps`, `load [--ttl --context-length --gpu --preset]`, `unload [--all]`, `get`,
+  `server start|stop|status`, `log stream`, `keys`, `users`, `update check|apply|rollback`
+  (reference: [`docs/CLI.md`](docs/CLI.md), generated).
+- First-run wizard: `studioforge setup` (interactive or fully flag-driven for CI) and the panel's
+  `/setup` page: account, hardware, engine, model libraries (offers LM Studio's), starter model, test
+  chat, snippets, exposure.
+- Panel: 11 sections (Overview, Models, Serving, Engines, Placement, Integrations, Users & Keys,
+  Updates, Logs & Metrics, Diagnostics, Advanced), owner-password sign-in, settings labels read from
+  the settings schema.
+- Docs: [`docs/SECURITY.md`](docs/SECURITY.md) (threat model, bind rules, keys, TLS, MCP),
+  [`SECURITY.md`](SECURITY.md) (disclosure contact placeholder), the capability registry gains a `cli`
+  column.
+
 Contracts foundation (refactor workstream W0-SF). All additive; no serving behaviour changes.
 
 - feat(errors): `studioforge.error_catalog` lists every `error.code` with its HTTP status, message

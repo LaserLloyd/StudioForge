@@ -12,7 +12,7 @@ import asyncio
 import contextlib
 import functools
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -121,7 +121,7 @@ def log_rejection(exc: StudioForgeError) -> None:
 SCAN_WAIT_S = 60.0
 
 
-def _route_label(scope: dict[str, Any]) -> str:
+def _route_label(scope: Mapping[str, Any]) -> str:
     """The route *template* a request matched (``/api/models/{model_id}/load``), not its URL.
 
     Metric labels must be bounded by the code, not by the traffic. A router that

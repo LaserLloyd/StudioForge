@@ -17,6 +17,7 @@ Files (repo-relative path -> content):
 ``docs/contracts/capabilities.json``     the capability registry
 ``docs/reference/settings.md``           the settings reference page
 ``docs/reference/errors.md``             the error reference page
+``docs/CLI.md``                          the command line reference (from the typer tree)
 ======================================== ==============================================
 
 The app is built over a throwaway data directory with a null GPU probe and a
@@ -37,7 +38,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-from studioforge import capability_registry, error_catalog, settings_schema
+from studioforge import capability_registry, cli_docs, error_catalog, settings_schema
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -145,6 +146,7 @@ def render_contracts(
         "docs/contracts/capabilities.json": dump_json(capability_registry.export()),
         "docs/reference/settings.md": settings_schema.render_markdown(),
         "docs/reference/errors.md": error_catalog.render_markdown(),
+        "docs/CLI.md": cli_docs.render_markdown(),
     }
 
 

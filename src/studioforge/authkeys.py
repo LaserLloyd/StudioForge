@@ -95,7 +95,9 @@ def hash_token(token: str) -> str:
 
 def looks_like_key(value: str | None) -> bool:
     """Cheap shape test (``sf-r|i|a-...``) used to skip a lookup for obviously other tokens."""
-    return bool(value) and value.startswith(KEY_PREFIX) and value[3:5] in {"r-", "i-", "a-"}  # type: ignore[union-attr]
+    return (
+        bool(value) and str(value).startswith(KEY_PREFIX) and str(value)[3:5] in {"r-", "i-", "a-"}
+    )
 
 
 def scope_hint(token: str) -> str | None:

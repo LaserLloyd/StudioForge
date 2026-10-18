@@ -359,7 +359,7 @@ async def _serve(config: Config, *, open_gui: bool = False) -> int:
     api = create_app(config)
     servers: list[uvicorn.Server] = []
     tls = resolve_tls(config)
-    ssl_kwargs: dict[str, str] = tls.uvicorn_kwargs() if tls is not None else {}
+    ssl_kwargs: dict[str, Any] = dict(tls.uvicorn_kwargs()) if tls is not None else {}
     scheme = scheme_for(config)
     draining_server = _draining_server_class()
 

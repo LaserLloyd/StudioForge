@@ -609,12 +609,12 @@ def resolve_principal(
     expected = config.server.api_key
     if expected and provided and _matches(provided, expected):
         if accounts is not None:
-            return accounts.authenticate_legacy(expected)  # type: ignore[no-any-return]
+            return accounts.authenticate_legacy(expected)
         return Principal("legacy", "", "legacy", "admin")
     if provided and accounts is not None and looks_like_key(provided):
         found = accounts.authenticate(provided, count=count)
         if found is not None:
-            return found  # type: ignore[no-any-return]
+            return found
     if on_mcp:
         pin = getattr(getattr(config, "mcp", None), "pin", None)
         candidate = header_pin or provided

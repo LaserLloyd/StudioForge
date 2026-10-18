@@ -41,7 +41,7 @@ _SAFE = re.compile(r"[^A-Za-z0-9._-]+")
 
 def _import_keyring() -> Any | None:
     try:
-        import keyring
+        import keyring  # type: ignore[import-not-found,unused-ignore]
 
         return keyring
     except Exception:  # noqa: BLE001 - absent, or a broken optional backend

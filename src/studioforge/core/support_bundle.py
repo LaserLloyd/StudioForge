@@ -105,7 +105,7 @@ def redacted_config(config: Config) -> dict[str, Any]:
     dumped = config.to_yaml_dict()
     redact_config_dict(dumped)
     # `pin_required` and the like are flags, not secrets: only strings are masked.
-    return _mask_tree(dumped)  # type: ignore[no-any-return]
+    return _mask_tree(dumped)
 
 
 def _tail(path: Path, lines: int) -> str | None:

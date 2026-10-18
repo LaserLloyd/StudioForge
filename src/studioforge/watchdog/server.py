@@ -2955,7 +2955,7 @@ async def serve(
     poll_task: asyncio.Task[None] | None = None
     if poll:
         poll_task = asyncio.create_task(watchdog.poll_loop(), name="studioforge-watchdog-poll")
-    ssl_kwargs: dict[str, str] = {}
+    ssl_kwargs: dict[str, Any] = {}
     try:
         tls = resolve_tls(config)
     except TlsError as exc:
@@ -2963,7 +2963,7 @@ async def serve(
         tls = None
         bind_host = "127.0.0.1"
     if tls is not None:
-        ssl_kwargs = tls.uvicorn_kwargs()
+        ssl_kwargs = dict(tls.uvicorn_kwargs())
     uv = uvicorn.Server(
         uvicorn.Config(
             asgi,
