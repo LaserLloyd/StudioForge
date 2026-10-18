@@ -995,7 +995,7 @@ def capabilities_cmd(
     """Show the backend, what it can run, and what your hardware allows."""
     from studioforge.core.capabilities import build_report, format_bytes
     from studioforge.core.engine import EngineManager
-    from studioforge.core.gpu import get_probe
+    from studioforge.core.gpu import probe_for_config
     from studioforge.core.registry import Registry
     from studioforge.db import Database
 
@@ -1005,7 +1005,7 @@ def capabilities_cmd(
     db.migrate()
     registry = Registry(config, db)
     registry.scan()
-    probe = get_probe()
+    probe = probe_for_config(config)
     report = build_report(
         config,
         gpus=probe.list_gpus(),

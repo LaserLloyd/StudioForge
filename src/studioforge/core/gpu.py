@@ -1064,6 +1064,16 @@ def llama_device_name(backend: str | None, index: int) -> str:
     return f"{_DEVICE_PREFIX.get(backend or '', 'CUDA')}{index}"
 
 
+def probe_for_config(config: Any) -> GpuProbe:
+    """The process-wide probe for ``config.gpu.backend``.
+
+    ``auto`` defers to ``SF_GPU_PROBE`` (and then to auto-detection); any other
+    value is an explicit choice and wins over the environment.
+    """
+    choice = str(getattr(getattr(config, "gpu", None), "backend", "auto") or "auto")
+    return get_probe(force=None if choice == "auto" else choice)
+
+
 def probe_diagnostics(probe: GpuProbe) -> dict[str, Any]:
     """Which backend a probe is using and why others were skipped (best effort)."""
     getter = getattr(probe, "diagnostics", None)

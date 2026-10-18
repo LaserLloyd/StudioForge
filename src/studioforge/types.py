@@ -1261,6 +1261,9 @@ class EngineInfo(BaseModel):
     smoke_result: str = "not_run"
     #: Warnings recorded at install time (e.g. "installed WITHOUT checksum").
     warnings: list[str] = Field(default_factory=list)
+    #: SHA-256 of the archive that was installed (``None`` for a source build or
+    #: a legacy install).
+    archive_sha256: str | None = None
 
 
 class GpuLease(BaseModel):

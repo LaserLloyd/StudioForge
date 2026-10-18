@@ -1345,9 +1345,9 @@ def load_config(path: Path | str | None = None, *, create: bool = False) -> Conf
         # the user tuning anything. Import lazily -- config must stay importable
         # on a machine with no NVML at all.
         try:
-            from studioforge.core.gpu import get_probe
+            from studioforge.core.gpu import probe_for_config
 
-            applied = tune_for_hardware(config, get_probe().list_gpus())
+            applied = tune_for_hardware(config, probe_for_config(config).list_gpus())
             if applied:
                 from studioforge.logging import get_logger
 
