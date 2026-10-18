@@ -1,0 +1,4944 @@
+{
+  "components": {
+    "schemas": {
+      "Body_create_lease_api_leases_post": {
+        "properties": {
+          "avoid": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Avoid"
+          },
+          "devices": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Devices"
+          },
+          "exclusive": {
+            "default": true,
+            "title": "Exclusive",
+            "type": "boolean"
+          },
+          "force": {
+            "default": false,
+            "title": "Force",
+            "type": "boolean"
+          },
+          "holder": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Holder"
+          },
+          "idle_ttl_s": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": 3600.0,
+            "title": "Idle Ttl S"
+          },
+          "min_free_gib": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Min Free Gib"
+          },
+          "model_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model Ids"
+          },
+          "prefer": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prefer"
+          },
+          "priority": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Priority"
+          },
+          "reason": {
+            "default": "",
+            "title": "Reason",
+            "type": "string"
+          },
+          "vacate_token": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Vacate Token"
+          },
+          "vacate_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Vacate Url"
+          }
+        },
+        "title": "Body_create_lease_api_leases_post",
+        "type": "object"
+      },
+      "Body_engine_activate_api_engine_activate_post": {
+        "properties": {
+          "tag": {
+            "title": "Tag",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tag"
+        ],
+        "title": "Body_engine_activate_api_engine_activate_post",
+        "type": "object"
+      },
+      "Body_engine_install_api_engine_install_post": {
+        "properties": {
+          "activate": {
+            "default": false,
+            "title": "Activate",
+            "type": "boolean"
+          },
+          "force": {
+            "default": false,
+            "title": "Force",
+            "type": "boolean"
+          },
+          "tag": {
+            "title": "Tag",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tag"
+        ],
+        "title": "Body_engine_install_api_engine_install_post",
+        "type": "object"
+      },
+      "Body_engine_smoke_test_api_engine_smoke_test_post": {
+        "properties": {
+          "tag": {
+            "title": "Tag",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tag"
+        ],
+        "title": "Body_engine_smoke_test_api_engine_smoke_test_post",
+        "type": "object"
+      },
+      "Body_engine_validate_flags_api_engine_validate_flags_post": {
+        "properties": {
+          "extra_flags": {
+            "title": "Extra Flags"
+          },
+          "tag": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tag"
+          }
+        },
+        "required": [
+          "extra_flags"
+        ],
+        "title": "Body_engine_validate_flags_api_engine_validate_flags_post",
+        "type": "object"
+      },
+      "Body_load_model_api_models__model_id__load_post": {
+        "properties": {
+          "allowed_devices": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The CUDA indices the planner may choose among for this load only -- a bound, not a placement. Mutually exclusive with 'devices'. Never persisted, and it only ever narrows: a card a saved setting, an exclusion or a lease forbids stays forbidden.",
+            "title": "Allowed Devices"
+          },
+          "ctx_size": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ctx Size"
+          },
+          "devices": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Devices"
+          },
+          "force": {
+            "default": false,
+            "title": "Force",
+            "type": "boolean"
+          },
+          "kv_cache_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Kv Cache Type"
+          },
+          "kv_cache_type_v": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Kv Cache Type V"
+          },
+          "parallel": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parallel"
+          },
+          "priority": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Priority"
+          }
+        },
+        "title": "Body_load_model_api_models__model_id__load_post",
+        "type": "object"
+      },
+      "Body_load_recommended_api_models__model_id__load_recommended_post": {
+        "properties": {
+          "allowed_devices": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The CUDA indices this walk may use, for this call only. The server still chooses among them and still refuses honestly when nothing fits. Never persisted, and it only ever narrows.",
+            "title": "Allowed Devices"
+          },
+          "ctx_size": {
+            "title": "Ctx Size",
+            "type": "integer"
+          },
+          "kv_min": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Lowest KV cache quality to accept: 'f16', 'q8_0' or 'q4_0'. The window is refused rather than reached with a worse cache than this.",
+            "title": "Kv Min"
+          },
+          "kv_unified": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "true: the slots share ONE KV pool of ctx_size tokens -- each may use all of it, together they may not exceed it -- for the VRAM of one slot plus each extra slot's sliding window. Omitted or false: ctx_size per slot.",
+            "title": "Kv Unified"
+          },
+          "max_slots": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Ceiling on the slot count this load may choose (>= 1). Omitted, the estimator's own recommendation stands.",
+            "title": "Max Slots"
+          },
+          "min_slots": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The fewest slots this load may have (>= 1, <= max_slots). The fit is judged at this count; a window it cannot reach is refused, never loaded short.",
+            "title": "Min Slots"
+          },
+          "persist": {
+            "default": false,
+            "description": "Write the resolved context, KV cache types, slot count and tier into the model's saved settings. Admin: needs server.api_key, a local caller or the MCP PIN.",
+            "title": "Persist",
+            "type": "boolean"
+          },
+          "prefer_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prefer Mode"
+          },
+          "priority": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Load tier: 1 active chat, 2 dispatched agent, 3 (or omitted) background.",
+            "title": "Priority"
+          }
+        },
+        "required": [
+          "ctx_size"
+        ],
+        "title": "Body_load_recommended_api_models__model_id__load_recommended_post",
+        "type": "object"
+      },
+      "Body_pin_model_api_models__model_id__pin_post": {
+        "properties": {
+          "pinned": {
+            "default": true,
+            "title": "Pinned",
+            "type": "boolean"
+          }
+        },
+        "title": "Body_pin_model_api_models__model_id__pin_post",
+        "type": "object"
+      },
+      "Body_register_tenant_api_tenants_register_post": {
+        "properties": {
+          "capabilities": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Capabilities"
+          },
+          "default_priority": {
+            "default": 3,
+            "title": "Default Priority",
+            "type": "integer"
+          },
+          "family": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Family"
+          },
+          "health_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Health Url"
+          },
+          "kind": {
+            "default": "tenant",
+            "title": "Kind",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "notes": {
+            "default": "",
+            "title": "Notes",
+            "type": "string"
+          },
+          "protocol": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Protocol"
+          },
+          "status_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status Url"
+          },
+          "vacate_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Vacate Url"
+          },
+          "version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Version"
+          },
+          "warm_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Warm Url"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "Body_register_tenant_api_tenants_register_post",
+        "type": "object"
+      },
+      "Body_restart_backend_api_restart_backend_post": {
+        "properties": {
+          "only_stale_engine": {
+            "default": false,
+            "title": "Only Stale Engine",
+            "type": "boolean"
+          }
+        },
+        "title": "Body_restart_backend_api_restart_backend_post",
+        "type": "object"
+      },
+      "Body_restart_server_api_restart_server_post": {
+        "properties": {
+          "confirm": {
+            "default": false,
+            "title": "Confirm",
+            "type": "boolean"
+          }
+        },
+        "title": "Body_restart_server_api_restart_server_post",
+        "type": "object"
+      },
+      "Body_start_download_api_downloads_post": {
+        "properties": {
+          "force": {
+            "default": false,
+            "title": "Force",
+            "type": "boolean"
+          },
+          "include_mmproj": {
+            "default": true,
+            "title": "Include Mmproj",
+            "type": "boolean"
+          },
+          "quant": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Quant"
+          },
+          "repo_id": {
+            "title": "Repo Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repo_id"
+        ],
+        "title": "Body_start_download_api_downloads_post",
+        "type": "object"
+      },
+      "Body_test_model_api_models__model_id__test_post": {
+        "properties": {
+          "keep_loaded": {
+            "default": false,
+            "title": "Keep Loaded",
+            "type": "boolean"
+          },
+          "prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt"
+          }
+        },
+        "title": "Body_test_model_api_models__model_id__test_post",
+        "type": "object"
+      },
+      "Body_update_install_api_update_install_post": {
+        "properties": {
+          "confirm": {
+            "default": false,
+            "title": "Confirm",
+            "type": "boolean"
+          },
+          "restart": {
+            "default": true,
+            "title": "Restart",
+            "type": "boolean"
+          },
+          "tag": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tag"
+          }
+        },
+        "title": "Body_update_install_api_update_install_post",
+        "type": "object"
+      },
+      "Body_update_rollback_api_update_rollback_post": {
+        "properties": {
+          "confirm": {
+            "default": false,
+            "title": "Confirm",
+            "type": "boolean"
+          }
+        },
+        "title": "Body_update_rollback_api_update_rollback_post",
+        "type": "object"
+      },
+      "Body_vram_reclaim_api_vram_reclaim_post": {
+        "properties": {
+          "dry_run": {
+            "default": false,
+            "title": "Dry Run",
+            "type": "boolean"
+          }
+        },
+        "title": "Body_vram_reclaim_api_vram_reclaim_post",
+        "type": "object"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "GPU-only OpenAI-compatible LLM gateway over llama.cpp llama-server",
+    "title": "StudioForge",
+    "version": "1.26-09-23"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/adapters": {
+      "get": {
+        "operationId": "list_adapters_api_adapters_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Adapters Api Adapters Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Adapters",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/adapters/scan": {
+      "post": {
+        "operationId": "scan_adapters_api_adapters_scan_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Scan Adapters Api Adapters Scan Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Scan Adapters",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/adapters/{adapter_id}": {
+      "delete": {
+        "operationId": "delete_adapter_api_adapters__adapter_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "adapter_id",
+            "required": true,
+            "schema": {
+              "title": "Adapter Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "delete_file",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Delete File",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "confirm",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Confirm",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Delete Adapter Api Adapters  Adapter Id  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Adapter",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/benchmark/jobs": {
+      "get": {
+        "description": "Every known benchmark job, newest first.\n\nWithout this the job table was write-only -- ``job_id`` or nothing. A\nsecond client, or the same client after a crash, could not discover a\nrunning benchmark except by getting ``503 benchmark_busy`` on its next\nPOST; the playbook literally said \"poll the job_id you started\".",
+        "operationId": "benchmark_jobs_api_benchmark_jobs_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Benchmark Jobs Api Benchmark Jobs Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Benchmark Jobs",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/benchmark/jobs/{job_id}": {
+      "delete": {
+        "description": "Ask a running job to stop.\n\nThe stop happens at a mode boundary rather than mid-load: killing a\nhalf-started llama-server would leak a child process and leave the model's\ndevice override unrestored, which is exactly the surprise this subsystem\nmust not create.",
+        "operationId": "cancel_benchmark_job_api_benchmark_jobs__job_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Cancel Benchmark Job Api Benchmark Jobs  Job Id  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Cancel Benchmark Job",
+        "tags": [
+          "management"
+        ]
+      },
+      "get": {
+        "operationId": "benchmark_job_api_benchmark_jobs__job_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Benchmark Job Api Benchmark Jobs  Job Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Benchmark Job",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/benchmark/modes": {
+      "get": {
+        "description": "Every GPU placement this machine can benchmark, model-independent.",
+        "operationId": "benchmark_modes_api_benchmark_modes_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Benchmark Modes Api Benchmark Modes Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Benchmark Modes",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/capabilities": {
+      "get": {
+        "description": "What this backend supports, what the hardware allows, and what is newer.\n\nAnswers \"what kinds of model can I actually run?\" in one call, for the GUI,\nthe CLI and MCP alike.\n\n``implemented`` (D64) is what a client feature-gates on: ``decisions`` (every\nDECISIONS.md number this build includes, ``\"D1\"`` .. ``latest_decision``) and\n``features`` (named behaviours such as ``plan_recommended``, with\n``feature_decisions`` naming the decision behind each). Additive, and correct\nfor a server running past its release tag, which ``/api/version`` is not.",
+        "operationId": "capabilities_api_capabilities_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "check_update",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Check Update",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Capabilities Api Capabilities Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Capabilities",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/catalog": {
+      "get": {
+        "description": "Every model with its loading options, newest download first.\n\nOne call answers \"what can I run, at what context, how fast, and how many\nat once\" for the whole library. Each option row carries a ``load_args``\nobject that ``POST /api/models/{id}/load`` (and the MCP ``load_model``\ntool) accept verbatim.\n\nBuilt off the event loop: a full catalog walks the planner once per model\nper context tier, which is pure arithmetic but enough of it to stall a\nstream if it ran inline.",
+        "operationId": "catalog_api_catalog_get",
+        "parameters": [
+          {
+            "description": "Rebuild instead of serving the short cache",
+            "in": "query",
+            "name": "refresh",
+            "required": false,
+            "schema": {
+              "default": false,
+              "description": "Rebuild instead of serving the short cache",
+              "title": "Refresh",
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Restrict to one model id or alias",
+            "in": "query",
+            "name": "model",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Restrict to one model id or alias",
+              "title": "Model"
+            }
+          },
+          {
+            "description": "Keep only each model's recommended row",
+            "in": "query",
+            "name": "compact",
+            "required": false,
+            "schema": {
+              "default": false,
+              "description": "Keep only each model's recommended row",
+              "title": "Compact",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Catalog Api Catalog Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Catalog",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/config": {
+      "get": {
+        "description": "Config with every credential redacted to a short fingerprint.\n\n``server.api_key``, ``mcp.pin`` and ``hf.token`` all go through\n:func:`~studioforge.api.auth.redact_config_dict`. The PIN matters most here:\non the shipped default (``server.api_key`` unset) this route needs no\ncredential at all, so returning the PIN in full handed the MCP control\nplane to any caller who could reach the port.",
+        "operationId": "get_config_api_config_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Config Api Config Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Config",
+        "tags": [
+          "management"
+        ]
+      },
+      "patch": {
+        "description": "Apply dotted-path updates, validate, persist, and report restart needs.\n\nOne key here does less than it looks: ``engine.pinned_tag`` records which\nbuild *should* be live, but ``active.json`` is what a load actually reads, so\nsetting the pin alone leaves the running engine untouched and shows up as\n``drift`` on ``GET /api/engine``. Use ``POST /api/engine/activate`` to switch\nengines -- it does both, and revalidates saved expert flags (D49-5).",
+        "operationId": "set_config_api_config_patch",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "title": "Updates",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Set Config Api Config Patch",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Config",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/downloads": {
+      "get": {
+        "description": "The queue, plus how much room is left where it is landing.\n\n``disk`` rides along on the list rather than living on its own endpoint\nbecause every consumer that renders a queue wants both, and asking twice\nwould let the two answers disagree by a poll interval. It is ``None`` when\nthe volume cannot be measured (no ``models.dir`` yet, an unmapped drive) --\nnever an invented zero, which a client would render as a full disk.",
+        "operationId": "list_downloads_api_downloads_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Downloads Api Downloads Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Downloads",
+        "tags": [
+          "management"
+        ]
+      },
+      "post": {
+        "description": "Queue a download, picking the quant when one is not named.",
+        "operationId": "start_download_api_downloads_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_start_download_api_downloads_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Start Download Api Downloads Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Start Download",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/downloads/{group_id}": {
+      "delete": {
+        "operationId": "cancel_download_api_downloads__group_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "title": "Group Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "delete_partial",
+            "required": false,
+            "schema": {
+              "default": true,
+              "title": "Delete Partial",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Cancel Download Api Downloads  Group Id  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Cancel Download",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/downloads/{group_id}/pause": {
+      "post": {
+        "operationId": "pause_download_api_downloads__group_id__pause_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "title": "Group Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Pause Download Api Downloads  Group Id  Pause Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Pause Download",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/downloads/{group_id}/resume": {
+      "post": {
+        "operationId": "resume_download_api_downloads__group_id__resume_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "title": "Group Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Resume Download Api Downloads  Group Id  Resume Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Resume Download",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/engine": {
+      "get": {
+        "description": "The engine inventory: what is pinned, what is live, what is installed.\n\n``drift`` is non-null when ``engine.pinned_tag`` and the actually-active\nbuild disagree -- ``active.json`` wins at load time, so a pin edited on its\nown (via ``PATCH /api/config``) changes nothing until something activates\nit, and before D49 that disagreement was a boot-time log line and nothing\nelse. ``install_progress`` is the latest snapshot from an in-flight\n``POST /api/engine/install`` (tag, phase, fraction, done/error) or ``null``\nwhen no install has run in this process; a ~600 MB download is otherwise a\nblind wait for the caller.\n\n``update_channel`` and ``stable`` (D62) put upstream's stable channel beside\nthe inventory: ``stable`` is ``{version, tag, published_at}`` from the\nmanager's cached :meth:`~studioforge.core.engine.EngineManager.stable_release`\n(``null`` with ``stable_error`` saying why when it cannot be read) and\n``stable_installed`` says whether that build is already under\n``engines/``. The full recommendation -- which needs the newest build's\nasset probed as well -- is ``/api/capabilities?check_update=true``.",
+        "operationId": "engine_status_api_engine_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Engine Status Api Engine Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Engine Status",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/engine/activate": {
+      "post": {
+        "description": "Make an installed build the live engine, and pin it (D49-5).\n\nThree things, because doing fewer of them is what produced pin/active drift:\n``active.json`` is rewritten (that is what new loads read),\n``engine.pinned_tag`` is set and saved (that is what survives a restart, and\nwhat a rollback edits), and every saved ``extra_flags`` string is\nrevalidated against the new build.\n\n``offenders`` is ``[{model_id, errors}]`` for models whose saved flags no\nlonger parse -- a warning, never a refusal: llama-server ignores flags it\ndoes not know, so the switch would otherwise take effect with a setting\nsilently dropped. ``previous`` is the tag that was live before, for an\nundo. ``note`` is :data:`ENGINE_ACTIVATE_NOTE`.\n\nThe tag must already be installed (``POST /api/engine/install`` first);\nactivating a missing build is an error rather than an implicit download.",
+        "operationId": "engine_activate_api_engine_activate_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_engine_activate_api_engine_activate_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Engine Activate Api Engine Activate Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Engine Activate",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/engine/install": {
+      "post": {
+        "description": "Download and unpack a llama.cpp build. Does not switch to it.\n\n**Behaviour change (D49-4).** Installing used to activate the new build as\nits last step, unconditionally -- which is how a failed smoke test could\nleave ``active.json`` pointing at the build that had just failed while the\nCLI printed \"keeping <current>\". Install and activate are now separate\ndecisions: this route unpacks the binary and leaves the live engine exactly\nwhere it was. Pass ``activate: true`` for the old behaviour, or -- better --\ncall ``POST /api/engine/activate`` afterwards, which additionally pins the\ntag in ``engine.pinned_tag`` (so it survives a restart) and revalidates\nsaved expert flags against the new build.\n\n``force`` re-downloads a build that is already present. Poll ``GET\n/api/engine`` for ``install_progress`` while this runs; the response itself\narrives only on completion.",
+        "operationId": "engine_install_api_engine_install_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_engine_install_api_engine_install_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Engine Install Api Engine Install Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Engine Install",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/engine/releases": {
+      "get": {
+        "description": "Installable llama.cpp builds, newest first.\n\nUpstream publishes build releases with GitHub's ``prerelease`` flag set, so\nthe answer is filtered on asset eligibility rather than on that flag (D49-1);\nan empty list means no build carried an asset for this OS/arch/CUDA variant,\nnot that no build exists.",
+        "operationId": "engine_releases_api_engine_releases_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Engine Releases Api Engine Releases Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Engine Releases",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/engine/smoke-test": {
+      "post": {
+        "description": "Load a tiny model on the GPU with this build and report whether it ran.\n\nA real micro-load, not a ``--version`` check: it is the only thing that\ncatches a driver too old for the CUDA build. It costs a few seconds of GPU,\nwhich is why the route is D32-gated like the rest of ``/api/engine/``.",
+        "operationId": "engine_smoke_test_api_engine_smoke_test_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_engine_smoke_test_api_engine_smoke_test_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Engine Smoke Test Api Engine Smoke Test Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Engine Smoke Test",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/engine/validate-flags": {
+      "post": {
+        "description": "Check expert flags against a build's own ``--help`` before saving them.\n\n``extra_flags`` takes either shape: a single string (``\"--foo 1 --bar\"``) or\na list of strings (``[\"--foo\", \"1\", \"--bar\"]``, joined with spaces). Anything\nelse is a 400 naming both (D49-11). ``tag`` defaults to the pinned build.\n\nOpen without a credential even on an install with no ``server.api_key``:\nunlike its neighbours under ``/api/engine/`` this changes nothing on the box\n-- it reads one binary's help text -- and pre-checking a flag is exactly what\na remote operator should be able to do before ``PUT /api/models/{id}/settings``\n(which is gated) makes it stick. The first validation run for a tag execs\nthat build's ``--help`` and caches the accepted flags in\n``engines/<tag>/flags.txt``, so it is slower than the runs after it.",
+        "operationId": "engine_validate_flags_api_engine_validate_flags_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_engine_validate_flags_api_engine_validate_flags_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Engine Validate Flags Api Engine Validate Flags Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Engine Validate Flags",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/evictions": {
+      "get": {
+        "description": "Recent eviction events, newest first: who was unloaded, by what, and why.\n\n\"Why did that model disappear?\" used to need log archaeology once the\nevicting plan scrolled out of /api/status -- and it is the first question\nasked whenever a companion's model goes missing mid-conversation. Each\nevent carries ``{ts, evicted, evicted_by, reason, freed_bytes, priority}``\nwith ``reason`` in {plan, oom-retry, ttl, lease, removed, rebalance-failed}\n-- the last one is a D42 move whose relaunch died and whose rollback to\nthe previous placement failed too, so the model is down (D70). In-memory ring:\nsurvives as long as the process, which is when the question is asked.",
+        "operationId": "evictions_api_evictions_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "since",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Since"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Evictions Api Evictions Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Evictions",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/gpus": {
+      "get": {
+        "operationId": "gpus_api_gpus_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Gpus Api Gpus Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Gpus",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/health": {
+      "get": {
+        "operationId": "health_api_health_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Health Api Health Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Health",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/hf/repo/{repo_id}": {
+      "get": {
+        "description": "One repo's quants, each with a fit verdict and a context matrix.\n\nUnlike search this always reads the model's GGUF header (once per repo, from\nthe smallest quant -- every quant shares the geometry), because the user has\nstopped browsing and is choosing. That read is what turns ``fit.approximate``\noff and fills in ``context_fit``.",
+        "operationId": "hf_repo_api_hf_repo__repo_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "repo_id",
+            "required": true,
+            "schema": {
+              "title": "Repo Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Hf Repo Api Hf Repo  Repo Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Hf Repo",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/hf/search": {
+      "get": {
+        "description": "Search HuggingFace for GGUF repos, with per-quant fit verdicts.\n\n``sort`` and ``date_field`` are validated in :mod:`studioforge.core.hf_search`\nrather than by an ``enum`` annotation here, so the HTTP route, the GUI and\nthe MCP tool all reject the same values with the same message -- and so the\nallowed set lives next to the HF names it maps to.\n\n``with_context=1`` adds the per-quant context matrix, which costs one remote\nGGUF header read *per repo*. It is refused above ``limit``\n:data:`CONTEXT_SEARCH_LIMIT` rather than silently made slow: a 20-result\nsearch would pull a couple of hundred megabytes of headers.\n\nThe response echoes the options back under ``sort_options`` /\n``date_field_options``. The reader is often an LLM driving this endpoint\nwith no schema in hand, and a discoverable menu is the difference between\none wrong guess and three.",
+        "operationId": "hf_search_api_hf_search_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "q",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Q",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 100,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "author",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Author"
+            }
+          },
+          {
+            "in": "query",
+            "name": "sort",
+            "required": false,
+            "schema": {
+              "default": "downloads",
+              "title": "Sort",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "newer_than_days",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 3650,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Newer Than Days"
+            }
+          },
+          {
+            "in": "query",
+            "name": "date_field",
+            "required": false,
+            "schema": {
+              "default": "updated",
+              "title": "Date Field",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "with_context",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "With Context",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Hf Search Api Hf Search Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Hf Search",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/leases": {
+      "get": {
+        "description": "Every standing GPU lease: which cards, held by whom, for which models.\n\nEach row carries ``priority`` (the D46 class of the claim), ``state``\n(``vacating`` while the holder has been asked to leave, D56),\n``vacate_registered`` and ``vacate_deadline``. The holder's ``vacate_url``\nitself is shown only to an admin caller (D32 as ``is_admin_caller``: this\nmachine, the MCP PIN, or a key-bearing request); the token is never shown\nto anyone.",
+        "operationId": "list_leases_api_leases_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Leases Api Leases Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Leases",
+        "tags": [
+          "management"
+        ]
+      },
+      "post": {
+        "description": "Give CUDA ``devices`` to ``model_ids`` -- or, with none, to something outside this server.\n\n``devices`` may be ``\"auto\"`` or omitted (D78): the server picks ONE card the\nway this grant judges a card -- never one with a busy resident, never a\nleased one (automatic placement asks nobody to vacate), never a pinned or\nbetter-tier idle resident without ``force``; then fewest evictions first,\nthe caller's ``prefer`` order, most free VRAM, lowest index. ``min_free_gib``\nis measured against the card once its evictable idle residents are gone;\n``avoid`` rules cards out. The reply carries the chosen ``devices`` and a\n``placement`` block with every card ``considered``; so does a refusal, in\n``error.studioforge.considered``, under the usual codes. ``exclusive`` must\nbe ``true``: a lease is a whole card (the partial-card share lease is the\ndocumented extension point, docs/TENANTS.md).\n\nWhile the lease stands nothing else is planned onto those cards; the named\nmodels are loaded onto exactly them, sized for as many slots as their\ncontext allows, in the split mode their own benchmark measured fastest\nthere. Idle residents on the cards are unloaded; a model mid-request\nrefuses the call (503, ``retry_after_s``); a pinned idle resident refuses\nunless ``force``. ``idle_ttl_s`` (default 3600) is how long the lease\nsurvives without activity before the server releases it; ``null`` holds\nit until ``DELETE``.\n\n``holder`` defaults to the ``X-SF-Client`` header when one is sent, else\n``\"api\"``. ``priority`` is the D46 class of the claim (1 chat, 2 dispatched\nagent, 3 background -- the default). ``vacate_url`` / ``vacate_token``\nregister where a *better* class may ask this holder to leave (D56): the\nserver POSTs ``{lease_id, devices, requester, requester_priority,\ndeadline_s, deadline_at}`` there with the token in ``X-SF-Vacate-Token``,\nand the asker is answered ``409 lease_vacating`` (``retry_after_s``,\n``Retry-After``) until this lease is released or ``leases.vacate_timeout_s``\npasses. A card already leased by an equal or better class, or by a holder\nthat registered no URL, is a plain ``409 lease_conflict`` -- also with\n``Retry-After`` now. ``force`` never overrides a standing lease.",
+        "operationId": "create_lease_api_leases_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_create_lease_api_leases_post"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Create Lease Api Leases Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Lease",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/leases/{lease_id}": {
+      "delete": {
+        "operationId": "release_lease_api_leases__lease_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "lease_id",
+            "required": true,
+            "schema": {
+              "title": "Lease Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Release Lease Api Leases  Lease Id  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Release Lease",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/leases/{lease_id}/touch": {
+      "post": {
+        "description": "Restart the idle clock -- for a holder outside this server that is still busy.",
+        "operationId": "touch_lease_api_leases__lease_id__touch_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "lease_id",
+            "required": true,
+            "schema": {
+              "title": "Lease Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Touch Lease Api Leases  Lease Id  Touch Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Touch Lease",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/logs": {
+      "get": {
+        "description": "The server's own log ring buffer.\n\nOpen, because a log is how a client finds out why its load failed -- but\n**path-redacted for a caller who is not an admin** (D55). Absolute paths in\na log line name the operator's username and the whole disk layout, and this\nroute had no credential in front of it at all. ``redacted: true`` says which\nanswer this is, so a client is never guessing.",
+        "operationId": "get_logs_api_logs_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "n",
+            "required": false,
+            "schema": {
+              "default": 200,
+              "maximum": 5000,
+              "title": "N",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "level",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Level"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Logs Api Logs Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Logs",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/logs/models/{model_id}": {
+      "get": {
+        "description": "Per-model llama-server stderr, which is where load failures explain\nthemselves.\n\nSame rule as ``GET /api/logs`` (D55): the lines and the log's own ``path``\nare reduced to basenames for a caller who is not an admin. The route stays\nopen because \"why did my load fail\" is a question any client on an open\ninstall is entitled to ask -- it is the *layout* that was never theirs.",
+        "operationId": "get_model_log_api_logs_models__model_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "n",
+            "required": false,
+            "schema": {
+              "default": 200,
+              "maximum": 5000,
+              "title": "N",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Model Log Api Logs Models  Model Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Model Log",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/mcp/info": {
+      "get": {
+        "description": "Where to reach the MCP endpoint, and the PIN to pair with it.\n\nAdvertises the **Tailscale** address first because that is the one that\nkeeps working: a tailnet IP survives a network change, a DHCP renewal and a\nmove between sites, where a LAN address silently stops resolving. The LAN\naddresses are returned alongside so a client on the same network can take\nthe shorter, faster direct hop when it wants one.",
+        "operationId": "mcp_info_api_mcp_info_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Mcp Info Api Mcp Info Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Mcp Info",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/model-gate": {
+      "get": {
+        "description": "Is a loaded model above this bar, and which one should I send work to? (D52)\n\nThe routing question an agent asks *before* it decides between three\noptions: send this task to the local ``/v1`` API, spend 40 seconds loading\nsomething bigger, or pay a cloud provider. The operator usually has\nsomething loaded and most loaded models can do most jobs, so \"is what is\nalready resident good enough\" is the cheap question that avoids the other\ntwo -- but only if it can be asked in one call.\n\nThe answer therefore carries the **model id**, not just a yes: a caller told\n\"yes, something qualifies\" would still have to fetch ``/v1/models`` and\nguess which of three resident models was meant. ``model`` goes straight into\nthe next ``/v1/chat/completions`` request. ``instances`` shows the working\nfor every resident model, and on a \"no\" ``reason`` names the gap and\n``hint`` points at the fix.\n\n``vision``/``audio``/``tools``/``thinking``/``uncensored`` are sugar for the\n``tags`` list -- every one of them lands in the same requirement set -- and\n``tags`` itself is free-form, so a caller can ask for something nobody\nanticipated and get a truthful \"yes\" or \"unknown\" without a server change.\n\nRead-only, and therefore **not** behind the D32 admin gate: that gate is\n``auth.is_admin_mutation``, which returns False for any verb outside\n``{POST, PUT, PATCH, DELETE}``, so a GET is open by construction and this\nroute needs no entry in any admin list. That is correct here -- routing\ndecisions are exactly what LAN clients are supposed to make, and this\nendpoint reveals no more than ``GET /api/models`` already does.",
+        "operationId": "model_gate_api_model_gate_get",
+        "parameters": [
+          {
+            "description": "Size bar in billions: 20, '20b', '500m', '0.5b'",
+            "in": "query",
+            "name": "min_params",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Size bar in billions: 20, '20b', '500m', '0.5b'",
+              "title": "Min Params"
+            }
+          },
+          {
+            "description": "Require image input",
+            "in": "query",
+            "name": "vision",
+            "required": false,
+            "schema": {
+              "default": false,
+              "description": "Require image input",
+              "title": "Vision",
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Require audio input",
+            "in": "query",
+            "name": "audio",
+            "required": false,
+            "schema": {
+              "default": false,
+              "description": "Require audio input",
+              "title": "Audio",
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Require tool calling",
+            "in": "query",
+            "name": "tools",
+            "required": false,
+            "schema": {
+              "default": false,
+              "description": "Require tool calling",
+              "title": "Tools",
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Require a reasoning/thinking mode",
+            "in": "query",
+            "name": "thinking",
+            "required": false,
+            "schema": {
+              "default": false,
+              "description": "Require a reasoning/thinking mode",
+              "title": "Thinking",
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Require an uncensored/abliterated model",
+            "in": "query",
+            "name": "uncensored",
+            "required": false,
+            "schema": {
+              "default": false,
+              "description": "Require an uncensored/abliterated model",
+              "title": "Uncensored",
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Comma-separated extra tags, e.g. 'coding,roleplay,vietnamese'",
+            "in": "query",
+            "name": "tags",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Comma-separated extra tags, e.g. 'coding,roleplay,vietnamese'",
+              "title": "Tags"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Model Gate Api Model Gate Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Model Gate",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/models": {
+      "get": {
+        "description": "The whole library, each row's saved record plus what it is doing now.\n\nAdditive per-row keys on top of the stored ``ModelRecord``: ``loaded`` /\n``state`` / ``port`` (is there a child, and where), ``ttl_remaining_s`` and\n``effective_ttl_s`` (0 means pinned), ``active_requests`` and\n``last_tokens_per_second``, and ``priority`` -- the tier this model would\nload at right now (D46/D48): the running instance if there is one, else the\nin-memory memo of what clients have been asking for, else the saved\n``settings.priority``, else background.\n\n``priority`` and ``effective_ttl_s`` share a caveat: both are **soft\nanswers** about the *next* load, not promises. A request may still name its\nown tier, and a tier that outranks the standing one wins.\n\n``effective`` (D54) is the opposite kind of answer: the launch settings a\n*running* child was really started with -- prompt cache, continuous\nbatching, KV pool shape, slots -- parsed from its argv with the engine's\ndefaults filled in. ``null`` for anything not loaded.\n\n``arch_supported`` (D66): whether the llama.cpp build that would serve the\nnext load (the model's ``engine_tag`` pin, else the active build) can load\nits architecture -- ``false`` with a short ``arch_note``, ``engine_supported:\nfalse`` and the full ``unsupported_reason`` when it certainly cannot, ``null``\nwhen that cannot be told. Every load of a ``false`` model is refused ``400\nunsupported_architecture``. ``last_load_failure`` (``{at, code, message,\nengine_tag}``) is the last launch of the model that died, until one works:\nthe failed child is gone, so ``state`` alone would just say ``stopped``.",
+        "operationId": "list_models_api_models_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Models Api Models Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Models",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/models/scan": {
+      "post": {
+        "operationId": "scan_models_api_models_scan_post",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "force",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Force",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Scan Models Api Models Scan Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Scan Models",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/models/unload-all": {
+      "post": {
+        "description": "Unload every resident model, freeing all VRAM.\n\nRefused with 409 ``lease_conflict`` when a standing GPU lease holds one of\nthem and the caller is neither the holder nor an admin (D55). Answers 500\n``unload_failed`` -- naming every survivor in ``error.studioforge.failed``\nand what did unload in ``error.studioforge.unloaded`` -- when a child\noutlived the teardown; it never reports a count for children still alive.",
+        "operationId": "unload_all_api_models_unload_all_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Unload All Api Models Unload All Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Unload All",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/models/{model_id}": {
+      "delete": {
+        "operationId": "delete_model_api_models__model_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "delete_files",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Delete Files",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "confirm",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Confirm",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Delete Model Api Models  Model Id  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Model",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/models/{model_id}/adapter-scales": {
+      "post": {
+        "description": "Change LoRA scales on a running instance without a reload.\n\nllama-server exposes runtime adapter scaling, so a scale change on an\nalready-loaded model is a POST rather than a multi-second reload.",
+        "operationId": "set_adapter_scales_api_models__model_id__adapter_scales_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "title": "Payload",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Set Adapter Scales Api Models  Model Id  Adapter Scales Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Adapter Scales",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/models/{model_id}/benchmark": {
+      "post": {
+        "description": "Start a benchmark in the background and return a job id.\n\nA background job rather than a synchronous response because a four-mode run\non a 17 GiB model is minutes of loading and generating -- far past any\nsensible HTTP timeout. Clients poll ``/api/benchmark/jobs/{job_id}``.",
+        "operationId": "start_benchmark_api_models__model_id__benchmark_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "additionalProperties": true,
+                    "type": "object"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Payload"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Start Benchmark",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/models/{model_id}/benchmark-parallel": {
+      "post": {
+        "description": "Measure how many parallel slots this model is worth running (WP19).\n\nLoads the model once at the chosen placement with as many slots as it holds,\nfires 1 / 2 / 4 / 8 concurrent completions, records the curve, and leaves the\nrig as it found it. A background job for the same reason the placement\nbenchmark is one -- minutes of loading and generating past any HTTP timeout\n-- and pollable through the same ``/api/benchmark/jobs/{job_id}``.\n\nBody: ``mode`` (a hardware-mode key such as ``dual_5090``), ``devices``,\n``ctx_size``, ``kv_cache_type``, ``streams``, ``prompt_tokens``,\n``max_tokens``. All optional; the default is the placement's own optimal on\nthe planner's choice of cards, which is the load the catalog recommends and\ntherefore the one worth measuring.",
+        "operationId": "start_parallel_benchmark_api_models__model_id__benchmark_parallel_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "additionalProperties": true,
+                    "type": "object"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Payload"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Start Parallel Benchmark",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/models/{model_id}/benchmark/modes": {
+      "get": {
+        "description": "Modes for one model, each carrying the planner's applicability verdict.\n\nInapplicable modes are listed with the rejection reason rather than hidden,\nso the GUI can grey out a placement *and* say why it is unavailable.",
+        "operationId": "model_benchmark_modes_api_models__model_id__benchmark_modes_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "ctx_size",
+            "required": false,
+            "schema": {
+              "default": 4096,
+              "minimum": 1,
+              "title": "Ctx Size",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Model Benchmark Modes Api Models  Model Id  Benchmark Modes Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Model Benchmark Modes",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/models/{model_id}/benchmarks": {
+      "get": {
+        "description": "Persisted benchmark history for one model, newest first.",
+        "operationId": "list_model_benchmarks_api_models__model_id__benchmarks_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 10,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Model Benchmarks Api Models  Model Id  Benchmarks Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Model Benchmarks",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/models/{model_id}/introspect": {
+      "get": {
+        "description": "Real running settings from llama-server's own /props and /slots.",
+        "operationId": "introspect_api_models__model_id__introspect_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Introspect Api Models  Model Id  Introspect Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Introspect",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/models/{model_id}/load": {
+      "post": {
+        "description": "Load one model, optionally onto named GPUs.\n\n``devices`` is a one-shot placement for this load only (D36) -- the\ncatalog's per-hardware-mode ``load_args`` carry one -- and never touches the\nmodel's saved settings. A CUDA index this box does not have is a 400 naming\nthe parameter, not a planner refusal that reads like a VRAM problem.\n\n``allowed_devices`` is the other one-shot, and the distinction is the whole\nof D59: ``devices`` says *use exactly these cards, all of them* -- more than\none becomes a split -- while ``allowed_devices`` says *choose among these*\nand leaves the ranking, the split and the arithmetic to the planner. A\ntenant that needs a load kept off the card ComfyUI renders on wants the\nsecond; forcing the first made it pick placements this server picks better.\nSending both is a 400: one would have decided nothing.\n\nIt **narrows and never widens**. The request's set is intersected with the\nmodel's saved ``settings.allowed_devices``; ``planner.excluded_devices`` and\nstanding GPU leases (D43) still remove cards afterwards; and a saved\n``settings.device_override`` still outranks every allow-list, so a request\nexcluding a card the override names is a 400 rather than a silent placement\nonto exactly the card it asked to avoid. Nothing is persisted -- the next\nload without the field is the model's own business again. An empty list is a\n400, not a no-op: \"every card except that one\", computed to nothing, means\n*nowhere*, and treating it as *anywhere* would place the load on the one\ncard the caller was avoiding. When the set is real but nothing in it fits,\nthe answer is the ordinary honest 507 -- ``allowed_devices_unavailable``, or\n``gpu_leased`` when a lease is why (D53).\n\n``priority`` is the load's tier (D46): 1 the active chat model, 2 a\ndispatched agent, 3 (or omitted) background. A tier-1/2 load takes the\nfastest placement -- displacing idle worse-tier models from the cards it\npicks and reloading the recently active ones afterwards where they fit --\njumps the load queue, and holds new worse-tier traffic off (503 +\nRetry-After) while it loads. The tier is remembered per model, so a JIT\nreload keeps it -- and since D48 a saved ``settings.priority`` is the floor\nthat survives a restart.\n\nThe mirror image: while a better-tier load holds the server, this route\nanswers 503 with the code ``priority_hold`` (not the generic busy code),\n``Retry-After`` and ``details.priority_hold`` naming the model being loaded\nand its tier. It is a wait, not a failure -- honour the header.",
+        "operationId": "load_model_api_models__model_id__load_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_load_model_api_models__model_id__load_post"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Load Model Api Models  Model Id  Load Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Load Model",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/models/{model_id}/load-recommended": {
+      "post": {
+        "description": "Load at exactly ``ctx_size`` per slot; the server picks everything else.\n\nName the model and the context you need. This walks the hardware modes in\nheadline order, asks for that exact context per slot under the quality-first\nKV rule with the recommended slot count, and loads the first placement that\nfits -- evicting only idle models, never a busy one.\n\n**Strict about context, unlike every other load path.** A window that does\nnot fit is a structured 507 naming, per mode, the largest context that would\nwork and what is in the way, with ``retry_after_s`` when the cause is a\nmodel that is serving right now. Above the model's trained window it is a\n400 with the number that would be accepted.\n\n``kv_min`` is the lowest KV cache quality this call will accept -- ``f16``,\n``q8_0`` or ``q4_0``. It floors the quality-first ladder rather than\nsteering it: a window that needs a worse cache than the floor is refused\nwith the same structured 507, never quietly quantized to reach the number.\nOmitted, the whole ladder is available (and a q4_0 K cache is still never\nchosen automatically).\n\n``max_slots`` caps the slot count for this load only. The estimator's\nanswer is what a placement *could* sustain; a caller that knows it has\nthree bots wanting one window each does not want the other five slots' KV\ncache priced into the fit. Must be >= 1 (400 naming the parameter\notherwise). The cap applies before the descent loop, so the winning plan is\nreally planned at the capped count rather than planned larger and launched\nsmaller.\n\n``allowed_devices`` bounds the walk to those CUDA indices, for this call\nonly (D59). It is a bound, not a placement: the mode walk still chooses\nwithin it, still applies the quality-first KV rule, and still returns the\nsame structured 507 when nothing in the set reaches the window. It is\napplied where ``planner.excluded_devices`` is -- to the card list the\nhardware modes are built from -- so the modes offered are the real ones over\nthe permitted cards and ``prefer_mode`` names one of those; a mode outside\nthe set is unreachable rather than merely unpreferred. Narrows only: it is\nintersected with the model's saved ``settings.allowed_devices``, contradicts\na saved ``settings.device_override`` with a 400 rather than quietly\noverruling it, and never widens past a lease or an exclusion. An empty list\nis a 400. Nothing about it is persisted, ``persist: true`` included -- a\nplacement is a one-shot load argument (D36), and so is a bound on one.\n\n``persist`` writes the *resolved* profile -- context per slot, both KV\ncache types, the slot count and the tier -- into the model's saved settings\nonce the load succeeds, so the next plain load (a JIT reload included)\nreproduces it. The trade: it freezes the KV ladder and the slot estimator\nfor this model, which then stop responding to a changed machine; null those\nfields with ``PATCH /api/models/{id}/settings`` to hand the decision back.\nDevices are deliberately **not** persisted -- a placement is a one-shot\nload argument (D36). It is refused for a preset-only virtual model (the\nwrite would land on the base model and every persona sharing it -- call it\non the base id instead) and while the model is being benchmarked; both are\nchecked before the walk begins, so the 400 arrives with nothing loaded.\nAfterwards the write is best-effort: anything that refuses it once the load\nhas succeeded -- a benchmark that started *during* the load, or the settings\nvalidation rejecting the resolved row (a resident whose slot count predates\na ``max_parallel_cap`` lowered under it) -- leaves the load standing and\nskips only the write, with a warning in the server log.\n\n``priority`` is the load's tier (D46): 1 the active chat model, 2 a\ndispatched agent, 3 (or omitted) background.\n\n``min_slots`` and ``kv_unified`` shape the slots (D72). ``min_slots`` is a\nfloor on the count the walk picks -- the fit, the KV cache type and any\nrefusal are all judged at it, so a mode that reaches the window only with\nfewer slots is a 507 carrying ``max_ctx_that_fits`` and\n``max_parallel_that_fits``, never a shorter load. ``kv_unified: true``\nmakes ``ctx_size`` ONE shared pool: the child runs ``--parallel N\n--kv-unified --ctx-size ctx_size --no-cache-idle-slots``, every slot may\nuse the whole pool, and VRAM is one slot's KV plus each extra slot's\nsliding window and recurrent state. ClawChat asks for ``min_slots: 2,\nmax_slots: 2, kv_unified: true``: one slot for the chat, one for\neverything else, at the price of one. A resident is \"already exactly\nthat\" only at or above the floor and, when the caller names a pool shape,\nin that shape. ``persist`` with ``kv_unified: true`` is a 400: the saved\nsettings keep ``ctx_size`` per slot and cannot hold a shared pool.\n\n**Auth.** The route itself is ungated (residency is open, LM Studio\nparity), but ``persist: true`` writes settings -- the same box change\n``PUT /settings`` is gated for (D32) -- so that field alone needs\n``server.api_key``, a caller on this machine, or the MCP pairing PIN. The\nrefusal is a 403 ``remote_admin_requires_credential`` and the same request\nwithout ``persist`` still loads.\n\nA load held off by a higher-tier load in flight is a 503 with code\n``priority_hold``, ``Retry-After`` and ``details.priority_hold`` naming the\nholder -- distinct from the other 503s this route can return, so honour the\nheader rather than retrying immediately.",
+        "operationId": "load_recommended_api_models__model_id__load_recommended_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_load_recommended_api_models__model_id__load_recommended_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Load Recommended Api Models  Model Id  Load Recommended Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Load Recommended",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/models/{model_id}/options": {
+      "get": {
+        "description": "Every loading option for one model -- the MCP ``model_options`` table, over REST.\n\nRead-only capacity math (context/KV matrices, per-placement fit, the\n``load_args`` recipes), previously reachable only through the MCP plane --\nso a planning agent without MCP credentials had to *estimate* the very\nnumbers this server computes exactly. GET, ungated, like every other\nread surface.",
+        "operationId": "model_options_api_models__model_id__options_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "refresh",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Refresh",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Model Options Api Models  Model Id  Options Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Model Options",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/models/{model_id}/parallel-observations": {
+      "get": {
+        "description": "The measured slot sweeps behind this model's ``recommended_parallel``.",
+        "operationId": "list_parallel_observations_api_models__model_id__parallel_observations_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 64,
+              "maximum": 500,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Parallel Observations Api Models  Model Id  Parallel Observations Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Parallel Observations",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/models/{model_id}/pin": {
+      "post": {
+        "operationId": "pin_model_api_models__model_id__pin_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_pin_model_api_models__model_id__pin_post"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Pin Model Api Models  Model Id  Pin Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Pin Model",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/models/{model_id}/plan": {
+      "get": {
+        "description": "The dry-run planner: what would happen if this model were loaded now.\n\nNothing is loaded. The same planner that decides a real load answers\nagainst the GPUs as they stand, through the same one-shot ``devices`` /\n``allowed_devices`` copies the load route makes (D36/D59) and at the tier\nthe load would run at (``priority``, else the model's remembered tier).\nThe GUI's live fit check and the MCP ``plan_load`` tool are this route.\nRepeat ``devices`` / ``allowed_devices`` per index\n(``?allowed_devices=2&allowed_devices=3``); sending both is a 400, as on\nthe load route.\n\n**Units.** ``estimate_mb`` is the estimate breakdown in MiB (1024 * 1024\nbytes) -- its keys keep the terms' ``*_bytes`` names, the values are MiB --\nand is unchanged for existing clients. ``estimate_bytes`` is the same\nbreakdown in bytes, like ``per_gpu_bytes`` and ``shortfall_bytes``; prefer\nit (D64).",
+        "operationId": "plan_api_models__model_id__plan_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "ctx_size",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Ctx Size"
+            }
+          },
+          {
+            "in": "query",
+            "name": "kv_cache_type",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Kv Cache Type"
+            }
+          },
+          {
+            "in": "query",
+            "name": "kv_cache_type_v",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Kv Cache Type V"
+            }
+          },
+          {
+            "in": "query",
+            "name": "parallel",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Parallel"
+            }
+          },
+          {
+            "in": "query",
+            "name": "devices",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "integer"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Devices"
+            }
+          },
+          {
+            "in": "query",
+            "name": "allowed_devices",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "integer"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Allowed Devices"
+            }
+          },
+          {
+            "in": "query",
+            "name": "priority",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Priority"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Plan Api Models  Model Id  Plan Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Plan",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/models/{model_id}/plan-recommended": {
+      "get": {
+        "description": "The dry run of ``POST /api/models/{id}/load-recommended`` (D64).\n\nWhat that call would do right now, without doing it: nothing is loaded,\nevicted, leased, held, re-tiered or persisted. It takes the same inputs\n(``ctx_size``, ``prefer_mode``, ``kv_min``, ``max_slots``, ``min_slots``,\n``kv_unified``, ``allowed_devices`` repeated per index, ``priority``;\n``persist`` has no meaning for a dry run) and refuses a bad one with the\nsame 400. A fit also reports ``kv_unified``, ``ctx_per_slot`` and\n``ctx_total`` -- all equal to ``ctx_size`` for a shared pool (D72).\n\n**It is the same decision, not a model of it.** The real call and this\nroute run one function -- the mode walk, leases included -- so the answer\ncannot drift from what the load would choose. That is the point: on\n2026-09-12 two paths answered one question two ways and chat was down for\nseven minutes.\n\nA separate route rather than ``?recommended=true`` on ``/plan``, because\nthe two answer different questions with different inputs and shapes:\n``/plan`` is a dry run of ``/load`` (one planner call, the D14 ladder);\nthis is a dry run of the strict-context mode walk.\n\nAlways **200**. ``fits: true`` carries ``mode``, ``devices``, ``ctx_size``,\n``kv_cache_type`` / ``kv_cache_type_v``, ``parallel``, ``evict_model_ids``,\n``notes`` (a lease the walk routed around is named there, with its holder\nand how it ends), ``lease_skipped_modes``, ``placement_tier`` and\n``estimate_bytes`` (bytes, every term plus ``total``); ``already_loaded``\nsays the call would return the resident unchanged. ``fits: false`` carries\n``status_code`` and ``error`` -- exactly the body the real call would answer\nwith -- plus ``code``, ``retry_after_s``, ``shortfall_bytes``,\n``largest_term`` and ``max_ctx_that_fits`` lifted to the top. ``modes``\nlists every mode tried either way.\n\nNot previewed: the D46 ``priority_hold`` 503 (a transient admission wait,\nnot a placement decision), and the D51 observed correction the real load\nmay apply on top of the walk's formula estimate -- the placement agrees,\nthe last megabyte of the estimate may not. Same auth as ``/plan``: a GET,\nungated.",
+        "operationId": "plan_recommended_api_models__model_id__plan_recommended_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Tokens per slot, exactly -- as on load-recommended.",
+            "in": "query",
+            "name": "ctx_size",
+            "required": true,
+            "schema": {
+              "description": "Tokens per slot, exactly -- as on load-recommended.",
+              "title": "Ctx Size",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "prefer_mode",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Prefer Mode"
+            }
+          },
+          {
+            "description": "Lowest KV cache quality to accept: 'f16', 'q8_0' or 'q4_0'.",
+            "in": "query",
+            "name": "kv_min",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Lowest KV cache quality to accept: 'f16', 'q8_0' or 'q4_0'.",
+              "title": "Kv Min"
+            }
+          },
+          {
+            "description": "Ceiling on the slot count (>= 1).",
+            "in": "query",
+            "name": "max_slots",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Ceiling on the slot count (>= 1).",
+              "title": "Max Slots"
+            }
+          },
+          {
+            "description": "The CUDA indices the walk may use; repeat per index.",
+            "in": "query",
+            "name": "allowed_devices",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "integer"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The CUDA indices the walk may use; repeat per index.",
+              "title": "Allowed Devices"
+            }
+          },
+          {
+            "description": "Load tier: 1 active chat, 2 dispatched agent, 3 (or omitted) background.",
+            "in": "query",
+            "name": "priority",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Load tier: 1 active chat, 2 dispatched agent, 3 (or omitted) background.",
+              "title": "Priority"
+            }
+          },
+          {
+            "description": "The fewest slots this load may have (>= 1, <= max_slots).",
+            "in": "query",
+            "name": "min_slots",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The fewest slots this load may have (>= 1, <= max_slots).",
+              "title": "Min Slots"
+            }
+          },
+          {
+            "description": "true: the slots share ONE KV pool of ctx_size tokens. Omitted or false: ctx_size per slot.",
+            "in": "query",
+            "name": "kv_unified",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "true: the slots share ONE KV pool of ctx_size tokens. Omitted or false: ctx_size per slot.",
+              "title": "Kv Unified"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Plan Recommended Api Models  Model Id  Plan Recommended Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Plan Recommended",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/models/{model_id}/probe": {
+      "post": {
+        "description": "Run one real streamed completion against a loaded model.\n\nDeliberately does **not** load the model: a probe that loads is a load, and\nit would turn a monitoring poll into minutes of VRAM allocation. An\nunloaded model is reported as such, honestly, instead of being made to pass.",
+        "operationId": "probe_model_route_api_models__model_id__probe_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "timeout_s",
+            "required": false,
+            "schema": {
+              "default": 20.0,
+              "exclusiveMinimum": 0,
+              "maximum": 300,
+              "title": "Timeout S",
+              "type": "number"
+            }
+          },
+          {
+            "in": "query",
+            "name": "max_tokens",
+            "required": false,
+            "schema": {
+              "default": 8,
+              "exclusiveMinimum": 0,
+              "maximum": 256,
+              "title": "Max Tokens",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Probe Model Route Api Models  Model Id  Probe Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Probe Model Route",
+        "tags": [
+          "health"
+        ]
+      }
+    },
+    "/api/models/{model_id}/profiles": {
+      "get": {
+        "description": "Best achievable load per hardware mode, so an agent can pick one.\n\nSaves OpenClaw from probing context sizes by trial and error: one call says\nwhat this model can do on the 5090 pair, on the 3090 pair, and on the whole\nrig, with the KV cache type each choice implies.",
+        "operationId": "placement_profiles_api_models__model_id__profiles_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Placement Profiles Api Models  Model Id  Profiles Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Placement Profiles",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/models/{model_id}/restart": {
+      "post": {
+        "description": "Reload one model's ``llama-server`` child with its current settings.\n\nA force-load rather than unload-then-load so the planner runs once against\ncurrent free VRAM and the model is never left unloaded on a failure path.",
+        "operationId": "restart_model_api_models__model_id__restart_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Restart Model Api Models  Model Id  Restart Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Restart Model",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/models/{model_id}/settings": {
+      "get": {
+        "operationId": "get_settings_api_models__model_id__settings_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Settings Api Models  Model Id  Settings Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Settings",
+        "tags": [
+          "management"
+        ]
+      },
+      "patch": {
+        "description": "Merge-patch per-model settings (RFC 7386): change ONLY the named fields.\n\nA present key is set, an explicit ``null`` clears that field, and an\nabsent key is left byte-identical -- so ``{\"ctx_size\": 131072}`` touches\nnothing else. This exists because the full-object PUT punishes the natural\ncall shape: sending only the field you mean to change silently nulls every\nother field, and the loss surfaces later as a different symptom (thinking\nleaking into ``content``, a model sprawling across cards). A key that is\nnot a settings field is a 400 naming it, not an ignored no-op -- a typoed\nfield that \"worked\" is the same failure class this verb exists to close.\n\n``priority`` saved here is the **standing default** a restart falls back to\n(D48); a tier this server session already remembers from an explicit load\nstill outranks it until the next restart or the next explicitly tiered load.",
+        "operationId": "patch_settings_api_models__model_id__settings_patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "title": "Payload",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Patch Settings Api Models  Model Id  Settings Patch",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Patch Settings",
+        "tags": [
+          "management"
+        ]
+      },
+      "put": {
+        "description": "Save per-model settings, validating expert flags against the engine.\n\nValidation happens here rather than at load time so an unknown flag is a\nsave-time error the user sees immediately, not a mystery crash later.\n\n**This is a full-object REPLACE**: a field the payload omits is reset to\nits default, silently. That has already cost a deliberate\n``reasoning_format`` once -- a client that means \"change one field\" wants\n``PATCH`` below, and should only PUT a payload it first GETs and merges.\n\n``priority`` saved here is the **standing default** a restart falls back to\n(D48); a tier this server session already remembers from an explicit load\nstill outranks it until the next restart or the next explicitly tiered load.",
+        "operationId": "put_settings_api_models__model_id__settings_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "title": "Payload",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Put Settings Api Models  Model Id  Settings Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Put Settings",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/models/{model_id}/test": {
+      "post": {
+        "description": "One canned request through the model, on an otherwise idle server (D36).\n\nA cold model is loaded small (one slot, the default context) and unloaded\nagain unless ``keep_loaded``. Refused with a 503 and ``retry_after_s`` while\nanything is serving, loading or benchmarking, and while another test runs.",
+        "operationId": "test_model_api_models__model_id__test_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_test_model_api_models__model_id__test_post"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Test Model Api Models  Model Id  Test Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Test Model",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/models/{model_id}/unload": {
+      "post": {
+        "description": "Stop the child serving this model. Open, except against a GPU lease (D55).\n\nLogged with the caller (D70): the peer address, the ``X-SF-Client`` label\nand what the model was serving at that moment. This route does not\ndrain -- requests in flight are cut -- and until D70 nothing recorded who\nhad asked.",
+        "operationId": "unload_model_api_models__model_id__unload_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Unload Model Api Models  Model Id  Unload Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Unload Model",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/openclaw-setup": {
+      "get": {
+        "description": "Everything needed to point OpenClaw at this server.\n\nThree blocks, not two: ``inference`` (the OpenAI-compatible env), ``mcp``\n(the stdio server registration) and ``companion_config`` (what ``sfctl``\nneeds locally).\n\n``next_steps`` rides along because the reader is often the agent itself:\nknowing the URL is not the same as knowing which of the merged tools to call\nfirst, and the answer has been stable since the catalog landed.",
+        "operationId": "openclaw_setup_api_openclaw_setup_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Openclaw Setup",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/restart/backend": {
+      "post": {
+        "description": "Restart every loaded model's engine process, keeping the API up.\n\nUsed after an engine update: running children keep the engine they were\nlaunched with, so a reload is what actually moves them onto the new build.\n\n``only_stale_engine=true`` restarts just the children that are *not* already\non the active build, which is what makes calling this after an activation\nidempotent -- the D50 case, where a double-clicked button reloaded every\nresident twice. Leave it false for \"recycle everything\", which is what a\nmisbehaving model needs.\n\nThe loop itself lives in :meth:`ModelManager.reload_resident`; this route\nused to carry its own copy, and the GUI carried a third with different\nfailure semantics. The response keeps ``restarted``/``failed``/``count``\nverbatim for the tray, and adds ``skipped`` and ``active_engine``.",
+        "operationId": "restart_backend_api_restart_backend_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_restart_backend_api_restart_backend_post"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Restart Backend Api Restart Backend Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Restart Backend",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/restart/server": {
+      "post": {
+        "description": "Restart the whole StudioForge process.\n\nPrefers the watchdog: a process cannot reliably restart itself, and the\nwatchdog is a separate always-on sidecar that exists precisely to outlive\nthis one. Without it, fall back to a detached respawn.",
+        "operationId": "restart_server_api_restart_server_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_restart_server_api_restart_server_post"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Restart Server Api Restart Server Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Restart Server",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/restart/status": {
+      "get": {
+        "description": "How the last restart attempt on *this* process went.\n\nExists because ``POST /restart/server`` must answer before it acts. When the\nrestart works this route is unreachable -- the process it belongs to is\ngone, and a fresh one reports ``never``. So a non-``never`` answer from a\nlive server is itself the diagnosis: the restart did not happen, and\n``detail`` says why.",
+        "operationId": "restart_status_api_restart_status_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Restart Status Api Restart Status Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Restart Status",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/settings/schema": {
+      "get": {
+        "description": "Every config key with its type, default, range, level and env override.\n\nRead-only metadata derived from the config model itself\n(:mod:`studioforge.settings_schema`); it carries defaults, never the\nrunning values, so it needs no more protection than the other ``GET /api``\nreads. The same body is committed as ``docs/contracts/settings-schema.json``.",
+        "operationId": "settings_schema_api_settings_schema_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Settings Schema Api Settings Schema Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Settings Schema",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/status": {
+      "get": {
+        "description": "Live server snapshot: GPUs, residents, queue, downloads, VRAM holders.\n\nTwo keys on every ``loaded[]`` row are worth naming because nothing else\nreports them per instance: ``priority`` is the tier that load was actually\nmade at (1 active chat, 2 dispatched agent, 3 background) -- the hard\nanswer, not the soft prediction ``GET /api/models`` gives for an unloaded\nmodel -- and ``speculative`` is what drafting resolved to, where ``null``\nmeans the launch has not decided yet and ``{\"type\": \"none\", \"reason\": ...}``\nmeans it was considered and declined.\n\n``busy.priority_hold`` alongside says whether a chat/agent load is\ncurrently holding worse-tier traffic off.\n\n``in_flight`` on each row lists the requests behind ``active_requests``,\noldest first, as ``{id, started_at, client}`` (D70, S6) -- a bounded\nwindow, never longer than the count -- and ``loaded_by_client`` is the\n``X-SF-Client`` label (else peer address) behind ``loaded_by``. A bench\nthat wants to wait for a two-second call and stand down for a\nforty-minute stream reads the first; \"who loaded that?\" reads the second.",
+        "operationId": "status_api_status_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Status Api Status Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Status",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/tenants": {
+      "get": {
+        "description": "Every known tenant: the operator's declarations merged with self-registrations.\n\nEach row carries ``kind`` (``module`` = an optional add-on this server may\nask to warm, ``tenant`` = anything else that leases cards here), ``family``\n(the ``holder_family`` its leases carry), ``registered`` and ``version``\n(from its own ``POST /api/tenants/register``), ``health`` (the last probe of\nits ``health_url``: ``healthy`` / ``unhealthy`` / ``unreachable`` /\n``unpolled``), its standing ``leases`` and the ``devices`` they cover. The\nURLs themselves travel only to an admin caller (D32 as ``is_admin_caller``);\neveryone else sees ``*_registered`` and the health endpoint's ``host:port``.",
+        "operationId": "list_tenants_api_tenants_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Tenants Api Tenants Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Tenants",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/tenants/register": {
+      "post": {
+        "description": "A tenant announces itself (D77). Re-sent at every boot; idempotent.\n\nSame gate as ``POST /api/leases`` (D32): this machine, the MCP PIN, or a\nkey. ``name`` is the registry key and should be the tenant's\n``holder_family`` (lower-case); a name the operator declared in\n``tenants.registry`` keeps its declared ``kind``/``family``/``notes`` and\ntakes the URLs sent here. Every URL must be loopback, a tailnet address or\na host in ``tenants.allowed_hosts`` (``400 tenant_url_refused`` otherwise);\n``health_url`` is then polled every ``tenants.health_interval_s``.\n``protocol`` may be sent and must be ``vt.1``. StudioForge never starts or\nstops the registrant (D79); registering says \"I exist, here is where to\nlook\", nothing more. The reply is the row as stored, URLs included.",
+        "operationId": "register_tenant_api_tenants_register_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_register_tenant_api_tenants_register_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Register Tenant Api Tenants Register Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Register Tenant",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/tenants/{name}": {
+      "delete": {
+        "description": "The tenant says goodbye. A row the operator declared stays, unregistered.",
+        "operationId": "deregister_tenant_api_tenants__name__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Deregister Tenant Api Tenants  Name  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Deregister Tenant",
+        "tags": [
+          "management"
+        ]
+      },
+      "get": {
+        "operationId": "get_tenant_api_tenants__name__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Tenant Api Tenants  Name  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Tenant",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/tenants/{name}/warm": {
+      "post": {
+        "description": "Ask a ``module`` to warm up, by relaying one POST to its ``warm_url``.\n\nThe module decides what that means (load its models, open its session) and\nanswers; this returns its status and a bounded summary of its JSON body.\nA tenant that is not a module, or registered no ``warm_url``, is a 400\n``tenant_not_warmable``; a module that does not answer 2xx is a 502\n``tenant_unreachable``. Nothing is launched: a module that is not running\nis unreachable, and starting it is the operator's (D79).",
+        "operationId": "warm_tenant_api_tenants__name__warm_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Warm Tenant Api Tenants  Name  Warm Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Warm Tenant",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/update": {
+      "get": {
+        "description": "Current vs latest version. ``check=true`` queries GitHub.",
+        "operationId": "update_status_api_update_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "check",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Check",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Update Status Api Update Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Status",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/update/install": {
+      "post": {
+        "description": "Install a release, then health-check and auto-rollback on failure.",
+        "operationId": "update_install_api_update_install_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_update_install_api_update_install_post"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Update Install Api Update Install Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Install",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/update/releases": {
+      "get": {
+        "operationId": "update_releases_api_update_releases_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Update Releases Api Update Releases Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Releases",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/update/rollback": {
+      "post": {
+        "operationId": "update_rollback_api_update_rollback_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_update_rollback_api_update_rollback_post"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Update Rollback Api Update Rollback Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Rollback",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/v0/chat/completions": {
+      "post": {
+        "description": "LM Studio's ``/api/v0`` twin of ``POST /v1/chat/completions``: an\nidentical body, the additive ``ttl`` and ``priority`` fields included; see\nthat operation's description.",
+        "operationId": "v0_chat_completions_api_v0_chat_completions_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response V0 Chat Completions Api V0 Chat Completions Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "V0 Chat Completions",
+        "tags": [
+          "openai"
+        ]
+      }
+    },
+    "/api/v0/completions": {
+      "post": {
+        "description": "LM Studio's ``/api/v0`` twin of ``POST /v1/completions``: an identical\nbody, the additive ``ttl`` and ``priority`` fields included; see that\noperation's description.",
+        "operationId": "v0_completions_api_v0_completions_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response V0 Completions Api V0 Completions Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "V0 Completions",
+        "tags": [
+          "openai"
+        ]
+      }
+    },
+    "/api/v0/embeddings": {
+      "post": {
+        "operationId": "v0_embeddings_api_v0_embeddings_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response V0 Embeddings Api V0 Embeddings Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "V0 Embeddings",
+        "tags": [
+          "openai"
+        ]
+      }
+    },
+    "/api/v0/models": {
+      "get": {
+        "description": "LM Studio's model list, including per-model load state.",
+        "operationId": "v0_list_models_api_v0_models_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "V0 List Models",
+        "tags": [
+          "openai"
+        ]
+      }
+    },
+    "/api/v0/models/{model_id}": {
+      "get": {
+        "operationId": "v0_retrieve_model_api_v0_models__model_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "V0 Retrieve Model",
+        "tags": [
+          "openai"
+        ]
+      }
+    },
+    "/api/version": {
+      "get": {
+        "operationId": "version_api_version_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Version Api Version Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Version",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/virtual-models": {
+      "post": {
+        "description": "A named base + adapters + preset combination, selectable through the\nOpenAI API -- the Modelfile/persona experience.\n\nThe OpenAI protocol has no LoRA, system-prompt or preset parameter, so a\nvirtual model id is how a client picks all of them: by model name, with no\nclient changes. ``system_prompt`` and the sampler defaults are applied per\nrequest by the gateway, so any number of such presets over one base share\na single llama-server instance. ``ctx_size``/``kv_cache_type`` are\nlaunch-time overrides: they are stored as the virtual model's settings\n(the planner honours those) and cost the model its own instance.",
+        "operationId": "create_virtual_model_api_virtual_models_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "title": "Payload",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Create Virtual Model Api Virtual Models Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Virtual Model",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/virtual-models/{model_id}": {
+      "delete": {
+        "operationId": "delete_virtual_model_api_virtual_models__model_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Delete Virtual Model Api Virtual Models  Model Id  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Virtual Model",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/vram/holders": {
+      "get": {
+        "description": "Every process holding VRAM, with who launched it and whether it is safe to kill.\n\nAnswers the question ``/api/gpus`` cannot: \"10 GiB is gone and nothing is\nloaded -- who has it?\". Each holder carries ``classification``:\n\n* ``ours`` -- a child of this server. Unload the model.\n* ``child-of-live-process`` -- someone else's running llama-server (a test\n  run, a second instance). Reported, never killed automatically; the parent\n  is named so you can go and stop it.\n* ``orphan`` -- our engine binary with a dead parent. Pure leak; reclaim it.\n* ``other-instance`` -- a ``llama-server`` from a different install, named\n  by its own ``--alias``/``--port`` in ``detail``. Never killed from here.\n* ``foreign`` -- not one of our binaries at all (browser, compositor,\n  ComfyUI).\n\nDesktop noise is summarised in ``desktop_processes_count`` instead of being\nlisted. ``used_bytes_source`` says where each byte figure came from: NVML\ncannot measure per-process VRAM on Windows, so ``pdh`` numbers are\nper-process totals across adapters and must not be summed across GPUs.\n\n``per_gpu_bytes`` splits that total per CUDA ordinal (D39) --\n``{\"0\": 16660000000, \"1\": 15550000000}`` -- and ``gpu_indices`` lists only\nthe devices holding at least 256 MiB. ``gpu_indices_source`` says which\nquestion was answered: ``pdh`` means \"this is where the memory is\",\n``nvml-context`` means \"these are the devices the process has a CUDA\ncontext on\", which llama.cpp opens on every visible card.",
+        "operationId": "vram_holders_api_vram_holders_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Vram Holders Api Vram Holders Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Vram Holders",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/api/vram/reclaim": {
+      "post": {
+        "description": "Kill orphaned llama-server processes and free their VRAM.\n\nOnly ``orphan`` holders are touched: our own engine binary, under our own\nengines directory, with a parent that no longer exists. Nothing else on the\nbox launches binaries from there, so such a process cannot belong to anyone\nelse and nothing is waiting on it.\n\nA ``child-of-live-process`` is deliberately never killed here, however much\nVRAM it holds -- it belongs to something that is still running, and taking\nits model away is not recovery. Use ``dry_run: true`` to see what would go.",
+        "operationId": "vram_reclaim_api_vram_reclaim_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_vram_reclaim_api_vram_reclaim_post"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Vram Reclaim Api Vram Reclaim Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Vram Reclaim",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/health": {
+      "get": {
+        "description": "Liveness by default; genuine generation when ``deep=true``.\n\nThe shallow answer stays the default because the watchdog and load\nbalancers poll it constantly, and it must stay free. But shallow is\nalso exactly the check that lied for hours during the incident behind\nthe deep mode -- a 200 here proves this process is alive and nothing\nmore. ``?deep=true`` is the one that proves models generate.",
+        "operationId": "health_health_get",
+        "parameters": [
+          {
+            "description": "Run a real streamed completion against every loaded model instead of only reporting that this process is up.",
+            "in": "query",
+            "name": "deep",
+            "required": false,
+            "schema": {
+              "default": false,
+              "description": "Run a real streamed completion against every loaded model instead of only reporting that this process is up.",
+              "title": "Deep",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "timeout_s",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "exclusiveMinimum": 0,
+                  "maximum": 300,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Timeout S"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Health Health Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Health",
+        "tags": [
+          "health"
+        ]
+      }
+    },
+    "/v1/chat/completions": {
+      "post": {
+        "description": "Chat completions, with every check done *before* the first byte.\n\nOrdering matters. Resolution and validation run against the registry\nrecord, which needs no load, so a bad request still gets a real 4xx status\ninstead of an error frame buried in a 200 SSE stream -- clients handle the\nformer and routinely mishandle the latter. Only the load itself is deferred\ninto the stream, where it is covered by keep-alives.\n\nTwo additive body fields are consumed here and never forwarded upstream:\nLM Studio's ``ttl`` (seconds of idle life for a JIT-loaded model), and\n``priority`` -- this request's load tier (D46's vocabulary): ``1`` the\nmodel a person is actively chatting with, ``2`` a dispatched agent, ``3``\n(or omitted) background. Anything else is a 400 naming the parameter, so a\ntypo cannot quietly demote a chat turn.\n\nA request's tier gates **its own admission** -- a tier-1 turn is let\nthrough a hold that would 503 a background turn for the same model, and\nadmission reads the requested tier verbatim -- and it tiers the\njust-in-time load it triggers, so that load jumps the queue and may\ndisplace idle worse-tier models.\n\nWhat it cannot do is **demote**. The load runs at the better of the\nrequested tier and the model's standing one (the memo of its last explicit\nload, else ``settings.priority``), so a background turn naming\n``priority: 3`` against the model a person is chatting with loads it at the\nchat tier, not below it. Nor does it re-tier a model that is already\nrunning: a bot naming ``priority: 1`` cannot promote the instance a\nperson's chat is sharing, and the tier a resident carries stays what\nloaded it. The standing default lives in the model's ``settings.priority``\n(D48); this field is per-turn and remembers nothing.\n\n**Break for old clients (D48).** Before this field existed an unknown\n``priority`` in the body was forwarded to llama-server and ignored. It is\nnow validated and consumed: anything outside 1, 2 and 3 is a 400 naming the\nparameter, ``true`` included. A client that was sending some other\n``priority`` -- a float, a string, a 0-based scale -- stops working loudly\nrather than being silently demoted to background.",
+        "operationId": "chat_completions_v1_chat_completions_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Chat Completions V1 Chat Completions Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Chat Completions",
+        "tags": [
+          "openai"
+        ]
+      }
+    },
+    "/v1/completions": {
+      "post": {
+        "description": "Legacy text completions -- the same JIT loading as chat completions.\n\nTakes the same two additive body fields, consumed here and never forwarded\nupstream: ``ttl`` (idle seconds for a JIT-loaded model) and ``priority``,\nthis request's load tier -- ``1`` an active chat, ``2`` a dispatched agent,\n``3`` (or omitted) background. Anything else is a 400 naming the parameter.\nThe tier gates this request's own admission (read verbatim) and tiers the\nload it triggers, but it cannot demote: the load runs at the better of this\ntier and the model's standing one (memo, else ``settings.priority``). It\nnever re-tiers a model that is already running.",
+        "operationId": "completions_v1_completions_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Completions V1 Completions Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Completions",
+        "tags": [
+          "openai"
+        ]
+      }
+    },
+    "/v1/embeddings": {
+      "post": {
+        "description": "Embeddings. ``ttl`` and ``priority`` are **not** consumed here --\nchat/completions only; an unknown field is forwarded to the engine, which\nignores it -- so give an embedding model a standing tier through its\nsettings instead.",
+        "operationId": "embeddings_v1_embeddings_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Embeddings V1 Embeddings Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Embeddings",
+        "tags": [
+          "openai"
+        ]
+      }
+    },
+    "/v1/models": {
+      "get": {
+        "description": "Every downloaded model, loaded or not -- LM Studio parity.",
+        "operationId": "list_models_v1_models_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Models",
+        "tags": [
+          "openai"
+        ]
+      }
+    },
+    "/v1/models/{model_id}": {
+      "get": {
+        "operationId": "retrieve_model_v1_models__model_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Retrieve Model",
+        "tags": [
+          "openai"
+        ]
+      }
+    },
+    "/v1/rerank": {
+      "post": {
+        "description": "Rerank. ``ttl`` and ``priority`` are **not** consumed here --\nchat/completions only; an unknown field is forwarded to the engine, which\nignores it -- so set a standing tier in the model's settings instead.",
+        "operationId": "rerank_v1_rerank_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Rerank V1 Rerank Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Rerank",
+        "tags": [
+          "openai"
+        ]
+      }
+    },
+    "/v1/tokenize": {
+      "post": {
+        "description": "Tokenize. ``ttl`` and ``priority`` are **not** consumed here --\nchat/completions only; an unknown field is forwarded to the engine, which\nignores it -- so set a standing tier in the model's settings instead.",
+        "operationId": "tokenize_v1_tokenize_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Tokenize V1 Tokenize Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Tokenize",
+        "tags": [
+          "openai"
+        ]
+      }
+    }
+  }
+}

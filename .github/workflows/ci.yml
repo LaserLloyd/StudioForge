@@ -85,6 +85,14 @@ jobs:
       - name: Format (ruff format --check)
         run: uv run --python .venv ruff format --check src/ tests/ packages/
 
+      - name: Generated contracts and reference docs are current
+        # docs/contracts/*.json (OpenAPI, MCP tools, errors, settings, capabilities) and
+        # docs/reference/*.md are generated from code. A route, tool, error code or
+        # setting changed without regenerating fails here with the command that fixes it.
+        env:
+          SF_GPU_PROBE: "null"
+        run: uv run --python .venv python scripts/gen_docs.py --check
+
       - name: Unit tests
         env:
           SF_GPU_PROBE: "null"
