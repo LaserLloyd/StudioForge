@@ -132,6 +132,9 @@ PY
     # legacy server.api_key all satisfy it). The answer goes to a file because
     # the first CLI call on a fresh volume also logs migrations to stdout.
     FLAG=/tmp/sf-has-admin-credential
+    # A restarted container keeps /tmp (unless it is a tmpfs): never let a "no"
+    # from an earlier boot decide this one if the check below fails.
+    rm -f "$FLAG"
     python - "$FLAG" <<'PY' || log "WARNING: could not evaluate the credential posture; assuming one exists"
 import sys
 
