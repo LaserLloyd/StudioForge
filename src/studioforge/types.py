@@ -300,6 +300,12 @@ class ModelSettings(BaseModel):
 
     # --- Tier 3: expert escape hatch -----------------------------------
     extra_flags: str = ""
+    #: Off-by-default opt-in to a partial CPU offload (``--n-cpu-moe`` /
+    #: ``--no-kv-offload`` in ``extra_flags``). Honoured ONLY while
+    #: ``engine.strict_gpu`` is false; with the shipped ``strict_gpu: true``
+    #: this flag does nothing and the offload flags stay refused. See
+    #: ``docs/ENGINES.md``. ``-ngl 999`` and ``--fit off`` are always passed.
+    allow_partial_cpu_offload: bool = False
 
     # --- adapters ------------------------------------------------------
     adapters: list[AdapterAttachment] = Field(default_factory=list)
@@ -701,6 +707,20 @@ class GpuInfo(BaseModel):
     utilization_pct: float | None = None
     temperature_c: float | None = None
     compute_capability: tuple[int, int] | None = None
+    #: Which GPU API reported this device: ``"cuda"``, ``"rocm"``, ``"vulkan"``
+    #: or ``"metal"`` (``None`` for a fake/legacy record, treated as "infer
+    #: from the name"). The engine manager picks its archive from this, not
+    #: from the product name.
+    backend: str | None = None
+    #: ``"nvidia"``, ``"amd"``, ``"intel"``, ``"apple"`` or ``None`` (unknown).
+    vendor: str | None = None
+    #: AMD ISA target as the driver names it (``gfx1100``), never guessed from
+    #: the marketing name. Feeds ``-DAMDGPU_TARGETS`` for a source build.
+    gfx_target: str | None = None
+    #: True when the device has no memory of its own and draws from system RAM
+    #: (APUs such as Strix Halo, Apple silicon). The budget formula is the
+    #: driver-reported figure with no bonus; see ``core/gpu.py``.
+    unified_memory: bool = False
 
     @property
     def cc_str(self) -> str:
@@ -1224,6 +1244,23 @@ class EngineInfo(BaseModel):
     installed_at: float = Field(default_factory=time.time)
     flags: list[str] = Field(default_factory=list)
     build_log: Path | None = None
+    #: GPU API this build targets: ``cuda``, ``rocm``, ``vulkan``, ``metal`` or
+    #: ``""`` when it cannot be told (a hand-placed directory with no ggml
+    #: backend library).
+    backend: str = ""
+    #: Archive checksum verdict. ``True``: the downloaded archive matched a
+    #: published SHA-256. ``False``: no checksum was published (or the build is
+    #: a local source build) so the archive was installed unverified, with a
+    #: warning. ``None``: installed before verification existed (legacy).
+    verified: bool | None = None
+    #: Where the expected digest came from (``github-digest``,
+    #: ``sha256-sidecar``, ``sha256sums``) or why none was available.
+    verified_by: str = ""
+    #: Smoke-test outcome: ``passed``, ``partial`` (``--version`` only, no
+    #: model for a micro-load), ``failed`` or ``not_run``.
+    smoke_result: str = "not_run"
+    #: Warnings recorded at install time (e.g. "installed WITHOUT checksum").
+    warnings: list[str] = Field(default_factory=list)
 
 
 class GpuLease(BaseModel):

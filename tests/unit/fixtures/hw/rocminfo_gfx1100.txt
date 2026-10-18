@@ -1,0 +1,50 @@
+ROCk module version 6.8.5 is loaded
+=====================
+HSA System Attributes
+=====================
+Runtime Version:         1.14
+Runtime Ext Version:     1.6
+System Timestamp Freq.:  1000.000000MHz
+==========
+HSA Agents
+==========
+*******
+Agent 1
+*******
+  Name:                    AMD Ryzen 9 7950X 16-Core Processor
+  Uuid:                    CPU-XX
+  Marketing Name:          AMD Ryzen 9 7950X 16-Core Processor
+  Vendor Name:             CPU
+  Feature:                 None specified
+  Device Type:             CPU
+  Pool Info:
+    Pool 1
+      Segment:                 GLOBAL; FLAGS: COARSE GRAINED
+      Size:                    65482076(0x3e7e8dc) KB
+      Allocatable:             TRUE
+*******
+Agent 2
+*******
+  Name:                    gfx1100
+  Uuid:                    GPU-0123456789abcdef
+  Marketing Name:          AMD Radeon RX 7900 XTX
+  Vendor Name:             AMD
+  Feature:                 KERNEL_DISPATCH
+  Device Type:             GPU
+  Pool Info:
+    Pool 1
+      Segment:                 GLOBAL; FLAGS: COARSE GRAINED
+      Size:                    25149440(0x17fc000) KB
+      Allocatable:             TRUE
+    Pool 2
+      Segment:                 GLOBAL; FLAGS: EXTENDED FINE GRAINED
+      Size:                    25149440(0x17fc000) KB
+      Allocatable:             TRUE
+    Pool 3
+      Segment:                 GROUP
+      Size:                    64(0x40) KB
+      Allocatable:             FALSE
+  ISA Info:
+    ISA 1
+      Name:                    amdgcn-amd-amdhsa--gfx1100
+*** Done ***

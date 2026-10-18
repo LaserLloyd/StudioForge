@@ -1,0 +1,22 @@
+{
+  "card0": {
+    "VRAM Total Memory (B)": "25753026560",
+    "VRAM Total Used Memory (B)": "1253376000",
+    "Card Series": "AMD Radeon RX 7900 XTX",
+    "Card Model": "0x744c",
+    "Card Vendor": "Advanced Micro Devices, Inc. [AMD/ATI]",
+    "Card SKU": "NAVI31",
+    "GFX Version": "gfx1100"
+  },
+  "card1": {
+    "VRAM Total Memory (B)": "17163091968",
+    "VRAM Total Used Memory (B)": "0",
+    "Card Series": "AMD Radeon RX 7800 XT",
+    "Card Model": "0x747e",
+    "Card Vendor": "Advanced Micro Devices, Inc. [AMD/ATI]",
+    "Card SKU": "NAVI32"
+  },
+  "system": {
+    "Driver version": "6.8.5"
+  }
+}

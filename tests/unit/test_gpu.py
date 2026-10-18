@@ -372,7 +372,7 @@ class TestGetProbe:
 
     def test_unknown_backend_rejected(self) -> None:
         with pytest.raises(ConfigError):
-            get_probe(force="rocm")
+            get_probe(force="directml")
 
     def test_bad_fake_spec_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SF_FAKE_GPUS", "not json")

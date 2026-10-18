@@ -2,10 +2,14 @@
 
 The planner and the engine selector both need GPU facts (free VRAM, compute
 capability, driver's CUDA level). Everything flows through :class:`GpuProbe`
-so that a ROCm/Vulkan backend can be added later and so tests never touch
-real hardware. CUDA/NVML (:class:`NvmlGpuProbe`) is the only real
-implementation today; :class:`NullGpuProbe` stands in on GPU-less boxes and
-:class:`FakeGpuProbe` serves tests and synthetic-hardware integration runs.
+so that tests never touch real hardware. Real implementations:
+CUDA/NVML (:class:`NvmlGpuProbe`), ROCm (:class:`RocmGpuProbe`, via amd-smi /
+rocm-smi / rocminfo), Vulkan (:class:`VulkanGpuProbe`, via vulkaninfo) and
+Metal (:class:`MetalGpuProbe`, via system_profiler). :class:`AutoGpuProbe`
+tries them in that order and is the default (``gpu.backend: auto``);
+:class:`NullGpuProbe` stands in on GPU-less boxes and :class:`FakeGpuProbe`
+serves tests and synthetic-hardware integration runs. The vendor-tool output
+parsers live in :mod:`studioforge.core.hw_parsers`.
 
 Design rules:
 
@@ -22,13 +26,31 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import platform
+import shutil
+import subprocess
 import threading
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 import psutil
 
+from studioforge.core.hw_parsers import (
+    RocmAgent,
+    gpus_from_rocminfo,
+    gpus_from_vulkan,
+    merge_amd_smi,
+    parse_amd_smi_metric,
+    parse_amd_smi_static,
+    parse_rocm_smi_json,
+    parse_rocminfo,
+    parse_system_profiler_displays,
+    parse_vulkaninfo_json,
+    parse_vulkaninfo_text,
+)
 from studioforge.errors import ConfigError
 from studioforge.logging import get_logger
 from studioforge.types import GpuInfo, VramProcess
@@ -65,7 +87,9 @@ class GpuProbe(Protocol):
 
     @property
     def backend(self) -> str:
-        """Backend identifier: ``"cuda"``, ``"null"``, or ``"fake"``."""
+        """Backend identifier: ``"cuda"``, ``"rocm"``, ``"vulkan"``, ``"metal"``,
+        ``"null"``, or ``"fake"`` (an :class:`AutoGpuProbe` reports the one it
+        selected)."""
         ...
 
     def available(self) -> bool:
@@ -122,6 +146,9 @@ class NvmlGpuProbe:
         self._handles: list[Any] = []
         self._initialized = False
         self._failed = False
+        #: Why NVML is unusable (import/init failure or zero devices); ``None``
+        #: while it works. Read by :class:`AutoGpuProbe` to explain a skip.
+        self.failure_reason: str | None = None
 
     @property
     def backend(self) -> str:
@@ -140,6 +167,7 @@ class NvmlGpuProbe:
                 nvml.nvmlInit()
             except Exception as exc:
                 self._failed = True
+                self.failure_reason = f"NVML unavailable: {exc}"
                 log.warning(
                     "nvml_unavailable",
                     error=str(exc),
@@ -153,6 +181,9 @@ class NvmlGpuProbe:
             except Exception as exc:
                 log.warning("nvml_enumeration_failed", error=str(exc))
                 self._handles = []
+                self.failure_reason = f"NVML could not enumerate devices: {exc}"
+            if not self._handles and self.failure_reason is None:
+                self.failure_reason = "NVML initialised but reported 0 devices"
             self._initialized = True
             return True
 
@@ -167,6 +198,7 @@ class NvmlGpuProbe:
             self._handles = []
             self._initialized = False
             self._failed = False
+            self.failure_reason = None
 
     # -- queries --------------------------------------------------------
 
@@ -324,6 +356,8 @@ class NvmlGpuProbe:
             utilization_pct=utilization,
             temperature_c=temperature,
             compute_capability=capability,
+            backend="cuda",
+            vendor="nvidia",
         )
 
 
@@ -511,50 +545,532 @@ def _fake_probe_from_env() -> FakeGpuProbe:
 
 
 # ---------------------------------------------------------------------------
+# Command-line probes: ROCm, Vulkan, Metal
+# ---------------------------------------------------------------------------
+#
+# Budget formula (the same for every backend; there is deliberately NO
+# heuristic bonus anywhere):
+#
+#   total_bytes = what the driver / tool reports as this device's memory
+#   free_bytes  = what the driver / tool reports as still available
+#   budget      = free_bytes   (the planner then applies its own headroom)
+#
+# Unified-memory systems (``GpuInfo.unified_memory``: Strix Halo and other
+# APUs, Apple silicon) are NOT given extra memory for the system RAM they
+# could in principle borrow. They use the same formula on the figure the
+# driver reports for the device:
+#
+# * ROCm APU: amd-smi / rocm-smi ``VRAM`` total (the BIOS/driver carve-out),
+#   free = total - used. GTT is not added.
+# * Vulkan integrated GPU: the largest DEVICE_LOCAL heap, free = its
+#   ``VK_EXT_memory_budget`` budget (capped at the heap size).
+# * Metal (Apple silicon): system_profiler reports no VRAM; the pool is the
+#   machine's physical memory (psutil) and free is the OS's "available"
+#   memory. Metal itself caps a process below physical RAM (its recommended
+#   working set), so on Metal ``free_bytes`` is an UPPER bound and the
+#   planner's headroom fraction is what absorbs the difference.
+#
+# Raising the number for an APU (e.g. counting GTT) is a user decision made
+# in the BIOS / driver, not something this module guesses.
+
+CommandRunner = Callable[[Sequence[str], float], "tuple[int, str]"]
+
+
+def run_command(argv: Sequence[str], timeout: float = 20.0) -> tuple[int, str]:
+    """Run a read-only query tool; ``(returncode, stdout)``, never raises.
+
+    A missing binary is ``(127, "")``, a timeout ``(124, "")``. Injected into
+    every probe so tests never spawn anything.
+    """
+    try:
+        done = subprocess.run(  # noqa: S603 - fixed argv, no shell, read-only query tools
+            list(argv),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except FileNotFoundError:
+        return 127, ""
+    except subprocess.TimeoutExpired:
+        return 124, ""
+    except OSError:
+        return 126, ""
+    return done.returncode, done.stdout or ""
+
+
+class _ProbeFailure(Exception):
+    """A backend that cannot list GPUs, with the reason to show the operator."""
+
+
+class _CliProbe:
+    """Shared plumbing for probes that shell out to a vendor tool.
+
+    Subclasses implement :meth:`_query` returning ``(gpus, driver)`` or
+    raising :class:`_ProbeFailure` with a reason. The result is cached for
+    ``ttl_s`` seconds (the tools take 50-500 ms and the planner polls), and a
+    failure is remembered in :attr:`failure_reason` so the auto-selector can
+    say why a backend was skipped.
+    """
+
+    _BACKEND = "?"
+
+    def __init__(
+        self,
+        *,
+        runner: CommandRunner | None = None,
+        which: Callable[[str], str | None] | None = None,
+        ttl_s: float = 1.0,
+        clock: Callable[[], float] | None = None,
+    ) -> None:
+        self._run: CommandRunner = runner or run_command
+        self._which = which or shutil.which
+        self._ttl = ttl_s
+        self._clock = clock or time.monotonic
+        self._lock = threading.Lock()
+        self._gpus: list[GpuInfo] = []
+        self._driver: str | None = None
+        self._stamp: float | None = None
+        self.failure_reason: str | None = None
+        #: Human-readable caveats from the last query (e.g. "free memory unknown").
+        self.notes: list[str] = []
+        self.source: str | None = None
+
+    @property
+    def backend(self) -> str:
+        return self._BACKEND
+
+    # subclasses -------------------------------------------------------
+    def _query(self) -> tuple[list[GpuInfo], str | None]:  # pragma: no cover - abstract
+        raise NotImplementedError
+
+    # shared -----------------------------------------------------------
+    def _refresh(self) -> list[GpuInfo]:
+        with self._lock:
+            now = self._clock()
+            if self._stamp is not None and now - self._stamp < self._ttl:
+                return self._gpus
+            try:
+                gpus, driver = self._query()
+                self.failure_reason = None
+            except _ProbeFailure as exc:
+                gpus, driver = [], None
+                self.failure_reason = str(exc)
+                log.debug("gpu_probe_failed", backend=self._BACKEND, reason=str(exc))
+            except Exception as exc:  # noqa: BLE001 - a probe must never raise
+                gpus, driver = [], None
+                self.failure_reason = f"unexpected error: {exc}"
+                log.warning("gpu_probe_error", backend=self._BACKEND, error=str(exc))
+            self._gpus, self._driver, self._stamp = gpus, driver, now
+            return self._gpus
+
+    def available(self) -> bool:
+        return bool(self._refresh())
+
+    def list_gpus(self) -> list[GpuInfo]:
+        return [g.model_copy(deep=True) for g in self._refresh()]
+
+    def get_gpu(self, index: int) -> GpuInfo | None:
+        return next((g for g in self.list_gpus() if g.index == index), None)
+
+    def driver_version(self) -> str | None:
+        self._refresh()
+        return self._driver
+
+    def cuda_driver_version(self) -> tuple[int, int] | None:
+        return None
+
+    def compute_processes(self) -> list[VramProcess]:
+        # Per-process VRAM attribution needs vendor-specific tools; callers
+        # treat an empty list as "unknown" (see the Protocol docstring).
+        return []
+
+    def shutdown(self) -> None:
+        with self._lock:
+            self._gpus, self._driver, self._stamp = [], None, None
+            self.failure_reason = None
+
+    def _text(self, argv: Sequence[str], *, timeout: float = 20.0) -> str | None:
+        """stdout of ``argv`` when the tool exists and exits 0, else ``None``."""
+        if self._which(argv[0]) is None:
+            return None
+        code, out = self._run(argv, timeout)
+        return out if code == 0 and out.strip() else None
+
+
+class RocmGpuProbe(_CliProbe):
+    """AMD GPUs through ``amd-smi``, ``rocm-smi`` or (identity only) ``rocminfo``.
+
+    Tried in this order, first usable wins: ``amd-smi static|metric --json``
+    (current ROCm), ``rocm-smi --showmeminfo vram --showproductname --json``
+    (older ROCm), ``rocminfo`` (no live counters: names, gfx target and total
+    memory only, free is reported equal to total and a note says so). The gfx
+    target always comes from the driver (``target_graphics_version`` /
+    ``GFX Version`` / the rocminfo agent name), never from the marketing name.
+    """
+
+    _BACKEND = "rocm"
+
+    def _query(self) -> tuple[list[GpuInfo], str | None]:
+        gpus: list[GpuInfo] = []
+        driver: str | None = None
+        self.notes = []
+        self.source = None
+
+        static_text = self._text(["amd-smi", "static", "--json"])
+        if static_text is not None:
+            static = parse_amd_smi_static(static_text)
+            if static:
+                metric_text = self._text(["amd-smi", "metric", "--json"], timeout=30.0)
+                metric = parse_amd_smi_metric(metric_text) if metric_text else {}
+                if not metric:
+                    self.notes.append(
+                        "amd-smi metric unavailable: free VRAM assumed equal to total"
+                    )
+                gpus, driver = merge_amd_smi(static, metric)
+                self.source = "amd-smi"
+        if not gpus:
+            smi_text = self._text(
+                ["rocm-smi", "--showmeminfo", "vram", "--showproductname", "--json"]
+            )
+            if smi_text is not None:
+                parsed = parse_rocm_smi_json(smi_text)
+                gpus, driver = parsed.gpus, parsed.driver
+                if gpus:
+                    self.source = "rocm-smi"
+        agents: list[RocmAgent] = []
+        if not gpus or any(g.gfx_target is None for g in gpus):
+            info_text = self._text(["rocminfo"])
+            agents = parse_rocminfo(info_text) if info_text else []
+        if not gpus and agents:
+            gpus = gpus_from_rocminfo(agents)
+            self.source = "rocminfo"
+            self.notes.append("rocminfo has no live counters: free VRAM is reported equal to total")
+        elif agents:
+            for gpu, agent in zip(gpus, agents, strict=False):
+                if gpu.gfx_target is None:
+                    gpu.gfx_target = agent.gfx_target
+        if not gpus:
+            tools = [t for t in ("amd-smi", "rocm-smi", "rocminfo") if self._which(t)]
+            raise _ProbeFailure(
+                "no AMD GPU reported: "
+                + (
+                    f"{', '.join(tools)} found but listed no devices"
+                    if tools
+                    else "none of amd-smi, rocm-smi, rocminfo is installed"
+                )
+            )
+        return gpus, driver
+
+
+class VulkanGpuProbe(_CliProbe):
+    """Any Vulkan GPU, through ``vulkaninfo``.
+
+    ``vulkaninfo --summary`` names the devices; the memory heaps only appear
+    in the full ``vulkaninfo`` output, so both are read. If the full output is
+    unusable ``vulkaninfo --json`` is tried for a single device. Software
+    rasterisers (llvmpipe) are dropped: they are CPU inference by another
+    name, which STRICT_GPU forbids. Device order follows ``vulkaninfo``;
+    llama.cpp's ``Vulkan<N>`` numbering is checked against
+    ``llama-server --list-devices`` by the engine manager, not assumed here.
+    """
+
+    _BACKEND = "vulkan"
+
+    def _query(self) -> tuple[list[GpuInfo], str | None]:
+        self.notes = []
+        summary = self._text(["vulkaninfo", "--summary"])
+        if summary is None:
+            raise _ProbeFailure(
+                "vulkaninfo is not installed or failed (install the Vulkan runtime tools)"
+            )
+        devices = parse_vulkaninfo_text(summary)
+        full = self._text(["vulkaninfo"], timeout=60.0)
+        if full:
+            by_index = {d.index: d for d in parse_vulkaninfo_text(full)}
+            for device in devices:
+                other = by_index.get(device.index)
+                if other is not None and other.heaps:
+                    device.heaps = other.heaps
+        if devices and not any(d.heaps for d in devices):
+            blob = self._text(["vulkaninfo", "--json"], timeout=60.0)
+            parsed = parse_vulkaninfo_json(blob) if blob else []
+            if parsed and len(devices) == 1:
+                devices[0].heaps = parsed[0].heaps
+        gpus, notes = gpus_from_vulkan(devices)
+        self.notes.extend(notes)
+        if not gpus:
+            raise _ProbeFailure(
+                "vulkaninfo listed no usable GPU" + (f" ({'; '.join(notes)})" if notes else "")
+            )
+        self.source = "vulkaninfo"
+        driver = next((d.driver_info for d in devices if d.driver_info), None)
+        return gpus, driver
+
+
+def _physical_memory() -> tuple[int, int]:
+    vm = psutil.virtual_memory()
+    return int(vm.total), int(vm.available)
+
+
+class MetalGpuProbe(_CliProbe):
+    """Apple GPUs through ``system_profiler SPDisplaysDataType -json`` (macOS only)."""
+
+    _BACKEND = "metal"
+
+    def __init__(
+        self,
+        *,
+        system: Callable[[], str] | None = None,
+        memory: Callable[[], tuple[int, int]] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self._system = system or platform.system
+        #: ``() -> (total_bytes, available_bytes)`` of physical memory.
+        self._memory = memory or _physical_memory
+
+    def _query(self) -> tuple[list[GpuInfo], str | None]:
+        self.notes = []
+        if self._system() != "Darwin":
+            raise _ProbeFailure("not macOS: the Metal backend only exists on Apple platforms")
+        text = self._text(["system_profiler", "SPDisplaysDataType", "-json"], timeout=30.0)
+        if text is None:
+            raise _ProbeFailure("system_profiler SPDisplaysDataType failed")
+        total, available = self._memory()
+        gpus = parse_system_profiler_displays(text, memory_bytes=total, available_bytes=available)
+        if not gpus:
+            raise _ProbeFailure("system_profiler listed no GPU")
+        if any(g.unified_memory for g in gpus):
+            self.notes.append(
+                "unified memory: pool is physical RAM; Metal's per-process working-set cap "
+                "is lower, so free VRAM is an upper bound"
+            )
+        self.source = "system_profiler"
+        return gpus, None
+
+
+# ---------------------------------------------------------------------------
+# Auto selection
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ProbeAttempt:
+    """One backend the auto-selector tried, and what came of it."""
+
+    backend: str
+    ok: bool
+    reason: str = ""
+    gpu_count: int = 0
+
+
+class AutoGpuProbe:
+    """Tries NVML -> ROCm -> Vulkan -> Metal; the first that lists a GPU wins.
+
+    Order matters and is deliberate: an NVIDIA box with a working driver always
+    resolves to NVML (identical to the pre-``auto`` behaviour, with real
+    per-process VRAM and a CUDA driver version); Vulkan is only reached when
+    no vendor-native API lists anything, so an NVIDIA or AMD card is never
+    driven through Vulkan merely because the Vulkan runtime is installed.
+    One backend per process: a box with an NVIDIA and an AMD card uses the
+    first one that answers.
+
+    Resolution is lazy and sticky until :meth:`shutdown`. :attr:`attempts`
+    records every backend tried and why the failures failed, which is what
+    ``/api/gpus`` and the setup wizard should show.
+    """
+
+    def __init__(self, candidates: Sequence[GpuProbe] | None = None) -> None:
+        self._candidates: list[GpuProbe] = (
+            list(candidates)
+            if candidates is not None
+            else [NvmlGpuProbe(), RocmGpuProbe(), VulkanGpuProbe(), MetalGpuProbe()]
+        )
+        self._lock = threading.Lock()
+        self._selected: GpuProbe | None = None
+        self._resolved = False
+        self.attempts: list[ProbeAttempt] = []
+
+    def _resolve(self) -> GpuProbe | None:
+        with self._lock:
+            if self._resolved:
+                return self._selected
+            attempts: list[ProbeAttempt] = []
+            selected: GpuProbe | None = None
+            for probe in self._candidates:
+                reason = ""
+                try:
+                    count = len(probe.list_gpus())
+                except Exception as exc:  # noqa: BLE001 - a probe must never break detection
+                    count = 0
+                    reason = f"error: {exc}"
+                if not count and not reason:
+                    reason = getattr(probe, "failure_reason", None) or "no GPUs listed"
+                attempts.append(ProbeAttempt(probe.backend, count > 0, reason, count))
+                if count > 0:
+                    selected = probe
+                    break
+            self.attempts, self._selected, self._resolved = attempts, selected, True
+            log.info(
+                "gpu_probe_auto",
+                selected=selected.backend if selected else None,
+                attempts=[{"backend": a.backend, "ok": a.ok, "reason": a.reason} for a in attempts],
+            )
+            return selected
+
+    @property
+    def backend(self) -> str:
+        selected = self._resolve()
+        return selected.backend if selected is not None else "null"
+
+    @property
+    def selected(self) -> GpuProbe | None:
+        return self._resolve()
+
+    def diagnostics(self) -> dict[str, Any]:
+        """Which backend was used and why each earlier one was not."""
+        selected = self._resolve()
+        notes = list(getattr(selected, "notes", []) or []) if selected is not None else []
+        return {
+            "selected": selected.backend if selected is not None else None,
+            "source": getattr(selected, "source", None) if selected is not None else None,
+            "attempts": [
+                {"backend": a.backend, "ok": a.ok, "reason": a.reason, "gpu_count": a.gpu_count}
+                for a in self.attempts
+            ],
+            "notes": notes,
+        }
+
+    def available(self) -> bool:
+        selected = self._resolve()
+        return selected is not None and selected.available()
+
+    def list_gpus(self) -> list[GpuInfo]:
+        selected = self._resolve()
+        return selected.list_gpus() if selected is not None else []
+
+    def get_gpu(self, index: int) -> GpuInfo | None:
+        selected = self._resolve()
+        return selected.get_gpu(index) if selected is not None else None
+
+    def driver_version(self) -> str | None:
+        selected = self._resolve()
+        return selected.driver_version() if selected is not None else None
+
+    def cuda_driver_version(self) -> tuple[int, int] | None:
+        selected = self._resolve()
+        return selected.cuda_driver_version() if selected is not None else None
+
+    def compute_processes(self) -> list[VramProcess]:
+        selected = self._resolve()
+        return selected.compute_processes() if selected is not None else []
+
+    def shutdown(self) -> None:
+        with self._lock:
+            for probe in self._candidates:
+                with contextlib.suppress(Exception):
+                    probe.shutdown()
+            self._selected, self._resolved, self.attempts = None, False, []
+
+
+# ---------------------------------------------------------------------------
 # Module-level probe factory + helpers
 # ---------------------------------------------------------------------------
 
 _probe: GpuProbe | None = None
 _probe_lock = threading.Lock()
 
-_BACKEND_FOR_CHOICE = {"nvml": "cuda", "cuda": "cuda", "null": "null", "fake": "fake"}
+#: Accepted ``gpu.backend`` / ``SF_GPU_PROBE`` values -> the probe family they
+#: select. ``auto`` is its own family: the cache is keyed on the *request*, not
+#: on the backend the auto-selector happened to resolve to.
+_BACKEND_FOR_CHOICE = {
+    "auto": "auto",
+    "nvml": "cuda",
+    "cuda": "cuda",
+    "rocm": "rocm",
+    "vulkan": "vulkan",
+    "metal": "metal",
+    "null": "null",
+    "fake": "fake",
+}
+_probe_family: str | None = None
 
 
 def get_probe(*, force: str | None = None) -> GpuProbe:
     """The process-wide probe, created on first call and cached.
 
-    ``force`` (or env ``SF_GPU_PROBE``) selects ``nvml``/``cuda``, ``null``,
-    or ``fake``; ``fake`` reads its synthetic GPUs from env ``SF_FAKE_GPUS``.
-    A force that differs from the cached probe's backend rebuilds the cache.
+    ``force`` (or env ``SF_GPU_PROBE``) selects ``auto`` (the default: NVML ->
+    ROCm -> Vulkan -> Metal), ``nvml``/``cuda``, ``rocm``, ``vulkan``,
+    ``metal``, ``null`` or ``fake``; ``fake`` reads its synthetic GPUs from env
+    ``SF_FAKE_GPUS``. A force that names a different family than the cached
+    probe rebuilds the cache.
     """
-    global _probe
+    global _probe, _probe_family
     choice = (force or os.environ.get(_ENV_PROBE, "")).strip().lower() or None
     if choice is not None and choice not in _BACKEND_FOR_CHOICE:
         raise ConfigError(
             f"Unknown GPU probe backend {choice!r}; expected one of "
             f"{sorted(set(_BACKEND_FOR_CHOICE))}"
         )
+    family = _BACKEND_FOR_CHOICE[choice] if choice is not None else "auto"
     with _probe_lock:
-        if _probe is not None and (choice is None or _probe.backend == _BACKEND_FOR_CHOICE[choice]):
+        if _probe is not None and (choice is None or _probe_family == family):
             return _probe
-        if choice in ("nvml", "cuda", None):
+        if family == "auto":
+            _probe = AutoGpuProbe()
+        elif family == "cuda":
             _probe = NvmlGpuProbe()
-        elif choice == "null":
+        elif family == "rocm":
+            _probe = RocmGpuProbe()
+        elif family == "vulkan":
+            _probe = VulkanGpuProbe()
+        elif family == "metal":
+            _probe = MetalGpuProbe()
+        elif family == "null":
             _probe = NullGpuProbe()
         else:  # "fake"
             _probe = _fake_probe_from_env()
-        log.debug("gpu_probe_created", backend=_probe.backend)
+        _probe_family = family
+        log.debug("gpu_probe_created", family=family)
         return _probe
 
 
 def reset_probe() -> None:
     """Drop the cached probe (tests). Shuts the old one down first."""
-    global _probe
+    global _probe, _probe_family
     with _probe_lock:
         if _probe is not None:
             with contextlib.suppress(Exception):  # pragma: no cover - defensive
                 _probe.shutdown()
         _probe = None
+        _probe_family = None
+
+
+#: llama.cpp device-name prefix per backend (``--device CUDA0``, ``ROCm0``,
+#: ``Vulkan0``, ``MTL0``). The numeric suffix is the index within that
+#: backend's own enumeration.
+_DEVICE_PREFIX = {"cuda": "CUDA", "rocm": "ROCm", "vulkan": "Vulkan", "metal": "MTL"}
+
+
+def llama_device_name(backend: str | None, index: int) -> str:
+    """The ``--device`` token llama.cpp uses for GPU ``index`` on ``backend``.
+
+    Unknown / fake / absent backends keep the historical ``CUDA`` prefix, so a
+    supervisor built without a probe (tests, the command preview) is unchanged.
+    """
+    return f"{_DEVICE_PREFIX.get(backend or '', 'CUDA')}{index}"
+
+
+def probe_diagnostics(probe: GpuProbe) -> dict[str, Any]:
+    """Which backend a probe is using and why others were skipped (best effort)."""
+    getter = getattr(probe, "diagnostics", None)
+    if callable(getter):
+        with contextlib.suppress(Exception):
+            return dict(getter())
+    return {"selected": probe.backend, "source": None, "attempts": [], "notes": []}
 
 
 def system_ram() -> tuple[int, int]:
