@@ -38,12 +38,12 @@ jobs:
         # Not just the head: a secret added in one commit and removed in the
         # next still publishes, and a head-only scan calls that clean.
         # One finding is tolerated in OLD commits only: the argon2id hash-format prefix
-        # that tests/unit/test_accounts.py spelled out before it carried a scrub-ok marker.
+        # that two unit-test files spelled out before they carried a scrub-ok marker.
         # It names a hash format, not a secret, and history is not rewritten. The tip
         # is scanned strictly by the step above; any other finding in any commit (or
         # a crash that reports no findings) still fails here.
         run: |
-          allowed="(tests/unit/test_accounts.py|[.]github/workflows/ci[.]yml):[0-9]+: looks like a password hash"
+          allowed="(tests/unit/[a-z_]+[.]py|[.]github/workflows/ci[.]yml):[0-9]+: looks like a password hash .* '[$]argon2id[$]'"
           status=0
           for sha in $(git rev-list --reverse \
               "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"); do
