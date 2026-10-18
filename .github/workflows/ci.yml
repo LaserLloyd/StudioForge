@@ -86,7 +86,8 @@ jobs:
         # vendor` (docs/DEVELOPMENT.md, "GUI theming"). forgeui comes from the release tag,
         # not PyPI (that name belongs to another project).
         run: |
-          uv pip install --python .venv "forgeui @ git+https://github.com/LaserLloyd/ThemeForge@v1.2.0"
+          # ForgeUI 1.2.0 pinned to the ThemeForge commit; switch to @v1.2.0 once that tag exists (OWNER_ACTIONS #22)
+          uv pip install --python .venv "forgeui @ git+https://github.com/LaserLloyd/ThemeForge@d70f6608bdf386fc095d43fc1caec61e88664795"
           uv run --python .venv --no-sync python -m forgeui vendor --check
 
       - name: Lint (ruff check)
