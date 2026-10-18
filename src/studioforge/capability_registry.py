@@ -160,6 +160,7 @@ CAPABILITIES: tuple[Capability, ...] = (
         "models.scan",
         "Rescan the model directories.",
         api=("POST", "/api/models/scan"),
+        cli="scan",
         sfctl="models scan",
         panel="Models page: Rescan",
     ),

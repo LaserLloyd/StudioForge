@@ -366,7 +366,7 @@
         "method": "POST",
         "path": "/api/models/scan"
       },
-      "cli": null,
+      "cli": "scan",
       "description": "Rescan the model directories.",
       "id": "models.scan",
       "mcp": null,
