@@ -117,7 +117,7 @@ def is_owner_only(path: Path) -> bool | None:
     """Whether only the current user can open ``path``; ``None`` if it cannot be told.
 
     POSIX: no group/other bits set. Windows: ``icacls`` lists no principal other
-    than the current user, SYSTEM and the Administrators group (the entries
+    than the current user, SYSTEM, the Administrators group and OWNER RIGHTS (the entries
     Windows keeps for itself even on a locked-down file).
     """
     target = Path(path)
@@ -142,7 +142,9 @@ def is_owner_only(path: Path) -> bool | None:
     if result.returncode != 0:
         return None
     user = getpass.getuser().lower()
-    allowed = (user, "nt authority\\system", "builtin\\administrators")
+    # "OWNER RIGHTS" is the placeholder principal for the file's owner (the current
+    # user): some hosts, GitHub's Windows runners among them, list it beside the user.
+    allowed = (user, "nt authority\\system", "builtin\\administrators", "owner rights")
     principals: list[str] = []
     for line in result.stdout.splitlines():
         text = line.strip()
