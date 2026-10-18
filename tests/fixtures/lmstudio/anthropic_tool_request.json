@@ -1,0 +1,33 @@
+{
+  "model": "vendor/thing-Q4_K_M",
+  "max_tokens": 512,
+  "tools": [
+    {
+      "name": "get_weather",
+      "description": "Current weather for a city.",
+      "input_schema": {
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+        "required": ["city"]
+      }
+    }
+  ],
+  "tool_choice": {"type": "auto"},
+  "messages": [
+    {"role": "user", "content": "Weather in Oslo?"},
+    {
+      "role": "assistant",
+      "content": [
+        {"type": "text", "text": "Checking."},
+        {"type": "tool_use", "id": "toolu_01", "name": "get_weather", "input": {"city": "Oslo"}}
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {"type": "tool_result", "tool_use_id": "toolu_01", "content": "4 C, light rain"},
+        {"type": "text", "text": "Summarize."}
+      ]
+    }
+  ]
+}
