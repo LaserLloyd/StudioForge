@@ -151,6 +151,15 @@ def _enforce_security_start(config: Config) -> None:
         raise typer.Exit(2) from exc
 
 
+def _stdout_is_a_terminal() -> bool:
+    """Whether stdout is an interactive terminal (a human) rather than a log sink."""
+    stream = sys.stdout
+    try:
+        return bool(stream is not None and stream.isatty())
+    except (OSError, ValueError, AttributeError):  # closed, detached or dead stream
+        return False
+
+
 def _console(message: str, *, err: bool = False) -> None:
     """Write to the console, if this process still has a usable one.
 
@@ -533,7 +542,16 @@ def _log_mcp_banner(config: Config) -> None:
         marker = "->" if entry is endpoints[0] else "  "
         lines.append(f"  {marker} {entry['url']}  ({entry['label']})")
     if mcp.pin_required and mcp.pin:
-        lines.append(f"     PIN: {mcp.pin}    (header 'X-MCP-Pin', or bearer) - deprecated;")
+        if _stdout_is_a_terminal():
+            lines.append(f"     PIN: {mcp.pin}    (header 'X-MCP-Pin', or bearer) - deprecated;")
+        else:
+            # Not a terminal: stdout is a container log, a journal or a file,
+            # where a credential would persist. The panel's Integrations page
+            # and GET /api/mcp/info (admin) show it.
+            lines.append(
+                "     PIN: set, not shown here (stdout is not a terminal; see the panel's "
+                "Integrations page or GET /api/mcp/info) - deprecated;"
+            )
         lines.append("          prefer a scoped key: studioforge keys create --scope admin")
     else:
         lines.append("     PIN: not required")
