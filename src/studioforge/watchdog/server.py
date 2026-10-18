@@ -2016,7 +2016,12 @@ class _Access:
         pin = getattr(mcp_config, "pin", None) if mcp_config else None
         provided = _bearer(headers)
         header_pin = _pin_header(headers)
-        if api_key and provided and _constant_time_eq(provided, api_key):
+        if (
+            api_key
+            and provided
+            and _constant_time_eq(provided, api_key)
+            and not self.verifier().legacy_revoked(api_key)
+        ):
             return Principal("legacy", "", "legacy", "admin")
         found = self.verifier().verify(provided)
         if found is not None:
@@ -2588,6 +2593,8 @@ def wrap_asgi(
                 expected_key is not None
                 and provided is not None
                 and _constant_time_eq(provided, expected_key)
+                # `keys revoke legacy` disables the config key here too.
+                and not (verifier is not None and verifier.legacy_revoked(expected_key))
             )
             pin_ok = expected_pin is not None and any(
                 candidate is not None and _constant_time_eq(candidate, expected_pin)
@@ -2601,7 +2608,10 @@ def wrap_asgi(
             elif pin_ok:
                 principal = Principal("pin", "", "mcp-pin", "admin")
             if principal is not None:
-                _CREDENTIAL_GUARD.record_success(peer)
+                if principal.allows("admin"):
+                    # Same rule as the gateway: a read/inference key must not
+                    # reset the lockout that protects the (admin) PIN.
+                    _CREDENTIAL_GUARD.record_success(peer)
             else:
                 if provided or pin_carrier:
                     _CREDENTIAL_GUARD.record_failure(peer)
@@ -2823,7 +2833,12 @@ def _credential_ok(
     """
     provided = _bearer_from_headers(scope.get("headers") or [])
     pin_carrier = _pin_from_request(scope)
-    if expected_key and provided and _constant_time_eq(provided, expected_key):
+    if (
+        expected_key
+        and provided
+        and _constant_time_eq(provided, expected_key)
+        and not (verifier is not None and verifier.legacy_revoked(expected_key))
+    ):
         return True
     if verifier is not None and provided and verifier.verify(provided) is not None:
         return True

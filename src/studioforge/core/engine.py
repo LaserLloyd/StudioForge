@@ -1580,6 +1580,24 @@ def _common_prefix(names: Sequence[str]) -> str:
 _PendingLink = tuple[list[str], str, str]
 
 
+def _member_parts(name: str) -> list[str] | None:
+    """An archive member's path components, or ``None`` when it is unsafe.
+
+    Unsafe: empty, absolute, a ``..`` component, or any component with a colon.
+    The colon matters on Windows, where ``Path(name).is_absolute()`` is False
+    for a drive-RELATIVE name: ``dest.joinpath("C:x", "evil.dll")`` is
+    ``C:x/evil.dll`` (the current directory of drive C:, outside ``dest``), and
+    ``llama-server.exe:stream`` is an NTFS alternate data stream. No release
+    archive has a colon in a member name.
+    """
+    parts = [p for p in name.split("/") if p not in ("", ".")]
+    if not parts or Path(name).is_absolute() or name.startswith("/"):
+        return None
+    if any(p == ".." or ":" in p for p in parts):
+        return None
+    return parts
+
+
 def _link_target(parts: list[str], linkname: str) -> str | None:
     """Where a link at ``parts`` points, as a path relative to the extraction root.
 
@@ -1589,7 +1607,7 @@ def _link_target(parts: list[str], linkname: str) -> str | None:
     because a chain of links can make a lexically safe path leave the root.
     """
     text = linkname.replace("\\", "/")
-    if not text or text.startswith("/") or re.match(r"^[A-Za-z]:", text):
+    if not text or text.startswith("/") or ":" in text:
         return None
     joined = posixpath.normpath(posixpath.join(*parts[:-1], text))
     if joined in ("", ".") or joined == ".." or joined.startswith("../"):
@@ -1687,10 +1705,11 @@ def extract_engine_zip(zip_path: Path, dest: Path) -> Path | None:
                 name = name[len(prefix) :]
             if not name or name.endswith("/"):
                 continue
-            parts = [p for p in name.split("/") if p not in ("", ".")]
-            if any(p == ".." for p in parts) or Path(name).is_absolute():
+            safe = _member_parts(name)
+            if safe is None:
                 log.warning("engine.zip.skip_unsafe_member", member=member.filename)
                 continue
+            parts = safe
             target = dest.joinpath(*parts)
             target.parent.mkdir(parents=True, exist_ok=True)
             if stat.S_ISLNK(member.external_attr >> 16):
@@ -1779,9 +1798,10 @@ def _extract_engine_tar(tar_path: Path, dest: Path) -> Path | None:
             name = member.name.replace("\\", "/")
             if prefix and name.startswith(prefix):
                 name = name[len(prefix) :]
-            parts = [p for p in name.split("/") if p not in ("", ".")]
+            safe = _member_parts(name)
+            parts = safe or []
             if member.issym() or member.islnk():
-                if not parts or any(p == ".." for p in parts) or Path(name).is_absolute():
+                if safe is None:
                     log.warning("engine.tar.skip_unsafe_member", member=member.name)
                     continue
                 linkname = member.linkname.replace("\\", "/")
@@ -1803,7 +1823,7 @@ def _extract_engine_tar(tar_path: Path, dest: Path) -> Path | None:
                 continue
             if not member.isfile():
                 continue
-            if not parts or any(p == ".." for p in parts) or Path(name).is_absolute():
+            if safe is None:
                 log.warning("engine.tar.skip_unsafe_member", member=member.name)
                 continue
             target = dest.joinpath(*parts)

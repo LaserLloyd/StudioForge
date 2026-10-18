@@ -20,6 +20,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import sys
 import time
 from collections.abc import Callable
@@ -785,6 +786,8 @@ def migrate_cmd(
 
 #: Pre-migration backups kept (newest first); older ones are removed.
 BACKUPS_KEPT = 5
+#: The folder names :func:`_backup_database` writes (and the only ones it prunes).
+_MIGRATE_BACKUP_RE = re.compile(r"^.+-schema\d+-\d{8}-\d{6}$")
 
 
 def _backup_database(path: Path, version: int) -> Path:
@@ -815,9 +818,11 @@ def _backup_database(path: Path, version: int) -> Path:
 
     restrict_to_owner(folder, directory=True)
     restrict_to_owner(target)
-    for old in sorted((d for d in root.iterdir() if d.is_dir()), key=lambda d: d.stat().st_mtime)[
-        :-BACKUPS_KEPT
-    ]:
+    # Only this command's own folders (``<version>-schema<N>-<time>``): the same
+    # ``backups/`` holds the container entrypoint's pre-migration snapshots
+    # (rotated by the entrypoint) and whatever the operator put there.
+    own = (d for d in root.iterdir() if d.is_dir() and _MIGRATE_BACKUP_RE.match(d.name))
+    for old in sorted(own, key=lambda d: d.stat().st_mtime)[:-BACKUPS_KEPT]:
         with contextlib.suppress(OSError):
             shutil.rmtree(old)
     return target
@@ -871,8 +876,13 @@ def setup_cmd(
     ),
     skip_model: bool = typer.Option(False, "--skip-model"),
     skip_chat: bool = typer.Option(False, "--skip-chat"),
-    exposure: str = typer.Option(
-        "local", "--exposure", help="local (default) | lan (HTTPS on the network) | peer (later)."
+    exposure: str | None = typer.Option(
+        None,
+        "--exposure",
+        help=(
+            "local | lan (HTTPS on the network) | peer (later). Default: keep a network "
+            "binding that is already configured, else local."
+        ),
     ),
     no_start: bool = typer.Option(
         False, "--no-start", help="Do not start the server for steps 5-6."

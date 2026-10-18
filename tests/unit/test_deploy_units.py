@@ -88,6 +88,11 @@ def test_the_entrypoint_bootstraps_the_owner_account() -> None:
     # Only a fresh volume is touched: the app's own posture check decides, so an
     # existing account, an admin key or the legacy server.api_key all win.
     assert "has_admin_credential" in script
+    # The verdict file is cleared before it is re-computed: a stale "no" from an
+    # earlier boot (the posture check failing this time) would otherwise try to
+    # create the owner again, fail on "already exists" and crash-loop.
+    flag_at = script.index("FLAG=/tmp/sf-has-admin-credential")
+    assert script.index('rm -f "$FLAG"', flag_at) < script.index('python - "$FLAG"', flag_at)
 
 
 def test_the_compose_env_example_documents_the_owner_password() -> None:

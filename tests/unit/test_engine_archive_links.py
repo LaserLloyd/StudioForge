@@ -190,3 +190,36 @@ def test_zip_symlink_members_are_links_not_text_files(tmp_path: Path) -> None:
     bad = tmp_path / "bad"
     extract_engine_zip(_zip_with_link(tmp_path / "bad.zip", "/etc/passwd"), bad)
     assert not os.path.lexists(bad / "libllama.so")
+
+
+def test_drive_relative_and_stream_member_names_are_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``C:x/evil.dll`` is not absolute on Windows but lands outside ``dest``; refuse colons."""
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)  # where a drive-relative write would land on Windows
+    drive = tmp_path.drive or "C:"
+    archive = tmp_path / "evil.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr(f"{PREFIX}/{BIN_NAME}", b"EXE")
+        zf.writestr(f"{PREFIX}/ggml.dll", b"DLL")
+        zf.writestr(f"{PREFIX}/{drive}escape/evil.dll", b"PWN")
+        zf.writestr(f"{PREFIX}/{BIN_NAME}:hidden", b"ADS")
+    dest = tmp_path / "engines" / TAG
+
+    binary = extract_engine_zip(archive, dest)
+
+    assert binary == dest / BIN_NAME and binary.read_bytes() == b"EXE"
+    assert not list(cwd.rglob("evil.dll"))
+    assert not list(tmp_path.rglob("evil.dll"))
+    assert sorted(p.name for p in dest.iterdir()) == sorted([BIN_NAME, "ggml.dll"])
+
+    tarball = _tar(
+        tmp_path / "evil.tar.gz",
+        {f"{PREFIX}/{BIN_NAME}": b"ELF", f"{PREFIX}/{drive}escape/evil.so": b"PWN"},
+        symlinks={f"{PREFIX}/libx.so": f"{drive}escape/evil.so"},
+    )
+    tar_dest = tmp_path / "engines" / "tar"
+    extract_engine_archive(tarball, tar_dest)
+    assert not list(cwd.rglob("evil.so")) and not (tar_dest / "libx.so").exists()

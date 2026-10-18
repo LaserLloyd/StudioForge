@@ -76,7 +76,9 @@ class WizardOptions:
     model: str | None = None
     skip_model: bool = False
     skip_chat: bool = False
-    exposure: str = "local"
+    #: ``local`` | ``lan`` | ``peer``; ``None`` (the default) keeps a network binding
+    #: that is already configured and means ``local`` on a fresh install.
+    exposure: str | None = None
     interactive: bool = False
     start_server: bool = True
 
@@ -451,19 +453,38 @@ class SetupWizard:
     def step_exposure(self) -> StepResult:
         title = "Network exposure"
         mode = self.options.exposure
-        if mode not in EXPOSURES:
+        if mode is not None and mode not in EXPOSURES:
             raise ValueError(f"exposure must be one of {', '.join(EXPOSURES)}")
-        if self.prompter is not None and mode == "local" and self.options.exposure == "local":
-            choice = self.prompter.choose(
-                "Who can reach this server?",
-                [
-                    "Only this computer (recommended)",
-                    "My local network, over HTTPS (needs the owner account)",
-                    "Other StudioForge machines (peers - not available yet)",
-                ],
-                0,
-            )
-            mode = EXPOSURES[choice]
+        if mode is None:
+            # Not asked for: never undo a network binding the operator already
+            # has. `studioforge setup` is what the bind-rule refusal tells an
+            # upgraded LAN install to run (to create the owner account), and
+            # silently rewriting its hosts to 127.0.0.1 cut every LAN client off.
+            getter = getattr(self.services, "network_hosts", None)
+            exposed = list(getter()) if callable(getter) else []
+            if exposed:
+                return self._record(
+                    8,
+                    "exposure",
+                    title,
+                    "done",
+                    f"kept the existing network binding ({', '.join(exposed)}); pass "
+                    "--exposure local or --exposure lan to change it",
+                    mode="kept",
+                    hosts=exposed,
+                )
+            mode = "local"
+            if self.prompter is not None:
+                choice = self.prompter.choose(
+                    "Who can reach this server?",
+                    [
+                        "Only this computer (recommended)",
+                        "My local network, over HTTPS (needs the owner account)",
+                        "Other StudioForge machines (peers - not available yet)",
+                    ],
+                    0,
+                )
+                mode = EXPOSURES[choice]
         if mode == "peer":
             return self._record(
                 8,
@@ -708,6 +729,12 @@ class LiveServices:
         return base_url_for(self.config)
 
     # -- exposure ----------------------------------------------------------
+
+    def network_hosts(self) -> list[str]:
+        """The configured bind hosts that are reachable from the network."""
+        from studioforge.api.auth import remote_services
+
+        return [host for _service, host in remote_services(self.config)]
 
     def create_admin_key(self, name: str) -> str | None:
         db, store = self._store()

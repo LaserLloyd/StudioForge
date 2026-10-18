@@ -569,6 +569,23 @@ def test_migrate_applies_after_taking_a_backup(scratch: Path) -> None:
     assert "current" in invoke(scratch, "migrate").output  # nothing left
 
 
+def test_migrate_prunes_only_its_own_backup_folders(scratch: Path) -> None:
+    """The container's .premigrate snapshots and the operator's folders share backups/."""
+    import os
+
+    backups = scratch.parent / "backups"
+    foreign = [backups / f"2.0.0-2026101{i}T000000Z" for i in range(6)] + [backups / "mine"]
+    for folder in foreign:
+        folder.mkdir(parents=True)
+        (folder / ".premigrate").write_text("from 2.0.0", encoding="utf-8")
+        os.utime(folder, (1.0, 1.0))  # older than anything migrate writes
+    db = scratch.parent / "registry.sqlite3"
+    old_database(db)
+    summary = json.loads(invoke(scratch, "migrate", "--json").output)
+    assert Path(summary["backup"]).is_file()
+    assert all(folder.is_dir() for folder in foreign)
+
+
 def test_migrate_with_no_database_previews_the_whole_chain(scratch: Path) -> None:
     summary = json.loads(invoke(scratch, "migrate", "--dry-run", "--json").output)
     assert summary["exists"] is False and summary["current"] == 0 and len(summary["pending"]) == 9

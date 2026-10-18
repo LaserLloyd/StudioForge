@@ -31,7 +31,7 @@ from studioforge.api.auth import (
     may_reveal_pin,
 )
 from studioforge.core.ports import EXIT_RESTART_REQUESTED, supervised_by, supervising_tray_is_alive
-from studioforge.errors import BadRequestError, ModelNotFoundError
+from studioforge.errors import AuthError, BadRequestError, ModelNotFoundError
 from studioforge.logging import get_logger
 from studioforge.tlsutil import scheme_for
 
@@ -100,6 +100,23 @@ def _record(state: Any, outcome: str, detail: str, **extra: Any) -> dict[str, An
     return status
 
 
+def _legacy_revoked(accounts: Any, key: str) -> bool:
+    """Whether the operator revoked the ``legacy`` mirror of ``server.api_key``.
+
+    The watchdog refuses a revoked legacy key (it reads the revocation from the
+    key snapshot), so this process must present its own admin key instead.
+    """
+    if accounts is None:
+        return False
+    try:
+        accounts.authenticate_legacy(key)
+    except AuthError:
+        return True
+    except Exception:  # noqa: BLE001 - bookkeeping trouble: keep the historical behaviour
+        return False
+    return False
+
+
 def _watchdog_credential(config: Any, accounts: Any = None) -> tuple[str | None, str]:
     """The bearer token the watchdog will accept from us, and what it is called.
 
@@ -112,7 +129,7 @@ def _watchdog_credential(config: Any, accounts: Any = None) -> tuple[str | None,
     fell back to the self-respawn that cannot work while we hold the ports.
     """
     key = getattr(config.server, "api_key", None)
-    if key:
+    if key and not _legacy_revoked(accounts, key):
         return key, "api_key"
     if accounts is not None:
         # Scoped keys only (no legacy key): the watchdog verifies them against the

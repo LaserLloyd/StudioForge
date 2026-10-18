@@ -19,6 +19,7 @@ format, and both need the same two things:
 
 from __future__ import annotations
 
+import codecs
 import json
 import uuid
 from collections.abc import AsyncIterator
@@ -71,20 +72,16 @@ async def iter_frames(chunks: AsyncIterator[bytes]) -> AsyncIterator[Frame]:
     reaches the upstream stream (which holds the request slot) at once.
     """
     buffer = ""
-    decoder_tail = b""
+    # Incremental: a multi-byte character split across chunks is held until its
+    # last byte arrives, and an invalid byte becomes U+FFFD at once. (Slicing at
+    # UnicodeDecodeError.start held EVERYTHING after an invalid byte -- the
+    # stream stalled, and the held bytes were dropped at the end.)
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     async with closing(chunks):
         async for chunk in chunks:
             if not chunk:
                 continue
-            raw = decoder_tail + chunk
-            try:
-                text = raw.decode("utf-8")
-                decoder_tail = b""
-            except UnicodeDecodeError as exc:
-                # A multi-byte character split across chunks: keep the
-                # incomplete tail for the next read instead of corrupting it.
-                text = raw[: exc.start].decode("utf-8", "replace")
-                decoder_tail = raw[exc.start :]
+            text = decoder.decode(chunk)
             # Normalise on the whole buffer: a CRLF split across two reads
             # leaves a lone CR here until its LF arrives.
             buffer = (buffer + text).replace("\r\n", "\n")
@@ -93,6 +90,12 @@ async def iter_frames(chunks: AsyncIterator[bytes]) -> AsyncIterator[Frame]:
                 frame = _parse_block(block)
                 if frame is not None:
                     yield frame
+    buffer = (buffer + decoder.decode(b"", final=True)).replace("\r\n", "\n")
+    while "\n\n" in buffer:
+        block, buffer = buffer.split("\n\n", 1)
+        frame = _parse_block(block)
+        if frame is not None:
+            yield frame
     if buffer.strip():
         frame = _parse_block(buffer)
         if frame is not None:

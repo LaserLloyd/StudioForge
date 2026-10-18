@@ -59,6 +59,26 @@ def test_write_private_tightens_an_existing_loose_file(tmp_path: Path) -> None:
     assert target.read_text(encoding="utf-8") == "new" and is_owner_only(target) is True
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits")
+def test_write_private_never_writes_into_a_loose_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The secret goes in only after the existing file's mode is already 0600."""
+    target = tmp_path / "loose.txt"
+    target.write_text("old", encoding="utf-8")
+    target.chmod(0o644)
+    seen: list[int] = []
+    real_fdopen = os.fdopen
+
+    def spying_fdopen(fd: int, *args: object, **kwargs: object) -> object:
+        seen.append(os.fstat(fd).st_mode & 0o777)
+        return real_fdopen(fd, *args, **kwargs)  # type: ignore[call-overload]
+
+    monkeypatch.setattr(os, "fdopen", spying_fdopen)
+    write_private(target, "secret")
+    assert seen == [0o600]
+
+
 def test_a_missing_file_is_not_reported_either_way(tmp_path: Path) -> None:
     assert is_owner_only(tmp_path / "nope") is None
 

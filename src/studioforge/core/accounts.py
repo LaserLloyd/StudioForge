@@ -133,7 +133,7 @@ class AccountStore:
         self._lock = threading.Lock()
         self._touched: dict[str, float] = {}
         self._windows: dict[str, deque[float]] = {}
-        self._posture: tuple[float, bool, bool] | None = None
+        self._posture: tuple[float, bool, bool, bool] | None = None
 
     # ------------------------------------------------------------------
     # Keys: create / list / revoke
@@ -244,21 +244,36 @@ class AccountStore:
         server runs, hence a short TTL rather than only invalidating on our own
         writes.
         """
+        cached = self._cached_posture()
+        return cached[1], cached[2]
+
+    def _cached_posture(self) -> tuple[float, bool, bool, bool]:
+        """``(stamp, any active key, any owner, any key ever -- revoked ones too)``."""
         now = self._clock()
         with self._lock:
             cached = self._posture
             if cached is not None and now - cached[0] < _POSTURE_TTL_S:
-                return cached[1], cached[2]
-        keys, owner = self.has_active_keys(), self.has_owner()
+                return cached
+        rows = self.list_keys()
+        fresh = (now, any(k.active(now) for k in rows), self.has_owner(), bool(rows))
         with self._lock:
-            self._posture = (now, keys, owner)
-        return keys, owner
+            self._posture = fresh
+        return fresh
 
     def has_active_keys_cached(self) -> bool:
-        return self.posture()[0]
+        return self._cached_posture()[1]
 
     def has_owner_cached(self) -> bool:
-        return self.posture()[1]
+        return self._cached_posture()[2]
+
+    def had_keys_cached(self) -> bool:
+        """Whether any key was ever created here (revoked and expired ones count).
+
+        A network-bound server keeps requiring a credential after its last key
+        is revoked: the bind rule is only checked at start, and revoking the last
+        key must not silently reopen the server to the network.
+        """
+        return self._cached_posture()[3]
 
     def has_active_admin_key(self) -> bool:
         return any(k.active(self._clock()) and k.scope == "admin" for k in self.list_keys())
@@ -270,7 +285,14 @@ class AccountStore:
     def sync_snapshot(self) -> None:
         """Rewrite ``keys.snapshot.json`` (what the watchdog verifies against)."""
         try:
-            write_snapshot(self.data_dir, self.list_keys(include_revoked=False))
+            keys = self.list_keys()
+            write_snapshot(
+                self.data_dir,
+                [k for k in keys if not k.revoked],
+                revoked_legacy=[
+                    k.key_hash for k in keys if k.revoked and k.name == LEGACY_KEY_NAME
+                ],
+            )
         except OSError as exc:
             log.warning("could not write the key snapshot for the watchdog", error=str(exc))
 

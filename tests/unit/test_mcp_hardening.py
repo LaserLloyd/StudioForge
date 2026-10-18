@@ -390,6 +390,31 @@ async def test_watchdog_refuses_a_foreign_origin_and_a_read_key_on_restart(
         await http.aclose()
 
 
+async def test_watchdog_a_read_key_does_not_reset_the_pin_lockout(
+    watchdog_env: tuple[Watchdog, Any, Any, Any],
+) -> None:
+    from studioforge.watchdog import server as watchdog_server
+
+    _watchdog, asgi, _server, accounts = watchdog_env
+    _r, read = accounts.create_key("ro", "read")
+    guard = watchdog_server._CREDENTIAL_GUARD
+    guard.reset()
+    http = httpx2.AsyncClient(
+        transport=httpx2.ASGITransport(app=asgi, client=("192.168.1.50", 50000)),
+        base_url="http://127.0.0.1:11235",
+    )
+    wrong = {"X-MCP-Pin": "00000000"}
+    try:
+        for _ in range(3):
+            assert (await http.post("/restart", headers=wrong)).status_code == 401
+        assert (await http.post("/restart", headers=bearer(read))).status_code == 403  # genuine
+        assert (await http.post("/restart", headers=wrong)).status_code == 401  # arms lockout
+        assert (await http.post("/restart", headers=wrong)).status_code == 429
+    finally:
+        guard.reset()
+        await http.aclose()
+
+
 async def test_watchdog_audits_denials_and_the_restart_route(
     watchdog_env: tuple[Watchdog, Any, Any, Any],
 ) -> None:
@@ -430,3 +455,44 @@ async def test_watchdog_write_config_is_owner_only(
     watchdog.write_config(loaded)
     assert is_owner_only(path) is True
     assert yaml.safe_load(path.read_text(encoding="utf-8"))["server"]["port"] == 11234
+
+
+async def test_watchdog_refuses_a_revoked_legacy_api_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`keys revoke legacy` disables server.api_key on the watchdog too, not only the gateway."""
+    from studioforge.api.admin_routes import _watchdog_credential
+    from studioforge.authkeys import SnapshotVerifier
+    from studioforge.core.accounts import AccountStore
+    from studioforge.db import Database
+
+    legacy = "legacy-key-0123456789"  # scrub-ok: fixture
+    monkeypatch.setenv("SF_DATA_DIR", str(tmp_path / "data"))
+    config = make_config(tmp_path, server={"port": 11234, "api_key": legacy})
+    config.ensure_dirs()
+    path = config.save(tmp_path / "data" / "config.yaml")
+    db = Database(config.db_path)
+    db.migrate()
+    accounts = AccountStore(db, config.data_dir)
+    accounts.adopt_legacy_key(legacy)
+    asgi, server = create_asgi_app(Watchdog(path))
+    http = httpx2.AsyncClient(
+        transport=httpx2.ASGITransport(app=asgi), base_url="http://127.0.0.1:11235"
+    )
+    body = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
+    try:
+        async with server.session_manager.run():
+            before = await http.post("/mcp", headers=bearer(legacy), json=body)
+            assert before.status_code != 401
+            assert _watchdog_credential(config, accounts) == (legacy, "api_key")
+            accounts.revoke_key("legacy")
+            assert SnapshotVerifier(config.data_dir).legacy_revoked(legacy)
+            after = await http.post("/mcp", headers=bearer(legacy), json=body)
+            assert after.status_code == 401
+            # The gateway's own hand-off to the watchdog stops sending the dead key
+            # (no other key exists here, so it falls back to the PIN).
+            token, kind = _watchdog_credential(config, accounts)
+            assert (token, kind) == (PIN, "mcp_pin")
+    finally:
+        await http.aclose()
+        db.close()
