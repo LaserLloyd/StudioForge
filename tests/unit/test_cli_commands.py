@@ -565,7 +565,8 @@ def test_migrate_applies_after_taking_a_backup(scratch: Path) -> None:
         saved.close()
     now = sqlite3.connect(db)
     try:
-        assert now.execute("SELECT name FROM sqlite_master WHERE name='api_keys'").fetchone()
+        columns = {row[1] for row in now.execute("PRAGMA table_info(gpu_leases)")}
+        assert "holder_key" in columns
     finally:
         now.close()
     assert "current" in invoke(scratch, "migrate").output  # nothing left

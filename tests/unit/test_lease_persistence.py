@@ -40,6 +40,7 @@ from tests.unit.test_gateway_lifecycle import CountingSupervisor, StubRegistry, 
 HOLDER_URL = "http://10.0.0.7:8700/vacate"
 TOKEN = "cf2-secret-token"
 PEER = "10.0.0.7"
+HOLDER_KEY = "key:k-full"
 
 LEASE_COLUMNS = {
     "id",
@@ -135,6 +136,7 @@ def acquire_full(book: LeaseBook, *, now: float, devices: list[int] | None = Non
         vacate_url=HOLDER_URL,
         vacate_token=TOKEN,
         holder_peer=PEER,
+        holder_key=HOLDER_KEY,
         now=now,
     )
 
@@ -179,12 +181,14 @@ def test_migration_008_creates_the_lease_table(db: Database) -> None:
     columns = {
         row["name"]: row for row in db.connect().execute("PRAGMA table_info(gpu_leases)").fetchall()
     }
-    assert set(columns) == LEASE_COLUMNS
+    # 008 created these; 010 (2.0.1) added the owning key
+    assert set(columns) == LEASE_COLUMNS | {"holder_key"}
     assert columns["id"]["pk"] == 1
     for required in ("devices_json", "holder", "model_ids_json", "created_at", "updated_at"):
         assert columns[required]["notnull"] == 1, required
     assert columns["idle_ttl_s"]["notnull"] == 0, "NULL is 'until released'"
     assert columns["vacate_token"]["notnull"] == 0 and columns["holder_peer"]["notnull"] == 0
+    assert columns["holder_key"]["notnull"] == 0, "NULL is a lease no scoped key took"
 
 
 def test_save_lease_upserts_and_list_leases_answers_oldest_first(db: Database) -> None:
@@ -301,6 +305,7 @@ def test_acquire_writes_a_row_with_every_field_including_token_and_peer(db: Data
         "vacate_url": HOLDER_URL,
         "vacate_token": TOKEN,
         "holder_peer": PEER,
+        "holder_key": HOLDER_KEY,
     }
     assert "vacate_token" not in lease.model_dump(), "still excluded from every API dump"
 
