@@ -152,6 +152,38 @@ the [VRAM Tenant Protocol](docs/TENANTS.md). StudioForge never starts or stops o
 
 ## Install
 
+### Quick start (3 steps)
+
+For a terminal install on Windows (PowerShell, with [Git](https://git-scm.com/download/win),
+[Python 3.12+](https://www.python.org/downloads/) and [uv](https://docs.astral.sh/uv/getting-started/installation/)
+installed). Linux and Docker are below.
+
+1. **Install it** into a virtualenv:
+
+   ```powershell
+   git clone https://github.com/LaserLloyd/StudioForge.git; cd StudioForge
+   uv venv --python 3.12
+   uv pip install -e .
+   .venv\Scripts\Activate.ps1
+   ```
+
+2. **Set up the owner account** (pick your own password, 10+ characters; this also downloads and smoke-tests the
+   llama.cpp engine):
+
+   ```powershell
+   $env:SF_OWNER_PASSWORD = "choose-a-password"
+   studioforge setup --non-interactive --username owner --password-env SF_OWNER_PASSWORD --skip-model --skip-chat --no-start
+   ```
+
+3. **Start it:** `studioforge serve --open` opens the control panel at <http://127.0.0.1:8080>.
+
+`studioforge` is on your `PATH` only while the virtualenv is active (step 1's last line, once per
+terminal); otherwise call `.venv\Scripts\studioforge.exe`. The options of every command are in
+[`docs/CLI.md`](docs/CLI.md), and [`docs/SETUP.md`](docs/SETUP.md) walks through the same first run.
+On Linux, follow [Linux](#linux) below; for containers, the quick start in
+[`docs/deploy/docker.md`](docs/deploy/docker.md#quick-start) (summarised under
+[Run in Docker](#run-in-docker)).
+
 ### Windows
 
 1. Install [Git](https://git-scm.com/download/win), [Python 3.12+](https://www.python.org/downloads/)
@@ -218,6 +250,9 @@ hardware; NVIDIA/CUDA is the verified path, see the status note in
 | `1234` | Gateway: `/v1`, `/api`, `/mcp`, `/health` |
 | `8080` | Control panel |
 | `1235` | Watchdog sidecar |
+
+These are the container ports; change the host side with `SF_GATEWAY_PORT`, `SF_PANEL_PORT` and
+`SF_WATCHDOG_PORT` in `.env`.
 
 GPU passthrough: Docker `--gpus all`; Podman `--device nvidia.com/gpu=all` (after
 `sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml`); AMD `--device /dev/kfd --device /dev/dri`.
@@ -367,7 +402,10 @@ server is wedged.
 | Watchdog | `1235` | Recovery MCP sidecar (separate process) |
 | `llama-server` children | `18100–18200` | Internal, one port per loaded model |
 
-LM Studio also uses `1234`: quit it, or set `server.port`. All three services bind `127.0.0.1`
+LM Studio also uses `1234`: quit it, or set `server.port`. Change the ports with the config keys
+`server.port`, `gui.port` and `watchdog.port` (Setup tab or `config.yaml`; `SF_SERVER__PORT`-style
+environment variables only seed first-run defaults, and `studioforge serve --port` overrides the
+gateway port only). All three services bind `127.0.0.1`
 by default. Binding the network (`0.0.0.0`) requires an owner account or an admin key — the server
 refuses to start without one — and then every request needs a key: `read`, `inference` or `admin`
 (`studioforge keys create`). On a loopback-only install with no keys, anything that changes the *box*
