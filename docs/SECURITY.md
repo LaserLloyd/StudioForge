@@ -89,10 +89,15 @@ ClawForge2, a benchmark harness) never needs `admin`: `POST /api/leases`,
 request), `POST /api/tenants/register` and `DELETE /api/tenants/{name}` are `inference`
 (`api/auth.py:_TENANT_PROTOCOL_ROUTES`). Each lease and each registration is stamped with the key that
 created it, and a non-admin key can renew, release or re-register only its own: another `inference`
-key gets `403 permission_denied`, and an `admin` key can act on any. A lease taken by an admin key, an
-owner session or a local caller, or one that predates 2.0.1, has no `inference` owner and is
-administered by `admin` callers only. `POST /api/tenants/{name}/warm` stays `admin` (the server makes
-an outbound call to a registered URL). On an install with no keys the D32 rule is unchanged: these
+key gets `403 permission_denied`, and an `admin` key can act on any. The MCP `release_gpus` tool
+follows the same rule. A lease taken with no scoped key (an owner session, `server.api_key`, the PIN,
+a local caller) or before 2.0.1, or one whose key was since revoked, is administered by `admin`
+callers or by its holder's D55 proof (its `X-SF-Client` label from the address it was taken from,
+or its vacate token); a lease a live key owns yields to that key or its vacate token only -- every
+tenant on one box shares the loopback peer, so the peer proves nothing there.
+`POST /api/tenants/{name}/warm` stays `admin` (the server makes an outbound call to a registered
+URL), and for the same reason a non-admin caller's lease `vacate_url` must be loopback, a tailnet
+address or a host in `tenants.allowed_hosts` (`400 tenant_url_refused`). On an install with no keys the D32 rule is unchanged: these
 routes still need a caller on this machine or the MCP PIN.
 
 ### Keys

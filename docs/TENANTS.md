@@ -156,7 +156,11 @@ Auth is StudioForge's (D32): reads are open on the LAN; every mutation below nee
 box, the MCP PIN (`X-MCP-Pin`), `server.api_key` as a bearer when one is set, or -- once keys exist --
 a scoped key with the **`inference`** scope (2.0.1, D80: a tenant never needs `admin`). The lease or
 registration a key creates is bound to it: renewing, releasing, re-registering or deregistering
-needs that same key (or an `admin` one), otherwise `403 permission_denied`. Only `POST
+needs that same key (or an `admin` one), otherwise `403 permission_denied`; a lease no live key
+owns (taken keyless, before 2.0.1, or by a key since revoked) also yields to its holder's
+`X-SF-Client` label from the address it was taken from, so `release_stale` keeps working across an
+upgrade or a key rotation. With a non-admin key a lease's `vacate_url` must be loopback, a tailnet
+address or a host in `tenants.allowed_hosts` (`400 tenant_url_refused`). Only `POST
 /api/tenants/{name}/warm` needs `admin`. Errors are the
 OpenAI envelope: `{"error": {"message", "type", "code", "param", "studioforge": {...details}}}`;
 every retryable refusal also carries a `Retry-After` header.

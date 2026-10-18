@@ -7591,3 +7591,17 @@ caller chooses. The MCP `reserve_gpus` / `release_gpus` tools keep their own pol
 
 **Surfaces.** `docs/SECURITY.md` (scopes), `docs/TENANTS.md` §7, `CHANGELOG.md` 2.0.1,
 `tests/unit/test_lease_scope_inference.py`.
+
+**Amended in review (2.0.1).** Four gaps closed before release. (1) The MCP `release_gpus` tool is
+`inference` scope and released any lease: it now runs the same owner check (`auth.owner_check`,
+the caller's principal handed to the tool through `mcp_policy.current_principal`). (2) The D55
+unload waiver accepted "same peer + `X-SF-Client` label"; on this rig every tenant is a loopback
+peer, so one tenant's key could take another's lease-held models down. For a lease a live key owns
+the proof is now that key or the lease's own vacate token (`mgmt_routes.lease_holder_may_act`). (3)
+A lease `vacate_url` is a URL the server POSTs to -- the reason `/warm` stays admin -- so a non-admin
+caller's must pass the tenant URL rule (loopback, tailnet, `tenants.allowed_hosts`). (4) "Admin
+only" for a lease with no key owner left every tenant's pre-upgrade lease squatting its card: the
+SDK's `release_stale` got `403`, and the next grant collided with the tenant's own ghost until the
+idle TTL (or forever with `idle_ttl_s: null`). Such a lease -- and one whose key was since revoked,
+and a registration whose key was revoked -- now also yields to the holder's D55 proof, the same
+proof that already let that holder unload its models.
