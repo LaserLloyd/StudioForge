@@ -1914,6 +1914,20 @@ async def get_config(request: Request) -> dict[str, Any]:
     }
 
 
+@router.get("/settings/schema")
+async def settings_schema() -> dict[str, Any]:
+    """Every config key with its type, default, range, level and env override.
+
+    Read-only metadata derived from the config model itself
+    (:mod:`studioforge.settings_schema`); it carries defaults, never the
+    running values, so it needs no more protection than the other ``GET /api``
+    reads. The same body is committed as ``docs/contracts/settings-schema.json``.
+    """
+    from studioforge import settings_schema as registry
+
+    return registry.export()
+
+
 @router.patch("/config")
 async def set_config(request: Request, updates: dict[str, Any] = Body(...)) -> dict[str, Any]:
     """Apply dotted-path updates, validate, persist, and report restart needs.
