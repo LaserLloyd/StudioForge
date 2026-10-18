@@ -126,6 +126,9 @@ WorkingDirectory=${DATA_DIR}
 ExecStart=${VENV}/bin/studioforge serve
 Restart=on-failure
 RestartSec=5
+# The server exits 130 (SIGINT) / 143 (SIGTERM) on a clean stop; without this
+# `systemctl stop` leaves the unit "failed".
+SuccessExitStatus=130 143
 TimeoutStopSec=120
 KillMode=mixed
 KillSignal=SIGTERM
@@ -153,6 +156,9 @@ WorkingDirectory=${DATA_DIR}
 ExecStart=${VENV}/bin/studioforge serve
 Restart=on-failure
 RestartSec=5
+# The server exits 130 (SIGINT) / 143 (SIGTERM) on a clean stop; without this
+# `systemctl --user stop` leaves the unit "failed".
+SuccessExitStatus=130 143
 TimeoutStopSec=120
 KillMode=mixed
 KillSignal=SIGTERM
@@ -191,6 +197,8 @@ WorkingDirectory=${DATA_DIR}
 ExecStart=${VENV}/bin/python -m studioforge.watchdog --config ${DATA_DIR}/config.yaml
 Restart=always
 RestartSec=3
+# A clean stop (SIGINT/SIGTERM) is not a failure.
+SuccessExitStatus=130 143
 TimeoutStopSec=20
 NoNewPrivileges=true
 
@@ -216,9 +224,22 @@ write_file() {  # write_file PATH MODE  (content on stdin)
         printf '    [dry-run] write %s (mode %s)\n' "$path" "$mode"
         cat >/dev/null
     else
-        cat >"$path"
-        chmod "$mode" "$path"
+        # Write beside the target and rename, so a re-run never leaves a
+        # half-written unit for systemd to read.
+        local tmp="$path.tmp.$$"
+        cat >"$tmp"
+        chmod "$mode" "$tmp"
+        mv -f "$tmp" "$path"
     fi
+}
+
+# Units that exist and are running right now (a re-run over a live install).
+active_units() {
+    local u
+    for u in studioforge studioforge-watchdog; do
+        "${SYSTEMCTL[@]}" is-active --quiet "$u.service" 2>/dev/null && printf '%s.service\n' "$u"
+    done
+    return 0
 }
 
 # --------------------------------------------------------------- preflight
@@ -240,10 +261,19 @@ if [ "$MODE" = uninstall ]; then
     say "Uninstalling StudioForge ($SCOPE)"
     if [ "$DO_SERVICE" = 1 ] && have_systemd; then
         for u in studioforge studioforge-watchdog; do
+            # Clear a "failed" state left by an earlier unclean stop first, and
+            # again after the stop below: an unit written by an older installer
+            # has no SuccessExitStatus= and would otherwise stay listed as
+            # failed after its file is gone.
+            run "${SYSTEMCTL[@]}" reset-failed "$u.service" 2>/dev/null || true
             run "${SYSTEMCTL[@]}" disable --now "$u.service" 2>/dev/null || true
+            run "${SYSTEMCTL[@]}" reset-failed "$u.service" 2>/dev/null || true
             run rm -f "$UNIT_DIR/$u.service"
         done
         run "${SYSTEMCTL[@]}" daemon-reload
+        for u in studioforge studioforge-watchdog; do
+            run "${SYSTEMCTL[@]}" reset-failed "$u.service" 2>/dev/null || true
+        done
     else
         for u in studioforge studioforge-watchdog; do run rm -f "$UNIT_DIR/$u.service"; done
     fi
@@ -336,6 +366,21 @@ fi
 
 # 3. venv + install ------------------------------------------------------
 say "Installing into $VENV"
+# Re-running over a live install: `uv venv --clear` below deletes the virtualenv
+# the running server executes from. Stop what is running first (and clear the
+# failed state an unit from an older installer would be left in); step 5
+# starts it again from the new venv.
+WAS_ACTIVE=""
+if [ "$DO_SERVICE" = 1 ] && [ "$DRY" = 0 ] && have_systemd; then
+    WAS_ACTIVE="$(active_units)"
+    if [ -n "$WAS_ACTIVE" ]; then
+        info "stopping the running unit(s) for the upgrade: $(echo "$WAS_ACTIVE" | tr '\n' ' ')"
+        # shellcheck disable=SC2086
+        "${SYSTEMCTL[@]}" stop $WAS_ACTIVE || true
+        # shellcheck disable=SC2086
+        "${SYSTEMCTL[@]}" reset-failed $WAS_ACTIVE 2>/dev/null || true
+    fi
+fi
 run mkdir -p "$APP_DIR"
 # Keep uv's managed Python INSIDE the app dir: in --system mode the default
 # (~root/.local/share/uv) is unreadable to the `studioforge` service account, and
@@ -379,9 +424,11 @@ if [ "$DO_SERVICE" = 1 ]; then
     info "wrote $UNIT_DIR/studioforge.service and studioforge-watchdog.service"
     if have_systemd || [ "$DRY" = 1 ]; then
         run "${SYSTEMCTL[@]}" daemon-reload
-        if [ "$DO_START" = 1 ]; then
+        # A re-run must not trip over the state the previous run left.
+        run "${SYSTEMCTL[@]}" reset-failed studioforge.service studioforge-watchdog.service 2>/dev/null || true
+        if [ "$DO_START" = 1 ] || [ -n "$WAS_ACTIVE" ]; then
             run "${SYSTEMCTL[@]}" enable studioforge.service studioforge-watchdog.service
-            # restart (not just start): on a re-run the old venv's code is still loaded.
+            # restart (not just start): safe whether the unit is stopped, running or failed.
             run "${SYSTEMCTL[@]}" restart studioforge.service studioforge-watchdog.service
             info "enabled and (re)started"
         else
