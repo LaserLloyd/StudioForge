@@ -1,0 +1,12 @@
+Devices:
+========
+GPU0:
+	apiVersion         = 1.4.305
+	driverVersion      = 25.1.0
+	vendorID           = 0x1002
+	deviceID           = 0x1586
+	deviceType         = PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU
+	deviceName         = AMD Radeon Graphics (RADV GFX1151)
+	driverID           = DRIVER_ID_MESA_RADV
+	driverName         = radv
+	driverInfo         = Mesa 25.1.0

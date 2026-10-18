@@ -20,7 +20,10 @@ page is the walk-through, with a verification after every step.
 | GPU rig — runs StudioForge and the models | `<rig>` | `<rig-ip>` | Windows 11 |
 | OpenClaw box — runs the agent and `sfctl` | `<openclaw-host>` | `<openclaw-ip>` | Linux |
 
-Ports on the rig, all bound to `0.0.0.0` so they answer on the tailnet:
+Ports on the rig. The shipped default is `127.0.0.1`; this deployment sets all three hosts to
+`0.0.0.0` so they answer on the tailnet, which requires an owner account or admin key
+(`studioforge setup`) and, for OpenClaw, its own scoped key (`studioforge keys create --name
+openclaw --scope inference`):
 
 | Port | Surface | Who talks to it |
 | --- | --- | --- |
@@ -74,7 +77,7 @@ Do this first. Every later step assumes it, and it is the single most common thi
 curl -s -m 8 http://<rig-ip>:1234/health
 ```
 
-Expected: `{"status":"ok","version":"1.26-09-23","build":"<short sha>",...}` — the version comes from
+Expected: `{"status":"ok","version":"2.0.0","build":"<short sha>",...}` — the version comes from
 this repository's `studioforge/__init__.py`, and `build` is the git commit the server runs from
 (`-dirty` when it carries uncommitted changes, `unknown` from a wheel). A different version means you
 are talking to another build, and these instructions may not match it.

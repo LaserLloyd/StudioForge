@@ -8,6 +8,7 @@ here -- it stays on the OpenAI endpoints.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import re
 import time
 from typing import Any
@@ -62,6 +63,7 @@ from studioforge.errors import (
     StudioForgeError,
 )
 from studioforge.logging import RING_BUFFER, get_logger
+from studioforge.tlsutil import scheme_for
 from studioforge.types import AdapterAttachment, ModelSettings, VirtualPreset
 
 log = get_logger(__name__)
@@ -214,6 +216,9 @@ async def status(request: Request) -> dict[str, Any]:
     # release, `build` the commit (`unknown` from a wheel). Here as well as
     # on /health because `sfctl status` renders this payload.
     data["build"] = build_id()
+    from studioforge.tlsutil import describe_tls
+
+    data["tls"] = describe_tls(state.config)
     _attach_child_metrics(state, data)
     # Names every VRAM holder, says which GPU each one's memory is actually on
     # (``device_bytes``/``per_gpu_bytes``), and collapses desktop noise. Off the
@@ -293,14 +298,25 @@ def _attach_child_metrics(state: Any, data: dict[str, Any]) -> None:
 @router.get("/gpus")
 async def gpus(request: Request) -> dict[str, Any]:
     state = _state(request)
-    from studioforge.core.gpu import system_ram
+    from studioforge.core.gpu import probe_diagnostics, system_ram
 
     total_ram, used_ram = system_ram()
+
+    def snapshot() -> dict[str, Any]:
+        # The ROCm / Vulkan / Metal probes wait on a vendor tool: keep that off
+        # the event loop.
+        return {
+            "backend": state.probe.backend,
+            # Which backend the auto-selector used and why the earlier ones were
+            # skipped (empty for a forced / fake probe).
+            "probe": probe_diagnostics(state.probe),
+            "driver_version": state.probe.driver_version(),
+            "cuda_driver_version": state.probe.cuda_driver_version(),
+            "gpus": [g.model_dump(mode="json") for g in state.probe.list_gpus()],
+        }
+
     return {
-        "backend": state.probe.backend,
-        "driver_version": state.probe.driver_version(),
-        "cuda_driver_version": state.probe.cuda_driver_version(),
-        "gpus": [g.model_dump(mode="json") for g in state.probe.list_gpus()],
+        **await run_in_threadpool(snapshot),
         "system_ram_total_bytes": total_ram,
         "system_ram_used_bytes": used_ram,
     }
@@ -1411,7 +1427,11 @@ async def _validated_settings_save(state: Any, record: Any, settings: Any) -> di
 
     if settings.extra_flags.strip():
         tag = settings.engine_tag or state.config.engine.pinned_tag
-        errors = await state.engine_manager.validate_extra_flags(tag, settings.extra_flags)
+        errors = await state.engine_manager.validate_extra_flags(
+            tag,
+            settings.extra_flags,
+            allow_partial_cpu_offload=settings.allow_partial_cpu_offload,
+        )
         if errors:
             raise BadRequestError("extra_flags rejected: " + "; ".join(errors), param="extra_flags")
 
@@ -1859,8 +1879,11 @@ async def engine_smoke_test(request: Request, tag: str = Body(..., embed=True)) 
     which is why the route is D32-gated like the rest of ``/api/engine/``.
     """
     state = _state(request)
-    ok, detail = await state.engine_manager.smoke_test(tag)
-    return {"tag": tag, "ok": ok, "detail": detail}
+    ok, smoke_result, detail = await state.engine_manager.smoke_check(tag)
+    # ``ok`` is "acceptable to run": a full pass, or ``smoke_result`` =
+    # "binary-only (no model available)" when the library had no GGUF to
+    # micro-load (the binary itself ran). Read ``smoke_result`` to tell them apart.
+    return {"tag": tag, "ok": ok, "smoke_result": smoke_result, "detail": detail}
 
 
 @router.post("/engine/validate-flags")
@@ -1914,6 +1937,20 @@ async def get_config(request: Request) -> dict[str, Any]:
     }
 
 
+@router.get("/settings/schema")
+async def settings_schema() -> dict[str, Any]:
+    """Every config key with its type, default, range, level and env override.
+
+    Read-only metadata derived from the config model itself
+    (:mod:`studioforge.settings_schema`); it carries defaults, never the
+    running values, so it needs no more protection than the other ``GET /api``
+    reads. The same body is committed as ``docs/contracts/settings-schema.json``.
+    """
+    from studioforge import settings_schema as registry
+
+    return registry.export()
+
+
 @router.patch("/config")
 async def set_config(request: Request, updates: dict[str, Any] = Body(...)) -> dict[str, Any]:
     """Apply dotted-path updates, validate, persist, and report restart needs.
@@ -1950,6 +1987,15 @@ async def set_config(request: Request, updates: dict[str, Any] = Body(...)) -> d
     ):
         setattr(state.config, section, getattr(updated, section))
     state.config.server.api_key = updated.server.api_key
+    if "server.api_key" in updates:
+        accounts = getattr(state, "accounts", None)
+        if accounts is not None:
+            # The deprecated key is mirrored into the key table (and the watchdog's
+            # snapshot) the moment it changes, so `keys list` never lags the config.
+            accounts.adopt_legacy_key(updated.server.api_key)
+    # The panel calls this handler with a stand-in request that has no .state.
+    with contextlib.suppress(AttributeError):
+        request.state.audit_target = ", ".join(changed)
     state.config.server.cors_origins = updated.server.cors_origins
     state.config.server.drain_timeout_s = updated.server.drain_timeout_s
     state.config.server.request_timeout_s = updated.server.request_timeout_s
@@ -2077,9 +2123,30 @@ async def unload_all(request: Request) -> dict[str, Any]:
     return {"unloaded": unloaded, "count": len(unloaded)}
 
 
+#: The API families this server speaks, each with its own version. Additive
+#: bookkeeping for clients and docs: ``openai`` is the OpenAI-compatible ``/v1``
+#: surface, ``lmstudio_v0`` the LM Studio ``/api/v0`` mirror, ``studioforge_api``
+#: this management API under ``/api``.
+API_VERSIONS: dict[str, str] = {
+    "openai": "v1",
+    "lmstudio_v0": "v0",
+    "studioforge_api": "v1",
+}
+
+
 @router.get("/version")
 async def version() -> dict[str, Any]:
-    return {"version": __version__, "build": build_id()}
+    """What this server is: product, release, build and the API versions it speaks.
+
+    ``version`` and ``build`` are what this route has always returned; ``product``
+    and ``api_versions`` were added alongside them.
+    """
+    return {
+        "product": "StudioForge",
+        "version": __version__,
+        "build": build_id(),
+        "api_versions": dict(API_VERSIONS),
+    }
 
 
 @router.get("/openclaw-setup")
@@ -2102,7 +2169,8 @@ async def openclaw_setup(request: Request) -> JSONResponse:
     # BIND address and is normally 0.0.0.0, so echoing it produced a placeholder
     # the user had to substitute by hand -- and the Tailscale address is the one
     # that keeps working across network changes, so it goes first.
-    endpoints = reachable_urls(config.server.port, host=config.server.host)
+    scheme = scheme_for(config)
+    endpoints = reachable_urls(config.server.port, host=config.server.host, scheme=scheme)
     host = endpoints[0]["ip"] if endpoints else "127.0.0.1"
     key = config.server.api_key or "not-required"
     # Same rule as /api/mcp/info: the PIN only goes out when a credential was
@@ -2112,7 +2180,7 @@ async def openclaw_setup(request: Request) -> JSONResponse:
     return JSONResponse(
         {
             "inference": {
-                "OPENAI_BASE_URL": f"http://{host}:{config.server.port}/v1",
+                "OPENAI_BASE_URL": f"{scheme}://{host}:{config.server.port}/v1",
                 "OPENAI_API_KEY": key,
             },
             # Two spellings, because clients disagree. OpenClaw's key is
@@ -2136,7 +2204,7 @@ async def openclaw_setup(request: Request) -> JSONResponse:
                 },
             },
             "companion_config": {
-                "server.url": f"http://{host}:{config.server.port}",
+                "server.url": f"{scheme}://{host}:{config.server.port}",
                 "server.api_key": key,
             },
             "endpoints": endpoints,
@@ -2156,7 +2224,7 @@ async def openclaw_setup(request: Request) -> JSONResponse:
                 "-> send the work to /v1 with the model id it returns and load nothing.",
                 'answer "no" -> list_models, take the recommended row, load_model(**load_args) '
                 "(or load_recommended(model_id, ctx_size)) with priority=2 for a dispatched agent.",
-                f"Send prompts to http://{host}:{config.server.port}/v1/chat/completions with "
+                f"Send prompts to {scheme}://{host}:{config.server.port}/v1/chat/completions with "
                 "X-SF-Client: <your agent name> and priority in the body (omitted = background).",
                 "507 gpu_leased: read error.studioforge.lease.kind -- benchmark means stand down, "
                 "render/agent means wait retry_after_s. 400 context_exceeded: shorten the prompt "
@@ -2664,7 +2732,7 @@ def _gpu_summary(gpu: Any) -> dict[str, Any]:
 async def benchmark_modes(request: Request) -> dict[str, Any]:
     """Every GPU placement this machine can benchmark, model-independent."""
     state = _state(request)
-    gpus = state.probe.list_gpus()
+    gpus = await run_in_threadpool(state.probe.list_gpus)
     return {
         "modes": [mode.to_dict() for mode in available_modes(gpus)],
         "gpus": [_gpu_summary(gpu) for gpu in gpus],

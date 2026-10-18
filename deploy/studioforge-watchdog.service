@@ -20,6 +20,8 @@ ExecStart=%h/studioforge/.venv/bin/python -m studioforge.watchdog --config %h/st
 # clean one.
 Restart=always
 RestartSec=3
+# A clean stop (SIGINT/SIGTERM) is not a failure.
+SuccessExitStatus=130 143
 TimeoutStopSec=20
 NoNewPrivileges=true
 

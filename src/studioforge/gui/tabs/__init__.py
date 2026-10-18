@@ -133,15 +133,36 @@ def viewer_host() -> str:
         return ""
 
 
+def viewer_actor() -> str:
+    """Who the sign-in gate says the current viewer is, for the audit log.
+
+    ``owner:<name>``, ``key:<id>`` or ``legacy``, set on the ASGI scope by the
+    panel's auth gate (:class:`studioforge.gui.app.GuiAuthGate`). ``panel`` when
+    there is no sign-in at all (an open loopback install) or no client context
+    (a direct call from a test).
+    """
+    try:
+        state = ui.context.client.request.state
+        actor = getattr(state, "panel_actor", None)
+    except Exception:  # noqa: BLE001 - no page context: the generic actor
+        return "panel"
+    return str(actor) if actor else "panel"
+
+
 def viewer_may_change_box(ctx: GuiContext) -> bool:
     """Whether the current viewer passes the D32 rule.
 
-    With ``server.api_key`` set, reaching the panel at all took the key (the
-    gate exchanged it for the session cookie), so the key *is* the credential
-    and nothing more is asked -- exactly as the API behaves. Without one, only
-    a viewer on this machine may change the box.
+    When the server requires a credential (``server.api_key``, any API key, or
+    a network bind with an owner account), reaching the panel at all took an
+    admin credential -- the gate refuses anything less -- so being past it *is*
+    the permission, exactly as the API behaves. On an open install only a
+    viewer on this machine may change the box.
     """
-    if ctx.config.server.api_key:
+    from studioforge.api.auth import auth_enforced
+
+    if ctx.config.server.api_key or auth_enforced(
+        ctx.config, getattr(ctx.api_state, "accounts", None)
+    ):
         return True
     # The API's own loopback predicate, so the panel and ``check_request``
     # cannot disagree on what "this machine" means.
@@ -151,13 +172,39 @@ def viewer_may_change_box(ctx: GuiContext) -> bool:
     return not host or _is_loopback(host)
 
 
+def audit_panel(
+    ctx: GuiContext, action: str, target: str = "", *, result: str = "ok", detail: str = ""
+) -> None:
+    """Append one line to the audit log for a change made from the panel.
+
+    ``target`` must never carry a secret (key names, ids and setting *names*
+    only). A state with no audit log (an embedded app, a test) is skipped, and a
+    failing write never fails the action it records.
+    """
+    audit = getattr(ctx.api_state, "audit", None)
+    if audit is None:
+        return
+    try:
+        audit.record(
+            actor=viewer_actor(),
+            action=action,
+            target=target,
+            result=result,
+            surface="panel",
+            peer=viewer_host() or None,
+            detail=detail or None,
+        )
+    except Exception as exc:  # noqa: BLE001 - bookkeeping must never fail an action
+        log.debug("could not write the audit line", action=action, error=str(exc))
+
+
 #: What a remote viewer on an open install is told. Names the two ways in, in
 #: the same words the API uses for the same refusal.
 REMOTE_VIEWER_NOTE = (
-    "this changes the server itself and server.api_key is not set, so the panel only "
-    "accepts it from a browser on this machine. Open the panel on the box, or set "
-    "server.api_key (Setup tab, on the box) and sign in with it to manage the server "
-    "remotely with a real credential."
+    "this changes the server itself and no sign-in is required yet (server.api_key is not set "
+    "and no owner account or key exists), so the panel only accepts it from a browser on this "
+    "machine. Open the panel on the box, or create an owner account or an admin key (Users & "
+    "Keys page, on the box) and sign in to manage the server remotely."
 )
 
 
@@ -236,6 +283,8 @@ async def apply_config_updates(ctx: GuiContext, updates: dict[str, Any]) -> dict
     from studioforge.api.mgmt_routes import set_config
 
     payload = await set_config(api_request(ctx), updates)
+    # Names only, never values: a setting can be a credential.
+    audit_panel(ctx, "panel.config.set", ", ".join(sorted(str(key) for key in updates)))
     return dict(payload)
 
 
@@ -431,6 +480,7 @@ __all__ = [
     "admin_control",
     "api_request",
     "apply_config_updates",
+    "audit_panel",
     "badge",
     "busy",
     "element_alive",
@@ -443,6 +493,7 @@ __all__ = [
     "run_blocking",
     "section",
     "single_flight",
+    "viewer_actor",
     "viewer_host",
     "viewer_may_change_box",
 ]

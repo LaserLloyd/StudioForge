@@ -1,0 +1,27 @@
+ROCk module version 6.12.12 is loaded
+==========
+HSA Agents
+==========
+*******
+Agent 1
+*******
+  Name:                    AMD RYZEN AI MAX+ 395 w/ Radeon 8060S
+  Marketing Name:          AMD RYZEN AI MAX+ 395 w/ Radeon 8060S
+  Vendor Name:             CPU
+  Device Type:             CPU
+*******
+Agent 2
+*******
+  Name:                    gfx1151
+  Marketing Name:          AMD Radeon Graphics
+  Vendor Name:             AMD
+  Device Type:             GPU
+  Pool Info:
+    Pool 1
+      Segment:                 GLOBAL; FLAGS: COARSE GRAINED
+      Size:                    100663296(0x6000000) KB
+      Allocatable:             TRUE
+  ISA Info:
+    ISA 1
+      Name:                    amdgcn-amd-amdhsa--gfx1151
+*** Done ***

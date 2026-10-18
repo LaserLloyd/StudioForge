@@ -1,0 +1,76 @@
+# StudioForge in a container -- base file. Add exactly ONE GPU override:
+#
+#   NVIDIA, Docker    docker compose -f compose.yml -f compose.cuda.yml up -d
+#   NVIDIA, Podman    podman compose -f compose.yml -f compose.cuda.podman.yml up -d
+#   AMD ROCm          docker compose -f compose.yml -f compose.rocm.yml  up -d   (SF_BACKEND=rocm)
+#   Vulkan (AMD/Intel) docker compose -f compose.yml -f compose.vulkan.yml up -d (SF_BACKEND=vulkan)
+#
+# Then open http://localhost:8080 (control panel) -- the OpenAI-compatible base
+# URL for clients is http://localhost:1234/v1 .  docs/deploy/docker.md has the
+# full walkthrough, the offline-engine alternative and the troubleshooting list.
+#
+# StudioForge is GPU-only: without a GPU override the container still boots and
+# /health answers, but reports can_serve=false.
+name: studioforge
+
+services:
+  studioforge:
+    image: ghcr.io/laserlloyd/studioforge:${SF_VERSION:-2.0.0}-${SF_BACKEND:-cuda}
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      args:
+        BACKEND: ${SF_BACKEND:-cuda}
+        VERSION: ${SF_VERSION:-2.0.0}
+    container_name: studioforge
+    hostname: studioforge
+    # `init: true` is required: `serve` spawns a watchdog sidecar and one
+    # llama-server child per loaded model, and PID 1 must reap them.
+    init: true
+    # unless-stopped, not on-failure: a graceful stop exits 130, which
+    # on-failure would treat as a crash.
+    restart: unless-stopped
+    # Drain (server.drain_timeout_s = 30) plus stopping every child.
+    stop_grace_period: 60s
+    ports:
+      # Published to the host's loopback only by default. SF_BIND=0.0.0.0 publishes
+      # to the LAN: every request then needs a key (Users & Keys, or `docker compose
+      # exec studioforge studioforge keys create --name <client> --scope inference`);
+      # put TLS in front (server.tls.mode, a reverse proxy or `tailscale serve`).
+      - "${SF_BIND:-127.0.0.1}:${SF_GATEWAY_PORT:-1234}:1234"   # gateway: /v1 /api /mcp /health
+      - "${SF_BIND:-127.0.0.1}:${SF_PANEL_PORT:-8080}:8080"     # control panel
+      - "${SF_BIND:-127.0.0.1}:${SF_WATCHDOG_PORT:-1235}:1235"  # watchdog: MCP + /health
+    environment:
+      TZ: ${TZ:-UTC}
+      SF_DATA_DIR: /data
+      # First-run default only: config.yaml wins once the panel has saved.
+      SF_MODELS__DIR: /models
+      # Owner account for the panel, created on the first start of a fresh
+      # volume (the image binds the container's interfaces, and the app will not
+      # listen beyond loopback without an account or key). Leave empty to get a
+      # generated password at /data/owner-password.initial (see docs/deploy/docker.md).
+      SF_OWNER_USER: ${SF_OWNER_USER:-owner}
+      SF_OWNER_PASSWORD: ${SF_OWNER_PASSWORD:-}
+      # 0 = skip the one-time download of the llama.cpp engine on a fresh volume (offline hosts).
+      SF_ENGINE_BOOTSTRAP: ${SF_ENGINE_BOOTSTRAP:-1}
+    volumes:
+      # config.yaml, registry, engines/ (llama.cpp builds), logs/, downloads/.
+      - ${SF_DATA:-studioforge-data}:/data
+      # Your GGUF library, read-only. Downloads from the panel go to the data
+      # volume's downloads/ -- point models.dir at a writable path if you want
+      # them in the library.
+      - ${SF_MODELS:-./models}:/models:ro,z
+    user: "${SF_UID:-1000}:${SF_GID:-1000}"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /home/studioforge:mode=1777   # scrub-ok: the container user's home inside the image, not a person's
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+
+volumes:
+  studioforge-data:
+    name: studioforge-data

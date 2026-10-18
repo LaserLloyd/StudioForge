@@ -67,11 +67,13 @@ from studioforge.core.engine import (
     EngineFeatures,
     architecture_table,
     child_environment,
+    partial_offload_allowance,
     policy_family,
     probe_engine_features,
     refuse_policy_flags,
 )
 from studioforge.core.gguf import is_mtp_draft
+from studioforge.core.gpu import llama_device_name
 from studioforge.core.planner import attention_kind, effective_ubatch, is_moe
 from studioforge.errors import ModelLoadError, ModelUnloadError
 from studioforge.logging import get_logger
@@ -311,7 +313,7 @@ def _parse_launch_argv(argv: Sequence[str]) -> tuple[dict[str, str], dict[str, b
 
 
 def launch_policy_violations(
-    argv: Sequence[str], settings: ModelSettings | None = None
+    argv: Sequence[str], settings: ModelSettings | None = None, *, strict_gpu: bool = True
 ) -> list[str]:
     """Every token of a FINAL argv that contradicts the GPU-only policy.
 
@@ -329,7 +331,16 @@ def launch_policy_violations(
     anything here, and :func:`effective_launch` reports the list on every
     instance -- so on every launch StudioForge composes itself this is empty,
     and non-empty is a bug report (:attr:`EffectiveLaunch.policy_violations`).
+
+    ``strict_gpu`` is ``engine.strict_gpu``. Only with it ``False`` AND the
+    model's ``allow_partial_cpu_offload`` set are ``--n-cpu-moe`` and
+    ``--no-kv-offload`` (and their short spellings) not violations; ``-ngl``,
+    ``--fit`` and every other check are unconditional.
     """
+    allow = partial_offload_allowance(
+        strict_gpu=strict_gpu,
+        allow_partial_cpu_offload=bool(settings is not None and settings.allow_partial_cpu_offload),
+    )
     found: list[str] = []
     tokens = list(argv[1:])
     i = 0
@@ -338,6 +349,9 @@ def launch_policy_violations(
         family = policy_family(token) if token.startswith("-") else None
         if family is not None and family.kind == "offload":
             base, sep, _inline = token.partition("=")
+            if base in allow:
+                i += 2 if family.takes_value and not sep and i + 1 < len(tokens) else 1
+                continue
             if family.takes_value and not sep and i + 1 < len(tokens):
                 found.append(f"{base} {tokens[i + 1]}")
                 i += 2
@@ -358,7 +372,7 @@ def launch_policy_violations(
     _contradicts("spec_draft_ngl", "--spec-draft-ngl", lambda v: v in _ALL_LAYERS_VALUES)
     _contradicts("spec_draft_device", "--spec-draft-device", lambda v: v.strip().lower() != "none")
     _contradicts("mmproj_device", "--mmproj-device", lambda v: v.strip().lower() != "none")
-    if switches.get("kv_offload") is False:
+    if switches.get("kv_offload") is False and not (allow & {"--no-kv-offload", "-nkvo"}):
         found.append("--no-kv-offload")
     if switches.get("mmproj_offload") is False:
         found.append("--no-mmproj-offload")
@@ -392,6 +406,7 @@ def effective_launch(
     checkpoints: CheckpointChoice | None = None,
     attention: str | None = None,
     slots_debug: bool = False,
+    strict_gpu: bool = True,
 ) -> EffectiveLaunch:
     """What the child really runs with: the argv, then the engine's defaults.
 
@@ -553,7 +568,7 @@ def effective_launch(
     src("load_mode", "load_mode" in values)
     kv_offload = switches.get("kv_offload", True)
     src("kv_offload", "kv_offload" in switches)
-    policy_violations = launch_policy_violations(argv, settings)
+    policy_violations = launch_policy_violations(argv, settings, strict_gpu=strict_gpu)
 
     inert: list[str] = []
     if settings is not None and settings.cont_batching is False and cont_batching:
@@ -1797,7 +1812,14 @@ class Supervisor:
             # Enforcement point two of the GPU-only policy. The same table the
             # save-time validator uses, applied to what is about to launch:
             # this is the check that survives a stale row.
-            refused = refuse_policy_flags(extra)
+            # engine.strict_gpu (default on) + the model's own opt-in decide
+            # whether --n-cpu-moe / --no-kv-offload are legal; nothing else is
+            # ever relaxed, and -ngl 999 / --fit off below are unconditional.
+            allow = partial_offload_allowance(
+                strict_gpu=self._config.engine.strict_gpu,
+                allow_partial_cpu_offload=settings.allow_partial_cpu_offload,
+            )
+            refused = refuse_policy_flags(extra, allow) if allow else refuse_policy_flags(extra)
             if refused:
                 raise ModelLoadError(
                     f"'{record.id}' cannot be launched: its saved extra_flags carry "
@@ -1824,7 +1846,9 @@ class Supervisor:
         # The final argv, read the way the child will read it. Anything that
         # got past the token check above -- there is no such path today, and
         # this is what keeps it that way -- is refused with its name.
-        violations = launch_policy_violations(argv, settings)
+        violations = launch_policy_violations(
+            argv, settings, strict_gpu=self._config.engine.strict_gpu
+        )
         if violations:
             raise ModelLoadError(
                 f"'{record.id}' cannot be launched: the final command line contradicts the "
@@ -1853,6 +1877,14 @@ class Supervisor:
             mtp_draft=draft is not None and is_mtp_draft(draft.meta),
         )
 
+    def _device_name(self, index: int) -> str:
+        """llama.cpp's ``--device`` token for GPU ``index`` on the detected backend.
+
+        ``CUDA<i>`` / ``ROCm<i>`` / ``Vulkan<i>`` / ``MTL<i>``. A supervisor built
+        without a probe (the command preview, tests) keeps ``CUDA``.
+        """
+        return llama_device_name(getattr(self._probe, "backend", None), index)
+
     def _placement_args(self, plan: LoadPlan, decided: ResolvedFeatures) -> list[str]:
         """Device selection, split mode and main GPU.
 
@@ -1866,7 +1898,7 @@ class Supervisor:
         (see :func:`resolve_split_mode`).
         """
         devices = list(plan.devices) or [0]
-        device_arg = ",".join(f"CUDA{i}" for i in devices)
+        device_arg = ",".join(self._device_name(i) for i in devices)
         if len(devices) == 1:
             return ["--device", device_arg, "--main-gpu", "0", "--split-mode", "none"]
 
@@ -2331,7 +2363,7 @@ class Supervisor:
         # not drafting at all.
         args += ["--spec-draft-ngl", ALL_GPU_LAYERS]
         draft_devices = settings.draft_device_override or plan.devices or [0]
-        args += ["--spec-draft-device", ",".join(f"CUDA{i}" for i in draft_devices)]
+        args += ["--spec-draft-device", ",".join(self._device_name(i) for i in draft_devices)]
         # "auto" is OUR sentinel, resolved by the planner; llama-server has no
         # such value and would refuse to start. The draft cache type is not
         # planned, so pass it through only when it is a real type.
@@ -2550,6 +2582,7 @@ class Supervisor:
             checkpoints=resolve_checkpoints(inst.record, self._config.models),
             attention=(attention_kind(inst.record.meta) if inst.record.meta is not None else None),
             slots_debug=_int_or(env.get("LLAMA_SERVER_SLOTS_DEBUG"), 0) != 0,
+            strict_gpu=self._config.engine.strict_gpu,
         )
         inst.info.launch_args = redact_argv(argv)
         if inst.info.effective.policy_violations:

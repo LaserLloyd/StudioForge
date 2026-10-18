@@ -12,7 +12,7 @@ import asyncio
 import contextlib
 import functools
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -23,22 +23,41 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from studioforge import __version__
-from studioforge.api import admin_routes, health_routes, mgmt_routes, openai_routes
-from studioforge.api.auth import check_request
+from studioforge.api import (
+    admin_routes,
+    anthropic_routes,
+    health_routes,
+    lmstudio_routes,
+    mgmt_routes,
+    openai_routes,
+    responses_routes,
+    security_routes,
+)
+from studioforge.api.auth import (
+    check_request,
+    is_mcp_path,
+    origin_allowed,
+    principal_of,
+    required_scope,
+)
+from studioforge.auditlog import AuditLog
 from studioforge.build import build_id
 from studioforge.config import Config, load_config
+from studioforge.core.accounts import AccountStore
 from studioforge.core.downloader import Downloader
 from studioforge.core.engine import EngineManager
-from studioforge.core.gpu import get_probe
+from studioforge.core.gpu import probe_for_config
 from studioforge.core.health import PROBE_MAX_TOKENS, PROBE_TIMEOUT_S, deep_health
 from studioforge.core.leases import LeaseBook
 from studioforge.core.manager import ModelManager
+from studioforge.core.metrics import GatewayMetrics
 from studioforge.core.planner import Planner
 from studioforge.core.registry import Registry
 from studioforge.core.supervisor import Supervisor
 from studioforge.core.updater import Updater
 from studioforge.db import Database
-from studioforge.errors import StudioForgeError
+from studioforge.error_catalog import envelope_extras
+from studioforge.errors import AuthError, StudioForgeError
 from studioforge.logging import configure_logging, get_logger
 
 log = get_logger(__name__)
@@ -102,17 +121,91 @@ def log_rejection(exc: StudioForgeError) -> None:
 SCAN_WAIT_S = 60.0
 
 
+def _route_label(scope: Mapping[str, Any]) -> str:
+    """The route *template* a request matched (``/api/models/{model_id}/load``), not its URL.
+
+    Metric labels must be bounded by the code, not by the traffic. A router that
+    was included with a prefix reports a path without it, so the template is
+    rebuilt from the real path and the matched path parameters.
+    """
+    if scope.get("route") is None:
+        return "(unmatched)"
+    label = str(scope.get("path", ""))
+    for name, value in (scope.get("path_params") or {}).items():
+        text = str(value)
+        if text:
+            label = label.replace(text, "{" + str(name) + "}", 1)
+    return label
+
+
+_MUTATING = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+def _audited(method: str, path: str, config: Config) -> bool:
+    """Whether a request is an admin mutation worth an audit line.
+
+    Every mutating route an ``admin`` scope is needed for, plus the LM Studio
+    native model verbs (load/unload/download). Inference traffic is not audited
+    (volume, and the content is not the point) and neither is MCP here: its
+    mutating tool calls are audited per tool by ``mcp_policy``.
+    """
+    if method not in _MUTATING or is_mcp_path(path, config):
+        return False
+    return required_scope(method, path, config) == "admin" or path.startswith("/api/v1/models/")
+
+
 class AuthMiddleware(BaseHTTPMiddleware):
-    """Applies the optional bearer key to every route in one place -- and holds
+    """Applies authentication and scopes to every route in one place -- and holds
     every request but liveness until the boot's first library scan is in (D33),
     so a client that connects the moment the port answers is not told the
-    library is empty or a model does not exist."""
+    library is empty or a model does not exist.
+
+    Also the two cross-cutting security duties of the gateway: the Origin check
+    on the MCP endpoint (a browser page not on the allowlist gets 403 before any
+    credential is looked at) and the audit line for every admin mutation."""
 
     def __init__(self, app: Any, config: Config) -> None:
         super().__init__(app)
         self.config = config
 
+    def _audit(self, request: Request, *, result: str, detail: str | None = None) -> None:
+        audit = getattr(request.app.state, "audit", None)
+        if audit is None:
+            return
+        principal = principal_of(request)
+        client = request.client.host if request.client else None
+        target = getattr(request.state, "audit_target", None) or request.url.path
+        audit.record(
+            actor=principal.actor if principal else "anonymous",
+            action=f"api.{request.method} {request.url.path}",
+            target=str(target),
+            result=result,
+            surface="api",
+            peer=client,
+            detail=detail,
+        )
+
     async def dispatch(self, request: Request, call_next: Any) -> Any:
+        method = request.method.upper()
+        path = request.url.path
+        if method != "OPTIONS" and is_mcp_path(path, self.config):
+            origin = request.headers.get("origin")
+            if not origin_allowed(origin, self.config.server.cors_origins):
+                refusal = AuthError(
+                    f"Refused: the request's Origin '{origin}' is not allowed to reach the MCP "
+                    "endpoint. Call MCP from a non-browser client (no Origin header) or from a "
+                    "loopback page, or add the page's origin to server.cors_origins.",
+                    code="origin_not_allowed",
+                    status_code=403,
+                )
+                log.warning("mcp request refused: Origin not allowed", origin=origin, path=path)
+                self._audit(request, result="denied", detail=f"origin {origin}")
+                return JSONResponse(refusal.to_payload(), status_code=403)
+        audited = _audited(method, path, self.config)
+        metrics = getattr(request.app.state, "metrics", None)
+        started = time.monotonic()
+        if metrics is not None:
+            metrics.begin()
         try:
             check_request(request, self.config)
         except StudioForgeError as exc:
@@ -122,10 +215,28 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 # below ever runs, so the header has to be set here too or a
                 # locked-out client gets the wait only in the JSON body.
                 headers["Retry-After"] = str(exc.details["retry_after_s"])
+            if audited:
+                self._audit(request, result="denied", detail=exc.code)
+            if metrics is not None:
+                metrics.observe(method, "(rejected)", exc.status_code, time.monotonic() - started)
             return JSONResponse(exc.to_payload(), status_code=exc.status_code, headers=headers)
         if request.url.path not in _NO_BOOT_WAIT_PATHS:
             await wait_for_boot(request.app.state, timeout_s=SCAN_WAIT_S, scan_only=True)
-        return await call_next(request)
+        response = await call_next(request)
+        if metrics is not None:
+            metrics.observe(
+                method,
+                _route_label(request.scope),
+                response.status_code,
+                time.monotonic() - started,
+            )
+        if audited:
+            self._audit(
+                request,
+                result="ok" if response.status_code < 400 else "error",
+                detail=None if response.status_code < 400 else f"HTTP {response.status_code}",
+            )
+        return response
 
 
 #: Strong references to in-flight post-download scan tasks, keyed by download
@@ -564,7 +675,7 @@ def build_state(config: Config, *, version: str = __version__) -> Any:
     # the server (fresh DB, corrupt file kept aside), never stop it booting.
     db.migrate_with_recovery()
 
-    probe = get_probe()
+    probe = probe_for_config(config)
     engine_manager = EngineManager(config, probe=probe)
     registry = Registry(config, db)
     # One lease book shared by the planner (which honours leases) and the
@@ -611,6 +722,15 @@ def build_state(config: Config, *, version: str = __version__) -> Any:
 
     state.config = config  # type: ignore[attr-defined]
     state.db = db  # type: ignore[attr-defined]
+    # Who may call this server (owner account, scoped keys) and the append-only
+    # record of what they changed.
+    state.accounts = AccountStore(db, config.data_dir)  # type: ignore[attr-defined]
+    state.metrics = GatewayMetrics()  # type: ignore[attr-defined]
+    state.audit = AuditLog(  # type: ignore[attr-defined]
+        config.logs_dir,
+        max_mb=config.logging.audit_file_max_mb,
+        backups=config.logging.audit_file_backups,
+    )
     state.probe = probe  # type: ignore[attr-defined]
     state.engine_manager = engine_manager  # type: ignore[attr-defined]
     state.registry = registry  # type: ignore[attr-defined]
@@ -781,6 +901,28 @@ def create_app(
         setattr(app.state, key, value)
     app.state.client = None
 
+    # The deprecated server.api_key is mirrored into the key table (and the
+    # watchdog's snapshot) so it appears in `keys list` and can be revoked; it
+    # keeps authenticating from config either way.
+    accounts = getattr(app.state, "accounts", None)
+    if accounts is not None:
+        try:
+            accounts.adopt_legacy_key(config.server.api_key)
+            accounts.sync_snapshot()
+            if start_background and accounts.has_active_keys():
+                # Authentication is on, so the helpers on this machine (the CLI, the
+                # tray, the watchdog hand-off) need their own admin key; make sure
+                # <data-dir>/cli.key exists rather than waiting for the first 401.
+                accounts.local_cli_key()
+        except Exception as exc:  # noqa: BLE001 - key bookkeeping must not stop the server booting
+            log.warning("could not mirror server.api_key into the key table", error=str(exc))
+    if "*" in [o.strip() for o in config.server.cors_origins]:
+        log.warning(
+            "server.cors_origins contains '*': any website may read this API from a visitor's "
+            "browser. It does not let a page reach the MCP endpoints (those need an explicit "
+            "origin). Remove it unless you serve a web app from another origin."
+        )
+
     # Claimed here rather than in build_state because the lock is about *acting*
     # on a data directory, not about composing an object graph: the stdio MCP
     # server and every `start_background=False` test build the same graph and
@@ -803,9 +945,14 @@ def create_app(
     )
 
     app.include_router(openai_routes.router, tags=["openai"])
+    app.include_router(lmstudio_routes.router, tags=["lmstudio"])
+    app.include_router(anthropic_routes.router, tags=["anthropic"])
+    app.include_router(responses_routes.router, tags=["openai"])
     app.include_router(mgmt_routes.router, prefix="/api", tags=["management"])
     app.include_router(admin_routes.router, prefix="/api", tags=["admin"])
     app.include_router(health_routes.router, prefix="/api", tags=["health"])
+    app.include_router(security_routes.router, prefix="/api", tags=["security"])
+    app.include_router(security_routes.metrics_router)
 
     # Management-plane MCP over streamable HTTP, behind the same API key.
     # Failure here must not stop the server from serving inference.
@@ -893,7 +1040,7 @@ def create_app(
         boot = getattr(app.state, "boot", None)
         if boot is not None:
             payload["boot"] = boot.snapshot()
-        payload.update(_serving_readiness(app.state))
+        payload.update(await _serving_readiness(app.state))
         if not deep:
             return payload
         gateway = app.state.config.gateway
@@ -913,7 +1060,7 @@ def create_app(
     return app
 
 
-def _serving_readiness(state: Any) -> dict[str, Any]:
+async def _serving_readiness(state: Any) -> dict[str, Any]:
     """The part of ``/health`` that says whether a model could be served.
 
     ``engine`` is what the lifespan's ``ensure_engine`` concluded (``ok``,
@@ -942,10 +1089,12 @@ def _serving_readiness(state: Any) -> dict[str, Any]:
             }
         else:
             engine = {"ok": False, "tag": None, "error": "no llama-server engine is installed"}
+    # Off the event loop: the ROCm / Vulkan / Metal probes wait on a vendor tool.
     try:
-        gpu_count = len(state.planner.probe.list_gpus())
+        gpu_count = await asyncio.to_thread(lambda: len(state.planner.probe.list_gpus()))
     except Exception:  # noqa: BLE001
         gpu_count = 0
+    blocked = getattr(state.planner.probe, "blocked_reason", None) if gpu_count == 0 else None
     try:
         models_indexed = len(state.registry.all())
     except Exception:  # noqa: BLE001
@@ -961,10 +1110,14 @@ def _serving_readiness(state: Any) -> dict[str, Any]:
             "`studioforge engine --update`"
             + (f" ({engine.get('error')})" if engine.get("error") else "")
         )
+    elif blocked:
+        # A CUDA engine with a failing NVML: say so (and the fix), not "no GPU".
+        reason = str(blocked)
     elif gpu_count == 0:
         reason = (
-            "no NVIDIA GPU detected (this server is GPU-only): check the driver and "
-            "nvidia-smi, then re-probe from the Setup tab"
+            "no GPU detected (this server is GPU-only): check the driver and its query "
+            "tool (nvidia-smi, rocm-smi / amd-smi, vulkaninfo), then re-probe from the "
+            "Setup tab. GET /api/gpus shows which backends were tried and why they failed"
         )
     elif models_indexed == 0:
         reason = (
@@ -1035,6 +1188,7 @@ def _install_error_handlers(app: FastAPI) -> None:
                     "type": "invalid_request_error",
                     "code": "invalid_request",
                     "param": None,
+                    **envelope_extras("invalid_request"),
                 }
             },
             status_code=400,
@@ -1063,6 +1217,7 @@ def _install_error_handlers(app: FastAPI) -> None:
                     "type": "server_error",
                     "code": "internal_error",
                     "param": None,
+                    **envelope_extras("internal_error"),
                     "studioforge": {"ref": ref},
                 }
             },

@@ -220,20 +220,20 @@ one. The card says so when it does; nothing deletes your rollback engine while y
 
 | Field | Notes |
 | --- | --- |
-| `server.host` | A **bind** address. `0.0.0.0` listens on every interface, LAN and tailnet included; `127.0.0.1` is this machine only, which also means no agent on another box can reach it |
+| `server.host` | A **bind** address. The default is `127.0.0.1`: this machine only, so no agent on another box can reach it. `0.0.0.0` listens on every interface, LAN and tailnet included, and the server then refuses to start until an owner account or an admin key exists (`studioforge setup`; see [`SECURITY.md`](SECURITY.md)) |
 | `server.port` | `1234` is LM Studio's default, which is the whole point — pointing an OpenAI client here is a host change, not a rewrite. They cannot share the port, though: quit LM Studio or move one of them |
 | `gui.port` / `watchdog.port` | This panel, and the recovery sidecar (a separate process) |
-| `server.api_key` | Guards inference **and** this panel. Blank is the LAN/tailnet-trust default: reads, inference and load/unload are open, but changing the box (config, files, engines, restarts, downloads) needs a browser on the machine itself, the same rule the API applies (D32) |
-| `mcp.pin` | A short pairing code for the MCP path only — deliberately *not* the inference credential. Setting `server.api_key` does not retire it: the app's `/mcp` and the watchdog accept **either** credential, so a paired agent keeps working. **Generate new PIN** rotates it, which is the documented response to a leak; every already-paired agent then needs the new one |
+| `server.api_key` | **Deprecated**: the single shared key. It still guards inference **and** this panel as an admin credential (and shows up as the key `legacy` in Users & Keys). Prefer scoped keys: `studioforge keys create`. With no key and a loopback bind, reads, inference and load/unload are open, but changing the box (config, files, engines, restarts, downloads) needs a browser on the machine itself, the same rule the API applies (D32) |
+| `mcp.pin` | **Deprecated.** A short pairing code for the MCP path only — deliberately *not* the inference credential. Setting `server.api_key` does not retire it: the app's `/mcp` and the watchdog accept **either** credential, so a paired agent keeps working. **Generate new PIN** rotates it, which is the documented response to a leak; every already-paired agent then needs the new one |
 
 All three secrets render masked, with a reveal button. Leaving a masked field untouched keeps the
 current value: the panel never posts the placeholder back over a working credential.
 
 **Network exposure** is a checklist item, not a footnote. Bound to `127.0.0.1` (all three
 listeners: `server.host`, `gui.host`, `watchdog.host`) it is green and optional — nothing off this
-box can reach the API. Any of them bound to `0.0.0.0` (or a LAN address) with no `server.api_key`
-turns it **required and amber**: everyone on the LAN or tailnet can then load and unload models
-and use the control panel. **Set API key** mints one and saves it; copy it into OpenClaw
+box can reach the API. Any of them bound to `0.0.0.0` (or a LAN address) with no owner account or
+admin key is **required and amber**, and the server will not start in that state. Create an
+account or a key on the Users & Keys page, then give each client its own scoped key
 (`Authorization: Bearer <key>`). The same rule decides whether `GET /api/mcp/info` and
 `/api/openclaw-setup` will hand the PIN to a remote caller at all — with no key set they answer
 only on the machine itself.
@@ -346,9 +346,9 @@ read.
 
 ```yaml
 server:
-  host: 0.0.0.0
+  host: 127.0.0.1            # 0.0.0.0 = the network; then an account or admin key is required
   port: 1234
-  api_key: null              # null = no auth (LAN/tailnet trust)
+  api_key: null              # deprecated; prefer `studioforge keys create`
 mcp:
   pin: "12345678"            # auto-generated on first run
   pin_required: true

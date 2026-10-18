@@ -1,0 +1,18 @@
+{
+  "error": {
+    "message": "Stateful /api/v1/chat is not supported; use /v1/chat/completions (or /v1/messages, /v1/responses)",
+    "type": "not_implemented_error",
+    "code": "not_implemented",
+    "param": null,
+    "fix": "Use the OpenAI-compatible route instead (POST /v1/chat/completions for stateful /api/v1/chat); see docs/API.md for the compatibility matrix.",
+    "docs": "errors/not_implemented",
+    "studioforge": {
+      "alternatives": [
+        "/v1/chat/completions",
+        "/v1/messages",
+        "/v1/responses"
+      ],
+      "reason": "this server is stateless: send the whole conversation each turn"
+    }
+  }
+}

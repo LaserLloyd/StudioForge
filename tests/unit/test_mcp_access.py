@@ -12,10 +12,25 @@ from typing import Any
 import pytest
 from fastapi import Request
 
-from studioforge.api.auth import check_request, extract_pin, is_mcp_path, pin_in_query
+from studioforge.api.auth import GUARD, check_request, extract_pin, is_mcp_path, pin_in_query
 from studioforge.config import Config, generate_pin
 from studioforge.core import netinfo
 from studioforge.errors import AuthError
+
+
+@pytest.fixture(autouse=True)
+def _fresh_credential_guard() -> Any:
+    """Every test starts without a lockout record.
+
+    Several tests here present a wrong PIN, or the right PIN on a path where it
+    is not valid, from the same fake client address. Since a wrong ``X-MCP-Pin``
+    header counts toward the per-address lockout (it used to be free, which was
+    the brute-force hole), those attempts would otherwise lock the address for
+    the tests that follow.
+    """
+    GUARD.reset()
+    yield
+    GUARD.reset()
 
 
 def make_request(

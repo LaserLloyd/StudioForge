@@ -1,10 +1,11 @@
 [project]
 name = "studioforge"
-# The human/display version is `1.26-09-23` (see `src/studioforge/__init__.py`
-# `__version__`, which is what /health, the GUI, MCP and the User-Agent report).
-# PEP 440 cannot spell a hyphenated date, so the package metadata carries the
-# same date as `1.26.9.23`. Release tags are `v1.26-09-23`.
-version = "1.26.9.23"
+# Semantic version since 2.0.0 (the prosumer refactor); the same string is
+# `src/studioforge/__init__.py` `__version__` (what /health, the GUI, MCP and the
+# User-Agent report) and the release tag `v2.0.0`. Releases before 2.0.0 were
+# calendar-versioned (`1.26-09-23` / `1.26.9.23`); `core/updater.py::_version_key`
+# still reads both spellings so an update from one scheme to the other sorts right.
+version = "2.0.0"
 description = "Self-hosted GPU-only llama.cpp server for Windows and Linux: an OpenAI-compatible gateway over llama-server with a model registry, VRAM planner, GPU leases, web control panel and MCP tools."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -42,12 +43,16 @@ dependencies = [
     "nicegui>=2.7",
     "huggingface-hub>=0.26",
     "nvidia-ml-py>=12.560",
-    "mcp>=1.2",
+    "mcp>=2.3,<3",  # 2.x: mcp.server.extension (tool-call policy), mcp_types, the 2026-07-28 revision
     "pillow>=11.0",
     "psutil>=6.1",
     "pystray>=0.19",
     "typer>=0.15",
     "rich>=13.9",
+    # Accounts and keys (W3): argon2id password hashes for the owner account, and
+    # the self-signed certificate for `server.tls.mode: self_signed`.
+    "argon2-cffi>=23.1",
+    "cryptography>=43",
     # Windows-only: job objects (children die with the supervisor, D23) and PDH
     # per-process VRAM attribution. Both degrade gracefully when absent, but a
     # fresh install must get them without being told (WP17 F10).
@@ -62,6 +67,10 @@ Changelog = "https://github.com/LaserLloyd/StudioForge/blob/main/CHANGELOG.md"
 Decisions = "https://github.com/LaserLloyd/StudioForge/blob/main/DECISIONS.md"
 
 [project.optional-dependencies]
+# OS keyring for hf.token and the owner password hash. Optional and soft-imported:
+# without it (headless Linux, minimal installs) the same secrets live in an
+# owner-only (0600) file under <data-dir>/secrets/.
+keyring = ["keyring>=25"]
 dev = [
     # The test stack has an upper bound because pytest-asyncio 0.x -> 1.x
     # changed fixture loop scoping and pytest majors move collection rules;
@@ -97,18 +106,23 @@ packages = ["src/studioforge"]
 include = [
     "src/studioforge/migrations/*.sql",
     "src/studioforge/data/*.json",
-    # The ThemeForge drop-in bundle, copied verbatim from the theme repo;
-    # see docs/DEVELOPMENT.md's "GUI theming" section. Everything in it ships.
+    # The ForgeUI (ThemeForge) drop-in bundle, vendored whole by `python -m forgeui
+    # vendor`; see docs/DEVELOPMENT.md's "GUI theming" section. Everything in it ships.
     "src/studioforge/gui/theme/**",
 ]
+
+[tool.hatch.build.targets.wheel.force-include]
+# The theme manifest: gui/app.py reads the picker's themes, default and storage key
+# from it at runtime, so the installed wheel carries a copy beside the module.
+"forgeui.json" = "studioforge/gui/forgeui.json"
 
 [tool.ruff]
 line-length = 100
 target-version = "py312"
 src = ["src", "tests"]
-# gui/theme/ is the ThemeForge drop-in bundle, vendored verbatim and
-# checksummed by its files.json (its update.py refuses to update a copy that
-# was edited by hand, and the next install overwrites the folder anyway), so
+# gui/theme/ is the ForgeUI (ThemeForge) drop-in bundle, vendored whole and
+# checksummed by its files.json (`forgeui vendor` refuses to update a copy that
+# was edited by hand, and the next vendor overwrites the folder anyway), so
 # it is never reformatted to this project's rules: ruff skips it, lint and
 # format alike. force-exclude keeps that true when a file is named explicitly
 # (editors, pre-commit).
@@ -181,3 +195,9 @@ markers = [
 ]
 filterwarnings = ["ignore::DeprecationWarning"]
 timeout = 300
+
+[tool.uv]
+# uv caches this project's own built wheel and by default only rebuilds it when
+# pyproject.toml/setup.* change; the container builds keep that cache in a persistent
+# mount with a non-editable install, so list the sources too (2026-10 review finding).
+cache-keys = [{ file = "pyproject.toml" }, { file = "forgeui.json" }, { file = "src/**/*.py" }, { file = "src/**/*.html" }, { file = "src/**/*.css" }, { file = "src/**/*.js" }, { file = "src/**/*.sql" }]

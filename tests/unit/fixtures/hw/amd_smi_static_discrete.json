@@ -1,0 +1,22 @@
+[
+  {
+    "gpu": 0,
+    "asic": {
+      "market_name": "AMD Radeon RX 7900 XTX",
+      "vendor_id": "0x1002",
+      "vendor_name": "Advanced Micro Devices Inc. [AMD/ATI]",
+      "device_id": "0x744c",
+      "rev_id": "0xc8",
+      "asic_serial": "N/A",
+      "num_compute_units": 96,
+      "target_graphics_version": "gfx1100"
+    },
+    "driver": {"name": "AMDGPU", "version": "6.8.5"},
+    "vram": {
+      "type": "GDDR6",
+      "vendor": "SAMSUNG",
+      "size": {"value": 24560, "unit": "MB"},
+      "bit_width": 384
+    }
+  }
+]

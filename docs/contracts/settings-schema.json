@@ -1,0 +1,1722 @@
+{
+  "count": 116,
+  "env_nested_delimiter": "__",
+  "env_prefix": "SF_",
+  "levels": [
+    "basic",
+    "advanced"
+  ],
+  "product": "StudioForge",
+  "schema": 1,
+  "settings": [
+    {
+      "choices": null,
+      "constraints": {
+        "ge": 1
+      },
+      "default": 1,
+      "description": "Layout version of config.yaml. Older files without it load as version 1.",
+      "env": "SF_SCHEMA_VERSION",
+      "key": "schema",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "general",
+      "type": "int"
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": "127.0.0.1",
+      "description": "Loopback by default: nothing is reachable from the network until you choose to expose it (`studioforge setup`). A non-loopback bind (0.0.0.0, a LAN address) refuses to start unless an owner account or an admin API key exists.",
+      "env": "SF_SERVER__HOST",
+      "key": "server.host",
+      "level": "basic",
+      "restart_required": true,
+      "secret": false,
+      "section": "server",
+      "type": "string"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "ge": 1,
+        "le": 65535
+      },
+      "default": 1234,
+      "description": "1234, the port LM Studio uses, so pointing an existing OpenAI client here is a host change.",
+      "env": "SF_SERVER__PORT",
+      "key": "server.port",
+      "level": "basic",
+      "restart_required": true,
+      "secret": false,
+      "section": "server",
+      "type": "int"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "min_length": 6
+      },
+      "default": null,
+      "description": "DEPRECATED (2.0). Still works, and is mirrored into the key table as an admin key named \"legacy\". Prefer `studioforge keys create`.",
+      "env": "SF_SERVER__API_KEY",
+      "key": "server.api_key",
+      "level": "basic",
+      "restart_required": false,
+      "secret": true,
+      "section": "server",
+      "type": "string | null"
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": [],
+      "description": "Origins allowed to call the API from a browser (and to reach /mcp from one). Empty = none; non-browser clients are unaffected.",
+      "env": "SF_SERVER__CORS_ORIGINS",
+      "key": "server.cors_origins",
+      "level": "advanced",
+      "restart_required": true,
+      "secret": false,
+      "section": "server",
+      "type": "list[string]"
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": false,
+      "description": "Let browsers send credentials cross-origin. Requires explicit cors_origins (no \"*\").",
+      "env": "SF_SERVER__CORS_ALLOW_CREDENTIALS",
+      "key": "server.cors_allow_credentials",
+      "level": "advanced",
+      "restart_required": true,
+      "secret": false,
+      "section": "server",
+      "type": "bool"
+    },
+    {
+      "choices": [
+        "off",
+        "self_signed",
+        "cert"
+      ],
+      "constraints": {},
+      "default": "off",
+      "description": "HTTPS for the gateway, panel and watchdog: off, self_signed (a certificate generated into the data directory, fingerprint shown in the panel) or cert (your own PEM files).",
+      "env": "SF_SERVER__TLS__MODE",
+      "key": "server.tls.mode",
+      "level": "advanced",
+      "restart_required": true,
+      "secret": false,
+      "section": "server",
+      "type": "\"off\" | \"self_signed\" | \"cert\""
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": null,
+      "description": "PEM certificate (chain) served when server.tls.mode is cert.",
+      "env": "SF_SERVER__TLS__CERT_FILE",
+      "key": "server.tls.cert_file",
+      "level": "advanced",
+      "restart_required": true,
+      "secret": false,
+      "section": "server",
+      "type": "path | null"
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": null,
+      "description": "PEM private key served when server.tls.mode is cert.",
+      "env": "SF_SERVER__TLS__KEY_FILE",
+      "key": "server.tls.key_file",
+      "level": "advanced",
+      "restart_required": true,
+      "secret": false,
+      "section": "server",
+      "type": "path | null"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "ge": 0
+      },
+      "default": 30.0,
+      "description": "Seconds to let in-flight requests finish when the server shuts down.",
+      "env": "SF_SERVER__DRAIN_TIMEOUT_S",
+      "key": "server.drain_timeout_s",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "server",
+      "type": "float"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "gt": 0
+      },
+      "default": 900.0,
+      "description": "Seconds a single upstream request may take before it is abandoned with a 504.",
+      "env": "SF_SERVER__REQUEST_TIMEOUT_S",
+      "key": "server.request_timeout_s",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "server",
+      "type": "float"
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": true,
+      "description": "Serve the control panel.",
+      "env": "SF_GUI__ENABLED",
+      "key": "gui.enabled",
+      "level": "advanced",
+      "restart_required": true,
+      "secret": false,
+      "section": "gui",
+      "type": "bool"
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": "127.0.0.1",
+      "description": "Address the control panel binds to.",
+      "env": "SF_GUI__HOST",
+      "key": "gui.host",
+      "level": "advanced",
+      "restart_required": true,
+      "secret": false,
+      "section": "gui",
+      "type": "string"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "ge": 1,
+        "le": 65535
+      },
+      "default": 8080,
+      "description": "TCP port of the control panel.",
+      "env": "SF_GUI__PORT",
+      "key": "gui.port",
+      "level": "basic",
+      "restart_required": true,
+      "secret": false,
+      "section": "gui",
+      "type": "int"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "gt": 0
+      },
+      "default": 2.0,
+      "description": "How often the panel refreshes its live views, in seconds.",
+      "env": "SF_GUI__REFRESH_INTERVAL_S",
+      "key": "gui.refresh_interval_s",
+      "level": "advanced",
+      "restart_required": true,
+      "secret": false,
+      "section": "gui",
+      "type": "float"
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": true,
+      "description": "Run the recovery watchdog sidecar (health, restart, kill tools).",
+      "env": "SF_WATCHDOG__ENABLED",
+      "key": "watchdog.enabled",
+      "level": "advanced",
+      "restart_required": true,
+      "secret": false,
+      "section": "watchdog",
+      "type": "bool"
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": "127.0.0.1",
+      "description": "Address the watchdog binds to.",
+      "env": "SF_WATCHDOG__HOST",
+      "key": "watchdog.host",
+      "level": "advanced",
+      "restart_required": true,
+      "secret": false,
+      "section": "watchdog",
+      "type": "string"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "ge": 1,
+        "le": 65535
+      },
+      "default": 1235,
+      "description": "TCP port of the watchdog (health, restart and its MCP endpoint).",
+      "env": "SF_WATCHDOG__PORT",
+      "key": "watchdog.port",
+      "level": "advanced",
+      "restart_required": true,
+      "secret": false,
+      "section": "watchdog",
+      "type": "int"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "gt": 0
+      },
+      "default": 10.0,
+      "description": "Seconds between the watchdog's own health probes.",
+      "env": "SF_WATCHDOG__POLL_INTERVAL_S",
+      "key": "watchdog.poll_interval_s",
+      "level": "advanced",
+      "restart_required": true,
+      "secret": false,
+      "section": "watchdog",
+      "type": "float"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "gt": 0
+      },
+      "default": 5.0,
+      "description": "Seconds the watchdog waits for the server's /health before counting a failure.",
+      "env": "SF_WATCHDOG__HEALTH_TIMEOUT_S",
+      "key": "watchdog.health_timeout_s",
+      "level": "advanced",
+      "restart_required": true,
+      "secret": false,
+      "section": "watchdog",
+      "type": "float"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "gt": 0
+      },
+      "default": 3,
+      "description": "Consecutive failed probes before the server is called wedged.",
+      "env": "SF_WATCHDOG__WEDGED_AFTER_FAILURES",
+      "key": "watchdog.wedged_after_failures",
+      "level": "advanced",
+      "restart_required": true,
+      "secret": false,
+      "section": "watchdog",
+      "type": "int"
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": true,
+      "description": "Serve the management MCP endpoint on the gateway.",
+      "env": "SF_MCP__ENABLED",
+      "key": "mcp.enabled",
+      "level": "advanced",
+      "restart_required": true,
+      "secret": false,
+      "section": "mcp",
+      "type": "bool"
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": "/mcp",
+      "description": "URL path the MCP endpoint is mounted at.",
+      "env": "SF_MCP__PATH",
+      "key": "mcp.path",
+      "level": "advanced",
+      "restart_required": true,
+      "secret": false,
+      "section": "mcp",
+      "type": "string"
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": null,
+      "description": "DEPRECATED pairing code for the /mcp endpoint ONLY, separate from the API key. Auto-generated on first run and printed in the startup banner. Blank here on purpose -- never commit a real one.",
+      "env": "SF_MCP__PIN",
+      "key": "mcp.pin",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": true,
+      "section": "mcp",
+      "type": "string | null"
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": true,
+      "description": "Require the pairing PIN (or API key) on the MCP endpoint.",
+      "env": "SF_MCP__PIN_REQUIRED",
+      "key": "mcp.pin_required",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "mcp",
+      "type": "bool"
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": true,
+      "description": "Print the reachable MCP URLs (and the PIN) in the startup banner.",
+      "env": "SF_MCP__ADVERTISE",
+      "key": "mcp.advertise",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "mcp",
+      "type": "bool"
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": null,
+      "description": "Your GGUF library. Left null, first run probes for an LM Studio one (including the relocated `downloadsFolder` in ~/.lmstudio/settings.json). models.extra_dirs adds more, scanned after it.",
+      "env": "SF_MODELS__DIR",
+      "key": "models.dir",
+      "level": "basic",
+      "restart_required": false,
+      "secret": false,
+      "section": "models",
+      "type": "path | null"
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": [],
+      "description": "Further directories scanned for models, after models.dir.",
+      "env": "SF_MODELS__EXTRA_DIRS",
+      "key": "models.extra_dirs",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "models",
+      "type": "list[path]"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "gt": 0
+      },
+      "default": 8192,
+      "description": "The context FLOOR. The planner never recommends less than this to buy an extra parallel slot.",
+      "env": "SF_MODELS__DEFAULT_CTX",
+      "key": "models.default_ctx",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "models",
+      "type": "int"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "ge": 0
+      },
+      "default": 600,
+      "description": "Idle countdown for a load that names no tier and has no per-tier entry: 10 minutes since the last request against it. A load with no priority is a background load (D46), and a background model nobody has asked for in ten minutes is VRAM somebody else could use. 0 = never unload.",
+      "env": "SF_MODELS__DEFAULT_TTL_S",
+      "key": "models.default_ttl_s",
+      "level": "basic",
+      "restart_required": false,
+      "secret": false,
+      "section": "models",
+      "type": "int"
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": {
+        "1": 900,
+        "2": 900,
+        "3": 600
+      },
+      "description": "Idle TTL per load tier since the last request: {1: 900, 2: 900, 3: 600} -- the chat model and an agent's model idle out after 15 minutes, background (and any load that named no tier) after 10. Empty = default_ttl_s for every tier.",
+      "env": "SF_MODELS__TTL_BY_PRIORITY",
+      "key": "models.ttl_by_priority",
+      "level": "basic",
+      "restart_required": false,
+      "secret": false,
+      "section": "models",
+      "type": "map[int, int]"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "gt": 0
+      },
+      "default": null,
+      "description": "Null = off. Seconds: every model with no per-model ttl_s and no pin unloads after that much idle time, whatever its tier (replaces the two timers above); a request's own ttl still wins (D75).",
+      "env": "SF_MODELS__AUTO_UNLOAD_IDLE_S",
+      "key": "models.auto_unload_idle_s",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "models",
+      "type": "int | null"
+    },
+    {
+      "choices": [
+        "auto",
+        "f32",
+        "f16",
+        "bf16",
+        "q8_0",
+        "q5_1",
+        "q5_0",
+        "q4_1",
+        "q4_0"
+      ],
+      "constraints": {},
+      "default": "auto",
+      "description": "\"auto\": the planner picks per model rather than forcing one type on the whole library.",
+      "env": "SF_MODELS__DEFAULT_KV_CACHE_TYPE",
+      "key": "models.default_kv_cache_type",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "models",
+      "type": "\"auto\" | \"f32\" | \"f16\" | \"bf16\" | \"q8_0\" | \"q5_1\" | \"q5_0\" | \"q4_1\" | \"q4_0\""
+    },
+    {
+      "choices": [
+        "auto"
+      ],
+      "constraints": {},
+      "default": "auto",
+      "description": "\"auto\": the planner sizes the slot count per model and per placement (see DECISIONS.md D17) instead of forcing every load to one conversation.",
+      "env": "SF_MODELS__DEFAULT_PARALLEL",
+      "key": "models.default_parallel",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "models",
+      "type": "int | \"auto\""
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "gt": 0
+      },
+      "default": 32768,
+      "description": "Per-slot context the parallel estimator assumes when nothing else says. Only used to *size* the slot count and to build the catalog's loading-options table; it never overrides a planned or explicit ctx_size.",
+      "env": "SF_MODELS__CTX_PER_SLOT_DEFAULT",
+      "key": "models.ctx_per_slot_default",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "models",
+      "type": "int"
+    },
+    {
+      "choices": [
+        "on",
+        "off",
+        "auto"
+      ],
+      "constraints": {},
+      "default": "on",
+      "description": "\"on\" rather than \"auto\": flash attention is a large KV-bandwidth and memory win and is supported on every GPU from Ampere (sm_80) up, which is all of this rig. \"auto\" defers the same decision to the engine and has been observed to decline it.",
+      "env": "SF_MODELS__DEFAULT_FLASH_ATTN",
+      "key": "models.default_flash_attn",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "models",
+      "type": "\"on\" | \"off\" | \"auto\""
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "ge": 0
+      },
+      "default": 256,
+      "description": "Prompt-cache reuse: the OpenClaw latency win",
+      "env": "SF_MODELS__DEFAULT_CACHE_REUSE",
+      "key": "models.default_cache_reuse",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "models",
+      "type": "int"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "ge": 0
+      },
+      "default": 8,
+      "description": "Context checkpoints for models whose cache cannot be rolled back (sliding-window \"iswa\" and hybrid ones; full-attention models never make them). Each checkpoint copies the slot's sliding-window cells into HOST RAM (~800 MiB at f16 for a 31B Gemma-4), so the count is capped below the engine's 32. A model's own ctx_checkpoints / checkpoint_min_step setting wins. null = pass nothing (the engine's defaults: 32, 8192 tokens apart).",
+      "env": "SF_MODELS__AUTO_CTX_CHECKPOINTS",
+      "key": "models.auto_ctx_checkpoints",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "models",
+      "type": "int | null"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "ge": 0
+      },
+      "default": null,
+      "description": "`--checkpoint-min-step` for the same models (D72). `None` -- the shipped value -- passes nothing and keeps the engine's 8192: the last user message and the end of every prompt are checkpointed whatever the spacing, which is where a chat's next turn diverges, so a denser spacing...",
+      "env": "SF_MODELS__AUTO_CHECKPOINT_MIN_STEP",
+      "key": "models.auto_checkpoint_min_step",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "models",
+      "type": "int | null"
+    },
+    {
+      "choices": [
+        "none",
+        "deepseek",
+        "deepseek-legacy"
+      ],
+      "constraints": {},
+      "default": "none",
+      "description": "\"none\" keeps a reasoning model's thoughts inline in message.content. llama.cpp's default (\"auto\") splits them into reasoning_content and leaves content empty, which reads as an empty reply to every OpenAI client.",
+      "env": "SF_MODELS__DEFAULT_REASONING_FORMAT",
+      "key": "models.default_reasoning_format",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "models",
+      "type": "\"none\" | \"deepseek\" | \"deepseek-legacy\""
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "gt": 0
+      },
+      "default": 32768,
+      "description": "Reasoning models spend their budget thinking before answering, so the ordinary default truncates the chain of thought AND the visible answer. Applied only when a thinking model has no explicit ctx_size, clamped to the model's trained window and to what actually fits.",
+      "env": "SF_MODELS__THINKING_DEFAULT_CTX",
+      "key": "models.thinking_default_ctx",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "models",
+      "type": "int"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "gt": 0
+      },
+      "default": 1048576,
+      "description": "What every load AIMS for, halving down to what actually fits in VRAM, never below default_ctx.",
+      "env": "SF_MODELS__TARGET_CTX",
+      "key": "models.target_ctx",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "models",
+      "type": "int"
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": true,
+      "description": "Pinned models are loaded at startup AND kept resident: the reconciler reloads one that goes down -- crash past max_restarts, a failure, a pin set while unloaded -- unless a caller explicitly unloaded it (D41). Turning this off reduces a pin to \"no idle TTL, never evicted\".",
+      "env": "SF_MODELS__AUTO_LOAD_PINNED",
+      "key": "models.auto_load_pinned",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "models",
+      "type": "bool"
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": null,
+      "description": "Served when a request omits \"model\", or names one of DEFAULT_MODEL_ALIASES (\"local-model\", \"default\", \"auto\"). LM Studio clients send \"local-model\" as a fallback, so 404-ing it breaks them for no good reason.",
+      "env": "SF_MODELS__DEFAULT_MODEL",
+      "key": "models.default_model",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "models",
+      "type": "string | null"
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": false,
+      "description": "Load the default model at startup so the first request is not also the first (slow) load.",
+      "env": "SF_MODELS__PRELOAD_DEFAULT_MODEL",
+      "key": "models.preload_default_model",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "models",
+      "type": "bool"
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": "b10425",
+      "description": "The llama.cpp build in use. `studioforge engine --update` moves this on only after a smoke test.",
+      "env": "SF_ENGINE__PINNED_TAG",
+      "key": "engine.pinned_tag",
+      "level": "basic",
+      "restart_required": true,
+      "secret": false,
+      "section": "engine",
+      "type": "string"
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": "auto",
+      "description": "\"auto\" picks the CUDA build matching your driver; pin it (\"13.3\", \"12.4\") if the guess is wrong.",
+      "env": "SF_ENGINE__CUDA_VARIANT",
+      "key": "engine.cuda_variant",
+      "level": "advanced",
+      "restart_required": true,
+      "secret": false,
+      "section": "engine",
+      "type": "string"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "gt": 0
+      },
+      "default": 3,
+      "description": "Installed engine builds to keep; older ones are pruned.",
+      "env": "SF_ENGINE__KEEP_VERSIONS",
+      "key": "engine.keep_versions",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "engine",
+      "type": "int"
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": true,
+      "description": "Build llama.cpp from source when no prebuilt asset fits.",
+      "env": "SF_ENGINE__ALLOW_SOURCE_BUILD",
+      "key": "engine.allow_source_build",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "engine",
+      "type": "bool"
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": "ggml-org/llama.cpp",
+      "description": "GitHub repository engine builds are downloaded from.",
+      "env": "SF_ENGINE__REPO",
+      "key": "engine.repo",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "engine",
+      "type": "string"
+    },
+    {
+      "choices": [
+        "stable",
+        "latest"
+      ],
+      "constraints": {},
+      "default": "stable",
+      "description": "Which release \"Check for update\" and `engine --update` act on (D62). \"stable\": the bNNNN build named by upstream's newest vX.Y.Z version release (its nightly-tag.txt asset); \"latest\": the newest bNNNN build with an asset this box can install. The other channel is still reported.",
+      "env": "SF_ENGINE__UPDATE_CHANNEL",
+      "key": "engine.update_channel",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "engine",
+      "type": "\"stable\" | \"latest\""
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "gt": 0
+      },
+      "default": 180.0,
+      "description": "Seconds a new engine build gets to pass its smoke test.",
+      "env": "SF_ENGINE__SMOKE_TEST_TIMEOUT_S",
+      "key": "engine.smoke_test_timeout_s",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "engine",
+      "type": "float"
+    },
+    {
+      "choices": [
+        "auto"
+      ],
+      "constraints": {},
+      "default": "auto",
+      "description": "Host-RAM prompt cache (`--cache-ram`): evicted prompt prefixes are kept in system memory instead of recomputed. Costs no VRAM, changes no output, so it is on by default. \"auto\" = a POOL of 25% of RAM capped at 32 GiB, shared out among the loaded models; an explicit integer is per model, verbatim. 0 disables it, -1 is the engine's \"no limit\".",
+      "env": "SF_ENGINE__CACHE_RAM_MB",
+      "key": "engine.cache_ram_mb",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "engine",
+      "type": "int | \"auto\""
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "gt": 0
+      },
+      "default": null,
+      "description": "`--ubatch-size` for every model that does not set its own. Raising it buys prompt speed with compute-buffer VRAM the planner then charges per card (D40) -- a trade to make knowingly, so it ships unset (engine's 512).",
+      "env": "SF_ENGINE__UBATCH_SIZE",
+      "key": "engine.ubatch_size",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "engine",
+      "type": "int | null"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "gt": 0
+      },
+      "default": 1024,
+      "description": "`--ubatch-size` for a MANY-SLOT launch (>4 slots) when nothing above is set. D38 measured a larger micro-batch as pure prefill speed and D40 made the estimate charge its VRAM, so the automatic raise is safe (error direction: a refused context, never an OOM). Helps exactly the heavy concurrent prefill; a single-stream load stays at the engine's 512. null turns the automatic raise off.",
+      "env": "SF_ENGINE__UBATCH_MANY_SLOTS",
+      "key": "engine.ubatch_many_slots",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "engine",
+      "type": "int | null"
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": false,
+      "description": "`--backend-sampling`: GPU-side sampling. b10425 marks it EXPERIMENTAL, so it is off under the quality-first rule (only lossless, non-experimental features ship enabled).",
+      "env": "SF_ENGINE__BACKEND_SAMPLING",
+      "key": "engine.backend_sampling",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "engine",
+      "type": "bool"
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": true,
+      "description": "STRICT_GPU: every load is fully resident on the GPU (`-ngl 999 --fit off` are always passed; --cpu-moe / --n-cpu-moe / --no-kv-offload and the other CPU-offload flags are refused). false only makes a model's own, off-by- default `allow_partial_cpu_offload` setting effective -- see docs/ENGINES.md.",
+      "env": "SF_ENGINE__STRICT_GPU",
+      "key": "engine.strict_gpu",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "engine",
+      "type": "bool"
+    },
+    {
+      "choices": [
+        "balanced",
+        "fastest_replies",
+        "fastest_long_prompts"
+      ],
+      "constraints": {},
+      "default": "balanced",
+      "description": "Which backend to favour when several are benchmarked for a GPU: balanced, fastest_replies (token generation) or fastest_long_prompts (prompt processing). Nothing benchmarks on its own; see docs/ENGINES.md.",
+      "env": "SF_ENGINE__PREFERENCE",
+      "key": "engine.preference",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "engine",
+      "type": "\"balanced\" | \"fastest_replies\" | \"fastest_long_prompts\""
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": false,
+      "description": "True = refuse to install an engine archive that has no published SHA-256. false (default) installs it, records verified: false and warns.",
+      "env": "SF_ENGINE__REQUIRE_VERIFIED",
+      "key": "engine.require_verified",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "engine",
+      "type": "bool"
+    },
+    {
+      "choices": [
+        "auto",
+        "nvml",
+        "cuda",
+        "rocm",
+        "vulkan",
+        "metal",
+        "null",
+        "fake"
+      ],
+      "constraints": {},
+      "default": "auto",
+      "description": "Auto = NVML, then ROCm, then Vulkan, then Metal; the first that lists a GPU wins. Force nvml / cuda / rocm / vulkan / metal to skip the others. Restart required. (`SF_GPU_PROBE` is the env equivalent while this is auto.)",
+      "env": "SF_GPU__BACKEND",
+      "key": "gpu.backend",
+      "level": "advanced",
+      "restart_required": true,
+      "secret": false,
+      "section": "gpu",
+      "type": "\"auto\" | \"nvml\" | \"cuda\" | \"rocm\" | \"vulkan\" | \"metal\" | \"null\" | \"fake\""
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "ge": 0
+      },
+      "default": 2.0,
+      "description": "Seconds a ROCm / Vulkan / Metal probe result is reused before the vendor tool (amd-smi, vulkaninfo, system_profiler) runs again. NVML is not cached. 0 = query on every call. Restart required.",
+      "env": "SF_GPU__PROBE_CACHE_S",
+      "key": "gpu.probe_cache_s",
+      "level": "advanced",
+      "restart_required": true,
+      "secret": false,
+      "section": "gpu",
+      "type": "float"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "gt": 0
+      },
+      "default": 15.0,
+      "description": "Most seconds one call waits for a vendor tool; past it the last good answer (or no GPUs) is returned and the tool finishes in the background. Restart required.",
+      "env": "SF_GPU__PROBE_TIMEOUT_S",
+      "key": "gpu.probe_timeout_s",
+      "level": "advanced",
+      "restart_required": true,
+      "secret": false,
+      "section": "gpu",
+      "type": "float"
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": 0.1,
+      "description": "Fraction of every card left free (0.10 = 10%).",
+      "env": "SF_PLANNER__HEADROOM_FRACTION",
+      "key": "planner.headroom_fraction",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "planner",
+      "type": "float"
+    },
+    {
+      "choices": [
+        "evict",
+        "reject"
+      ],
+      "constraints": {},
+      "default": "evict",
+      "description": "What to do when a load does not fit: evict other models or reject the load.",
+      "env": "SF_PLANNER__ON_INSUFFICIENT",
+      "key": "planner.on_insufficient",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "planner",
+      "type": "\"evict\" | \"reject\""
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "ge": 0
+      },
+      "default": 0.06,
+      "description": "Compute/graph buffers scale with batch and model width; calibrated against observed loads and refined by predicted-vs-actual logging. See DECISIONS.md.",
+      "env": "SF_PLANNER__COMPUTE_OVERHEAD_FRACTION",
+      "key": "planner.compute_overhead_fraction",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "planner",
+      "type": "float"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "ge": 0
+      },
+      "default": 400,
+      "description": "Minimum compute-buffer reserve per card, in MiB.",
+      "env": "SF_PLANNER__COMPUTE_OVERHEAD_FLOOR_MB",
+      "key": "planner.compute_overhead_floor_mb",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "planner",
+      "type": "int"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "ge": 0
+      },
+      "default": 300,
+      "description": "Per-GPU CUDA context + cuBLAS workspace",
+      "env": "SF_PLANNER__CUDA_CONTEXT_MB",
+      "key": "planner.cuda_context_mb",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "planner",
+      "type": "int"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "gt": 0
+      },
+      "default": 1024,
+      "description": "Tokens assumed per image when planning a vision load.",
+      "env": "SF_PLANNER__IMAGE_TOKENS_DEFAULT",
+      "key": "planner.image_tokens_default",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "planner",
+      "type": "int"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "ge": 0
+      },
+      "default": 512,
+      "description": "VRAM reserved for the multimodal projector's compute, in MiB.",
+      "env": "SF_PLANNER__MMPROJ_COMPUTE_MB",
+      "key": "planner.mmproj_compute_mb",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "planner",
+      "type": "int"
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": true,
+      "description": "Prefer a placement on one GPU over splitting across several.",
+      "env": "SF_PLANNER__PREFER_SINGLE_GPU",
+      "key": "planner.prefer_single_gpu",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "planner",
+      "type": "bool"
+    },
+    {
+      "choices": [
+        "fallback",
+        "never",
+        "any"
+      ],
+      "constraints": {},
+      "default": "fallback",
+      "description": "Whether a layer split may mix GPU generations (Blackwell with Ampere).",
+      "env": "SF_PLANNER__MIXED_GENERATION_SPLIT",
+      "key": "planner.mixed_generation_split",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "planner",
+      "type": "\"fallback\" | \"never\" | \"any\""
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": true,
+      "description": "Trust what a configuration measured last time over what the formula computes for it (D51): a clean per-device observation of the same model at the same context, slots, KV cache types and device COUNT is taken as the estimate plus 10%, clamped to 0.60-1.30 of the formula's own answer.",
+      "env": "SF_PLANNER__OBSERVED_CORRECTION",
+      "key": "planner.observed_correction",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "planner",
+      "type": "bool"
+    },
+    {
+      "choices": [
+        "auto",
+        "suggest",
+        "off"
+      ],
+      "constraints": {},
+      "default": "auto",
+      "description": "Whether the sweep may relocate an idle resident whose placement went stale (D42) -- e.g. still sharing a card with another model long after the layout that forced it is gone. `\"auto\"` reloads it onto the strictly better placement when the whole box is quiet",
+      "env": "SF_PLANNER__REBALANCE",
+      "key": "planner.rebalance",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "planner",
+      "type": "\"auto\" | \"suggest\" | \"off\""
+    },
+    {
+      "choices": [
+        "quality",
+        "throughput"
+      ],
+      "constraints": {},
+      "default": "quality",
+      "description": "What the catalog's one recommended load per model optimises for (D36): \"quality\" = the best KV cache that reaches the context floor, then the largest window at that quality; \"throughput\" = the largest window, and a second slot if it fits, even with a quantized cache.",
+      "env": "SF_PLANNER__PREFERENCE",
+      "key": "planner.preference",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "planner",
+      "type": "\"quality\" | \"throughput\""
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": {
+        "MXFP4": {
+          "min_compute_capability": "12.0",
+          "mode": "prefer"
+        },
+        "NVFP4": {
+          "min_compute_capability": "12.0",
+          "mode": "prefer"
+        }
+      },
+      "description": "Quant family -> hardware affinity. Keys are matched case-insensitively against the model's quant label. See default_quant_affinity().",
+      "env": "SF_PLANNER__QUANT_AFFINITY",
+      "key": "planner.quant_affinity",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "planner",
+      "type": "map[string, QuantAffinity]"
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": [],
+      "description": "CUDA indices the planner may never touch, for a box that also runs ComfyUI or a training job.",
+      "env": "SF_PLANNER__EXCLUDED_DEVICES",
+      "key": "planner.excluded_devices",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "planner",
+      "type": "list[int]"
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": {},
+      "description": "{index: MiB} held back on a card -- the softer version of the same knob, applied even to a forced placement, because it is the NEIGHBOUR's memory.",
+      "env": "SF_PLANNER__RESERVED_MB",
+      "key": "planner.reserved_mb",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "planner",
+      "type": "map[int, int]"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "ge": 1,
+        "le": 65535
+      },
+      "default": 18100,
+      "description": "First loopback port used for llama-server children.",
+      "env": "SF_GATEWAY__CHILD_PORT_START",
+      "key": "gateway.child_port_start",
+      "level": "advanced",
+      "restart_required": true,
+      "secret": false,
+      "section": "gateway",
+      "type": "int"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "ge": 1,
+        "le": 65535
+      },
+      "default": 18200,
+      "description": "Last loopback port used for llama-server children.",
+      "env": "SF_GATEWAY__CHILD_PORT_END",
+      "key": "gateway.child_port_end",
+      "level": "advanced",
+      "restart_required": true,
+      "secret": false,
+      "section": "gateway",
+      "type": "int"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "gt": 0
+      },
+      "default": 600.0,
+      "description": "Seconds a model gets to become healthy after it is started.",
+      "env": "SF_GATEWAY__LOAD_TIMEOUT_S",
+      "key": "gateway.load_timeout_s",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "gateway",
+      "type": "float"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "gt": 0
+      },
+      "default": 0.5,
+      "description": "Seconds between health polls while a model loads.",
+      "env": "SF_GATEWAY__HEALTH_POLL_INTERVAL_S",
+      "key": "gateway.health_poll_interval_s",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "gateway",
+      "type": "float"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "ge": 0
+      },
+      "default": 3,
+      "description": "Times a crashed llama-server is restarted before giving up.",
+      "env": "SF_GATEWAY__MAX_RESTARTS",
+      "key": "gateway.max_restarts",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "gateway",
+      "type": "int"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "ge": 0
+      },
+      "default": 2.0,
+      "description": "Seconds to wait between restart attempts (grows each time).",
+      "env": "SF_GATEWAY__RESTART_BACKOFF_S",
+      "key": "gateway.restart_backoff_s",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "gateway",
+      "type": "float"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "ge": 0
+      },
+      "default": 8,
+      "description": "Most images accepted in one request.",
+      "env": "SF_GATEWAY__MAX_IMAGES_PER_REQUEST",
+      "key": "gateway.max_images_per_request",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "gateway",
+      "type": "int"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "gt": 0
+      },
+      "default": 20971520,
+      "description": "Largest accepted image, in bytes.",
+      "env": "SF_GATEWAY__MAX_IMAGE_BYTES",
+      "key": "gateway.max_image_bytes",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "gateway",
+      "type": "int"
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": false,
+      "description": "Vision image_url fetches are the one outbound request a CALLER chooses, so by default the server refuses loopback/private/link-local targets: on an open install that made it an unauthenticated probe for anything else on the LAN or tailnet.",
+      "env": "SF_GATEWAY__ALLOW_PRIVATE_IMAGE_HOSTS",
+      "key": "gateway.allow_private_image_hosts",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "gateway",
+      "type": "bool"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "gt": 0
+      },
+      "default": 20.0,
+      "description": "Seconds allowed to download a remote image.",
+      "env": "SF_GATEWAY__IMAGE_FETCH_TIMEOUT_S",
+      "key": "gateway.image_fetch_timeout_s",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "gateway",
+      "type": "float"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "gt": 0
+      },
+      "default": 2048,
+      "description": "Largest image side in pixels; larger images are downscaled.",
+      "env": "SF_GATEWAY__MAX_IMAGE_DIM",
+      "key": "gateway.max_image_dim",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "gateway",
+      "type": "int"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "gt": 0
+      },
+      "default": 15.0,
+      "description": "Seconds between the sweeps that unload idle models.",
+      "env": "SF_GATEWAY__TTL_SWEEP_INTERVAL_S",
+      "key": "gateway.ttl_sweep_interval_s",
+      "level": "basic",
+      "restart_required": false,
+      "secret": false,
+      "section": "gateway",
+      "type": "float"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "gt": 0
+      },
+      "default": 5.0,
+      "description": "While a streaming request waits on a JIT load, emit an SSE comment this often so the client's read timeout cannot fire on a load that is progressing. Large models take minutes to page in from disk.",
+      "env": "SF_GATEWAY__STREAM_KEEPALIVE_INTERVAL_S",
+      "key": "gateway.stream_keepalive_interval_s",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "gateway",
+      "type": "float"
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": true,
+      "description": "Merge a reasoning-only reply into `content` rather than returning \"\".",
+      "env": "SF_GATEWAY__MERGE_REASONING_INTO_CONTENT",
+      "key": "gateway.merge_reasoning_into_content",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "gateway",
+      "type": "bool"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "gt": 0
+      },
+      "default": 20.0,
+      "description": "Deep health probe: a real streamed completion per loaded model. Small and bounded, because a check that can hang is worse than no check.",
+      "env": "SF_GATEWAY__DEEP_PROBE_TIMEOUT_S",
+      "key": "gateway.deep_probe_timeout_s",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "gateway",
+      "type": "float"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "gt": 0
+      },
+      "default": 8,
+      "description": "Tokens a deep health probe generates.",
+      "env": "SF_GATEWAY__DEEP_PROBE_MAX_TOKENS",
+      "key": "gateway.deep_probe_max_tokens",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "gateway",
+      "type": "int"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "gt": 0
+      },
+      "default": 180.0,
+      "description": "Vacating (D56): when a better-class lease asks for cards a holder that registered a `vacate_url` is holding, the holder has this long to release before the asker gets today's plain `409 lease_conflict` again.",
+      "env": "SF_LEASES__VACATE_TIMEOUT_S",
+      "key": "leases.vacate_timeout_s",
+      "level": "advanced",
+      "restart_required": true,
+      "secret": false,
+      "section": "leases",
+      "type": "float"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "gt": 0
+      },
+      "default": 15.0,
+      "description": "The re-ask interval handed to a requester (`retry_after_s` and the `Retry-After` header) while the holder is vacating.",
+      "env": "SF_LEASES__VACATE_RETRY_AFTER_S",
+      "key": "leases.vacate_retry_after_s",
+      "level": "advanced",
+      "restart_required": true,
+      "secret": false,
+      "section": "leases",
+      "type": "float"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "gt": 0
+      },
+      "default": 30.0,
+      "description": "Per-request HTTP timeout for the one vacate POST to the holder -- the ACK budget, not the release window (that is `vacate_timeout_s`).",
+      "env": "SF_LEASES__VACATE_CALLBACK_TIMEOUT_S",
+      "key": "leases.vacate_callback_timeout_s",
+      "level": "advanced",
+      "restart_required": true,
+      "secret": false,
+      "section": "leases",
+      "type": "float"
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": [],
+      "description": "The tenant registry (D77, docs/TENANTS.md): other programs that share these GPUs. Declaring one here puts it on the Tenants card with live health before it has registered itself; a program may also announce itself at runtime with POST /api/tenants/register (the two merge by name). StudioForge never starts or stops a tenant (D79): `kind: module` only means it may be ASKED to warm through its own warm_url. Every URL must be loopback, a tailnet address (100.64.0.0/10) or a host in allowed_hosts below; nothing else is ever called, and names are never resolved. Two examples, commented out: registry: # SpeechForge, a speech module on the same box: one card, class 2. - name: speechforge kind: module health_url: http://127.0.0.1:1236/health warm_url: http://127.0.0.1:1236/v1/speech/warm default_priority: 2 notes: speech-to-text and text-to-speech; leases one card while a session is open # ClawForge2, the image gateway: a plain tenant that leases ComfyUI's card. - name: clawforge2 kind: tenant health_url: http://127.0.0.1:8700/health status_url: http://127.0.0.1:8700/ui/api/status default_priority: 3",
+      "env": "SF_TENANTS__REGISTRY",
+      "key": "tenants.registry",
+      "level": "advanced",
+      "restart_required": true,
+      "secret": false,
+      "section": "tenants",
+      "type": "list[TenantEntry]"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "gt": 0
+      },
+      "default": 30.0,
+      "description": "How often every registered `health_url` is polled.",
+      "env": "SF_TENANTS__HEALTH_INTERVAL_S",
+      "key": "tenants.health_interval_s",
+      "level": "advanced",
+      "restart_required": true,
+      "secret": false,
+      "section": "tenants",
+      "type": "float"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "gt": 0
+      },
+      "default": 2.0,
+      "description": "Per-poll HTTP timeout. Two seconds: a health route that takes longer is unhealthy for this purpose, and the poller must never pile up.",
+      "env": "SF_TENANTS__HEALTH_TIMEOUT_S",
+      "key": "tenants.health_timeout_s",
+      "level": "advanced",
+      "restart_required": true,
+      "secret": false,
+      "section": "tenants",
+      "type": "float"
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": [],
+      "description": "Hosts, beyond loopback and the tailnet range, a tenant URL may name -- as IP literals or as names compared verbatim (never resolved).",
+      "env": "SF_TENANTS__ALLOWED_HOSTS",
+      "key": "tenants.allowed_hosts",
+      "level": "advanced",
+      "restart_required": true,
+      "secret": false,
+      "section": "tenants",
+      "type": "list[string]"
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": 2,
+      "description": "The D46 class this server's own benchmark leases carry: 2 may ask a background render tenant to vacate; 3 asks nobody (pre-D56 behaviour).",
+      "env": "SF_BENCHMARK__LEASE_PRIORITY",
+      "key": "benchmark.lease_priority",
+      "level": "advanced",
+      "restart_required": true,
+      "secret": false,
+      "section": "benchmark",
+      "type": "int"
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": null,
+      "description": "HuggingFace token for gated repos. A secret: it is registered for log redaction, and it does not belong in version control.",
+      "env": "SF_HF__TOKEN",
+      "key": "hf.token",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": true,
+      "section": "hf",
+      "type": "string | null"
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": null,
+      "description": "Reserved: no code reads this key yet (the metadata cache lives under the data directory).",
+      "env": "SF_HF__CACHE_DIR",
+      "key": "hf.cache_dir",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "hf",
+      "type": "path | null"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "gt": 0
+      },
+      "default": 2,
+      "description": "Downloads that run at the same time.",
+      "env": "SF_HF__MAX_CONCURRENT_DOWNLOADS",
+      "key": "hf.max_concurrent_downloads",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "hf",
+      "type": "int"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "gt": 0
+      },
+      "default": 8388608,
+      "description": "Bytes requested per HTTP range read while downloading.",
+      "env": "SF_HF__CHUNK_BYTES",
+      "key": "hf.chunk_bytes",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "hf",
+      "type": "int"
+    },
+    {
+      "choices": [
+        "DEBUG",
+        "INFO",
+        "WARNING",
+        "ERROR",
+        "CRITICAL"
+      ],
+      "constraints": {},
+      "default": "INFO",
+      "description": "Minimum log level: DEBUG, INFO, WARNING or ERROR.",
+      "env": "SF_LOGGING__LEVEL",
+      "key": "logging.level",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "logging",
+      "type": "\"DEBUG\" | \"INFO\" | \"WARNING\" | \"ERROR\" | \"CRITICAL\""
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": false,
+      "description": "Write logs as JSON lines instead of text.",
+      "env": "SF_LOGGING__JSON",
+      "key": "logging.json",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "logging",
+      "type": "bool"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "ge": 0
+      },
+      "default": 20,
+      "description": "Log files rotate at this size (MiB) and keep this many copies (D69). 0 never rotates.",
+      "env": "SF_LOGGING__FILE_MAX_MB",
+      "key": "logging.file_max_mb",
+      "level": "advanced",
+      "restart_required": true,
+      "secret": false,
+      "section": "logging",
+      "type": "int"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "ge": 1,
+        "le": 100
+      },
+      "default": 5,
+      "description": "Rotated copies kept per log file, newest first; the oldest is deleted when a new one is made. At least 1.",
+      "env": "SF_LOGGING__FILE_BACKUPS",
+      "key": "logging.file_backups",
+      "level": "advanced",
+      "restart_required": true,
+      "secret": false,
+      "section": "logging",
+      "type": "int"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "ge": 0
+      },
+      "default": 10,
+      "description": "The audit log (logs/audit.jsonl: every admin mutation and mutating MCP call) rotates at this size (MiB) and keeps this many copies.",
+      "env": "SF_LOGGING__AUDIT_FILE_MAX_MB",
+      "key": "logging.audit_file_max_mb",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "logging",
+      "type": "int"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "ge": 1,
+        "le": 1000
+      },
+      "default": 10,
+      "description": "Rotated audit logs kept, newest first.",
+      "env": "SF_LOGGING__AUDIT_FILE_BACKUPS",
+      "key": "logging.audit_file_backups",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "logging",
+      "type": "int"
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": null,
+      "description": "GitHub `owner/name` that publishes StudioForge releases, or null when there is none yet: the self-update check then reports \"not configured\" without asking GitHub. (The old placeholder `studioforge/studioforge` is treated the same as null.)",
+      "env": "SF_UPDATE__REPO",
+      "key": "update.repo",
+      "level": "basic",
+      "restart_required": false,
+      "secret": false,
+      "section": "update",
+      "type": "string | null"
+    },
+    {
+      "choices": [
+        "stable",
+        "prerelease"
+      ],
+      "constraints": {},
+      "default": "stable",
+      "description": "Release channel the updater follows (stable or prerelease).",
+      "env": "SF_UPDATE__CHANNEL",
+      "key": "update.channel",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "update",
+      "type": "\"stable\" | \"prerelease\""
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": true,
+      "description": "Reserved: not read by any code path yet.",
+      "env": "SF_UPDATE__AUTO_CHECK",
+      "key": "update.auto_check",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "update",
+      "type": "bool"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "gt": 0
+      },
+      "default": 24.0,
+      "description": "Reserved: not read by any code path yet.",
+      "env": "SF_UPDATE__CHECK_INTERVAL_H",
+      "key": "update.check_interval_h",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "update",
+      "type": "float"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "gt": 0
+      },
+      "default": 60.0,
+      "description": "Seconds a freshly installed release gets to report healthy before it is rolled back.",
+      "env": "SF_UPDATE__HEALTH_CHECK_TIMEOUT_S",
+      "key": "update.health_check_timeout_s",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "update",
+      "type": "float"
+    }
+  ]
+}

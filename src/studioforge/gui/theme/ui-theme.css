@@ -1,7 +1,7 @@
-/* GENERATED theme tokens: ThemeForge 1.0.0, drop-in bundle (ui-theme/).
+/* GENERATED theme tokens: ThemeForge 1.2.0, drop-in bundle (ui-theme/).
    https://github.com/LaserLloyd/ThemeForge . Do not edit this copy: update the whole
    folder (python ui-theme/update.py) and keep app styles in the app.
-   body sha256: 2447a7108667201e */
+   body sha256: 059625214785c466 */
 /* ============================================================================
    theme-base.css — the token contract, Purple (the base theme), and the
    theme-agnostic element layer.
@@ -94,6 +94,12 @@
   --highlight:         #fcd34d;
   --highlight-subtle:  rgba(252,211,77,.12);
   --on-highlight:      #251a00;
+  /* --cta-gradient: the gradient fill for a primary call to action, from the
+     hover step to the resting step. A background image only; its label still
+     uses --on-cta. Core themes carry the gradient DisPatch shipped with
+     (Purple's from its purple palette); opt-in themes derive theirs from
+     --cta-hover and --cta. */
+  --cta-gradient:      linear-gradient(135deg, var(--accent-hover), var(--accent));
 
   /* ---- Lines ---- */
   --border-subtle:      #21213b;
@@ -174,6 +180,18 @@
   --on-idle:      #251a00;
   --on-offline:   #ffffff;
   --on-heartbeat: #2a0c1c;
+
+  /* ---- Notification ----
+     The unread indicator. --notify is the one token whose job is to be
+     noticed; --notify-idle marks the same spot when nothing is waiting.
+     Solved as a pair against the rail and sidebar grounds (--surface-0 and
+     --surface-1), and tools/check_contrast.py checks all three rules:
+       --notify        >= 4.5:1  (impossible to miss)
+       --notify-idle   <= 3:1    (present, unremarkable)
+       --notify vs --notify-idle >= 3:1 (the two states never blur)
+     Pair it with a size change too; colour alone is not enough (WCAG 1.4.1). */
+  --notify:      #a78bfa;
+  --notify-idle: #38385c;
 
   /* ---- Overlays ---- */
   --scrim:         rgba(6,6,14,.66);
@@ -275,7 +293,7 @@
   /* ---- Type families ---- */
   --font-sans:    'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   --font-serif:   var(--font-sans);
-  --font-mono:    'JetBrains Mono', 'Fira Code', ui-monospace, SFMono-Regular, Menlo, monospace;
+  --font-mono:    'JetBrains Mono', 'Fira Code', ui-monospace, monospace;  /* no SFMono-Regular/Menlo: ui-monospace covers Apple, and Linux fontconfig maps both names to a proportional sans */
   --font-display: var(--font-sans);
 
   /* ---- Elevation ---- */
@@ -435,6 +453,8 @@
   --accent:          #7a5c12;
   --accent-hover:    #916d15;
   --accent-pressed:  #5f470d;  /* D */
+  --cta-gradient:    linear-gradient(135deg, #8d721b, var(--accent-hover), var(--accent));  /* D */
+  --notify: #ffca28; --notify-idle: #474133;  /* D — unread indicator, solved as a pair */
   --accent-subtle:   rgba(122,92,18,.20);  /* D */
   --accent-muted:    rgba(122,92,18,.34);  /* D */
   --accent-glow:     rgba(227,191,90,.30); /* D */
@@ -594,6 +614,8 @@
   --accent:          #185e7a;
   --accent-hover:    #206b88;
   --accent-pressed:  #12495f;  /* D */
+  --cta-gradient:    linear-gradient(135deg, #387d94, var(--accent-hover), var(--accent));  /* D */
+  --notify: #7fe0f2; --notify-idle: #33424a;  /* D — unread indicator, solved as a pair */
   --accent-subtle:   rgba(24,94,122,.24);  /* D */
   --accent-muted:    rgba(24,94,122,.40);  /* D */
   --accent-glow:     rgba(127,224,242,.28);/* D */
@@ -775,6 +797,8 @@
   --accent:          #396237;
   --accent-hover:    #447341;
   --accent-pressed:  #2e502f;
+  --cta-gradient:    linear-gradient(135deg, #5b9257, var(--accent-hover), var(--accent));  /* D — a lighter step of the green accent */
+  --notify: #b5d59b; --notify-idle: #3c4536;  /* D — unread indicator, solved as a pair: notify = the pale lichen of the focus ring; idle a mossy step above --border */
   --accent-subtle:   rgba(57,98,55,.26);
   --accent-muted:    rgba(57,98,55,.42);
   --accent-glow:     rgba(181,213,155,.28);
@@ -938,6 +962,8 @@
   --accent:          #a3241c;
   --accent-hover:    #b8362d;
   --accent-pressed:  #8a1f18;  /* D */
+  --cta-gradient:    linear-gradient(180deg, var(--accent-hover), var(--accent));  /* D */
+  --notify: #8f1d16; --notify-idle: #c7bda0;  /* D — unread indicator, solved as a pair */
   --accent-subtle:   rgba(163,36,28,.12);  /* D */
   --accent-muted:    rgba(163,36,28,.24);  /* D */
   --accent-glow:     rgba(163,36,28,.26);  /* D */
@@ -1104,6 +1130,8 @@
   --accent:          #2c56c9;
   --accent-hover:    #3866d8;
   --accent-pressed:  #1d47b8;
+  --cta-gradient:    linear-gradient(135deg, #4371d3, var(--accent-hover), var(--accent));  /* D */
+  --notify: #1d47b8; --notify-idle: #c3c8d1;  /* D — unread indicator, solved as a pair */
   --accent-subtle:   rgba(44,86,201,.10);  /* D */
   --accent-muted:    rgba(44,86,201,.22);  /* D */
   --accent-glow:     rgba(44,86,201,.28);  /* D */
@@ -1229,6 +1257,511 @@
   --unselected-border: var(--text-tertiary);
 }
 
+/* theme-slate.css — CORE
+   Ground: dark · family: slate · color-scheme: dark
+   theme-color: #0f1318
+   The neutral, professional default: a cool grey-blue ground with no strong hue, a steel-blue
+   accent, muted status colours, and dense-but-calm geometry (tighter radii and control
+   heights than the other themes; text sizes and the touch target stay the shared scale).
+   (D) = derived from this theme's own palette. */
+
+[data-palette="slate"] {
+  color-scheme: dark;
+
+  /* Dense: smaller radii and controls. Controls stay 26px or taller (WCAG 2.5.8 asks 24). */
+  --radius-xs: 3px;
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-xl: 12px;
+  --control-h-sm: 26px;
+  --control-h-md: 32px;
+  --control-h-lg: 40px;
+  --header-h: 48px;
+  --bar-h: 52px;
+  --sidebar-w: 280px;
+
+  --surface-void:    #0a0d11;
+  --surface-0:       #0f1318;
+  --surface-1:       #141920;
+  --surface-2:       #1a2027;
+  --surface-3:       #212831;
+  --surface-4:       #29313b;
+  --surface-sunken:  #0c1014;
+  --surface-overlay: #1d242c;
+  --glass-1:         rgba(26,32,39,.78);  /* D */
+  --glass-2:         rgba(26,32,39,.90);  /* D */
+  --glass-3:         rgba(15,19,24,.94);  /* D */
+  --glass-highlight: rgba(255,255,255,.04);  /* D */
+  --code-bg:         #0a0e12;
+
+  --text-primary:    #e4e9ef;
+  --text-secondary:  #a9b4c0;
+  --text-tertiary:   #93a0ae;
+  --text-disabled:   #76838f;
+  --text-inverse:    #0f1318;
+  --text-link:       #86b8ee;
+  --text-link-hover: #b0d2f6;
+  --on-accent:       #ffffff;
+  --on-danger:       #260808;
+  --on-success:      #04200f;
+  --on-warning:      #231a02;
+  --on-media:        #ffffff;
+  --on-media-muted:  #d5dce4;
+
+  --accent:          #2f6db3;
+  --accent-hover:    #3676be;
+  --accent-pressed:  #285f9f;
+  --cta-gradient:    linear-gradient(135deg, var(--accent-hover), var(--accent));
+  --notify: #86b8ee; --notify-idle: #2c3642;  /* D — unread indicator, solved as a pair */
+  --accent-subtle:   rgba(47,109,179,.18);  /* D */
+  --accent-muted:    rgba(47,109,179,.30);  /* D */
+  --accent-glow:     rgba(47,109,179,.36);  /* D */
+  --accent-rgb:      47,109,179;
+  --accent-2:        #6fc9c0;
+  --accent-2-subtle: rgba(111,201,192,.12);  /* D */
+
+  --cta:              #2f6db3;  /* D — aliases accent */
+  --cta-hover:        #3676be;  /* D */
+  --cta-pressed:      #285f9f;  /* D */
+  --on-cta:           #ffffff;  /* D */
+  --cta-shadow:       0 4px 14px rgba(47,109,179,.26);  /* D */
+  --cta-shadow-hover: 0 8px 22px rgba(47,109,179,.34);  /* D */
+  --highlight:        #e5c36b;
+  --highlight-subtle: rgba(229,195,107,.12);  /* D */
+  --on-highlight:     #231a02;  /* D */
+
+  --border-subtle:       #1f262e;  /* D */
+  --border:              #29323c;
+  --border-strong:       #6d7c8c;
+  --divider:             #1f262e;  /* D */
+  --focus-ring:          #86b8ee;
+  --glass-stroke:        rgba(255,255,255,.07);  /* D */
+  --glass-stroke-strong: rgba(255,255,255,.14);  /* D */
+
+  --success: #3fb985; --success-hover: #62c9a0;
+  --success-subtle: rgba(63,185,133,.13); --success-text: #5fcf9f;
+  --success-border: rgba(63,185,133,.40);
+  --warning: #d9a43f; --warning-hover: #e4b862;
+  --warning-subtle: rgba(217,164,63,.13); --warning-text: #e6b85c;
+  --warning-border: rgba(217,164,63,.40);
+  --danger: #e0645c; --danger-hover: #e98a84;
+  --danger-subtle: rgba(224,100,92,.13); --danger-text: #ee8a83;
+  --danger-border: rgba(224,100,92,.40);
+  --info: #5aa6e6; --info-hover: #82bcee;
+  --info-subtle: rgba(90,166,230,.13); --info-text: #7ab9ee;
+  --info-border: rgba(90,166,230,.40);
+  --live: #52c77a; --live-hover: #78d796;
+  --live-subtle: rgba(82,199,122,.14); --live-text: #6dd592;
+  --live-border: rgba(82,199,122,.42);
+  --idle: #d9a43f; --idle-hover: #e4b862;
+  --idle-subtle: rgba(217,164,63,.13); --idle-text: #e6b85c;
+  --idle-border: rgba(217,164,63,.36);
+  --offline: #6b7685; --offline-hover: #8591a1;
+  --offline-subtle: rgba(107,118,133,.17); --offline-text: #9aa6b4;
+  --offline-border: rgba(107,118,133,.42);
+  --heartbeat: #d77ab4; --heartbeat-hover: #e298c6;
+  --heartbeat-subtle: rgba(215,122,180,.13); --heartbeat-text: #e598c6;
+  --heartbeat-border: rgba(215,122,180,.40);
+  --on-info: #041022; --on-live: #052210; --on-idle: #231a02;  /* D */
+  --on-offline: #ffffff; --on-heartbeat: #2a0c1c;              /* D */
+
+  --scrim:        rgba(5,8,12,.66);  /* D */
+  --scrim-strong: rgba(3,5,9,.88);   /* D */
+  --scrim-light:  rgba(5,8,12,.44);  /* D */
+  --scrim-media:  linear-gradient(to top, rgba(6,9,13,.88), rgba(6,9,13,0)); /* D */
+
+  --bubble-user-bg:        #243a57;
+  --bubble-user-text:      #e4e9ef;  /* D */
+  --bubble-user-border:    #2d4668;  /* D */
+  --bubble-assistant-bg:   #1a2027;
+  --bubble-assistant-text: #e4e9ef;  /* D */
+  --quote-bar:             #6fc9c0;
+  --mark-bg:               rgba(217,164,63,.28);
+  --md-bold:               #ffffff;
+  --md-italic:             #e5c36b;
+  --md-bolditalic:         #f0d99a;  /* D */
+  --md-bolditalic-glow:    rgba(240,217,154,.30);  /* D */
+  --rp-speech:  #e4e9ef;  /* D */
+  --rp-action:  #a9b4c0;  /* D */
+  --rp-thought: #a6e0da;  /* D */
+  --rp-whisper: #93a0ae;  /* D */
+  --rp-ooc:     #93a0ae;  /* D */
+  --rp-shout:   #f0a36b;  /* D */
+  --rp-shout-glow: rgba(240,163,107,.40);  /* D */
+  --rp-critical: #ee8a96;  /* D */
+  --rp-critical-glow: rgba(238,138,150,.40);  /* D */
+  --diff-add-bg: rgba(63,185,133,.14); --diff-add-text: #84dcb4;      /* D */
+  --diff-remove-bg: rgba(224,100,92,.14); --diff-remove-text: #f0a09a; /* D */
+
+  /* Syntax — D, on the dark --syn-bg */
+  --syn-fg: #dde4ec;      --syn-bg: #0a0e12;
+  --syn-comment: #7f8b99; --syn-keyword: #a9b8f2; --syn-string: #86d9b4;
+  --syn-number: #f0c070;  --syn-function: #86bff0; --syn-title: #86bff0;
+  --syn-type: #6fd0c6;    --syn-variable: #e8a8c8; --syn-attr: #f0d08a;
+  --syn-tag: #a9b8f2;     --syn-builtin: #6fd0c6;  --syn-literal: #f0c070;
+  --syn-meta: #98a4b2;    --syn-operator: #c6d0de; --syn-punctuation: #b2bccb;
+  --syn-deletion: #f0a09a; --syn-addition: #84dcb4;
+
+  /* Categorical — D, 3:1 or better on --surface-0 */
+  --cat-1: #6fa8e8; --cat-2: #5fcf9f; --cat-3: #e6b85c; --cat-4: #ee8a83;
+  --cat-5: #b79ae8; --cat-6: #6fc9c0; --cat-7: #e598c6; --cat-8: #9bb3c9;
+  --cat-9: #c4d36b; --cat-10: #f0a36b; --cat-11: #8e9be8; --cat-12: #aab4c0;
+  --chart-grid: rgba(255,255,255,.07);  /* D */
+  --chart-axis: #6b7886;                /* D */
+
+  --canvas-mask:    rgba(5,8,12,.70);  /* D */
+  --canvas-handle:  #86b8ee;
+  --canvas-guide:   rgba(134,184,238,.55);  /* D */
+  --canvas-outline: #e4e9ef;
+
+  --shadow-1: 0 1px 2px rgba(0,0,0,.30);
+  --shadow-2: 0 4px 14px rgba(0,0,0,.36);
+  --shadow-3: 0 14px 40px rgba(0,0,0,.50);
+  --shadow-4: 0 26px 70px rgba(0,0,0,.62);
+  --shadow-glow:  0 0 0 1px rgba(47,109,179,.30), 0 6px 22px rgba(47,109,179,.24);
+  --shadow-inset: inset 0 1px 0 rgba(255,255,255,.04);
+
+  --selection-bg:    rgba(47,109,179,.45);  /* D */
+  --selection-text:  #ffffff;
+  --scrollbar-track: transparent;
+  --scrollbar-thumb: #2f3945;  /* D */
+  --scrollbar-hover: #435061;  /* D */
+  /* The empty part of a slider: 3.4:1 on surface-2. */
+  --control-track: #5f6c7b;
+}
+
+/* theme-high-contrast.css — CORE
+   Ground: dark · family: high-contrast · color-scheme: dark
+   theme-color: #000000
+   Contrast profile: high (tools/check_contrast.py): 7:1 for every text colour, 4.5:1 for
+   edges, the focus ring, state indicators and chart colours, 3:1 for every line, and no
+   translucent colour token (surfaces, strokes, fills and glows are solid; shadows and glows
+   are zero-size). Separation comes from edges and weight, not from tint or depth.
+   (D) = derived from this theme's own palette. */
+
+[data-palette="high-contrast"] {
+  color-scheme: dark;
+
+  --surface-void:    #000000;
+  --surface-0:       #000000;
+  --surface-1:       #0d0d0d;
+  --surface-2:       #171717;
+  --surface-3:       #222222;
+  --surface-4:       #2e2e2e;
+  --surface-sunken:  #000000;
+  --surface-overlay: #171717;
+  --glass-1:         #171717;  /* D — solid: no translucent panes */
+  --glass-2:         #171717;  /* D */
+  --glass-3:         #0d0d0d;  /* D */
+  --glass-highlight: transparent;
+  --code-bg:         #000000;
+
+  --text-primary:    #ffffff;
+  --text-secondary:  #e0e0e0;
+  --text-tertiary:   #cfcfcf;
+  --text-disabled:   #9e9e9e;
+  --text-inverse:    #000000;
+  --text-link:       #7fd6ff;
+  --text-link-hover: #b8ebff;
+  --on-accent:       #000000;
+  --on-danger:       #000000;
+  --on-success:      #000000;
+  --on-warning:      #000000;
+  --on-media:        #ffffff;
+  --on-media-muted:  #e0e0e0;
+
+  --accent:          #ffd400;
+  --accent-hover:    #ffe347;
+  --accent-pressed:  #e6bd00;
+  --cta-gradient:    linear-gradient(135deg, var(--accent-hover), var(--accent));
+  --notify: #ffd400; --notify-idle: #555555;  /* unread pair: 5.3:1 apart, idle under 3:1 */
+  --accent-subtle:   #332a00;  /* D — solid tint */
+  --accent-muted:    #4d3f00;  /* D */
+  --accent-glow:     transparent;
+  --accent-rgb:      255,212,0;
+  --accent-2:        #5ef0ff;
+  --accent-2-subtle: #00323a;  /* D */
+
+  --cta:              #ffd400;  /* D — aliases accent */
+  --cta-hover:        #ffe347;  /* D */
+  --cta-pressed:      #e6bd00;  /* D */
+  --on-cta:           #000000;  /* D */
+  --cta-shadow:       0 0 0 0 transparent;
+  --cta-shadow-hover: 0 0 0 0 transparent;
+  --highlight:        #ffe347;
+  --highlight-subtle: #332a00;  /* D */
+  --on-highlight:     #000000;  /* D */
+
+  --border-subtle:       #8a8a8a;  /* D — every line is visible: 3:1 or better */
+  --border:              #b3b3b3;
+  --border-strong:       #e6e6e6;
+  --divider:             #8a8a8a;  /* D */
+  --focus-ring:          #ffd400;
+  --focus-ring-width:    3px;
+  --glass-stroke:        #8a8a8a;  /* D */
+  --glass-stroke-strong: #e6e6e6;  /* D */
+
+  --success: #3fe07f; --success-hover: #6bf0a0;
+  --success-subtle: #0a2e1a; --success-text: #6ff2a2;
+  --success-border: #6ff2a2;
+  --warning: #ffa11a; --warning-hover: #ffbc4d;
+  --warning-subtle: #332000; --warning-text: #ffb84a;
+  --warning-border: #ffb84a;
+  --danger: #ff7a70; --danger-hover: #ff9a92;
+  --danger-subtle: #3a0d0a; --danger-text: #ff9a92;
+  --danger-border: #ff9a92;
+  --info: #5cc8ff; --info-hover: #8bdaff;
+  --info-subtle: #062a3d; --info-text: #7fd6ff;
+  --info-border: #7fd6ff;
+  --live: #8dff5a; --live-hover: #aaff85;
+  --live-subtle: #17300a; --live-text: #a6ff80;
+  --live-border: #a6ff80;
+  --idle: #ffa11a; --idle-hover: #ffbc4d;
+  --idle-subtle: #332000; --idle-text: #ffb84a;
+  --idle-border: #ffb84a;
+  --offline: #b0b0b0; --offline-hover: #cfcfcf;
+  --offline-subtle: #2e2e2e; --offline-text: #cfcfcf;
+  --offline-border: #b0b0b0;
+  --heartbeat: #ff7ad8; --heartbeat-hover: #ff9be3;
+  --heartbeat-subtle: #3a0f2f; --heartbeat-text: #ff9be3;
+  --heartbeat-border: #ff9be3;
+  --on-info: #000000; --on-live: #000000; --on-idle: #000000;  /* D */
+  --on-offline: #000000; --on-heartbeat: #000000;              /* D */
+
+  --scrim:        #000000;  /* D — a solid backdrop: the page behind a dialog is not shown */
+  --scrim-strong: #000000;  /* D */
+  --scrim-light:  #000000;  /* D */
+  --scrim-media:  linear-gradient(to top, #000000, rgba(0,0,0,0)); /* D — dims a picture under its caption */
+  --backdrop-blur: 0px;
+
+  --bubble-user-bg:        #0b3d91;
+  --bubble-user-text:      #ffffff;  /* D */
+  --bubble-user-border:    #7fd6ff;  /* D */
+  --bubble-assistant-bg:   #171717;
+  --bubble-assistant-text: #ffffff;  /* D */
+  --quote-bar:             #ffd400;
+  --mark-bg:               #5c4a00;  /* solid: the mark's text stays --text-primary */
+  --md-bold:               #ffffff;
+  --md-italic:             #ffe347;
+  --md-bolditalic:         #fff3b0;  /* D */
+  --md-bolditalic-glow:    transparent;
+  --rp-speech:  #ffffff;  /* D */
+  --rp-action:  #e0e0e0;  /* D */
+  --rp-thought: #b8f0ff;  /* D */
+  --rp-whisper: #cfcfcf;  /* D */
+  --rp-ooc:     #cfcfcf;  /* D */
+  --rp-shout:   #ffb27a;  /* D */
+  --rp-shout-glow: transparent;
+  --rp-critical: #ff9aa8;  /* D */
+  --rp-critical-glow: transparent;
+  --diff-add-bg: #0a2e1a; --diff-add-text: #8affb4;      /* D */
+  --diff-remove-bg: #3a0d0a; --diff-remove-text: #ffa8a0; /* D */
+
+  /* Syntax — D, 7:1 on the black --syn-bg */
+  --syn-fg: #ffffff;      --syn-bg: #000000;
+  --syn-comment: #b0b0b0; --syn-keyword: #d4b5ff; --syn-string: #7fffb0;
+  --syn-number: #ffc66b;  --syn-function: #7fd6ff; --syn-title: #7fd6ff;
+  --syn-type: #5ff0e0;    --syn-variable: #ffa8d8; --syn-attr: #ffd98a;
+  --syn-tag: #d4b5ff;     --syn-builtin: #5ff0e0;  --syn-literal: #ffc66b;
+  --syn-meta: #cfcfcf;    --syn-operator: #e8e8e8; --syn-punctuation: #d0d0d0;
+  --syn-deletion: #ff9a92; --syn-addition: #7fffb0;
+  --code-stroke: #8a8a8a;  /* a visible edge round the slab */
+
+  /* Categorical — D, 4.5:1 or better on black */
+  --cat-1: #ffd400; --cat-2: #5cc8ff; --cat-3: #ff7a70; --cat-4: #6ff2a2;
+  --cat-5: #d4b5ff; --cat-6: #ffa11a; --cat-7: #ff7ad8; --cat-8: #5ff0e0;
+  --cat-9: #b8e04a; --cat-10: #9ab0ff; --cat-11: #ffd0a0; --cat-12: #c0c0c0;
+  --chart-grid: #4d4d4d;  /* D */
+  --chart-axis: #b0b0b0;  /* D */
+
+  --canvas-mask:    rgba(0,0,0,.72);  /* D — dims the picture it covers */
+  --canvas-handle:  #ffd400;
+  --canvas-guide:   rgba(255,212,0,.80);  /* D */
+  --canvas-outline: #ffffff;
+
+  --shadow-1: 0 0 0 0 transparent;  /* no depth cues: edges carry the structure */
+  --shadow-2: 0 0 0 0 transparent;
+  --shadow-3: 0 0 0 0 transparent;
+  --shadow-4: 0 0 0 0 transparent;
+  --shadow-glow:  0 0 0 0 transparent;
+  --shadow-inset: inset 0 0 0 0 transparent;
+
+  --selection-bg:    #ffd400;
+  --selection-text:  #000000;
+  --scrollbar-track: transparent;
+  --scrollbar-thumb: #8a8a8a;  /* D */
+  --scrollbar-hover: #e6e6e6;  /* D */
+  /* The empty part of a slider: 5.3:1 on surface-2, 6.2:1 on surface-0. */
+  --control-track: #8c8c8c;
+}
+
+/* theme-high-contrast-light.css — CORE
+   Ground: light · family: high-contrast · color-scheme: light
+   theme-color: #ffffff
+   The light partner of High Contrast. Contrast profile: high (tools/check_contrast.py): 7:1 for
+   every text colour, 4.5:1 for edges, the focus ring, state indicators and chart colours, 3:1
+   for every line, and no translucent colour token. Status fills are dark, with white labels
+   (a light fill cannot give a label 7:1 and stay a recognisable colour), and every edge is
+   near-black or a mid grey that clears 4.5:1 on white.
+   (D) = derived from this theme's own palette. */
+
+[data-palette="high-contrast-light"] {
+  color-scheme: light;
+
+  --surface-void:    #d9d9d9;
+  --surface-0:       #ffffff;
+  --surface-1:       #f2f2f2;
+  --surface-2:       #ffffff;
+  --surface-3:       #ebebeb;
+  --surface-4:       #dedede;
+  --surface-sunken:  #f2f2f2;
+  --surface-overlay: #ffffff;
+  --glass-1:         #ffffff;  /* D — solid: no translucent panes */
+  --glass-2:         #ffffff;  /* D */
+  --glass-3:         #f2f2f2;  /* D */
+  --glass-highlight: transparent;
+  --code-bg:         #000000;  /* D — code blocks stay dark in every theme */
+
+  --text-primary:    #000000;
+  --text-secondary:  #1a1a1a;
+  --text-tertiary:   #2e2e2e;
+  --text-disabled:   #595959;
+  --text-inverse:    #ffffff;
+  --text-link:       #002f9e;
+  --text-link-hover: #001f6b;
+  --on-accent:       #ffffff;
+  --on-danger:       #ffffff;
+  --on-success:      #ffffff;
+  --on-warning:      #ffffff;
+  --on-media:        #ffffff;
+  --on-media-muted:  #e6e6e6;
+
+  --accent:          #1a47c8;
+  --accent-hover:    #12369c;  /* darker, not lighter: the white label keeps 7:1 */
+  --accent-pressed:  #0b2778;
+  --cta-gradient:    linear-gradient(180deg, var(--accent-hover), var(--accent));
+  --notify: #002f9e; --notify-idle: #b0b0b0;  /* unread pair: idle under 3:1, 9:1 apart */
+  --accent-subtle:   #d6e0fa;  /* D — solid tint */
+  --accent-muted:    #b5c6f5;  /* D */
+  --accent-glow:     transparent;
+  --accent-rgb:      26,71,200;
+  --accent-2:        #005f68;
+  --accent-2-subtle: #d0eef0;  /* D */
+
+  --cta:              #1a47c8;  /* D — aliases accent */
+  --cta-hover:        #12369c;  /* D */
+  --cta-pressed:      #0b2778;  /* D */
+  --on-cta:           #ffffff;  /* D */
+  --cta-shadow:       0 0 0 0 transparent;
+  --cta-shadow-hover: 0 0 0 0 transparent;
+  --highlight:        #7a4a00;
+  --highlight-subtle: #f5e6c8;  /* D */
+  --on-highlight:     #ffffff;  /* D */
+
+  --border-subtle:       #767676;  /* D — every line is visible: 3:1 or better */
+  --border:              #4d4d4d;
+  --border-strong:       #000000;
+  --divider:             #767676;  /* D */
+  --focus-ring:          #002f9e;
+  --focus-ring-width:    3px;
+  --glass-stroke:        #767676;  /* D */
+  --glass-stroke-strong: #000000;  /* D */
+
+  --success: #005c27; --success-hover: #004a1f;
+  --success-subtle: #dcf5e5; --success-text: #004d20;
+  --success-border: #004d20;
+  --warning: #7a4a00; --warning-hover: #653b00;
+  --warning-subtle: #fbebcc; --warning-text: #6b3f00;
+  --warning-border: #6b3f00;
+  --danger: #a8001c; --danger-hover: #8f0016;
+  --danger-subtle: #fbdada; --danger-text: #8f0016;
+  --danger-border: #8f0016;
+  --info: #00508f; --info-hover: #004075;
+  --info-subtle: #d6e9f8; --info-text: #004a82;
+  --info-border: #004a82;
+  --live: #2a5c00; --live-hover: #224c00;
+  --live-subtle: #e4f2d6; --live-text: #245000;
+  --live-border: #245000;
+  --idle: #7a4a00; --idle-hover: #653b00;
+  --idle-subtle: #fbebcc; --idle-text: #6b3f00;
+  --idle-border: #6b3f00;
+  --offline: #4d4d4d; --offline-hover: #3d3d3d;
+  --offline-subtle: #e6e6e6; --offline-text: #404040;
+  --offline-border: #4d4d4d;
+  --heartbeat: #8f0066; --heartbeat-hover: #780054;
+  --heartbeat-subtle: #f7d9ee; --heartbeat-text: #800059;
+  --heartbeat-border: #800059;
+  --on-info: #ffffff; --on-live: #ffffff; --on-idle: #ffffff;  /* D */
+  --on-offline: #ffffff; --on-heartbeat: #ffffff;              /* D */
+
+  --scrim:        #000000;  /* D — a solid backdrop: the page behind a dialog is not shown */
+  --scrim-strong: #000000;  /* D */
+  --scrim-light:  #000000;  /* D */
+  --scrim-media:  linear-gradient(to top, #000000, rgba(0,0,0,0)); /* D — dims a picture under its caption */
+  --backdrop-blur: 0px;
+
+  --bubble-user-bg:        #cfdcff;
+  --bubble-user-text:      #000000;  /* D */
+  --bubble-user-border:    #002f9e;  /* D */
+  --bubble-assistant-bg:   #ffffff;
+  --bubble-assistant-text: #000000;  /* D */
+  --quote-bar:             #1a47c8;
+  --mark-bg:               #ffe680;
+  --md-bold:               #000000;
+  --md-italic:             #5c3a00;
+  --md-bolditalic:         #4a2e00;  /* D */
+  --md-bolditalic-glow:    transparent;
+  --rp-speech:  #000000;  /* D */
+  --rp-action:  #1a1a1a;  /* D */
+  --rp-thought: #00424d;  /* D */
+  --rp-whisper: #2e2e2e;  /* D */
+  --rp-ooc:     #2e2e2e;  /* D */
+  --rp-shout:   #7a2e00;  /* D */
+  --rp-shout-glow: transparent;
+  --rp-critical: #8f0016;  /* D */
+  --rp-critical-glow: transparent;
+  --diff-add-bg: #dcf5e5; --diff-add-text: #004d20;      /* D */
+  --diff-remove-bg: #fbdada; --diff-remove-text: #8f0016; /* D */
+
+  /* Syntax — D, 7:1 on the dark --code-bg */
+  --syn-fg: #ffffff;      --syn-bg: #000000;
+  --syn-comment: #b0b0b0; --syn-keyword: #d4b5ff; --syn-string: #7fffb0;
+  --syn-number: #ffc66b;  --syn-function: #7fd6ff; --syn-title: #7fd6ff;
+  --syn-type: #5ff0e0;    --syn-variable: #ffa8d8; --syn-attr: #ffd98a;
+  --syn-tag: #d4b5ff;     --syn-builtin: #5ff0e0;  --syn-literal: #ffc66b;
+  --syn-meta: #cfcfcf;    --syn-operator: #e8e8e8; --syn-punctuation: #d0d0d0;
+  --syn-deletion: #ff9a92; --syn-addition: #7fffb0;
+  --code-stroke: #767676;  /* a visible edge round the slab */
+
+  /* Categorical — D, 4.5:1 or better on white */
+  --cat-1: #1a47c8; --cat-2: #006b75; --cat-3: #7a4a00; --cat-4: #a8001c;
+  --cat-5: #5b2d9e; --cat-6: #005c27; --cat-7: #8f0066; --cat-8: #00508f;
+  --cat-9: #4d5a00; --cat-10: #00608f; --cat-11: #7a2e00; --cat-12: #4b4b4b;
+  --chart-grid: #bdbdbd;  /* D */
+  --chart-axis: #4d4d4d;  /* D */
+
+  --canvas-mask:    rgba(0,0,0,.60);  /* D — dims the picture it covers */
+  --canvas-handle:  #ffffff;          /* light: it sits on the dark mask */
+  --canvas-guide:   rgba(255,255,255,.90);  /* D */
+  --canvas-outline: #000000;
+
+  --shadow-1: 0 0 0 0 transparent;  /* no depth cues: edges carry the structure */
+  --shadow-2: 0 0 0 0 transparent;
+  --shadow-3: 0 0 0 0 transparent;
+  --shadow-4: 0 0 0 0 transparent;
+  --shadow-glow:  0 0 0 0 transparent;
+  --shadow-inset: inset 0 0 0 0 transparent;
+
+  --selection-bg:    #1a47c8;
+  --selection-text:  #ffffff;
+  --scrollbar-track: transparent;
+  --scrollbar-thumb: #767676;  /* D */
+  --scrollbar-hover: #000000;  /* D */
+  /* The empty part of a slider: 5.3:1 on white. */
+  --control-track: #6b6b6b;
+}
+
 /* theme-electric-yellow.css — OPT-IN
    Ground: dark (graphite) · family: electric-yellow · color-scheme: dark
    theme-color: #0a0a0b
@@ -1281,6 +1814,8 @@
   --accent:          #e8ff00;
   --accent-hover:    #f2ff3d;
   --accent-pressed:  #ccdf00;
+  --cta-gradient:    linear-gradient(135deg, var(--cta-hover), var(--cta));  /* D */
+  --notify: #e8ff00; --notify-idle: #3a3a40;  /* D — notify = the focus yellow; idle a step above --border */
   --accent-subtle:   rgba(232,255,0,.12);
   --accent-muted:    rgba(232,255,0,.24);
   --accent-glow:     rgba(232,255,0,.30);
@@ -1384,7 +1919,7 @@
   --font-sans:    'Archivo', 'Helvetica Neue', Helvetica, system-ui, sans-serif;
   --font-serif:   var(--font-sans);
   --font-display: 'Archivo', 'Helvetica Neue', Helvetica, system-ui, sans-serif;
-  --font-mono:    'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  --font-mono:    'JetBrains Mono', ui-monospace, monospace;
 
   /* Tighter geometry — a second signal against Midnight Gold */
   --radius-xs: 3px;
@@ -1482,6 +2017,8 @@
   --accent:          #2ea8ff;
   --accent-hover:    #4fb6ff;
   --accent-pressed:  #1f8ad6;  /* D */
+  --cta-gradient:    linear-gradient(135deg, var(--cta-hover), var(--cta));  /* D */
+  --notify: #2ea8ff; --notify-idle: #2f3b49;  /* D — notify = link blue; idle a step above --border */
   --accent-subtle:   rgba(46,168,255,.10);
   --accent-muted:    rgba(46,168,255,.22);  /* D */
   --accent-glow:     rgba(46,168,255,.35);
@@ -1594,7 +2131,7 @@
   --font-sans:    'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
   --font-serif:   var(--font-sans);
   --font-display: 'Space Grotesk', 'Inter', system-ui, sans-serif;
-  --font-mono:    ui-monospace, SFMono-Regular, 'Cascadia Code', Menlo, Consolas, monospace;
+  --font-mono:    ui-monospace, 'Cascadia Code', Consolas, monospace;
 
   --radius-xs: 7px;
   --radius-sm: 9px;
@@ -1684,6 +2221,8 @@
   --accent:          #0b78d0;
   --accent-hover:    #0d69b4;
   --accent-pressed:  #0a5a9c;  /* D */
+  --cta-gradient:    linear-gradient(135deg, var(--cta-hover), var(--cta));  /* D */
+  --notify: #0d69b4; --notify-idle: #c3cedb;  /* D — notify = link blue; idle a step below --border */
   --accent-subtle:   rgba(11,120,208,.08);  /* D */
   --accent-muted:    rgba(11,120,208,.20);  /* D */
   --accent-glow:     rgba(11,120,208,.26);  /* D */
@@ -1800,7 +2339,7 @@
   --font-sans:    'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
   --font-serif:   var(--font-sans);
   --font-display: 'Space Grotesk', 'Inter', system-ui, sans-serif;
-  --font-mono:    ui-monospace, SFMono-Regular, 'Cascadia Code', Menlo, Consolas, monospace;
+  --font-mono:    ui-monospace, 'Cascadia Code', Consolas, monospace;
 
   --radius-xs: 7px;
   --radius-sm: 9px;
@@ -1946,6 +2485,8 @@
   --accent:          #ff0000;
   --accent-hover:    #ff2a00;
   --accent-pressed:  #ec0000;
+  --cta-gradient:    linear-gradient(135deg, var(--cta-hover), var(--cta));  /* D */
+  --notify: #c88400; --notify-idle: #5c0000;  /* D — notify = amber (the highlight accent, not red: red is body text); idle a red-only step, zero blue */
   --accent-subtle:   rgba(255,0,0,.12);
   --accent-muted:    rgba(255,0,0,.22);
   --accent-glow:     rgba(255,0,0,.40);

@@ -1,0 +1,22 @@
+Device Properties and Extensions:
+=================================
+GPU0:
+VkPhysicalDeviceProperties:
+---------------------------
+	vendorID          = 0x1002
+	deviceType        = PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU
+	deviceName        = AMD Radeon Graphics (RADV GFX1151)
+
+VkPhysicalDeviceMemoryProperties:
+=================================
+	memoryHeapCount = 2
+	memoryHeaps[0]:
+		size   = 103079215104 (0x1800000000) (96.00 GiB)
+		budget = 102000000000 (0x17bfa1c000) (95.00 GiB)
+		usage  = 0 (0x00000000) (0.00 B)
+		flags: count = 1
+			MEMORY_HEAP_DEVICE_LOCAL_BIT
+	memoryHeaps[1]:
+		size   = 16106127360 (0x3c0000000) (15.00 GiB)
+		flags:
+			None

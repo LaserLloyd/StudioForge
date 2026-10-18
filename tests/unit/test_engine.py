@@ -693,6 +693,30 @@ async def test_ensure_engine_raises_when_nothing_eligible(
 
 
 @pytest.mark.asyncio
+async def test_a_failed_release_lookup_is_named_when_the_source_build_fallback_fails(
+    tmp_config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """System test 2026-10-18: the lookup failed on GitHub's anonymous rate limit, the app fell back
+    to a source build, and the only error shown was git's ("clone failed")."""
+    mgr = EngineManager(tmp_config, probe=StubProbe(MIXED_GPUS, (12, 0)))
+    mgr.os_token, mgr.arch_token = "win", "x64"
+
+    async def rate_limited(tag: str) -> list[EngineAsset]:
+        raise EngineError("GitHub's API rate limit is exhausted; set GITHUB_TOKEN or GH_TOKEN")
+
+    async def no_git(tag: str, *, arches: Any, progress: Any = None, activate: bool = False):
+        raise EngineError("cannot build llama.cpp from source: git clone failed")
+
+    monkeypatch.setattr(mgr, "list_assets", rate_limited)
+    monkeypatch.setattr(mgr, "build_from_source", no_git)
+    with pytest.raises(EngineError) as excinfo:
+        await mgr.ensure_engine()
+    message = str(excinfo.value)
+    assert "git clone failed" in message
+    assert "rate limit" in message and "GITHUB_TOKEN" in message
+
+
+@pytest.mark.asyncio
 async def test_ensure_engine_falls_back_to_source_build(
     tmp_config: Config, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -868,8 +892,15 @@ def _stub_prebuilt(
         seen["captures"].append(list(args))
         return 0, help_text
 
+    async def no_published_checksum(asset: EngineAsset) -> tuple[str | None, str]:
+        # Keeps these tests off the network: the fixture assets carry a sidecar
+        # URL that would otherwise be fetched. Verification has its own tests
+        # (test_engine_backends.py).
+        return None, "stubbed: no checksum in this test"
+
     monkeypatch.setattr(mgr, "list_assets", fake_assets)
     monkeypatch.setattr(mgr, "_download", fake_download)
+    monkeypatch.setattr(mgr, "_expected_digest", no_published_checksum)
     monkeypatch.setattr(mgr, "_smoke", fake_smoke)
     monkeypatch.setattr(mgr, "_capture", fake_capture)
     return seen
@@ -2445,6 +2476,10 @@ class _EngineCliManager:
     async def smoke_test(self, tag: str, **_kwargs: Any) -> tuple[bool, str]:
         type(self).calls.append(f"smoke_test({tag})")
         return type(self).smoke_ok, f"micro-load detail for {tag}"
+
+    async def smoke_check(self, tag: str, **kwargs: Any) -> tuple[bool, str, str]:
+        ok, detail = await self.smoke_test(tag, **kwargs)
+        return ok, "passed" if ok else "failed", detail
 
     async def activate(self, tag: str) -> Any:
         type(self).calls.append(f"activate({tag})")

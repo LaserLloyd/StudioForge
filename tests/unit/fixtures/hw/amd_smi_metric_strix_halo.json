@@ -1,0 +1,14 @@
+{
+  "gpu_data": [
+    {
+      "gpu": 0,
+      "usage": {"gfx_activity": {"value": "N/A", "unit": "%"}},
+      "mem_usage": {
+        "total_vram": {"value": 98304, "unit": "MB"},
+        "used_vram": {"value": 612, "unit": "MB"},
+        "free_vram": {"value": 97692, "unit": "MB"}
+      },
+      "temperature": {"edge": {"value": "N/A", "unit": "C"}}
+    }
+  ]
+}

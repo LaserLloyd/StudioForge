@@ -28,6 +28,9 @@ Notes
 - These are *user* units on purpose: the process must run as the login user that owns the model
   library, the venv and the GPU device nodes. Do not add `User=`/`Group=` — those are only valid in
   system units and make a user unit fail to load.
+- `SuccessExitStatus=130 143`: the server exits 130 (SIGINT) or 143 (SIGTERM) on a clean stop, so
+  without it every `systemctl --user stop` leaves the unit `failed`. If a unit is already stuck in
+  that state: `systemctl --user reset-failed studioforge studioforge-watchdog`.
 - The watchdog is not `BindsTo=` the gateway: it exists to be up when the gateway is not (it can
   restart the gateway, reclaim orphaned `llama-server` processes and answer `/health` on its own port).
 - First run: `~/studioforge/.venv/bin/studioforge engine --update` installs the pinned llama.cpp build

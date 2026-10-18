@@ -1,0 +1,340 @@
+name: Containers
+
+# OCI images ghcr.io/laserlloyd/studioforge:<version>-{cuda,rocm,vulkan} (+ -cuda-devel),
+# with an SBOM, SHA256SUMS, keyless cosign signatures and GitHub build-provenance
+# attestations. Sits NEXT TO release.yml (which builds the wheels and the source
+# zip and creates the GitHub release) and leaves it alone.
+#
+# SKELETON: written, validated as YAML, never run. Do not push a tag to test it
+# on the live repository; use a fork, or run `workflow_dispatch` with push=false.
+#
+# Channels, by tag shape:
+#   v2.0.0                   -> stable. Tags: <ver>-<backend> and stable-<backend>
+#   v2.0.0-beta.2            -> beta.   Tags: <ver>-<backend> and beta-<backend>
+#   (a plain version is a stable tag; only -beta.N / -rc.N make a beta; the old
+#    calendar tags such as v1.26-09-23 sort below 2.0.0 in core/updater.py)
+#
+# Dormant on purpose (documented in docs/deploy/release-pipeline.md):
+#   * windows-sign and macos-notarize run ONLY when the owner has created the
+#     named repository secrets. GitHub does not allow `secrets.*` in an `if:`,
+#     so a tiny `secrets-present` job turns "is the secret set" into an output
+#     and the signing jobs gate on that output.
+#   * gpu-smoke targets a self-hosted runner and is `if: false` until one is
+#     registered (docs/ci/self-hosted-runner.md).
+#
+# Action versions below are the latest majors as of 2026-10-18. Pin them to
+# commit SHAs before the first real tag.
+
+on:
+  push:
+    tags:
+      - "v*"
+  pull_request:
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - "deploy/compose/**"
+      - ".github/workflows/containers.yml"
+  workflow_dispatch:
+    inputs:
+      push:
+        description: "Push the images to GHCR (needs write access to the package)"
+        type: boolean
+        default: false
+      version:
+        description: "Version string to tag with (default: the ref name)"
+        type: string
+        default: ""
+
+concurrency:
+  group: containers-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/laserlloyd/studioforge
+
+jobs:
+  prepare:
+    name: version and channel
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      channel: ${{ steps.v.outputs.channel }}
+      push: ${{ steps.v.outputs.push }}
+    steps:
+      - id: v
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_PUSH: ${{ inputs.push }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          raw="${INPUT_VERSION:-$REF_NAME}"
+          version="${raw#v}"
+          # Image tags may not contain '/' and must start with [A-Za-z0-9_].
+          version="$(printf '%s' "$version" | tr '/' '-')"
+          channel=stable
+          if printf '%s' "$version" | grep -Eq -- '-(beta|rc)\.[0-9]+$'; then channel=beta; fi
+          push=false
+          if [ "$EVENT" = push ] && [ "$REF_TYPE" = tag ]; then push=true; fi
+          if [ "$EVENT" = workflow_dispatch ] && [ "$INPUT_PUSH" = true ]; then push=true; fi
+          # Pull requests never push (and have no package write token).
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+          echo "push=$push" >> "$GITHUB_OUTPUT"
+          echo "version=$version channel=$channel push=$push"
+
+  image:
+    name: image (${{ matrix.variant }})
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write        # push to GHCR
+      id-token: write        # keyless cosign + attestations (OIDC)
+      attestations: write    # actions/attest-build-provenance
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { variant: cuda,       backend: cuda,   build_args: "" }
+          - { variant: rocm,       backend: rocm,   build_args: "" }
+          - { variant: vulkan,     backend: vulkan, build_args: "" }
+          # The engine is a SOURCE BUILD on Linux + NVIDIA, which needs nvcc: this
+          # flavour carries the toolchain (~14 GB image, the slowest build here).
+          - { variant: cuda-devel, backend: cuda,   build_args: "CUDA_FLAVOR=devel" }
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Free disk space (cuda/rocm bases are large)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        if: needs.prepare.outputs.push == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tags
+        id: tags
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          CHANNEL: ${{ needs.prepare.outputs.channel }}
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          set -euo pipefail
+          {
+            echo "list<<EOF"
+            echo "${IMAGE}:${VERSION}-${VARIANT}"
+            echo "${IMAGE}:${CHANNEL}-${VARIANT}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build (and push on tags)
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: ${{ needs.prepare.outputs.push == 'true' }}
+          load: ${{ needs.prepare.outputs.push != 'true' }}
+          tags: ${{ steps.tags.outputs.list }}
+          build-args: |
+            BACKEND=${{ matrix.backend }}
+            VERSION=${{ needs.prepare.outputs.version }}
+            REVISION=${{ github.sha }}
+            ${{ matrix.build_args }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+          # An SBOM and provenance are produced below by anchore/sbom-action and
+          # attest-build-provenance (so they are signed and attached to the
+          # release); keep buildkit's out of the registry manifest.
+          sbom: false
+          provenance: false
+          cache-from: type=gha,scope=${{ matrix.variant }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.variant }}
+
+      - name: Smoke test (no GPU needed)
+        run: |
+          set -euo pipefail
+          ref="${IMAGE}:${{ needs.prepare.outputs.version }}-${{ matrix.variant }}"
+          if [ "${{ needs.prepare.outputs.push }}" = true ]; then docker pull "$ref"; fi
+          docker run --rm "$ref" version
+          docker run --rm "$ref" --help >/dev/null
+          cid=$(docker run -d --init -p 11234:1234 "$ref")
+          for i in $(seq 1 30); do
+            sleep 2
+            curl -fsS http://127.0.0.1:11234/health && break
+          done
+          docker logs "$cid" | tail -5
+          docker rm -f "$cid"
+
+      - name: SBOM (syft, CycloneDX JSON)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.IMAGE }}:${{ needs.prepare.outputs.version }}-${{ matrix.variant }}
+          format: cyclonedx-json
+          output-file: sbom-${{ matrix.variant }}.cdx.json
+          upload-artifact: false
+
+      - name: Install cosign
+        if: needs.prepare.outputs.push == 'true'
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign the image (keyless, by digest)
+        if: needs.prepare.outputs.push == 'true'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes "${IMAGE}@${DIGEST}"
+          # The SBOM travels with the image as a signed attestation.
+          cosign attest --yes --type cyclonedx \
+            --predicate "sbom-${{ matrix.variant }}.cdx.json" "${IMAGE}@${DIGEST}"
+
+      - name: Build-provenance attestation
+        if: needs.prepare.outputs.push == 'true'
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Record the digest
+        if: needs.prepare.outputs.push == 'true'
+        run: echo "${{ matrix.variant }} ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}" > digest-${{ matrix.variant }}.txt
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: supply-chain-${{ matrix.variant }}
+          path: |
+            sbom-${{ matrix.variant }}.cdx.json
+            digest-${{ matrix.variant }}.txt
+          if-no-files-found: ignore
+
+  checksums:
+    name: SHA256SUMS for the supply-chain files
+    needs: [prepare, image]
+    if: needs.prepare.outputs.push == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write      # attach to the release that release.yml creates
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: supply-chain-*
+          path: out
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd out
+          sha256sum *.cdx.json digest-*.txt > SHA256SUMS-containers.txt
+          cat SHA256SUMS-containers.txt
+      - uses: actions/upload-artifact@v7
+        with:
+          name: SHA256SUMS-containers
+          path: out/SHA256SUMS-containers.txt
+      - name: Attach to the GitHub release (waits for release.yml to create it)
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            gh release view "$TAG" >/dev/null 2>&1 && break
+            echo "release $TAG not there yet ($i/30)"; sleep 20
+          done
+          gh release upload "$TAG" out/*.cdx.json out/SHA256SUMS-containers.txt --clobber
+
+  # --------------------------------------------------------------------------
+  # Dormant signing jobs. Nothing below runs until the owner adds the secrets
+  # (see docs/deploy/release-pipeline.md for the exact names and how to make them).
+  # --------------------------------------------------------------------------
+  secrets-present:
+    name: which signing secrets exist
+    runs-on: ubuntu-latest
+    outputs:
+      windows: ${{ steps.s.outputs.windows }}
+      macos: ${{ steps.s.outputs.macos }}
+    steps:
+      - id: s
+        env:
+          WIN_PFX: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+          MAC_CERT: ${{ secrets.APPLE_DEVELOPER_ID_CERT_BASE64 }}
+          MAC_NOTARY: ${{ secrets.APPLE_NOTARY_APPLE_ID }}
+        run: |
+          [ -n "$WIN_PFX" ] && echo "windows=true" >> "$GITHUB_OUTPUT" || echo "windows=false" >> "$GITHUB_OUTPUT"
+          { [ -n "$MAC_CERT" ] && [ -n "$MAC_NOTARY" ]; } && echo "macos=true" >> "$GITHUB_OUTPUT" || echo "macos=false" >> "$GITHUB_OUTPUT"
+
+  windows-sign:
+    name: Authenticode-sign the Windows installer (dormant)
+    needs: [prepare, secrets-present]
+    if: needs.secrets-present.outputs.windows == 'true' && needs.prepare.outputs.push == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      # TODO(owner/W9): build the installer first (deploy/windows/README.md ->
+      # "Building the payload"), then sign it. Until that job exists, this one
+      # fails loudly the moment the certificate secret is added, on purpose.
+      - name: Sign
+        shell: pwsh
+        env:
+          PFX_B64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+          PFX_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $installer = Get-ChildItem dist\windows\*-setup.exe -ErrorAction Stop | Select-Object -First 1
+          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\cert.pfx", [Convert]::FromBase64String($env:PFX_B64))
+          & signtool sign /f "$env:RUNNER_TEMP\cert.pfx" /p $env:PFX_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $installer.FullName
+          & signtool verify /pa $installer.FullName
+          Remove-Item "$env:RUNNER_TEMP\cert.pfx"
+
+  macos-notarize:
+    name: Notarize the macOS bundle (dormant, TIER2)
+    needs: [prepare, secrets-present]
+    if: needs.secrets-present.outputs.macos == 'true' && needs.prepare.outputs.push == 'true'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      # TODO(owner/W10): there is no Metal engine or app bundle yet. When there
+      # is: codesign with the Developer ID certificate, `xcrun notarytool submit
+      # --wait`, then `xcrun stapler staple`.
+      - name: Notarize
+        env:
+          APPLE_ID: ${{ secrets.APPLE_NOTARY_APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_NOTARY_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_NOTARY_APP_PASSWORD }}
+        run: |
+          echo "no macOS bundle is built yet; see deploy/windows/README.md for the equivalent plan" >&2
+          exit 1
+
+  gpu-smoke:
+    name: GPU smoke on a self-hosted runner (placeholder, disabled)
+    needs: [prepare, image]
+    if: false      # flip to a real condition once a runner with the label below is registered
+    runs-on: [self-hosted, gpu-cuda]
+    steps:
+      - name: nvidia-smi through the container runtime
+        run: docker run --rm --gpus all nvidia/cuda:13.0.1-base-ubuntu24.04 nvidia-smi -L
+      - name: StudioForge sees the GPUs (no model is loaded)
+        run: |
+          cid=$(docker run -d --init --gpus all -p 11234:1234 \
+            "${IMAGE}:${{ needs.prepare.outputs.version }}-cuda")
+          sleep 25
+          curl -fsS http://127.0.0.1:11234/health | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["gpu_count"] > 0, d'
+          docker rm -f "$cid"

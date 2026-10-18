@@ -1,0 +1,14 @@
+# AMD GPUs (ROCm). Build/run with SF_BACKEND=rocm.
+# Group IDs differ per host: `getent group video render` and put the numbers in
+# .env as SF_VIDEO_GID / SF_RENDER_GID (names do not resolve across the userns).
+services:
+  studioforge:
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    group_add:
+      - "${SF_VIDEO_GID:-44}"
+      - "${SF_RENDER_GID:-109}"
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=unconfined   # ROCm's KFD ioctls; drop if your runtime allows them

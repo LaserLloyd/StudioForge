@@ -39,7 +39,7 @@ log = get_logger(__name__)
 
 #: Highest migration version this build of the code ships. ``migrate()``
 #: brings any older database up to this.
-SCHEMA_VERSION: int = 8
+SCHEMA_VERSION: int = 9
 
 #: SQLite's own words for "this file is not a usable database". Only a message
 #: carrying one of these is treated as corruption by ``migrate_with_recovery``;
@@ -338,6 +338,18 @@ class Database:
         conn = self.connect()
         with self._write_lock:
             return conn.execute(sql, params)
+
+    def execute_write(self, sql: str, params: Sequence[Any] = ()) -> int:
+        """Run one write statement from outside this module; returns the row count.
+
+        For stores that own their own tables (``core/accounts.py``) and should not
+        grow this class by a method per query. Same lock, same autocommit.
+        """
+        return self._write(sql, params).rowcount
+
+    def query(self, sql: str, params: Sequence[Any] = ()) -> list[dict[str, Any]]:
+        """Run one read statement; rows come back as plain dicts."""
+        return [_row_to_dict(row) for row in self.connect().execute(sql, params).fetchall()]
 
     # ------------------------------------------------------------------
     # Migrations

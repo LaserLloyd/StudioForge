@@ -112,58 +112,89 @@ depends on nothing above it. A change that makes `core` import from `api` is a c
    (`tenants.registry`) is deliberately *not* generated: it needs a row widget, like
    `planner.reserved_mb` has on the GPU card. Add it to `gui/state.CUSTOM_WIDGET_KEYS` along with
    the widget, or the same test fails.
+6. **Regenerate the generated docs.** Run `uv run python scripts/gen_docs.py`: the key appears in
+   `docs/reference/settings.md` and `docs/contracts/settings-schema.json` (the settings registry,
+   `settings_schema.py`, walks the model). It needs a description - a comment above the field in
+   `config.py` or in `config.example.yaml` - or `tests/unit/test_settings_schema.py` fails. The same
+   command refreshes the OpenAPI, MCP tool, error and capability contracts; CI runs
+   `scripts/gen_docs.py --check`.
 
 ## GUI theming
 
-The panel's colours, type and component skin come from **ThemeForge**
-([LaserLloyd/ThemeForge](https://github.com/LaserLloyd/ThemeForge), a separate repository — not
-part of this one), not from anything hand-written here. `gui/theme/` is ThemeForge's **drop-in
-bundle** (its `ui-theme/` folder), copied verbatim: the same folder every app gets. It is never
+The panel's colours, type and component skin come from **ForgeUI**, the ThemeForge design system
+([LaserLloyd/ThemeForge](https://github.com/LaserLloyd/ThemeForge), a separate repository, not
+part of this one), not from anything hand-written here. `gui/theme/` is ForgeUI's **drop-in
+bundle** (its `ui-theme/` folder), vendored whole: the same folder every app gets. It is never
 hand-edited:
 
 ```
 gui/theme/ui-theme.js            the runtime and the full theme registry
 gui/theme/ui-theme-base.css      element layer + the text standard (.ui-text-*, .ui-markdown)
 gui/theme/ui-theme.css           contract tokens for every theme
+gui/theme/ui-components.css/js   the component layer (not loaded by the panel today)
 gui/theme/adapters/quasar.js     keeps Quasar's dark-mode flag in step with the theme's ground
 gui/theme/adapters/quasar.css    contract tokens onto Quasar's components
 gui/theme/themes.json            the registry (app.py reads it for the picker's names)
-gui/theme/update.py              installs/updates the bundle; a command-line tool, no page loads it
-gui/theme/files.json             sha256 of every bundle file; what update.py checks against
+gui/theme/locales/               string tables for the component helpers
+gui/theme/update.py              installs/updates the bundle without pip; no page loads it
+gui/theme/files.json             sha256 of every bundle file; what the vendor check verifies
 gui/theme/VERSION, README.md     bundle version and plug-in notes
+gui/theme/adapters/studioforge-extra.css   OURS: copied here from gui/overlays/ by `forgeui vendor`
 ```
 
-StudioForge's own settings are `THEME_SETTINGS` in `app.py`: the picker's themes in order, the
-default (Glacier) and the storage key. They ride as `data-*` attributes on the `ui-theme.js`
-script tag. `app.py` serves `gui/theme/` at `/sf-theme/` (exempted from the auth gate, since it
-has to be reachable from the unauthenticated login page too) and injects five tags into every
-page's `<head>` exactly once, each with a `?v=<sha256 prefix>` cache-busting query string
-computed at import. The header's theme picker (`_theme_picker`) is a `ui.select` that calls
-`UITheme.set(slug)` in the browser; `adapters/quasar.js` keeps Quasar's own dark-mode flag in step
-with the active theme's ground, so `ui.run_with(dark=True)` stays fixed in Python regardless of
-which theme is active.
+StudioForge's own theme choice lives in **one place**, the manifest `forgeui.json` at the
+repository root: `settings.themes` (the picker's themes, in order), `settings.default`
+(`glacier`) and `settings.storage_key` (`studioforge.theme`), plus `adapters` (`["quasar"]`),
+`version` (`"1.2"`: any 1.2.x) and `extra_files` (the overlay). `gui/app.py` reads it as
+`THEME_SETTINGS` and writes it as `data-*` attributes on the `ui-theme.js` script tag; the wheel
+carries a copy next to `gui/app.py` (`pyproject.toml` `force-include`; the Dockerfile copies it).
+`app.py` serves `gui/theme/` at `/sf-theme/` (exempted from the auth gate, since it has to be
+reachable from the unauthenticated login page too) and injects six tags into every page's
+`<head>` exactly once, each with a `?v=<sha256 prefix>` cache-busting query string computed at
+import: the runtime, the Quasar script, base, tokens, the Quasar CSS, and the overlay. The
+header's theme picker (`_theme_picker`) is a `ui.select` that calls `UITheme.set(slug)` in the
+browser; `adapters/quasar.js` keeps Quasar's own dark-mode flag in step with the active theme's
+ground, so `ui.run_with(dark=True)` stays fixed in Python regardless of which theme is active.
+To offer another theme, add its slug to `settings.themes` in `forgeui.json` (opt-in themes such
+as `electric-yellow` are listed on purpose, never by default) and restart the panel.
 
-To change how a Quasar component looks, edit `adapters/quasar.css` (and, for the runtime's JS
-behaviour, `adapters/quasar.js`) in ThemeForge — never `gui/theme/*` directly, it is replaced
-wholesale. `ruff` skips `gui/theme/` (`extend-exclude` in `pyproject.toml`): the bundle follows
-ThemeForge's own style and `files.json` checksums every file in it, so a reformat here would be both
-a hand edit and undone by the next install. A theme update is: build the bundle in a ThemeForge
-checkout, then install it over `gui/theme/` with ThemeForge's own tool, from that checkout:
+**StudioForge's own CSS** (the `sf-well`, `sf-danger-card`, `sf-warning-card` and
+`sf-theme-picker` helpers) lives in `gui/overlays/studioforge-extra.css`. It is never appended
+into a bundle file: `forgeui vendor` copies it to `gui/theme/adapters/studioforge-extra.css`
+(listed under `extra_files`), the head loads it after `adapters/quasar.css`, and `files.json`
+keeps proving the bundle. Edit the overlay, then vendor.
+
+**Updating the bundle** (no registry, no private tooling):
 
 ```bash
-python tools/sync_theme.py build
-python tools/sync_theme.py install studioforge --dest <path to this checkout>
+uv pip install "forgeui @ git+https://github.com/LaserLloyd/ThemeForge@v1.2.0"   # the release forgeui.json accepts
+python -m forgeui vendor                 # write the new copy (VERSION last)
+python -m forgeui vendor --check         # exit 1 on any drift: version, stale/edited file, overlay, settings
+# offline: python -m forgeui vendor --source <ThemeForge checkout, ui-theme folder, zip or wheel>
 ```
+
+(`forgeui` is installed from the ThemeForge release tag, not PyPI: that name belongs to another
+project. It is a development tool, not a dependency of StudioForge.) A hand-edited bundle file is
+refused unless you pass `--force`; move the edit to the overlay first. When ForgeUI moves to a new
+minor (1.3), change `version` in `forgeui.json`, vendor, and re-run the GUI tests.
+
+`tests/unit/test_forgeui_vendor.py` proves, with the standard library alone, that the folder
+matches its `files.json`, the overlay matches its source, the version stamp is one the manifest
+accepts and the settings name real themes; with `forgeui` installed it also runs
+`forgeui vendor --check`. CI installs it and sets `FORGEUI_REQUIRED=1`, and has its own
+`forgeui vendor --check` step. `ruff` skips `gui/theme/` (`extend-exclude` in `pyproject.toml`):
+the bundle follows ForgeUI's own style and `files.json` checksums every file in it. The wheel
+ships `gui/theme/**` and `forgeui.json`.
+
+To change how a Quasar component looks for every app, change ForgeUI's `adapters/quasar.css`
+(and, for JS behaviour, `adapters/quasar.js`) in the ThemeForge repository and vendor the
+release; for StudioForge alone, use the overlay. Never edit `gui/theme/*` directly.
 
 No restart is needed for new colours: `/sf-theme/` is served with `max_cache_age=0`, so browsers
 revalidate on every load and get the new bytes even under the old `?v=` (computed once at
 import, see `_asset_version`). Restart the server (`POST /api/restart/server` with
-`{"confirm": true}`, or the tray's Restart server) only when the bundle gains a theme you add to
-`THEME_SETTINGS`, since the picker's options are read at import.
-
-`tools/sync_theme.py check studioforge --dest <path to this checkout>` reports drift without
-writing anything. `pyproject.toml`'s `[tool.hatch.build.targets.wheel]` `include` list ships
-`gui/theme/**`, the whole bundle.
+`{"confirm": true}`, or the tray's Restart server) when the bundle gains a theme you add to
+`settings.themes`, since the picker's options are read at import.
 
 Quasar's named palette classes (`.text-cyan`, `.bg-orange`, `.text-purple`, `.bg-teal`,
 `.text-blue-grey`, `.text-grey`/`.bg-grey`, used via `color=` props and `gui/state.py`'s

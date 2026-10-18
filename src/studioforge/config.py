@@ -30,6 +30,11 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from studioforge.errors import ConfigError
+from studioforge.secret_store import SecretStore
+from studioforge.secure_files import write_private
+
+#: Name under which ``hf.token`` is kept in the secret store.
+HF_TOKEN_SECRET = "hf.token"
 
 #: "auto" is resolved by the planner per model: it takes the best-quality KV
 #: cache that still reaches the chosen context on the hardware available.
@@ -45,6 +50,17 @@ KvCacheType = Literal["auto", "f32", "f16", "bf16", "q8_0", "q5_1", "q5_0", "q4_
 SplitMode = Literal["none", "layer", "row", "tensor", "auto"]
 FlashAttn = Literal["on", "off", "auto"]
 EngineUpdateChannel = Literal["stable", "latest"]
+
+#: Which llama.cpp backend to favour when a box offers more than one (a Strix
+#: Halo has both HIP and Vulkan, an NVIDIA box with the Vulkan runtime has
+#: both CUDA and Vulkan). ``balanced`` weighs prompt processing and generation
+#: equally; the other two follow the measured pp512 / tg128 winner. See
+#: ``core/backend_select.py``.
+EnginePreference = Literal["balanced", "fastest_replies", "fastest_long_prompts"]
+
+#: ``gpu.backend``: how the GPU probe is chosen. ``auto`` tries NVML, then
+#: ROCm, then Vulkan, then Metal and uses the first that lists a device.
+GpuBackendChoice = Literal["auto", "nvml", "cuda", "rocm", "vulkan", "metal", "null", "fake"]
 
 #: Ceiling for the automatic host-RAM prompt cache, in MiB. 32 GiB on a 128 GiB
 #: box: big enough to hold many agent prefixes, small enough that the cache can
@@ -175,15 +191,53 @@ PositiveFloat = Annotated[float, Field(gt=0)]
 NonNegativeFloat = Annotated[float, Field(ge=0)]
 
 
+TlsMode = Literal["off", "self_signed", "cert"]
+
+
+class TlsConfig(BaseModel):
+    """HTTPS for the gateway, the control panel and the watchdog (one setting for all three)."""
+
+    #: ``off`` serves plain HTTP (fine on loopback). ``self_signed`` generates a
+    #: certificate into the data directory on first use and shows its SHA-256
+    #: fingerprint in the panel and `/api/status`. ``cert`` serves the PEM files
+    #: named by ``cert_file`` and ``key_file``.
+    mode: TlsMode = "off"
+    #: PEM certificate (chain) for ``mode: cert``.
+    cert_file: Path | None = None
+    #: PEM private key for ``mode: cert``.
+    key_file: Path | None = None
+
+    @model_validator(mode="after")
+    def _cert_needs_files(self) -> TlsConfig:
+        if self.mode == "cert" and (self.cert_file is None or self.key_file is None):
+            raise ValueError(
+                "server.tls.mode=cert needs both server.tls.cert_file and server.tls.key_file"
+            )
+        return self
+
+
 class ServerConfig(BaseModel):
-    host: str = "0.0.0.0"
+    #: Address the OpenAI-compatible gateway (/v1, /api, /mcp) binds to. The
+    #: default is loopback: nothing is reachable from the network until you
+    #: choose to expose it (`studioforge setup`, or set this to 0.0.0.0), and a
+    #: non-loopback bind refuses to start without an owner account or admin key.
+    host: str = "127.0.0.1"
     port: Port = 1234  # LM Studio's default port: OpenClaw only changes the host
-    # >= 6 chars so the log-redaction processor will register it: shorter
-    # values are ignored there, and an unredactable key can surface inside a
-    # logged command line or an httpx error repr.
+    #: DEPRECATED (2.0): the single shared key. It keeps working and is mirrored
+    #: into the key table as an admin key named "legacy"; create named, scoped,
+    #: revocable keys with `studioforge keys create` instead.
+    #:
+    #: At least 6 characters so the log-redaction processor will register it:
+    #: shorter values are ignored there, and an unredactable key can surface
+    #: inside a logged command line or an httpx error repr.
     api_key: str | None = Field(default=None, min_length=6)
-    cors_origins: list[str] = Field(default_factory=lambda: ["*"])
+    #: Origins allowed to call the API from a browser. Empty (the default) allows
+    #: none: non-browser clients are unaffected. Also the Origin allowlist for the
+    #: MCP endpoints, together with loopback pages.
+    cors_origins: list[str] = Field(default_factory=list)
     cors_allow_credentials: bool = False
+    #: HTTPS settings shared by the gateway, the panel and the watchdog.
+    tls: TlsConfig = Field(default_factory=TlsConfig)
     drain_timeout_s: NonNegativeFloat = 30.0
     request_timeout_s: PositiveFloat = 900.0
 
@@ -191,9 +245,9 @@ class ServerConfig(BaseModel):
     def _no_credentialed_wildcard_cors(self) -> ServerConfig:
         """``["*"]`` + ``allow_credentials`` is the one CORS pair browsers treat
         as "any website may make credentialed requests here". The shipped default
-        (wildcard, credentials off) is safe; flipping credentials on without
-        narrowing the origins would silently open the API to every page the
-        operator visits. Refuse the pair at load time (WP17 review, open item 1).
+        (empty allowlist, credentials off) is safe; flipping credentials on with
+        a wildcard would silently open the API to every page the operator
+        visits. Refuse the pair at load time (WP17 review, open item 1).
         """
         if self.cors_allow_credentials and any(o.strip() == "*" for o in self.cors_origins):
             raise ValueError(
@@ -205,14 +259,14 @@ class ServerConfig(BaseModel):
 
 class GuiConfig(BaseModel):
     enabled: bool = True
-    host: str = "0.0.0.0"
+    host: str = "127.0.0.1"
     port: Port = 8080
     refresh_interval_s: PositiveFloat = 2.0
 
 
 class WatchdogConfig(BaseModel):
     enabled: bool = True
-    host: str = "0.0.0.0"
+    host: str = "127.0.0.1"
     port: Port = 1235
     poll_interval_s: PositiveFloat = 10.0
     health_timeout_s: PositiveFloat = 5.0
@@ -372,6 +426,29 @@ class ModelsConfig(BaseModel):
         return v
 
 
+class GpuConfig(BaseModel):
+    """Hardware detection (``core/gpu.py``)."""
+
+    #: ``auto`` (default) = NVML -> ROCm -> Vulkan -> Metal, first one that
+    #: lists a GPU wins; an NVIDIA box with a working driver always gets NVML.
+    #: Force one backend to skip the others (``SF_GPU_PROBE`` is the env
+    #: equivalent and applies only while this stays ``auto``). Restart required.
+    backend: GpuBackendChoice = "auto"
+
+    #: Seconds a ROCm / Vulkan / Metal probe result is reused before the vendor
+    #: tool (``amd-smi``, ``vulkaninfo``, ``system_profiler``) runs again. The
+    #: status page, ``/metrics`` and the planner all ask about once a second, so
+    #: without this each of those polls would spawn a subprocess. NVML is a
+    #: library call and is not cached. ``0`` re-queries on every call. Restart
+    #: required.
+    probe_cache_s: NonNegativeFloat = 2.0
+    #: Most seconds one call waits for a vendor tool. Past it the call returns
+    #: the last good answer (or "no GPUs" if there is none) and the tool keeps
+    #: running in the background, so a hung tool cannot stall a request. Restart
+    #: required.
+    probe_timeout_s: PositiveFloat = 15.0
+
+
 class EngineConfig(BaseModel):
     pinned_tag: str = "b10425"
     cuda_variant: str = "auto"  # e.g. "12.4" / "13.3" / "auto"
@@ -434,6 +511,25 @@ class EngineConfig(BaseModel):
     #: ``--split-mode tensor``. Off by default under the quality-first rule --
     #: only features that are lossless *and* not experimental ship enabled.
     backend_sampling: bool = False
+
+    #: STRICT_GPU (default on). With it on, every load is fully resident on the
+    #: GPU: ``--n-gpu-layers 999 --fit off`` are always passed and the
+    #: CPU-offload flags (``--cpu-moe``, ``--n-cpu-moe``, ``--no-kv-offload``,
+    #: ``--override-tensor`` ...) are refused. Turning it off does NOT change
+    #: any model by itself: it only makes the per-model, off-by-default
+    #: ``allow_partial_cpu_offload`` preset flag effective, and even then only
+    #: ``--n-cpu-moe`` and ``--no-kv-offload`` become legal. ``-ngl 999`` and
+    #: ``--fit off`` are passed either way. See ``docs/ENGINES.md``.
+    strict_gpu: bool = True
+    #: Which backend to prefer when more than one is installed and benchmarked
+    #: for a GPU (see :data:`EnginePreference`). Only consulted by
+    #: ``core.backend_select.select_backend``; nothing benchmarks on its own.
+    preference: EnginePreference = "balanced"
+    #: Refuse to install an engine archive that has no published SHA-256. Off
+    #: by default: llama.cpp does not publish a checksum for every release, and
+    #: the unverified install is recorded (``verified: false``) and warned
+    #: about rather than silent. Turn on for a hardened box.
+    require_verified: bool = False
 
     @field_validator("cache_ram_mb")
     @classmethod
@@ -665,8 +761,11 @@ class McpConfig(BaseModel):
 
     enabled: bool = True
     path: str = "/mcp"
-    #: Auto-generated on first run when empty. Set to null / pin_required=False
-    #: to fall back to the API key alone.
+    #: DEPRECATED (2.0): the eight-digit pairing code. Still accepted on the MCP
+    #: endpoints (as an admin credential, with a logged warning) so existing
+    #: clients keep working; use a scoped API key instead
+    #: (`studioforge keys create --scope admin`). Auto-generated on first run
+    #: when empty.
     pin: str | None = None
     pin_required: bool = True
     #: Print the reachable MCP URLs (and the PIN) in the startup banner.
@@ -954,6 +1053,11 @@ class LoggingConfig(BaseModel):
     #: Rotated copies kept per log file, newest first; the oldest is deleted
     #: when a new one is made. At least 1.
     file_backups: int = Field(default=5, ge=1, le=100)
+    #: Size in MiB at which the audit log (logs/audit.jsonl, every admin mutation
+    #: and every mutating MCP call) is rotated. 0 never rotates.
+    audit_file_max_mb: int = Field(default=10, ge=0)
+    #: Rotated audit logs kept, newest first.
+    audit_file_backups: int = Field(default=10, ge=1, le=1000)
 
     @field_validator("level", mode="before")
     @classmethod
@@ -992,6 +1096,12 @@ class UpdateConfig(BaseModel):
         return value
 
 
+#: Version of the config.yaml layout; the ``schema:`` key and the settings
+#: registry (``studioforge.settings_schema``). Bump it when a key is renamed,
+#: removed or changes meaning, together with a migration for old files.
+CONFIG_SCHEMA_VERSION = 1
+
+
 class Config(BaseSettings):
     """Root configuration object."""
 
@@ -1002,6 +1112,13 @@ class Config(BaseSettings):
         validate_assignment=True,
     )
 
+    #: Layout version of config.yaml (the settings registry's ``schema: N``,
+    #: ``studioforge.settings_schema``). Written to the file as ``schema`` -- the
+    #: attribute is ``schema_version`` because ``BaseModel.schema`` is taken, and
+    #: a validation alias of ``schema`` would make pydantic-settings read a bare
+    #: ``SCHEMA`` environment variable. A file without the key loads as version 1,
+    #: so every config.yaml written before this field existed loads unchanged.
+    schema_version: int = Field(default=CONFIG_SCHEMA_VERSION, ge=1, serialization_alias="schema")
     data_dir: Path = Field(default_factory=default_data_dir)
     server: ServerConfig = Field(default_factory=ServerConfig)
     gui: GuiConfig = Field(default_factory=GuiConfig)
@@ -1009,6 +1126,7 @@ class Config(BaseSettings):
     mcp: McpConfig = Field(default_factory=McpConfig)
     models: ModelsConfig = Field(default_factory=ModelsConfig)
     engine: EngineConfig = Field(default_factory=EngineConfig)
+    gpu: GpuConfig = Field(default_factory=GpuConfig)
     planner: PlannerConfig = Field(default_factory=PlannerConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     leases: LeasesConfig = Field(default_factory=LeasesConfig)
@@ -1020,6 +1138,15 @@ class Config(BaseSettings):
 
     # Set when loaded from disk so save() knows where to write back.
     source_path: Path | None = Field(default=None, exclude=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _schema_key(cls, data: Any) -> Any:
+        """Accept the file's ``schema`` key for the ``schema_version`` attribute."""
+        if isinstance(data, dict) and "schema" in data:
+            data = dict(data)
+            data.setdefault("schema_version", data.pop("schema"))
+        return data
 
     @model_validator(mode="after")
     def _validate_ports(self) -> Config:
@@ -1105,6 +1232,29 @@ class Config(BaseSettings):
         # by_alias so LoggingConfig.json_logs round-trips as the `json` key.
         return self.model_dump(mode="json", exclude=set(self.UNPERSISTED_KEYS), by_alias=True)
 
+    def _park_hf_token(self, data: dict[str, Any]) -> None:
+        """Keep ``hf.token`` out of config.yaml when the OS keyring can hold it.
+
+        With a keyring the token is stored there and the YAML carries ``null``;
+        ``load_config`` reads it back. Without one the token stays in the (now
+        0600) file, which is the documented fallback. Clearing the token clears
+        both places. Best effort: a secret store that fails must not stop a save.
+        """
+        hf = data.get("hf")
+        if not isinstance(hf, dict):
+            return
+        try:
+            store = SecretStore(self.data_dir)
+            token = hf.get("token")
+            if not token:
+                store.delete(HF_TOKEN_SECRET)
+            elif store.backend == "keyring" and store.set(HF_TOKEN_SECRET, str(token)) == "keyring":
+                hf["token"] = None
+            else:
+                store.delete(HF_TOKEN_SECRET)
+        except Exception:  # noqa: BLE001 - never let secret storage break a settings save
+            return
+
     def save(self, path: Path | None = None) -> Path:
         """Write the config atomically, tolerating a concurrent reader.
 
@@ -1118,20 +1268,24 @@ class Config(BaseSettings):
         """
         target = path or self.config_path
         target.parent.mkdir(parents=True, exist_ok=True)
-        payload = yaml.safe_dump(self.to_yaml_dict(), sort_keys=False, default_flow_style=False)
+        data = self.to_yaml_dict()
+        self._park_hf_token(data)
+        payload = yaml.safe_dump(data, sort_keys=False, default_flow_style=False)
         tmp = target.with_suffix(target.suffix + ".tmp")
         # fsync before the rename: without it a power loss in the rename window
         # can leave a zero-length config.yaml, which loads as "{}" and silently
         # reverts every setting to its default (WP17 R5). The previous file is
         # kept as .bak so a truncated one is recoverable by hand.
-        with tmp.open("w", encoding="utf-8") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
+        #
+        # config.yaml and its .bak hold server.api_key, mcp.pin and (without a
+        # keyring) hf.token, so both are written owner-only: 0600 on POSIX, an
+        # owner-only ACL on Windows. The temp file is created that way before
+        # the secrets go in, and the rename carries the permissions along.
+        write_private(tmp, payload)
         if target.is_file():
             with contextlib.suppress(OSError):
                 backup = target.with_suffix(target.suffix + ".bak")
-                backup.write_bytes(target.read_bytes())
+                write_private(backup, target.read_bytes())
         last: OSError | None = None
         for attempt in range(_SAVE_RETRIES):
             try:
@@ -1287,6 +1441,15 @@ def load_config(path: Path | str | None = None, *, create: bool = False) -> Conf
 
     config.source_path = config_path if file_present else None
 
+    if config.hf.token is None:
+        # A keyring-held token (see Config._park_hf_token) is not in the file.
+        try:
+            stored = SecretStore(data_dir).get(HF_TOKEN_SECRET)
+        except Exception:  # noqa: BLE001 - an unreadable keyring is "no token", not a crash
+            stored = None
+        if stored:
+            config.hf.token = stored
+
     if config.models.dir is None:
         detected = detect_model_dir()
         if detected is not None:
@@ -1304,9 +1467,9 @@ def load_config(path: Path | str | None = None, *, create: bool = False) -> Conf
         # the user tuning anything. Import lazily -- config must stay importable
         # on a machine with no NVML at all.
         try:
-            from studioforge.core.gpu import get_probe
+            from studioforge.core.gpu import probe_for_config
 
-            applied = tune_for_hardware(config, get_probe().list_gpus())
+            applied = tune_for_hardware(config, probe_for_config(config).list_gpus())
             if applied:
                 from studioforge.logging import get_logger
 
@@ -1350,12 +1513,17 @@ def _warn_unknown_keys(raw: dict[str, Any], config_path: Path) -> None:
     does not work and nothing says why".
     """
     unknown: list[str] = []
-    top_fields = set(Config.model_fields)
+    top_fields = set(Config.model_fields) | {
+        info.serialization_alias
+        for info in Config.model_fields.values()
+        if info.serialization_alias
+    }
     for key, value in raw.items():
         if key not in top_fields:
             unknown.append(key)
             continue
-        section_type = Config.model_fields[key].annotation
+        section_info = Config.model_fields.get(key)
+        section_type = section_info.annotation if section_info is not None else None
         fields = getattr(section_type, "model_fields", None)
         if not isinstance(value, dict) or not isinstance(fields, dict):
             continue
@@ -1432,12 +1600,19 @@ RESTART_REQUIRED_KEYS = frozenset(
         "watchdog.host",
         "watchdog.port",
         "data_dir",
+        "gpu.backend",
+        "gpu.probe_cache_s",
+        "gpu.probe_timeout_s",
         "gateway.child_port_start",
         "gateway.child_port_end",
         # CORS origins are captured when the middleware is constructed, and the
         # MCP path decides where the app mounts -- neither can change in place.
         "server.cors_origins",
         "server.cors_allow_credentials",
+        # Certificates are loaded when the listeners are created.
+        "server.tls.mode",
+        "server.tls.cert_file",
+        "server.tls.key_file",
         "mcp.path",
         "mcp.enabled",
         # The log file handlers are built once, at start (D69 §15).

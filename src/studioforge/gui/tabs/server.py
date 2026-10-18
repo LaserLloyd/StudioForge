@@ -62,6 +62,31 @@ def render(ctx: GuiContext) -> None:
         _capabilities_panel(ctx, engine_refresh)
 
 
+def engine_panels(ctx: GuiContext) -> None:
+    """The engine controls and what this build can run (Engines)."""
+    # The capabilities panel's update banner installs engines, so it is handed
+    # the Engine panel's own refresh: painting an install into a stale engine
+    # list was the no-op refresh of D49-9.
+    engine_refresh = _engine_panel(ctx)
+    _capabilities_panel(ctx, engine_refresh)
+
+
+def integration_panels(ctx: GuiContext) -> None:
+    """Pointing other programs at this server (Integrations)."""
+    _openclaw_panel(ctx)
+    _protocol_panel(ctx)
+
+
+def health_panels(ctx: GuiContext) -> None:
+    """Version, uptime and what is loaded (Diagnostics)."""
+    _health_panel(ctx)
+
+
+def config_panels(ctx: GuiContext) -> None:
+    """The raw settings editor (Advanced)."""
+    _config_panel(ctx)
+
+
 # ---------------------------------------------------------------------------
 # First-run readiness
 # ---------------------------------------------------------------------------
@@ -793,12 +818,15 @@ async def smoke_engine(ctx: GuiContext, tag: str) -> None:
             return
         with busy(message=f"Smoke testing {tag}…"):
             try:
-                ok, detail = await ctx.engine_manager.smoke_test(tag)
+                ok, smoke_result, detail = await ctx.engine_manager.smoke_check(tag)
             except Exception as exc:  # noqa: BLE001
                 notify_error(exc, what="smoke test")
                 return
+        verdict = (
+            "FAIL" if not ok else ("PASS" if smoke_result == "passed" else "PASS (binary-only)")
+        )
         ui.notify(
-            f"{tag}: {'PASS' if ok else 'FAIL'}\n{detail[:400]}",
+            f"{tag}: {verdict}\n{detail[:400]}",
             type="positive" if ok else "negative",
             multi_line=True,
             close_button=True,

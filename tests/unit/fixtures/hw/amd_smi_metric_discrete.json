@@ -1,0 +1,12 @@
+[
+  {
+    "gpu": 0,
+    "usage": {"gfx_activity": {"value": 7, "unit": "%"}},
+    "mem_usage": {
+      "total_vram": {"value": 24560, "unit": "MB"},
+      "used_vram": {"value": 1195, "unit": "MB"},
+      "free_vram": {"value": 23365, "unit": "MB"}
+    },
+    "temperature": {"edge": {"value": 41, "unit": "C"}}
+  }
+]

@@ -1,0 +1,1506 @@
+{
+  "count": 33,
+  "format": 1,
+  "tools": [
+    {
+      "annotations": {
+        "destructive_hint": false,
+        "idempotent_hint": false,
+        "open_world_hint": false,
+        "read_only_hint": false
+      },
+      "description": "Measure how many concurrent slots this model is actually worth running.\n\nEvery catalog row carries ``max_parallel`` (how many slots FIT) and\n``recommended_parallel`` (how many are worth running). Until this tool\nhas been run for a model on a given set of cards, the second number is\nan *estimate* -- a bandwidth calculation, not an observation -- and\n``recommended_parallel_basis`` says ``\"estimated\"``. This replaces it\nwith a measurement, and every later ``list_models`` on that placement\nreports ``\"measured\"``.\n\nWhat it does: loads the model once at that placement with as many slots\nas it holds, then fires 1, 2, 4 and 8 concurrent completions and records\nper-stream tokens/second, aggregate tokens/second and p95 latency for\neach. The engine's own decode counter is read alongside, so the result\ncan prove the requests really batched instead of queueing.\n\n**This takes minutes and it is synchronous.** It is also refused\noutright while anything is serving, loading, testing or benchmarking --\nthe numbers here *are* contention, so a busy server cannot produce them.\nRead ``server_status.busy`` first. It leaves the rig as it found it: a\nmodel that was not loaded is unloaded again, and one that was resident\nis reloaded with the settings it had.\n\nArgs:\n    model_id: Model id or alias.\n    mode: A hardware-mode key from a ``placements[]`` row --\n        ``dual_5090``, ``dual_3090``, ``all_gpus``, ``single_5090`` on\n        this rig. Omit it to measure the placement the planner would\n        choose, which is usually what you want.\n    ctx_size: Context per slot to measure at. Omit it to use the\n        placement's own optimal, so the measurement describes the load\n        the catalog recommends. The knee moves with context, so a run at\n        one context is not evidence about another.\n    max_tokens: Tokens generated per request (default 128). Raise it if\n        a fast small model finishes before the batch stabilises.\n\nReturns:\n    ``levels`` (one row per concurrency: ``per_stream_tps``,\n    ``aggregate_tps``, ``p95_latency_s``, ``achieved_batch``), the\n    resulting ``recommended_parallel`` with its ``basis`` and a\n    ``detail`` sentence saying which level failed which test, and what\n    the run did to the rig (``loaded_for_benchmark``,\n    ``unloaded_after``, ``restored``).",
+      "input_schema": {
+        "properties": {
+          "ctx_size": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Ctx Size"
+          },
+          "max_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Max Tokens"
+          },
+          "mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Mode"
+          },
+          "model_id": {
+            "title": "Model Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "model_id"
+        ],
+        "title": "benchmark_parallelArguments",
+        "type": "object"
+      },
+      "name": "benchmark_parallel",
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "benchmark_parallelDictOutput",
+        "type": "object"
+      },
+      "server": "gateway"
+    },
+    {
+      "annotations": {
+        "destructive_hint": false,
+        "idempotent_hint": true,
+        "open_world_hint": false,
+        "read_only_hint": true
+      },
+      "description": "**Ask this BEFORE you load anything.** Is the already-loaded model good enough?\n\nThe operator usually has a model loaded already, and most loaded models\ncan do most jobs. This tool answers \"is what is resident right now at\nleast this big / able to do this?\" in one call, and -- when the answer\nis yes -- hands back the **model id to put in your request**. That saves\nyou a 40-second load, or a call out to a cloud provider, that you did\nnot need to make.\n\nThe three calls you will make::\n\n    check_loaded_model(min_params=\"20b\")\n    check_loaded_model(min_params=\"7b\", vision=true)\n    check_loaded_model(tags=[\"coding\"])\n\nTHE RECIPE. Call it, then read ``answer``:\n\n1. ``answer == \"yes\"`` -- take the ``model`` field and send your work to\n   the local OpenAI-compatible API: ``POST /v1/chat/completions`` with\n   ``{\"model\": \"<model>\", \"messages\": [...]}``. Call ``connection_info``\n   once for the base URL (``openai_base_urls``). Do NOT call\n   ``load_model`` -- it is already loaded and warm.\n2. ``answer == \"no\"`` -- read ``reason``, which names the gap in one\n   sentence (\"nothing is loaded\", \"largest loaded model is 4B, below the\n   20B bar\", \"no loaded model reports audio\"). Then either\n   ``load_recommended(model_id=\"<a bigger/right model>\", ctx_size=...)``\n   -- use ``list_models`` to pick one -- or fall back to your other\n   provider. ``hint`` says the same thing in one line. \"No\" is about\n   what is loaded NOW: a model you already intend to use loads on\n   demand when a request names it, so do not fall back over that.\n\nA bare number in ``min_params`` means **billions**: ``\"20\"``, ``20`` and\n``\"20b\"`` are all a 20-billion-parameter bar, and ``\"500m\"`` is 0.5B.\n\nA tag the server cannot **verify** fails the bar, exactly like a \"no\":\nthe gate only ever answers yes to what it can prove, so it never sends\nvision work to a text-only model.\n\nArgs:\n    min_params: The size bar in billions -- ``\"20b\"``, ``\"7b\"``,\n        ``\"500m\"``, or just ``\"20\"``. Omit for no size bar. A model\n        whose size cannot be determined at all fails any bar.\n    vision: Require image input (the model can read pictures).\n    audio: Require audio input. Only a *running* child can prove this,\n        so a model that does not report its modalities is \"unknown\"\n        and fails.\n    tools: Require tool/function calling.\n    thinking: Require a reasoning/thinking mode.\n    uncensored: Require an uncensored/abliterated model.\n    tags: Anything else, as a list (``[\"coding\", \"roleplay\"]``) or a\n        comma-separated string (``\"coding,roleplay\"``) -- both work.\n        Free-form: ``\"vietnamese\"``, ``\"medical\"`` and words nobody\n        anticipated are matched against the model's name tokens and its\n        GGUF ``general.tags``, so an unlisted tag gets a truthful\n        \"yes\" or \"unknown\" rather than an error. Whole tokens only.\n\nReturns:\n    ``{\"ok\", \"answer\": \"yes\"|\"no\", \"model\", \"params_b\",\n    \"active_params_b\", \"params_source\", \"modalities\", \"capabilities\",\n    \"checked\", \"instances\", \"reason\", \"hint\"}``. ``model`` is the id to\n    use and is ``null`` on a no, along with every other field that\n    describes a winner. ``params_source`` says how the size was known:\n    ``metadata`` (exact), ``name`` (read off the model id), ``estimated``\n    (from file bytes -- a few percent out) or ``unknown``.\n    ``active_params_b`` is set only for a mixture-of-experts model, whose\n    routed count is far below its total; the size bar is checked against\n    the **total**. ``instances`` shows the working for every loaded\n    model, each with ``meets`` and a ``why_not`` list, so a \"no\" can be\n    diagnosed without a second call.",
+      "input_schema": {
+        "properties": {
+          "audio": {
+            "default": false,
+            "title": "Audio",
+            "type": "boolean"
+          },
+          "min_params": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Min Params"
+          },
+          "tags": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Tags"
+          },
+          "thinking": {
+            "default": false,
+            "title": "Thinking",
+            "type": "boolean"
+          },
+          "tools": {
+            "default": false,
+            "title": "Tools",
+            "type": "boolean"
+          },
+          "uncensored": {
+            "default": false,
+            "title": "Uncensored",
+            "type": "boolean"
+          },
+          "vision": {
+            "default": false,
+            "title": "Vision",
+            "type": "boolean"
+          }
+        },
+        "title": "check_loaded_modelArguments",
+        "type": "object"
+      },
+      "name": "check_loaded_model",
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "check_loaded_modelDictOutput",
+        "type": "object"
+      },
+      "server": "gateway"
+    },
+    {
+      "annotations": {
+        "destructive_hint": false,
+        "idempotent_hint": true,
+        "open_world_hint": false,
+        "read_only_hint": true
+      },
+      "description": "Every address this server can be reached on, best first.\n\nUse this when you want to move an existing connection somewhere better.\nA tailnet (Tailscale) address is returned first because it keeps working\nacross network changes; a LAN address is faster but only valid while you\nare on the same network, so ask for ``prefer=\"lan\"`` when you know you\nare local and want the shortest hop.\n\nArgs:\n    prefer: ``\"auto\"`` (tailnet, then LAN, then loopback), ``\"lan\"`` for\n        a direct local address, ``\"tailscale\"``, or ``\"loopback\"``.\n\nReturns the recommended URL plus every alternative, the OpenAI base URL\nfor inference, and whether a pairing PIN is required.",
+      "input_schema": {
+        "properties": {
+          "prefer": {
+            "default": "auto",
+            "title": "Prefer",
+            "type": "string"
+          }
+        },
+        "title": "connection_infoArguments",
+        "type": "object"
+      },
+      "name": "connection_info",
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "connection_infoDictOutput",
+        "type": "object"
+      },
+      "server": "gateway"
+    },
+    {
+      "annotations": {
+        "destructive_hint": true,
+        "idempotent_hint": false,
+        "open_world_hint": false,
+        "read_only_hint": false
+      },
+      "description": "Remove a model from the registry, optionally deleting its GGUF files.\n\nDESTRUCTIVE and requires ``confirm=true``. With ``delete_files=true``\nthis permanently deletes multi-gigabyte files from disk; there is no\nundo and no recycle bin. The model must not be loaded -- unload it\nfirst.\n\nWith ``delete_files=false`` only the registry entry and saved settings\ngo away; the next library scan will find the files again. That is the\nsafer choice and almost never what you actually want, so say which you\nmean. Either way, virtual models (personas) built on this base are\nremoved with it and are NOT restored by a rescan; the result lists them\nunder ``virtual_models_removed``.\n\nArgs:\n    model_id: Model id or alias.\n    delete_files: Also unlink the GGUF shards and the paired mmproj (a\n        shared mmproj used by another model is kept).\n    confirm: Must be true. Without it this call does nothing and\n        explains what it would have done.\n\nReturns:\n    ``{\"ok\": true, \"removed\": [paths]}`` -- the files that were deleted,\n    or that *would* be deleted when ``delete_files`` was false.",
+      "input_schema": {
+        "properties": {
+          "confirm": {
+            "default": false,
+            "title": "Confirm",
+            "type": "boolean"
+          },
+          "delete_files": {
+            "default": false,
+            "title": "Delete Files",
+            "type": "boolean"
+          },
+          "model_id": {
+            "title": "Model Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "model_id"
+        ],
+        "title": "delete_modelArguments",
+        "type": "object"
+      },
+      "name": "delete_model",
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "delete_modelDictOutput",
+        "type": "object"
+      },
+      "server": "gateway"
+    },
+    {
+      "annotations": {
+        "destructive_hint": true,
+        "idempotent_hint": false,
+        "open_world_hint": false,
+        "read_only_hint": false
+      },
+      "description": "Queue a GGUF model download from HuggingFace.\n\nReturns as soon as the download is *queued* -- it proceeds in the\nbackground, survives a restart, and resumes from its partial file.\nPoll ``server_status`` (``active_downloads``) for a count, and\n``list_models`` to see the model appear once it lands. Per-file detail\n(percent, MB/s, and on a stumble ``attempt``/``max_attempts``,\n``retry_in_s`` and ``last_error``) is on ``GET /api/downloads``, which\nis HTTP rather than a tool because it is a polling surface.\n\nChoose the quant with ``repo_details`` first: it is the only place the\nreal size and fit of each quantization are known.\n\nArgs:\n    repo_id: HuggingFace repo, e.g. \"bartowski/Qwen2.5-7B-Instruct-GGUF\".\n    quant: Quantization to pick, e.g. \"Q4_K_M\". When omitted the repo is\n        inspected and a sensible default chosen; if several match, the\n        available options are listed back to you so you can pick one.\n    include_mmproj: Also fetch the vision projector when the repo has\n        one. Leave this true for vision models -- without the mmproj file\n        the model loads but cannot see images.\n\nReturns:\n    The queued download's id and resolved file list, or an error\n    explaining what to fix (unknown repo, ambiguous quant, no HF token\n    for a gated repo).",
+      "input_schema": {
+        "properties": {
+          "include_mmproj": {
+            "default": true,
+            "title": "Include Mmproj",
+            "type": "boolean"
+          },
+          "quant": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Quant"
+          },
+          "repo_id": {
+            "title": "Repo Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repo_id"
+        ],
+        "title": "download_modelArguments",
+        "type": "object"
+      },
+      "name": "download_model",
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "download_modelDictOutput",
+        "type": "object"
+      },
+      "server": "gateway"
+    },
+    {
+      "annotations": {
+        "destructive_hint": false,
+        "idempotent_hint": true,
+        "open_world_hint": false,
+        "read_only_hint": true
+      },
+      "description": "Read the effective configuration, with secrets redacted.\n\n``server.api_key``, ``mcp.pin`` and ``hf.token`` are never returned in\nfull -- only a short fingerprint -- so this is safe to read into a\ntranscript. Use it to discover the exact dotted key names that\n``set_config`` accepts.\n\nReturns:\n    The whole config tree, the path of the file it came from, and the\n    list of keys that only take effect after a restart.",
+      "input_schema": {
+        "properties": {},
+        "title": "get_configArguments",
+        "type": "object"
+      },
+      "name": "get_config",
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "get_configDictOutput",
+        "type": "object"
+      },
+      "server": "gateway"
+    },
+    {
+      "annotations": {
+        "destructive_hint": false,
+        "idempotent_hint": true,
+        "open_world_hint": false,
+        "read_only_hint": true
+      },
+      "description": "Every standing GPU lease, with its clocks and class -- read-only (D77).\n\nThe same records ``GET /api/leases`` publishes and ``server_status``\ncarries under ``leases``, on their own so a tenant-aware agent can read\nthe lease book without the rest of the status payload. Each row has\n``id``, ``devices``, ``holder``, ``holder_family``, ``kind``\n(``benchmark`` / ``render`` / ``agent`` / ``other`` -- descriptive, not\npolicy), ``priority`` (the D46 class of the claim), ``state``\n(``active`` / ``idle`` / ``expiring`` / ``vacating``), ``idle_s``,\n``expires_at`` and ``retry_after_s``. A holder's ``vacate_url`` is\nnever in this view (``vacate_registered`` says whether one exists) and\nits token is never shown to anyone.\n\nBranch on ``kind`` the way docs/OPENCLAW-RIG.md says: ``benchmark``\nmeans stand down; ``render`` and ``agent`` mean wait ``retry_after_s``\nand re-ask; ``vacating`` means that holder has been asked to leave.\n\nReturns:\n    ``{\"ok\": true, \"leases\": [...], \"count\": n}``.",
+      "input_schema": {
+        "properties": {},
+        "title": "gpu_leasesArguments",
+        "type": "object"
+      },
+      "name": "gpu_leases",
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "gpu_leasesDictOutput",
+        "type": "object"
+      },
+      "server": "gateway"
+    },
+    {
+      "annotations": {
+        "destructive_hint": false,
+        "idempotent_hint": true,
+        "open_world_hint": false,
+        "read_only_hint": true
+      },
+      "description": "Who shares this rig's GPUs, and whether each one is up -- read-only (D77).\n\nThe tenant registry: every program the operator declared in\n``tenants.registry`` plus every one that registered itself through\n``POST /api/tenants/register`` (the VRAM Tenant Protocol, vt.1,\ndocs/TENANTS.md). Per row: ``name``, ``family`` (the ``holder_family``\nits leases carry, so you can match it against ``gpu_leases``), ``kind``\n(``module`` = an optional add-on this server may be asked to warm,\n``tenant`` = anything else that leases cards here), ``registered`` and\n``version`` (from its own registration), ``capabilities``,\n``default_priority`` (the D46 class its claims normally carry),\n``health`` (``state`` is ``healthy`` / ``unhealthy`` / ``unreachable`` /\n``unpolled``, with ``checked_at``, ``status_code``, ``latency_ms`` and a\nbounded ``summary`` of its health body), ``last_seen``, its standing\n``leases`` and the ``devices`` they cover.\n\nWhat this never does: start or stop a tenant (D79). A tenant whose\nhealth is ``unreachable`` is simply not running, and starting it is the\noperator's. URLs are withheld in this view, as ``server_status``\nwithholds a lease's ``vacate_url``; ``health_target`` gives the\n``host:port`` of the health endpoint.\n\nReturns:\n    ``{\"ok\": true, \"tenants\": [...], \"count\": n, \"protocol\": \"vt.1\"}``.",
+      "input_schema": {
+        "properties": {},
+        "title": "gpu_tenantsArguments",
+        "type": "object"
+      },
+      "name": "gpu_tenants",
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "gpu_tenantsDictOutput",
+        "type": "object"
+      },
+      "server": "gateway"
+    },
+    {
+      "annotations": {
+        "destructive_hint": false,
+        "idempotent_hint": true,
+        "open_world_hint": false,
+        "read_only_hint": true
+      },
+      "description": "**Start here.** Every model, newest download first, with how to load it.\n\nThis is the catalog: one call tells you what exists, what each model\nis, and -- per model -- a table of loading options with the exact\narguments to load each one. You should not need any other tool to\nchoose a model.\n\nHow to use the result:\n\n1. Read ``catalog_hint`` once; it explains every column.\n2. Models are ordered by ``downloaded_at``, **newest first**, which is\n   usually the order the user thinks in (\"the model I just got\").\n3. Take the model's ``recommended`` block. It is the default load: the\n   optimal settings on this rig's best pair of GPUs, chosen quality\n   first (the best KV cache that reaches the context floor, then the\n   largest context at that quality, then whatever slots fit).\n4. Pass its ``load_args`` object **verbatim** to ``load_model``. Do not\n   modify it, recompute it, or fill in extra fields -- it already names\n   the ``devices``.\n\n``placements`` is the same answer for every other set of cards this box\nhas, so \"run it on the 3090s and leave the 5090s free\" is a row you\npick rather than arithmetic you do. Each carries a ``ranking``\n(``fastest`` / ``largest_context`` / ``cheapest``). An ``optimal`` is\ncomputed as if that mode's cards were **idle**, which is what makes it\na property of the hardware rather than of this second; ``fits_now``\ntells you whether it would load right now and ``would_evict`` counts\nwhat is in the way, with ``fits_now_ctx`` giving the largest context\nthat does fit on that mode as things stand. Only ``recommended``\ncarries ``load_args`` in this compact view -- call ``model_options``\nfor the mode you settle on.\n\nAn ``options`` row with ``fits: false`` will not load right now. Check\nits ``if_gpus_idle`` block: if that says ``fits: true``, the VRAM exists\nbut something else is holding it, and ``unload_model`` on another model\nmakes the row available.\n\nTwo speed columns per row, because generation slows as the context\nwindow fills: ``est_gen_tps`` is one stream at about 8k tokens of\ncontext (an ordinary turn) and ``est_gen_tps_full_ctx`` is the same\nstream with the window nearly full. The truth is between them. Each\nmodel's ``attention_kind`` (\"full\", \"iswa\", \"hybrid\") says why its\ncontext tiers cost what they do -- iSWA and hybrid models keep only a\nfraction of the window in KV, so their huge contexts stay cheap.\n\nHow much to trust a speed: ``confidence`` is ``measured`` (this exact\nplacement and context were observed -- ``measured_gen_tps`` is real),\n``calibrated`` (corrected by a factor learned from observations; the\nmodel's ``calibration.basis`` says from what -- ``model+devices``,\n``model``, or ``peers``, meaning other models of the same density on\nthe same hardware) or ``estimated`` (nominal vendor bandwidth and\nFLOPS: an order of magnitude, not a promise).\n\nArgs:\n    loaded_only: Only models with a running llama-server child.\n    kind: Filter by kind -- \"chat\", \"embedding\" or \"rerank\".\n    full: Return every context-size row, and every placement's\n        ``load_args``. The default returns the recommended load, one\n        compact row per hardware mode, and the single context row that\n        fits best right now -- which is what you want unless you are\n        comparing context sizes.\n    refresh: Rebuild instead of serving the few-second cache. Only\n        needed right after loading or unloading something, because\n        ``fits`` depends on free VRAM.\n    limit: Return only the first N models after the other filters.\n        Because the ordering is newest-download-first, ``limit=5`` is\n        \"the five models the user most recently got\", which is usually\n        what \"my new model\" means. The default is 25; pass ``null`` (or\n        ``0``) to see the whole library, and read ``truncated`` /\n        ``total_matching`` to know whether the default hid anything.\n\nReturns:\n    ``{\"ok\": true, \"catalog_hint\": \"...\", \"models\": [...],\n    \"count\": N, \"truncated\": bool, \"total_matching\": M}``. Every\n    ``id`` is usable verbatim as the ``model`` field in OpenAI API\n    requests. ``count`` is the number of rows returned, so it reflects\n    ``limit`` (default 25, newest first); ``truncated`` says the limit\n    hid some, and ``total_matching`` how many matched the filters in\n    all -- raise ``limit`` or filter by ``kind`` to see the rest. ``state`` is the child\n    process's lifecycle word, kept from before the catalog existed:\n    ``\"stopped\"`` there means simply *not loaded*, not that anything\n    failed.",
+      "input_schema": {
+        "properties": {
+          "full": {
+            "default": false,
+            "title": "Full",
+            "type": "boolean"
+          },
+          "kind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Kind"
+          },
+          "limit": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": 25,
+            "title": "Limit"
+          },
+          "loaded_only": {
+            "default": false,
+            "title": "Loaded Only",
+            "type": "boolean"
+          },
+          "refresh": {
+            "default": false,
+            "title": "Refresh",
+            "type": "boolean"
+          }
+        },
+        "title": "list_modelsArguments",
+        "type": "object"
+      },
+      "name": "list_models",
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "list_modelsDictOutput",
+        "type": "object"
+      },
+      "server": "gateway"
+    },
+    {
+      "annotations": {
+        "destructive_hint": false,
+        "idempotent_hint": true,
+        "open_world_hint": false,
+        "read_only_hint": false
+      },
+      "description": "Load a model into VRAM now, returning once it is serving.\n\n**Pass a catalog ``load_args`` object straight in.** Every key in it\nis an argument of this tool, nothing needs adding, and that is the\nintended way to call it::\n\n    model = list_models()[\"models\"][0]\n    load_model(**model[\"recommended\"][\"load_args\"])      # names the devices\n    load_model(**model[\"options\"][3][\"load_args\"])       # a context tier; the\n                                                         # planner picks the cards\n\nThe ``recommended`` block and every ``placements[]`` recipe carry\n``devices``; the per-context ``options`` rows deliberately do not --\ntheir placement is the planner's choice at load time, which the row's\n``devices`` column previews.\n\nYou often do not need this tool at all: naming an unloaded model in an\nOpenAI API request loads it automatically with planner defaults. Reach\nfor it to pre-warm a model, or -- the usual reason -- to load one at a\nspecific context size and slot count from the catalog.\n\nThis is GPU-only. If the model cannot fit entirely in VRAM the call\nfails with the required-vs-available byte counts, the largest context\nthat *would* fit, and concrete suggestions -- there is no CPU fallback,\nso read those numbers and retry with a smaller ctx_size or a smaller\nkv_cache_type instead of retrying the same call. Better: call\n``model_options`` and pick a row whose ``fits`` is true.\n\nLoading may evict other idle models to make room (this is normal and is\nreported in the plan's ``evict_model_ids``).\n\nPlacement is normally the planner's decision against live free VRAM,\nand the catalog's ``devices`` column tells you what it will choose. To\npick the hardware yourself, pass ``devices`` -- which is what a\n``placements[]`` row's ``load_args`` does. To keep the load OFF a card\nwithout picking one yourself, pass ``allowed_devices``: the planner\nstill chooses, inside the set you name. Never pass both.\n\nArgs:\n    model_id: Model id or alias.\n    ctx_size: Context tokens per parallel slot. None uses the saved\n        per-model setting, else the global default.\n    kv_cache_type: KV cache quantization for the K cache -- \"f16\",\n        \"q8_0\" or \"q4_0\" (those three only). Each step down roughly\n        halves KV cache VRAM at a quality cost that is real and\n        family-dependent, and the K cache is the sensitive one: a q4_0\n        K cache is never chosen automatically. None lets the planner\n        pick the best-quality cache that reaches the requested context.\n    kv_cache_type_v: The V cache, when it should differ from K. Omit it\n        and V follows K. The one combination worth asking for is\n        \"q8_0\" K with \"q4_0\" V: the V cache tolerates 4 bits where the\n        K cache does not.\n    parallel: Number of concurrent slots, i.e. how many conversations\n        this load can serve at once. The engine is launched with\n        ctx_size * parallel total context, so each slot really gets\n        ctx_size. Match your own client concurrency to this number. A\n        catalog row's ``parallel`` is the **most** that placement\n        sustains, not a requirement -- asking for fewer is always fine\n        and simply leaves VRAM free for something else.\n    devices: CUDA indices to place this load on, for this load only --\n        it does not change the model's saved settings, so the next load\n        without it goes back to the planner's choice. Take it from a\n        ``placements[]`` row's ``load_args``; naming an index this box\n        does not have is rejected immediately. This is a FORCED\n        placement: exactly these cards, all of them, and more than one\n        becomes a split.\n    allowed_devices: CUDA indices the planner may CHOOSE AMONG for this\n        load only. Use this, not ``devices``, when what you know is\n        which card to stay off -- one another program is rendering on,\n        say. The planner still ranks the cards, sizes the context and\n        picks the split; you have only bounded where it may look, so\n        you keep every placement decision this server makes better than\n        you can. Not persisted, so the next load without it is\n        unbounded again. It only narrows: a card the model's own\n        settings, an operator exclusion or a GPU lease forbids stays\n        forbidden, and asking for one does not unlock it. Passing both\n        this and ``devices`` is an error -- the second would decide\n        nothing. An empty list is an error too, not \"no restriction\":\n        if you computed \"every card except X\" and got nothing, the\n        answer is \"nowhere\", and this server will not read it as\n        \"anywhere\". If nothing in the set fits, the refusal says so\n        with the numbers and names the lease when a lease is why.\n    force: Reload even if the model is already running (use after\n        changing its settings).\n    priority: The load's tier: 1 for the model a person is actively\n        chatting with, 2 for a model dispatched to work on a task, 3\n        (or omitted) for background work. A tier-1/2 load takes the\n        fastest placement -- idle worse-tier models are displaced from\n        the cards it picks and the recently active ones reloaded\n        afterwards where they fit -- jumps the load queue, and holds\n        new worse-tier traffic off (503 + Retry-After) while it loads.\n        The tier is remembered per model, so later loads of the same\n        model keep it. A tier-3 load never displaces tier 1 or 2.\n\nReturns:\n    The running instance: port, pid, devices, planned VRAM breakdown,\n    the plan's ``max_parallel``, the tier it loaded at (``priority``)\n    and its resolved ``speculative`` block (``null`` = not decided yet,\n    ``{\"type\": \"none\", \"reason\": ...}`` = considered and declined).",
+      "input_schema": {
+        "properties": {
+          "allowed_devices": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Allowed Devices"
+          },
+          "ctx_size": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Ctx Size"
+          },
+          "devices": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Devices"
+          },
+          "force": {
+            "default": false,
+            "title": "Force",
+            "type": "boolean"
+          },
+          "kv_cache_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Kv Cache Type"
+          },
+          "kv_cache_type_v": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Kv Cache Type V"
+          },
+          "model_id": {
+            "title": "Model Id",
+            "type": "string"
+          },
+          "parallel": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Parallel"
+          },
+          "priority": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Priority"
+          }
+        },
+        "required": [
+          "model_id"
+        ],
+        "title": "load_modelArguments",
+        "type": "object"
+      },
+      "name": "load_model",
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "load_modelDictOutput",
+        "type": "object"
+      },
+      "server": "gateway"
+    },
+    {
+      "annotations": {
+        "destructive_hint": false,
+        "idempotent_hint": true,
+        "open_world_hint": false,
+        "read_only_hint": false
+      },
+      "description": "**The easy way to load.** Say the model and the context you need.\n\nSay the model and the context you need -- 65536, 131072, 262144, 524288,\nor any number up to the model's trained window -- and the server picks\nthe GPUs, the KV cache type and the slot count under the quality-first\npolicy and loads at **exactly** that context. Or it tells you why it\ncannot.\n\nUse this instead of ``load_model`` whenever what you know is \"I need a\n200k window for this transcript\" rather than \"I want these two cards\".\nUse ``list_models`` -> a ``placements[]`` row -> ``load_model`` when you\nwant to choose the hardware yourself.\n\n**This is the one load path that never quietly shrinks your window.**\nEverywhere else a context that does not fit steps down to one that does,\nbecause a roomier window is a nicety. Here the window is the request, so\na refusal is a structured error listing, per set of cards, the largest\ncontext that *would* work and what is in the way -- a model that is\nserving (with ``retry_after_s``, so waiting is the right move), memory\nheld by something that is not us, or the model's own trained window. Ask\nagain with the number it names and it will load.\n\nIt never interrupts anyone: only idle models are evicted to make room,\nnever one that is mid-request.\n\nArgs:\n    model_id: Model id or alias.\n    ctx_size: Tokens **per concurrent conversation**, exactly. Above the\n        model's ``n_ctx_train`` this is refused with the number that\n        would be accepted, because serving past the trained window needs\n        RoPE scaling and degrades quality.\n    prefer_mode: A hardware-mode key from a ``placements[]`` row\n        (``dual_5090``, ``dual_3090``, ``all_gpus``, ``single_5090`` on\n        this rig) to try that placement instead of the default order.\n        A model whose saved settings pin its cards\n        (``device_override``) is loaded on exactly those and nowhere\n        else, as every other load of it is; naming another mode for it\n        is an error that says so. Its saved ``allowed_devices`` bounds\n        every mode the same way.\n    kv_min: The lowest KV cache quality this load may accept -- \"f16\",\n        \"q8_0\" or \"q4_0\", those three only. It is a floor on the\n        quality-first ladder, not a choice: pass \"f16\" to mean \"do not\n        quantize the cache to reach this window at all\", and a window\n        that would need a worse cache is refused with the same\n        structured error instead of being reached quietly at lower\n        quality. Omitted, the whole ladder is available (a q4_0 K cache\n        is still never chosen automatically).\n    priority: The load's tier: 1 for the model a person is actively\n        chatting with, 2 for a dispatched agent, 3 (or omitted) for\n        background work. A tier-1/2 load takes the best placement even\n        when idle worse-tier models must be displaced for it; the\n        recently active ones are reloaded afterwards where they fit.\n    max_slots: Ceiling on the number of concurrent slots this load may\n        choose, >= 1. The server's own answer is what the placement\n        *could* sustain; if you know how many conversations will really\n        run -- three bots, one window each -- cap it here and the KV\n        cache for the slots you will not use is never priced into the\n        fit, which often buys a larger window instead. Omitted, the\n        recommendation stands.\n    allowed_devices: CUDA indices this call may use, for this call\n        only. A bound on the search, not a placement: the server still\n        walks the placements over the cards you named, still picks the\n        KV cache type and the slot count, and still refuses with the\n        same structured error if the window does not fit on any of\n        them. Use it when what you know is which card to stay off --\n        one another program is rendering on, say -- rather than which\n        to use. ``prefer_mode`` then names one of the modes over those\n        cards. It only narrows: a card the model's own settings, an\n        operator exclusion or a GPU lease forbids stays forbidden. It\n        is never saved, ``persist=true`` included.\n    persist: Write the profile this call resolves -- context per slot,\n        both KV cache types, the slot count and the tier -- into the\n        model's saved settings, so a later plain load (including the\n        automatic one an inference request triggers) reproduces it\n        without you asking again. The trade: it freezes the KV ladder\n        and the slot estimator for this model, which then stop adapting\n        to what else is resident or to a changed machine; the settings\n        fields have to be nulled to hand the decision back, and no MCP\n        tool writes per-model settings, so that undo happens elsewhere:\n        ``PATCH /api/models/{id}/settings`` on the management REST port\n        with ``{\"ctx_size\": null, \"kv_cache_type\": null,\n        \"kv_cache_type_v\": null, \"parallel\": null, \"priority\": null}``\n        (a merge-patch: an explicit null clears exactly that field and\n        nothing else), the same fields set back to \"Auto\" in the\n        GUI's model settings dialog, or ``sfctl models settings\n        <model> --set ctx_size=null`` and friends from a shell -- a\n        literal null clears the field whatever it holds. Devices are\n        deliberately not persisted -- a placement is a one-shot load\n        argument. Refused for a preset-only virtual model (the write\n        would land on the base model and every persona sharing it, so\n        call it on the base id) and while that model is being\n        benchmarked. Both are checked before the walk begins, so the\n        refusal is an ordinary error result naming the reason and\n        nothing was loaded. After a successful load the write is\n        best-effort instead: anything that refuses it then -- a\n        benchmark that started *during* the load, or the settings\n        validation rejecting the resolved row (a resident whose slot\n        count predates a max_parallel_cap lowered under it) -- leaves\n        the load standing and skips only the write, so a success here\n        means the model is loaded but does not by itself prove the\n        profile was saved.\n    min_slots: The fewest concurrent slots this load may have, >= 1\n        and not above ``max_slots``. The server still picks the count,\n        but never below this, and it judges the fit AT this count: if\n        the window only fits with fewer slots, the answer is the same\n        structured refusal, naming the largest context that would fit\n        with this many slots and the most slots that fit at this\n        context -- never a load with fewer slots than you asked for.\n    kv_unified: ``true`` makes ``ctx_size`` ONE memory pool that every\n        slot shares: each conversation may use the whole window, all of\n        them together may not exceed it, and the pool costs about what\n        ONE slot of that window costs (plus a little per extra slot).\n        Right for \"one main conversation plus quick side requests\" --\n        two slots so the side requests never push the conversation's\n        cached prompt out, for the price of one. Wrong for several\n        long conversations at once, which would run out of room\n        mid-reply. Omitted or ``false``: ``ctx_size`` per slot, each\n        slot's own. Cannot be combined with ``persist``.\n\nReturns:\n    The running instance: port, pid, devices, the KV cache type chosen,\n    the slot count, the tier it loaded at (``priority``), its resolved\n    ``speculative`` block, and the planned VRAM breakdown.",
+      "input_schema": {
+        "properties": {
+          "allowed_devices": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Allowed Devices"
+          },
+          "ctx_size": {
+            "title": "Ctx Size",
+            "type": "integer"
+          },
+          "kv_min": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Kv Min"
+          },
+          "kv_unified": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Kv Unified"
+          },
+          "max_slots": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Max Slots"
+          },
+          "min_slots": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Min Slots"
+          },
+          "model_id": {
+            "title": "Model Id",
+            "type": "string"
+          },
+          "persist": {
+            "default": false,
+            "title": "Persist",
+            "type": "boolean"
+          },
+          "prefer_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Prefer Mode"
+          },
+          "priority": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Priority"
+          }
+        },
+        "required": [
+          "model_id",
+          "ctx_size"
+        ],
+        "title": "load_recommendedArguments",
+        "type": "object"
+      },
+      "name": "load_recommended",
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "load_recommendedDictOutput",
+        "type": "object"
+      },
+      "server": "gateway"
+    },
+    {
+      "annotations": {
+        "destructive_hint": false,
+        "idempotent_hint": true,
+        "open_world_hint": false,
+        "read_only_hint": true
+      },
+      "description": "Full detail for one model, including what it is *actually* running as.\n\nUse this before loading a model (to see its trained context length and\ncapabilities) or when a loaded model is behaving unexpectedly: the\n``actual`` block is read live from llama-server's own ``/props``, so it\nshows the real context size and slot count rather than what was\nrequested. A mismatch between ``requested`` and ``actual`` is the first\nthing to check when context seems smaller than asked for.\n\nArgs:\n    model_id: A model id or alias as returned by ``list_models``.\n\nReturns:\n    Identity, files, capabilities, saved settings, GGUF metadata (the\n    chat template is summarised, not included -- it is thousands of\n    tokens), plus ``loaded``/``actual``/``slots`` when running.\n    ``arch_supported: false`` (with ``arch_note`` and\n    ``unsupported_reason``) means this llama.cpp build cannot load the\n    model at all; ``last_load_failure`` is its last launch that died.",
+      "input_schema": {
+        "properties": {
+          "model_id": {
+            "title": "Model Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "model_id"
+        ],
+        "title": "model_infoArguments",
+        "type": "object"
+      },
+      "name": "model_info",
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "model_infoDictOutput",
+        "type": "object"
+      },
+      "server": "gateway"
+    },
+    {
+      "annotations": {
+        "destructive_hint": false,
+        "idempotent_hint": true,
+        "open_world_hint": false,
+        "read_only_hint": true
+      },
+      "description": "Every loading option for ONE model: all context sizes, with speeds.\n\nUse this after ``list_models`` when the ``recommended`` load is not what\nyou want -- you need a 262144-token window and it offers 65536, you\nneed six concurrent conversations and it offers two, or you want one of\nthe other ``placements`` modes and need its ``load_args``. This view\nreturns every placement in full, including the ``load_args`` the\ncompact list omits.\n\nEach row is independent and complete: ``ctx_per_slot`` (context per\nconversation), ``fits`` (right now, on current free VRAM), ``devices``,\n``kv_cache_type``, ``vram_mb``, ``max_parallel`` with\n``parallel_limited_by``, estimated and measured tokens/second, and\n``load_args``.\n\nTrade-offs the table makes visible, so you can choose deliberately:\ndoubling ``ctx_per_slot`` costs ``max_parallel`` (by how much depends\non the model's ``attention_kind`` -- an \"iswa\" or \"hybrid\" model keeps\nonly a fraction of the window in KV, so its wide rows stay cheap while\na \"full\" model's do not); a ``kv_cache_type`` of q8_0 or q4_0 buys\ncontext back at some quality cost; and a row spread over more\n``devices`` is usually slower per token than a single-GPU row.\n``est_gen_tps`` shows that at ~8k of context, ``est_gen_tps_full_ctx``\nwith the window nearly full -- the wider the row, the further those two\nnumbers sit apart, and that gap is the real price of the context.\n\nThe row marked ``best_now`` is what would load on the machine exactly as\nit stands; the model-level ``recommended`` is the better answer when you\ncan choose the hardware, because it is computed with its cards idle.\nBoth are chosen quality first: the best KV cache that reaches the\nserver's context floor, then the largest context at that quality. A\n4-bit K cache is never chosen for you -- ask for it explicitly with\n``kv_cache_type`` if you have decided the trade is worth it.\n\nArgs:\n    model_id: Model id or alias, as returned by ``list_models``.\n    refresh: Rebuild rather than serve the few-second cache.\n\nReturns:\n    ``{\"ok\": true, \"model\": {...with \"options\": [...]}}``. Pass the\n    chosen row's ``load_args`` verbatim to ``load_model``.",
+      "input_schema": {
+        "properties": {
+          "model_id": {
+            "title": "Model Id",
+            "type": "string"
+          },
+          "refresh": {
+            "default": false,
+            "title": "Refresh",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "model_id"
+        ],
+        "title": "model_optionsArguments",
+        "type": "object"
+      },
+      "name": "model_options",
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "model_optionsDictOutput",
+        "type": "object"
+      },
+      "server": "gateway"
+    },
+    {
+      "annotations": {
+        "destructive_hint": false,
+        "idempotent_hint": true,
+        "open_world_hint": false,
+        "read_only_hint": false
+      },
+      "description": "Pin a model so it stays loaded at all times, or unpin it.\n\nNOT needed for on-demand use: every model, pinned or not, loads itself\nwhen a ``/v1`` request names it and unloads after its idle TTL. Pin\nonly what must never pay a cold load.\n\nThe two calls you will make::\n\n    pin_model(model_id=\"vendor/Some-Model-GGUF/Some-Model-Q4_K_M\")  # keep loaded\n    pin_model(model_id=\"vendor/Some-Model-GGUF/Some-Model-Q4_K_M\", pinned=False)\n\nA pinned model has no idle TTL, is never chosen as an eviction victim,\nis loaded at server startup, and is brought back automatically (within\none sweep, ~15s) if it is not resident -- so pinning an *unloaded*\nmodel also loads it shortly, no separate ``load_model`` call needed.\nDo NOT call ``unload_model`` and then pin to \"restart\" it: an explicit\nunload is honoured and holds the model down until it is loaded or\npinned again. Several models can be pinned at once; the only limit is\nVRAM, and every pin permanently shrinks what the planner can offer\nother loads, so pin only what must always answer instantly. In every\nother tool's output, ``effective_ttl_s: 0`` / ``ttl_remaining_s: null``\non a model means \"pinned\".\n\nArgs:\n    model_id: The ``id`` field exactly as ``list_models`` returns it,\n        slashes and all (an alias also works).\n    pinned: ``false`` to remove the pin (the model becomes an ordinary\n        resident with the default idle TTL again). Omit it to pin.\n\nReturns:\n    ``{\"ok\": true, \"model_id\", \"pinned\", \"effective_ttl_s\", \"loaded\"}``\n    -- ``effective_ttl_s`` is 0 while pinned, and ``loaded`` says\n    whether it is resident right now (the reconciler handles it if not:\n    no error, no follow-up call needed, just wait ~15s).",
+      "input_schema": {
+        "properties": {
+          "model_id": {
+            "title": "Model Id",
+            "type": "string"
+          },
+          "pinned": {
+            "default": true,
+            "title": "Pinned",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "model_id"
+        ],
+        "title": "pin_modelArguments",
+        "type": "object"
+      },
+      "name": "pin_model",
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "pin_modelDictOutput",
+        "type": "object"
+      },
+      "server": "gateway"
+    },
+    {
+      "annotations": {
+        "destructive_hint": false,
+        "idempotent_hint": true,
+        "open_world_hint": false,
+        "read_only_hint": true
+      },
+      "description": "Dry-run a load: what WOULD happen if this model were loaded now.\n\nNothing is loaded, unloaded or evicted. The same planner that decides\na real load answers against the GPUs exactly as they stand, through\nthe same one-shot ``devices`` / ``allowed_devices`` copies a real load\nmakes (D36, D59) and at the tier the real load would run at. Use it\nbefore an expensive ``load_model`` to learn where the model would\nland, what it would displace, how much VRAM each card would hold and\nwhich KV cache type and context the ladder would settle on -- or to\nask \"why not?\": a refusal names the shortfall in GiB and the estimate\nterm that blew the budget, plus ``suggestions``, ``max_ctx_that_fits``\nand ``max_parallel_that_fits``. Cheap enough to call before every\nload; it never changes the box.\n\nArgs:\n    model_id: Model id or alias, as returned by ``list_models``.\n    ctx_size: Per-slot context to plan for; omitted = the planner's ladder.\n    kv_cache_type: K cache type (``f16``, ``q8_0``, ``q4_0``); omitted = auto.\n    kv_cache_type_v: V cache type; omitted = the same rule as K.\n    parallel: Slot count; omitted = the estimator's answer.\n    devices: Force exactly these CUDA indices, all of them. Mutually\n        exclusive with ``allowed_devices``.\n    allowed_devices: Let the planner choose among these CUDA indices\n        only -- a bound, not a placement (D59).\n    priority: Tier to plan at (1 chat, 2 agent, 3 background); omitted\n        = the model's remembered tier (D46/D48).\n\nReturns:\n    ``{\"ok\": true, \"plan\": {...}}``. ``plan.fits`` says whether the\n    load would land. A fit carries ``devices``, ``tensor_split``,\n    ``ctx_size``, ``parallel``, ``kv_cache_type``, ``per_gpu_bytes``,\n    ``evict_model_ids``, ``estimate_mb`` (MiB) / ``estimate_bytes``\n    (bytes) and ``notes`` (including a\n    ``mixed_generation`` warning when the split spans a 5090 and a\n    3090); a refusal carries ``reason``, ``reason_code``,\n    ``shortfall_bytes``, ``largest_term``, ``suggestions``,\n    ``max_ctx_that_fits`` and ``max_parallel_that_fits``. Always\n    ``dry_run: true``.",
+      "input_schema": {
+        "properties": {
+          "allowed_devices": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Allowed Devices"
+          },
+          "ctx_size": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Ctx Size"
+          },
+          "devices": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Devices"
+          },
+          "kv_cache_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Kv Cache Type"
+          },
+          "kv_cache_type_v": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Kv Cache Type V"
+          },
+          "model_id": {
+            "title": "Model Id",
+            "type": "string"
+          },
+          "parallel": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Parallel"
+          },
+          "priority": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Priority"
+          }
+        },
+        "required": [
+          "model_id"
+        ],
+        "title": "plan_loadArguments",
+        "type": "object"
+      },
+      "name": "plan_load",
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "plan_loadDictOutput",
+        "type": "object"
+      },
+      "server": "gateway"
+    },
+    {
+      "annotations": {
+        "destructive_hint": false,
+        "idempotent_hint": true,
+        "open_world_hint": false,
+        "read_only_hint": false
+      },
+      "description": "Release a GPU lease now, so the cards go back to the general pool.\n\nThe id is the ``lease.id`` that ``reserve_gpus`` returned; ``server_status``\nlists every standing lease with its id if you lost it. Releasing does\nnot unload the model that held the cards -- it simply stops being the\nonly model allowed there, and goes back to the ordinary idle TTL and\neviction rules (unless it is pinned). Leases also end by themselves\nonce idle for their ``idle_ttl_s``, so this is the early exit, not the\nonly one. If your lease shows ``state: \"vacating\"`` a better class\nhas asked for the cards (D56): finish or stop the work on them and\nrelease here -- that is the only way a vacate completes; nothing\ntakes the lease from you.\n\nArgs:\n    lease_id: The lease to release.\n\nReturns:\n    ``{\"ok\": true, \"released\": {...the lease as it stood...}}``, or an\n    error result naming the id when no such lease exists.",
+      "input_schema": {
+        "properties": {
+          "lease_id": {
+            "title": "Lease Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "lease_id"
+        ],
+        "title": "release_gpusArguments",
+        "type": "object"
+      },
+      "name": "release_gpus",
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "release_gpusDictOutput",
+        "type": "object"
+      },
+      "server": "gateway"
+    },
+    {
+      "annotations": {
+        "destructive_hint": false,
+        "idempotent_hint": true,
+        "open_world_hint": false,
+        "read_only_hint": true
+      },
+      "description": "One HuggingFace repo in full: quant sizes, fit, and the context matrix.\n\nCall this on a ``repo_id`` from ``search_models`` (or one the user named)\n**before** downloading. It reads the model's GGUF header remotely over\nrange requests -- a few seconds the first time, then cached -- which is\nwhat makes the answers exact rather than rules of thumb:\n\n* ``total_gb`` per quant, from the repo's real blob sizes, in the same\n  unit as ``list_models``'s ``size_gb`` so the two compare directly;\n* ``fit`` -- would this quant load on this box at the default context,\n  with ``suggested_quant`` naming a smaller one when it would not;\n* ``context_fit`` -- for each GPU placement (one card, a matched pair,\n  every card), which of the 64k/128k/256k/512k tiers actually fit.\n  ``max_ctx`` is the largest context reachable with a full-quality f16\n  KV cache; ``max_ctx_q8`` is present only when a q8_0 cache reaches\n  further, so a tier that is ``true`` in ``fits`` but above ``max_ctx``\n  is one you would be buying with a quantized cache. Tiers above the\n  model's trained window are absent, never offered.\n* ``mtp`` / ``mtp_source`` -- whether THIS quant keeps its\n  multi-token-prediction heads (``mtp_layers`` of them), which\n  StudioForge turns into ``--spec-type draft-mtp`` at load: a real\n  single-stream speedup (+34% measured on a 27B) at no extra VRAM.\n  ``\"header\"`` means the file's own GGUF header said so and is the\n  only source to trust; ``\"name\"`` means only the name says MTP;\n  ``null`` means unknown. Prefer a header-confirmed MTP quant over the\n  same quant without it when both fit.\n\nThe matrix is computed with the same planner a real load uses, so it\ncannot promise a context the loader would refuse. ``weights_fit: false``\non a placement means the weights alone do not fit there, whatever the\ncontext. ``approximate: true`` (or a non-null ``unavailable``) means the\nheader could not be read and the numbers are a bounded estimate.\n\nThen: ``download_model(repo_id, quant)``. The model appears in\n``list_models`` once the download finishes.\n\nArgs:\n    repo_id: Full HuggingFace repo id, e.g. \"unsloth/Qwen3.8-27B-GGUF\".\n    with_context: Read the header and include ``context_fit``. Set false\n        only when you want sizes quickly and do not care about context.\n\nReturns:\n    Repo identity and popularity, plus ``quants``: one entry per\n    downloadable quantization with ``quant``, ``total_gb``, ``files``,\n    ``mmproj``, ``mtp``, ``mtp_source``, ``fit`` and (by default)\n    ``context_fit``.",
+      "input_schema": {
+        "properties": {
+          "repo_id": {
+            "title": "Repo Id",
+            "type": "string"
+          },
+          "with_context": {
+            "default": true,
+            "title": "With Context",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "repo_id"
+        ],
+        "title": "repo_detailsArguments",
+        "type": "object"
+      },
+      "name": "repo_details",
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "repo_detailsDictOutput",
+        "type": "object"
+      },
+      "server": "gateway"
+    },
+    {
+      "annotations": {
+        "destructive_hint": true,
+        "idempotent_hint": false,
+        "open_world_hint": false,
+        "read_only_hint": false
+      },
+      "description": "Reserve specific GPUs for one model, or for something outside this server.\n\nThe two calls you will make::\n\n    reserve_gpus(devices=[0], model_id=\"vendor/Some-Model-GGUF/Some-Model-Q4_K_M\")\n    reserve_gpus(devices=[3], reason=\"ComfyUI render\")   # no model: held for an outsider\n\nWhile the lease stands nothing else is planned onto those cards. A\nnamed model is loaded onto exactly them (pin it too if it must also\nsurvive restarts), sized for as many parallel slots as its context\nallows, and in the split mode its own benchmark measured fastest on\nthose cards -- tensor split is never assumed, because it measured\nslower than layer split on this rig; run a benchmark if you want it\nconsidered. Idle residents on the cards are unloaded to make room; a\nmodel mid-request refuses the call (retry when idle); a pinned idle\nresident refuses unless ``force=true``.\n\n**A card already leased is a conflict, never a takeover** -- but a\nstrictly better ``priority`` may ASK the holder to leave (D56). If\nevery lease in the way is a worse class that registered a vacate\nendpoint, the server sends it one vacate request and answers\n``lease_vacating`` with ``retry_after_s``: re-call this tool on that\ninterval; it succeeds once the holder releases, and degrades to a\nplain ``lease_conflict`` if the holder has not released within\n``leases.vacate_timeout_s`` (default 180 s). Send ``priority=2`` for\ndispatched work that should be able to ask a background render tenant\nto vacate; ``force`` never overrides a standing lease.\n\nArgs:\n    devices: CUDA indices, e.g. ``[0]`` or ``[0, 1]`` -- exactly the\n        cards the model should run on. ``server_status`` lists them.\n    model_id: The ``id`` from ``list_models``. Omit to hold the cards\n        for something outside this server.\n    reason: Free text shown beside the lease (what it is for).\n    idle_ttl_s: Seconds of idleness after which the server releases\n        the lease by itself (default 3600). ``null`` = until released.\n    force: Evict a *pinned* idle resident from the cards.\n    holder: Who is holding them -- say who you are, the same name you\n        send as ``X-SF-Client``. Defaults to ``\"mcp\"``, which other\n        tenants read as \"an agent\" and cannot tell apart from the\n        next agent.\n    priority: The D46 class of the CLAIM: 1 active chat, 2 dispatched\n        agent, 3 background (the default; asks nobody to leave).\n    vacate_url: Where a better class may ask *you* to leave: the\n        server POSTs ``{lease_id, devices, requester,\n        requester_priority, deadline_s, deadline_at}`` there. http(s)\n        only; never this server's own address.\n    vacate_token: Sent back in ``X-SF-Vacate-Token`` on that POST so\n        your endpoint can trust it. Never shown anywhere.\n\nReturns:\n    ``{\"ok\": true, \"lease\": {id, devices, holder, model_ids, reason,\n    created_at, last_activity_at, idle_ttl_s, idle_s, expires_at,\n    priority, state, vacate_registered, vacate_deadline}}``.\n    Keep ``lease.id`` -- ``release_gpus`` needs it.",
+      "input_schema": {
+        "properties": {
+          "devices": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Devices",
+            "type": "array"
+          },
+          "force": {
+            "default": false,
+            "title": "Force",
+            "type": "boolean"
+          },
+          "holder": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Holder"
+          },
+          "idle_ttl_s": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": 3600.0,
+            "title": "Idle Ttl S"
+          },
+          "model_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Model Id"
+          },
+          "priority": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Priority"
+          },
+          "reason": {
+            "default": "",
+            "title": "Reason",
+            "type": "string"
+          },
+          "vacate_token": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Vacate Token"
+          },
+          "vacate_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Vacate Url"
+          }
+        },
+        "required": [
+          "devices"
+        ],
+        "title": "reserve_gpusArguments",
+        "type": "object"
+      },
+      "name": "reserve_gpus",
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "reserve_gpusDictOutput",
+        "type": "object"
+      },
+      "server": "gateway"
+    },
+    {
+      "annotations": {
+        "destructive_hint": false,
+        "idempotent_hint": true,
+        "open_world_hint": false,
+        "read_only_hint": true
+      },
+      "description": "Find GGUF repos on HuggingFace. One compact row per repo.\n\nThis is the *browse* step, and it is deliberately thin: a row names the\nrepo, how popular and how fresh it is, and which quantization labels it\npublishes. **Sizes and fit are not known at search time** -- HuggingFace's\nmodel-list endpoint carries no file sizes, so nothing here can say how\nbig a quant is or whether it would fit. Do not guess from the label.\n\nPick a promising ``repo_id`` and call ``repo_details(repo_id)``: that is\nwhere real per-quant sizes, fit verdicts and the per-GPU context matrix\ncome from. Then ``download_model(repo_id, quant)``.\n\nArgs:\n    query: Search text, e.g. \"llama\" or \"qwen\". Minimum 1 character.\n    limit: Maximum rows to return. Capped at 25 to keep results compact.\n    sort: Ordering -- one of ``downloads`` (HuggingFace's TRAILING\n        30-DAY count, not an all-time total), ``likes``, ``updated``,\n        ``created``, ``trending``.\n    newer_than_days: Restrict results to repos changed/created in the\n        last N days. When absent, no time restriction is applied.\n    date_field: Which date ``newer_than_days`` filters on -- ``updated``\n        (default) or ``created``.\n    author: Restrict results to one publisher/author name.\n\nReturns:\n    ``{\"ok\": true, \"repos\": [...], \"truncated\": bool, \"sort_options\":\n    [...], \"date_field_options\": [...]}``. Each row: ``repo_id``,\n    ``publisher``, ``downloads``, ``likes``, ``updated_days_ago``,\n    ``created_days_ago``, ``gated`` (true means you must accept terms\n    and have an HF token), ``quants`` (the labels on offer), ``mmproj``\n    (true if the repo ships a vision projector), ``mtp_likely`` (the\n    repo or a file NAME says MTP -- a hint only; ``repo_details`` reads\n    each quant's header to settle it) and ``file_count``.\n    ``trending_score`` appears only with ``sort=\"trending\"`` -- HF omits\n    the field under every other ordering, so its absence is not a zero.\n    ``truncated: true`` means the date window holds more matches than\n    were walked; narrow the query or the window rather than trusting\n    the tail.",
+      "input_schema": {
+        "properties": {
+          "author": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Author"
+          },
+          "date_field": {
+            "default": "updated",
+            "title": "Date Field",
+            "type": "string"
+          },
+          "limit": {
+            "default": 10,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "newer_than_days": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Newer Than Days"
+          },
+          "query": {
+            "title": "Query",
+            "type": "string"
+          },
+          "sort": {
+            "default": "downloads",
+            "title": "Sort",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "title": "search_modelsArguments",
+        "type": "object"
+      },
+      "name": "search_models",
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "search_modelsDictOutput",
+        "type": "object"
+      },
+      "server": "gateway"
+    },
+    {
+      "annotations": {
+        "destructive_hint": false,
+        "idempotent_hint": true,
+        "open_world_hint": false,
+        "read_only_hint": true
+      },
+      "description": "Live snapshot: VRAM, who is holding it, loaded models, queue, engine.\n\nThe first thing to call when deciding whether a model will fit, or when\nsomething is slow: ``gpus[].free_gib`` is the real constraint on this\nGPU-only host, and ``queue_depth`` shows how many requests are waiting\non a model that is still loading.\n\n**When VRAM is missing, read ``engine_processes``.** Every llama-server\non this box is classified: ``ours`` (started by this server),\n``child_of_live_process`` (someone else's -- another install, a test run\n-- and never killed automatically), and ``orphan`` (our binary, parent\ngone, pure leak). ``vram_orphan_count`` above zero is recoverable\nmemory: the watchdog's ``reclaim_orphan_engines`` tool kills exactly\nthose and nothing else. Both counts are ``null`` if the process table\ncould not be read, which is not the same as zero.\n\n**Before load_model or test_model on a shared server, read ``busy``.**\nIt carries ``active_requests`` (and which models are serving),\n``loading`` (model ids whose load is in flight), ``testing`` (the\nmodel a smoke test has claimed, or null) and ``priority_hold`` (the\nchat/agent load currently holding worse-tier traffic off, as\n``{\"model_id\", \"priority\"}``, or null -- the standing hold, read here\n*before* a `priority_hold` refusal rather than after one). A load that\nwould have to evict a model mid-request is refused rather than granted,\nand ``test_model`` refuses outright while any of those is non-zero --\nso checking here first turns a refusal into a short wait.\n\nReturns:\n    Per-GPU VRAM and utilization, every loaded model with its port,\n    remaining TTL, who loaded it (``loaded_by``), the tier it loaded at\n    (``priority``: 1 active chat, 2 dispatched agent, 3 background) and\n    its resolved ``speculative`` block (``null`` = not decided yet,\n    ``{\"type\": \"none\", \"reason\": ...}`` = considered and declined, so\n    ``reason`` says why drafting is off), the active llama.cpp engine\n    tag, the total number of models in the library, queue depth, what\n    the server is busy with, active downloads, engine-process\n    attribution and whether the server is draining. ``leases[]`` rows\n    carry ``kind``/``holder_family`` (D53) plus ``priority`` (the D46\n    class of the claim), ``state`` -- ``vacating`` means a better\n    class has asked that holder to leave (D56) -- and\n    ``vacate_registered``/``vacate_deadline``. Each loaded row\n    also carries ``effective`` (the prompt-cache / batching / KV\n    settings the child was really launched with -- a ``null``\n    per-model setting means inherit, not off) and ``prompt_cache``\n    (lifetime ``processed_total`` / ``cached_total`` / ``hit_ratio``\n    from the child's own counters, ``null`` until sampled).",
+      "input_schema": {
+        "properties": {},
+        "title": "server_statusArguments",
+        "type": "object"
+      },
+      "name": "server_status",
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "server_statusDictOutput",
+        "type": "object"
+      },
+      "server": "gateway"
+    },
+    {
+      "annotations": {
+        "destructive_hint": true,
+        "idempotent_hint": true,
+        "open_world_hint": false,
+        "read_only_hint": false
+      },
+      "description": "Change configuration values, validate them, and persist to disk.\n\nTakes dotted paths exactly as ``get_config`` reports them, for example\n``{\"models.default_ctx\": 16384, \"planner.headroom_fraction\": 0.15}``.\nThe whole update is validated as one unit against the real schema: if\nany value is invalid *nothing* is written, so a bad call cannot leave a\nhalf-applied config behind.\n\nMost changes apply immediately to the running server. Ports, hosts and\nthe data directory cannot -- those are listed in ``restart_required``,\nand you need the watchdog's ``restart_server`` tool (or a manual\nrestart) for them to take effect.\n\nArgs:\n    updates: Mapping of dotted config path to new value. An unknown key\n        is an error, not a silent no-op.\n\nReturns:\n    ``{\"ok\": true, \"updated\": [keys], \"restart_required\": [keys]}``.",
+      "input_schema": {
+        "properties": {
+          "updates": {
+            "additionalProperties": true,
+            "title": "Updates",
+            "type": "object"
+          }
+        },
+        "required": [
+          "updates"
+        ],
+        "title": "set_configArguments",
+        "type": "object"
+      },
+      "name": "set_config",
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "set_configDictOutput",
+        "type": "object"
+      },
+      "server": "gateway"
+    },
+    {
+      "annotations": {
+        "destructive_hint": false,
+        "idempotent_hint": false,
+        "open_world_hint": false,
+        "read_only_hint": false
+      },
+      "description": "Smoke-test a model end to end on an idle server, leaving it as found.\n\n**This is a smoke test, not a way to pre-warm a model -- use\n``load_model`` for that.** It sends one short canned request and reports\nlatency and tokens/second; the response text is truncated and there is\nno streaming, no system prompt and no sampling control. For real\ngeneration use the OpenAI endpoints.\n\nBecause it is a health check, it refuses to rearrange a server other\npeople are using:\n\n* **One at a time.** A second concurrent call is refused, not queued.\n* **Idle only.** Any model serving a request, any load in flight or a\n  running benchmark refuses the call with ``retry_after_s``. Check\n  ``server_status.busy`` first and you will not hit this.\n* **Small and temporary.** If the model is not already loaded it is\n  loaded at this server's default context with ONE slot, and unloaded\n  again afterwards. A model that was already resident is left alone.\n\nArgs:\n    model_id: Model id or alias.\n    prompt: Optional replacement for the default one-sentence prompt.\n    keep_loaded: Leave a model this call loaded resident afterwards.\n        Off by default: a health check should not change what is loaded.\n\nReturns:\n    ``latency_s``, ``tokens_per_second``, ``completion_tokens`` and a\n    truncated ``text`` (or ``embedding_dims`` for embedding models),\n    plus what the call did: ``loaded_for_test``, ``unloaded_after`` and\n    ``ctx_size_used``.",
+      "input_schema": {
+        "properties": {
+          "keep_loaded": {
+            "default": false,
+            "title": "Keep Loaded",
+            "type": "boolean"
+          },
+          "model_id": {
+            "title": "Model Id",
+            "type": "string"
+          },
+          "prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Prompt"
+          }
+        },
+        "required": [
+          "model_id"
+        ],
+        "title": "test_modelArguments",
+        "type": "object"
+      },
+      "name": "test_model",
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "test_modelDictOutput",
+        "type": "object"
+      },
+      "server": "gateway"
+    },
+    {
+      "annotations": {
+        "destructive_hint": true,
+        "idempotent_hint": true,
+        "open_world_hint": false,
+        "read_only_hint": false
+      },
+      "description": "Unload a model, freeing its VRAM immediately.\n\nGraceful: the llama-server child is asked to stop and its process tree\nis confirmed gone, so the VRAM really is released. In-flight requests to\nthat model will fail, so prefer letting the idle TTL unload it unless you\nspecifically need the VRAM now (for example to load something bigger).\n\nArgs:\n    model_id: Model id or alias.\n\nUnloading a *pinned* model is honoured and sticks: the reconciler\nleaves it down until it is loaded again or re-pinned. The pin setting\nitself is not changed -- use ``pin_model`` with ``pinned=false`` to\nremove it.\n\nA model held by a standing GPU lease (D43) is unloaded without\ncomplaint here: this tool is behind the PIN, so its caller is the\noperator. The open HTTP route refuses the same unload (D55).\n\nReturns:\n    ``{\"ok\": true, \"unloaded\": true}``, or ``unloaded: false`` when the\n    model was not running (which is not an error).",
+      "input_schema": {
+        "properties": {
+          "model_id": {
+            "title": "Model Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "model_id"
+        ],
+        "title": "unload_modelArguments",
+        "type": "object"
+      },
+      "name": "unload_model",
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "unload_modelDictOutput",
+        "type": "object"
+      },
+      "server": "gateway"
+    },
+    {
+      "annotations": {
+        "destructive_hint": false,
+        "idempotent_hint": true,
+        "open_world_hint": false,
+        "read_only_hint": true
+      },
+      "description": "Read config.yaml directly from disk, with secrets redacted.\n\nThis reads the FILE, not the running server's memory, so it works when\nthe main server is wedged or dead -- which is the point: when a bad\nsetting stops the server from starting, this is how you see it. If the\nfile is currently invalid, the error is reported in `config_error`\nalongside the raw contents, so you can tell exactly what to fix.\n\n`server.api_key`, `mcp.pin` and `hf.token` come back as short\nfingerprints, never in full.\n\nReturns:\n    The parsed config, the raw file text, the file path, any validation\n    error, and which keys need a restart to take effect.",
+      "input_schema": {
+        "properties": {},
+        "title": "get_configArguments",
+        "type": "object"
+      },
+      "name": "get_config",
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "get_configDictOutput",
+        "type": "object"
+      },
+      "server": "watchdog"
+    },
+    {
+      "annotations": {
+        "destructive_hint": false,
+        "idempotent_hint": true,
+        "open_world_hint": false,
+        "read_only_hint": true
+      },
+      "description": "Read per-GPU VRAM, utilization and temperature.\n\nRead by the watchdog itself via NVML, NOT by asking the main server --\nso you can still see which GPU is full when the server is dead, which is\nexactly when you need to know whether a leaked llama-server child is\nholding VRAM. If NVML is unavailable it falls back to parsing\nnvidia-smi, and if that fails too it returns a clear error rather than\npretending there are no GPUs.\n\nReturns:\n    `source` (nvml or nvidia-smi) and one entry per GPU with total /\n    free / used VRAM in bytes and MiB, utilization, temperature and\n    compute capability.",
+      "input_schema": {
+        "properties": {},
+        "title": "gpu_statusArguments",
+        "type": "object"
+      },
+      "name": "gpu_status",
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "gpu_statusDictOutput",
+        "type": "object"
+      },
+      "server": "watchdog"
+    },
+    {
+      "annotations": {
+        "destructive_hint": false,
+        "idempotent_hint": true,
+        "open_world_hint": false,
+        "read_only_hint": true
+      },
+      "description": "Check whether StudioForge is up, degraded, wedged or down.\n\nAlways call this first. It probes the main server's /health AND finds\nevery llama-server child process itself with psutil, probing each\nchild's own /health too -- so it does not depend on the main server\nbeing able to tell the truth about its children.\n\nThe four statuses mean different actions:\n\n  up       - everything answers. Nothing to do.\n  degraded - main server and children disagree; check `children` for\n             which one is unresponsive, and consider kill_model on it.\n  wedged   - the main server PROCESS EXISTS but does not answer within\n             the health timeout, on several consecutive attempts. It\n             will not recover on its own: use restart_server(confirm=true).\n  down     - no main server process exists. A restart cannot help\n             something that is not running; it must be started (by the\n             service manager, or restart_server which will also spawn a\n             fresh one).\n\nReturns:\n    Overall status and summary, plus a `main` block (URL probed, attempt\n    count, pid, uptime, why it failed) and a `children` list (pid,\n    alias, port, healthy).",
+      "input_schema": {
+        "properties": {},
+        "title": "healthArguments",
+        "type": "object"
+      },
+      "name": "health",
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "healthDictOutput",
+        "type": "object"
+      },
+      "server": "watchdog"
+    },
+    {
+      "annotations": {
+        "destructive_hint": true,
+        "idempotent_hint": false,
+        "open_world_hint": false,
+        "read_only_hint": false
+      },
+      "description": "SIGKILL one model's llama-server child, freeing its VRAM.\n\nThe surgical alternative to restart_server: it frees one model's VRAM\nwithout touching the main server or any other loaded model. Use it when\na single model is wedged (`health` shows that child unhealthy), or when\nyou need VRAM back right now for something bigger and the main server is\nnot responding to a normal unload.\n\nMatching is on the child's `--alias`, which is the model id -- exact\nfirst, then case-insensitive, then substring, so a partial name works\nwhen it is unambiguous. `health` lists the running aliases.\n\nThe whole process tree is killed, because a surviving descendant keeps\nits CUDA context and the VRAM stays allocated.\n\nArgs:\n    model_name: Model id / alias of the child to kill.\n\nReturns:\n    The pids killed and how much VRAM that freed, measured with NVML\n    before and after. VRAM accounting degrades to null if NVML is\n    unavailable; the kill still happens.",
+      "input_schema": {
+        "properties": {
+          "model_name": {
+            "title": "Model Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "model_name"
+        ],
+        "title": "kill_modelArguments",
+        "type": "object"
+      },
+      "name": "kill_model",
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "kill_modelDictOutput",
+        "type": "object"
+      },
+      "server": "watchdog"
+    },
+    {
+      "annotations": {
+        "destructive_hint": true,
+        "idempotent_hint": false,
+        "open_world_hint": false,
+        "read_only_hint": false
+      },
+      "description": "Kill EVERY llama-server child process. DESTRUCTIVE; needs confirm=true.\n\nThe \"give me all my VRAM back now\" button. Every loaded model dies\nimmediately and every in-flight inference request fails. The main server\nprocess is left alone and will reload models on demand, so this is much\nless disruptive than restart_server -- use it when VRAM is exhausted or\nwhen a stale child is holding memory the main server has lost track of.\n\nArgs:\n    confirm: Must be true. Without it nothing happens.\n\nReturns:\n    Every pid killed, with alias and port, plus the VRAM freed and any\n    survivors (a pid that refused to die needs OS-level attention).",
+      "input_schema": {
+        "properties": {
+          "confirm": {
+            "default": false,
+            "title": "Confirm",
+            "type": "boolean"
+          }
+        },
+        "title": "nuke_all_modelsArguments",
+        "type": "object"
+      },
+      "name": "nuke_all_models",
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "nuke_all_modelsDictOutput",
+        "type": "object"
+      },
+      "server": "watchdog"
+    },
+    {
+      "annotations": {
+        "destructive_hint": true,
+        "idempotent_hint": false,
+        "open_world_hint": false,
+        "read_only_hint": false
+      },
+      "description": "Kill LEAKED llama-server processes -- the ones nothing owns any more.\n\nThe narrow, always-safe version of nuke_all_models, and it needs no\nconfirmation because of how narrow it is: a process only qualifies when\nits executable lives under this install's `engines/` directory AND its\nparent process no longer exists. Nothing else on the box launches\nbinaries from there, and nothing alive is waiting on it, so its VRAM is\npure leak.\n\nWhat it will NOT touch: a llama-server whose parent is still running.\nThat is somebody's working process -- another StudioForge instance, a\ntest run, a hand-started server -- and killing it to recover memory is\nnot recovery. Those are returned in `spared`, with the parent named, so\nyou can decide. Use nuke_all_models if you really want them gone.\n\nArgs:\n    dry_run: List what would be killed without killing anything.\n\nReturns:\n    `orphans` (pid, alias, port, exe, parent pid/name, whether the\n    parent's pid had been recycled), `spared`, and the VRAM freed\n    measured with NVML before and after.",
+      "input_schema": {
+        "properties": {
+          "dry_run": {
+            "default": false,
+            "title": "Dry Run",
+            "type": "boolean"
+          }
+        },
+        "title": "reclaim_orphan_enginesArguments",
+        "type": "object"
+      },
+      "name": "reclaim_orphan_engines",
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "reclaim_orphan_enginesDictOutput",
+        "type": "object"
+      },
+      "server": "watchdog"
+    },
+    {
+      "annotations": {
+        "destructive_hint": true,
+        "idempotent_hint": false,
+        "open_world_hint": false,
+        "read_only_hint": false
+      },
+      "description": "Restart the main StudioForge server. DESTRUCTIVE; needs confirm=true.\n\nUse when `health` reports `wedged`: the process exists but will not\nanswer, and nothing short of killing it will help. Also use after\nset_config changed a restart-required key.\n\nWhat it does, in order: on Linux, `systemctl restart` the unit (name\nfrom SF_WATCHDOG_SERVICE_UNIT, default \"studioforge\") and stop there if\nthat worked. Otherwise -- always on Windows, which has no systemd -- it\nkills the server's whole process TREE with psutil (not just the parent:\na surviving llama-server child would keep its CUDA context and leak\nVRAM), kills any remaining inference children, waits for the port to be\nreleased, then spawns a fresh detached server and polls /health until it\nanswers.\n\nConsequences: every in-flight inference request fails, every loaded\nmodel is unloaded and its VRAM released. Models reload on demand\nafterwards, so the first request after a restart is slow.\n\nArgs:\n    confirm: Must be true. Without it nothing happens.\n    timeout_s: How long to wait for the new server to answer /health.\n        A cold start that rescans a large model library can take a\n        while; the default is generous.\n\nReturns:\n    The method used, the pids killed, the new pid, whether /health came\n    back and how long it took. If it did not come back, an error telling\n    you to check tail_logs() -- a config error will show up there.",
+      "input_schema": {
+        "properties": {
+          "confirm": {
+            "default": false,
+            "title": "Confirm",
+            "type": "boolean"
+          },
+          "timeout_s": {
+            "default": 120.0,
+            "title": "Timeout S",
+            "type": "number"
+          }
+        },
+        "title": "restart_serverArguments",
+        "type": "object"
+      },
+      "name": "restart_server",
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "restart_serverDictOutput",
+        "type": "object"
+      },
+      "server": "watchdog"
+    },
+    {
+      "annotations": {
+        "destructive_hint": true,
+        "idempotent_hint": false,
+        "open_world_hint": false,
+        "read_only_hint": false
+      },
+      "description": "Switch back to the previous installed release and restart.\n\nDESTRUCTIVE; needs confirm=true. Use when a self-update produced a\nserver that will not start or misbehaves: it repoints <data_dir>/current\nat the release directory installed before the current one and then\nrestarts.\n\nOn Windows `current` is a POINTER FILE (`current.txt` naming the release\ndirectory) rather than a symlink, because creating symlinks on Windows\nrequires elevation that a recovery tool cannot assume it has. On Linux a\nsymlink is used and preferred.\n\nIf there is no previous release this refuses and tells you which\nreleases are installed. Config and the model registry live outside the\nrelease directories, so a rollback never touches them.\n\nArgs:\n    confirm: Must be true. Without it you get a preview of which release\n        it would roll back from and to.\n    timeout_s: How long to wait for the rolled-back server's /health.\n\nReturns:\n    Which release it moved from and to, the pointer it wrote, and the\n    nested restart result.",
+      "input_schema": {
+        "properties": {
+          "confirm": {
+            "default": false,
+            "title": "Confirm",
+            "type": "boolean"
+          },
+          "timeout_s": {
+            "default": 120.0,
+            "title": "Timeout S",
+            "type": "number"
+          }
+        },
+        "title": "rollback_updateArguments",
+        "type": "object"
+      },
+      "name": "rollback_update",
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "rollback_updateDictOutput",
+        "type": "object"
+      },
+      "server": "watchdog"
+    },
+    {
+      "annotations": {
+        "destructive_hint": true,
+        "idempotent_hint": true,
+        "open_world_hint": false,
+        "read_only_hint": false
+      },
+      "description": "Edit config.yaml on disk, validating against the real schema.\n\nTHE ESCAPE HATCH. Because this reads and writes the file directly, it\nworks with the main server completely dead -- so a setting that prevents\nstartup (an impossible port, a bad model directory, a port collision)\ncan be fixed from here and then `restart_server` brings the server back.\n\nTakes dotted paths, e.g. {\"server.port\": 1234, \"models.default_ctx\":\n8192}. Validation is all-or-nothing and uses the same schema the server\nitself enforces: if any value is rejected, NOTHING is written, so a bad\ncall cannot make the situation worse. The write is atomic (temp file plus\nrename), so a reader can never see a half-written config.\n\nArgs:\n    updates: Mapping of dotted config path to new value. Unknown keys are\n        rejected rather than silently ignored.\n\nReturns:\n    Which keys were written, which of them need a restart, and the file\n    path. On rejection, the validation error explaining why.",
+      "input_schema": {
+        "properties": {
+          "updates": {
+            "additionalProperties": true,
+            "title": "Updates",
+            "type": "object"
+          }
+        },
+        "required": [
+          "updates"
+        ],
+        "title": "set_configArguments",
+        "type": "object"
+      },
+      "name": "set_config",
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "set_configDictOutput",
+        "type": "object"
+      },
+      "server": "watchdog"
+    },
+    {
+      "annotations": {
+        "destructive_hint": false,
+        "idempotent_hint": true,
+        "open_world_hint": false,
+        "read_only_hint": true
+      },
+      "description": "Read the tail of the server, watchdog and per-model log files.\n\nReads the files directly from <data_dir>/logs/, so it works when the\nmain server is wedged or dead and its own /api/logs endpoint is\nunreachable. This is where a failed startup explains itself.\n\nPass `model_id` to also get that model's llama-server stderr from\n<data_dir>/logs/models/, which is where load failures (bad flags, out\nof VRAM, corrupt GGUF) are actually reported. A model that has never\nbeen loaded has no log file yet; that returns an empty list, not an\nerror.\n\nArgs:\n    n: Number of trailing lines per file.\n    model_id: Optional model id to also fetch the per-model log for.\n\nReturns:\n    Line lists plus the resolved paths and whether each file exists.",
+      "input_schema": {
+        "properties": {
+          "model_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Model Id"
+          },
+          "n": {
+            "default": 200,
+            "title": "N",
+            "type": "integer"
+          }
+        },
+        "title": "tail_logsArguments",
+        "type": "object"
+      },
+      "name": "tail_logs",
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "tail_logsDictOutput",
+        "type": "object"
+      },
+      "server": "watchdog"
+    }
+  ]
+}

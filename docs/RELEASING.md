@@ -4,25 +4,26 @@ Cutting a release is pushing a tag. `.github/workflows/release.yml` does the res
 wheels, the sdist and the source zip from that tag, writes `SHA256SUMS.txt`, and creates the GitHub
 release with them attached. Nothing is built from a developer's working tree.
 
-## Versions: one date, three spellings
+## Versions: one string, several places
 
-StudioForge is calendar-versioned — a major, then the release date:
+StudioForge is semantically versioned since 2.0.0 (`MAJOR.MINOR.PATCH`, pre-releases as
+`2.1.0-beta.1`):
 
-| Where | Spelling | Example |
-| --- | --- | --- |
-| `src/studioforge/__init__.py` `__version__` | display | `1.26-08-23` |
-| `packages/studioforge-companion/src/studioforge_companion/__init__.py` | display | `1.26-08-23` |
-| `pyproject.toml` (both) | PEP 440 | `1.26.8.23` |
-| the git tag | display, with a `v` | `v1.26-08-23` |
+| Where | Example |
+| --- | --- |
+| `src/studioforge/__init__.py` `__version__` | `2.0.0` |
+| `packages/studioforge-companion/src/studioforge_companion/__init__.py` | `2.0.0` |
+| `packages/studioforge-tenant/src/studioforge_tenant/__init__.py` | `2.0.0` |
+| `pyproject.toml` (all three) | `2.0.0` |
+| the git tag | `v2.0.0` |
 
-The display string is what `/health`, the GUI footer, the MCP `server_status` tool and the GitHub
-User-Agent report. PEP 440 has no way to spell a hyphenated date, so the *package metadata* says
-`1.26.8.23` and `pip show studioforge` will show that — deliberately, not a mistake. Nothing in the
-app parses `__version__` with `packaging`; the one parser that reads it is
-`core/updater.py::_version_key`, which reads both spellings as the same four numbers so the updater
-cannot mistake the running build for an update. `tests/unit/test_version.py` pins all four strings
-together — plus the README status line and the `/health` sample in `docs/OPENCLAW-SETUP.md` — and
-fails if one drifts.
+The version string is what `/health`, the GUI footer, the MCP `server_status` tool and the GitHub
+User-Agent report. Releases before 2.0.0 were calendar-versioned — a major, then the release date,
+spelled `1.26-09-23` on display and `1.26.9.23` in PEP 440 metadata. The one parser that reads
+versions, `core/updater.py::_version_key`, reads both schemes (`1.26-09-23` is `(1, 26, 9, 23)`,
+`2.0.0` is `(2, 0, 0)`), so a 1.26 install sees `v2.0.0` as newer and a 2.x install never sees an old
+calendar tag as an update. `tests/unit/test_version.py` pins every string together — plus the README
+status line and the `/health` sample in `docs/OPENCLAW-SETUP.md` — and fails if one drifts.
 
 The version names the last *release*, so a server running commits past its tag still reports the
 tag. The `build` field beside it (`/health`, `/api/version`, `/api/status`, `server_status`, the
@@ -32,9 +33,10 @@ resolved once at startup (`src/studioforge/build.py`) and needs nothing from the
 
 ## Cutting one
 
-1. Bump the four version strings above (display in the two `__init__.py`, PEP 440 in the two
-   `pyproject.toml`) and update the `**Status:**` line in `README.md` and the sample `/health`
-   output in `docs/OPENCLAW-SETUP.md`.
+1. Bump the version strings above (the three `__init__.py`, the three `pyproject.toml`) and
+   update the `**Status:**` line in `README.md`, the sample `/health` output in
+   `docs/OPENCLAW-SETUP.md`, `deploy/compose/compose.yml` + `env.example`, and the winget manifests;
+   `tests/unit/test_version.py` catches the first three.
 2. Run the gates — `just check` (or `make check`): `ruff check`, `ruff format --check`, `mypy` on
    the typed core, and `pytest tests/unit`. Never a bare `pytest`: `tests/contract` starts real
    `llama-server` children on the real GPUs (D23).
@@ -42,18 +44,18 @@ resolved once at startup (`src/studioforge/build.py`) and needs nothing from the
 4. Tag it, annotated, and push the tag:
 
    ```bash
-   git tag -a v1.26-08-23 -m "StudioForge 1.26-08-23"
+   git tag -a v2.0.0 -m "StudioForge 2.0.0"
    git push origin main
-   git push origin v1.26-08-23
+   git push origin v2.0.0
    ```
 
 The workflow triggers on `v*`, builds on `ubuntu-latest`, and attaches four assets:
 
 | Asset | What |
 | --- | --- |
-| `StudioForge-1.26-08-23.zip` | the source tree at the tag, plus the built wheels and sdist under `dist/` |
-| `studioforge-1.26.8.23-py3-none-any.whl` | the server |
-| `studioforge_companion-1.26.8.23-py3-none-any.whl` | `sfctl` — installable on a box that has no GPU |
+| `StudioForge-2.0.0.zip` | the source tree at the tag, plus the built wheels and sdist under `dist/` |
+| `studioforge-2.0.0-py3-none-any.whl` | the server |
+| `studioforge_companion-2.0.0-py3-none-any.whl` | `sfctl` — installable on a box that has no GPU |
 | `SHA256SUMS.txt` | `sha256sum` lines for all of the above |
 
 **Only one archive is attached, on purpose.** `core/updater.py::_parse_release` takes the *first*

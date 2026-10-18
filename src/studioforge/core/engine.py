@@ -10,9 +10,12 @@ rolled back by editing one config key instead of reinstalling anything.
 Responsibilities:
 
 * discovery -- list upstream releases and their assets (GitHub API);
-* selection -- pick the right prebuilt archive for this box's driver/arch;
-* install -- download, verify, extract (flattening nested archives), fetch the
-  matching CUDA runtime bundle, smoke test;
+* selection -- pick the right prebuilt archive for this box's detected GPU
+  backend (CUDA, ROCm/HIP, Vulkan or Metal) and driver/arch;
+* install -- download, verify (archive integrity AND a published SHA-256 when
+  one exists; an install without one is recorded ``verified: false`` and
+  warned about, never silent), extract (flattening nested archives), fetch
+  the matching CUDA runtime bundle, smoke test;
 * activation -- which installed build new loads use. Separate from install
   since D49-4: unpacking a binary and deciding to run it are different
   decisions, and conflating them meant a build that failed its smoke test was
@@ -32,9 +35,11 @@ from __future__ import annotations
 import asyncio
 import bisect
 import contextlib
+import hashlib
 import json
 import os
 import platform
+import posixpath
 import re
 import shlex
 import shutil
@@ -74,6 +79,12 @@ ACTIVE_FILE = "active.json"
 META_FILE = "engine.json"
 FLAGS_FILE = "flags.txt"
 HELP_FILE = "help.txt"
+#: ``smoke_result`` of an engine whose binary runs (``--version``, ``--list-devices``) but
+#: that was never micro-loaded because the library had no GGUF to load. Not a full
+#: pass (``smoke_tested`` stays false, so the next boot or ``engine --smoke-test`` repeats
+#: the real micro-load once a model exists) but not a failure either: a fresh install has
+#: no models yet, and an engine install must not exit 1 over that.
+SMOKE_BINARY_ONLY = "binary-only (no model available)"
 
 ProgressFn = Callable[[str, float], None]
 
@@ -281,17 +292,45 @@ def policy_family(token: str) -> FlagFamily | None:
     return POLICY_FLAGS.get(token.split("=", 1)[0])
 
 
-def policy_refusal(token: str) -> str | None:
+#: Every spelling that ``engine.strict_gpu: false`` plus a model's
+#: ``allow_partial_cpu_offload`` can legalise -- exactly two families,
+#: ``--n-cpu-moe`` (keep the first N layers' experts on the CPU) and
+#: ``--no-kv-offload`` (KV cache in host RAM). Everything else in
+#: :data:`POLICY_FAMILIES` stays refused whatever the switches say, and
+#: ``-ngl 999 --fit off`` are always passed (see ``Supervisor.build_command``).
+PARTIAL_OFFLOAD_SPELLINGS: frozenset[str] = frozenset(
+    {"--n-cpu-moe", "-ncmoe", "--no-kv-offload", "-nkvo"}
+)
+
+
+def partial_offload_allowance(
+    *, strict_gpu: bool, allow_partial_cpu_offload: bool
+) -> frozenset[str]:
+    """The refused spellings that are legal for one model right now.
+
+    Empty (nothing is legalised) unless STRICT_GPU is off AND the model opted
+    in; both are off-by-default, so a shipped config can never return a
+    non-empty set.
+    """
+    if strict_gpu or not allow_partial_cpu_offload:
+        return frozenset()
+    return PARTIAL_OFFLOAD_SPELLINGS
+
+
+def policy_refusal(token: str, allow: frozenset[str] = frozenset()) -> str | None:
     """Why an operator may not set ``token``, or ``None`` when they may.
 
     One sentence per token, naming the family and the reason, so a form error
     and a refused load read the same way: the operator learns what the flag
-    would have done here, not only that it is banned.
+    would have done here, not only that it is banned. ``allow`` is the set from
+    :func:`partial_offload_allowance`.
     """
     family = policy_family(token)
     if family is None:
         return None
     base = token.split("=", 1)[0]
+    if base in allow:
+        return None
     alias = "" if base == family.canonical else f" ({family.canonical})"
     if family.kind == "offload":
         return (
@@ -303,7 +342,7 @@ def policy_refusal(token: str) -> str | None:
     )
 
 
-def refuse_policy_flags(tokens: Iterable[str]) -> list[str]:
+def refuse_policy_flags(tokens: Iterable[str], allow: frozenset[str] = frozenset()) -> list[str]:
     """Every refusal for a token list, one message each; ``[]`` means clean.
 
     Values are skipped by shape (``-1`` is a number, ``-ot`` is a flag), the
@@ -314,7 +353,7 @@ def refuse_policy_flags(tokens: Iterable[str]) -> list[str]:
         base = token.split("=", 1)[0]
         if not _FLAG_START_RE.match(base) or not re.match(r"^-{1,2}[A-Za-z]", base):
             continue
-        reason = policy_refusal(base)
+        reason = policy_refusal(base, allow)
         if reason is not None:
             refused.append(reason)
     return refused
@@ -567,6 +606,20 @@ class EngineError(StudioForgeError):
     code = "engine_error"
 
 
+class EngineChecksumError(EngineError):
+    """A downloaded engine archive does not match its published SHA-256."""
+
+    status_code = 502
+    code = "engine_checksum_mismatch"
+
+
+class EngineUnverifiedError(EngineError):
+    """``engine.require_verified`` is on and the archive has no published checksum."""
+
+    status_code = 422
+    code = "engine_unverified_refused"
+
+
 # ---------------------------------------------------------------------------
 # Asset model
 # ---------------------------------------------------------------------------
@@ -585,6 +638,19 @@ class EngineAsset:
     cudart_url: str | None
     os_token: str = "win"
     arch: str = "x64"
+    #: Expected SHA-256 of the archive, when the release API published one
+    #: (GitHub's per-asset ``digest``). ``None`` = look for a sidecar/sums file.
+    sha256: str | None = None
+    #: A ``<archive>.sha256``-style sidecar asset for this archive, if any.
+    checksum_url: str | None = None
+    #: A release-wide ``SHA256SUMS``-style asset, if any.
+    sums_url: str | None = None
+    cudart_sha256: str | None = None
+
+    @property
+    def backend(self) -> str:
+        """``cuda`` / ``rocm`` / ``vulkan`` / ``metal``, or ``""`` (cpu, unknown)."""
+        return variant_backend(self.variant)
 
     @property
     def is_cuda(self) -> bool:
@@ -596,6 +662,161 @@ class EngineAsset:
         if not self.variant.startswith("cuda-"):
             return None
         return _parse_version(self.variant[len("cuda-") :])
+
+
+#: The GPU APIs a llama.cpp build can target, in the order a box that somehow
+#: offers several is resolved (the probe normally yields exactly one).
+BACKENDS: tuple[str, ...] = ("cuda", "rocm", "metal", "vulkan")
+
+
+def variant_backend(variant: str) -> str:
+    """The backend an asset/engine ``variant`` string targets, or ``""``.
+
+    ``cuda-13.3`` -> cuda, ``rocm-7.14`` / ``hip-radeon`` -> rocm, ``vulkan``
+    -> vulkan, ``metal`` -> metal. ``cpu``, ``source-local`` and unknown give
+    ``""`` (the caller must know the backend from elsewhere).
+    """
+    value = (variant or "").strip().lower()
+    if value == "cuda" or value.startswith("cuda-"):
+        return "cuda"
+    if value.startswith(("rocm", "hip")):
+        return "rocm"
+    if value.startswith("vulkan"):
+        return "vulkan"
+    if value.startswith("metal"):
+        return "metal"
+    return ""
+
+
+def gpu_backend(gpu: GpuInfo) -> str:
+    """The backend a detected GPU is driven through.
+
+    The probe's own answer wins (``GpuInfo.backend``). A record without one --
+    a fake probe, an old caller -- is inferred from the vendor, then from the
+    product name; an unrecognised non-NVIDIA name keeps the historical
+    "must be AMD" reading (``rocm``) so such callers behave as before.
+    """
+    if gpu.backend in BACKENDS:
+        return gpu.backend
+    vendor = {"nvidia": "cuda", "amd": "rocm", "apple": "metal", "intel": "vulkan"}.get(
+        gpu.vendor or ""
+    )
+    if vendor:
+        return vendor
+    lowered = gpu.name.lower()
+    if _looks_nvidia(gpu.name):
+        return "cuda"
+    if lowered.startswith("apple") or "metal" in lowered:
+        return "metal"
+    if "intel" in lowered:
+        return "vulkan"
+    return "rocm"
+
+
+def detected_backend(gpus: Sequence[GpuInfo]) -> str:
+    """One backend for a GPU list (``cuda`` when there is none, as before)."""
+    if not gpus:
+        return "cuda"
+    seen = [gpu_backend(g) for g in gpus]
+    for preferred in BACKENDS:
+        if preferred in seen:
+            return preferred
+    return seen[0]  # pragma: no cover - gpu_backend always returns a BACKENDS member
+
+
+#: What a source build needs installed, per backend, for the "building is off"
+#: refusal. Always names ``cmake`` (the message is part of the install contract).
+_TOOLCHAIN_HINT: dict[str, str] = {
+    "cuda": "git, cmake and a CUDA toolkit (nvcc) matching the driver",
+    "rocm": "git, cmake and the ROCm / HIP SDK (hipcc) for the detected gfx target",
+    "vulkan": "git, cmake and the Vulkan SDK (glslc)",
+    "metal": "git, cmake and the Xcode command line tools",
+}
+
+
+def cmake_backend_flags(backend: str, arches: Sequence[str]) -> list[str]:
+    """The CMake options that select ``backend`` for a source build.
+
+    * ``cuda``: ``-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=<sm list>``
+    * ``rocm``: ``-DGGML_HIP=ON -DAMDGPU_TARGETS=<gfx list>``
+    * ``vulkan``: ``-DGGML_VULKAN=ON``
+    * ``metal``: ``-DGGML_METAL=ON``
+
+    ``arches`` come from the probe (:meth:`EngineManager.target_arches`), never
+    from a table here: an empty CUDA/ROCm list is an error, not a default.
+    CUDA arches sort numerically (``86;120``), gfx targets lexically.
+    """
+    unique = {a for a in arches if a}
+    if backend == "cuda":
+        if not unique:
+            raise EngineError(
+                "cannot build llama.cpp from source: no CUDA compute capability was "
+                "detected, so CMAKE_CUDA_ARCHITECTURES would be empty"
+            )
+        ordered = sorted(unique, key=lambda a: int(a) if a.isdigit() else 0)
+        return ["-DGGML_CUDA=ON", f"-DCMAKE_CUDA_ARCHITECTURES={';'.join(ordered)}"]
+    if backend == "rocm":
+        if not unique:
+            raise EngineError(
+                "cannot build llama.cpp from source: no AMD gfx target was reported by "
+                "amd-smi / rocm-smi / rocminfo, so AMDGPU_TARGETS would be empty"
+            )
+        return ["-DGGML_HIP=ON", f"-DAMDGPU_TARGETS={';'.join(sorted(unique))}"]
+    if backend == "vulkan":
+        return ["-DGGML_VULKAN=ON"]
+    if backend == "metal":
+        return ["-DGGML_METAL=ON"]
+    raise EngineError(f"cannot build llama.cpp from source for unknown backend {backend!r}")
+
+
+def _hip_build_env() -> dict[str, str] | None:
+    """Environment for a Linux HIP build (``HIPCXX`` / ``HIP_PATH`` from ``hipconfig``).
+
+    ``None`` when not applicable (Windows, or no ``hipconfig`` on PATH): cmake
+    then runs with the inherited environment and finds the toolchain itself or
+    fails with its own message in the build log.
+    """
+    if os.name == "nt" or shutil.which("hipconfig") is None:
+        return None
+
+    def ask(flag: str) -> str:
+        try:
+            done = subprocess.run(  # noqa: S603 - fixed argv, no shell
+                ["hipconfig", flag], capture_output=True, text=True, timeout=30, check=False
+            )
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        return done.stdout.strip() if done.returncode == 0 else ""
+
+    clang_dir, root = ask("-l"), ask("-R")
+    if not clang_dir or not root:
+        return None
+    return {**os.environ, "HIPCXX": f"{clang_dir}/clang", "HIP_PATH": root}
+
+
+def engine_record(info: Any) -> dict[str, Any]:
+    """The JSON-able row ``engine list`` shows for one installed engine.
+
+    Reads attributes with defaults so a light-weight stand-in (a test double, an
+    object from before these fields existed) renders as "unknown" instead of
+    raising.
+    """
+    variant = str(getattr(info, "variant", "") or "")
+    smoke_tested = bool(getattr(info, "smoke_tested", False))
+    return {
+        "tag": info.tag,
+        "active": bool(getattr(info, "active", False)),
+        "backend": getattr(info, "backend", "") or variant_backend(variant) or "unknown",
+        "variant": variant,
+        "verified": getattr(info, "verified", None),
+        "verified_by": getattr(info, "verified_by", "") or "",
+        "smoke_result": getattr(info, "smoke_result", None)
+        or ("passed" if smoke_tested else "not_run"),
+        "smoke_tested_at": getattr(info, "smoke_tested_at", None),
+        "installed_at": float(getattr(info, "installed_at", None) or time.time()),
+        "version_string": getattr(info, "version_string", None),
+        "warnings": list(getattr(info, "warnings", None) or []),
+    }
 
 
 def _parse_version(text: str) -> tuple[int, int] | None:
@@ -1355,6 +1576,126 @@ def _common_prefix(names: Sequence[str]) -> str:
     return "/".join(prefix) + "/" if prefix else ""
 
 
+#: ``(path parts inside the extraction root, link target text, archive name)``.
+_PendingLink = tuple[list[str], str, str]
+
+
+def _member_parts(name: str) -> list[str] | None:
+    """An archive member's path components, or ``None`` when it is unsafe.
+
+    Unsafe: empty, absolute, a ``..`` component, or any component with a colon.
+    The colon matters on Windows, where ``Path(name).is_absolute()`` is False
+    for a drive-RELATIVE name: ``dest.joinpath("C:x", "evil.dll")`` is
+    ``C:x/evil.dll`` (the current directory of drive C:, outside ``dest``), and
+    ``llama-server.exe:stream`` is an NTFS alternate data stream. No release
+    archive has a colon in a member name.
+    """
+    parts = [p for p in name.split("/") if p not in ("", ".")]
+    if not parts or Path(name).is_absolute() or name.startswith("/"):
+        return None
+    if any(p == ".." or ":" in p for p in parts):
+        return None
+    return parts
+
+
+def _link_target(parts: list[str], linkname: str) -> str | None:
+    """Where a link at ``parts`` points, as a path relative to the extraction root.
+
+    ``None`` when the target is absolute, empty or climbs out of the root. The
+    check is lexical (the link's own directory plus ``linkname``, normalised);
+    :func:`_finish_links` repeats it against the real filesystem afterwards,
+    because a chain of links can make a lexically safe path leave the root.
+    """
+    text = linkname.replace("\\", "/")
+    if not text or text.startswith("/") or ":" in text:
+        return None
+    joined = posixpath.normpath(posixpath.join(*parts[:-1], text))
+    if joined in ("", ".") or joined == ".." or joined.startswith("../"):
+        return None
+    return joined
+
+
+def _within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root)
+    except (ValueError, OSError, RuntimeError):
+        return False
+    return True
+
+
+def _finish_links(
+    dest: Path,
+    links: list[_PendingLink],
+    binary: Path | None,
+    *,
+    kind: str,
+    copy_names: frozenset[tuple[str, ...]] = frozenset(),
+) -> Path | None:
+    """Recreate an archive's symlinks once every regular file is on disk.
+
+    Upstream's Linux llama.cpp tarballs ship ``libllama.so -> libllama.so.0``
+    style links; dropping them leaves a binary whose dynamic loader cannot
+    find its libraries, so the engine fails its own smoke test. Links are made
+    *after* all files so no later member's write can follow one; only relative
+    targets that stay inside ``dest`` are honoured (absolute or ``..``-escaping
+    ones are skipped with a warning), and each created link is re-checked with
+    ``resolve()`` against ``dest``. Where a real symlink cannot be made
+    (Windows, a filesystem that refuses) the target file is copied instead.
+    Members named in ``copy_names`` (tar hard links) are always copied: a hard
+    link is a second name for the same data, not a pointer that can dangle.
+    """
+    root = dest.resolve()
+    pending: list[tuple[Path, Path, str]] = []
+    for parts, linkname, archive_name in links:
+        rel = _link_target(parts, linkname)
+        if rel is None:
+            log.warning(f"engine.{kind}.skip_unsafe_link", member=archive_name, link=linkname)
+            continue
+        pending.append((dest.joinpath(*parts), dest.joinpath(*rel.split("/")), archive_name))
+
+    copy_paths = {dest.joinpath(*names) for names in copy_names}
+
+    def _make(link: Path, target: Path) -> bool:
+        if os.name != "nt" and link not in copy_paths:
+            try:
+                if link.is_symlink() or link.exists():
+                    link.unlink()
+                link.symlink_to(os.path.relpath(target, link.parent))
+            except OSError:
+                pass
+            else:
+                if _within(link, root):
+                    return True
+                link.unlink()
+                log.warning(f"engine.{kind}.skip_unsafe_link", link=str(link))
+                return True  # handled: refused, not retried
+        if target.is_file():  # Windows, or a filesystem without symlinks
+            shutil.copyfile(target, link)
+            shutil.copymode(target, link)
+            return True
+        return False
+
+    # A copy-fallback link whose target is itself a link made later needs
+    # another pass; stop when a pass makes no progress.
+    remaining = pending
+    while remaining:
+        left: list[tuple[Path, Path, str]] = []
+        for link, target, archive_name in remaining:
+            link.parent.mkdir(parents=True, exist_ok=True)
+            if not _make(link, target):
+                left.append((link, target, archive_name))
+        if len(left) == len(remaining):
+            for _link, _target, archive_name in left:
+                log.warning(f"engine.{kind}.skip_unresolved_link", member=archive_name)
+            break
+        remaining = left
+    if binary is None:
+        for link, _target, _name in pending:
+            if link.name == BIN_NAME and link.is_file():
+                return link
+    return binary
+
+
 def extract_engine_zip(zip_path: Path, dest: Path) -> Path | None:
     """Extract ``zip_path`` into ``dest``, flattening a shared top-level dir.
 
@@ -1364,6 +1705,7 @@ def extract_engine_zip(zip_path: Path, dest: Path) -> Path | None:
     """
     dest.mkdir(parents=True, exist_ok=True)
     binary: Path | None = None
+    links: list[_PendingLink] = []
     with zipfile.ZipFile(zip_path) as archive:
         prefix = _common_prefix(archive.namelist())
         for member in archive.infolist():
@@ -1372,17 +1714,25 @@ def extract_engine_zip(zip_path: Path, dest: Path) -> Path | None:
                 name = name[len(prefix) :]
             if not name or name.endswith("/"):
                 continue
-            parts = [p for p in name.split("/") if p not in ("", ".")]
-            if any(p == ".." for p in parts) or Path(name).is_absolute():
+            safe = _member_parts(name)
+            if safe is None:
                 log.warning("engine.zip.skip_unsafe_member", member=member.filename)
                 continue
+            parts = safe
             target = dest.joinpath(*parts)
             target.parent.mkdir(parents=True, exist_ok=True)
+            if stat.S_ISLNK(member.external_attr >> 16):
+                # A unix zip stores a symlink as a file whose content is the
+                # link target. Writing that text out as a file leaves a
+                # ``libllama.so`` that is a 14-byte string, not a library.
+                text = archive.read(member).decode("utf-8", "replace")
+                links.append((parts, text, member.filename))
+                continue
             with archive.open(member) as src, target.open("wb") as out:
                 shutil.copyfileobj(src, out)
             if target.name == BIN_NAME:
                 binary = target
-    return binary
+    return _finish_links(dest, links, binary, kind="zip")
 
 
 def _swap_engine_dir(staged: Path, dest: Path) -> None:
@@ -1449,19 +1799,42 @@ def _extract_engine_tar(tar_path: Path, dest: Path) -> Path | None:
     """
     dest.mkdir(parents=True, exist_ok=True)
     binary: Path | None = None
+    links: list[_PendingLink] = []
+    hard_links: set[tuple[str, ...]] = set()
     with tarfile.open(tar_path, "r:*") as archive:
         members = archive.getmembers()
         prefix = _common_prefix([m.name for m in members if m.isfile()])
         for member in members:
-            if not member.isfile():
-                if member.issym() or member.islnk():
-                    log.warning("engine.tar.skip_link_member", member=member.name)
-                continue
             name = member.name.replace("\\", "/")
             if prefix and name.startswith(prefix):
                 name = name[len(prefix) :]
-            parts = [p for p in name.split("/") if p not in ("", ".")]
-            if not parts or any(p == ".." for p in parts) or Path(name).is_absolute():
+            safe = _member_parts(name)
+            parts = safe or []
+            if member.issym() or member.islnk():
+                if safe is None:
+                    log.warning("engine.tar.skip_unsafe_member", member=member.name)
+                    continue
+                linkname = member.linkname.replace("\\", "/")
+                if member.islnk():
+                    # A hard link names another archive member by its full
+                    # archive path; re-express it relative to the link's own
+                    # directory so both kinds share one containment check.
+                    other = linkname
+                    if prefix and other.startswith(prefix):
+                        other = other[len(prefix) :]
+                    other_parts = [p for p in other.split("/") if p not in ("", ".")]
+                    if linkname.startswith("/") or not other_parts:
+                        log.warning(
+                            "engine.tar.skip_unsafe_link", member=member.name, link=member.linkname
+                        )
+                        continue
+                    linkname = "/".join([".."] * (len(parts) - 1) + other_parts)
+                    hard_links.add(tuple(parts))
+                links.append((parts, linkname, member.name))
+                continue
+            if not member.isfile():
+                continue
+            if safe is None:
                 log.warning("engine.tar.skip_unsafe_member", member=member.name)
                 continue
             target = dest.joinpath(*parts)
@@ -1476,7 +1849,7 @@ def _extract_engine_tar(tar_path: Path, dest: Path) -> Path | None:
                     target.chmod(target.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
             if target.name == BIN_NAME:
                 binary = target
-    return binary
+    return _finish_links(dest, links, binary, kind="tar", copy_names=frozenset(hard_links))
 
 
 def _make_executable(directory: Path) -> None:
@@ -1554,6 +1927,18 @@ class _SmokeResult:
     version_string: str | None = None
     model_used: Path | None = None
     no_model: bool = False
+
+    @property
+    def passed(self) -> bool:
+        """Acceptable for an install: a full pass, or a binary-only check with no model to load."""
+        return self.ok or self.no_model
+
+    @property
+    def label(self) -> str:
+        """The ``smoke_result`` string recorded in ``engine.json``."""
+        if self.ok:
+            return "passed"
+        return SMOKE_BINARY_ONLY if self.no_model else "failed"
 
 
 class _ProbeLike(Protocol):  # pragma: no cover - structural typing only
@@ -1636,6 +2021,17 @@ class EngineManager:
         # first thing that runs on every path that can spawn one -- the server's
         # build_state and the engine CLI alike.
         warn_remapping_environment()
+        # The auto-selecting probe must know the active engine's backend, so a
+        # failing NVML next to a CUDA build is reported rather than papered over
+        # with a Vulkan device list the build cannot use.
+        bind = getattr(probe, "bind_engine_backend", None)
+        if callable(bind):
+            bind(self.active_backend)
+
+    def active_backend(self) -> str | None:
+        """The active engine's backend (``cuda``, ``rocm``, ``vulkan``, ``metal``), or ``None``."""
+        info = self.active()
+        return (info.backend or variant_backend(info.variant) or None) if info is not None else None
 
     def _install_lock(self, tag: str) -> asyncio.Lock:
         lock = self._install_locks.get(tag)
@@ -2069,8 +2465,16 @@ class EngineManager:
         *,
         gpus: Sequence[GpuInfo],
         cuda_driver: tuple[int, int] | None,
+        backend: str | None = None,
     ) -> EngineAsset | None:
         """Pick the best prebuilt archive for this box, or ``None``.
+
+        The backend is the GPU API the probe detected (``backend`` overrides
+        it): CUDA archives for NVIDIA, ``rocm-*`` / ``hip-*`` for AMD,
+        ``vulkan`` for Vulkan, the macOS arm64 archive for Metal. Only an
+        archive for the detected backend is ever eligible -- a CPU archive never
+        is -- so Vulkan/ROCm assets are reachable exactly when the probe says
+        the box is driven through them.
 
         Eligibility rule (the one correctness rule that matters here): an asset
         built against CUDA *X.Y* runs only on a driver whose supported CUDA
@@ -2098,13 +2502,9 @@ class EngineManager:
         if requested and requested.lower() != "auto":
             return self._select_explicit(matching, requested)
 
-        # AMD box: ROCm is the only GPU-only option upstream ships for it, and a
-        # CUDA build would be selected purely because it exists.
-        if gpus and not any(_looks_nvidia(g.name) for g in gpus):
-            rocm = [a for a in matching if a.variant.startswith("rocm")]
-            if rocm:
-                return max(rocm, key=lambda a: _parse_version(a.variant[5:]) or (0, 0))
-            return None
+        chosen_backend = backend or detected_backend(gpus)
+        if chosen_backend != "cuda":
+            return self._select_non_cuda(matching, chosen_backend)
 
         cuda = [a for a in matching if a.is_cuda]
         if cuda:
@@ -2125,6 +2525,30 @@ class EngineManager:
             )
 
         return None
+
+    def _select_non_cuda(self, matching: Sequence[EngineAsset], backend: str) -> EngineAsset | None:
+        """Best archive for a ROCm / Vulkan / Metal box, or ``None``.
+
+        Highest ROCm release wins (``hip-*`` Windows builds carry no version and
+        rank below any ``rocm-X.Y``). A box with no archive for its backend gets
+        ``None`` -- the caller falls back to a source build -- never a CPU
+        archive.
+        """
+        pool = [a for a in matching if a.backend == backend]
+        if not pool:
+            log.info(
+                "engine.select_asset.no_asset_for_backend",
+                backend=backend,
+                available=sorted({a.variant for a in matching}),
+            )
+            return None
+        if backend == "rocm":
+
+            def rank(asset: EngineAsset) -> tuple[int, int]:
+                return _parse_version(re.sub(r"^(?:rocm|hip)-?", "", asset.variant)) or (0, 0)
+
+            return max(pool, key=rank)
+        return sorted(pool, key=lambda a: a.name)[0]
 
     def _host_variants(self, assets: Sequence[EngineAsset]) -> list[str]:
         """The variants upstream ships for *this* os/arch, for a refusal message.
@@ -2203,6 +2627,13 @@ class EngineManager:
         variant = str(meta.get("variant") or "")
         if not variant or variant == "unknown":
             variant = guess_variant(directory)
+        verified = meta.get("verified")
+        warnings = meta.get("warnings")
+        smoke_result = meta.get("smoke_result")
+        if not isinstance(smoke_result, str) or not smoke_result:
+            smoke_result = "passed" if meta.get("smoke_tested") else "not_run"
+        elif smoke_result == "partial":  # the pre-2.0.0 spelling of binary-only
+            smoke_result = SMOKE_BINARY_ONLY
         return EngineInfo(
             tag=directory.name,
             path=directory,
@@ -2215,7 +2646,27 @@ class EngineManager:
             installed_at=float(installed_at or time.time()),
             flags=flags,
             build_log=Path(build_log) if isinstance(build_log, str) else None,
+            backend=str(meta.get("backend") or variant_backend(variant)),
+            verified=verified if isinstance(verified, bool) else None,
+            verified_by=str(meta.get("verified_by") or ""),
+            smoke_result=smoke_result,
+            warnings=[str(w) for w in warnings] if isinstance(warnings, list) else [],
+            archive_sha256=(
+                str(meta["archive_sha256"]) if isinstance(meta.get("archive_sha256"), str) else None
+            ),
         )
+
+    def list_engines(self) -> list[dict[str, Any]]:
+        """One record per installed engine tag: the data behind ``engine list``.
+
+        ``backend`` (cuda/rocm/vulkan/metal, ``""`` when unknowable),
+        ``verified`` (``True`` = archive matched a published SHA-256, ``False``
+        = installed without that guarantee, ``None`` = installed before
+        verification existed), ``smoke_result`` (passed / binary-only / failed /
+        not_run), ``installed_at`` (epoch seconds) and any install-time
+        warnings. Oldest install first, like :meth:`installed`.
+        """
+        return [engine_record(info) for info in self.installed()]
 
     def get(self, tag: str) -> EngineInfo | None:
         directory = self.engine_dir(tag)
@@ -2457,7 +2908,13 @@ class EngineManager:
             if not extra:
                 continue
             try:
-                errors = await self.validate_extra_flags(tag, extra)
+                errors = await self.validate_extra_flags(
+                    tag,
+                    extra,
+                    allow_partial_cpu_offload=bool(
+                        getattr(settings, "allow_partial_cpu_offload", False)
+                    ),
+                )
             except EngineError as exc:  # an unreadable --help must not hide the rest
                 errors = [f"cannot validate flags against {tag}: {exc}"]
             if errors:
@@ -2480,6 +2937,12 @@ class EngineManager:
             "installed_at": info.installed_at,
             "server_binary": str(info.server_binary),
             "build_log": str(info.build_log) if info.build_log else None,
+            "backend": info.backend,
+            "verified": info.verified,
+            "verified_by": info.verified_by,
+            "archive_sha256": info.archive_sha256,
+            "smoke_result": info.smoke_result,
+            "warnings": list(info.warnings),
         }
         with contextlib.suppress(OSError):
             (info.path / META_FILE).write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -2583,6 +3046,7 @@ class EngineManager:
                     activate=activate,
                     build_log=current.build_log,
                     installed_at=current.installed_at,
+                    prior=current,
                 )
             log.warning("engine.install.reinstall_after_failed_smoke", tag=tag, detail=smoke.detail)
 
@@ -2607,6 +3071,7 @@ class EngineManager:
                     activate=activate,
                     build_log=current.build_log,
                     installed_at=current.installed_at,
+                    prior=current,
                 )
 
         # D49-7. Everything below re-extracts over ``dest``. On Windows a
@@ -2626,9 +3091,9 @@ class EngineManager:
                 )
 
         assets = await self.list_assets(tag)
-        asset = self.select_asset(
-            assets, gpus=self._gpus(), cuda_driver=self._cuda_driver_version()
-        )
+        gpus = self._gpus()
+        backend = detected_backend(gpus)
+        asset = self.select_asset(assets, gpus=gpus, cuda_driver=self._cuda_driver_version())
         if asset is None:
             variants = self._host_variants(assets)
             if self.config.engine.allow_source_build:
@@ -2644,14 +3109,17 @@ class EngineManager:
                     prebuilt_variants=variants,
                 )
                 return await self.build_from_source(
-                    tag, arches=self.cuda_arches(), progress=progress, activate=activate
+                    tag,
+                    arches=self.target_arches(backend, gpus),
+                    progress=progress,
+                    activate=activate,
                 )
             raise EngineError(
                 f"no GPU-capable llama-server build for {self.os_token}/{self.arch_token} at "
                 f"{tag} is compatible with this driver "
                 f"(CUDA {_fmt_version(self._cuda_driver_version())}); "
                 f"available variants: {', '.join(variants)}. Building from source needs "
-                f"git, cmake and a CUDA toolkit (nvcc) matching the driver; set "
+                f"{_TOOLCHAIN_HINT.get(backend, 'git and cmake')}; set "
                 f"engine.allow_source_build: true to enable it"
             )
 
@@ -2660,6 +3128,9 @@ class EngineManager:
         archive = self.config.downloads_dir / asset.name
         await self._download(asset.url, archive, asset.size_bytes, "download", progress)
         _verify_archive(archive)
+        _emit(progress, "verify", 0.0)
+        verification = await self._verify_download(asset, archive)
+        _emit(progress, "verify", 1.0)
 
         # Extract to a sibling and swap, never in place (D49-7): a failure --
         # a truncated archive, a locked file, a full disk -- must leave the
@@ -2677,6 +3148,7 @@ class EngineManager:
                 cudart = self.config.downloads_dir / Path(asset.cudart_url).name
                 await self._download(asset.cudart_url, cudart, 0, "cudart", progress)
                 _verify_zip(cudart)
+                verification = await self._verify_companion(asset, cudart, verification)
                 extract_engine_zip(cudart, staging)
 
             _make_executable(staging)
@@ -2699,11 +3171,119 @@ class EngineManager:
                 f"engine {tag} ({asset.variant}) failed its smoke test: {smoke.detail}"
             )
         if smoke.no_model:
-            log.warning("engine.install.smoke_partial", tag=tag, detail=smoke.detail)
+            log.warning("engine.install.smoke_binary_only", tag=tag, detail=smoke.detail)
         _emit(progress, "done", 1.0)
-        info = self._finalize(dest, binary, asset.variant, smoke, activate=activate)
+        info = self._finalize(
+            dest,
+            binary,
+            asset.variant,
+            smoke,
+            activate=activate,
+            backend=asset.backend,
+            verification=verification,
+        )
         await self._warm_flag_cache(tag)
         return info
+
+    # ------------------------------------------------------------------
+    # Checksum verification
+    # ------------------------------------------------------------------
+
+    async def _expected_digest(self, asset: EngineAsset) -> tuple[str | None, str]:
+        """``(sha256, source)`` for an archive, or ``(None, why-not)``.
+
+        Looked up in order: GitHub's per-asset ``digest`` field (``github-digest``),
+        a ``<archive>.sha256`` sidecar asset (``sha256-sidecar``), a release-wide
+        ``SHA256SUMS`` asset (``sha256sums``). All three come from the same
+        release the archive does, so this detects a corrupt or truncated
+        download or a tampered mirror -- it is NOT a signature and does not
+        defend against a compromised release; see docs/ENGINES.md.
+        """
+        if asset.sha256:
+            return asset.sha256, "github-digest"
+        problems: list[str] = []
+        for url, source in ((asset.checksum_url, "sha256-sidecar"), (asset.sums_url, "sha256sums")):
+            if not url:
+                continue
+            try:
+                resp = await self.client.get(url)
+                resp.raise_for_status()
+            except httpx.HTTPError as exc:
+                problems.append(f"{source} {url} could not be fetched ({exc})")
+                continue
+            found = parse_sha256_text(resp.text, asset.name)
+            if found:
+                return found, source
+            problems.append(f"{source} {url} has no entry for {asset.name}")
+        if problems:
+            return None, "; ".join(problems)
+        return None, "the release publishes no checksum for this archive"
+
+    async def _verify_download(self, asset: EngineAsset, archive: Path) -> Verification:
+        """Check the downloaded archive against its published SHA-256.
+
+        A mismatch deletes the archive and raises :class:`EngineChecksumError`.
+        No published checksum is never silent: the install proceeds with
+        ``verified: false`` and a warning (logged, returned, stored in
+        ``engine.json``, shown by ``engine list``) -- unless
+        ``engine.require_verified`` is on, which refuses it with
+        :class:`EngineUnverifiedError`.
+        """
+        expected, source = await self._expected_digest(asset)
+        if expected is None:
+            if self.config.engine.require_verified:
+                _discard(archive)
+                raise EngineUnverifiedError(
+                    f"{asset.name} has no published SHA-256 ({source}) and "
+                    "engine.require_verified is on, so it was not installed. Turn that setting "
+                    "off to install it unverified, or build from source",
+                    details={"asset": asset.name, "reason": source},
+                )
+            warning = (
+                f"{asset.name} was installed WITHOUT checksum verification: {source}. The archive "
+                "passed its integrity check (it opens and is complete) but its origin is "
+                "unverified; set engine.require_verified to refuse such installs"
+            )
+            log.warning("engine.install.unverified", asset=asset.name, reason=source)
+            return Verification(False, f"none: {source}", None, (warning,))
+        actual = await asyncio.to_thread(sha256_file, archive)
+        if actual != expected:
+            _discard(archive)
+            raise EngineChecksumError(
+                f"{asset.name} does not match its published SHA-256 (expected {expected}, got "
+                f"{actual}, from {source}). The download was discarded; retry, and if it keeps "
+                "failing do not install this build",
+                details={
+                    "asset": asset.name,
+                    "expected": expected,
+                    "actual": actual,
+                    "source": source,
+                },
+            )
+        log.info("engine.install.verified", asset=asset.name, sha256=actual, source=source)
+        return Verification(True, source, actual)
+
+    async def _verify_companion(
+        self, asset: EngineAsset, path: Path, current: Verification
+    ) -> Verification:
+        """The CUDA runtime bundle: checked when a digest exists, else a warning."""
+        if not asset.cudart_sha256:
+            note = (
+                f"{path.name} (CUDA runtime bundle) has no published checksum and was not verified"
+            )
+            log.warning("engine.install.cudart_unverified", asset=path.name)
+            return Verification(
+                current.verified, current.by, current.sha256, (*current.warnings, note)
+            )
+        actual = await asyncio.to_thread(sha256_file, path)
+        if actual != asset.cudart_sha256:
+            _discard(path)
+            raise EngineChecksumError(
+                f"{path.name} does not match its published SHA-256 (expected "
+                f"{asset.cudart_sha256}, got {actual}); the download was discarded",
+                details={"asset": path.name, "expected": asset.cudart_sha256, "actual": actual},
+            )
+        return current
 
     def _tag_holders(self, tag: str) -> list[str]:
         """Model ids whose running child uses engine ``tag`` (D49-7).
@@ -2764,14 +3344,23 @@ class EngineManager:
         activate: bool,
         build_log: Path | None = None,
         installed_at: float | None = None,
+        backend: str = "",
+        verification: Verification | None = None,
+        prior: EngineInfo | None = None,
     ) -> EngineInfo:
         """Write ``engine.json`` for a just-verified engine, activating on request.
 
         ``installed_at`` is passed by the already-present paths so a *reuse*
         keeps the original stamp: prune orders by it, and restamping it "now"
-        made the oldest build look like the newest one (D49-7).
+        made the oldest build look like the newest one (D49-7). Those paths
+        also pass ``prior`` so the backend and the checksum verdict recorded at
+        the original install survive the reuse instead of being forgotten.
         """
         stamp = time.time() if installed_at is None else installed_at
+        if verification is None and prior is not None:
+            verification = Verification(
+                prior.verified, prior.verified_by, prior.archive_sha256, tuple(prior.warnings)
+            )
         info = EngineInfo(
             tag=dest.name,
             path=dest,
@@ -2783,6 +3372,12 @@ class EngineManager:
             active=activate,
             installed_at=stamp,
             build_log=build_log,
+            backend=backend or (prior.backend if prior else "") or variant_backend(variant),
+            verified=verification.verified if verification else None,
+            verified_by=verification.by if verification else "",
+            archive_sha256=verification.sha256 if verification else None,
+            warnings=list(verification.warnings) if verification else [],
+            smoke_result=smoke.label,
         )
         self._write_meta(info)
         self._notify_engine_change(info.tag, "install")
@@ -2854,6 +3449,20 @@ class EngineManager:
         arches = {gpu.sm_arch for gpu in pool if gpu.sm_arch}
         return sorted(arches, key=lambda a: int(a) if a.isdigit() else 0)
 
+    def target_arches(self, backend: str, gpus: Sequence[GpuInfo] | None = None) -> list[str]:
+        """Build targets for ``backend`` from the detected GPUs -- never hardcoded.
+
+        CUDA: ``sm`` numbers from the compute capability. ROCm: the ``gfxNNNN``
+        targets the driver reported (``GpuInfo.gfx_target``). Vulkan and Metal
+        need none.
+        """
+        pool = list(gpus) if gpus is not None else self._gpus()
+        if backend == "cuda":
+            return self.cuda_arches(pool)
+        if backend == "rocm":
+            return sorted({g.gfx_target for g in pool if g.gfx_target})
+        return []
+
     async def build_from_source(
         self,
         tag: str,
@@ -2861,8 +3470,13 @@ class EngineManager:
         arches: Sequence[str],
         progress: ProgressFn | None = None,
         activate: bool = False,
+        backend: str | None = None,
     ) -> EngineInfo:
-        """Build ``llama-server`` from source for exactly this box's arches.
+        """Build ``llama-server`` from source for exactly this box's targets.
+
+        ``backend`` defaults to the detected one (CUDA when nothing is
+        detected); ``arches`` are that backend's targets (:meth:`target_arches`).
+        The flags per backend are :func:`cmake_backend_flags`.
 
         The fallback path for a GPU too new for any prebuilt archive (or a
         driver too old for the newest CUDA build). Installs to
@@ -2872,16 +3486,8 @@ class EngineManager:
         engine until somebody says so. ``ensure_engine`` says so, because the
         first engine on a box has to be usable.
         """
-        arch_list = (
-            self.cuda_arches([])
-            if not arches
-            else sorted({a for a in arches if a}, key=lambda a: int(a) if a.isdigit() else 0)
-        )
-        if not arch_list:
-            raise EngineError(
-                "cannot build llama.cpp from source: no CUDA compute capability was "
-                "detected, so CMAKE_CUDA_ARCHITECTURES would be empty"
-            )
+        backend = backend or detected_backend(self._gpus())
+        backend_flags = cmake_backend_flags(backend, arches)
 
         self.config.logs_dir.mkdir(parents=True, exist_ok=True)
         log_path = self.config.logs_dir / f"engine-build-{tag}.log"
@@ -2898,8 +3504,7 @@ class EngineManager:
             str(src),
             "-B",
             str(build_dir),
-            "-DGGML_CUDA=ON",
-            f"-DCMAKE_CUDA_ARCHITECTURES={';'.join(arch_list)}",
+            *backend_flags,
             "-DCMAKE_BUILD_TYPE=Release",
             "-DLLAMA_BUILD_SERVER=ON",
             # ggml builds shared libraries by default on Linux, so llama-server
@@ -2918,9 +3523,20 @@ class EngineManager:
             "-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON",
             "-DCMAKE_INSTALL_RPATH_USE_LINK_PATH=ON",
         ]
-        code = await self._run_logged(
-            configure, cwd=src, log_path=log_path, phase="configure", progress=progress
-        )
+        hip_env = _hip_build_env() if backend == "rocm" else None
+        if hip_env is not None:
+            code = await self._run_logged(
+                configure,
+                cwd=src,
+                log_path=log_path,
+                phase="configure",
+                progress=progress,
+                env=hip_env,
+            )
+        else:
+            code = await self._run_logged(
+                configure, cwd=src, log_path=log_path, phase="configure", progress=progress
+            )
         if code != 0:
             raise EngineError(f"cmake configure failed (exit {code}); see {log_path}")
 
@@ -2935,9 +3551,14 @@ class EngineManager:
             "--parallel",
             str(os.cpu_count() or 4),
         ]
-        code = await self._run_logged(
-            build, cwd=src, log_path=log_path, phase="build", progress=progress
-        )
+        if hip_env is not None:
+            code = await self._run_logged(
+                build, cwd=src, log_path=log_path, phase="build", progress=progress, env=hip_env
+            )
+        else:
+            code = await self._run_logged(
+                build, cwd=src, log_path=log_path, phase="build", progress=progress
+            )
         if code != 0:
             raise EngineError(f"cmake build failed (exit {code}); see {log_path}")
 
@@ -2949,7 +3570,16 @@ class EngineManager:
                 f"source-built engine {dest.name} failed its smoke test: {smoke.detail}"
             )
         info = self._finalize(
-            dest, binary, "source-local", smoke, activate=activate, build_log=log_path
+            dest,
+            binary,
+            "source-local",
+            smoke,
+            activate=activate,
+            build_log=log_path,
+            backend=backend,
+            # A local compile has no archive to checksum: recorded as such, with
+            # no warning (nothing was skipped; the source came from the git tag).
+            verification=Verification(False, f"source-build ({backend}) from git tag {tag}"),
         )
         await self._warm_flag_cache(dest.name)
         return info
@@ -3019,12 +3649,14 @@ class EngineManager:
         log_path: Path,
         phase: str,
         progress: ProgressFn | None,
+        env: Mapping[str, str] | None = None,
     ) -> int:
         """Run ``cmd``, tee-ing output to ``log_path`` and parsing ``[ NN%]``."""
         log.info("engine.build.run", phase=phase, cmd=list(cmd))
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             cwd=str(cwd) if cwd else None,
+            env=dict(env) if env is not None else None,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             **_spawn_kwargs(),
@@ -3091,6 +3723,11 @@ class EngineManager:
             if smoke.ok:
                 info.smoke_tested = True
                 info.smoke_tested_at = time.time()
+                info.smoke_result = "passed"
+            elif smoke.no_model:
+                info.smoke_result = (
+                    SMOKE_BINARY_ONLY if not info.smoke_tested else info.smoke_result
+                )
             info.version_string = smoke.version_string or info.version_string
             self._write_meta(info)
             self._warn_driver_too_old(info)
@@ -3143,16 +3780,33 @@ class EngineManager:
             return await self.install(tag, progress=progress, activate=True)
 
         if self.config.engine.allow_source_build:
+            if error:
+                # The release lookup failed (GitHub's anonymous rate limit, no network): say so
+                # BEFORE falling back, because a source build on a box without git/cmake/nvcc
+                # fails with an unrelated-looking message.
+                log.warning("engine.ensure.release_lookup_failed", tag=tag, detail=error)
             log.info("engine.ensure.source_build", tag=tag)
-            return await self.build_from_source(
-                tag, arches=self.cuda_arches(), progress=progress, activate=True
-            )
+            try:
+                return await self.build_from_source(
+                    tag,
+                    arches=self.target_arches(detected_backend(self._gpus())),
+                    progress=progress,
+                    activate=True,
+                )
+            except EngineError as exc:
+                if error:
+                    raise EngineError(
+                        f"{exc} (the prebuilt-engine lookup had failed first, so a source "
+                        f"build was tried: {error})"
+                    ) from exc
+                raise
 
         gpus = self._gpus()
         detected = ", ".join(f"{g.name} (sm_{g.sm_arch or '?'})" for g in gpus) or "no GPUs"
         variants = self._host_variants(assets)
         raise EngineError(
-            f"no usable llama-server engine for {tag}: detected {detected} with driver CUDA "
+            f"no usable llama-server engine for {tag}: detected {detected} "
+            f"({detected_backend(gpus)} backend) with driver CUDA "
             f"{_fmt_version(self._cuda_driver_version())} on {self.os_token}/{self.arch_token}; "
             f"upstream offered {', '.join(variants)}; engine.allow_source_build is disabled"
             + (f" ({error})" if error else "")
@@ -3200,7 +3854,45 @@ class EngineManager:
         child's stderr, without which a failure report is undiagnosable.
         """
         result = await self._smoke(tag, tiny_model)
+        self._record_smoke(tag, result)
         return result.ok, result.detail
+
+    async def smoke_check(
+        self, tag: str, *, tiny_model: Path | None = None
+    ) -> tuple[bool, str, str]:
+        """:meth:`smoke_test` for callers that decide whether to *activate*.
+
+        Returns ``(acceptable, smoke_result, detail)``. ``acceptable`` is true
+        for a full pass and for the binary-only outcome (``smoke_result`` is
+        :data:`SMOKE_BINARY_ONLY`: the library had no model to micro-load), so
+        ``engine --update`` on a fresh box installs and activates instead of
+        exiting 1 over a missing GGUF. A real failure is still ``False``.
+        """
+        result = await self._smoke(tag, tiny_model)
+        self._record_smoke(tag, result)
+        return result.passed, result.label, result.detail
+
+    def _record_smoke(self, tag: str, result: _SmokeResult) -> None:
+        """Persist a manual smoke test's outcome so ``engine list`` shows it.
+
+        A pass also sets ``smoke_tested`` (the boot path then trusts the
+        build); a failure only records ``smoke_result`` -- it never clears an
+        earlier pass, which is a statement about the install, not about
+        whether the GPUs happened to be free just now.
+        """
+        try:
+            info = self.get(tag)
+        except EngineError:
+            return
+        if info is None:
+            return
+        if result.ok:
+            info.smoke_tested, info.smoke_tested_at, info.smoke_result = True, time.time(), "passed"
+        elif result.no_model:
+            info.smoke_result = SMOKE_BINARY_ONLY
+        else:
+            info.smoke_result = "failed"
+        self._write_meta(info)
 
     async def _boot_check(self, tag: str, info: EngineInfo) -> _SmokeResult:
         """The startup verification of an installed engine (see :meth:`ensure_engine`).
@@ -3289,10 +3981,18 @@ class EngineManager:
 
         model = tiny_model or self.find_tiny_model()
         if model is None:
+            # An empty library (a fresh install) cannot micro-load anything.
+            # The binary-only checks are the whole smoke test then: --version
+            # above proved the libraries resolve, --list-devices shows what
+            # the build sees (informational: a CPU-only CI box lists none).
+            devices = await self.list_devices(tag)
+            seen = f"{len(devices)} device(s) listed" if devices else "no devices listed"
             return _SmokeResult(
                 False,
-                f"engine {tag} reports '{version}' but no GGUF model was available for the "
-                "micro-load, so only the --version check ran (this is NOT a full pass)",
+                f"engine {tag}: {version}; {SMOKE_BINARY_ONLY}: --version and --list-devices "
+                f"ran ({seen}) but no GGUF was available for the micro-load. This is not a "
+                "full pass; the next engine check with a model in the library (a restart, "
+                "or `studioforge engine --smoke-test`) runs the real micro-load",
                 version_ok=True,
                 version_string=version,
                 no_model=True,
@@ -3584,8 +4284,14 @@ class EngineManager:
         self._removed_cache[tag] = merged
         return dict(merged)
 
-    async def validate_extra_flags(self, tag: str, extra: str) -> list[str]:
+    async def validate_extra_flags(
+        self, tag: str, extra: str, *, allow_partial_cpu_offload: bool = False
+    ) -> list[str]:
         """Validate the expert tier's free-text flag string. ``[]`` means ok.
+
+        ``allow_partial_cpu_offload`` is the model's own opt-in; it legalises
+        ``--n-cpu-moe`` / ``--no-kv-offload`` only while ``engine.strict_gpu``
+        is also off (:func:`partial_offload_allowance`).
 
         Validated at *save* time against the pinned engine's own ``--help``, so
         a typo or a renamed flag is a form error instead of a load failure --
@@ -3609,6 +4315,10 @@ class EngineManager:
         except EngineError as exc:
             return [*errors, f"cannot validate flags: {exc}"]
 
+        allow = partial_offload_allowance(
+            strict_gpu=self.config.engine.strict_gpu,
+            allow_partial_cpu_offload=allow_partial_cpu_offload,
+        )
         previous = ""
         for token in tokens:
             base = token.split("=", 1)[0]
@@ -3627,7 +4337,7 @@ class EngineManager:
             # Policy before existence: a CPU-offload flag EXISTS in every
             # engine's help, which is exactly why an existence check alone let
             # ``--cpu-moe`` through for as long as it did (audit 2026-09-09).
-            refusal = policy_refusal(base)
+            refusal = policy_refusal(base, allow)
             if refusal is not None:
                 errors.append(refusal)
             elif base in removed:
@@ -3910,6 +4620,93 @@ def _reuse_completed_download(target: Path, expected_bytes: int) -> bool:
     return True
 
 
+_SHA256_RE = re.compile(r"(?<![0-9a-fA-F])([0-9a-fA-F]{64})(?![0-9a-fA-F])")
+_BSD_SUM_RE = re.compile(r"^SHA256\s*\((?P<name>.+)\)\s*=\s*(?P<hash>[0-9a-fA-F]{64})\s*$", re.I)
+_SUMS_NAMES = frozenset(
+    {
+        "sha256sums",
+        "sha256sums.txt",
+        "sha256sum.txt",
+        "sha256sums.sha256",
+        "checksums.txt",
+        "checksums.sha256",
+        "checksums.sha256.txt",
+    }
+)
+_SIDECAR_SUFFIXES = (".sha256", ".sha256sum", ".sha256.txt")
+
+
+def parse_digest(value: Any) -> str | None:
+    """``"sha256:<hex>"`` (GitHub's asset ``digest`` field) -> lower-case hex."""
+    if not isinstance(value, str):
+        return None
+    algo, _, hexdigest = value.strip().partition(":")
+    if algo.lower() != "sha256" or not re.fullmatch(r"[0-9a-fA-F]{64}", hexdigest):
+        return None
+    return hexdigest.lower()
+
+
+def parse_sha256_text(text: str, filename: str) -> str | None:
+    """The SHA-256 for ``filename`` out of a sidecar or a ``SHA256SUMS`` file.
+
+    Understands ``<hex>  <name>``, ``<hex> *<name>``, BSD ``SHA256 (name) =
+    <hex>`` and a bare ``<hex>`` line. A bare hash counts only when the file
+    holds exactly one hash (a sidecar): in a multi-entry sums file a line
+    with no name cannot be attributed to ``filename``.
+    """
+    bare: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        bsd = _BSD_SUM_RE.match(line)
+        if bsd:
+            if Path(bsd.group("name")).name == filename:
+                return bsd.group("hash").lower()
+            continue
+        found = _SHA256_RE.search(line)
+        if found is None:
+            continue
+        rest = line[found.end() :].strip().lstrip("*").strip()
+        if not rest:
+            bare.append(found.group(1).lower())
+        elif Path(rest.replace("\\", "/")).name == filename:
+            return found.group(1).lower()
+    return bare[0] if len(bare) == 1 else None
+
+
+def _discard(path: Path) -> None:
+    """Delete a file that failed verification; a failure to delete is not the story."""
+    with contextlib.suppress(OSError):
+        path.unlink(missing_ok=True)
+
+
+def sha256_file(path: Path) -> str:
+    """Streaming SHA-256 of a file (archives are hundreds of MB)."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+@dataclass(frozen=True)
+class Verification:
+    """What was established about a downloaded archive.
+
+    ``verified`` is ``True`` only when the archive's SHA-256 matched a
+    published value. ``False`` means installed WITHOUT that guarantee (no
+    checksum published, or a local source build); ``by`` says which, and
+    ``warnings`` carries the sentences to show the operator. ``None`` is a
+    legacy install that predates verification.
+    """
+
+    verified: bool | None
+    by: str = ""
+    sha256: str | None = None
+    warnings: tuple[str, ...] = ()
+
+
 def _verify_archive(path: Path) -> None:
     """Integrity check before extraction; which check depends on the suffix."""
     if _is_tarball(path):
@@ -3950,6 +4747,7 @@ def guess_variant(directory: Path) -> str:
         ("cuda", ("ggml-cuda.dll", "libggml-cuda.so")),
         ("rocm", ("ggml-hip.dll", "libggml-hip.so")),
         ("vulkan", ("ggml-vulkan.dll", "libggml-vulkan.so")),
+        ("metal", ("libggml-metal.dylib", "libggml-metal.so", "ggml-metal.metallib")),
     ):
         if any((directory / name).is_file() for name in names):
             return variant
@@ -3980,7 +4778,8 @@ def build_assets(tag: str, raw_assets: Sequence[Any]) -> list[EngineAsset]:
     without a second API round-trip (a CUDA engine without cudart fails to
     start with a missing-DLL error that looks nothing like the real cause).
     """
-    cudart: dict[tuple[str, str, str], str] = {}
+    cudart: dict[tuple[str, str, str], tuple[str, str | None]] = {}
+    url_by_name: dict[str, str] = {}
     for entry in raw_assets:
         if not isinstance(entry, dict):
             continue
@@ -3988,9 +4787,15 @@ def build_assets(tag: str, raw_assets: Sequence[Any]) -> list[EngineAsset]:
         url = entry.get("browser_download_url")
         if not isinstance(name, str) or not isinstance(url, str):
             continue
+        url_by_name[name] = url
         match = _CUDART_RE.match(name)
         if match:
-            cudart[(match.group("os"), match.group("ver"), _norm_arch(match.group("arch")))] = url
+            key = (match.group("os"), match.group("ver"), _norm_arch(match.group("arch")))
+            cudart[key] = (url, parse_digest(entry.get("digest")))
+    sums_url = next(
+        (u for n, u in url_by_name.items() if n.lower() in _SUMS_NAMES),
+        None,
+    )
 
     assets: list[EngineAsset] = []
     for entry in raw_assets:
@@ -4004,9 +4809,21 @@ def build_assets(tag: str, raw_assets: Sequence[Any]) -> list[EngineAsset]:
         if parsed is None:
             continue
         asset_tag, asset_os, variant, arch = parsed
+        # Upstream's macOS arm64 archive has no backend token in its name but is
+        # built with Metal; label it so a Metal box can select it. (macOS x64 is
+        # left "cpu": not known to ship Metal, and a CPU archive is never picked.)
+        if asset_os == "macos" and arch == "arm64" and variant == "cpu":
+            variant = "metal"
         cudart_url: str | None = None
+        cudart_sha: str | None = None
         if variant.startswith("cuda-"):
-            cudart_url = cudart.get((asset_os, variant[len("cuda-") :], arch))
+            found = cudart.get((asset_os, variant[len("cuda-") :], arch))
+            if found is not None:
+                cudart_url, cudart_sha = found
+        sidecar = next(
+            (url_by_name[name + sfx] for sfx in _SIDECAR_SUFFIXES if name + sfx in url_by_name),
+            None,
+        )
         size = entry.get("size")
         assets.append(
             EngineAsset(
@@ -4019,6 +4836,10 @@ def build_assets(tag: str, raw_assets: Sequence[Any]) -> list[EngineAsset]:
                 cudart_url=cudart_url,
                 os_token=asset_os,
                 arch=arch,
+                sha256=parse_digest(entry.get("digest")),
+                checksum_url=sidecar,
+                sums_url=sums_url,
+                cudart_sha256=cudart_sha,
             )
         )
     return assets

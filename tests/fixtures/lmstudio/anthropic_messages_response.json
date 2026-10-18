@@ -1,0 +1,10 @@
+{
+  "id": "msg_0123456789abcdef01234567",
+  "type": "message",
+  "role": "assistant",
+  "model": "vendor/thing-Q4_K_M",
+  "content": [{"type": "text", "text": "Hello there."}],
+  "stop_reason": "end_turn",
+  "stop_sequence": null,
+  "usage": {"input_tokens": 11, "output_tokens": 5}
+}

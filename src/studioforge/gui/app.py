@@ -14,27 +14,34 @@ there are no absolute URLs here at all, which is exactly what makes the panel
 work identically on plain HTTP over a tailnet and behind ``tailscale serve``'s
 HTTPS front end.
 
-**Auth mirrors the gateway's.** When ``server.api_key`` is set, the panel is
-gated too: a browser gets a small login page that exchanges the key for a
-signed cookie, and an API client can present the same ``Authorization: Bearer``
-header the gateway accepts. When no key is configured the page itself is open,
-which matches the gateway's own LAN/tailnet-trust default -- reads, chat, load
-and unload work for anyone who can reach it -- but the buttons that change the
-*box* (config, files, engines, restarts, downloads) follow the API's D32 rule
-from the viewer's peer address: they work from a browser on this machine and
-refuse a remote one (:func:`studioforge.gui.tabs.require_local_admin`). The
-cookie carries a *derived* token, never the key, and ``secure`` is deliberately
-not set because the common deployment is plain HTTP on a tailnet.
+**Auth mirrors the gateway's.** Whenever the server requires a credential
+(:func:`studioforge.api.auth.auth_enforced`: ``server.api_key`` is set, any API
+key exists, or a network bind has an owner account) the panel is gated too. A
+browser gets a small sign-in page that takes the owner's username and password,
+or an *admin* API key, and exchanges it for a signed cookie; an API client can
+present the same ``Authorization: Bearer`` header the gateway accepts. On an open
+install (loopback, no credentials) the page itself is open, which matches the
+gateway's own default -- reads, chat, load and unload work for anyone who can
+reach it -- but the buttons that change the *box* (config, files, engines,
+restarts, downloads) follow the API's D32 rule from the viewer's peer address:
+they work from a browser on this machine and refuse a remote one
+(:func:`studioforge.gui.tabs.require_local_admin`). The cookie carries a
+*derived*, signed token, never a key or a password, and ``secure`` is set only
+when the panel is served over HTTPS (``server.tls.mode``).
 """
 
 from __future__ import annotations
 
 import hashlib
 import hmac
+import html
 import json
+import math
+import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote, unquote
 
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
@@ -43,11 +50,17 @@ from nicegui import ui
 from starlette.datastructures import Headers
 
 from studioforge import __version__
+from studioforge.api.auth import GUARD, auth_enforced
+from studioforge.authkeys import looks_like_key, scope_at_least
 from studioforge.config import Config
+from studioforge.credential_guard import client_key
+from studioforge.errors import AuthError
 from studioforge.gui import state as st
 from studioforge.gui.state import UNKNOWN
 from studioforge.gui.tabs import GuiContext, panel_guard
 from studioforge.logging import get_logger
+from studioforge.secure_files import write_private
+from studioforge.tlsutil import scheme_for
 
 log = get_logger(__name__)
 
@@ -81,11 +94,45 @@ _NICEGUI_MOUNTED = False
 #: ``create_gui_app`` call so the newest wiring wins.
 _CONTEXT: GuiContext | None = None
 
-#: Setup sits second, right after the Dashboard, because it is read once and
-#: then rarely -- but a *fresh* install opens on it (see :func:`_default_tab`),
-#: since on a box with no engine and no library the Dashboard has nothing to
-#: show and the checklist has everything.
-TAB_NAMES = ("Dashboard", "Setup", "Models", "Download", "Chat", "Server", "Logs")
+#: The panel's sections, in the order the strip shows them. Each is a decision
+#: the owner makes, not a module of the code: first what is happening (Overview),
+#: then what is installed (Models), how it is served and run (Serving, Engines,
+#: Placement), how other programs connect (Integrations), who may (Users & Keys),
+#: and the upkeep pages. The 2.x panel's seven tabs (Dashboard, Setup, Models,
+#: Download, Chat, Server, Logs) were moved into these, not rewritten; old links
+#: keep working through :data:`LEGACY_TABS`.
+TAB_NAMES = (
+    "Overview",
+    "Models",
+    "Serving",
+    "Engines",
+    "Placement",
+    "Integrations",
+    "Users & Keys",
+    "Updates",
+    "Logs & Metrics",
+    "Diagnostics",
+    "Advanced",
+)
+
+#: What the old tab names in a deep link (``?tab=server``) now open:
+#: ``(section, Models sub-tab or None)``. Translated here rather than in
+#: ``gui/state.py`` so the link grammar the protocol handler writes does not change.
+LEGACY_TABS: Mapping[str, tuple[str, str | None]] = {
+    "Dashboard": ("Overview", None),
+    "Setup": ("Overview", None),
+    "Models": ("Models", "Library"),
+    "Download": ("Models", "Download"),
+    "Chat": ("Models", "Chat"),
+    "Server": ("Integrations", None),
+    "Logs": ("Logs & Metrics", None),
+}
+
+#: Sub-tabs of the Models section.
+MODELS_SUBTABS = ("Library", "Download", "Chat")
+
+#: Where the first-run wizard lives.
+SETUP_PATH = "/setup"
 
 
 # ---------------------------------------------------------------------------
@@ -143,14 +190,156 @@ def _safe_eq(presented: str, expected: str) -> bool:
     )
 
 
-def _is_authorized(headers: Headers, expected: str) -> bool:
-    presented = _presented_key(headers)
-    if presented and _safe_eq(presented, expected):
+#: How long an owner or key sign-in lasts.
+SESSION_DAYS = 30
+_SESSION_LABEL = "studioforge-gui-session-v2"
+
+
+def _session_signature(secret: str, kind: str, ident: str, expiry: int, fingerprint: str) -> str:
+    """HMAC-SHA256 over kind, identity, expiry and a fingerprint of the credential.
+
+    The fingerprint is what ties a session to the credential it came from: the
+    owner's changes whenever the password does, a key's is the head of its
+    stored hash. Changing a password, or revoking or replacing a key, therefore
+    ends every session opened with the old one -- with no server-side table.
+    """
+    message = "|".join((_SESSION_LABEL, kind, quote(ident, safe=""), str(expiry), fingerprint))
+    return hmac.new(secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def make_session_cookie(
+    secret: str, kind: str, ident: str, fingerprint: str, *, now: float | None = None
+) -> str:
+    """``kind.ident.expiry.signature`` for an owner (``owner``) or key (``key``) sign-in."""
+    expiry = int((time.time() if now is None else now) + SESSION_DAYS * 86400)
+    quoted = quote(ident, safe="")
+    return (
+        f"{kind}.{quoted}.{expiry}.{_session_signature(secret, kind, ident, expiry, fingerprint)}"
+    )
+
+
+def _split_session_cookie(value: str) -> tuple[str, str, int, str] | None:
+    """``(kind, ident, expiry, signature)`` or ``None`` for anything malformed."""
+    try:
+        head, signature = value.rsplit(".", 1)
+        head, expiry_text = head.rsplit(".", 1)
+        kind, quoted = head.split(".", 1)
+        expiry = int(expiry_text)
+    except ValueError:
+        return None
+    if kind not in {"owner", "key"} or not quoted or not signature:
+        return None
+    return kind, unquote(quoted), expiry, signature
+
+
+def _key_record(accounts: Any, key_id: str) -> Any:
+    for record in accounts.list_keys():
+        if record.id == key_id:
+            return record
+    return None
+
+
+def _key_fingerprint(record: Any) -> str:
+    return str(record.key_hash)[:16]
+
+
+def _session_actor(
+    value: str, secret: str, accounts: Any, *, now: float | None = None
+) -> str | None:
+    """The actor a signed session cookie proves, or ``None``.
+
+    Tolerates garbage (a stale cookie from another app on the same host is an
+    ordinary "not signed in"), compares in constant time, and re-checks the
+    credential behind the session on every call, so a disabled account, a
+    revoked key or a downgraded scope ends the session at once.
+    """
+    parts = _split_session_cookie(value)
+    if parts is None or accounts is None:
+        return None
+    kind, ident, expiry, signature = parts
+    if expiry <= (time.time() if now is None else now):
+        return None
+    try:
+        if kind == "owner":
+            account = accounts.get_account(ident)
+            if account is None or account.disabled:
+                return None
+            fingerprint = accounts.password_fingerprint(account.username)
+            ident = account.username
+            actor = f"owner:{account.username}"
+        else:
+            record = _key_record(accounts, ident)
+            if record is None or not record.active() or record.scope != "admin":
+                return None
+            fingerprint = _key_fingerprint(record)
+            actor = f"key:{record.id}"
+    except Exception:  # noqa: BLE001 - a broken store means "not signed in", not a 500
+        return None
+    expected = _session_signature(secret, kind, ident, expiry, fingerprint)
+    return actor if _safe_eq(signature, expected) else None
+
+
+def _legacy_still_valid(accounts: Any, api_key: str) -> bool:
+    """False when the operator revoked the ``legacy`` mirror of ``server.api_key``."""
+    if accounts is None:
         return True
+    try:
+        return accounts.authenticate_legacy(api_key) is not None
+    except AuthError:
+        return False
+    except Exception:  # noqa: BLE001 - bookkeeping trouble must not lock the owner out
+        return True
+
+
+def _admin_key_actor(accounts: Any, token: str) -> tuple[str | None, str | None]:
+    """``(actor, problem)`` for a presented scoped key.
+
+    ``actor`` when it is an active *admin* key; otherwise ``problem`` says why
+    not ("scope", or the revoked/expired message), or both are ``None`` when the
+    token is simply not one of ours.
+    """
+    if accounts is None or not looks_like_key(token):
+        return None, None
+    try:
+        principal = accounts.authenticate(token, count=False)
+    except AuthError as exc:
+        return None, exc.message
+    except Exception:  # noqa: BLE001
+        return None, None
+    if principal is None:
+        return None, None
+    if not scope_at_least(principal.scope, "admin"):
+        return None, "scope"
+    return principal.actor, None
+
+
+def authorize(
+    headers: Headers,
+    config: Config,
+    accounts: Any,
+    secret_for: Callable[[], str],
+) -> str | None:
+    """The actor a request is signed in as (``legacy``, ``owner:<name>``, ``key:<id>``).
+
+    ``None`` means not signed in. Only admin credentials open the panel: it can
+    change the box, so a read or inference key is not enough.
+    """
+    legacy = config.server.api_key
+    presented = _presented_key(headers)
+    if presented:
+        if legacy and _safe_eq(presented, legacy) and _legacy_still_valid(accounts, legacy):
+            return "legacy"
+        actor, _problem = _admin_key_actor(accounts, presented)
+        if actor:
+            return actor
     cookie = _cookie_value(headers)
     if not cookie:
-        return False
-    return _safe_eq(cookie, session_token(expected))
+        return None
+    if legacy and _safe_eq(cookie, session_token(legacy)) and _legacy_still_valid(accounts, legacy):
+        return "legacy"
+    if "." in cookie:
+        return _session_actor(cookie, secret_for(), accounts)
+    return None
 
 
 def _host_only(value: str) -> str:
@@ -268,9 +457,22 @@ class GuiAuthGate:
     it. So this is plain ASGI and closes an unauthenticated upgrade.
     """
 
-    def __init__(self, app: Any, config: Config) -> None:
+    def __init__(self, app: Any, config: Config, api_state: Any = None) -> None:
         self.app = app
         self.config = config
+        self.api_state = api_state
+        self._secret: str | None = None
+
+    @property
+    def accounts(self) -> Any:
+        """The live account store; re-read per request (it may be attached late)."""
+        return getattr(self.api_state, "accounts", None)
+
+    def secret(self) -> str:
+        """The panel's session-signing secret, read once on first need."""
+        if self._secret is None:
+            self._secret = _storage_secret(self.config)
+        return self._secret
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
         kind = scope.get("type")
@@ -315,8 +517,7 @@ class GuiAuthGate:
             # response-returning middleware: the page, its assets and the
             # polling transport all come out of NiceGUI's mount, below us.
             send = _with_frame_headers(send)
-        expected = self.config.server.api_key
-        if not expected or kind not in ("http", "websocket"):
+        if kind not in ("http", "websocket") or not auth_enforced(self.config, self.accounts):
             await self.app(scope, receive, send)
             return
 
@@ -328,7 +529,10 @@ class GuiAuthGate:
         ):
             await self.app(scope, receive, send)
             return
-        if _is_authorized(headers, expected):
+        actor = authorize(headers, self.config, self.accounts, self.secret)
+        if actor is not None:
+            # Page code reads this back (``viewer_actor``) for the audit log.
+            scope.setdefault("state", {})["panel_actor"] = actor
             await self.app(scope, receive, send)
             return
 
@@ -345,8 +549,8 @@ class GuiAuthGate:
                 {
                     "error": {
                         "message": (
-                            "This panel requires the server API key. Open "
-                            f"{LOGIN_PATH} in a browser or send it as "
+                            "This panel requires a sign-in. Open "
+                            f"{LOGIN_PATH} in a browser, or send an admin API key as "
                             "'Authorization: Bearer <key>'."
                         ),
                         "type": "invalid_request_error",
@@ -363,22 +567,49 @@ class GuiAuthGate:
 # Theme assets
 # ---------------------------------------------------------------------------
 #
-# gui/theme/ is the ThemeForge drop-in bundle, copied verbatim from the
-# theme repo: the same folder every app gets (see docs/DEVELOPMENT.md's "GUI
-# theming" section). Never hand-edited; a theme update is copying the new
-# folder over this one. What is StudioForge's own is THEME_SETTINGS below.
+# gui/theme/ is the ForgeUI (ThemeForge) drop-in bundle, vendored whole by
+# `python -m forgeui vendor` from the manifest at the repository root
+# (forgeui.json; see docs/DEVELOPMENT.md's "GUI theming" section). Never
+# hand-edited: StudioForge's own CSS is the overlay gui/overlays/
+# studioforge-extra.css, which vendor copies to adapters/studioforge-extra.css.
+# What is StudioForge's own is THEME_SETTINGS below, and it is read from
+# forgeui.json so the theme choice lives in exactly one place.
 
 #: The drop-in bundle: ui-theme.js/.css/-base.css, adapters/, themes.json.
 _THEME_DIR = Path(__file__).parent / "theme"
 
-#: This app's own theme settings. The bundle carries none: they ride as
-#: data-* attributes on the ui-theme.js <script> tag (see _THEME_HEAD_HTML),
-#: and the header picker lists the same themes in the same order.
+
+def _load_forgeui_manifest() -> Mapping[str, Any]:
+    """forgeui.json: beside this module in an installed wheel (hatch force-include),
+    at the repository root in a source checkout or editable install."""
+    here = Path(__file__).resolve().parent
+    for candidate in (here / "forgeui.json", here.parents[2] / "forgeui.json"):
+        if candidate.is_file():
+            data = json.loads(candidate.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+    raise RuntimeError(
+        "forgeui.json (the theme manifest) was not found next to the GUI package or at the "
+        "repository root; the wheel must ship it (pyproject.toml force-include)"
+    )
+
+
+_FORGEUI_MANIFEST = _load_forgeui_manifest()
+
+#: This app's own theme settings, read from forgeui.json ``settings``. The bundle
+#: carries none: they ride as data-* attributes on the ui-theme.js <script> tag
+#: (see _THEME_HEAD_HTML), and the header picker lists the same themes in the
+#: same order.
 THEME_SETTINGS: Mapping[str, Any] = {
-    "themes": ("purple", "midnight-gold", "glacier", "forest", "paper", "daylight", "night-red"),
-    "default": "glacier",
-    "storage_key": "studioforge.theme",
+    **_FORGEUI_MANIFEST["settings"],
+    "themes": tuple(_FORGEUI_MANIFEST["settings"]["themes"]),
 }
+
+#: App-owned CSS overlays the manifest lists (extra_files), served from the bundle
+#: folder after the Quasar adapter so they win source-order ties.
+_THEME_OVERLAY_CSS: tuple[str, ...] = tuple(
+    target for target in _FORGEUI_MANIFEST.get("extra_files", {}) if target.endswith(".css")
+)
 
 
 def _asset_version(name: str) -> str:
@@ -409,11 +640,15 @@ def _theme_script_tag(name: str, version: str, attrs: str = "") -> str:
 
 def _theme_settings_attrs() -> str:
     """THEME_SETTINGS as the runtime's data-* configuration."""
-    return (
+    attrs = (
         f' data-themes="{",".join(THEME_SETTINGS["themes"])}"'
         f' data-default="{THEME_SETTINGS["default"]}"'
         f' data-storage-key="{THEME_SETTINGS["storage_key"]}"'
     )
+    for key in ("default_dark", "default_light"):
+        if THEME_SETTINGS.get(key):
+            attrs += f' data-{key.replace("_", "-")}="{THEME_SETTINGS[key]}"'
+    return attrs
 
 
 def _theme_link_tag(name: str, version: str) -> str:
@@ -426,14 +661,15 @@ def _theme_link_tag(name: str, version: str) -> str:
 #: then the Quasar adapter's script (it needs the runtime), the element
 #: layer (loaded before the app's own CSS so its rules keep priority), the
 #: contract tokens (loaded after it so they beat any same-named legacy
-#: value), and last the Quasar adapter's CSS, which maps the tokens onto
-#: Quasar's components.
+#: value), then the Quasar adapter's CSS, which maps the tokens onto
+#: Quasar's components, and last the app-owned overlay(s) from forgeui.json.
 _THEME_HEAD_HTML = (
     _theme_script_tag("ui-theme.js", _THEME_JS_VERSION, _theme_settings_attrs())
     + _theme_script_tag("adapters/quasar.js", _QUASAR_JS_VERSION)
     + _theme_link_tag("ui-theme-base.css", _THEME_BASE_CSS_VERSION)
     + _theme_link_tag("ui-theme.css", _THEME_CSS_VERSION)
     + _theme_link_tag("adapters/quasar.css", _QUASAR_CSS_VERSION)
+    + "".join(_theme_link_tag(rel, _asset_version(rel)) for rel in _THEME_OVERLAY_CSS)
 )
 
 
@@ -505,6 +741,8 @@ _LOGIN_PAGE = """<!doctype html>
         border: 1px solid var(--border-subtle); }}
  h1 {{ font-size: 1.1rem; margin: 0 0 .25rem; }}
  p {{ font-size: .8rem; color: var(--text-secondary); margin: 0 0 1.25rem; }}
+ label {{ display: block; font-size: .8rem; margin: .9rem 0 .25rem;
+         color: var(--text-secondary); }}
  input {{ width: 100%; padding: .6rem .7rem; font-size: 1rem; border-radius: var(--radius-sm);
          border: 1px solid var(--border-strong); background: var(--surface-sunken);
          color: var(--text-primary); box-sizing: border-box; }}
@@ -519,50 +757,141 @@ _LOGIN_PAGE = """<!doctype html>
  .error {{ color: var(--danger-text); font-size: .8rem; margin-top: .75rem; }}
 </style></head>
 <body><form method="post" action="{login_path}">
- <h1>StudioForge</h1>
- <p>This panel is protected by the server API key.</p>
- <input type="password" name="api_key" placeholder="API key" autofocus
-        autocomplete="current-password">
+ <h1>Sign in to StudioForge</h1>
+ <p>Use the owner username and password, or leave the username empty and paste an admin
+    API key.</p>
+ <label for="username">Username (leave empty to use an API key)</label>
+ <input id="username" type="text" name="username" autocomplete="username"
+        autocapitalize="none" spellcheck="false">
+ <label for="credential">Password or API key</label>
+ <input id="credential" type="password" name="credential" autofocus
+        autocomplete="current-password" required>
  <button type="submit">Sign in</button>
- {error}
+ <div class="error" role="alert">{error}</div>
 </form></body></html>
 """
 
 
 def _login_html(error: str = "") -> str:
-    block = f'<div class="error">{error}</div>' if error else ""
-    return _LOGIN_PAGE.format(login_path=LOGIN_PATH, error=block, theme_head=_THEME_HEAD_HTML)
+    return _LOGIN_PAGE.format(
+        login_path=LOGIN_PATH, error=html.escape(error), theme_head=_THEME_HEAD_HTML
+    )
 
 
-def _install_auth_routes(app: FastAPI, config: Config) -> None:
+#: Login failure texts. None of them echoes what was submitted.
+_NOT_ACCEPTED = "That username and password, or that API key, was not accepted."
+_NEEDS_ADMIN = "That key cannot open the control panel (it needs the admin scope)."
+
+
+def _install_auth_routes(app: FastAPI, config: Config, api_state: Any = None) -> None:
     """Login/logout plus the gate. Registered before NiceGUI's catch-all mount."""
+
+    def accounts() -> Any:
+        return getattr(api_state, "accounts", None)
+
+    def session_cookie(response: Response, value: str) -> Response:
+        response.set_cookie(
+            COOKIE_NAME,
+            value,
+            httponly=True,
+            samesite="lax",
+            secure=scheme_for(config) == "https",
+            path="/",
+            max_age=SESSION_DAYS * 24 * 3600,
+        )
+        return response
+
+    def audit(actor: str, result: str, client: str | None) -> None:
+        trail = getattr(api_state, "audit", None)
+        if trail is None:
+            return
+        try:
+            trail.record(
+                actor=actor,
+                action="panel.login",
+                target="",
+                result=result,
+                surface="panel",
+                peer=client,
+            )
+        except Exception:  # noqa: BLE001 - never fail a sign-in over bookkeeping
+            return
 
     @app.get(LOGIN_PATH, include_in_schema=False)
     async def login_form() -> HTMLResponse:
-        if not config.server.api_key:
-            return HTMLResponse(_login_html(), status_code=200)
         return HTMLResponse(_login_html())
 
     @app.post(LOGIN_PATH, include_in_schema=False)
-    async def login_submit(api_key: str = Form("")) -> Response:
-        expected = config.server.api_key
-        if not expected:
+    async def login_submit(
+        request: Request,
+        api_key: str = Form(""),
+        credential: str = Form(""),
+        username: str = Form(""),
+    ) -> Response:
+        if not _same_origin_scope(request.scope):
+            # A cross-site page must not be able to sign a visitor in to an
+            # account of its choosing (login CSRF), or probe credentials.
+            return HTMLResponse(
+                _login_html("Refused: the form was not submitted from this page."), status_code=403
+            )
+        store = accounts()
+        if not auth_enforced(config, store):
             return RedirectResponse("/", status_code=303)
-        if not api_key or not _safe_eq(api_key.strip(), expected):
-            # Never log the submitted value, correct or not.
-            log.info("gui login rejected")
-            return HTMLResponse(_login_html("That key was not accepted."), status_code=401)
-        response = RedirectResponse("/", status_code=303)
-        response.set_cookie(
-            COOKIE_NAME,
-            session_token(expected),
-            httponly=True,
-            samesite="lax",
-            path="/",
-            max_age=30 * 24 * 3600,
-        )
-        log.info("gui login accepted")
-        return response
+        client = client_key(request.client.host if request.client else None)
+        wait = GUARD.retry_after(client)
+        if wait > 0:
+            seconds = max(1, math.ceil(wait))
+            return HTMLResponse(
+                _login_html(f"Too many incorrect attempts. Wait {seconds} seconds and try again."),
+                status_code=429,
+                headers={"Retry-After": str(seconds)},
+            )
+        who = username.strip()
+        secret_text = credential or api_key
+        problem = _NOT_ACCEPTED
+        if who and store is not None:
+            from fastapi.concurrency import run_in_threadpool
+
+            account = await run_in_threadpool(store.verify_password, who, secret_text)
+            if account is not None:
+                GUARD.record_success(client)
+                audit(f"owner:{account.username}", "ok", client)
+                log.info("gui login accepted", kind="owner")
+                value = make_session_cookie(
+                    _storage_secret(config),
+                    "owner",
+                    account.username,
+                    store.password_fingerprint(account.username),
+                )
+                return session_cookie(RedirectResponse("/", status_code=303), value)
+        elif secret_text.strip():
+            presented = secret_text.strip()
+            legacy = config.server.api_key
+            if legacy and _safe_eq(presented, legacy) and _legacy_still_valid(store, legacy):
+                GUARD.record_success(client)
+                audit("legacy", "ok", client)
+                log.info("gui login accepted", kind="legacy")
+                return session_cookie(RedirectResponse("/", status_code=303), session_token(legacy))
+            actor, why = _admin_key_actor(store, presented)
+            record = _key_record(store, actor.split(":", 1)[1]) if actor else None
+            if actor and record is not None:
+                GUARD.record_success(client)
+                audit(actor, "ok", client)
+                log.info("gui login accepted", kind="key")
+                value = make_session_cookie(
+                    _storage_secret(config), "key", record.id, _key_fingerprint(record)
+                )
+                return session_cookie(RedirectResponse("/", status_code=303), value)
+            if why == "scope":
+                # The key is genuine, not a guess, so it does not feed the lockout.
+                return HTMLResponse(_login_html(_NEEDS_ADMIN), status_code=403)
+            if why:
+                problem = why
+        # Never log the submitted value, correct or not.
+        GUARD.record_failure(client)
+        audit(f"owner:{who}" if who else "anonymous", "denied", client)
+        log.info("gui login rejected")
+        return HTMLResponse(_login_html(problem), status_code=401)
 
     @app.get(LOGOUT_PATH, include_in_schema=False)
     async def logout() -> Response:
@@ -574,7 +903,7 @@ def _install_auth_routes(app: FastAPI, config: Config) -> None:
     async def gui_health() -> dict[str, Any]:
         return {"status": "ok", "version": __version__, "gui": True}
 
-    app.add_middleware(GuiAuthGate, config=config)
+    app.add_middleware(GuiAuthGate, config=config, api_state=api_state)
 
 
 # ---------------------------------------------------------------------------
@@ -657,7 +986,8 @@ def _header(ctx: GuiContext) -> Any:
         with ui.row().classes("items-center gap-2"):
             status = ui.label("").classes("text-xs opacity-80 font-mono")
             _theme_picker()
-            if ctx.config.server.api_key:
+            ui.link("setup guide", SETUP_PATH).classes("text-xs")
+            if auth_enforced(ctx.config, getattr(ctx.api_state, "accounts", None)):
                 ui.link("sign out", LOGOUT_PATH).classes("text-xs")
     return status
 
@@ -683,62 +1013,148 @@ def _status_line(ctx: GuiContext) -> str:
 
 
 def _default_tab(ctx: GuiContext) -> str:
-    """Where the page lands with no deep link: Setup on a fresh install.
+    """Where the page lands with no deep link: always the Overview.
 
-    "Fresh" is measured, not remembered: no model library, or no models
-    indexed, or no engine installed. On such a box the Dashboard is four empty
-    panels and the Setup tab is the whole answer, so opening there saves the
-    new user from having to guess which tab is the one that matters. Once the
-    server can actually serve, this reverts to the Dashboard for good.
-
-    Any failure lands on the Dashboard: the landing tab is not worth a broken
-    page.
+    A fresh install used to land on the Setup tab. It now lands on the Overview
+    too, where a "Finish setup" banner (see
+    :func:`studioforge.gui.tabs.overview.needs_setup`) points at the first-run
+    wizard: one place that always answers "what is this box doing", with the
+    next step on top when there is one.
     """
-    try:
-        config = ctx.config
-        if not config.models.dir:
-            return "Setup"
-        if ctx.registry is not None and not ctx.registry.all():
-            return "Setup"
-        if ctx.engine_manager is not None and ctx.engine_manager.active() is None:
-            return "Setup"
-    except Exception:  # noqa: BLE001 - never break the page over a landing tab
-        return "Dashboard"
-    return "Dashboard"
+    return "Overview"
+
+
+#: Lower-case spellings accepted for ``?section=`` (the canonical names, plus
+#: the short forms a hand-typed link would use).
+_SECTION_ALIASES: Mapping[str, str] = {
+    **{name.lower(): name for name in TAB_NAMES},
+    "users": "Users & Keys",
+    "users-keys": "Users & Keys",
+    "keys": "Users & Keys",
+    "logs": "Logs & Metrics",
+    "metrics": "Logs & Metrics",
+    "logs-metrics": "Logs & Metrics",
+}
+
+
+def resolve_section(
+    params: Mapping[str, Any], query: Mapping[str, Any] | None, default: str
+) -> tuple[str, str | None]:
+    """``(section, Models sub-tab or None)`` the page opens on.
+
+    ``?section=Updates`` names a section directly. Otherwise the legacy
+    ``?tab=`` value that :func:`studioforge.gui.state.initial_tab` understood
+    (Dashboard, Setup, Models, Download, Chat, Server, Logs) is translated by
+    :data:`LEGACY_TABS`, so every link the protocol handler or an old bookmark
+    holds still lands somewhere sensible.
+    """
+    wanted = str((query or {}).get("section") or "").strip().lower()
+    if wanted in _SECTION_ALIASES:
+        section = _SECTION_ALIASES[wanted]
+        return section, ("Library" if section == "Models" else None)
+    legacy = st.initial_tab(params, default="")
+    if legacy in LEGACY_TABS:
+        return LEGACY_TABS[legacy]
+    return default, ("Library" if default == "Models" else None)
+
+
+def _models_section(ctx: GuiContext, params: Mapping[str, Any], sub: str) -> None:
+    """Library, Download and Chat as nested tabs of the Models section."""
+    from studioforge.gui.tabs import chat, download, models, setup
+
+    with ui.tabs().classes("w-full") as subtabs:
+        for name in MODELS_SUBTABS:
+            ui.tab(name)
+    with ui.tab_panels(subtabs, value=sub if sub in MODELS_SUBTABS else "Library").classes(
+        "w-full"
+    ):
+        with ui.tab_panel("Library"), panel_guard("The Library tab"):
+            models.render(ctx, params)
+            setup.library_cards(ctx)
+        with ui.tab_panel("Download"), panel_guard("The Download tab"):
+            download.render(ctx, params)
+        with ui.tab_panel("Chat"), panel_guard("The Chat tab"):
+            chat.render(ctx)
 
 
 def _render_index(query: Mapping[str, Any] | None = None) -> None:
-    """Build the single-page shell: header, tab strip, six panels.
+    """Build the single-page shell: header, the eleven sections, one panel each.
 
     ``query`` carries the deep-link intent (``?tab=download&repo=owner/repo``)
-    that the protocol handler produces from HuggingFace's download button. With
-    no query string this behaves exactly as before and opens the Dashboard.
+    that the protocol handler produces from HuggingFace's download button, or a
+    direct ``?section=Updates``. With no query string the page opens on the
+    Overview.
     """
     ctx = _context()
     ui.page_title("StudioForge")
     status = _header(ctx)
     params = st.deep_link_params(query)
+    section, sub = resolve_section(params, query, _default_tab(ctx))
 
-    from studioforge.gui.tabs import chat, dashboard, download, logs, models, server, setup
+    from studioforge.gui.tabs import (
+        dashboard,
+        diagnostics,
+        integrations,
+        logs,
+        overview,
+        server,
+        serving,
+        setup,
+        updates,
+        users_keys,
+    )
+
+    def logs_and_metrics() -> None:
+        logs.render(ctx)
+        with ui.column().classes("w-full gap-2 p-2"):
+            logs.metrics_panel(ctx)
+
+    def column(*builders: Callable[[GuiContext], None]) -> Callable[[], None]:
+        def build() -> None:
+            with ui.column().classes("w-full gap-4 p-2"):
+                for builder in builders:
+                    builder(ctx)
+
+        return build
+
+    def placement() -> None:
+        with ui.column().classes("w-full gap-4 p-2"):
+            setup.placement_cards(ctx)
+            dashboard.placement_panels(ctx)
+            ui.label(
+                "Peers and the placement decision log arrive with multi-host support "
+                "(milestone M3)."
+            ).classes("text-xs opacity-70")
+
+    def advanced() -> None:
+        with ui.column().classes("w-full gap-4 p-2"):
+            setup.advanced_cards(ctx)
+            server.config_panels(ctx)
+            ui.label(
+                "Raw engine flags for one model are set in its settings: Models, Library, then "
+                "the model's settings, Extra flags."
+            ).classes("text-xs opacity-70")
 
     renderers: dict[str, Callable[[], None]] = {
-        "Dashboard": lambda: dashboard.render(ctx),
-        "Setup": lambda: setup.render(ctx),
-        "Models": lambda: models.render(ctx, params),
-        "Download": lambda: download.render(ctx, params),
-        "Chat": lambda: chat.render(ctx),
-        "Server": lambda: server.render(ctx),
-        "Logs": lambda: logs.render(ctx),
+        "Overview": lambda: overview.render(ctx),
+        "Models": lambda: _models_section(ctx, params, sub or "Library"),
+        "Serving": lambda: serving.render(ctx),
+        "Engines": column(lambda c: setup.engine_cards(c), lambda c: server.engine_panels(c)),
+        "Placement": placement,
+        "Integrations": lambda: integrations.render(ctx),
+        "Users & Keys": lambda: users_keys.render(ctx),
+        "Updates": lambda: updates.render(ctx),
+        "Logs & Metrics": logs_and_metrics,
+        "Diagnostics": lambda: diagnostics.render(ctx),
+        "Advanced": advanced,
     }
 
-    with ui.tabs().classes("w-full") as tabs:
+    with ui.tabs().props("outside-arrows mobile-arrows").classes("w-full") as tabs:
         for name in TAB_NAMES:
             ui.tab(name)
-    with ui.tab_panels(tabs, value=st.initial_tab(params, default=_default_tab(ctx))).classes(
-        "w-full"
-    ):
+    with ui.tab_panels(tabs, value=section).classes("w-full"):
         for name in TAB_NAMES:
-            with ui.tab_panel(name), panel_guard(f"The {name} tab"):
+            with ui.tab_panel(name), panel_guard(f"The {name} page"):
                 renderers[name]()
 
     def tick() -> None:
@@ -759,6 +1175,13 @@ def _register_pages() -> None:
         # NiceGUI injects the Starlette request when the page declares it,
         # which is how the deep-link query string reaches the tabs.
         _render_index(dict(request.query_params))
+
+    @ui.page(SETUP_PATH)
+    def setup_page() -> None:
+        # Behind the same gate as the panel itself (see GuiAuthGate).
+        from studioforge.gui.tabs import setup_wizard_page
+
+        setup_wizard_page.render(_context())
 
 
 # ---------------------------------------------------------------------------
@@ -788,7 +1211,6 @@ def _storage_secret(config: Config) -> str:
     falls back to a per-process random secret -- sessions do not survive that
     restart, which is a cosmetic loss, and the key is still not guessable.
     """
-    import os
     import secrets
 
     path = config.data_dir / GUI_SECRET_FILE
@@ -800,10 +1222,8 @@ def _storage_secret(config: Config) -> str:
         pass
     value = secrets.token_hex(32)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(value, encoding="utf-8")
-        if os.name != "nt":
-            path.chmod(0o600)
+        # Owner-only on POSIX (0600) and on Windows (an owner-only ACL).
+        write_private(path, value)
     except OSError as exc:
         log.warning(
             "could not persist the GUI session secret; panel sessions will not survive a restart",
@@ -830,7 +1250,7 @@ def create_gui_app(config: Config, *, api_state: Any) -> FastAPI:
         redoc_url=None,
         openapi_url=None,
     )
-    _install_auth_routes(app, config)
+    _install_auth_routes(app, config, api_state)
     _register_pages()
     _register_theme_assets()
 
@@ -854,8 +1274,25 @@ def create_gui_app(config: Config, *, api_state: Any) -> FastAPI:
         # reloads must not blow up on the second call.
         app.mount("/", nicegui_app)
 
-    log.info("gui app created", port=config.gui.port, auth=bool(config.server.api_key))
+    log.info(
+        "gui app created",
+        port=config.gui.port,
+        auth=auth_enforced(config, getattr(api_state, "accounts", None)),
+    )
     return app
 
 
-__all__ = ["COOKIE_NAME", "LOGIN_PATH", "LOGOUT_PATH", "create_gui_app", "session_token"]
+__all__ = [
+    "COOKIE_NAME",
+    "LEGACY_TABS",
+    "LOGIN_PATH",
+    "LOGOUT_PATH",
+    "SETUP_PATH",
+    "TAB_NAMES",
+    "GuiAuthGate",
+    "authorize",
+    "create_gui_app",
+    "make_session_cookie",
+    "resolve_section",
+    "session_token",
+]

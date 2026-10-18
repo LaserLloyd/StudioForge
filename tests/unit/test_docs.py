@@ -349,7 +349,7 @@ def test_the_rig_page_only_names_tools_that_exist() -> None:
         assert name in WATCHDOG_UNPREFIXED, f"{name} is no longer an unprefixed watchdog tool"
         assert name in text, f"{name} dropped out of the rig page"
     # The counts are facts, and the page states them twice (the table and the
-    # agent-facing block). 20 management + 10 recovery = the 30 sfctl merges.
+    # agent-facing block). 23 management + 10 recovery = the 33 sfctl merges.
     assert f"the app's {len(real)} management tools" in text
     assert f"`studioforge` ({len(real) + 10} tools)" in text
 

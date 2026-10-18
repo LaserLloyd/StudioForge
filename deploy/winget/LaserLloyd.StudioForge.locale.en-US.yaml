@@ -1,0 +1,22 @@
+# winget locale manifest (SKELETON: prepared, NOT submitted).
+PackageIdentifier: LaserLloyd.StudioForge
+PackageVersion: 2.0.0
+PackageLocale: en-US
+Publisher: LaserLloyd
+PublisherUrl: https://github.com/LaserLloyd
+PublisherSupportUrl: https://github.com/LaserLloyd/StudioForge/issues
+PackageName: StudioForge
+PackageUrl: https://github.com/LaserLloyd/StudioForge
+License: MIT
+LicenseUrl: https://github.com/LaserLloyd/StudioForge/blob/main/LICENSE
+ShortDescription: GPU-only OpenAI-compatible LLM server over llama.cpp, with a control panel and MCP tools.
+Description: StudioForge serves local GGUF models through llama.cpp's llama-server behind an OpenAI-compatible gateway, with a model registry, VRAM planner, GPU leases and a web control panel. It needs an NVIDIA GPU today.
+Moniker: studioforge
+Tags:
+  - llama-cpp
+  - llm
+  - openai-compatible
+  - gpu
+  - mcp
+ManifestType: defaultLocale
+ManifestVersion: 1.9.0

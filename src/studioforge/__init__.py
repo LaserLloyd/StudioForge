@@ -1,3 +1,3 @@
 """StudioForge: GPU-only local LLM serving system built on llama.cpp's llama-server."""
 
-__version__ = "1.26-09-23"
+__version__ = "2.0.0"

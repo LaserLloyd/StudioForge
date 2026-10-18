@@ -1,0 +1,18 @@
+{
+  "gpu_data": [
+    {
+      "gpu": 0,
+      "asic": {
+        "market_name": "AMD Radeon 8060S Graphics",
+        "vendor_id": "0x1002",
+        "device_id": "0x1586",
+        "target_graphics_version": "gfx1151"
+      },
+      "driver": {"name": "AMDGPU", "version": "6.12.12"},
+      "vram": {
+        "type": "LPDDR5X",
+        "size": {"value": 98304, "unit": "MB"}
+      }
+    }
+  ]
+}

@@ -1056,3 +1056,29 @@ def test_ci_gives_the_linux_leg_the_inert_backend() -> None:
     value = steps[0]["env"]["PYSTRAY_BACKEND"]
     assert "dummy" in value
     assert "runner.os == 'Linux'" in value, "must not replace the real backend on Windows"
+
+
+# ---------------------------------------------------------------------------
+# W3: a server that refuses to listen on the network without an account
+# ---------------------------------------------------------------------------
+
+
+def test_an_auth_required_exit_is_not_a_crash_and_is_never_respawned(app: TrayApp) -> None:
+    assert app.classify_exit(tray_app.EXIT_AUTH_REQUIRED) == tray_app.KIND_AUTH_REQUIRED
+    app.user_stopped = False
+    app.restarts = 0
+    respawn, notice = app._child_exited_locked(tray_app.KIND_AUTH_REQUIRED, 4)
+    assert respawn is False and app.restarts == 0, "respawning cannot create an account"
+    assert app.state == STATE_CRASHED and app.user_stopped is True
+    assert "studioforge setup" in app.detail
+    assert notice is not None and "studioforge setup" in notice
+
+
+def test_the_tray_sends_the_local_admin_key_when_there_is_no_api_key(config: Config) -> None:
+    (config.data_dir).mkdir(parents=True, exist_ok=True)
+    (config.data_dir / "cli.key").write_text("sf-a-" + "k" * 43, encoding="utf-8")
+    config.server.api_key = None
+    headers = tray_app.HttpApiClient(config)._headers()
+    assert headers["Authorization"] == "Bearer sf-a-" + "k" * 43
+    config.server.api_key = "legacy-key-0123456789"  # scrub-ok: fixture
+    assert tray_app.HttpApiClient(config)._headers()["Authorization"].endswith("0123456789")

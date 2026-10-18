@@ -1,7 +1,7 @@
-/* GENERATED component layer: ThemeForge 1.0.0, drop-in bundle (ui-theme/).
+/* GENERATED component layer: ThemeForge 1.2.0, drop-in bundle (ui-theme/).
    https://github.com/LaserLloyd/ThemeForge . Do not edit this copy: update the whole
    folder (python ui-theme/update.py) and keep app styles in the app.
-   body sha256: 2cad8d7aeb443ac2 */
+   body sha256: a0deda9ab3942418 */
 /* ============================================================================
    components.css — the component layer. Theme-agnostic.
    ----------------------------------------------------------------------------
@@ -460,6 +460,7 @@
 .ui-label { color: var(--text-secondary); font-size: var(--fs-xs); font-weight: var(--fw-medium); }
 .ui-help { color: var(--text-tertiary); font-size: var(--fs-xs); }
 .ui-error { color: var(--danger-text); font-size: var(--fs-xs); font-weight: var(--fw-medium); }
+.ui-error:empty { display: none; }
 
 .ui-input,
 .ui-select,
@@ -929,7 +930,9 @@
      </figcaption>
      <pre><code>…</code></pre>
    </figure>
-   The slab is dark in every theme (the syntax tokens), light themes too. */
+   The slab is dark in every theme (the syntax tokens), light themes too. With
+   ui-components.js loaded the button copies the code (see Copy to clipboard);
+   leave it empty to get the word "Copy" in the page's language. */
 
 .ui-codeblock {
   margin: 0;
@@ -1137,7 +1140,13 @@
 .ui-toast--danger  { border-inline-start-color: var(--danger); }
 .ui-toast--info    { border-inline-start-color: var(--info); }
 
-/* ---- Empty state ------------------------------------------------------------------------------- */
+/* ---- Empty state -------------------------------------------------------------------------------
+   <div class="ui-empty">
+     <h3 class="ui-empty__title">No jobs yet</h3>
+     <p class="ui-empty__desc">Start one to see it here.</p>
+     <div class="ui-empty__actions"><button class="ui-btn ui-btn--primary">New job</button></div>
+   </div>
+   Say what is missing, why it matters, and put the next step in the actions slot. */
 
 .ui-empty {
   display: flex;
@@ -1151,6 +1160,199 @@
   text-align: center;
 }
 .ui-empty__title { margin: 0; color: var(--text-primary); font-size: var(--fs-md); font-weight: var(--fw-semibold); }
+.ui-empty__icon { color: var(--text-tertiary); font-size: var(--fs-2xl); line-height: 1; }
+.ui-empty__desc { margin: 0; max-width: 46ch; font-size: var(--fs-sm); }
+/* The action slot: the next step, as one or two buttons. */
+.ui-empty__actions { display: flex; flex-wrap: wrap; justify-content: center; gap: var(--space-2); margin-top: var(--space-3); }
+
+/* ---- Visually hidden ----------------------------------------------------------------------
+   Text for screen readers only (the live region UIComponents.announce() writes to). */
+
+.ui-visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* ---- Settings rows -------------------------------------------------------------------------
+   A label and description on one side, the control on the other, with a "reset to default"
+   button, a Basic/Advanced marker and a "set by environment" badge:
+
+   <div class="ui-settings">
+     <div class="ui-setting" data-level="advanced" data-default="8080">
+       <div class="ui-setting__text">
+         <div class="ui-setting__label">
+           <label for="port">Port</label>
+           <span class="ui-badge ui-setting__level"></span>
+           <span class="ui-badge ui-badge--info ui-setting__env"></span>
+         </div>
+         <p class="ui-setting__desc" id="port-desc">Where the server listens.</p>
+       </div>
+       <div class="ui-setting__control">
+         <input class="ui-input" id="port" value="8080" aria-describedby="port-desc">
+         <button class="ui-btn ui-btn--ghost ui-btn--sm ui-setting__reset" type="button" hidden></button>
+       </div>
+     </div>
+   </div>
+
+   State comes from attributes on the row: data-level="advanced" shows the Advanced marker,
+   data-source="env" shows the "set by environment" badge, data-modified (set by
+   UIComponents.setting) is "differs from the default". data-level-filter="basic" on
+   .ui-settings hides the advanced rows. Empty badges and the reset button get their words
+   from UIComponents' string table, so they translate. The row wraps: the control drops under
+   the text when there is no room. */
+
+.ui-settings {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-2);
+}
+.ui-settings[data-level-filter="basic"] > .ui-setting[data-level="advanced"] { display: none; }
+.ui-setting {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: var(--space-2) var(--space-5);
+  padding: var(--space-3) var(--space-4);
+}
+.ui-settings > .ui-setting + .ui-setting { border-top: 1px solid var(--divider); }
+.ui-setting__text { flex: 1 1 16rem; min-width: 0; }
+.ui-setting__label {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1) var(--space-2);
+  color: var(--text-primary);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
+}
+.ui-setting__desc {
+  margin: 2px 0 0;
+  color: var(--text-secondary);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-snug);
+  overflow-wrap: anywhere;
+}
+.ui-setting__control {
+  flex: 0 1 22rem;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: min(100%, 12rem);
+}
+.ui-setting__control > :where(.ui-input, .ui-select, .ui-textarea) { flex: 1 1 10rem; }
+.ui-setting__control > .ui-error { flex-basis: 100%; }
+.ui-setting__level, .ui-setting__env { display: none; }
+.ui-setting[data-level="advanced"] .ui-setting__level,
+.ui-setting[data-source="env"] .ui-setting__env { display: inline-flex; }
+.ui-setting__reset[hidden] { display: none; }
+.ui-setting[data-modified] .ui-setting__label label::after {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-inline-start: var(--space-2);
+  border-radius: var(--radius-pill);
+  background: var(--selected);
+  vertical-align: middle;
+}
+
+/* ---- Copy to clipboard ---------------------------------------------------------------------
+   A value with a copy button glued to its end:
+
+   <div class="ui-copy">
+     <input class="ui-input ui-copy__value" readonly value="http://192.0.2.10:8080" aria-label="Server URL">
+     <button class="ui-btn ui-copy__button" type="button"></button>
+   </div>
+
+   The value may be a readonly input or any element (a <code class="ui-copy__value">). The
+   button copies on click through UIComponents (no script of yours), shows "Copied" for a
+   moment (data-copied="true", or "failed" when the browser refused) and announces it.
+   An empty button gets the word for "Copy" from the string table. */
+
+.ui-copy { display: flex; align-items: stretch; min-width: 0; }
+.ui-copy__value {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  height: var(--control-h-md);
+  padding-inline: 11px;
+  border: 1px solid var(--border-strong);
+  border-start-start-radius: var(--radius-sm);
+  border-end-start-radius: var(--radius-sm);
+  border-start-end-radius: 0;
+  border-end-end-radius: 0;
+  background: var(--surface-sunken);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ui-copy__button {
+  flex: none;
+  margin-inline-start: -1px;
+  border-start-start-radius: 0;
+  border-end-start-radius: 0;
+}
+.ui-copy__button[data-copied="true"] { border-color: var(--success-border); color: var(--success-text); }
+.ui-copy__button[data-copied="failed"] { border-color: var(--danger-border); color: var(--danger-text); }
+.ui-codeblock__button[data-copied="true"] { border-color: currentColor; color: var(--syn-addition); }
+.ui-codeblock__button[data-copied="failed"] { border-color: currentColor; color: var(--syn-deletion); }
+
+/* ---- Progress with cancel -------------------------------------------------------------------
+   A labelled progress bar with a slot for the cancel button:
+
+   <div class="ui-progress-row" aria-busy="true">
+     <div class="ui-progress-row__body">
+       <div class="ui-progress-row__head">
+         <span class="ui-progress-row__label" id="job-1">Generating images</span>
+         <span class="ui-progress-row__value">42%</span>
+       </div>
+       <progress class="ui-progress" value="42" max="100" aria-labelledby="job-1"></progress>
+       <p class="ui-progress-row__detail">Step 12 of 30</p>
+     </div>
+     <button class="ui-btn ui-btn--ghost ui-btn--sm ui-progress-row__cancel" type="button">Cancel</button>
+   </div>
+
+   When the length is unknown, put a .ui-spinner in the head instead of the bar. data-state
+   ("done", "failed", "cancelled") marks how a finished row ended, by an edge as well as colour. */
+
+.ui-progress-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-2);
+}
+.ui-progress-row[data-state="done"] { border-inline-start: 3px solid var(--success); }
+.ui-progress-row[data-state="failed"] { border-inline-start: 3px solid var(--danger); }
+.ui-progress-row[data-state="cancelled"] { border-inline-start: 3px dashed var(--border-strong); }
+.ui-progress-row__body { flex: 1 1 auto; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.ui-progress-row__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-3);
+  font-size: var(--fs-sm);
+}
+.ui-progress-row__label { min-width: 0; color: var(--text-primary); font-weight: var(--fw-medium); overflow-wrap: anywhere; }
+.ui-progress-row__value { flex: none; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+.ui-progress-row__detail { margin: 0; color: var(--text-tertiary); font-size: var(--fs-xs); overflow-wrap: anywhere; }
+.ui-progress-row__cancel { flex: none; }
 
 /* ---- Chat ---------------------------------------------------------------------------------------
    <div class="ui-stack"><div class="ui-bubble ui-bubble--user">…</div>
@@ -1408,7 +1610,8 @@
 @media print {
   .ui-app { display: block; min-height: 0; }
   .ui-app__header { position: static; }
-  .ui-app__nav, .ui-toasts, .ui-menu, .ui-drawer, [data-ui-tooltip]::after { display: none !important; }
+  .ui-app__nav, .ui-toasts, .ui-menu, .ui-drawer, [data-ui-tooltip]::after,
+  .ui-setting__reset, .ui-copy__button, .ui-progress-row__cancel { display: none !important; }
   .ui-card, .ui-table-wrap, .ui-callout, .ui-codeblock { break-inside: avoid; box-shadow: none; }
   .ui-table-wrap--scroll { max-height: none; overflow: visible; }
 }

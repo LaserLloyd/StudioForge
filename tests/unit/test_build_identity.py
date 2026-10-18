@@ -187,7 +187,12 @@ def test_health_status_and_version_routes_carry_the_build(
     assert health["version"] == studioforge.__version__
     assert health["build"] == "abc1234-dirty"
     assert api_health["build"] == "abc1234-dirty"
-    assert version == {"version": studioforge.__version__, "build": "abc1234-dirty"}
+    assert version == {
+        "product": "StudioForge",
+        "version": studioforge.__version__,
+        "build": "abc1234-dirty",
+        "api_versions": {"openai": "v1", "lmstudio_v0": "v0", "studioforge_api": "v1"},
+    }
     assert status["build"] == "abc1234-dirty", "sfctl status renders this payload"
 
 

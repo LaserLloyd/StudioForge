@@ -3,6 +3,18 @@
 [![CI](https://github.com/LaserLloyd/StudioForge/actions/workflows/ci.yml/badge.svg)](https://github.com/LaserLloyd/StudioForge/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/readme/panel-overview.png" alt="StudioForge control panel Overview in the Glacier theme: base URL, four GPU cards with VRAM bars and no model loaded"><br><sub><b>Overview.</b> The base URL to paste into any OpenAI client, every GPU with its VRAM and load, and what is loaded right now.</sub></td>
+    <td width="50%"><img src="docs/screenshots/readme/panel-models.png" alt="StudioForge Models tab listing three indexed GGUF models with size, quant and architecture"><br><sub><b>Models.</b> Your GGUF library, indexed in place: size, quant, architecture and load state, with load, pin and benchmark actions.</sub></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/readme/panel-integrations.png" alt="StudioForge Integrations tab with copy-paste connection snippets for OpenClaw, the OpenAI and Anthropic Python SDKs and DisPatch"><br><sub><b>Integrations.</b> Copy-paste connection snippets for OpenAI-compatible clients, filled in with your server's address and a model.</sub></td>
+    <td width="50%"><img src="docs/screenshots/readme/setup-wizard.png" alt="StudioForge setup guide, step 1: create the owner account"><br><sub><b>Setup guide.</b> Eight optional steps from owner account to network exposure, starting with step 1 here.</sub></td>
+  </tr>
+</table>
+
 Run a computer as an AI server: a llama.cpp backend with an MCP control plane in front that automatically optimizes, loads and evicts models. Designed for a dedicated server machine or for other programs to call. OpenAI-compatible.
 
 **StudioForge is a self-hosted, GPU-only llama.cpp server for Windows and Linux**: an
@@ -12,19 +24,22 @@ control panel, a system tray, and MCP tools so an agent can run it from another 
 replace LM Studio as the backend for [OpenClaw](docs/OPENCLAW.md) — it listens on LM Studio's port, so
 switching is a host change, not a rewrite.
 
-**Status:** v1.26-09-23. `main` has moved on since (D71 to D79, see [`CHANGELOG.md`](CHANGELOG.md)).
-Windows is the reference platform and runs it daily; Linux is supported (CI runs both) and less
-battle-tested. Questions and bug reports: [Contact](#contact).
+**Status:** v2.0.0. The first release on the new scheme: secure-by-default binds, scoped keys,
+backend-aware engines (CUDA verified; ROCm and Vulkan not yet tested on real hardware, see
+[`docs/ENGINES.md`](docs/ENGINES.md)) and the LM Studio native API (see [`CHANGELOG.md`](CHANGELOG.md), **BREAKING**
+first). Windows is the reference platform and runs it daily; Linux is supported (CI runs both) and
+less battle-tested. Questions and bug reports: [Contact](#contact).
 
 **Read more:** [the StudioForge write-up](https://www.laserlloyd.com/projects/studioforge-gpu-only-llm-server/)
 on LaserLloyd.com, and the author's other [AI projects](https://www.laserlloyd.com/ai/).
 
-**On versions.** StudioForge is calendar-versioned: a major, then the release date. The display
-version lives in `src/studioforge/__init__.py` — `1.26-09-23` — and is what `GET /api/version`,
-`GET /health`, the MCP `server_status` tool and `sfctl status` report. PEP 440 has no way to spell
-a hyphenated date, so both `pyproject.toml` files carry the same date as `1.26.9.23`, which is what
-`pip`/`uv` see in the wheel metadata; the `sfctl` companion ships from the same release and carries
-the same version, and release tags are `v1.26-09-23`. Check what a server is actually running with
+**On versions.** StudioForge uses semantic versioning since 2.0.0. The version lives in
+`src/studioforge/__init__.py` — `2.0.0` — and is what `GET /api/version`, `GET /health`, the MCP
+`server_status` tool and `sfctl status` report; all three `pyproject.toml` files (the app,
+`packages/studioforge-companion` for `sfctl`, and `packages/studioforge-tenant`) carry the same string,
+the companion ships from the same release and carries the same version, and release tags are
+`v2.0.0`. Releases before 2.0.0 were calendar-versioned (`1.26-08-23` style); the updater reads both
+schemes, so a 1.x install sees 2.0.0 as the update it is. Check what a server is actually running with
 `curl -s <host>/api/version`. A server running a commit past its release still reports that release,
 but the `build` field beside `version` (on `/health`, `/api/version`, `/api/status`, `server_status`
 and the "starting" log line) names the checkout itself: the short commit SHA, `-dirty`
@@ -149,57 +164,240 @@ the [VRAM Tenant Protocol](docs/TENANTS.md). StudioForge never starts or stops o
 
 ## Install
 
+Pick your platform below. Methods are listed simplest first, and each block runs top to bottom on a
+fresh machine. StudioForge serves models from GPU memory only. NVIDIA (CUDA) is the tested path; the
+AMD (ROCm) and Vulkan images build and boot but have not been run on real AMD or Intel hardware.
+With no usable GPU the server still starts and reports `can_serve=false`.
+
+**Ports:** `1234` gateway (`/v1`, `/api`, `/mcp`, `/health`), `8080` control panel, `1235` watchdog
+sidecar. All three bind `127.0.0.1` unless you change it (see [Ports](#ports)). LM Studio also uses
+`1234`: quit it first. In the Docker methods these are the container ports; change the host side with
+`SF_GATEWAY_PORT`, `SF_PANEL_PORT` and `SF_WATCHDOG_PORT` in `.env`.
+
 ### Windows
 
-1. Install [Git](https://git-scm.com/download/win), [Python 3.12+](https://www.python.org/downloads/)
-   and [uv](https://docs.astral.sh/uv/getting-started/installation/). Have a current
-   [NVIDIA driver](https://www.nvidia.com/drivers/) — the CUDA 13 engine builds need a 580-series
-   driver or newer (no CUDA toolkit needed: the prebuilt engine ships its runtime).
-2. Clone:
+You need an NVIDIA driver from the 580 series or newer for the CUDA 13 engine builds (no CUDA toolkit
+needed: the prebuilt engine ships its runtime).
 
-   ```bash
-   git clone https://github.com/LaserLloyd/StudioForge.git
-   ```
+#### 1. Git + uv, run from a clone (simplest)
 
-3. Double-click **`launchers\Update StudioForge.bat`** — creates the virtualenv, installs the
-   dependencies, then installs the **newest** llama.cpp release that has a build your driver can
-   run, smoke-tests it, and only then activates and pins it. A build that fails its smoke test is
-   installed but never made active (D49). (`b10425` is the build the numbers in these docs were
-   measured on, not necessarily the one you will get.)
-4. Double-click **`launchers\Start StudioForge.bat`**. The control panel opens at
-   <http://127.0.0.1:8080> on its **Setup** tab — a checklist with a button for each unmet item.
-   (Prefer a notification-area icon that keeps the server alive and restarts it if it crashes?
-   Use **`launchers\StudioForge Tray.bat`** instead, and open the panel from the icon's menu.)
+Choose this for one Windows PC with an NVIDIA GPU. It uses the prebuilt llama.cpp engine, and
+`launchers\` adds a tray icon and start-at-login.
+
+```powershell
+winget install --id Git.Git -e
+winget install --id astral-sh.uv -e
+```
+
+Close PowerShell and open a new window so `git` and `uv` are on `PATH`, then:
+
+```powershell
+git clone https://github.com/LaserLloyd/StudioForge.git
+cd StudioForge
+uv venv --python 3.12 .venv
+uv pip install --python .venv\Scripts\python.exe -e .
+.venv\Scripts\python.exe -m studioforge serve --open
+```
+
+The first start downloads the pinned llama.cpp engine and checks its checksum. `serve --open` stays in
+the foreground and opens the control panel at <http://127.0.0.1:8080>. To check it, open a second
+PowerShell window:
+
+```powershell
+curl.exe -s http://127.0.0.1:1234/health
+```
+
+The panel's setup guide creates the owner account in its first step. To do that from the terminal instead
+(pick your own password, 10 or more characters; this also downloads and smoke-tests the llama.cpp engine),
+run this before the first `serve`:
+
+```powershell
+$env:SF_OWNER_PASSWORD = "choose-a-password"
+.venv\Scripts\python.exe -m studioforge setup --non-interactive --username owner --password-env SF_OWNER_PASSWORD --skip-model --skip-chat --no-start
+```
+
+The options of every command are in [`docs/CLI.md`](docs/CLI.md), and [`docs/SETUP.md`](docs/SETUP.md) walks
+through the same first run.
+
+A later `studioforge engine --update` installs the newest llama.cpp build your driver can run and
+smoke-tests it before activating. The full smoke test micro-loads one small GGUF from your library;
+with an empty library it runs `llama-server --version` and `--list-devices` only, records
+`binary-only (no model available)` and still activates, and the next engine check with a model
+present runs the real micro-load. Prefer double-clicking? `launchers\Update StudioForge.bat`
+does the venv, install and engine steps,
+`launchers\Start StudioForge.bat` starts the server, and `launchers\StudioForge Tray.bat` runs it from
+the notification area (see [Windows launchers](#windows-launchers)).
+
+| Pros | Cons |
+| --- | --- |
+| Fewest steps, no container layer | You update Python packages and the engine yourself |
+| Prebuilt engine, nothing to compile | Windows only; data lives in `data\` inside the clone unless you set `SF_DATA_DIR` |
+| Tray, autostart and Update launchers included | Runs as your user, not isolated from the rest of the PC |
+
+#### 2. Docker Desktop
+
+Choose this to keep StudioForge in a container with its data on a Docker volume. The container is
+Linux, so the llama.cpp engine is compiled inside it on the first start (several minutes of CPU) and
+the image that can do that is large (about 14 GB).
+
+```powershell
+winget install --id Docker.DockerDesktop -e
+winget install --id Git.Git -e
+```
+
+Start Docker Desktop once and accept its first-run prompts (WSL 2 backend; the Windows NVIDIA driver
+gives containers GPU access). Then, in a new PowerShell window:
+
+```powershell
+git clone https://github.com/LaserLloyd/StudioForge.git
+cd StudioForge\deploy\compose
+@"
+SF_BACKEND=cuda-devel
+SF_MODELS=C:/Users/you/models
+SF_OWNER_PASSWORD=change-this-password
+"@ | Set-Content .env
+docker build --build-arg BACKEND=cuda --build-arg CUDA_FLAVOR=devel --build-arg VERSION=2.0.0 -t ghcr.io/laserlloyd/studioforge:2.0.0-cuda-devel ..\..
+docker compose -f compose.yml -f compose.cuda.yml up -d
+docker compose ps
+curl.exe -s http://127.0.0.1:1234/health
+```
+
+Edit the `SF_MODELS` path (your GGUF folder) and `SF_OWNER_PASSWORD` (10 or more characters) before you
+run it. Open <http://localhost:8080> and sign in as `owner` with that password; create one key per
+client under **Users & Keys**, and point clients at `http://localhost:1234/v1`. Leave
+`SF_OWNER_PASSWORD` out and the container generates one into `/data/owner-password.initial` on the
+volume. Once the image is published to the registry, replace the `docker build` line with
+`docker compose -f compose.yml -f compose.cuda.yml pull`. Do not add `--build` to `up` (see the Linux note below).
+
+| Pros | Cons |
+| --- | --- |
+| Data on a named volume, read-only image, pre-migration snapshots | About 14 GB image; engine compiles on first start |
+| Easy upgrade and rollback by tag | Needs Docker Desktop and its NVIDIA/WSL 2 GPU setup |
+| Nothing installed on Windows besides Docker | No tray icon; Docker Desktop must be running |
 
 ### Linux
 
-1. Install [Git](https://git-scm.com/downloads), [Python 3.12+](https://www.python.org/downloads/),
-   [uv](https://docs.astral.sh/uv/getting-started/installation/), `cmake`, and the
-   [CUDA toolkit](https://developer.nvidia.com/cuda-downloads) whose `nvcc` matches your driver.
-   Upstream ships no Linux CUDA archive, so the engine is **built from source once per version**.
-2. Clone and install:
+Ubuntu and Debian package names are shown; use your distribution's equivalents. NVIDIA is the tested
+GPU path. On Linux the pinned llama.cpp engine for NVIDIA is **built from source on the first start**
+(minutes of CPU, once per version), which needs `git`, `cmake`, a compiler and a CUDA toolkit whose
+`nvcc` matches your driver ([download](https://developer.nvidia.com/cuda-downloads)). The container
+method brings its own toolchain.
+AMD (ROCm) and Vulkan are untested on hardware.
 
-   ```bash
-   git clone https://github.com/LaserLloyd/StudioForge.git && cd StudioForge
-   uv venv --python 3.12 .venv
-   uv pip install --python .venv/bin/python -e ".[dev]"
-   ```
+#### 1. Installer script with a systemd user service (simplest)
 
-3. Start it (the first run builds the engine; watch the progress in the terminal):
+Choose this for a Linux box you want StudioForge to run on at login, with no `sudo` after the
+prerequisites. It installs `uv` if you lack it, makes a Python 3.12 environment under your home
+directory, and writes and starts two systemd **user** units (gateway and watchdog).
 
-   ```bash
-   .venv/bin/studioforge serve --open
-   ```
+```bash
+sudo apt-get update && sudo apt-get install -y git curl ca-certificates cmake build-essential
+git clone https://github.com/LaserLloyd/StudioForge.git
+cd StudioForge
+deploy/linux/install.sh --from .
+export PATH="$HOME/.local/bin:$PATH"
+studioforge version
+curl --retry 20 --retry-connrefused -s http://127.0.0.1:1234/health
+```
 
-4. To run it as a service that survives logout, use the systemd user units in
-   [`deploy/`](deploy/README.md).
+The service builds the engine on its first start; follow it with `journalctl --user -u studioforge -f`
+(`/health` reports `can_serve=false` until the engine and a model are in place). Skip the CUDA toolkit
+and use method 2 if you would rather not install one. Avoid `studioforge engine --update` on Linux for
+now: it fetches an upstream CUDA archive whose smoke test failed in our container test. Add `sudo loginctl enable-linger "$USER"` so the services keep running when
+you are logged out. The control panel is <http://localhost:8080>. Read the script first with
+`less deploy/linux/install.sh`, preview it with `--dry-run`, or use `--system` (run as root) for a
+system-wide install under `/opt/studioforge`. When a GitHub release exists you can skip the clone:
+`curl -fsSL https://raw.githubusercontent.com/LaserLloyd/StudioForge/main/deploy/linux/install.sh | bash`
+installs the latest release wheel after checking it against `SHA256SUMS.txt`.
 
-### First run, either platform
+| Pros | Cons |
+| --- | --- |
+| Autostart, restart on failure and a watchdog, as user units | You install the CUDA toolkit for the engine build |
+| User-level: nothing outside your home directory, no `sudo` for the install | Needs a systemd user session (without one the script writes the units but cannot enable them, and says so) |
+| `--uninstall` removes the program and keeps your data | A script writes units for you; read it or use `--dry-run` first |
 
-The Setup tab asks you to confirm three things: the engine is installed, `models.dir` points at
-your GGUF library (**Detect LM Studio library** finds an existing one — models are indexed in
-place, never copied), and you have noted the MCP pairing PIN you will need for an agent. The full
-walkthrough, with the headless YAML/CLI equivalent, is [`docs/SETUP.md`](docs/SETUP.md).
+#### 2. Docker or Podman Compose
+
+Choose this for isolation, a data volume that survives updates, and no CUDA toolkit on the host. It
+needs Docker with the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
+(the `nvidia-ctk runtime configure --runtime=docker` step), or Podman with a CDI spec.
+
+```bash
+sudo apt-get update && sudo apt-get install -y git curl ca-certificates
+curl -fsSL https://get.docker.com | sh
+git clone https://github.com/LaserLloyd/StudioForge.git
+cd StudioForge/deploy/compose
+mkdir -p models
+cat > .env <<'EOF'
+SF_BACKEND=cuda-devel
+SF_MODELS=./models
+SF_OWNER_PASSWORD=change-this-password
+EOF
+sudo docker build --build-arg BACKEND=cuda --build-arg CUDA_FLAVOR=devel --build-arg VERSION=2.0.0 -t ghcr.io/laserlloyd/studioforge:2.0.0-cuda-devel ../..
+sudo docker compose -f compose.yml -f compose.cuda.yml up -d
+sudo docker compose ps
+curl --retry 20 --retry-connrefused -s http://127.0.0.1:1234/health
+```
+
+Put your GGUF files in `models/` (or set `SF_MODELS`), and choose your own `SF_OWNER_PASSWORD` (10 or
+more characters; leave it out to get a generated one in `/data/owner-password.initial`). Sign in at
+<http://localhost:8080>. The slim `-cuda` image cannot compile the engine: use `-cuda-devel` as above,
+or mount an engine you built once. Podman: `podman-compose -f compose.yml -f compose.cuda.podman.yml up -d`.
+Do not add `--build` to `up`: compose passes `SF_BACKEND` as the build argument, which only accepts
+`cuda`, `rocm` or `vulkan`. Once the image is published, replace the `docker build` line with `pull`. Full guide, the AMD and
+Vulkan overrides, and offline use: [docs/deploy/docker.md](docs/deploy/docker.md).
+
+| Pros | Cons |
+| --- | --- |
+| Data on the `studioforge-data` volume, read-only image, snapshot before each migration | About 14 GB devel image; first start compiles the engine |
+| Upgrade is a pull and `up -d`; rollback is the previous tag | Needs the NVIDIA Container Toolkit (or a CDI spec on Podman) |
+| No CUDA toolkit or Python on the host | No tray; models folder is mounted read-only |
+
+#### 3. From a clone with uv, no service (hackable)
+
+Choose this to read or change the code, or to run it in a terminal. Same prerequisites as method 1.
+
+```bash
+sudo apt-get update && sudo apt-get install -y git curl ca-certificates cmake build-essential
+curl -LsSf https://astral.sh/uv/install.sh | sh
+source "$HOME/.local/bin/env"
+git clone https://github.com/LaserLloyd/StudioForge.git
+cd StudioForge
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python -e ".[dev]"
+.venv/bin/studioforge serve
+```
+
+In a second terminal: `curl -s http://127.0.0.1:1234/health`. The first start builds the engine; watch the
+progress in the first terminal. To run it as a service later, use the units in [`deploy/`](deploy/README.md).
+
+| Pros | Cons |
+| --- | --- |
+| Editable install: change the code and restart | Most steps; you manage Python, uv and the CUDA toolkit |
+| Nothing written outside the clone and the data folder | No autostart until you add the systemd units yourself |
+
+### macOS
+
+Not supported. StudioForge's engines are CUDA, ROCm and Vulkan builds of llama.cpp, the installer
+refuses to run on anything but Linux, and Docker Desktop on a Mac cannot pass a GPU into a container.
+
+### Upgrade and uninstall
+
+| Method | Upgrade | Uninstall (your data is kept unless noted) |
+| --- | --- | --- |
+| Windows, clone | `git pull`, then `uv pip install --python .venv\Scripts\python.exe -e .`; stop the server first | `studioforge autostart disable` if you enabled it, then delete the folder. **Data is in `data\` inside the clone** unless `SF_DATA_DIR` points elsewhere: copy it out first |
+| Docker (Windows or Linux) | `git pull`, rebuild the image (or `docker compose pull` once it is published), then `docker compose up -d`. Roll back by setting `SF_VERSION` to the previous tag. The entrypoint snapshots `registry.sqlite3` and `config.yaml` to `/data/backups/` first | `docker compose down` keeps the `studioforge-data` volume; `docker compose down -v` deletes it. Backup and restore: [docs/deploy/docker.md](docs/deploy/docker.md#backup-and-restore) |
+| Linux installer | `git pull`, then `deploy/linux/install.sh --from .` again (replaces the program, keeps data); roll back with `git checkout <older tag>` and the same command | `deploy/linux/install.sh --uninstall`; data stays in `~/.local/share/studioforge` |
+| Linux, clone | `git pull`, then `uv pip install --python .venv/bin/python -e ".[dev]"` | Delete the clone; data is in `data/` inside it unless `SF_DATA_DIR` is set |
+
+### First run, any platform
+
+The panel opens on **Overview** with a *Finish setup* banner that leads to the setup guide
+(`/setup`, or `studioforge setup` in a terminal): owner account, hardware, engine, model library
+(**Detect LM Studio library** finds an existing one — models are indexed in place, never copied),
+a starter model, a test chat, integration snippets and network exposure. Every step is optional on a
+local-only install. The tab-by-tab reference, with the headless YAML/CLI equivalent, is
+[`docs/SETUP.md`](docs/SETUP.md).
 
 ---
 
@@ -244,8 +442,10 @@ print(client.models.list())   # every downloaded model; naming an unloaded one l
 ```
 
 `GET /v1/models` lists every **downloaded** model, like LM Studio, and a request that names an
-unloaded model just-in-time loads it. To use it from outside your LAN, set `server.api_key` on the
-Setup tab and pass that key — see [`docs/SETUP.md` §6](docs/SETUP.md#6-network--access).
+unloaded model just-in-time loads it. All three services listen on this machine only until you say
+otherwise: to use it from another machine run `studioforge setup` (account, HTTPS, an admin key),
+give each client its own key (`studioforge keys create`) and pass it as the `api_key` — see
+[`docs/SECURITY.md`](docs/SECURITY.md) and [`docs/SETUP.md` §6](docs/SETUP.md#6-network--access).
 
 ### C. With OpenClaw (or any MCP agent)
 
@@ -324,12 +524,16 @@ server is wedged.
 | Watchdog | `1235` | Recovery MCP sidecar (separate process) |
 | `llama-server` children | `18100–18200` | Internal, one port per loaded model |
 
-LM Studio also uses `1234`: quit it, or set `server.port`. With no `server.api_key` (the default)
-anyone on your LAN can read, chat and load/unload; anything that changes the *box* — config,
-engines, files, restarts — needs a browser or client on the machine itself, or the MCP PIN
-([DECISIONS.md](DECISIONS.md) D32). Set a key to manage it remotely: it is accepted on `/v1`,
-`/api`, `/mcp` and the watchdog, and it sits *beside* the PIN rather than replacing it — both MCP
-endpoints keep accepting either.
+LM Studio also uses `1234`: quit it, or set `server.port`. Change the ports with the config keys
+`server.port`, `gui.port` and `watchdog.port` (Setup tab or `config.yaml`; `SF_SERVER__PORT`-style
+environment variables only seed first-run defaults, and `studioforge serve --port` overrides the
+gateway port only). All three services bind `127.0.0.1`
+by default. Binding the network (`0.0.0.0`) requires an owner account or an admin key — the server
+refuses to start without one — and then every request needs a key: `read`, `inference` or `admin`
+(`studioforge keys create`). On a loopback-only install with no keys, anything that changes the *box*
+— config, engines, files, restarts — still needs a client on the machine itself, or the MCP PIN
+([DECISIONS.md](DECISIONS.md) D32). The old single `server.api_key` and the MCP PIN still work but
+are deprecated ([`docs/SECURITY.md`](docs/SECURITY.md)).
 
 ## Data directory
 
@@ -377,6 +581,8 @@ The same from a terminal, on any platform: `studioforge serve --open`, `studiofo
 
 ## Documentation
 
+- [`docs/SECURITY.md`](docs/SECURITY.md) — who may do what: bind rules, scoped keys, TLS, MCP, the audit log
+- [`docs/CLI.md`](docs/CLI.md) — every `studioforge` command (generated)
 - [`docs/SETUP.md`](docs/SETUP.md) — first run, tab by tab; GPUs, engine, network, downloads; headless
 - [`docs/OPENCLAW-SETUP.md`](docs/OPENCLAW-SETUP.md) — two-machine install, verified step by step
 - [`docs/OPENCLAW.md`](docs/OPENCLAW.md) — the tool list and the loop an agent runs; pins and leases
@@ -385,6 +591,7 @@ The same from a terminal, on any platform: `studioforge serve --open`, `studiofo
 - [`docs/CATALOG.md`](docs/CATALOG.md) — the model catalog an agent picks from, every column explained
 - [`docs/BENCHMARKING.md`](docs/BENCHMARKING.md) — the benchmarking playbook
 - [`docs/OPENCLAW-LONG-CONTEXT.md`](docs/OPENCLAW-LONG-CONTEXT.md) — what a long window really costs
+- [`docs/ENGINES.md`](docs/ENGINES.md) — engine backends, hardware detection, checksums, STRICT_GPU
 - [`docs/ENGINE-FEATURES.md`](docs/ENGINE-FEATURES.md) — llama.cpp features on, off, and measured
 - [`docs/RUNBOOK.md`](docs/RUNBOOK.md) — what `/health` means and what to do when it is wrong
 - [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) · [`CONTRIBUTING.md`](CONTRIBUTING.md) — working on the code, running the tests

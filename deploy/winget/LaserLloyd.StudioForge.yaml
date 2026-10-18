@@ -1,0 +1,7 @@
+# winget version manifest (SKELETON: prepared, NOT submitted).
+# Submit only after a signed release exists; see deploy/windows/README.md.
+PackageIdentifier: LaserLloyd.StudioForge
+PackageVersion: 2.0.0
+DefaultLocale: en-US
+ManifestType: version
+ManifestVersion: 1.9.0

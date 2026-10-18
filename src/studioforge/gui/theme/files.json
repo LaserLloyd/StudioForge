@@ -1,22 +1,27 @@
 {
   "name": "ThemeForge",
-  "version": "1.0.0",
-  "hash": "3db64d9f574f",
+  "version": "1.2.0",
+  "hash": "82d997e2846d",
   "repo": "LaserLloyd/ThemeForge",
   "files": {
-    "README.md": "d854aebf9b795615de54dc298dcdd799043679aa00407bc60f75b14165cdb93d",
-    "VERSION": "56f7d017680c06f03e5c15af995031e1ee1ef9921f41c295ee01477840cdcf31",
-    "adapters/quasar.css": "492cd1db1ed03f008fccf30372b3e41abe4721bbaba21afdb62125039b9f3c28",
-    "adapters/quasar.js": "d8c3d8d0774c2259e30728fba1fe2131194489677ef035b1cef210c451011d17",
-    "adapters/tailwind-v3.preset.js": "5567abea1dddabd5ab5da0a39d79ce17c15c68d9de3348f51533fd8a552a9cfd",
-    "adapters/tailwind.css": "615601ccb3bc0273daeee9fa13e77e0bbb81d95619d90212eab785fab5ab8f5f",
-    "themes.json": "94b23dc1dd9293ecd9d96a7270b34dfc30491a28eb850bd2bb4a9b46f3c8f968",
-    "ui-components.css": "b0f43bb9d6b4181e613a4a43a65456724296a5a9f3a89e3aa6f5ec0a7fe5bdc7",
-    "ui-components.js": "2e823e4b60203a6b820adbf783baec1425d1dc70ec9193e0e6fe08250ac6cd7d",
-    "ui-theme-base.css": "f03313ba5c015ac7cf6c3ec9741e66c159c0158edfb950407ade36b24160f88d",
-    "ui-theme.css": "44e444916690dd426cf9ae2fadd27d5f90c376166200db5768e9e22bfb45d879",
-    "ui-theme.d.ts": "68f4301ae7371f2f8b16c7faf0478c0760d4b9e3d40b3836f7c26cc07dc1a1bb",
-    "ui-theme.js": "5905584bffc50102ec8847154d8b477e615680a295db991e53f72656029bdf0f",
-    "update.py": "e4031f44e5688c9cb1c42975a2b7f0e97855a4ae00ad8cd4b5ce10c6a9c838b9"
+    "README.md": "5c174f5acca3afad6bf2fd66639361dfe0aff7cab8c1c8258006409674d5e85b",
+    "VERSION": "20b8a2609380ddef534e69536e47dcce7fb497fd6896175ff93780150a2bda00",
+    "adapters/quasar.css": "cc9de8a7f3ad7b344c374ab9b830083ec91ee63cd580058f36bc5c4456b828d0",
+    "adapters/quasar.js": "77b95e5eabfbac49bee57586553e6fa1cab8381cdb84051be6bbcb49f2da84d1",
+    "locales/en.json": "878e9746f4ecdabd7e49188882a57d1929a424e9190617d39143b797d35be11e",
+    "locales/ja.json": "ceaae4a407a4976561c52a3f9ffb791916c54ed1acc7c68b402467998dd06e26",
+    "themes.json": "1a97548f39b8bdc82fde7279d8019993977431af9bf22dacc5afedadd9f02bf1",
+    "ui-components.css": "0e32239bbd9134d1f3afa941ff7ac3e6a72342a337ff8a1f0ad1d0329d09a46b",
+    "ui-components.js": "c60c77f04e40e34cb91f88527ed82f1138c467cef111d95ce011fbb1e3e6568c",
+    "ui-theme-base.css": "9bd4ebb1e1e970b9678243bc5ad872d61b05a47d5274567347e22b5d8d285f36",
+    "ui-theme.css": "5fdf4891f7f59b27395d0e409e7834781cf3cf61bbbfb49c3ee868074cee689f",
+    "ui-theme.d.ts": "7e7b6be2ee7626a52cf85cb2136115a3cc2c59466c07a5c529883ba7207d59ee",
+    "ui-theme.js": "36dcd1503c4442a8780e6390752db598a086eb4694f22e85bccf2d1010a8eb20",
+    "update.py": "e44ece9810c55b339628d3c0b57760ea78f050b9a90a0cd072c428e29983b922"
+  },
+  "subset": {
+    "adapters": [
+      "quasar"
+    ]
   }
 }

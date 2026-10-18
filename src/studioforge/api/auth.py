@@ -1,19 +1,53 @@
-"""Optional bearer-token auth, shared by the API, the GUI and the watchdog."""
+"""Authentication and authorization for the API, the control panel and MCP.
+
+Credentials, in the order they are tried:
+
+1. ``server.api_key`` -- the legacy single shared key (**deprecated**). It is an
+   ``admin`` credential, mirrored into the key table as the key named ``legacy``.
+2. A scoped API key (``sf-<r|i|a>-...``), stored hashed: ``read`` < ``inference``
+   < ``admin``, optional expiry and per-minute limit (``core/accounts.py``).
+3. ``mcp.pin`` -- the eight-digit pairing code (**deprecated**). Accepted on the
+   MCP path only, as an ``admin`` credential, with a logged warning.
+
+Whether a credential is *required* is a posture, not a flag: it is when
+``server.api_key`` is set, when any key exists, or when any of the three services
+binds a non-loopback address (:func:`auth_enforced`). A loopback-only install
+with no keys stays open, exactly as before, so a first run needs no setup. And
+a server that would listen on the network with no owner account or admin key
+refuses to start (:func:`check_bind_rule`).
+
+When a credential *is* presented its scope is enforced whatever the posture:
+:func:`required_scope` maps every route to ``read``, ``inference`` or ``admin``.
+"""
 
 from __future__ import annotations
 
 import hmac
 import math
+import time
 from typing import Any
 
 from fastapi import Request
 
+from studioforge.authkeys import (
+    LOCAL_ADMIN,
+    Principal,
+    is_loopback_host,
+    looks_like_key,
+    origin_allowed,
+)
 from studioforge.config import SECRET_CONFIG_PATHS, Config, redact, redact_config_dict
 from studioforge.credential_guard import CredentialGuard, client_key
 
 # Re-exported: these live in ``studioforge.config`` (a leaf the watchdog may import)
 # but every API/MCP surface has always taken them from here.
-__all__ = ["SECRET_CONFIG_PATHS", "redact", "redact_config_dict"]
+__all__ = [
+    "LOCAL_ADMIN",
+    "SECRET_CONFIG_PATHS",
+    "origin_allowed",
+    "redact",
+    "redact_config_dict",
+]
 from studioforge.errors import AuthError
 
 # Endpoints reachable without a key: liveness probes and CORS preflight. Keeping
@@ -137,7 +171,15 @@ _ADMIN_MUTATION_PREFIXES: tuple[str, ...] = (
     "/api/update/",
     "/api/vram/reclaim",
     "/api/downloads",
+    # LM Studio's native twin of POST /api/downloads: same disk write, same gate.
+    "/api/v1/models/download",
     "/api/leases",
+    # W3: accounts, keys, the support bundle and the first-run wizard decide who
+    # may use the server -- the most box-changing routes there are.
+    "/api/keys",
+    "/api/users",
+    "/api/support-bundle",
+    "/api/setup",
     # D77: registering, deregistering or warming a tenant is the same class of
     # change as taking a lease -- it names URLs this server will then call.
     "/api/tenants",
@@ -314,6 +356,11 @@ def is_admin_caller(request: Any, config: Config) -> bool:
     being measured, and counting a read against the operator's own address
     would lock them out of a server nobody was attacking.
     """
+    established = principal_of(request)
+    if established is not None and established.kind in _CREDENTIAL_KINDS:
+        # A scoped key is only as powerful as its scope: an inference key on
+        # this machine is not an admin because it is on this machine.
+        return established.allows("admin")
     if config.server.api_key:
         return True
     if is_local_request(request) and not cross_site_browser_request(request):
@@ -355,6 +402,11 @@ def require_admin_action(request: Request, config: Config, action: str) -> None:
     Raises:
         AuthError: 403 ``remote_admin_requires_credential``.
     """
+    established = principal_of(request)
+    if established is not None and established.kind in _CREDENTIAL_KINDS:
+        if established.allows("admin"):
+            return
+        raise deny_scope(established, "admin", action)
     if config.server.api_key:
         return
     if is_local_request(request) and not cross_site_browser_request(request):
@@ -379,46 +431,268 @@ def require_admin_action(request: Request, config: Config, action: str) -> None:
     )
 
 
-def check_request(request: Request, config: Config) -> None:
+# ---------------------------------------------------------------------------
+# Scopes, posture and the bind rule
+# ---------------------------------------------------------------------------
+
+#: Paths that expose or change who may log in. Admin even to read.
+_ADMIN_READ_PREFIXES: tuple[str, ...] = (
+    "/api/keys",
+    "/api/users",
+    "/api/audit",
+    "/api/doctor",
+    "/api/support-bundle",
+)
+#: Per-model writes an ``inference`` key may make: loading is what a first
+#: request does anyway (JIT), and ``test`` is one short completion.
+_INFERENCE_MODEL_SUFFIXES: tuple[str, ...] = ("/load", "/load-recommended", "/unload", "/test")
+#: Browser-reachable inference surfaces (prefix-matched, so routes added later
+#: -- LM Studio's ``/api/v1``, Anthropic's ``/v1/messages`` -- are covered
+#: without an edit here).
+_INFERENCE_PREFIXES: tuple[str, ...] = ("/v1/", "/api/v0/", "/api/v1/")
+
+
+def required_scope(
+    method: str, path: str, config: Config | None = None, *, deep: bool = False
+) -> str:
+    """The weakest scope that may call ``method path``: ``read``, ``inference`` or ``admin``.
+
+    * ``/mcp``: ``read`` here -- each tool then demands its own scope
+      (:mod:`studioforge.mcp_policy`).
+    * Reads (GET/HEAD) are ``read``, except the account/audit/doctor pages.
+    * ``/v1/*``, ``/api/v0/*``, ``/api/v1/*`` POSTs (chat, completions, embeddings,
+      native load/unload) are ``inference``; the native model download is ``admin``.
+    * Every route the D32 prefix list guards is ``admin``, and so is every
+      other mutating ``/api`` route, except loading/unloading/testing a model.
+    * ``/health?deep=true`` runs a real completion per model: ``inference``.
+    """
+    verb = (method or "").upper()
+    if config is not None and is_mcp_path(path, config):
+        return "read"
+    if path in PUBLIC_PATHS:
+        return "inference" if deep else "read"
+    if verb in {"GET", "HEAD", "OPTIONS"}:
+        return "admin" if path.startswith(_ADMIN_READ_PREFIXES) else "read"
+    if is_admin_mutation(verb, path):
+        return "admin"
+    if path.startswith("/api/v1/models/download"):
+        return "admin"
+    if path.startswith(_INFERENCE_PREFIXES):
+        return "inference"
+    if (
+        path.startswith("/api/models/")
+        and verb == "POST"
+        and path.endswith(_INFERENCE_MODEL_SUFFIXES)
+    ):
+        return "inference"
+    return "admin"
+
+
+def remote_services(config: Config) -> list[tuple[str, str]]:
+    """``(service, host)`` for every enabled listener that is not loopback-only."""
+    found: list[tuple[str, str]] = []
+    if not is_loopback_host(config.server.host):
+        found.append(("the gateway", config.server.host))
+    if config.gui.enabled and not is_loopback_host(config.gui.host):
+        found.append(("the control panel", config.gui.host))
+    if config.watchdog.enabled and not is_loopback_host(config.watchdog.host):
+        found.append(("the watchdog", config.watchdog.host))
+    return found
+
+
+def auth_enforced(config: Config, accounts: Any = None) -> bool:
+    """Whether a request must carry a valid credential.
+
+    True when ``server.api_key`` is set, when any active API key exists, or when
+    a listener is reachable from the network *and* an owner account exists or
+    a key ever did (revoking the last key at runtime must not reopen a
+    network-bound server: the bind rule is only checked at start).
+    False for a loopback-only install with no credentials (the first-run state)
+    -- and for a network-bound one that never had any, a state
+    ``studioforge serve`` refuses to start in (:func:`check_bind_rule`), so it
+    is only reachable by embedding the app, where the legacy open rules (D32)
+    still apply.
+    """
+    if config.server.api_key:
+        return True
+    if accounts is None:
+        return False
+    if accounts.has_active_keys_cached():
+        return True
+    if not remote_services(config):
+        return False
+    had_keys = getattr(accounts, "had_keys_cached", None)
+    return bool(accounts.has_owner_cached() or (callable(had_keys) and had_keys()))
+
+
+def has_admin_credential(config: Config, accounts: Any = None) -> bool:
+    """An owner account, an active admin key, or the (deprecated) ``server.api_key`` exists."""
+    if config.server.api_key:
+        return True
+    return bool(accounts is not None and accounts.has_admin_credential())
+
+
+def check_bind_rule(config: Config, accounts: Any = None) -> None:
+    """Refuse to start a network-reachable server that nobody has to log in to.
+
+    Raises ``auth_required_for_remote_bind`` (catalogued) naming the exposed
+    services and the two commands that fix it. Loopback-only binds always pass.
+    """
+    exposed = remote_services(config)
+    if not exposed or has_admin_credential(config, accounts):
+        return
+    services = ", ".join(name for name, _host in exposed)
+    hosts = ", ".join(host for _name, host in exposed)
+    raise AuthError(
+        f"Refusing to start: {services} would listen on a non-loopback address ({hosts}) but "
+        "no owner account or admin API key exists, so anyone on the network could drive this "
+        "server. Fix: run `studioforge setup` (creates the owner account) or "
+        "`studioforge keys create --name admin --scope admin`, then start again. To stay "
+        "local-only instead, set server.host, gui.host and watchdog.host to 127.0.0.1 "
+        "(config.yaml).",
+        code="auth_required_for_remote_bind",
+        status_code=503,
+        details={"exposed": [{"service": n, "host": h} for n, h in exposed]},
+    )
+
+
+def accounts_of(request: Any) -> Any:
+    """The :class:`~studioforge.core.accounts.AccountStore` of the app serving ``request``."""
+    try:
+        app = request.app
+    except (AttributeError, KeyError):  # a bare scope (tests, in-process calls) has no app
+        return None
+    return getattr(getattr(app, "state", None), "accounts", None)
+
+
+def principal_of(request: Any) -> Principal | None:
+    """The principal :func:`check_request` established for ``request``, if any."""
+    state = getattr(request, "state", None)
+    found = getattr(state, "principal", None) if state is not None else None
+    return found if isinstance(found, Principal) else None
+
+
+#: Principal kinds that came from a presented credential (not "no credential at all").
+_CREDENTIAL_KINDS = frozenset({"key", "legacy", "owner", "pin"})
+
+_PIN_WARN_INTERVAL_S = 600.0
+_last_pin_warning = 0.0
+
+
+def _warn_pin_deprecated() -> None:
+    """One WARNING per ten minutes when the deprecated PIN authenticates a call."""
+    global _last_pin_warning
+    now = time.monotonic()
+    if _last_pin_warning and now - _last_pin_warning < _PIN_WARN_INTERVAL_S:
+        return
+    _last_pin_warning = now
+    from studioforge.logging import get_logger
+
+    get_logger(__name__).warning(
+        "a client authenticated with the deprecated mcp.pin; switch it to a scoped API key "
+        "(`studioforge keys create --scope admin`) -- the PIN will stop being minted in a "
+        "future release"
+    )
+
+
+def resolve_principal(
+    provided: str | None,
+    header_pin: str | None,
+    config: Config,
+    accounts: Any = None,
+    *,
+    on_mcp: bool = False,
+    count: bool = True,
+) -> Principal | None:
+    """Who a presented credential belongs to, or ``None`` if it is nobody's.
+
+    Order: ``server.api_key`` -> scoped key -> ``mcp.pin`` (MCP path only).
+    Raises :class:`AuthError` for a stored key that cannot be used (revoked,
+    expired, over its rate limit). ``count=False`` re-checks a credential the
+    middleware already admitted without spending the key's rate-limit budget.
+    """
+    expected = config.server.api_key
+    if expected and provided and _matches(provided, expected):
+        if accounts is not None:
+            return accounts.authenticate_legacy(expected)
+        return Principal("legacy", "", "legacy", "admin")
+    if provided and accounts is not None and looks_like_key(provided):
+        found = accounts.authenticate(provided, count=count)
+        if found is not None:
+            return found
+    if on_mcp:
+        pin = getattr(getattr(config, "mcp", None), "pin", None)
+        candidate = header_pin or provided
+        if pin and candidate and _matches(candidate, str(pin)):
+            if count:
+                _warn_pin_deprecated()
+            return Principal("pin", "", "mcp-pin", "admin")
+    return None
+
+
+def deny_scope(principal: Principal, need: str, action: str) -> AuthError:
+    return AuthError(
+        f"This credential's scope ({principal.scope}) is not enough for {action}; it needs "
+        f"{need}. Use a key with the scope the message names (read < inference < admin): "
+        "`studioforge keys create --scope admin`, or the panel's Users & Keys page.",
+        code="permission_denied",
+        status_code=403,
+        details={"scope": principal.scope, "needed": need},
+    )
+
+
+def _remember(request: Any, principal: Principal) -> None:
+    """Attach the established principal to the request for handlers and the audit log."""
+    try:
+        request.state.principal = principal
+    except Exception:  # noqa: BLE001 - a stand-in request without .state still authenticates
+        return
+
+
+def check_request(request: Request, config: Config, accounts: Any = None) -> None:
     """Raise :class:`AuthError` unless the request is authorized.
 
-    Two credentials are accepted, and which one works depends on the path:
+    Three credentials are accepted, tried in this order (see the module
+    docstring): ``server.api_key`` (deprecated, admin), a scoped API key, and
+    ``mcp.pin`` (deprecated, admin, **MCP path only** -- a short pairing code
+    that grants the management tools, never inference or the rest of the API).
 
-    * ``server.api_key`` -- the full credential, valid everywhere.
-    * ``mcp.pin`` -- a short pairing code valid **only on the MCP path**. It
-      exists so a client can be paired by reading eight digits off the startup
-      banner instead of copying a long key around, and it is deliberately
-      scoped: it grants the management tools, never inference or the rest of
-      the API.
+    A valid credential establishes a :class:`~studioforge.authkeys.Principal`
+    (stored on ``request.state``) whose scope must cover the route
+    (:func:`required_scope`): a read-only key cannot POST, an inference key
+    cannot change configuration. That holds even on an install that otherwise
+    needs no credential.
 
-    When ``server.api_key`` is unset the server is open (LAN/Tailscale trust),
-    which matches how LM Studio behaves out of the box -- but an MCP PIN is
-    still enforced when one is configured, so the control plane is never
-    accidentally the *least* protected surface. And on that open install the
-    routes that change the *box* -- edit config, delete files, restart,
-    install an engine or an update, queue downloads, kill processes -- need a
-    caller on this machine or the PIN (D32): the MCP ``set_config`` tool
-    demanded the PIN while ``PATCH /api/config`` -- same capability, same
-    process -- demanded nothing, and anyone on the LAN could set
-    ``server.api_key`` and lock the owner out.
+    When no credential matches: if auth is not enforced (:func:`auth_enforced`:
+    loopback-only, no keys, no ``server.api_key``) the server is open, which
+    matches how LM Studio behaves out of the box -- but an MCP PIN is still
+    enforced when one is configured, so the control plane is never accidentally
+    the *least* protected surface. And on that open install the routes that
+    change the *box* -- edit config, delete files, restart, install an engine or
+    an update, queue downloads, kill processes -- need a caller on this machine
+    or the PIN (D32): the MCP ``set_config`` tool demanded the PIN while
+    ``PATCH /api/config`` -- same capability, same process -- demanded nothing,
+    and anyone on the LAN could set ``server.api_key`` and lock the owner out.
     """
     path = request.url.path
     if request.method == "OPTIONS":
         return
+    deep = False
     if path in PUBLIC_PATHS:
         # The liveness form stays credential-free for watchdogs and load
         # balancers -- but /health?deep=true is genuine inference against
         # every loaded model, so it needs the key like any other request.
-        deep = (request.query_params.get("deep") or "").strip().lower()
-        if deep in _FALSY:
+        raw_deep = (request.query_params.get("deep") or "").strip().lower()
+        if raw_deep in _FALSY:
             return
+        deep = True
 
+    accounts = accounts if accounts is not None else accounts_of(request)
     mcp_config = getattr(config, "mcp", None)
     on_mcp = is_mcp_path(path, config)
     pin = getattr(mcp_config, "pin", None) if mcp_config else None
     pin_required = bool(getattr(mcp_config, "pin_required", False)) and bool(pin)
 
-    expected = config.server.api_key
     provided = extract_key(request)
     header_pin = extract_pin(request)
 
@@ -434,31 +708,50 @@ def check_request(request: Request, config: Config) -> None:
             # during a lockout still buys nothing.
             raise throttled
 
-    if expected and provided and _matches(provided, expected):
-        GUARD.record_success(client)
+    try:
+        principal = resolve_principal(
+            provided, header_pin, config, accounts, on_mcp=on_mcp, count=True
+        )
+    except AuthError as exc:
+        # A revoked or expired key is a wrong credential for lockout purposes;
+        # a rate-limited one is a right credential used too fast.
+        if exc.code != "key_rate_limited":
+            GUARD.record_failure(client)
+        raise
+    if principal is not None:
+        if principal.allows("admin"):
+            # Only a credential as strong as the ones being guessed (the PIN,
+            # the owner password: both admin) forgives earlier failures. A
+            # read or inference key clearing the record would let its holder
+            # interleave one good request between every three PIN guesses and
+            # walk the 8-digit space with no lockout at all -- a privilege
+            # escalation from the weakest key to admin.
+            GUARD.record_success(client)
+        _remember(request, principal)
+        need = required_scope(request.method, path, config, deep=deep)
+        if not principal.allows(need):
+            raise deny_scope(principal, need, f"{request.method} {path}")
         return
 
-    if on_mcp and pin:
-        candidate = header_pin or provided
-        if candidate and _matches(candidate, str(pin)):
-            GUARD.record_success(client)
-            return
-        if pin_required:
-            if candidate:
-                GUARD.record_failure(client)
-            note = " " + PIN_IN_QUERY_NOTE if pin_in_query(request) else ""
-            raise AuthError(
-                "This MCP endpoint needs the pairing PIN. Send it as "
-                "'X-MCP-Pin: <pin>' or as a bearer token. Read it ON THE SERVER: "
-                "the startup banner, `studioforge config`, or the control panel "
-                "(Setup -> Network & access). GET /api/mcp/info returns 'pin': null "
-                "to a caller in your position -- it only reveals the PIN to someone "
-                "who is already on the box or already authenticated, which is the "
-                "point of it being a credential." + note,
-                code="invalid_mcp_pin",
-            )
+    enforced = auth_enforced(config, accounts)
 
-    if not expected:
+    if on_mcp and pin and pin_required:
+        candidate = header_pin or provided
+        if candidate:
+            GUARD.record_failure(client)
+        note = " " + PIN_IN_QUERY_NOTE if pin_in_query(request) else ""
+        raise AuthError(
+            "This MCP endpoint needs a credential: an API key (preferred) or the pairing PIN. "
+            "Send it as 'Authorization: Bearer <key-or-pin>' or 'X-MCP-Pin: <pin>'. The PIN is "
+            "on the server: the startup banner, `studioforge config`, or the control panel "
+            "(Setup -> Network & access). GET /api/mcp/info returns 'pin': null "
+            "to a caller in your position -- it only reveals the PIN to someone "
+            "who is already on the box or already authenticated, which is the "
+            "point of it being a credential." + note,
+            code="invalid_mcp_pin",
+        )
+
+    if not enforced:
         # D32 covers the MCP plane too. Every streamable-HTTP JSON-RPC call is
         # a POST, and the tools behind it (set_config, delete_model,
         # download_model, reserve_gpus) are the same box changes the HTTP
@@ -471,10 +764,15 @@ def check_request(request: Request, config: Config) -> None:
         gated = is_admin_mutation(request.method, path) or (
             on_mcp and (request.method or "").upper() in _MUTATING_METHODS
         )
-        if gated and (not is_local_request(request) or cross_site_browser_request(request)):
+        local = is_local_request(request) and not cross_site_browser_request(request)
+        if gated and not local:
             candidate = header_pin or provided
             if pin and candidate and _matches(candidate, str(pin)):
+                # D32: on an open install the PIN also opens the box-changing
+                # HTTP routes, not only /mcp (deprecated, like the PIN itself).
                 GUARD.record_success(client)
+                _warn_pin_deprecated()
+                _remember(request, Principal("pin", "", "mcp-pin", "admin"))
                 return
             if candidate:
                 GUARD.record_failure(client)
@@ -484,12 +782,25 @@ def check_request(request: Request, config: Config) -> None:
                 code="remote_admin_requires_credential",
                 status_code=403,
             )
+        _remember(
+            request,
+            Principal("local", "", "unauthenticated", "admin")
+            if local
+            else Principal("anonymous", "", "unauthenticated", "inference"),
+        )
         return
-    if provided:
+    if provided or header_pin:
+        # A wrong X-MCP-Pin header is a failed credential too: without this a
+        # caller could walk the 8-digit PIN space through the header without
+        # ever tripping the per-address lockout (only the bearer form counted).
         GUARD.record_failure(client)
+    if provided and looks_like_key(provided):
+        message = "Incorrect API key provided."
+    else:
+        message = "An API key is required."
     raise AuthError(
-        "Incorrect API key provided. Set the same key the server has in "
-        "server.api_key, or send it as 'Authorization: Bearer <key>'."
+        message + " Send it as 'Authorization: Bearer <key>' (or 'X-API-Key'). Create one with "
+        "`studioforge keys create`, or in the panel under Users & Keys."
     )
 
 
@@ -523,6 +834,9 @@ def may_reveal_pin(request: Any, config: Config) -> bool:
     cross-origin, so a page the operator visits could otherwise read the PIN
     off ``http://127.0.0.1:1234/api/mcp/info`` and then use it.
     """
+    established = principal_of(request)
+    if established is not None and established.kind in _CREDENTIAL_KINDS:
+        return established.allows("admin")
     if config.server.api_key:
         return True
     if cross_site_browser_request(request):

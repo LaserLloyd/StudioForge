@@ -1,0 +1,32 @@
+[
+  {
+    "build_commit": "0000000",
+    "build_number": 10425,
+    "cpu_info": "SYNTHETIC",
+    "gpu_info": "SYNTHETIC GPU",
+    "backends": "ROCm",
+    "model_filename": "synthetic-8b-q4_k_m.gguf",
+    "n_gpu_layers": 999,
+    "n_prompt": 512,
+    "n_gen": 0,
+    "avg_ns": 640000000,
+    "stddev_ns": 5000000,
+    "avg_ts": 800.25,
+    "stddev_ts": 6.1,
+    "samples_ns": [638000000, 640000000, 642000000],
+    "samples_ts": [802.5, 800.0, 798.2]
+  },
+  {
+    "build_commit": "0000000",
+    "build_number": 10425,
+    "backends": "ROCm",
+    "model_filename": "synthetic-8b-q4_k_m.gguf",
+    "n_gpu_layers": 999,
+    "n_prompt": 0,
+    "n_gen": 128,
+    "avg_ns": 3200000000,
+    "stddev_ns": 12000000,
+    "avg_ts": 40.0,
+    "stddev_ts": 0.2
+  }
+]
