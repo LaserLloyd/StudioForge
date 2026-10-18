@@ -270,7 +270,14 @@ class AccountStore:
     def sync_snapshot(self) -> None:
         """Rewrite ``keys.snapshot.json`` (what the watchdog verifies against)."""
         try:
-            write_snapshot(self.data_dir, self.list_keys(include_revoked=False))
+            keys = self.list_keys()
+            write_snapshot(
+                self.data_dir,
+                [k for k in keys if not k.revoked],
+                revoked_legacy=[
+                    k.key_hash for k in keys if k.revoked and k.name == LEGACY_KEY_NAME
+                ],
+            )
         except OSError as exc:
             log.warning("could not write the key snapshot for the watchdog", error=str(exc))
 

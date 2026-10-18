@@ -455,3 +455,44 @@ async def test_watchdog_write_config_is_owner_only(
     watchdog.write_config(loaded)
     assert is_owner_only(path) is True
     assert yaml.safe_load(path.read_text(encoding="utf-8"))["server"]["port"] == 11234
+
+
+async def test_watchdog_refuses_a_revoked_legacy_api_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`keys revoke legacy` disables server.api_key on the watchdog too, not only the gateway."""
+    from studioforge.api.admin_routes import _watchdog_credential
+    from studioforge.authkeys import SnapshotVerifier
+    from studioforge.core.accounts import AccountStore
+    from studioforge.db import Database
+
+    legacy = "legacy-key-0123456789"  # scrub-ok: fixture
+    monkeypatch.setenv("SF_DATA_DIR", str(tmp_path / "data"))
+    config = make_config(tmp_path, server={"port": 11234, "api_key": legacy})
+    config.ensure_dirs()
+    path = config.save(tmp_path / "data" / "config.yaml")
+    db = Database(config.db_path)
+    db.migrate()
+    accounts = AccountStore(db, config.data_dir)
+    accounts.adopt_legacy_key(legacy)
+    asgi, server = create_asgi_app(Watchdog(path))
+    http = httpx2.AsyncClient(
+        transport=httpx2.ASGITransport(app=asgi), base_url="http://127.0.0.1:11235"
+    )
+    body = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
+    try:
+        async with server.session_manager.run():
+            before = await http.post("/mcp", headers=bearer(legacy), json=body)
+            assert before.status_code != 401
+            assert _watchdog_credential(config, accounts) == (legacy, "api_key")
+            accounts.revoke_key("legacy")
+            assert SnapshotVerifier(config.data_dir).legacy_revoked(legacy)
+            after = await http.post("/mcp", headers=bearer(legacy), json=body)
+            assert after.status_code == 401
+            # The gateway's own hand-off to the watchdog stops sending the dead key
+            # (no other key exists here, so it falls back to the PIN).
+            token, kind = _watchdog_credential(config, accounts)
+            assert (token, kind) == (PIN, "mcp_pin")
+    finally:
+        await http.aclose()
+        db.close()

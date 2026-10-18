@@ -235,16 +235,23 @@ def snapshot_path(data_dir: Path) -> Path:
     return Path(data_dir) / SNAPSHOT_NAME
 
 
-def write_snapshot(data_dir: Path, records: list[KeyRecord]) -> None:
+def write_snapshot(
+    data_dir: Path, records: list[KeyRecord], *, revoked_legacy: list[str] | None = None
+) -> None:
     """Write the active keys (hash, scope, expiry -- no secrets) for the watchdog.
 
     Only keys that could still authenticate are written; a revoked key simply
-    disappears, so the watchdog needs no revocation logic of its own.
+    disappears, so the watchdog needs no revocation logic of its own -- except
+    for the legacy ``server.api_key``, which the watchdog compares against
+    ``config.yaml`` rather than this file. ``revoked_legacy`` lists the hashes of
+    revoked ``legacy`` mirrors so ``keys revoke legacy`` disables the config key
+    on the watchdog too.
     """
     now = time.time()
     payload = {
         "version": 1,
         "written_at": now,
+        "revoked_legacy": sorted(set(revoked_legacy or [])),
         "keys": [
             {
                 "id": r.id,
@@ -284,6 +291,7 @@ class SnapshotVerifier:
         self._lock = threading.Lock()
         self._mtime: float | None = None
         self._by_hash: dict[str, dict[str, Any]] = {}
+        self._revoked_legacy: frozenset[str] = frozenset()
 
     def _refresh(self) -> None:
         try:
@@ -291,6 +299,7 @@ class SnapshotVerifier:
         except OSError:
             self._mtime = None
             self._by_hash = {}
+            self._revoked_legacy = frozenset()
             return
         if mtime == self._mtime:
             return
@@ -298,10 +307,22 @@ class SnapshotVerifier:
             data = json.loads(self._path.read_text(encoding="utf-8"))
             rows = data.get("keys", [])
             self._by_hash = {str(r["hash"]): r for r in rows if isinstance(r, dict) and "hash" in r}
+            revoked = data.get("revoked_legacy") or []
+            self._revoked_legacy = frozenset(str(h) for h in revoked if isinstance(h, str))
             self._mtime = mtime
-        except (OSError, ValueError, KeyError, TypeError):
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
             self._by_hash = {}
+            self._revoked_legacy = frozenset()
             self._mtime = None
+
+    def legacy_revoked(self, api_key: str | None) -> bool:
+        """Whether the operator revoked the ``legacy`` mirror of this ``server.api_key``."""
+        if not api_key:
+            return False
+        digest = hash_token(api_key)
+        with self._lock:
+            self._refresh()
+            return digest in self._revoked_legacy
 
     def has_keys(self) -> bool:
         with self._lock:
