@@ -113,6 +113,19 @@ def test_a_network_bind_with_an_owner_account_requires_credentials(tmp_path: Pat
         assert client.get("/api/status").status_code == 401
 
 
+def test_revoking_the_last_key_does_not_reopen_a_network_bound_server(tmp_path: Path) -> None:
+    app = make_app(tmp_path, server={"host": "0.0.0.0"})
+    accounts = app.state.accounts
+    record, _token = accounts.create_key("root", "admin")
+    with TestClient(app, client=LAN) as client:
+        assert client.get("/v1/models").status_code == 401
+        accounts.revoke_key(record.id)
+        assert not accounts.has_active_keys() and not accounts.has_owner()
+        assert auth_enforced(app.state.config, accounts)
+        assert client.get("/v1/models").status_code == 401
+        assert client.get("/health").status_code == 200
+
+
 # ---------------------------------------------------------------------------
 # scopes
 # ---------------------------------------------------------------------------

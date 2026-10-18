@@ -504,9 +504,11 @@ def auth_enforced(config: Config, accounts: Any = None) -> bool:
     """Whether a request must carry a valid credential.
 
     True when ``server.api_key`` is set, when any active API key exists, or when
-    a listener is reachable from the network *and* an owner account exists.
+    a listener is reachable from the network *and* an owner account exists or
+    a key ever did (revoking the last key at runtime must not reopen a
+    network-bound server: the bind rule is only checked at start).
     False for a loopback-only install with no credentials (the first-run state)
-    -- and for a network-bound one with no credentials at all, a state
+    -- and for a network-bound one that never had any, a state
     ``studioforge serve`` refuses to start in (:func:`check_bind_rule`), so it
     is only reachable by embedding the app, where the legacy open rules (D32)
     still apply.
@@ -517,7 +519,10 @@ def auth_enforced(config: Config, accounts: Any = None) -> bool:
         return False
     if accounts.has_active_keys_cached():
         return True
-    return bool(remote_services(config)) and accounts.has_owner_cached()
+    if not remote_services(config):
+        return False
+    had_keys = getattr(accounts, "had_keys_cached", None)
+    return bool(accounts.has_owner_cached() or (callable(had_keys) and had_keys()))
 
 
 def has_admin_credential(config: Config, accounts: Any = None) -> bool:
