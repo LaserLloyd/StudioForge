@@ -4526,6 +4526,7 @@
     },
     "/api/version": {
       "get": {
+        "description": "What this server is: product, release, build and the API versions it speaks.\n\n``version`` and ``build`` are what this route has always returned; ``product``\nand ``api_versions`` were added alongside them.",
         "operationId": "version_api_version_get",
         "responses": {
           "200": {
