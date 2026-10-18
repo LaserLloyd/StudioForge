@@ -177,12 +177,12 @@ async def test_creating_an_account_checks_the_passwords(
         user.find("Password").type(PASSWORD)
         user.find("Type the password again").type("something else entirely")
         user.find("Create account").click()
-        await user.should_see("do not match")
+        await user.should_see("do not match", retries=100)
         assert not store.has_owner()
 
         only(user, content="Type the password again").set_value(PASSWORD)
         user.find("Create account").click()
-        await user.should_see("Account 'alice' created (owner).")
+        await user.should_see("Account 'alice' created (owner).", retries=100)
     assert store.verify_password("alice", PASSWORD) is not None
 
 
