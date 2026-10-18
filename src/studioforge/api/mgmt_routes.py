@@ -301,14 +301,22 @@ async def gpus(request: Request) -> dict[str, Any]:
     from studioforge.core.gpu import probe_diagnostics, system_ram
 
     total_ram, used_ram = system_ram()
+
+    def snapshot() -> dict[str, Any]:
+        # The ROCm / Vulkan / Metal probes wait on a vendor tool: keep that off
+        # the event loop.
+        return {
+            "backend": state.probe.backend,
+            # Which backend the auto-selector used and why the earlier ones were
+            # skipped (empty for a forced / fake probe).
+            "probe": probe_diagnostics(state.probe),
+            "driver_version": state.probe.driver_version(),
+            "cuda_driver_version": state.probe.cuda_driver_version(),
+            "gpus": [g.model_dump(mode="json") for g in state.probe.list_gpus()],
+        }
+
     return {
-        "backend": state.probe.backend,
-        # Which backend the auto-selector used and why the earlier ones were
-        # skipped (empty for a forced / fake probe).
-        "probe": probe_diagnostics(state.probe),
-        "driver_version": state.probe.driver_version(),
-        "cuda_driver_version": state.probe.cuda_driver_version(),
-        "gpus": [g.model_dump(mode="json") for g in state.probe.list_gpus()],
+        **await run_in_threadpool(snapshot),
         "system_ram_total_bytes": total_ram,
         "system_ram_used_bytes": used_ram,
     }
@@ -2724,7 +2732,7 @@ def _gpu_summary(gpu: Any) -> dict[str, Any]:
 async def benchmark_modes(request: Request) -> dict[str, Any]:
     """Every GPU placement this machine can benchmark, model-independent."""
     state = _state(request)
-    gpus = state.probe.list_gpus()
+    gpus = await run_in_threadpool(state.probe.list_gpus)
     return {
         "modes": [mode.to_dict() for mode in available_modes(gpus)],
         "gpus": [_gpu_summary(gpu) for gpu in gpus],

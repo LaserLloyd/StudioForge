@@ -1040,7 +1040,7 @@ def create_app(
         boot = getattr(app.state, "boot", None)
         if boot is not None:
             payload["boot"] = boot.snapshot()
-        payload.update(_serving_readiness(app.state))
+        payload.update(await _serving_readiness(app.state))
         if not deep:
             return payload
         gateway = app.state.config.gateway
@@ -1060,7 +1060,7 @@ def create_app(
     return app
 
 
-def _serving_readiness(state: Any) -> dict[str, Any]:
+async def _serving_readiness(state: Any) -> dict[str, Any]:
     """The part of ``/health`` that says whether a model could be served.
 
     ``engine`` is what the lifespan's ``ensure_engine`` concluded (``ok``,
@@ -1089,8 +1089,9 @@ def _serving_readiness(state: Any) -> dict[str, Any]:
             }
         else:
             engine = {"ok": False, "tag": None, "error": "no llama-server engine is installed"}
+    # Off the event loop: the ROCm / Vulkan / Metal probes wait on a vendor tool.
     try:
-        gpu_count = len(state.planner.probe.list_gpus())
+        gpu_count = await asyncio.to_thread(lambda: len(state.planner.probe.list_gpus()))
     except Exception:  # noqa: BLE001
         gpu_count = 0
     try:

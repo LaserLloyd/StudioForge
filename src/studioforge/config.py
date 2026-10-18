@@ -435,6 +435,19 @@ class GpuConfig(BaseModel):
     #: equivalent and applies only while this stays ``auto``). Restart required.
     backend: GpuBackendChoice = "auto"
 
+    #: Seconds a ROCm / Vulkan / Metal probe result is reused before the vendor
+    #: tool (``amd-smi``, ``vulkaninfo``, ``system_profiler``) runs again. The
+    #: status page, ``/metrics`` and the planner all ask about once a second, so
+    #: without this each of those polls would spawn a subprocess. NVML is a
+    #: library call and is not cached. ``0`` re-queries on every call. Restart
+    #: required.
+    probe_cache_s: NonNegativeFloat = 2.0
+    #: Most seconds one call waits for a vendor tool. Past it the call returns
+    #: the last good answer (or "no GPUs" if there is none) and the tool keeps
+    #: running in the background, so a hung tool cannot stall a request. Restart
+    #: required.
+    probe_timeout_s: PositiveFloat = 15.0
+
 
 class EngineConfig(BaseModel):
     pinned_tag: str = "b10425"
@@ -1588,6 +1601,8 @@ RESTART_REQUIRED_KEYS = frozenset(
         "watchdog.port",
         "data_dir",
         "gpu.backend",
+        "gpu.probe_cache_s",
+        "gpu.probe_timeout_s",
         "gateway.child_port_start",
         "gateway.child_port_end",
         # CORS origins are captured when the middleware is constructed, and the

@@ -583,9 +583,10 @@ async def capabilities(request: Request, check_update: bool = False) -> dict[str
     from studioforge.core.capabilities import build_report, implemented_report
 
     state = _state(request)
+    gpus = await asyncio.to_thread(state.probe.list_gpus)  # vendor tools: off the event loop
     report = build_report(
         state.config,
-        gpus=state.probe.list_gpus(),
+        gpus=gpus,
         records=state.registry.all(),
         engine_manager=state.engine_manager,
         probe=state.probe,

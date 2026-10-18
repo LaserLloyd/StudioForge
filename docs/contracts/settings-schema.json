@@ -1,5 +1,5 @@
 {
-  "count": 114,
+  "count": 116,
   "env_nested_delimiter": "__",
   "env_prefix": "SF_",
   "levels": [
@@ -885,6 +885,36 @@
       "secret": false,
       "section": "gpu",
       "type": "\"auto\" | \"nvml\" | \"cuda\" | \"rocm\" | \"vulkan\" | \"metal\" | \"null\" | \"fake\""
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "ge": 0
+      },
+      "default": 2.0,
+      "description": "Seconds a ROCm / Vulkan / Metal probe result is reused before the vendor tool (`amd-smi`, `vulkaninfo`, `system_profiler`) runs again. The status page, `/metrics` and the planner all ask about once a second, so without this each of those polls would spawn a subprocess.",
+      "env": "SF_GPU__PROBE_CACHE_S",
+      "key": "gpu.probe_cache_s",
+      "level": "advanced",
+      "restart_required": true,
+      "secret": false,
+      "section": "gpu",
+      "type": "float"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "gt": 0
+      },
+      "default": 15.0,
+      "description": "Most seconds one call waits for a vendor tool. Past it the call returns the last good answer (or \"no GPUs\" if there is none) and the tool keeps running in the background, so a hung tool cannot stall a request. Restart required.",
+      "env": "SF_GPU__PROBE_TIMEOUT_S",
+      "key": "gpu.probe_timeout_s",
+      "level": "advanced",
+      "restart_required": true,
+      "secret": false,
+      "section": "gpu",
+      "type": "float"
     },
     {
       "choices": null,
