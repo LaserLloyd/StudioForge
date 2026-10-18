@@ -31,6 +31,7 @@ from studioforge.api import (
     mgmt_routes,
     openai_routes,
     responses_routes,
+    security_routes,
 )
 from studioforge.api.auth import (
     check_request,
@@ -49,6 +50,7 @@ from studioforge.core.gpu import get_probe
 from studioforge.core.health import PROBE_MAX_TOKENS, PROBE_TIMEOUT_S, deep_health
 from studioforge.core.leases import LeaseBook
 from studioforge.core.manager import ModelManager
+from studioforge.core.metrics import GatewayMetrics
 from studioforge.core.planner import Planner
 from studioforge.core.registry import Registry
 from studioforge.core.supervisor import Supervisor
@@ -119,6 +121,23 @@ def log_rejection(exc: StudioForgeError) -> None:
 SCAN_WAIT_S = 60.0
 
 
+def _route_label(scope: dict[str, Any]) -> str:
+    """The route *template* a request matched (``/api/models/{model_id}/load``), not its URL.
+
+    Metric labels must be bounded by the code, not by the traffic. A router that
+    was included with a prefix reports a path without it, so the template is
+    rebuilt from the real path and the matched path parameters.
+    """
+    if scope.get("route") is None:
+        return "(unmatched)"
+    label = str(scope.get("path", ""))
+    for name, value in (scope.get("path_params") or {}).items():
+        text = str(value)
+        if text:
+            label = label.replace(text, "{" + str(name) + "}", 1)
+    return label
+
+
 _MUTATING = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
 
@@ -183,6 +202,10 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 self._audit(request, result="denied", detail=f"origin {origin}")
                 return JSONResponse(refusal.to_payload(), status_code=403)
         audited = _audited(method, path, self.config)
+        metrics = getattr(request.app.state, "metrics", None)
+        started = time.monotonic()
+        if metrics is not None:
+            metrics.begin()
         try:
             check_request(request, self.config)
         except StudioForgeError as exc:
@@ -194,10 +217,19 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 headers["Retry-After"] = str(exc.details["retry_after_s"])
             if audited:
                 self._audit(request, result="denied", detail=exc.code)
+            if metrics is not None:
+                metrics.observe(method, "(rejected)", exc.status_code, time.monotonic() - started)
             return JSONResponse(exc.to_payload(), status_code=exc.status_code, headers=headers)
         if request.url.path not in _NO_BOOT_WAIT_PATHS:
             await wait_for_boot(request.app.state, timeout_s=SCAN_WAIT_S, scan_only=True)
         response = await call_next(request)
+        if metrics is not None:
+            metrics.observe(
+                method,
+                _route_label(request.scope),
+                response.status_code,
+                time.monotonic() - started,
+            )
         if audited:
             self._audit(
                 request,
@@ -693,6 +725,7 @@ def build_state(config: Config, *, version: str = __version__) -> Any:
     # Who may call this server (owner account, scoped keys) and the append-only
     # record of what they changed.
     state.accounts = AccountStore(db, config.data_dir)  # type: ignore[attr-defined]
+    state.metrics = GatewayMetrics()  # type: ignore[attr-defined]
     state.audit = AuditLog(  # type: ignore[attr-defined]
         config.logs_dir,
         max_mb=config.logging.audit_file_max_mb,
@@ -913,6 +946,8 @@ def create_app(
     app.include_router(mgmt_routes.router, prefix="/api", tags=["management"])
     app.include_router(admin_routes.router, prefix="/api", tags=["admin"])
     app.include_router(health_routes.router, prefix="/api", tags=["health"])
+    app.include_router(security_routes.router, prefix="/api", tags=["security"])
+    app.include_router(security_routes.metrics_router)
 
     # Management-plane MCP over streamable HTTP, behind the same API key.
     # Failure here must not stop the server from serving inference.

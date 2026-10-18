@@ -120,7 +120,9 @@ def local_addresses() -> list[Address]:
     return sorted(found.values(), key=lambda a: a.sort_key)
 
 
-def reachable_urls(port: int, path: str = "", *, host: str | None = None) -> list[dict[str, str]]:
+def reachable_urls(
+    port: int, path: str = "", *, host: str | None = None, scheme: str = "http"
+) -> list[dict[str, str]]:
     """Concrete URLs for a service on ``port``.
 
     When the server is bound to a specific interface rather than a wildcard,
@@ -134,7 +136,7 @@ def reachable_urls(port: int, path: str = "", *, host: str | None = None) -> lis
                 "ip": host,
                 "kind": "bound",
                 "label": "Configured bind address",
-                "url": f"http://{host}:{port}{suffix}",
+                "url": f"{scheme}://{host}:{port}{suffix}",
             }
         ]
     return [
@@ -142,13 +144,13 @@ def reachable_urls(port: int, path: str = "", *, host: str | None = None) -> lis
             "ip": address.ip,
             "kind": address.kind,
             "label": address.label,
-            "url": f"http://{address.ip}:{port}{suffix}",
+            "url": f"{scheme}://{address.ip}:{port}{suffix}",
         }
         for address in local_addresses()
     ]
 
 
-def primary_url(port: int, path: str = "", *, host: str | None = None) -> str:
+def primary_url(port: int, path: str = "", *, host: str | None = None, scheme: str = "http") -> str:
     """The single best URL to hand someone: tailnet, else LAN, else loopback."""
-    urls = reachable_urls(port, path, host=host)
-    return urls[0]["url"] if urls else f"http://127.0.0.1:{port}{path}"
+    urls = reachable_urls(port, path, host=host, scheme=scheme)
+    return urls[0]["url"] if urls else f"{scheme}://127.0.0.1:{port}{path}"

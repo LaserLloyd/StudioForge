@@ -37,6 +37,7 @@ __all__ = [
     "TlsError",
     "TlsMaterial",
     "certificate_fingerprint",
+    "describe_tls",
     "internal_verify",
     "resolve_tls",
     "scheme_for",
@@ -205,6 +206,30 @@ def _self_signed_is_current(cert_path: Path, key_path: Path) -> bool:
         return set(dns) | set(ips) <= _san_set(cert)
     except Exception:  # noqa: BLE001 - unreadable means regenerate
         return False
+
+
+def describe_tls(config: Any) -> dict[str, Any]:
+    """What ``/api/status`` and the panel show about TLS, without generating anything.
+
+    ``{"mode": "off"}``, or the mode plus the certificate's SHA-256 fingerprint and
+    expiry (``None`` for a self-signed certificate that does not exist yet).
+    """
+    tls = config.server.tls
+    info: dict[str, Any] = {"mode": tls.mode, "fingerprint_sha256": None, "not_after": None}
+    if tls.mode == "off":
+        return info
+    cert = (
+        Path(tls.cert_file)
+        if tls.mode == "cert" and tls.cert_file
+        else Path(config.data_dir) / "tls" / CERT_NAME
+    )
+    try:
+        pem = cert.read_bytes()
+        info["fingerprint_sha256"] = certificate_fingerprint(pem)
+        info["not_after"] = _not_after(pem)
+    except (OSError, TlsError):
+        pass
+    return info
 
 
 def resolve_tls(config: Any) -> TlsMaterial | None:
