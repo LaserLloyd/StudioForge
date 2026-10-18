@@ -22,8 +22,9 @@ on LaserLloyd.com, and the author's other [AI projects](https://www.laserlloyd.c
 
 **On versions.** StudioForge uses semantic versioning since 2.0.0. The version lives in
 `src/studioforge/__init__.py` — `2.0.0` — and is what `GET /api/version`, `GET /health`, the MCP
-`server_status` tool and `sfctl status` report; both `pyproject.toml` files carry the same string,
-the `sfctl` companion ships from the same release and carries the same version, and release tags are
+`server_status` tool and `sfctl status` report; all three `pyproject.toml` files (the app,
+`packages/studioforge-companion` for `sfctl`, and `packages/studioforge-tenant`) carry the same string,
+the companion ships from the same release and carries the same version, and release tags are
 `v2.0.0`. Releases before 2.0.0 were calendar-versioned (`1.26-08-23` style); the updater reads both
 schemes, so a 1.x install sees 2.0.0 as the update it is. Check what a server is actually running with
 `curl -s <host>/api/version`. A server running a commit past its release still reports that release,
