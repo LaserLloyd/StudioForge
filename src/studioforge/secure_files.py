@@ -101,8 +101,10 @@ def write_private(path: Path, data: bytes | str, *, encoding: str = "utf-8") -> 
     # The mode argument only applies to a NEW file: an existing 0644 one would
     # otherwise hold the secret world-readable until the chmod below. Tighten
     # the open descriptor before a byte goes in.
-    with contextlib.suppress(OSError, AttributeError):
-        os.fchmod(descriptor, 0o600)
+    fchmod = getattr(os, "fchmod", None)  # POSIX-only; typeshed hides it on win32
+    if fchmod is not None:
+        with contextlib.suppress(OSError):
+            fchmod(descriptor, 0o600)
     with os.fdopen(descriptor, "wb") as handle:
         handle.write(payload)
         handle.flush()
