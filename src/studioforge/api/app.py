@@ -38,6 +38,7 @@ from studioforge.core.registry import Registry
 from studioforge.core.supervisor import Supervisor
 from studioforge.core.updater import Updater
 from studioforge.db import Database
+from studioforge.error_catalog import envelope_extras
 from studioforge.errors import StudioForgeError
 from studioforge.logging import configure_logging, get_logger
 
@@ -1035,6 +1036,7 @@ def _install_error_handlers(app: FastAPI) -> None:
                     "type": "invalid_request_error",
                     "code": "invalid_request",
                     "param": None,
+                    **envelope_extras("invalid_request"),
                 }
             },
             status_code=400,
@@ -1063,6 +1065,7 @@ def _install_error_handlers(app: FastAPI) -> None:
                     "type": "server_error",
                     "code": "internal_error",
                     "param": None,
+                    **envelope_extras("internal_error"),
                     "studioforge": {"ref": ref},
                 }
             },
