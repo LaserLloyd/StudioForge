@@ -444,7 +444,7 @@ async def test_watchdog_audits_denials_and_the_restart_route(
 async def test_watchdog_write_config_is_owner_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from studioforge.secure_files import is_owner_only
+    from tests.unit.acl_helpers import assert_owner_only
 
     monkeypatch.setenv("SF_DATA_DIR", str(tmp_path / "data"))
     config = make_config(tmp_path)
@@ -453,7 +453,7 @@ async def test_watchdog_write_config_is_owner_only(
     watchdog = Watchdog(path)
     loaded, _ = watchdog.load_config()
     watchdog.write_config(loaded)
-    assert is_owner_only(path) is True
+    assert_owner_only(path)
     assert yaml.safe_load(path.read_text(encoding="utf-8"))["server"]["port"] == 11234
 
 

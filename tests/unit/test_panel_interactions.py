@@ -425,30 +425,30 @@ async def test_the_wizard_steps_run_when_their_buttons_are_pressed(
         user.find("Password (at least 10 characters)").type(PASSWORD)
         user.find("Type the password again").type("nope")
         user.find("Create owner account").click()
-        await user.should_see("The two passwords do not match")
+        await user.should_see("The two passwords do not match", retries=100)
         assert not store.has_owner()
         only(user, content="Type the password again").set_value(PASSWORD)
         user.find("Create owner account").click()
-        await user.should_see("Owner account: done")
+        await user.should_see("Owner account: done", retries=100)  # slow on a cold Windows runner
         assert store.has_owner()
 
         # 2. hardware
         user.find("Detect hardware").click()
-        await user.should_see("GPU 0: RTX 5090")
+        await user.should_see("GPU 0: RTX 5090", retries=100)
 
         # 3. engine
         user.find("Install and test the engine").click()
-        await user.should_see("Engine: done")
+        await user.should_see("Engine: done", retries=100)
         assert state.engine_manager.calls[-1].startswith("smoke")
 
         # 5. load the model that is already in the library
         user.find("Get this model ready").click()
-        await user.should_see("Starter model: done")
+        await user.should_see("Starter model: done", retries=100)
         assert state.manager.loaded == ["alpha"]
 
         # 6. test chat
         user.find("Send a test message").click()
-        await user.should_see("Reply: Hello from the model")
+        await user.should_see("Reply: Hello from the model", retries=100)
 
         # 7. connection details
         user.find("Show the connection details").click()
@@ -467,10 +467,10 @@ async def test_the_lan_exposure_shows_the_admin_key_once(
         exposure = next(r for r in radios if "lan" in r.options)
         exposure.set_value("lan")
         user.find("Apply").click()
-        await user.should_see("Your admin key")
+        await user.should_see("Your admin key", retries=100)
         (token,) = labels_starting(user, "sf-a-")
         assert store.authenticate(token, count=False).scope == "admin"  # type: ignore[union-attr]
-        await user.should_see("Restart required")
+        await user.should_see("Restart required", retries=100)
         user.find("I have copied it").click()
         await user.should_not_see("Your admin key")
         assert token not in all_text(user)

@@ -33,6 +33,7 @@ from studioforge.tlsutil import (
     resolve_tls,
     scheme_for,
 )
+from tests.unit.acl_helpers import assert_owner_only
 
 TOKEN = "hf_" + "a" * 34  # scrub-ok: fixture
 
@@ -46,7 +47,7 @@ def test_write_private_creates_an_owner_only_file(tmp_path: Path) -> None:
     target = tmp_path / "secret.txt"
     write_private(target, "hello")
     assert target.read_text(encoding="utf-8") == "hello"
-    assert is_owner_only(target) is True
+    assert_owner_only(target)
 
 
 def test_write_private_tightens_an_existing_loose_file(tmp_path: Path) -> None:
@@ -56,7 +57,8 @@ def test_write_private_tightens_an_existing_loose_file(tmp_path: Path) -> None:
         target.chmod(0o666)
         assert is_owner_only(target) is False
     write_private(target, "new")
-    assert target.read_text(encoding="utf-8") == "new" and is_owner_only(target) is True
+    assert target.read_text(encoding="utf-8") == "new"
+    assert_owner_only(target)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits")
@@ -87,7 +89,7 @@ def test_restrict_to_owner_on_a_directory(tmp_path: Path) -> None:
     folder = tmp_path / "sub"
     folder.mkdir()
     assert restrict_to_owner(folder, directory=True) is True
-    assert is_owner_only(folder) is True
+    assert_owner_only(folder)
 
 
 def test_config_yaml_and_its_backup_are_written_owner_only(tmp_path: Path) -> None:
@@ -95,9 +97,10 @@ def test_config_yaml_and_its_backup_are_written_owner_only(tmp_path: Path) -> No
     config.server.api_key = "a-secret-api-key"
     path = config.save(tmp_path / "data" / "config.yaml")
     config.save(path)  # the second save writes the .bak
-    assert is_owner_only(path) is True
+    assert_owner_only(path)
     backup = path.with_suffix(path.suffix + ".bak")
-    assert backup.is_file() and is_owner_only(backup) is True
+    assert backup.is_file()
+    assert_owner_only(backup)
     assert not list(path.parent.glob("*.tmp"))
 
 
@@ -151,7 +154,7 @@ def test_the_file_backend_stores_owner_only_under_secrets(tmp_path: Path) -> Non
     assert store.backend == "file"
     assert store.set("hf.token", TOKEN) == "file"
     assert store.get("hf.token") == TOKEN
-    assert is_owner_only(tmp_path / "secrets" / "hf.token") is True
+    assert_owner_only(tmp_path / "secrets" / "hf.token")
     store.delete("hf.token")
     assert store.get("hf.token") is None
 
@@ -216,7 +219,7 @@ def test_hf_token_stays_in_the_0600_file_without_a_keyring(
     config.hf.token = TOKEN
     path = config.save(tmp_path / "data" / "config.yaml")
     assert yaml.safe_load(path.read_text(encoding="utf-8"))["hf"]["token"] == TOKEN
-    assert is_owner_only(path) is True
+    assert_owner_only(path)
     assert SecretStore(tmp_path / "data").get(HF_TOKEN_SECRET) is None
 
 
@@ -242,7 +245,7 @@ def test_self_signed_is_generated_once_with_a_fingerprint(tmp_path: Path) -> Non
     material = resolve_tls(config)
     assert material is not None and material.mode == "self_signed"
     assert material.cert_file.is_file() and material.key_file.is_file()
-    assert is_owner_only(material.key_file) is True
+    assert_owner_only(material.key_file)
     fingerprint = material.fingerprint_sha256
     assert len(fingerprint) == 95 and fingerprint.count(":") == 31
     assert fingerprint == fingerprint.upper()
