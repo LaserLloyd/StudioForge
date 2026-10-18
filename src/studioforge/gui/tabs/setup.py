@@ -118,6 +118,38 @@ def render(ctx: GuiContext) -> None:
         _advanced_card(ctx)
 
 
+def checklist_cards(ctx: GuiContext) -> None:
+    """The "what is still stopping this from serving" checklist (Overview)."""
+    _checklist_card(ctx)
+
+
+def library_cards(ctx: GuiContext) -> None:
+    """Where models live and what is downloading (Models > Library)."""
+    _library_card(ctx)
+    _downloads_card(ctx)
+
+
+def engine_cards(ctx: GuiContext) -> None:
+    """Which llama.cpp build serves, and how to change it (Engines)."""
+    _engine_card(ctx)
+
+
+def placement_cards(ctx: GuiContext) -> None:
+    """How models are spread over the GPUs, and which cards are off limits (Placement)."""
+    _gpu_card(ctx)
+
+
+def serving_cards(ctx: GuiContext) -> None:
+    """Where the server listens and what it takes to talk to it (Serving)."""
+    _network_card(ctx)
+
+
+def advanced_cards(ctx: GuiContext) -> None:
+    """Start with Windows, and every remaining setting (Advanced)."""
+    _startup_card(ctx)
+    _advanced_card(ctx)
+
+
 # ---------------------------------------------------------------------------
 # Shared plumbing for the section forms
 # ---------------------------------------------------------------------------
@@ -1072,8 +1104,11 @@ def _network_body(ctx: GuiContext, refresh: Any) -> None:
 
 def _endpoints(ctx: GuiContext) -> list[dict[str, str]]:
     from studioforge.core.netinfo import reachable_urls
+    from studioforge.tlsutil import scheme_for
 
-    return reachable_urls(ctx.config.server.port, host=ctx.config.server.host)
+    return reachable_urls(
+        ctx.config.server.port, host=ctx.config.server.host, scheme=scheme_for(ctx.config)
+    )
 
 
 def _openclaw_panel(ctx: GuiContext) -> None:

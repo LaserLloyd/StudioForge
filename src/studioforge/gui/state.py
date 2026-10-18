@@ -21,6 +21,7 @@ Two invariants are load-bearing and are covered by tests:
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
 import re
 import time
@@ -6219,6 +6220,9 @@ CUSTOM_WIDGET_KEYS: Final = frozenset(
         "planner.reserved_mb",
         "planner.quant_affinity",
         "models.ttl_by_priority",
+        # A nested model (HTTPS): its mode, certificate and key are three
+        # different kinds of control, on the Serving page's HTTPS card.
+        "server.tls",
         # A list of nested models (D77): a text box would destroy the other
         # entries on save. Its "widget" is the Tenants card on the Dashboard,
         # which shows what the file declares; the file itself is edited by
@@ -6318,6 +6322,22 @@ def _spec_kind(annotation: Any) -> tuple[str, tuple[str, ...]]:
     return "unsupported", ()
 
 
+@functools.cache
+def registry_descriptions() -> Mapping[str, str]:
+    """``{dotted key: description}`` from the settings schema registry.
+
+    Cached: the registry is derived from source files that cannot change under a
+    running process. Any failure yields no descriptions, so the panel falls back
+    to :data:`CONFIG_FIELD_HELP` instead of losing its explanations.
+    """
+    try:
+        from studioforge.settings_schema import build_registry
+
+        return {row.key: row.description for row in build_registry() if row.description}
+    except Exception:  # noqa: BLE001 - the fallback text is always there
+        return {}
+
+
 def config_field_specs(
     config_model: Any = None, *, help_text: Mapping[str, str] | None = None
 ) -> list[ConfigFieldSpec]:
@@ -6331,7 +6351,16 @@ def config_field_specs(
     from studioforge.config import Config as _Config
 
     model = config_model or _Config
-    helps = dict(CONFIG_FIELD_HELP if help_text is None else help_text)
+    if help_text is not None:
+        helps = dict(help_text)
+    else:
+        # The settings schema registry (``studioforge.settings_schema``) is the
+        # single source of the descriptions the CLI, the docs and the API show;
+        # the panel reads the same words. ``CONFIG_FIELD_HELP`` remains only as
+        # the fallback for a key the registry has no text for.
+        helps = dict(CONFIG_FIELD_HELP)
+        if config_model is None:
+            helps.update(registry_descriptions())
     specs: list[ConfigFieldSpec] = []
     for section_name, section_field in model.model_fields.items():
         if section_name in {"source_path", "data_dir"}:
