@@ -1,0 +1,45 @@
+{
+  "models": [
+    {
+      "type": "llm",
+      "publisher": "local",
+      "key": "vendor/thing-Q4_K_M",
+      "display_name": "thing",
+      "architecture": "llama",
+      "arch": "llama",
+      "quantization": {"name": "Q4_K_M", "bits_per_weight": null},
+      "size_bytes": 8589934592,
+      "params_string": "8B",
+      "loaded_instances": [
+        {
+          "id": "vendor/thing-Q4_K_M",
+          "config": {"context_length": 16384, "parallel": 3, "offload_kv_cache_to_gpu": true},
+          "context_length": 16384
+        }
+      ],
+      "max_context_length": 32768,
+      "format": "gguf",
+      "capabilities": {"vision": false, "trained_for_tool_use": true},
+      "state": "loaded",
+      "loaded_context_length": 16384
+    },
+    {
+      "type": "embedding",
+      "publisher": "local",
+      "key": "vendor/embed-Q8_0",
+      "display_name": "embed",
+      "architecture": "bert",
+      "arch": "bert",
+      "quantization": {"name": "Q8_0", "bits_per_weight": null},
+      "size_bytes": 1073741824,
+      "params_string": "137M",
+      "loaded_instances": [],
+      "max_context_length": 2048,
+      "format": "gguf",
+      "capabilities": {"vision": false, "trained_for_tool_use": false},
+      "state": "not-loaded",
+      "loaded_context_length": null
+    }
+  ],
+  "object": "list"
+}

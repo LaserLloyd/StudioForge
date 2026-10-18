@@ -1,0 +1,10 @@
+{
+  "type": "llm",
+  "instance_id": "vendor/thing-Q4_K_M",
+  "model": "vendor/thing-Q4_K_M",
+  "context_length": 16384,
+  "load_time_seconds": 0.0,
+  "status": "loaded",
+  "load_config": {"context_length": 16384, "parallel": 3, "offload_kv_cache_to_gpu": true},
+  "ignored": ["flash_attention"]
+}

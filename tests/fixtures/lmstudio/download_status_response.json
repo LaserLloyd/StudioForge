@@ -1,0 +1,9 @@
+{
+  "job_id": "g-qwen",
+  "status": "downloading",
+  "bytes_per_second": 50000000,
+  "estimated_completion": "2026-10-18T12:05:00.000Z",
+  "total_size_bytes": 21474836480,
+  "downloaded_bytes": 4294967296,
+  "started_at": "2026-10-18T12:00:00.000Z"
+}

@@ -23,7 +23,13 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from studioforge import __version__
-from studioforge.api import admin_routes, health_routes, mgmt_routes, openai_routes
+from studioforge.api import (
+    admin_routes,
+    health_routes,
+    lmstudio_routes,
+    mgmt_routes,
+    openai_routes,
+)
 from studioforge.api.auth import check_request
 from studioforge.build import build_id
 from studioforge.config import Config, load_config
@@ -803,6 +809,7 @@ def create_app(
     )
 
     app.include_router(openai_routes.router, tags=["openai"])
+    app.include_router(lmstudio_routes.router, tags=["lmstudio"])
     app.include_router(mgmt_routes.router, prefix="/api", tags=["management"])
     app.include_router(admin_routes.router, prefix="/api", tags=["admin"])
     app.include_router(health_routes.router, prefix="/api", tags=["health"])
