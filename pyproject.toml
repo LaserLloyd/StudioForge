@@ -105,18 +105,23 @@ packages = ["src/studioforge"]
 include = [
     "src/studioforge/migrations/*.sql",
     "src/studioforge/data/*.json",
-    # The ThemeForge drop-in bundle, copied verbatim from the theme repo;
-    # see docs/DEVELOPMENT.md's "GUI theming" section. Everything in it ships.
+    # The ForgeUI (ThemeForge) drop-in bundle, vendored whole by `python -m forgeui
+    # vendor`; see docs/DEVELOPMENT.md's "GUI theming" section. Everything in it ships.
     "src/studioforge/gui/theme/**",
 ]
+
+[tool.hatch.build.targets.wheel.force-include]
+# The theme manifest: gui/app.py reads the picker's themes, default and storage key
+# from it at runtime, so the installed wheel carries a copy beside the module.
+"forgeui.json" = "studioforge/gui/forgeui.json"
 
 [tool.ruff]
 line-length = 100
 target-version = "py312"
 src = ["src", "tests"]
-# gui/theme/ is the ThemeForge drop-in bundle, vendored verbatim and
-# checksummed by its files.json (its update.py refuses to update a copy that
-# was edited by hand, and the next install overwrites the folder anyway), so
+# gui/theme/ is the ForgeUI (ThemeForge) drop-in bundle, vendored whole and
+# checksummed by its files.json (`forgeui vendor` refuses to update a copy that
+# was edited by hand, and the next vendor overwrites the folder anyway), so
 # it is never reformatted to this project's rules: ruff skips it, lint and
 # format alike. force-exclude keeps that true when a file is named explicitly
 # (editors, pre-commit).
@@ -194,4 +199,4 @@ timeout = 300
 # uv caches this project's own built wheel and by default only rebuilds it when
 # pyproject.toml/setup.* change; the container builds keep that cache in a persistent
 # mount with a non-editable install, so list the sources too (2026-10 review finding).
-cache-keys = [{ file = "pyproject.toml" }, { file = "src/**/*.py" }, { file = "src/**/*.html" }, { file = "src/**/*.css" }, { file = "src/**/*.js" }, { file = "src/**/*.sql" }]
+cache-keys = [{ file = "pyproject.toml" }, { file = "forgeui.json" }, { file = "src/**/*.py" }, { file = "src/**/*.html" }, { file = "src/**/*.css" }, { file = "src/**/*.js" }, { file = "src/**/*.sql" }]

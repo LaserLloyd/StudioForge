@@ -263,9 +263,9 @@ def test_a_failing_lease_book_is_a_stale_note_not_an_error_card(config: Config) 
 
 
 # ---------------------------------------------------------------------------
-# Theme assets: gui/theme/ is the ThemeForge drop-in bundle, served at
+# Theme assets: gui/theme/ is the ForgeUI (ThemeForge) drop-in bundle, served at
 # /sf-theme/, injected once into every page's <head> and the login page, and
-# configured by THEME_SETTINGS on the ui-theme.js script tag.
+# configured by THEME_SETTINGS (read from forgeui.json) on the ui-theme.js script tag.
 # ---------------------------------------------------------------------------
 
 
@@ -278,6 +278,7 @@ def test_theme_assets_are_served(config: Config) -> None:
         registry = client.get("/sf-theme/themes.json")
         quasar_js = client.get("/sf-theme/adapters/quasar.js")
         quasar_css = client.get("/sf-theme/adapters/quasar.css")
+        overlay = client.get("/sf-theme/adapters/studioforge-extra.css")
     assert js.status_code == 200
     assert "UITheme" in js.text
     assert css.status_code == 200
@@ -287,6 +288,8 @@ def test_theme_assets_are_served(config: Config) -> None:
     assert quasar_js.status_code == 200
     assert "Quasar" in quasar_js.text
     assert quasar_css.status_code == 200
+    assert overlay.status_code == 200
+    assert ".sf-well" in overlay.text
 
 
 def test_theme_assets_are_served_with_no_long_cache(config: Config) -> None:
@@ -301,7 +304,7 @@ def test_theme_assets_are_served_with_no_long_cache(config: Config) -> None:
     assert response.headers["cache-control"] == "public, max-age=0"
 
 
-def test_theme_head_html_has_the_five_tags_in_order_with_version_hashes() -> None:
+def test_theme_head_html_has_the_six_tags_in_order_with_version_hashes() -> None:
     from studioforge.gui.app import _THEME_HEAD_HTML
 
     js_at = _THEME_HEAD_HTML.index("/sf-theme/ui-theme.js?v=")
@@ -309,12 +312,13 @@ def test_theme_head_html_has_the_five_tags_in_order_with_version_hashes() -> Non
     base_at = _THEME_HEAD_HTML.index("/sf-theme/ui-theme-base.css?v=")
     css_at = _THEME_HEAD_HTML.index("/sf-theme/ui-theme.css?v=")
     adapter_css_at = _THEME_HEAD_HTML.index("/sf-theme/adapters/quasar.css?v=")
-    assert js_at < adapter_js_at < base_at < css_at < adapter_css_at, (
-        "runtime, then its Quasar script, then base, tokens and the Quasar CSS"
+    overlay_at = _THEME_HEAD_HTML.index("/sf-theme/adapters/studioforge-extra.css?v=")
+    assert js_at < adapter_js_at < base_at < css_at < adapter_css_at < overlay_at, (
+        "runtime, its Quasar script, base, tokens, the Quasar CSS, then the app-owned overlay"
     )
 
     hashes = re.findall(r"\?v=([0-9a-f]+)", _THEME_HEAD_HTML)
-    assert len(hashes) == 5
+    assert len(hashes) == 6
     assert all(len(h) == 10 for h in hashes), hashes
 
 
@@ -330,6 +334,16 @@ def test_theme_settings_ride_on_the_runtime_script_tag() -> None:
     assert attrs["data-default"] == THEME_SETTINGS["default"] == "glacier"
     assert attrs["data-storage-key"] == "studioforge.theme"
     assert "night-red" in THEME_SETTINGS["themes"]
+
+
+def test_theme_picker_offers_the_new_core_themes() -> None:
+    """ForgeUI 1.2 added slate and the high-contrast pair; the picker lists them."""
+    from studioforge.gui.app import _theme_options
+
+    options = _theme_options()
+    for slug in ("slate", "high-contrast", "high-contrast-light"):
+        assert slug in options, options
+    assert "electric-yellow" not in options, "opt-in themes the app did not list stay out"
 
 
 def test_theme_picker_options_come_from_the_bundle_registry_in_settings_order() -> None:

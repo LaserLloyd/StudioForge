@@ -1,0 +1,36 @@
+/* StudioForge's own CSS layer (app-owned; not part of the ForgeUI bundle).
+
+   `python -m forgeui vendor` copies this file to gui/theme/adapters/studioforge-extra.css
+   (see forgeui.json "extra_files") and the page head loads it after adapters/quasar.css.
+   It is never appended into a bundle file, so gui/theme/files.json keeps proving the bundle.
+   Edit THIS file (gui/overlays/studioforge-extra.css), then re-run the vendor command. */
+
+/* ============================================================================
+   sf-* helper classes — StudioForge-specific, kept to a minimum. Used only
+   where gui/tabs/*.py replaced a hard-coded `bg-black/10 dark:bg-white/5`
+   (etc.) pair with one semantic class. Declared last on purpose: they share
+   specificity with the adapter's .q-card rules and must win the source-order tiebreak
+   when a card also carries one of these classes.
+   ============================================================================ */
+
+.sf-well {
+  background: var(--surface-sunken);
+}
+
+.sf-danger-card {
+  background: var(--danger-subtle);
+  border-color: var(--danger-border);
+  color: var(--danger-text);
+}
+
+.sf-warning-card {
+  background: var(--warning-subtle);
+  border-color: var(--warning-border);
+  color: var(--warning-text);
+}
+
+/* Header theme picker: sizing only -- its colours come from the generic
+   .q-field rules in the adapter, which already read correctly on --surface-1. */
+.sf-theme-picker {
+  min-width: 9rem;
+}

@@ -1,4 +1,4 @@
-/* GENERATED adapter quasar.css: ThemeForge 1.0.0, drop-in bundle (ui-theme/).
+/* GENERATED adapter quasar.css: ThemeForge 1.2.0, drop-in bundle (ui-theme/).
    https://github.com/LaserLloyd/ThemeForge . Do not edit this copy: update the whole
    folder (python ui-theme/update.py) and keep app styles in the app.
    body sha256: 90952938c17de7b0 */
@@ -783,38 +783,4 @@ a:focus-visible {
   .q-field--disabled .q-field__label {
     color: var(--text-disabled) !important;
   }
-}
-
-/* StudioForge-only helper classes, appended to its copy of adapters/quasar.css
-   by the private app registry (extra_files append). Moved out of the public
-   adapter on 2026-10-04. */
-
-/* ============================================================================
-   sf-* helper classes — StudioForge-specific, kept to a minimum. Used only
-   where gui/tabs/*.py replaced a hard-coded `bg-black/10 dark:bg-white/5`
-   (etc.) pair with one semantic class. Declared last on purpose: they share
-   specificity with .q-card above and must win the source-order tiebreak
-   when a card also carries one of these classes.
-   ============================================================================ */
-
-.sf-well {
-  background: var(--surface-sunken);
-}
-
-.sf-danger-card {
-  background: var(--danger-subtle);
-  border-color: var(--danger-border);
-  color: var(--danger-text);
-}
-
-.sf-warning-card {
-  background: var(--warning-subtle);
-  border-color: var(--warning-border);
-  color: var(--warning-text);
-}
-
-/* Header theme picker: sizing only -- its colours come from the generic
-   .q-field rules above, which already read correctly on --surface-1. */
-.sf-theme-picker {
-  min-width: 9rem;
 }

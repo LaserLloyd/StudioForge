@@ -94,6 +94,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 # Application layer. --no-editable installs the built wheel into the venv, so
 # the runtime image does not need /src.
+# forgeui.json is the theme manifest; the wheel ships a copy (pyproject.toml force-include).
+COPY forgeui.json ./
 COPY src/ ./src/
 # --reinstall-package: guard against uv serving the project's OWN previously built
 # wheel from the cache mount (uv only invalidates it when pyproject.toml changes; seen

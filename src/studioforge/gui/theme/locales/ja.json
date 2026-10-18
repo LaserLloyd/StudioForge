@@ -1,0 +1,17 @@
+{
+  "$locale": "ja",
+  "cancel": "キャンセル",
+  "ok": "OK",
+  "confirm": "確認",
+  "input": "入力",
+  "message": "メッセージ",
+  "value": "値",
+  "copy": "コピー",
+  "copied": "コピーしました",
+  "copyFailed": "コピーできませんでした",
+  "reset": "初期値に戻す",
+  "resetNamed": "「{name}」を初期値に戻す",
+  "basic": "基本",
+  "advanced": "詳細設定",
+  "setByEnv": "環境変数で設定済み"
+}

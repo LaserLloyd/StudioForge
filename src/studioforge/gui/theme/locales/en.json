@@ -1,0 +1,17 @@
+{
+  "$locale": "en",
+  "cancel": "Cancel",
+  "ok": "OK",
+  "confirm": "Confirm",
+  "input": "Input",
+  "message": "Message",
+  "value": "Value",
+  "copy": "Copy",
+  "copied": "Copied",
+  "copyFailed": "Copy failed",
+  "reset": "Reset to default",
+  "resetNamed": "Reset {name} to default",
+  "basic": "Basic",
+  "advanced": "Advanced",
+  "setByEnv": "Set by environment"
+}

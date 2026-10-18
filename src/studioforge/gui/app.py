@@ -567,22 +567,49 @@ class GuiAuthGate:
 # Theme assets
 # ---------------------------------------------------------------------------
 #
-# gui/theme/ is the ThemeForge drop-in bundle, copied verbatim from the
-# theme repo: the same folder every app gets (see docs/DEVELOPMENT.md's "GUI
-# theming" section). Never hand-edited; a theme update is copying the new
-# folder over this one. What is StudioForge's own is THEME_SETTINGS below.
+# gui/theme/ is the ForgeUI (ThemeForge) drop-in bundle, vendored whole by
+# `python -m forgeui vendor` from the manifest at the repository root
+# (forgeui.json; see docs/DEVELOPMENT.md's "GUI theming" section). Never
+# hand-edited: StudioForge's own CSS is the overlay gui/overlays/
+# studioforge-extra.css, which vendor copies to adapters/studioforge-extra.css.
+# What is StudioForge's own is THEME_SETTINGS below, and it is read from
+# forgeui.json so the theme choice lives in exactly one place.
 
 #: The drop-in bundle: ui-theme.js/.css/-base.css, adapters/, themes.json.
 _THEME_DIR = Path(__file__).parent / "theme"
 
-#: This app's own theme settings. The bundle carries none: they ride as
-#: data-* attributes on the ui-theme.js <script> tag (see _THEME_HEAD_HTML),
-#: and the header picker lists the same themes in the same order.
+
+def _load_forgeui_manifest() -> Mapping[str, Any]:
+    """forgeui.json: beside this module in an installed wheel (hatch force-include),
+    at the repository root in a source checkout or editable install."""
+    here = Path(__file__).resolve().parent
+    for candidate in (here / "forgeui.json", here.parents[2] / "forgeui.json"):
+        if candidate.is_file():
+            data = json.loads(candidate.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+    raise RuntimeError(
+        "forgeui.json (the theme manifest) was not found next to the GUI package or at the "
+        "repository root; the wheel must ship it (pyproject.toml force-include)"
+    )
+
+
+_FORGEUI_MANIFEST = _load_forgeui_manifest()
+
+#: This app's own theme settings, read from forgeui.json ``settings``. The bundle
+#: carries none: they ride as data-* attributes on the ui-theme.js <script> tag
+#: (see _THEME_HEAD_HTML), and the header picker lists the same themes in the
+#: same order.
 THEME_SETTINGS: Mapping[str, Any] = {
-    "themes": ("purple", "midnight-gold", "glacier", "forest", "paper", "daylight", "night-red"),
-    "default": "glacier",
-    "storage_key": "studioforge.theme",
+    **_FORGEUI_MANIFEST["settings"],
+    "themes": tuple(_FORGEUI_MANIFEST["settings"]["themes"]),
 }
+
+#: App-owned CSS overlays the manifest lists (extra_files), served from the bundle
+#: folder after the Quasar adapter so they win source-order ties.
+_THEME_OVERLAY_CSS: tuple[str, ...] = tuple(
+    target for target in _FORGEUI_MANIFEST.get("extra_files", {}) if target.endswith(".css")
+)
 
 
 def _asset_version(name: str) -> str:
@@ -613,11 +640,15 @@ def _theme_script_tag(name: str, version: str, attrs: str = "") -> str:
 
 def _theme_settings_attrs() -> str:
     """THEME_SETTINGS as the runtime's data-* configuration."""
-    return (
+    attrs = (
         f' data-themes="{",".join(THEME_SETTINGS["themes"])}"'
         f' data-default="{THEME_SETTINGS["default"]}"'
         f' data-storage-key="{THEME_SETTINGS["storage_key"]}"'
     )
+    for key in ("default_dark", "default_light"):
+        if THEME_SETTINGS.get(key):
+            attrs += f' data-{key.replace("_", "-")}="{THEME_SETTINGS[key]}"'
+    return attrs
 
 
 def _theme_link_tag(name: str, version: str) -> str:
@@ -630,14 +661,15 @@ def _theme_link_tag(name: str, version: str) -> str:
 #: then the Quasar adapter's script (it needs the runtime), the element
 #: layer (loaded before the app's own CSS so its rules keep priority), the
 #: contract tokens (loaded after it so they beat any same-named legacy
-#: value), and last the Quasar adapter's CSS, which maps the tokens onto
-#: Quasar's components.
+#: value), then the Quasar adapter's CSS, which maps the tokens onto
+#: Quasar's components, and last the app-owned overlay(s) from forgeui.json.
 _THEME_HEAD_HTML = (
     _theme_script_tag("ui-theme.js", _THEME_JS_VERSION, _theme_settings_attrs())
     + _theme_script_tag("adapters/quasar.js", _QUASAR_JS_VERSION)
     + _theme_link_tag("ui-theme-base.css", _THEME_BASE_CSS_VERSION)
     + _theme_link_tag("ui-theme.css", _THEME_CSS_VERSION)
     + _theme_link_tag("adapters/quasar.css", _QUASAR_CSS_VERSION)
+    + "".join(_theme_link_tag(rel, _asset_version(rel)) for rel in _THEME_OVERLAY_CSS)
 )
 
 

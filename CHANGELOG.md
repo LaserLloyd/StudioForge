@@ -31,6 +31,20 @@ The version string still reads `1.26-09-23`; the `build` field tells these commi
   not captured), an offline suite in `tests/unit/compat/`, and an opt-in `tests/compat/` suite for a
   running test instance.
 
+- GUI theme: ForgeUI 1.2.0 (the ThemeForge bundle; was a ThemeForge-labelled UnifyingTheme 1.0.0
+  copy). The panel now offers the new Slate, High Contrast and High Contrast Light themes beside
+  the existing seven (Night Red stays, the other opt-in themes stay out). `gui/theme/` is vendored
+  whole by `python -m forgeui vendor` from a per-repo manifest, `forgeui.json`, which is now the
+  single place for the picker's themes, the default (`glacier`) and the storage key
+  (`studioforge.theme`); the wheel ships a copy beside `gui/app.py`. The `sf-*` helper classes that
+  used to be appended into `adapters/quasar.css` moved to an app-owned overlay,
+  `gui/overlays/studioforge-extra.css`, vendored as `adapters/studioforge-extra.css` and loaded
+  after the Quasar adapter, so `files.json` proves the bundle again. `tests/unit/test_forgeui_vendor.py`
+  and a CI step run `forgeui vendor --check`, so the bundle cannot drift. The owner-machine
+  registry (`sync_theme.py install studioforge`) is retired; see
+  [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md#gui-theming). The tailwind adapters are no longer
+  shipped (the panel uses Quasar).
+
 Security, MCP hardening, CLI and first-run wizard (refactor workstream W3-SF; the security release
 that 2.0.0 carries). Read **BREAKING** first.
 
