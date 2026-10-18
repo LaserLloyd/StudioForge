@@ -23,3 +23,4 @@ available, and keep these as the "tolerance" cases.
 | `vulkaninfo_single.json` | `vulkaninfo --json` | one device profile |
 | `system_profiler_apple_m2_max.json` | `system_profiler SPDisplaysDataType -json` | Apple silicon (no VRAM figure) |
 | `system_profiler_intel_mac_amd.json` | same | Intel Mac with a discrete AMD card (`spdisplays_vram`) |
+| `llama_bench_pp512_tg128.json` | `llama-bench -p 512 -n 128 -o json` | one pp512 row and one tg128 row |
