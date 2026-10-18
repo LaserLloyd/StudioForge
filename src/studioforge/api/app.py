@@ -24,9 +24,17 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from studioforge import __version__
 from studioforge.api import admin_routes, health_routes, mgmt_routes, openai_routes
-from studioforge.api.auth import check_request
+from studioforge.api.auth import (
+    check_request,
+    is_mcp_path,
+    origin_allowed,
+    principal_of,
+    required_scope,
+)
+from studioforge.auditlog import AuditLog
 from studioforge.build import build_id
 from studioforge.config import Config, load_config
+from studioforge.core.accounts import AccountStore
 from studioforge.core.downloader import Downloader
 from studioforge.core.engine import EngineManager
 from studioforge.core.gpu import get_probe
@@ -39,7 +47,7 @@ from studioforge.core.supervisor import Supervisor
 from studioforge.core.updater import Updater
 from studioforge.db import Database
 from studioforge.error_catalog import envelope_extras
-from studioforge.errors import StudioForgeError
+from studioforge.errors import AuthError, StudioForgeError
 from studioforge.logging import configure_logging, get_logger
 
 log = get_logger(__name__)
@@ -103,17 +111,70 @@ def log_rejection(exc: StudioForgeError) -> None:
 SCAN_WAIT_S = 60.0
 
 
+_MUTATING = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+def _audited(method: str, path: str, config: Config) -> bool:
+    """Whether a request is an admin mutation worth an audit line.
+
+    Every mutating route an ``admin`` scope is needed for, plus the LM Studio
+    native model verbs (load/unload/download). Inference traffic is not audited
+    (volume, and the content is not the point) and neither is MCP here: its
+    mutating tool calls are audited per tool by ``mcp_policy``.
+    """
+    if method not in _MUTATING or is_mcp_path(path, config):
+        return False
+    return required_scope(method, path, config) == "admin" or path.startswith("/api/v1/models/")
+
+
 class AuthMiddleware(BaseHTTPMiddleware):
-    """Applies the optional bearer key to every route in one place -- and holds
+    """Applies authentication and scopes to every route in one place -- and holds
     every request but liveness until the boot's first library scan is in (D33),
     so a client that connects the moment the port answers is not told the
-    library is empty or a model does not exist."""
+    library is empty or a model does not exist.
+
+    Also the two cross-cutting security duties of the gateway: the Origin check
+    on the MCP endpoint (a browser page not on the allowlist gets 403 before any
+    credential is looked at) and the audit line for every admin mutation."""
 
     def __init__(self, app: Any, config: Config) -> None:
         super().__init__(app)
         self.config = config
 
+    def _audit(self, request: Request, *, result: str, detail: str | None = None) -> None:
+        audit = getattr(request.app.state, "audit", None)
+        if audit is None:
+            return
+        principal = principal_of(request)
+        client = request.client.host if request.client else None
+        target = getattr(request.state, "audit_target", None) or request.url.path
+        audit.record(
+            actor=principal.actor if principal else "anonymous",
+            action=f"api.{request.method} {request.url.path}",
+            target=str(target),
+            result=result,
+            surface="api",
+            peer=client,
+            detail=detail,
+        )
+
     async def dispatch(self, request: Request, call_next: Any) -> Any:
+        method = request.method.upper()
+        path = request.url.path
+        if method != "OPTIONS" and is_mcp_path(path, self.config):
+            origin = request.headers.get("origin")
+            if not origin_allowed(origin, self.config.server.cors_origins):
+                refusal = AuthError(
+                    f"Refused: the request's Origin '{origin}' is not allowed to reach the MCP "
+                    "endpoint. Call MCP from a non-browser client (no Origin header) or from a "
+                    "loopback page, or add the page's origin to server.cors_origins.",
+                    code="origin_not_allowed",
+                    status_code=403,
+                )
+                log.warning("mcp request refused: Origin not allowed", origin=origin, path=path)
+                self._audit(request, result="denied", detail=f"origin {origin}")
+                return JSONResponse(refusal.to_payload(), status_code=403)
+        audited = _audited(method, path, self.config)
         try:
             check_request(request, self.config)
         except StudioForgeError as exc:
@@ -123,10 +184,19 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 # below ever runs, so the header has to be set here too or a
                 # locked-out client gets the wait only in the JSON body.
                 headers["Retry-After"] = str(exc.details["retry_after_s"])
+            if audited:
+                self._audit(request, result="denied", detail=exc.code)
             return JSONResponse(exc.to_payload(), status_code=exc.status_code, headers=headers)
         if request.url.path not in _NO_BOOT_WAIT_PATHS:
             await wait_for_boot(request.app.state, timeout_s=SCAN_WAIT_S, scan_only=True)
-        return await call_next(request)
+        response = await call_next(request)
+        if audited:
+            self._audit(
+                request,
+                result="ok" if response.status_code < 400 else "error",
+                detail=None if response.status_code < 400 else f"HTTP {response.status_code}",
+            )
+        return response
 
 
 #: Strong references to in-flight post-download scan tasks, keyed by download
@@ -612,6 +682,14 @@ def build_state(config: Config, *, version: str = __version__) -> Any:
 
     state.config = config  # type: ignore[attr-defined]
     state.db = db  # type: ignore[attr-defined]
+    # Who may call this server (owner account, scoped keys) and the append-only
+    # record of what they changed.
+    state.accounts = AccountStore(db, config.data_dir)  # type: ignore[attr-defined]
+    state.audit = AuditLog(  # type: ignore[attr-defined]
+        config.logs_dir,
+        max_mb=config.logging.audit_file_max_mb,
+        backups=config.logging.audit_file_backups,
+    )
     state.probe = probe  # type: ignore[attr-defined]
     state.engine_manager = engine_manager  # type: ignore[attr-defined]
     state.registry = registry  # type: ignore[attr-defined]
@@ -781,6 +859,23 @@ def create_app(
     for key, value in vars(composed).items():
         setattr(app.state, key, value)
     app.state.client = None
+
+    # The deprecated server.api_key is mirrored into the key table (and the
+    # watchdog's snapshot) so it appears in `keys list` and can be revoked; it
+    # keeps authenticating from config either way.
+    accounts = getattr(app.state, "accounts", None)
+    if accounts is not None:
+        try:
+            accounts.adopt_legacy_key(config.server.api_key)
+            accounts.sync_snapshot()
+        except Exception as exc:  # noqa: BLE001 - key bookkeeping must not stop the server booting
+            log.warning("could not mirror server.api_key into the key table", error=str(exc))
+    if "*" in [o.strip() for o in config.server.cors_origins]:
+        log.warning(
+            "server.cors_origins contains '*': any website may read this API from a visitor's "
+            "browser. It does not let a page reach the MCP endpoints (those need an explicit "
+            "origin). Remove it unless you serve a web app from another origin."
+        )
 
     # Claimed here rather than in build_state because the lock is about *acting*
     # on a data directory, not about composing an object graph: the stdio MCP

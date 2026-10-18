@@ -17,6 +17,7 @@ from typing import Any
 import pytest
 import yaml
 from fastapi.testclient import TestClient
+from pydantic import BaseModel
 
 from studioforge import settings_schema
 from studioforge.api.app import build_state, create_app
@@ -50,12 +51,27 @@ def _flatten(tree: Any, prefix: str = "") -> dict[str, Any]:
 
 
 def _persisted_keys(tmp_path: Path) -> set[str]:
-    """Top-level or section keys config.yaml can hold, to the depth the registry stops at."""
-    dumped = Config(data_dir=tmp_path).to_yaml_dict()
+    """Top-level or section keys config.yaml can hold, to the depth the registry stops at.
+
+    A key whose value is itself a config *model* (``server.tls``) is a nested
+    section and contributes its own keys (``server.tls.mode``) instead of itself.
+    """
+    config = Config(data_dir=tmp_path)
+    dumped = config.to_yaml_dict()
     keys: set[str] = set()
+
+    def descend(data: dict[str, Any], instance: Any, prefix: str) -> None:
+        for name, value in data.items():
+            attr = getattr(instance, name, None)
+            if isinstance(value, dict) and isinstance(attr, BaseModel):
+                descend(value, attr, f"{prefix}{name}.")
+            else:
+                keys.add(f"{prefix}{name}")
+
     for top, value in dumped.items():
-        if isinstance(value, dict):
-            keys.update(f"{top}.{sub}" for sub in value)
+        section = getattr(config, top, None)
+        if isinstance(value, dict) and isinstance(section, BaseModel):
+            descend(value, section, f"{top}.")
         else:
             keys.add(top)
     return keys

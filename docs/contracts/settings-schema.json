@@ -1,5 +1,5 @@
 {
-  "count": 105,
+  "count": 110,
   "env_nested_delimiter": "__",
   "env_prefix": "SF_",
   "levels": [
@@ -27,8 +27,8 @@
     {
       "choices": null,
       "constraints": {},
-      "default": "0.0.0.0",
-      "description": "Address the OpenAI-compatible gateway (/v1, /api, /mcp) binds to. 0.0.0.0 listens on every interface; 127.0.0.1 keeps it on this machine.",
+      "default": "127.0.0.1",
+      "description": "Loopback by default: nothing is reachable from the network until you choose to expose it (`studioforge setup`). A non-loopback bind (0.0.0.0, a LAN address) refuses to start unless an owner account or an admin API key exists.",
       "env": "SF_SERVER__HOST",
       "key": "server.host",
       "level": "basic",
@@ -59,7 +59,7 @@
         "min_length": 6
       },
       "default": null,
-      "description": "Null = open on your LAN/tailnet. Set it and it is required on /v1, /api, /mcp and the watchdog. Minimum 6 characters so log redaction can catch it.",
+      "description": "DEPRECATED (2.0). Still works, and is mirrored into the key table as an admin key named \"legacy\". Prefer `studioforge keys create`.",
       "env": "SF_SERVER__API_KEY",
       "key": "server.api_key",
       "level": "basic",
@@ -71,10 +71,8 @@
     {
       "choices": null,
       "constraints": {},
-      "default": [
-        "*"
-      ],
-      "description": "Origins allowed to call the API from a browser. [\"*\"] allows any.",
+      "default": [],
+      "description": "Origins allowed to call the API from a browser (and to reach /mcp from one). Empty = none; non-browser clients are unaffected.",
       "env": "SF_SERVER__CORS_ORIGINS",
       "key": "server.cors_origins",
       "level": "advanced",
@@ -95,6 +93,49 @@
       "secret": false,
       "section": "server",
       "type": "bool"
+    },
+    {
+      "choices": [
+        "off",
+        "self_signed",
+        "cert"
+      ],
+      "constraints": {},
+      "default": "off",
+      "description": "HTTPS for the gateway, panel and watchdog: off, self_signed (a certificate generated into the data directory, fingerprint shown in the panel) or cert (your own PEM files).",
+      "env": "SF_SERVER__TLS__MODE",
+      "key": "server.tls.mode",
+      "level": "advanced",
+      "restart_required": true,
+      "secret": false,
+      "section": "server",
+      "type": "\"off\" | \"self_signed\" | \"cert\""
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": null,
+      "description": "PEM certificate (chain) served when server.tls.mode is cert.",
+      "env": "SF_SERVER__TLS__CERT_FILE",
+      "key": "server.tls.cert_file",
+      "level": "advanced",
+      "restart_required": true,
+      "secret": false,
+      "section": "server",
+      "type": "path | null"
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": null,
+      "description": "PEM private key served when server.tls.mode is cert.",
+      "env": "SF_SERVER__TLS__KEY_FILE",
+      "key": "server.tls.key_file",
+      "level": "advanced",
+      "restart_required": true,
+      "secret": false,
+      "section": "server",
+      "type": "path | null"
     },
     {
       "choices": null,
@@ -142,7 +183,7 @@
     {
       "choices": null,
       "constraints": {},
-      "default": "0.0.0.0",
+      "default": "127.0.0.1",
       "description": "Address the control panel binds to.",
       "env": "SF_GUI__HOST",
       "key": "gui.host",
@@ -199,7 +240,7 @@
     {
       "choices": null,
       "constraints": {},
-      "default": "0.0.0.0",
+      "default": "127.0.0.1",
       "description": "Address the watchdog binds to.",
       "env": "SF_WATCHDOG__HOST",
       "key": "watchdog.host",
@@ -300,7 +341,7 @@
       "choices": null,
       "constraints": {},
       "default": null,
-      "description": "Pairing code for the /mcp endpoint ONLY, separate from the API key. Auto-generated on first run and printed in the startup banner. Blank here on purpose -- never commit a real one.",
+      "description": "DEPRECATED pairing code for the /mcp endpoint ONLY, separate from the API key. Auto-generated on first run and printed in the startup banner. Blank here on purpose -- never commit a real one.",
       "env": "SF_MCP__PIN",
       "key": "mcp.pin",
       "level": "advanced",
@@ -1475,6 +1516,37 @@
       "key": "logging.file_backups",
       "level": "advanced",
       "restart_required": true,
+      "secret": false,
+      "section": "logging",
+      "type": "int"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "ge": 0
+      },
+      "default": 10,
+      "description": "The audit log (logs/audit.jsonl: every admin mutation and mutating MCP call) rotates at this size (MiB) and keeps this many copies.",
+      "env": "SF_LOGGING__AUDIT_FILE_MAX_MB",
+      "key": "logging.audit_file_max_mb",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "logging",
+      "type": "int"
+    },
+    {
+      "choices": null,
+      "constraints": {
+        "ge": 1,
+        "le": 1000
+      },
+      "default": 10,
+      "description": "Rotated audit logs kept, newest first.",
+      "env": "SF_LOGGING__AUDIT_FILE_BACKUPS",
+      "key": "logging.audit_file_backups",
+      "level": "advanced",
+      "restart_required": false,
       "secret": false,
       "section": "logging",
       "type": "int"
