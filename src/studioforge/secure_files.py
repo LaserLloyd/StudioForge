@@ -98,6 +98,11 @@ def write_private(path: Path, data: bytes | str, *, encoding: str = "utf-8") -> 
             restrict_to_owner(target)
         return
     descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # The mode argument only applies to a NEW file: an existing 0644 one would
+    # otherwise hold the secret world-readable until the chmod below. Tighten
+    # the open descriptor before a byte goes in.
+    with contextlib.suppress(OSError, AttributeError):
+        os.fchmod(descriptor, 0o600)
     with os.fdopen(descriptor, "wb") as handle:
         handle.write(payload)
         handle.flush()
