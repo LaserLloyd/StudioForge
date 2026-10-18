@@ -22,6 +22,29 @@ The version string still reads `1.26-09-23`; the `build` field tells these commi
   `studioforge-tenant` SDK ([`docs/TENANTS.md`](docs/TENANTS.md)). StudioForge never starts or
   stops a tenant.
 
+Prosumer refactor, W1 (engines and hardware detection) -- see [`docs/ENGINES.md`](docs/ENGINES.md):
+
+- Hardware detection beyond NVIDIA: `RocmGpuProbe` (amd-smi / rocm-smi / rocminfo),
+  `VulkanGpuProbe` (vulkaninfo), `MetalGpuProbe` (system_profiler) and an `AutoGpuProbe`
+  (NVML, ROCm, Vulkan, Metal) that records why each skipped backend failed. New config
+  `gpu.backend` (default `auto`; NVIDIA boxes still get NVML). `GET /api/gpus` gains `probe`; GPU
+  records gain `backend`, `vendor`, `gfx_target` and `unified_memory`.
+- The engine manager is backend-aware: CUDA, `rocm`/`hip`, `vulkan` and Metal archives are chosen
+  from the detected backend, and source builds take per-backend CMake flags (`-DGGML_HIP=ON
+  -DAMDGPU_TARGETS=<detected gfx>` etc.).
+- Engine archives are checksum-verified (GitHub digest, `.sha256` sidecar or `SHA256SUMS`); with
+  no published checksum the install is recorded `verified: false` and warned about, and
+  `engine.require_verified` refuses it. `engine.json` now records backend, verification, smoke
+  result and warnings.
+- `studioforge engine list|install|update|select|benchmark`; the single-command flags still work.
+- `engine.strict_gpu` (default true) and a per-model, off-by-default `allow_partial_cpu_offload`:
+  only with both set are `--n-cpu-moe` / `--no-kv-offload` legal. `-ngl 999 --fit off` are always
+  passed.
+- `engine.preference` (`balanced`, `fastest_replies`, `fastest_long_prompts`) and a cached
+  `pp512`/`tg128` backend benchmark (`engine benchmark --yes` is the only thing that runs it).
+- New error codes: `engine_checksum_mismatch`, `engine_unverified_refused`,
+  `engine_benchmark_unconfirmed`.
+
 ## 1.26-09-23 (2026-09-23)
 
 - D58: the `loaded` model alias.
