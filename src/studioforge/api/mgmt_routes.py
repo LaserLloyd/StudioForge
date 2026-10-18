@@ -24,6 +24,7 @@ from studioforge.api.auth import (
     is_admin_caller,
     key_owner_of,
     may_reveal_pin,
+    principal_of,
     redact_config_dict,
     require_admin_action,
     require_owner,
@@ -116,13 +117,59 @@ def may_unload_lease_held(request: Request, state: Any, model_ids: Any) -> bool:
         return False
     if is_admin_caller(request, state.config):
         return True
+    return all(lease_holder_may_act(request, state, lease) for lease in held)
+
+
+def _owner_key_gone(state: Any, owner: str) -> bool:
+    """Whether ``owner`` (``key:<id>``) names a key that can no longer authenticate.
+
+    A revoked, expired or deleted key cannot prove anything, so what it took
+    falls back to the D55 holder proof instead of staying admin-only until its
+    idle TTL -- a tenant that rotated its key can still release its own stale
+    lease (2.0.1). Any other stamp (``owner:``, ``legacy:``, ``pin``) is an
+    admin credential's and is never "gone" here.
+    """
+    if not owner.startswith("key:"):
+        return False
+    accounts = getattr(state, "accounts", None)
+    if accounts is None:
+        return False
+    key_id = owner[len("key:") :]
+    try:
+        record = next((k for k in accounts.list_keys() if k.id == key_id), None)
+    except Exception:  # noqa: BLE001 - an unreadable key table proves nothing either way
+        return False
+    return record is None or not record.active()
+
+
+def lease_holder_may_act(request: Request, state: Any, lease: Any) -> bool:
+    """Whether a non-admin caller proves it holds ``lease`` (D55, bound to keys in 2.0.1).
+
+    * **The owning key.** A lease taken with a scoped key (``holder_key``)
+      belongs to that key, whoever else shares the machine: the key proves it.
+    * **The lease's own token** (``X-SF-Vacate-Token``) with the holder's
+      ``X-SF-Client`` label -- a secret only the holder and this server know.
+    * **The registering peer** with the label -- only for a lease no live key
+      owns (taken with no credential, before 2.0.1, or by a key since revoked).
+      On this rig every tenant is a loopback peer, so for a key-bound lease the
+      peer proves nothing: it would let one tenant's key act on another's.
+    """
+    principal = principal_of(request)
+    owner = getattr(lease, "holder_key", None)
+    if owner and principal is not None and principal.kind == "key" and principal.actor == owner:
+        return True
     headers = getattr(request, "headers", None)
     label = ((headers.get("x-sf-client") if headers is not None else None) or "").strip()
-    if not label or any(holder_family(label) != holder_family(lease.holder) for lease in held):
+    if not label or holder_family(label) != holder_family(lease.holder):
         return False
     presented = ((headers.get(VACATE_TOKEN_HEADER) if headers is not None else None) or "").strip()
+    token = getattr(lease, "vacate_token", None)
+    if token and presented and _matches(presented, str(token)):
+        return True
+    if owner and not _owner_key_gone(state, owner):
+        return False
     peer = str(getattr(getattr(request, "client", None), "host", None) or "")
-    return all(_holder_proof(lease, peer=peer, presented=presented) for lease in held)
+    return _holder_proof(lease, peer=peer, presented="")
 
 
 def _peer_host(request: Request) -> str | None:
@@ -515,6 +562,22 @@ async def create_lease(
             "whole card. See docs/TENANTS.md, 'Extension point: share leases'.",
             param="exclusive",
         )
+    if vacate_url is not None and not is_admin_caller(request, state.config):
+        # 2.0.1: an ``inference`` key may take a lease, and a lease's vacate URL
+        # is a URL this server will POST to on the holder's say-so -- the same
+        # outbound call that keeps ``/warm`` admin. A non-admin holder's URL
+        # therefore obeys the tenant URL rule (loopback, tailnet,
+        # ``tenants.allowed_hosts``) instead of "any host but this server".
+        from studioforge.netguard import TenantUrlError, validate_tenant_url
+
+        try:
+            validate_tenant_url(
+                vacate_url,
+                field="vacate_url",
+                allowed_hosts=state.config.tenants.allowed_hosts,
+            )
+        except TenantUrlError as exc:
+            raise BadRequestError(str(exc), code="tenant_url_refused", param="vacate_url") from exc
     client_label = (request.headers.get("x-sf-client") or "").strip()
     # The registering peer is the holder's proof on the open unload routes
     # (D55, ``may_unload_lease_held``): stored on the lease, never shown.
@@ -554,11 +617,16 @@ def _require_lease_owner(state: Any, request: Request, lease_id: str) -> None:
 
     An unknown id is left for the manager to answer with its usual 404, so the
     ownership check never turns "no such lease" into a different status for an
-    admin.
+    admin. Besides an admin and the owning key, the holder's D55 proof
+    (:func:`lease_holder_may_act`) is accepted, so a lease no live key owns --
+    taken keyless or before 2.0.1, or by a key since revoked -- can still be
+    released by the tenant that took it instead of holding its card until the
+    idle TTL.
     """
     lease = state.manager.leases.get(lease_id)
-    if lease is not None:
-        require_owner(request, lease.holder_key, f"lease {lease_id}")
+    if lease is None or lease_holder_may_act(request, state, lease):
+        return
+    require_owner(request, lease.holder_key, f"lease {lease_id}")
 
 
 @router.delete("/leases/{lease_id}")
@@ -587,6 +655,12 @@ async def touch_lease(lease_id: str, request: Request) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Tenants (D77): the programs that share this rig's cards
 # ---------------------------------------------------------------------------
+
+
+def _tenant_owner_gone(state: Any, record: Any) -> bool:
+    """A registration whose registering key was revoked: any key may take it over."""
+    owner = getattr(record, "owner", None)
+    return bool(owner) and _owner_key_gone(state, str(owner))
 
 
 def _tenants(state: Any) -> Any:
@@ -685,10 +759,11 @@ async def register_tenant(
     registry = _tenants(state)
     owner = key_owner_of(request)
     existing = registry.get(str(name).strip().lower())
-    if existing is not None and existing.registered:
+    if existing is not None and existing.registered and not _tenant_owner_gone(state, existing):
         # Re-registering is the normal boot path -- for the key that registered.
         # A different inference key may not take over (and re-point the URLs of)
-        # a live registration (2.0.1).
+        # a live registration (2.0.1) -- unless the key that registered it has
+        # since been revoked (a tenant that rotated its key re-registers).
         require_owner(request, existing.owner, f"tenant {existing.name!r}")
     record = registry.register(payload, peer=peer, owner=owner)
     return registry.view(record, reveal_urls=True)
@@ -699,7 +774,9 @@ async def deregister_tenant(name: str, request: Request) -> dict[str, Any]:
     """The tenant says goodbye. A row the operator declared stays, unregistered."""
     state = _state(request)
     registry = _tenants(state)
-    require_owner(request, registry.require(name).owner, f"tenant {name!r}")
+    existing = registry.require(name)
+    if not _tenant_owner_gone(state, existing):
+        require_owner(request, existing.owner, f"tenant {name!r}")
     record = registry.deregister(name)
     return {"deregistered": registry.view(record, reveal_urls=True)}
 

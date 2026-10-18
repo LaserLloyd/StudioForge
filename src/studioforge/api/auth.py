@@ -665,16 +665,41 @@ def resolve_principal(
 
 
 def key_owner_of(request: Any) -> str | None:
-    """The ownership tag a lease or tenant row is stamped with: ``key:<id>``.
+    """The ownership tag a lease or tenant row is stamped with.
 
-    Only a scoped key has one. An owner session, ``server.api_key``, the PIN
-    and a local or in-process caller are ``None`` -- rows they create are
-    administered by an ``admin`` caller only.
+    Only a scoped key has one: ``key:<id>``, the only tag an ``inference``
+    key can ever match. An owner session, ``server.api_key``, the PIN and a
+    local or in-process caller are ``None`` -- shared or keyless credentials
+    that name no particular tenant. A ``None`` row (those, and every lease
+    written before 2.0.1) is administered by an ``admin`` caller, or by its
+    holder's D55 proof (``mgmt_routes.lease_holder_may_act``: the label plus
+    the registering peer or the lease's own token) -- the same proof that
+    already lets that holder unload the lease's models.
     """
     found = principal_of(request)
     if found is not None and found.kind == "key" and found.id:
         return found.actor
     return None
+
+
+def owner_check(principal: Principal | None, owner: str | None, what: str) -> None:
+    """403 unless ``principal`` may act on a row stamped with ``owner`` (2.0.1).
+
+    The principal-level rule behind :func:`require_owner`, shared with the MCP
+    tools (which have a principal but no request). ``None`` is an in-process
+    caller that never crossed a network and passes, like ``admin``.
+    """
+    if principal is None or principal.allows("admin"):
+        return
+    if owner and principal.kind == "key" and principal.actor == owner:
+        return
+    raise AuthError(
+        f"{what} was not created by this API key. A key with the `inference` scope may renew, "
+        "release or deregister only what it created itself; an `admin` key may act on any.",
+        code="permission_denied",
+        status_code=403,
+        details={"scope": principal.scope, "needed": "owner-or-admin"},
+    )
 
 
 def require_owner(request: Any, owner: str | None, what: str) -> None:
@@ -686,18 +711,7 @@ def require_owner(request: Any, owner: str | None, what: str) -> None:
     The message names the row kind and the rule but not the owner: which key
     holds a card is not the asker's business.
     """
-    established = principal_of(request)
-    if established is None or established.allows("admin"):
-        return
-    if owner and established.kind == "key" and established.actor == owner:
-        return
-    raise AuthError(
-        f"{what} was not created by this API key. A key with the `inference` scope may renew, "
-        "release or deregister only what it created itself; an `admin` key may act on any.",
-        code="permission_denied",
-        status_code=403,
-        details={"scope": established.scope, "needed": "owner-or-admin"},
-    )
+    owner_check(principal_of(request), owner, what)
 
 
 def deny_scope(principal: Principal, need: str, action: str) -> AuthError:
