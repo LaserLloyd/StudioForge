@@ -1,19 +1,17 @@
-"""The version is spelled three ways; this pins all three to the same date.
+"""The version is spelled in several places; this pins them to one string.
 
-StudioForge is calendar-versioned. The display string -- what ``/health``, the
-GUI footer, the MCP ``server_status`` tool and the GitHub User-Agent all report
--- is ``1.26-09-23``: a major, then the release date. PEP 440 has no way to
-spell a hyphenated date, so the two ``pyproject.toml`` files carry the same
-date as ``1.26.9.23``, which is what ``pip``/``uv`` see in the wheel metadata.
-Release tags are ``v1.26-09-23``.
+StudioForge is semantically versioned since 2.0.0 (the prosumer refactor). The
+display string -- what ``/health``, the GUI footer, the MCP ``server_status``
+tool and the GitHub User-Agent all report -- is ``2.0.0``, the two
+``pyproject.toml`` files carry the same string, and release tags are ``v2.0.0``.
+Releases before 2.0.0 were calendar-versioned (``1.26-09-23`` on display,
+``1.26.9.23`` in PEP 440 metadata), and the updater's ``_version_key`` still
+reads both spellings so an install on either scheme orders the other correctly.
 
-Three spellings is two chances to drift, and the drift is silent: the updater
-compares ``/health``'s version against a GitHub tag, so a mismatch shows up as
-"already running the latest" against a release that is genuinely newer, or as
-a rollback of a perfectly healthy update. Hence this file. Nothing in the app
-parses ``__version__`` with ``packaging`` -- it could not, the string is not
-PEP 440 -- and ``_version_key`` is the junk-tolerant parser that has to read
-both spellings as the same number.
+Several spellings is several chances to drift, and the drift is silent: the
+updater compares ``/health``'s version against a GitHub tag, so a mismatch
+shows up as "already running the latest" against a release that is genuinely
+newer, or as a rollback of a perfectly healthy update. Hence this file.
 
 The two user-facing docs that quote the version verbatim (the README status
 line and the OPENCLAW-SETUP ``/health`` sample) are pinned here too: on
@@ -37,12 +35,16 @@ if str(COMPANION_SRC) not in sys.path:
 
 import studioforge_companion  # noqa: E402
 
-#: The human/display version, and the tag with its ``v``.
-DISPLAY_VERSION = "1.26-09-23"
-#: The same date, as the only thing PEP 440 will accept.
-PEP440_VERSION = "1.26.9.23"
-#: The release before this one; the new version must sort above it.
-PREVIOUS_RELEASE = "1.26-09-04-3"
+#: The human/display version, and the tag with its ``v``. SemVer since 2.0.0.
+DISPLAY_VERSION = "2.0.0"
+#: The package metadata; identical to the display version under SemVer.
+PEP440_VERSION = "2.0.0"
+#: The release before this one (the last calendar-versioned tag); the new
+#: version must sort above it across the two schemes.
+PREVIOUS_RELEASE = "1.26-09-23"
+#: Every earlier calendar release must sort below 2.0.0 too, or the updater
+#: would offer an old tag as an "update" to a 2.x install.
+OLDER_CALENDAR_RELEASES = ("1.26-09-04-3", "1.26-08-23", "1.26.8.23", "v1.26-09-23")
 
 
 def _pyproject_version(path: Path) -> str:
@@ -78,6 +80,22 @@ def test_the_new_version_is_newer_than_the_old_one() -> None:
     assert _version_key(studioforge.__version__) > _version_key(PREVIOUS_RELEASE), (
         "the updater would offer the previous release as an update"
     )
+
+
+def test_semver_sorts_above_every_calendar_release() -> None:
+    """2.0.0 follows the calendar-versioned 1.26-* line in the updater's ordering.
+
+    ``_version_key`` reads ``1.26-09-23`` as ``(1, 26, 9, 23)`` and ``2.0.0`` as
+    ``(2, 0, 0)``; the major number is what makes the scheme change safe, so a
+    2.x server never sees an old calendar tag as newer, and a 1.26 server sees
+    the 2.0.0 tag as the update it is.
+    """
+    new = _version_key(studioforge.__version__)
+    assert new == (2, 0, 0)
+    for old in OLDER_CALENDAR_RELEASES + (PREVIOUS_RELEASE,):
+        assert new > _version_key(old), old
+    assert _version_key("v2.0.0") == new
+    assert _version_key("2.0.1") > new > _version_key("1.99-12-31")
 
 
 def test_the_docs_quote_the_current_version() -> None:

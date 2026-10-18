@@ -5,7 +5,7 @@
 ; file. Replace every TODO before shipping.
 ;
 ; Build (on a Windows runner with Inno Setup 6 installed):
-;   iscc /DAppVersion=1.26-09-23 /DPayloadDir=..\..\dist\windows\payload deploy\windows\studioforge.iss
+;   iscc /DAppVersion=2.0.0 /DPayloadDir=..\..\dist\windows\payload deploy\windows\studioforge.iss
 ;
 ; What the installer does
 ;   1. copies the payload (embedded Python + the venv built from the release

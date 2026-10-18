@@ -9,9 +9,10 @@ name: Containers
 # on the live repository; use a fork, or run `workflow_dispatch` with push=false.
 #
 # Channels, by tag shape:
-#   v1.26-09-23              -> stable. Tags: <ver>-<backend> and stable-<backend>
-#   v1.26-09-23-beta.2       -> beta.   Tags: <ver>-<backend> and beta-<backend>
-#   (a hyphenated calendar version is a stable tag; only -beta.N / -rc.N make a beta)
+#   v2.0.0                   -> stable. Tags: <ver>-<backend> and stable-<backend>
+#   v2.0.0-beta.2            -> beta.   Tags: <ver>-<backend> and beta-<backend>
+#   (a plain version is a stable tag; only -beta.N / -rc.N make a beta; the old
+#    calendar tags such as v1.26-09-23 sort below 2.0.0 in core/updater.py)
 #
 # Dormant on purpose (documented in docs/deploy/release-pipeline.md):
 #   * windows-sign and macos-notarize run ONLY when the owner has created the
