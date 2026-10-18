@@ -1,5 +1,5 @@
 {
-  "count": 105,
+  "count": 109,
   "env_nested_delimiter": "__",
   "env_prefix": "SF_",
   "levels": [
@@ -779,6 +779,71 @@
       "secret": false,
       "section": "engine",
       "type": "bool"
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": true,
+      "description": "STRICT_GPU: every load is fully resident on the GPU (`-ngl 999 --fit off` are always passed; --cpu-moe / --n-cpu-moe / --no-kv-offload and the other CPU-offload flags are refused). false only makes a model's own, off-by- default `allow_partial_cpu_offload` setting effective -- see docs/ENGINES.md.",
+      "env": "SF_ENGINE__STRICT_GPU",
+      "key": "engine.strict_gpu",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "engine",
+      "type": "bool"
+    },
+    {
+      "choices": [
+        "balanced",
+        "fastest_replies",
+        "fastest_long_prompts"
+      ],
+      "constraints": {},
+      "default": "balanced",
+      "description": "Which backend to favour when several are benchmarked for a GPU: balanced, fastest_replies (token generation) or fastest_long_prompts (prompt processing). Nothing benchmarks on its own; see docs/ENGINES.md.",
+      "env": "SF_ENGINE__PREFERENCE",
+      "key": "engine.preference",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "engine",
+      "type": "\"balanced\" | \"fastest_replies\" | \"fastest_long_prompts\""
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": false,
+      "description": "True = refuse to install an engine archive that has no published SHA-256. false (default) installs it, records verified: false and warns.",
+      "env": "SF_ENGINE__REQUIRE_VERIFIED",
+      "key": "engine.require_verified",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "engine",
+      "type": "bool"
+    },
+    {
+      "choices": [
+        "auto",
+        "nvml",
+        "cuda",
+        "rocm",
+        "vulkan",
+        "metal",
+        "null",
+        "fake"
+      ],
+      "constraints": {},
+      "default": "auto",
+      "description": "Auto = NVML, then ROCm, then Vulkan, then Metal; the first that lists a GPU wins. Force nvml / cuda / rocm / vulkan / metal to skip the others. Restart required. (`SF_GPU_PROBE` is the env equivalent while this is auto.)",
+      "env": "SF_GPU__BACKEND",
+      "key": "gpu.backend",
+      "level": "advanced",
+      "restart_required": true,
+      "secret": false,
+      "section": "gpu",
+      "type": "\"auto\" | \"nvml\" | \"cuda\" | \"rocm\" | \"vulkan\" | \"metal\" | \"null\" | \"fake\""
     },
     {
       "choices": null,

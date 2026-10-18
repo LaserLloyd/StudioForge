@@ -465,6 +465,33 @@ _ENTRIES: tuple[ErrorEntry, ...] = (
     ),
     # --- downloads, engines, updates --------------------------------------
     _e(
+        "engine_checksum_mismatch",
+        502,
+        _SERVER,
+        "The downloaded engine archive does not match its published SHA-256.",
+        "Retry the download (`studioforge engine install <tag>`); if it fails again the upstream "
+        "asset or your network path is corrupt: pick another tag or check a proxy. Never activate "
+        "an engine whose checksum failed.",
+    ),
+    _e(
+        "engine_unverified_refused",
+        422,
+        _SERVER,
+        "This release publishes no checksum for the engine archive and engine.require_verified "
+        "is on.",
+        "Choose a release that publishes a digest or SHA256SUMS, build from source "
+        "(`studioforge engine install --source <tag>`), or set engine.require_verified to false "
+        "to accept an unverified archive (recorded as verified: false).",
+    ),
+    _e(
+        "engine_benchmark_unconfirmed",
+        500,
+        _SERVER,
+        "The engine benchmark was requested without explicit confirmation.",
+        "Benchmarks load models on the GPUs; run `studioforge engine benchmark --yes` when the "
+        "GPUs are idle.",
+    ),
+    _e(
         "downloads_unavailable",
         400,
         _INVALID,

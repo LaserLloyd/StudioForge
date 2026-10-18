@@ -108,12 +108,39 @@
       "surface": "mcp"
     },
     {
+      "code": "engine_benchmark_unconfirmed",
+      "docs": "errors/engine_benchmark_unconfirmed",
+      "error_type": "server_error",
+      "fix": "Benchmarks load models on the GPUs; run `studioforge engine benchmark --yes` when the GPUs are idle.",
+      "http_status": 500,
+      "message": "The engine benchmark was requested without explicit confirmation.",
+      "surface": "api"
+    },
+    {
+      "code": "engine_checksum_mismatch",
+      "docs": "errors/engine_checksum_mismatch",
+      "error_type": "server_error",
+      "fix": "Retry the download (`studioforge engine install <tag>`); if it fails again the upstream asset or your network path is corrupt: pick another tag or check a proxy. Never activate an engine whose checksum failed.",
+      "http_status": 502,
+      "message": "The downloaded engine archive does not match its published SHA-256.",
+      "surface": "api"
+    },
+    {
       "code": "engine_error",
       "docs": "errors/engine_error",
       "error_type": "server_error",
       "fix": "Check connectivity and disk space, then retry the install (Server tab or POST /api/engine/install); GET /api/engine shows what is installed.",
       "http_status": 500,
       "message": "An engine could not be resolved, installed or verified: {reason}.",
+      "surface": "api"
+    },
+    {
+      "code": "engine_unverified_refused",
+      "docs": "errors/engine_unverified_refused",
+      "error_type": "server_error",
+      "fix": "Choose a release that publishes a digest or SHA256SUMS, build from source (`studioforge engine install --source <tag>`), or set engine.require_verified to false to accept an unverified archive (recorded as verified: false).",
+      "http_status": 422,
+      "message": "This release publishes no checksum for the engine archive and engine.require_verified is on.",
       "surface": "api"
     },
     {
