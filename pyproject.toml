@@ -181,3 +181,9 @@ markers = [
 ]
 filterwarnings = ["ignore::DeprecationWarning"]
 timeout = 300
+
+[tool.uv]
+# uv caches this project's own built wheel and by default only rebuilds it when
+# pyproject.toml/setup.* change; the container builds keep that cache in a persistent
+# mount with a non-editable install, so list the sources too (2026-10 review finding).
+cache-keys = [{ file = "pyproject.toml" }, { file = "src/**/*.py" }, { file = "src/**/*.html" }, { file = "src/**/*.css" }, { file = "src/**/*.js" }, { file = "src/**/*.sql" }]
