@@ -9,6 +9,20 @@ the decisions each one carries rather than repeating them.
 To see what a running server includes, ask it: `GET /api/capabilities` lists every decision number
 the build implements, and the `build` field on `/health` names the exact commit.
 
+## 2.0.1
+
+### Fixed
+
+- D80: the tenant side of the VRAM protocol no longer needs an `admin` key. `POST /api/leases`,
+  `POST /api/leases/{id}/touch`, `DELETE /api/leases/{id}`, `POST /api/tenants/register` and
+  `DELETE /api/tenants/{name}` are `inference` scope (were `admin`, so SpeechForge and ClawForge2,
+  which hold `inference` keys, got `403` taking a lease). Each lease and registration is bound to the
+  key that created it: another `inference` key cannot renew, release, re-register or deregister it
+  (`403 permission_denied`); an `admin` key still can. Warming a tenant stays `admin`. Schema 10 adds
+  `gpu_leases.holder_key` (migration 010, backed up first by `studioforge migrate`); a lease taken
+  before the upgrade, or by an admin key, has no `inference` owner and is administered by `admin`
+  callers until it is released or idles out.
+
 ## 2.0.0 (unreleased; branch `refactor/prosumer-2026`)
 
 The first release on the new version scheme: `2.0.0` follows `1.26-09-23`, and the updater orders

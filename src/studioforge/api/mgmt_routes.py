@@ -22,9 +22,11 @@ from studioforge.api.auth import (
     PIN_WITHHELD_NOTE,
     _matches,
     is_admin_caller,
+    key_owner_of,
     may_reveal_pin,
     redact_config_dict,
     require_admin_action,
+    require_owner,
 )
 from studioforge.build import build_id
 from studioforge.config import RESTART_REQUIRED_KEYS, apply_overrides
@@ -527,6 +529,9 @@ async def create_lease(
         "vacate_url": vacate_url,
         "vacate_token": vacate_token,
         "holder_peer": peer,
+        # 2.0.1: the key that took the lease is the only non-admin key that may
+        # renew or release it (``require_owner``).
+        "holder_key": key_owner_of(request),
     }
     if devices is None or isinstance(devices, str):
         if isinstance(devices, str) and devices.strip().lower() != "auto":
@@ -544,16 +549,38 @@ async def create_lease(
     return lease_view(lease, reveal_vacate_url=True)
 
 
+def _require_lease_owner(state: Any, request: Request, lease_id: str) -> None:
+    """403 unless this caller may act on lease ``lease_id`` (see ``auth.require_owner``).
+
+    An unknown id is left for the manager to answer with its usual 404, so the
+    ownership check never turns "no such lease" into a different status for an
+    admin.
+    """
+    lease = state.manager.leases.get(lease_id)
+    if lease is not None:
+        require_owner(request, lease.holder_key, f"lease {lease_id}")
+
+
 @router.delete("/leases/{lease_id}")
 async def release_lease(lease_id: str, request: Request) -> dict[str, Any]:
+    """Release a lease -- also how a holder answers a vacate request (D56).
+
+    An ``admin`` caller may release any lease; an ``inference`` key only the
+    one it took (``403 permission_denied`` otherwise, 2.0.1).
+    """
     state = _state(request)
+    _require_lease_owner(state, request, lease_id)
     return {"released": lease_view(state.manager.release_lease(lease_id))}
 
 
 @router.post("/leases/{lease_id}/touch")
 async def touch_lease(lease_id: str, request: Request) -> dict[str, Any]:
-    """Restart the idle clock -- for a holder outside this server that is still busy."""
+    """Restart the idle clock -- for a holder outside this server that is still busy.
+
+    Same ownership rule as the release: an ``inference`` key renews only its own lease.
+    """
     state = _state(request)
+    _require_lease_owner(state, request, lease_id)
     return lease_view(state.manager.touch_lease(lease_id))
 
 
@@ -627,11 +654,13 @@ async def register_tenant(
     """A tenant announces itself (D77). Re-sent at every boot; idempotent.
 
     Same gate as ``POST /api/leases`` (D32): this machine, the MCP PIN, or a
-    key. ``name`` is the registry key and should be the tenant's
-    ``holder_family`` (lower-case); a name the operator declared in
-    ``tenants.registry`` keeps its declared ``kind``/``family``/``notes`` and
-    takes the URLs sent here. Every URL must be loopback, a tailnet address or
-    a host in ``tenants.allowed_hosts`` (``400 tenant_url_refused`` otherwise);
+    key -- an ``inference`` key is enough (2.0.1), and the registration is then
+    bound to it: another non-admin key may not refresh or deregister it.
+    ``name`` is the registry key and should be the tenant's ``holder_family``
+    (lower-case); a name the operator declared in ``tenants.registry`` keeps
+    its declared ``kind``/``family``/``notes`` and takes the URLs sent here.
+    Every URL must be loopback, a tailnet address or a host in
+    ``tenants.allowed_hosts`` (``400 tenant_url_refused`` otherwise);
     ``health_url`` is then polled every ``tenants.health_interval_s``.
     ``protocol`` may be sent and must be ``vt.1``. StudioForge never starts or
     stops the registrant (D79); registering says "I exist, here is where to
@@ -654,7 +683,14 @@ async def register_tenant(
         "notes": notes,
     }
     registry = _tenants(state)
-    record = registry.register(payload, peer=peer)
+    owner = key_owner_of(request)
+    existing = registry.get(str(name).strip().lower())
+    if existing is not None and existing.registered:
+        # Re-registering is the normal boot path -- for the key that registered.
+        # A different inference key may not take over (and re-point the URLs of)
+        # a live registration (2.0.1).
+        require_owner(request, existing.owner, f"tenant {existing.name!r}")
+    record = registry.register(payload, peer=peer, owner=owner)
     return registry.view(record, reveal_urls=True)
 
 
@@ -663,6 +699,7 @@ async def deregister_tenant(name: str, request: Request) -> dict[str, Any]:
     """The tenant says goodbye. A row the operator declared stays, unregistered."""
     state = _state(request)
     registry = _tenants(state)
+    require_owner(request, registry.require(name).owner, f"tenant {name!r}")
     record = registry.deregister(name)
     return {"deregistered": registry.view(record, reveal_urls=True)}
 

@@ -39,7 +39,7 @@ log = get_logger(__name__)
 
 #: Highest migration version this build of the code ships. ``migrate()``
 #: brings any older database up to this.
-SCHEMA_VERSION: int = 9
+SCHEMA_VERSION: int = 10
 
 #: SQLite's own words for "this file is not a usable database". Only a message
 #: carrying one of these is treated as corruption by ``migrate_with_recovery``;
@@ -1130,6 +1130,7 @@ class Database:
             "vacate_url": row.get("vacate_url"),
             "vacate_token": row.get("vacate_token"),
             "holder_peer": row.get("holder_peer"),
+            "holder_key": row.get("holder_key"),
             "updated_at": float(row.get("updated_at") or now),
         }
         columns = list(values)

@@ -73,8 +73,8 @@ Sessions in the panel use the owner password (argon2id) or an admin key; see bel
 | Scope | May | Examples |
 | --- | --- | --- |
 | `read` | look | `GET` anything except accounts, keys, audit, doctor; `/v1/models`; `/metrics`; MCP read tools |
-| `inference` | read + use the models | `POST /v1/chat/completions`, `/v1/messages`, `/v1/responses`, `/api/v0/*`, `/api/v1/*`; load, unload and test a model; MCP `load_model` |
-| `admin` | change the box | config, restart, engine install/activate, updates, downloads, delete, pin, leases, tenants, keys, accounts, audit, doctor, support bundle; MCP destructive tools |
+| `inference` | read + use the models | `POST /v1/chat/completions`, `/v1/messages`, `/v1/responses`, `/api/v0/*`, `/api/v1/*`; load, unload and test a model; **the tenant side of the VRAM protocol** (take, renew and release your own lease; register and deregister yourself); MCP `load_model` |
+| `admin` | change the box | config, restart, engine install/activate, updates, downloads, delete, pin, keys, accounts, audit, doctor, support bundle, releasing or renewing another key's lease, warming a tenant; MCP destructive tools |
 
 The mapping is code, not convention: `api/auth.py:required_scope`. It matches by prefix
 (`/v1/`, `/api/v0/`, `/api/v1/`), so routes added later are covered without an edit, and any
@@ -82,6 +82,18 @@ mutating route nobody classified needs `admin`.
 
 A scope is enforced whenever a credential is presented, even on an install that needs none: a read
 key cannot `POST`.
+
+**Tenants hold `inference` keys (2.0.1, D80).** A program that shares the rig's cards (SpeechForge,
+ClawForge2, a benchmark harness) never needs `admin`: `POST /api/leases`,
+`POST /api/leases/{id}/touch`, `DELETE /api/leases/{id}` (which is also how a holder answers a vacate
+request), `POST /api/tenants/register` and `DELETE /api/tenants/{name}` are `inference`
+(`api/auth.py:_TENANT_PROTOCOL_ROUTES`). Each lease and each registration is stamped with the key that
+created it, and a non-admin key can renew, release or re-register only its own: another `inference`
+key gets `403 permission_denied`, and an `admin` key can act on any. A lease taken by an admin key, an
+owner session or a local caller, or one that predates 2.0.1, has no `inference` owner and is
+administered by `admin` callers only. `POST /api/tenants/{name}/warm` stays `admin` (the server makes
+an outbound call to a registered URL). On an install with no keys the D32 rule is unchanged: these
+routes still need a caller on this machine or the MCP PIN.
 
 ### Keys
 

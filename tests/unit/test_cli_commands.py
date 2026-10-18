@@ -516,7 +516,7 @@ def test_users_create_reads_a_password_from_stdin(scratch: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def old_database(path: Path, upto: int = 8) -> None:
+def old_database(path: Path, upto: int = 9) -> None:
     connection = sqlite3.connect(path)
     connection.execute(
         "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at REAL, name TEXT)"
@@ -524,6 +524,8 @@ def old_database(path: Path, upto: int = 8) -> None:
     connection.executemany(
         "INSERT INTO schema_migrations VALUES (?, 0, 'old')", [(v,) for v in range(1, upto + 1)]
     )
+    # the table migration 010 alters, as migration 008 left it
+    connection.execute("CREATE TABLE gpu_leases (id TEXT PRIMARY KEY)")
     connection.execute("CREATE TABLE precious (x TEXT)")
     connection.execute("INSERT INTO precious VALUES ('keep me')")
     connection.commit()
@@ -536,14 +538,14 @@ def test_migrate_dry_run_changes_nothing(scratch: Path) -> None:
     before = db.read_bytes()
     result = invoke(scratch, "migrate", "--dry-run", "--json")
     summary = json.loads(result.output)
-    assert summary["current"] == 8 and summary["pending"] == [
-        {"version": 9, "name": "009_accounts_keys.sql"}
+    assert summary["current"] == 9 and summary["pending"] == [
+        {"version": 10, "name": "010_lease_holder_key.sql"}
     ]
     assert summary["dry_run"] is True and "backup" not in summary
     assert db.read_bytes() == before
     assert not (scratch.parent / "backups").exists()
     human = invoke(scratch, "migrate", "--dry-run").output
-    assert "Would apply" in human and "009" in human and "nothing was changed" in human
+    assert "Would apply" in human and "010" in human and "nothing was changed" in human
 
 
 def test_migrate_applies_after_taking_a_backup(scratch: Path) -> None:
@@ -551,14 +553,14 @@ def test_migrate_applies_after_taking_a_backup(scratch: Path) -> None:
     old_database(db)
     result = invoke(scratch, "migrate", "--json")
     summary = json.loads(result.output)
-    assert summary["applied"] == [9] and summary["current"] == 9
+    assert summary["applied"] == [10] and summary["current"] == 10
     backup = Path(summary["backup"])
     assert backup.is_file() and backup.name == "registry.sqlite3"
-    assert backup.parent.parent.name == "backups" and "schema8" in backup.parent.name
+    assert backup.parent.parent.name == "backups" and "schema9" in backup.parent.name
     saved = sqlite3.connect(backup)
     try:
         assert saved.execute("SELECT x FROM precious").fetchone() == ("keep me",)
-        assert saved.execute("SELECT MAX(version) FROM schema_migrations").fetchone() == (8,)
+        assert saved.execute("SELECT MAX(version) FROM schema_migrations").fetchone() == (9,)
     finally:
         saved.close()
     now = sqlite3.connect(db)
@@ -588,7 +590,7 @@ def test_migrate_prunes_only_its_own_backup_folders(scratch: Path) -> None:
 
 def test_migrate_with_no_database_previews_the_whole_chain(scratch: Path) -> None:
     summary = json.loads(invoke(scratch, "migrate", "--dry-run", "--json").output)
-    assert summary["exists"] is False and summary["current"] == 0 and len(summary["pending"]) == 9
+    assert summary["exists"] is False and summary["current"] == 0 and len(summary["pending"]) == 10
 
 
 def test_doctor_text_and_json_and_exit_codes(scratch: Path) -> None:

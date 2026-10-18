@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import hmac
 import math
+import re
 import time
 from typing import Any
 
@@ -208,6 +209,32 @@ _ADMIN_SETTINGS_SUFFIXES: tuple[tuple[str, str], ...] = (
     ("PATCH", "/settings"),
 )
 _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+#: The tenant half of the VRAM Tenant Protocol (D43/D56/D77, ``docs/TENANTS.md``):
+#: the calls a program that SHARES this rig's cards makes about itself -- take,
+#: renew and release its own lease (a release is also the vacate
+#: acknowledgement: a holder asked to leave answers by releasing), register and
+#: deregister itself. A tenant such as SpeechForge or ClawForge2 holds an
+#: ``inference`` key and must never need an ``admin`` one for these (2.0.1).
+#: The matching routes check ownership in the handler (:func:`require_owner`):
+#: a non-admin key reaches only what it created. Everything else under
+#: ``/api/leases`` and ``/api/tenants`` stays ``admin`` -- notably
+#: ``POST /api/tenants/{name}/warm``, where the SERVER makes an outbound call to
+#: a registered URL on someone's say-so.
+_TENANT_PROTOCOL_ROUTES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("POST", re.compile(r"/api/leases/?")),
+    ("DELETE", re.compile(r"/api/leases/[^/]+/?")),
+    ("POST", re.compile(r"/api/leases/[^/]+/touch/?")),
+    ("POST", re.compile(r"/api/tenants/register/?")),
+    ("DELETE", re.compile(r"/api/tenants/(?!register/?$)[^/]+/?")),
+)
+
+
+def is_tenant_protocol(method: str, path: str) -> bool:
+    """Whether ``method path`` is one of the calls a tenant makes for itself."""
+    verb = (method or "").upper()
+    return any(verb == v and pattern.fullmatch(path) for v, pattern in _TENANT_PROTOCOL_ROUTES)
+
 
 #: Exact paths that are POSTs by shape but reads by effect, and so stay open
 #: even under an admin prefix. Checked FIRST, ahead of the prefix match,
@@ -462,6 +489,11 @@ def required_scope(
     * Reads (GET/HEAD) are ``read``, except the account/audit/doctor pages.
     * ``/v1/*``, ``/api/v0/*``, ``/api/v1/*`` POSTs (chat, completions, embeddings,
       native load/unload) are ``inference``; the native model download is ``admin``.
+    * The tenant half of the VRAM protocol (:func:`is_tenant_protocol`: take,
+      renew or release a lease; register or deregister a tenant) is
+      ``inference``; the handlers then bind each lease and registration to the
+      key that created it. The rest of ``/api/leases`` and ``/api/tenants`` is
+      ``admin``.
     * Every route the D32 prefix list guards is ``admin``, and so is every
       other mutating ``/api`` route, except loading/unloading/testing a model.
     * ``/health?deep=true`` runs a real completion per model: ``inference``.
@@ -473,6 +505,8 @@ def required_scope(
         return "inference" if deep else "read"
     if verb in {"GET", "HEAD", "OPTIONS"}:
         return "admin" if path.startswith(_ADMIN_READ_PREFIXES) else "read"
+    if is_tenant_protocol(verb, path):
+        return "inference"
     if is_admin_mutation(verb, path):
         return "admin"
     if path.startswith("/api/v1/models/download"):
@@ -628,6 +662,42 @@ def resolve_principal(
                 _warn_pin_deprecated()
             return Principal("pin", "", "mcp-pin", "admin")
     return None
+
+
+def key_owner_of(request: Any) -> str | None:
+    """The ownership tag a lease or tenant row is stamped with: ``key:<id>``.
+
+    Only a scoped key has one. An owner session, ``server.api_key``, the PIN
+    and a local or in-process caller are ``None`` -- rows they create are
+    administered by an ``admin`` caller only.
+    """
+    found = principal_of(request)
+    if found is not None and found.kind == "key" and found.id:
+        return found.actor
+    return None
+
+
+def require_owner(request: Any, owner: str | None, what: str) -> None:
+    """403 unless the caller may act on a row stamped with ``owner`` (2.0.1).
+
+    An ``admin`` caller may act on any row; so may a request with no
+    established principal (an in-process call that never crossed a network).
+    Anyone else -- an ``inference`` key -- only on a row its own key created.
+    The message names the row kind and the rule but not the owner: which key
+    holds a card is not the asker's business.
+    """
+    established = principal_of(request)
+    if established is None or established.allows("admin"):
+        return
+    if owner and established.kind == "key" and established.actor == owner:
+        return
+    raise AuthError(
+        f"{what} was not created by this API key. A key with the `inference` scope may renew, "
+        "release or deregister only what it created itself; an `admin` key may act on any.",
+        code="permission_denied",
+        status_code=403,
+        details={"scope": established.scope, "needed": "owner-or-admin"},
+    )
 
 
 def deny_scope(principal: Principal, need: str, action: str) -> AuthError:

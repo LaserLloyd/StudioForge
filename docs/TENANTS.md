@@ -153,7 +153,11 @@ noise. To invoke D56, name the card.
 ## 7. The HTTP contract
 
 Auth is StudioForge's (D32): reads are open on the LAN; every mutation below needs a caller on the
-box, the MCP PIN (`X-MCP-Pin`), or `server.api_key` as a bearer when one is set. Errors are the
+box, the MCP PIN (`X-MCP-Pin`), `server.api_key` as a bearer when one is set, or -- once keys exist --
+a scoped key with the **`inference`** scope (2.0.1, D80: a tenant never needs `admin`). The lease or
+registration a key creates is bound to it: renewing, releasing, re-registering or deregistering
+needs that same key (or an `admin` one), otherwise `403 permission_denied`. Only `POST
+/api/tenants/{name}/warm` needs `admin`. Errors are the
 OpenAI envelope: `{"error": {"message", "type", "code", "param", "studioforge": {...details}}}`;
 every retryable refusal also carries a `Retry-After` header.
 

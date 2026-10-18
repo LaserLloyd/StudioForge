@@ -7559,3 +7559,35 @@ dialog text, `sfctl tenants list --help`, the runbook's tenant section, the MCP 
 docstring, `TenantEntry`'s docstring. No code implements a launch, and `test_tenants.py` asserts
 that the config model carries no command, launcher, argv or working-directory field -- the shape a
 "start it for me" feature would need -- so adding one fails a test before it can be wired.
+
+## D80 -- The tenant half of the protocol is `inference` scope, bound to the creating key
+
+**Problem.** 2.0.0 classified every `/api/leases` and `/api/tenants` mutation `admin`
+(`api/auth.py`, the D32 prefix list reused as the scope table). SpeechForge and ClawForge2 hold
+`inference` keys, so taking a lease returned `403 permission_denied` on the first live rig that ran
+2.0.0 with keys enabled. Handing every tenant an `admin` key would have fixed the symptom by making
+each program able to rewrite the config, install engines and mint keys.
+
+**Decision.** The calls a tenant makes *about itself* are `inference`: take, renew (`touch`) and
+release a lease (a release is also the vacate acknowledgement), register and deregister. They are
+listed in one place, `auth._TENANT_PROTOCOL_ROUTES`, and `required_scope` consults it before the
+admin prefix list. Everything else under the prefixes stays `admin`, including the warm relay (the
+server dials a URL a tenant registered) and any unclassified mutation. The D32 open-install gate
+(`is_admin_mutation`) is untouched: with no credentials these routes still need this machine or the
+PIN.
+
+Because `inference` keys are now many principals sharing one route, **ownership is checked in the
+handler**: a lease is stamped with `key:<id>` of the key that took it (`GpuLease.holder_key`, column
+`gpu_leases.holder_key`, migration 010, never shown in any dump), a tenant row with the registering
+key (in memory, like the registration). `auth.require_owner` lets an `admin` caller or the owning key
+through and answers any other key `403 permission_denied` without naming the owner. A row with no
+key owner (admin key, owner session, local caller, pre-2.0.1 lease) is administered by `admin`
+callers only -- the safe default, at the cost that a lease inherited across the upgrade must be
+released by an admin or left to idle out.
+
+**Not done.** Binding by holder *name* instead of by key was rejected: the name is a string the
+caller chooses. The MCP `reserve_gpus` / `release_gpus` tools keep their own policy
+(`mcp_policy.py`); tenants use REST.
+
+**Surfaces.** `docs/SECURITY.md` (scopes), `docs/TENANTS.md` §7, `CHANGELOG.md` 2.0.1,
+`tests/unit/test_lease_scope_inference.py`.

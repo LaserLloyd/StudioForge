@@ -818,7 +818,7 @@
   "info": {
     "description": "GPU-only OpenAI-compatible LLM gateway over llama.cpp llama-server",
     "title": "StudioForge",
-    "version": "2.0.0"
+    "version": "2.0.1"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -2251,6 +2251,7 @@
     },
     "/api/leases/{lease_id}": {
       "delete": {
+        "description": "Release a lease -- also how a holder answers a vacate request (D56).\n\nAn ``admin`` caller may release any lease; an ``inference`` key only the\none it took (``403 permission_denied`` otherwise, 2.0.1).",
         "operationId": "release_lease_api_leases__lease_id__delete",
         "parameters": [
           {
@@ -2295,7 +2296,7 @@
     },
     "/api/leases/{lease_id}/touch": {
       "post": {
-        "description": "Restart the idle clock -- for a holder outside this server that is still busy.",
+        "description": "Restart the idle clock -- for a holder outside this server that is still busy.\n\nSame ownership rule as the release: an ``inference`` key renews only its own lease.",
         "operationId": "touch_lease_api_leases__lease_id__touch_post",
         "parameters": [
           {
@@ -4402,7 +4403,7 @@
     },
     "/api/tenants/register": {
       "post": {
-        "description": "A tenant announces itself (D77). Re-sent at every boot; idempotent.\n\nSame gate as ``POST /api/leases`` (D32): this machine, the MCP PIN, or a\nkey. ``name`` is the registry key and should be the tenant's\n``holder_family`` (lower-case); a name the operator declared in\n``tenants.registry`` keeps its declared ``kind``/``family``/``notes`` and\ntakes the URLs sent here. Every URL must be loopback, a tailnet address or\na host in ``tenants.allowed_hosts`` (``400 tenant_url_refused`` otherwise);\n``health_url`` is then polled every ``tenants.health_interval_s``.\n``protocol`` may be sent and must be ``vt.1``. StudioForge never starts or\nstops the registrant (D79); registering says \"I exist, here is where to\nlook\", nothing more. The reply is the row as stored, URLs included.",
+        "description": "A tenant announces itself (D77). Re-sent at every boot; idempotent.\n\nSame gate as ``POST /api/leases`` (D32): this machine, the MCP PIN, or a\nkey -- an ``inference`` key is enough (2.0.1), and the registration is then\nbound to it: another non-admin key may not refresh or deregister it.\n``name`` is the registry key and should be the tenant's ``holder_family``\n(lower-case); a name the operator declared in ``tenants.registry`` keeps\nits declared ``kind``/``family``/``notes`` and takes the URLs sent here.\nEvery URL must be loopback, a tailnet address or a host in\n``tenants.allowed_hosts`` (``400 tenant_url_refused`` otherwise);\n``health_url`` is then polled every ``tenants.health_interval_s``.\n``protocol`` may be sent and must be ``vt.1``. StudioForge never starts or\nstops the registrant (D79); registering says \"I exist, here is where to\nlook\", nothing more. The reply is the row as stored, URLs included.",
         "operationId": "register_tenant_api_tenants_register_post",
         "requestBody": {
           "content": {

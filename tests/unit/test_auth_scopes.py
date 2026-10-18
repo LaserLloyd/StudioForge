@@ -158,7 +158,7 @@ def test_revoking_the_last_key_does_not_reopen_a_network_bound_server(tmp_path: 
         ("POST", "/api/engine/install", "admin"),
         ("POST", "/api/update/install", "admin"),
         ("POST", "/api/downloads", "admin"),
-        ("POST", "/api/leases", "admin"),
+        ("POST", "/api/leases", "inference"),  # tenant protocol (2.0.1)
         ("GET", "/api/keys", "admin"),
         ("POST", "/api/keys", "admin"),
         ("GET", "/api/users", "admin"),
