@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -203,6 +204,12 @@ class AmdSmiStatic:
     driver: str | None = None
 
 
+def _subdict(record: dict[str, Any], key: str) -> dict[str, Any]:
+    """``record[key]`` when it is a mapping, else ``{}`` (typed so mypy can follow the narrowing)."""
+    value = record.get(key)
+    return value if isinstance(value, dict) else {}
+
+
 def _amd_smi_records(text: str) -> list[dict[str, Any]]:
     data = _loads(text)
     if isinstance(data, dict):
@@ -221,9 +228,9 @@ def parse_amd_smi_static(text: str) -> list[AmdSmiStatic]:
     """``amd-smi static --json`` (a list, or ``{"gpu_data": [...]}`` on newer ROCm)."""
     out: list[AmdSmiStatic] = []
     for position, record in enumerate(_amd_smi_records(text)):
-        asic = record.get("asic") if isinstance(record.get("asic"), dict) else {}
-        vram = record.get("vram") if isinstance(record.get("vram"), dict) else {}
-        driver = record.get("driver") if isinstance(record.get("driver"), dict) else {}
+        asic = _subdict(record, "asic")
+        vram = _subdict(record, "vram")
+        driver = _subdict(record, "driver")
         index = parse_int(record.get("gpu"))
         name = asic.get("market_name") or asic.get("asic_name") or "AMD GPU"
         out.append(
@@ -264,12 +271,12 @@ def parse_amd_smi_metric(text: str) -> dict[int, AmdSmiMetric]:
     out: dict[int, AmdSmiMetric] = {}
     for position, record in enumerate(_amd_smi_records(text)):
         index = parse_int(record.get("gpu"))
-        mem = record.get("mem_usage") if isinstance(record.get("mem_usage"), dict) else {}
+        mem = _subdict(record, "mem_usage")
         total = to_bytes(mem.get("total_vram"))
         used = to_bytes(mem.get("used_vram"))
         free = to_bytes(mem.get("free_vram")) or max(0, total - used)
-        usage = record.get("usage") if isinstance(record.get("usage"), dict) else {}
-        temp = record.get("temperature") if isinstance(record.get("temperature"), dict) else {}
+        usage = _subdict(record, "usage")
+        temp = _subdict(record, "temperature")
         out[position if index is None else index] = AmdSmiMetric(
             total_bytes=total,
             used_bytes=used,
@@ -504,7 +511,7 @@ def parse_vulkaninfo_text(text: str) -> list[VulkanDevice]:
     return [devices[i] for i in sorted(devices) if devices[i].name]
 
 
-def _walk(node: Any):
+def _walk(node: Any) -> Iterator[Any]:
     yield node
     if isinstance(node, dict):
         for child in node.values():
