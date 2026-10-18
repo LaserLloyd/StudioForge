@@ -787,20 +787,28 @@ def _hip_build_env() -> dict[str, str] | None:
     return {**os.environ, "HIPCXX": f"{clang_dir}/clang", "HIP_PATH": root}
 
 
-def engine_record(info: EngineInfo) -> dict[str, Any]:
-    """The JSON-able row ``engine list`` shows for one installed engine."""
+def engine_record(info: Any) -> dict[str, Any]:
+    """The JSON-able row ``engine list`` shows for one installed engine.
+
+    Reads attributes with defaults so a light-weight stand-in (a test double, an
+    object from before these fields existed) renders as "unknown" instead of
+    raising.
+    """
+    variant = str(getattr(info, "variant", "") or "")
+    smoke_tested = bool(getattr(info, "smoke_tested", False))
     return {
         "tag": info.tag,
-        "active": info.active,
-        "backend": info.backend or "unknown",
-        "variant": info.variant,
-        "verified": info.verified,
-        "verified_by": info.verified_by,
-        "smoke_result": info.smoke_result,
-        "smoke_tested_at": info.smoke_tested_at,
-        "installed_at": info.installed_at,
-        "version_string": info.version_string,
-        "warnings": list(info.warnings),
+        "active": bool(getattr(info, "active", False)),
+        "backend": getattr(info, "backend", "") or variant_backend(variant) or "unknown",
+        "variant": variant,
+        "verified": getattr(info, "verified", None),
+        "verified_by": getattr(info, "verified_by", "") or "",
+        "smoke_result": getattr(info, "smoke_result", None)
+        or ("passed" if smoke_tested else "not_run"),
+        "smoke_tested_at": getattr(info, "smoke_tested_at", None),
+        "installed_at": float(getattr(info, "installed_at", None) or time.time()),
+        "version_string": getattr(info, "version_string", None),
+        "warnings": list(getattr(info, "warnings", None) or []),
     }
 
 

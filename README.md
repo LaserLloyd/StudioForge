@@ -385,6 +385,7 @@ The same from a terminal, on any platform: `studioforge serve --open`, `studiofo
 - [`docs/CATALOG.md`](docs/CATALOG.md) — the model catalog an agent picks from, every column explained
 - [`docs/BENCHMARKING.md`](docs/BENCHMARKING.md) — the benchmarking playbook
 - [`docs/OPENCLAW-LONG-CONTEXT.md`](docs/OPENCLAW-LONG-CONTEXT.md) — what a long window really costs
+- [`docs/ENGINES.md`](docs/ENGINES.md) — engine backends, hardware detection, checksums, STRICT_GPU
 - [`docs/ENGINE-FEATURES.md`](docs/ENGINE-FEATURES.md) — llama.cpp features on, off, and measured
 - [`docs/RUNBOOK.md`](docs/RUNBOOK.md) — what `/health` means and what to do when it is wrong
 - [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) · [`CONTRIBUTING.md`](CONTRIBUTING.md) — working on the code, running the tests

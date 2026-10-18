@@ -694,9 +694,15 @@ async def _activate_and_pin(manager: Any, config: Config, tag: str) -> None:
     )
 
 
+def _engine_records(manager: Any) -> list[dict[str, Any]]:
+    from studioforge.core.engine import engine_record
+
+    return [engine_record(entry) for entry in manager.installed()]
+
+
 def _print_engines(manager: Any) -> None:
     """The installed-engine table: backend, checksum verdict, smoke result, install date."""
-    records = manager.list_engines()
+    records = _engine_records(manager)
     if not records:
         typer.echo("no engines installed")
         return
@@ -927,7 +933,7 @@ def engine_list_cmd(
     config = _load(config_path)
     manager = EngineManager(config)
     if as_json:
-        typer.echo(json.dumps(manager.list_engines(), indent=2))
+        typer.echo(json.dumps(_engine_records(manager), indent=2))
         return
     _print_engines(manager)
 
