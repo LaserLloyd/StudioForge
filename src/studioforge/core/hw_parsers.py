@@ -205,7 +205,10 @@ class AmdSmiStatic:
 
 
 def _subdict(record: dict[str, Any], key: str) -> dict[str, Any]:
-    """``record[key]`` when it is a mapping, else ``{}`` (typed so mypy can follow the narrowing)."""
+    """``record[key]`` when it is a mapping, else ``{}``.
+
+    Typed so mypy can follow the narrowing.
+    """
     value = record.get(key)
     return value if isinstance(value, dict) else {}
 
