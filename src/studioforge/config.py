@@ -992,6 +992,12 @@ class UpdateConfig(BaseModel):
         return value
 
 
+#: Version of the config.yaml layout; the ``schema:`` key and the settings
+#: registry (``studioforge.settings_schema``). Bump it when a key is renamed,
+#: removed or changes meaning, together with a migration for old files.
+CONFIG_SCHEMA_VERSION = 1
+
+
 class Config(BaseSettings):
     """Root configuration object."""
 
@@ -1002,6 +1008,13 @@ class Config(BaseSettings):
         validate_assignment=True,
     )
 
+    #: Layout version of config.yaml (the settings registry's ``schema: N``,
+    #: ``studioforge.settings_schema``). Written to the file as ``schema`` -- the
+    #: attribute is ``schema_version`` because ``BaseModel.schema`` is taken, and
+    #: a validation alias of ``schema`` would make pydantic-settings read a bare
+    #: ``SCHEMA`` environment variable. A file without the key loads as version 1,
+    #: so every config.yaml written before this field existed loads unchanged.
+    schema_version: int = Field(default=CONFIG_SCHEMA_VERSION, ge=1, serialization_alias="schema")
     data_dir: Path = Field(default_factory=default_data_dir)
     server: ServerConfig = Field(default_factory=ServerConfig)
     gui: GuiConfig = Field(default_factory=GuiConfig)
@@ -1020,6 +1033,15 @@ class Config(BaseSettings):
 
     # Set when loaded from disk so save() knows where to write back.
     source_path: Path | None = Field(default=None, exclude=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _schema_key(cls, data: Any) -> Any:
+        """Accept the file's ``schema`` key for the ``schema_version`` attribute."""
+        if isinstance(data, dict) and "schema" in data:
+            data = dict(data)
+            data.setdefault("schema_version", data.pop("schema"))
+        return data
 
     @model_validator(mode="after")
     def _validate_ports(self) -> Config:
@@ -1350,12 +1372,17 @@ def _warn_unknown_keys(raw: dict[str, Any], config_path: Path) -> None:
     does not work and nothing says why".
     """
     unknown: list[str] = []
-    top_fields = set(Config.model_fields)
+    top_fields = set(Config.model_fields) | {
+        info.serialization_alias
+        for info in Config.model_fields.values()
+        if info.serialization_alias
+    }
     for key, value in raw.items():
         if key not in top_fields:
             unknown.append(key)
             continue
-        section_type = Config.model_fields[key].annotation
+        section_info = Config.model_fields.get(key)
+        section_type = section_info.annotation if section_info is not None else None
         fields = getattr(section_type, "model_fields", None)
         if not isinstance(value, dict) or not isinstance(fields, dict):
             continue

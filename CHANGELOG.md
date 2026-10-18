@@ -22,6 +22,29 @@ The version string still reads `1.26-09-23`; the `build` field tells these commi
   `studioforge-tenant` SDK ([`docs/TENANTS.md`](docs/TENANTS.md)). StudioForge never starts or
   stops a tenant.
 
+Contracts foundation (refactor workstream W0-SF). All additive; no serving behaviour changes.
+
+- feat(errors): `studioforge.error_catalog` lists every `error.code` with its HTTP status, message
+  template, fix and docs slug (`errors/<code>`). The error envelope gains `fix` and `docs` for
+  catalogued codes; `message`, `type`, `code` and `param` are unchanged and no code was renamed. A
+  unit test scans `src/` and fails on an uncatalogued or dead code.
+- feat(config): `studioforge.settings_schema` walks the config model into a registry (type,
+  default, description, range or choices, basic or advanced, `SF_` env name, restart required,
+  secret). `config.yaml` gains `schema: 1`; files without it load unchanged.
+  `GET /api/settings/schema` serves the registry read-only.
+- feat(contracts): `studioforge.capability_registry` maps each capability to its REST route, MCP
+  tool, `sfctl` command and panel control (`null` where a surface does not exist). A parity test
+  checks every declared surface exists and reports the gaps.
+- feat(contracts): `docs/contracts/` freezes `openapi.json`, `mcp-tools.json`, `errors.json`,
+  `settings-schema.json` and `capabilities.json`; `docs/reference/settings.md` and
+  `docs/reference/errors.md` are generated. `scripts/gen_docs.py` rewrites them, and
+  `scripts/gen_docs.py --check` (a CI step, and `tests/unit/test_contracts_drift.py`) fails when
+  they are stale.
+- feat(api): `GET /api/version` also returns `product` and `api_versions`
+  (`openai: v1`, `lmstudio_v0: v0`, `studioforge_api: v1`); `version` and `build` are unchanged.
+- chore(agents): `.claude/agents/` holds review subagents for contracts, security, migrations,
+  docs drift and accessibility.
+
 ## 1.26-09-23 (2026-09-23)
 
 - D58: the `loaded` model alias.

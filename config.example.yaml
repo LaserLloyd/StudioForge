@@ -65,6 +65,8 @@
 #
 # Everything else has a sensible default and a reason in DECISIONS.md.
 
+# Layout version of this file. Older files without it load as 1; leave it alone.
+schema: 1
 server:
   host: 0.0.0.0
   port: 1234

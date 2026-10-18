@@ -1,0 +1,571 @@
+{
+  "envelope": [
+    "message",
+    "type",
+    "code",
+    "param",
+    "fix",
+    "docs"
+  ],
+  "errors": [
+    {
+      "code": "allowed_devices_unavailable",
+      "docs": "errors/allowed_devices_unavailable",
+      "error_type": "server_error",
+      "fix": "Widen or clear allowed_devices (the model's setting or this request's), or free one of the named cards (planner.excluded_devices, leases).",
+      "http_status": 507,
+      "message": "None of the devices named by allowed_devices is usable right now.",
+      "surface": "api"
+    },
+    {
+      "code": "autostart_failed",
+      "docs": "errors/autostart_failed",
+      "error_type": "server_error",
+      "fix": "Run `studioforge autostart status` for the mechanism and path, and fix the permission or missing tool it names.",
+      "http_status": 500,
+      "message": "Autostart could not be changed: {reason}.",
+      "surface": "api"
+    },
+    {
+      "code": "benchmark_busy",
+      "docs": "errors/benchmark_busy",
+      "error_type": "server_error",
+      "fix": "Wait for the running job (GET /api/benchmark/jobs) or cancel it, then start yours.",
+      "http_status": 503,
+      "message": "A benchmark is already running; benchmarks are serialized.",
+      "surface": "api"
+    },
+    {
+      "code": "checksum_mismatch",
+      "docs": "errors/checksum_mismatch",
+      "error_type": "server_error",
+      "fix": "Retry the download; if it repeats, delete the partial file and start over.",
+      "http_status": 502,
+      "message": "The downloaded bytes do not match the checksum HuggingFace published.",
+      "surface": "api"
+    },
+    {
+      "code": "confirmation_required",
+      "docs": "errors/confirmation_required",
+      "error_type": "invalid_request_error",
+      "fix": "Repeat the call with confirm=true once you are sure. Nothing was changed.",
+      "http_status": 400,
+      "message": "{action} is destructive; pass confirm=true.",
+      "surface": "api"
+    },
+    {
+      "code": "context_exceeded",
+      "docs": "errors/context_exceeded",
+      "error_type": "invalid_request_error",
+      "fix": "Shorten the conversation, or reload the model with a larger context (POST /api/models/{id}/load-recommended or `sfctl models load --ctx`). Retrying unchanged fails the same way.",
+      "http_status": 400,
+      "message": "The prompt does not fit the context '{model}' is loaded with. Shorten the prompt or load the model with a larger context.",
+      "surface": "api"
+    },
+    {
+      "code": "cross_site_control_channel",
+      "docs": "errors/cross_site_control_channel",
+      "error_type": "invalid_request_error",
+      "fix": "Open the panel at the address it is served from. Behind a reverse proxy, forward the original Host header (proxy_set_header Host $host).",
+      "http_status": 403,
+      "message": "Refused: this is the control panel's own control channel and the request's Origin is not the host it was served from.",
+      "surface": "panel"
+    },
+    {
+      "code": "downloads_active",
+      "docs": "errors/downloads_active",
+      "error_type": "invalid_request_error",
+      "fix": "Pause or cancel the downloads (POST /api/downloads/{id}/pause), then update.",
+      "http_status": 400,
+      "message": "{count} download(s) are in progress; pause or cancel them before updating.",
+      "surface": "api"
+    },
+    {
+      "code": "downloads_unavailable",
+      "docs": "errors/downloads_unavailable",
+      "error_type": "invalid_request_error",
+      "fix": "The server is running as a secondary instance or without a downloader; use the primary instance.",
+      "http_status": 400,
+      "message": "Downloads are not available on this server.",
+      "surface": "api"
+    },
+    {
+      "code": "empty_reply",
+      "docs": "errors/empty_reply",
+      "error_type": "server_error",
+      "fix": "Retry with a larger max_tokens, or check the model's chat template and reasoning settings.",
+      "http_status": null,
+      "message": "The model answered with no content.",
+      "surface": "mcp"
+    },
+    {
+      "code": "engine_error",
+      "docs": "errors/engine_error",
+      "error_type": "server_error",
+      "fix": "Check connectivity and disk space, then retry the install (Server tab or POST /api/engine/install); GET /api/engine shows what is installed.",
+      "http_status": 500,
+      "message": "An engine could not be resolved, installed or verified: {reason}.",
+      "surface": "api"
+    },
+    {
+      "code": "gated_repo",
+      "docs": "errors/gated_repo",
+      "error_type": "server_error",
+      "fix": "Accept the model's licence on huggingface.co with the account that owns hf.token, set hf.token, and resume.",
+      "http_status": 502,
+      "message": "The repository is gated or private.",
+      "surface": "api"
+    },
+    {
+      "code": "gpu_leased",
+      "docs": "errors/gpu_leased",
+      "error_type": "server_error",
+      "fix": "Wait for the lease to end (see Retry-After and GET /api/leases) or ask the holder to release it.",
+      "http_status": 507,
+      "message": "Cannot load '{model}': the GPU it needs is leased to {holder} until it is released.",
+      "surface": "api"
+    },
+    {
+      "code": "image_fetch_failed",
+      "docs": "errors/image_fetch_failed",
+      "error_type": "invalid_request_error",
+      "fix": "Check that the URL is reachable and returns the image directly, or pass it inline as a data: URL.",
+      "http_status": 400,
+      "message": "Could not fetch the image: {reason}.",
+      "surface": "api"
+    },
+    {
+      "code": "image_fetch_refused",
+      "docs": "errors/image_fetch_refused",
+      "error_type": "invalid_request_error",
+      "fix": "Pass the image inline as a data: URL, or set gateway.allow_private_image_hosts=true if the private address is intended.",
+      "http_status": 400,
+      "message": "Refusing to fetch an image from this URL (unparseable, no host, wrong scheme, or a non-public address).",
+      "surface": "api"
+    },
+    {
+      "code": "image_fetch_timeout",
+      "docs": "errors/image_fetch_timeout",
+      "error_type": "invalid_request_error",
+      "fix": "Check the image host, or pass the image inline as a data: URL. The limit is gateway.image_fetch_timeout_s.",
+      "http_status": 400,
+      "message": "Timed out after {seconds}s fetching the image.",
+      "surface": "api"
+    },
+    {
+      "code": "image_too_large",
+      "docs": "errors/image_too_large",
+      "error_type": "invalid_request_error",
+      "fix": "Downscale the image, or raise gateway.max_image_bytes.",
+      "http_status": 400,
+      "message": "The image is over the {limit} byte limit (gateway.max_image_bytes).",
+      "surface": "api"
+    },
+    {
+      "code": "instance_secondary",
+      "docs": "errors/instance_secondary",
+      "error_type": "invalid_request_error",
+      "fix": "Use the primary instance; only one server owns a data directory.",
+      "http_status": 409,
+      "message": "This process may not write into the model directory (secondary instance).",
+      "surface": "api"
+    },
+    {
+      "code": "insufficient_disk",
+      "docs": "errors/insufficient_disk",
+      "error_type": "invalid_request_error",
+      "fix": "Free disk space or choose another models.dir, then retry.",
+      "http_status": 400,
+      "message": "Not enough disk space on {drive} for this download.",
+      "surface": "api"
+    },
+    {
+      "code": "insufficient_vram",
+      "docs": "errors/insufficient_vram",
+      "error_type": "server_error",
+      "fix": "Pick a smaller quant or context, unload another model (POST /api/models/unload-all), or free VRAM held by another program (GET /api/vram/holders).",
+      "http_status": 507,
+      "message": "Cannot load '{model}': it needs {required} of VRAM and {available} is available. StudioForge is GPU-only; there is no CPU fallback.",
+      "surface": "api"
+    },
+    {
+      "code": "internal_error",
+      "docs": "errors/internal_error",
+      "error_type": "server_error",
+      "fix": "Quote the ref value when reporting: the full detail is in the server log (GET /api/logs or the panel's Logs tab).",
+      "http_status": 500,
+      "message": "Internal server error. Quote ref={ref}.",
+      "surface": "api"
+    },
+    {
+      "code": "invalid_api_key",
+      "docs": "errors/invalid_api_key",
+      "error_type": "invalid_request_error",
+      "fix": "Send the value of server.api_key (Setup tab, or `studioforge config`) as a bearer token. The panel and the watchdog use the same key.",
+      "http_status": 401,
+      "message": "This server requires its API key. Send it as 'Authorization: Bearer <key>' or 'X-API-Key'.",
+      "surface": "api"
+    },
+    {
+      "code": "invalid_config",
+      "docs": "errors/invalid_config",
+      "error_type": "invalid_request_error",
+      "fix": "Fix the key named in the message. `studioforge config` prints the effective values; docs/reference/settings.md lists every key, its range and default.",
+      "http_status": 400,
+      "message": "The configuration is invalid: {reason}.",
+      "surface": "api"
+    },
+    {
+      "code": "invalid_image",
+      "docs": "errors/invalid_image",
+      "error_type": "invalid_request_error",
+      "fix": "Send a PNG/JPEG/WebP as a data: URL with valid base64, or as a public http(s) URL.",
+      "http_status": 400,
+      "message": "The image part is missing, malformed, empty, not valid base64, or cannot be decoded.",
+      "surface": "api"
+    },
+    {
+      "code": "invalid_image_url",
+      "docs": "errors/invalid_image_url",
+      "error_type": "invalid_request_error",
+      "fix": "Inline the file as a data: URL, or host it at an http(s) address the server can reach.",
+      "http_status": 400,
+      "message": "image_url must be a data: URL or an http(s) URL; local file paths are not accepted.",
+      "surface": "api"
+    },
+    {
+      "code": "invalid_mcp_pin",
+      "docs": "errors/invalid_mcp_pin",
+      "error_type": "invalid_request_error",
+      "fix": "Read mcp.pin on the server (startup banner, `studioforge config`, or Setup -> Network & access) and send it in the X-MCP-Pin header. Never put it in the URL.",
+      "http_status": 401,
+      "message": "This MCP endpoint needs the pairing PIN. Send it as 'X-MCP-Pin: <pin>' or as a bearer token.",
+      "surface": "mcp"
+    },
+    {
+      "code": "invalid_request",
+      "docs": "errors/invalid_request",
+      "error_type": "invalid_request_error",
+      "fix": "Fix the fields named in the message; the body does not match the endpoint's schema (see /docs or docs/contracts/openapi.json).",
+      "http_status": 400,
+      "message": "Invalid request: {validation errors}",
+      "surface": "api"
+    },
+    {
+      "code": "job_not_found",
+      "docs": "errors/job_not_found",
+      "error_type": "invalid_request_error",
+      "fix": "List jobs with GET /api/benchmark/jobs; finished jobs are pruned.",
+      "http_status": 404,
+      "message": "Unknown benchmark job '{job_id}'.",
+      "surface": "api"
+    },
+    {
+      "code": "lease_conflict",
+      "docs": "errors/lease_conflict",
+      "error_type": "invalid_request_error",
+      "fix": "Release the lease (DELETE /api/leases/{id}) or choose other devices.",
+      "http_status": 409,
+      "message": "Those devices are held by an existing GPU lease or a pinned model.",
+      "surface": "api"
+    },
+    {
+      "code": "lease_not_found",
+      "docs": "errors/lease_not_found",
+      "error_type": "invalid_request_error",
+      "fix": "List current leases with GET /api/leases; the lease may have expired.",
+      "http_status": 404,
+      "message": "No GPU lease with that id.",
+      "surface": "api"
+    },
+    {
+      "code": "lease_vacating",
+      "docs": "errors/lease_vacating",
+      "error_type": "invalid_request_error",
+      "fix": "Retry after the Retry-After interval; the holder has been asked to release the card.",
+      "http_status": 409,
+      "message": "CUDA {devices} is leased by a worse class and the holder has been asked to vacate.",
+      "surface": "api"
+    },
+    {
+      "code": "model_benchmarking",
+      "docs": "errors/model_benchmarking",
+      "error_type": "invalid_request_error",
+      "fix": "Wait for the benchmark to finish (GET /api/benchmark/jobs) or cancel it (DELETE /api/benchmark/jobs/{id}).",
+      "http_status": 400,
+      "message": "'{model}' is being benchmarked right now; the run rewrites its settings.",
+      "surface": "api"
+    },
+    {
+      "code": "model_busy",
+      "docs": "errors/model_busy",
+      "error_type": "server_error",
+      "fix": "Retry after the Retry-After interval.",
+      "http_status": 503,
+      "message": "The model is busy; try again shortly.",
+      "surface": "api"
+    },
+    {
+      "code": "model_load_failed",
+      "docs": "errors/model_load_failed",
+      "error_type": "server_error",
+      "fix": "Read the model's log (GET /api/logs/models/{id}) for the llama-server error. Quote the ref= value if one is shown. Reduce the context or free VRAM, then retry.",
+      "http_status": 502,
+      "message": "Failed to load '{model}': {reason}.",
+      "surface": "api"
+    },
+    {
+      "code": "model_loaded",
+      "docs": "errors/model_loaded",
+      "error_type": "invalid_request_error",
+      "fix": "Unload the model first (POST /api/models/{id}/unload), then repeat the call.",
+      "http_status": 400,
+      "message": "The model is loaded (serving as '{holder}'); the file is in use.",
+      "surface": "api"
+    },
+    {
+      "code": "model_not_found",
+      "docs": "errors/model_not_found",
+      "error_type": "invalid_request_error",
+      "fix": "List the ids the server knows with GET /v1/models (or `sfctl models list`); rescan the library if the file was added recently.",
+      "http_status": 404,
+      "message": "The model '{model}' does not exist.",
+      "surface": "api"
+    },
+    {
+      "code": "model_not_multimodal",
+      "docs": "errors/model_not_multimodal",
+      "error_type": "invalid_request_error",
+      "fix": "Use a vision model, or put the matching mmproj file next to the GGUF and rescan.",
+      "http_status": 400,
+      "message": "Model '{model}' does not support image input. It has no multimodal projector.",
+      "surface": "api"
+    },
+    {
+      "code": "no_benchmark_modes",
+      "docs": "errors/no_benchmark_modes",
+      "error_type": "invalid_request_error",
+      "fix": "Check that the GPUs are visible (GET /api/gpus) and not excluded or leased.",
+      "http_status": 400,
+      "message": "No GPU placements are available to benchmark on this machine.",
+      "surface": "api"
+    },
+    {
+      "code": "no_default_model",
+      "docs": "errors/no_default_model",
+      "error_type": "invalid_request_error",
+      "fix": "Name a model explicitly, or set models.default_model (Setup -> Models).",
+      "http_status": 400,
+      "message": "'{name}' means 'use the server default', but models.default_model is not set.",
+      "surface": "api"
+    },
+    {
+      "code": "no_loaded_model",
+      "docs": "errors/no_loaded_model",
+      "error_type": "invalid_request_error",
+      "fix": "Load a model of that kind first, or name a model explicitly.",
+      "http_status": 404,
+      "message": "'loaded' means the largest resident model that can serve this request, but no {kind} model is currently loaded.",
+      "surface": "api"
+    },
+    {
+      "code": "not_an_embedding_model",
+      "docs": "errors/not_an_embedding_model",
+      "error_type": "invalid_request_error",
+      "fix": "Call /v1/embeddings with an embedding GGUF (see GET /v1/models, type 'embeddings').",
+      "http_status": 400,
+      "message": "Model '{model}' is not an embedding model.",
+      "surface": "api"
+    },
+    {
+      "code": "part_file_locked",
+      "docs": "errors/part_file_locked",
+      "error_type": "invalid_request_error",
+      "fix": "Wait for the other download to finish or cancel it; do not start a second one.",
+      "http_status": 409,
+      "message": "Another writer already holds this partial download.",
+      "surface": "api"
+    },
+    {
+      "code": "placement_unavailable",
+      "docs": "errors/placement_unavailable",
+      "error_type": "invalid_request_error",
+      "fix": "Check the NVIDIA driver (`nvidia-smi`), then retry; or pass an explicit device list.",
+      "http_status": 400,
+      "message": "Automatic placement needs the GPU probe and found no usable GPUs.",
+      "surface": "api"
+    },
+    {
+      "code": "priority_hold",
+      "docs": "errors/priority_hold",
+      "error_type": "server_error",
+      "fix": "Retry after the Retry-After interval, or raise the request's priority.",
+      "http_status": 503,
+      "message": "A higher-priority model ('{holder}') is loading; lower-priority requests and loads wait for it.",
+      "surface": "api"
+    },
+    {
+      "code": "publish_failed",
+      "docs": "errors/publish_failed",
+      "error_type": "invalid_request_error",
+      "fix": "Close whatever holds the destination file (a loaded model, an antivirus scan) and resume; the verified partial is kept.",
+      "http_status": 409,
+      "message": "A complete download could not be renamed onto its destination.",
+      "surface": "api"
+    },
+    {
+      "code": "remote_admin_requires_credential",
+      "docs": "errors/remote_admin_requires_credential",
+      "error_type": "invalid_request_error",
+      "fix": "Make the change from the server's own machine, or send server.api_key (or mcp.pin for the MCP plane). Setting server.api_key lifts the restriction for authenticated callers.",
+      "http_status": 403,
+      "message": "Refusing {action}: a change to the box needs a credential when it does not come from this machine.",
+      "surface": "api"
+    },
+    {
+      "code": "remote_header_unreadable",
+      "docs": "errors/remote_header_unreadable",
+      "error_type": "server_error",
+      "fix": "Retry; the estimate falls back to a bounded guess. Check connectivity to huggingface.co and hf.token for gated repos.",
+      "http_status": 502,
+      "message": "The GGUF header could not be read over HTTP.",
+      "surface": "api"
+    },
+    {
+      "code": "restart_unhealthy",
+      "docs": "errors/restart_unhealthy",
+      "error_type": "watchdog_error",
+      "fix": "Read the watchdog log (tail_logs) and the server log; fix the config key it names, then call restart_server again.",
+      "http_status": null,
+      "message": "The server was restarted but did not become healthy.",
+      "surface": "watchdog"
+    },
+    {
+      "code": "spawn_failed",
+      "docs": "errors/spawn_failed",
+      "error_type": "watchdog_error",
+      "fix": "Check SF_WATCHDOG_RESTART_CMD / the service unit and that the entry point exists, then retry.",
+      "http_status": null,
+      "message": "The watchdog could not start the server process: {reason}.",
+      "surface": "watchdog"
+    },
+    {
+      "code": "tenant_not_found",
+      "docs": "errors/tenant_not_found",
+      "error_type": "invalid_request_error",
+      "fix": "List tenants with GET /api/tenants, or register it (POST /api/tenants/register).",
+      "http_status": 404,
+      "message": "No tenant named '{name}' in the registry.",
+      "surface": "api"
+    },
+    {
+      "code": "tenant_not_warmable",
+      "docs": "errors/tenant_not_warmable",
+      "error_type": "invalid_request_error",
+      "fix": "Only module tenants with a warm_url can be warmed; start the program yourself.",
+      "http_status": 400,
+      "message": "Tenant '{name}' cannot be warmed from here.",
+      "surface": "api"
+    },
+    {
+      "code": "tenant_protocol_unsupported",
+      "docs": "errors/tenant_protocol_unsupported",
+      "error_type": "invalid_request_error",
+      "fix": "Register the tenant with a supported protocol (vt.1).",
+      "http_status": 400,
+      "message": "The tenant protocol '{protocol}' is not one this server speaks.",
+      "surface": "api"
+    },
+    {
+      "code": "tenant_unreachable",
+      "docs": "errors/tenant_unreachable",
+      "error_type": "server_error",
+      "fix": "Check that the tenant program is running and that its URL is allowed (tenants.allowed_hosts).",
+      "http_status": 502,
+      "message": "The tenant did not answer a 2xx at its warm_url.",
+      "surface": "api"
+    },
+    {
+      "code": "tenant_url_refused",
+      "docs": "errors/tenant_url_refused",
+      "error_type": "invalid_request_error",
+      "fix": "Use a loopback or tailnet address, or add the host to tenants.allowed_hosts.",
+      "http_status": 400,
+      "message": "The tenant URL is not allowed.",
+      "surface": "api"
+    },
+    {
+      "code": "too_many_credential_attempts",
+      "docs": "errors/too_many_credential_attempts",
+      "error_type": "invalid_request_error",
+      "fix": "Wait for the Retry-After interval, then send the right credential. Set server.api_key for a real credential, or run the client on the server's own machine.",
+      "http_status": 429,
+      "message": "Too many incorrect credentials from this address. Wait {seconds}s and try again.",
+      "surface": "api"
+    },
+    {
+      "code": "too_many_images",
+      "docs": "errors/too_many_images",
+      "error_type": "invalid_request_error",
+      "fix": "Send fewer images, or raise gateway.max_images_per_request.",
+      "http_status": 400,
+      "message": "Too many images in one request: limit is {limit} (gateway.max_images_per_request).",
+      "surface": "api"
+    },
+    {
+      "code": "unload_failed",
+      "docs": "errors/unload_failed",
+      "error_type": "server_error",
+      "fix": "Use the watchdog (`sfctl recover --kill <model>`) or restart the server; VRAM is still held until the process exits.",
+      "http_status": 500,
+      "message": "'{model}' could not be unloaded: its process is still alive.",
+      "surface": "api"
+    },
+    {
+      "code": "unsupported",
+      "docs": "errors/unsupported",
+      "error_type": "invalid_request_error",
+      "fix": "Use a supported alternative named in the message; see docs/reference for the supported surface.",
+      "http_status": 400,
+      "message": "This operation is not supported: {reason}.",
+      "surface": "api"
+    },
+    {
+      "code": "unsupported_architecture",
+      "docs": "errors/unsupported_architecture",
+      "error_type": "invalid_request_error",
+      "fix": "Install a newer engine build (Server tab -> Engine, or `sfctl update --engine <tag>`). Retrying unchanged fails the same way.",
+      "http_status": 400,
+      "message": "The installed llama.cpp build cannot load the '{architecture}' architecture.",
+      "surface": "api"
+    },
+    {
+      "code": "update_failed",
+      "docs": "errors/update_failed",
+      "error_type": "server_error",
+      "fix": "Read the server log, then retry or roll back (POST /api/update/rollback).",
+      "http_status": 500,
+      "message": "The update could not be completed: {reason}.",
+      "surface": "api"
+    },
+    {
+      "code": "upstream_error",
+      "docs": "errors/upstream_error",
+      "error_type": "server_error",
+      "fix": "Read the model's log (GET /api/logs/models/{id}). Reload the model; if it repeats, try another engine build.",
+      "http_status": 502,
+      "message": "llama-server for '{model}' failed: {reason}.",
+      "surface": "api"
+    },
+    {
+      "code": "upstream_timeout",
+      "docs": "errors/upstream_timeout",
+      "error_type": "server_error",
+      "fix": "Shorten the request or raise server.request_timeout_s. If the model is wedged, unload and reload it.",
+      "http_status": 504,
+      "message": "llama-server for '{model}' did not answer within {seconds}s.",
+      "surface": "api"
+    }
+  ],
+  "format": 1
+}

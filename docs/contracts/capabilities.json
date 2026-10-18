@@ -1,0 +1,430 @@
+{
+  "capabilities": [
+    {
+      "api": {
+        "method": "GET",
+        "path": "/api/config"
+      },
+      "description": "Read the effective configuration (secrets redacted).",
+      "id": "config.get",
+      "mcp": {
+        "server": "gateway",
+        "tool": "get_config"
+      },
+      "notes": "",
+      "panel": "Setup tab: settings form",
+      "sfctl": "config get"
+    },
+    {
+      "api": {
+        "method": "GET",
+        "path": "/api/settings/schema"
+      },
+      "description": "Describe every configuration key: type, default, range, level, env override.",
+      "id": "config.schema",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "PATCH",
+        "path": "/api/config"
+      },
+      "description": "Change configuration keys (validated, persisted, restart needs reported).",
+      "id": "config.set",
+      "mcp": {
+        "server": "gateway",
+        "tool": "set_config"
+      },
+      "notes": "",
+      "panel": "Setup tab: Save",
+      "sfctl": "config set"
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/api/engine/activate"
+      },
+      "description": "Make an installed llama.cpp build the active engine.",
+      "id": "engine.activate",
+      "mcp": null,
+      "notes": "",
+      "panel": "Server tab: activate + reload",
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/api/engine/install"
+      },
+      "description": "Download, verify and smoke-test a llama.cpp build.",
+      "id": "engine.install",
+      "mcp": null,
+      "notes": "",
+      "panel": "Server tab: Install",
+      "sfctl": "update --engine"
+    },
+    {
+      "api": {
+        "method": "GET",
+        "path": "/api/engine"
+      },
+      "description": "Show the installed llama.cpp builds and which is active.",
+      "id": "engine.list",
+      "mcp": null,
+      "notes": "`sfctl update --engine TAG --check` prints the engine block but is not a dedicated command.",
+      "panel": "Server tab: engine builds",
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "GET",
+        "path": "/health"
+      },
+      "description": "Is the server up, and can it serve? (the watchdog diagnoses a wedged one).",
+      "id": "health.get",
+      "mcp": {
+        "server": "watchdog",
+        "tool": "health"
+      },
+      "notes": "`sfctl recover` with no flags prints the watchdog's health diagnosis.",
+      "panel": null,
+      "sfctl": "recover"
+    },
+    {
+      "api": {
+        "method": "GET",
+        "path": "/api/hf/search"
+      },
+      "description": "Search HuggingFace for GGUF repositories.",
+      "id": "hf.search",
+      "mcp": {
+        "server": "gateway",
+        "tool": "search_models"
+      },
+      "notes": "",
+      "panel": "Download tab: Search",
+      "sfctl": "search"
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/api/leases"
+      },
+      "description": "Reserve GPUs for a holder until released or expired.",
+      "id": "leases.acquire",
+      "mcp": {
+        "server": "gateway",
+        "tool": "reserve_gpus"
+      },
+      "notes": "",
+      "panel": null,
+      "sfctl": "leases add"
+    },
+    {
+      "api": {
+        "method": "GET",
+        "path": "/api/leases"
+      },
+      "description": "List standing GPU leases.",
+      "id": "leases.list",
+      "mcp": {
+        "server": "gateway",
+        "tool": "gpu_leases"
+      },
+      "notes": "",
+      "panel": "Dashboard tab: GPU leases",
+      "sfctl": "leases list"
+    },
+    {
+      "api": {
+        "method": "DELETE",
+        "path": "/api/leases/{lease_id}"
+      },
+      "description": "Release a GPU lease.",
+      "id": "leases.release",
+      "mcp": {
+        "server": "gateway",
+        "tool": "release_gpus"
+      },
+      "notes": "",
+      "panel": "Dashboard tab: Release lease",
+      "sfctl": "leases release"
+    },
+    {
+      "api": {
+        "method": "GET",
+        "path": "/api/logs"
+      },
+      "description": "Read the server log, or one model's llama-server log.",
+      "id": "logs.read",
+      "mcp": {
+        "server": "watchdog",
+        "tool": "tail_logs"
+      },
+      "notes": "",
+      "panel": "Logs tab: Refresh",
+      "sfctl": "logs"
+    },
+    {
+      "api": {
+        "method": "DELETE",
+        "path": "/api/models/{model_id}"
+      },
+      "description": "Delete a model's files from disk (needs confirmation).",
+      "id": "models.delete",
+      "mcp": {
+        "server": "gateway",
+        "tool": "delete_model"
+      },
+      "notes": "",
+      "panel": "Models tab: Delete",
+      "sfctl": "models delete"
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/api/downloads"
+      },
+      "description": "Download a GGUF from HuggingFace.",
+      "id": "models.download",
+      "mcp": {
+        "server": "gateway",
+        "tool": "download_model"
+      },
+      "notes": "",
+      "panel": "Download tab: Download",
+      "sfctl": "download"
+    },
+    {
+      "api": {
+        "method": "GET",
+        "path": "/api/models"
+      },
+      "description": "List the models in the library with their load state.",
+      "id": "models.list",
+      "mcp": {
+        "server": "gateway",
+        "tool": "list_models"
+      },
+      "notes": "",
+      "panel": "Models tab: model table",
+      "sfctl": "models list"
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/api/models/{model_id}/load"
+      },
+      "description": "Load a model onto the GPUs (planned, with a context and placement).",
+      "id": "models.load",
+      "mcp": {
+        "server": "gateway",
+        "tool": "load_model"
+      },
+      "notes": "",
+      "panel": "Models tab: Load",
+      "sfctl": "models load"
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/api/models/{model_id}/pin"
+      },
+      "description": "Pin a model so it stays loaded.",
+      "id": "models.pin",
+      "mcp": {
+        "server": "gateway",
+        "tool": "pin_model"
+      },
+      "notes": "",
+      "panel": "Models tab: Pin",
+      "sfctl": "models pin"
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/api/models/scan"
+      },
+      "description": "Rescan the model directories.",
+      "id": "models.scan",
+      "mcp": null,
+      "notes": "",
+      "panel": "Models tab: Rescan",
+      "sfctl": "models scan"
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/api/models/{model_id}/test"
+      },
+      "description": "Run one short completion against a model and report latency and tokens per second.",
+      "id": "models.test",
+      "mcp": {
+        "server": "gateway",
+        "tool": "test_model"
+      },
+      "notes": "",
+      "panel": "Models tab: Test",
+      "sfctl": "models test"
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/api/models/{model_id}/unload"
+      },
+      "description": "Unload a model and free its VRAM.",
+      "id": "models.unload",
+      "mcp": {
+        "server": "gateway",
+        "tool": "unload_model"
+      },
+      "notes": "",
+      "panel": "Models tab: Unload",
+      "sfctl": "models unload"
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/api/models/unload-all"
+      },
+      "description": "Unload every loaded model.",
+      "id": "models.unload_all",
+      "mcp": null,
+      "notes": "",
+      "panel": "Dashboard tab: Unload all",
+      "sfctl": null
+    },
+    {
+      "api": null,
+      "description": "Kill one model's llama-server child through the watchdog.",
+      "id": "recovery.kill_model",
+      "mcp": {
+        "server": "watchdog",
+        "tool": "kill_model"
+      },
+      "notes": "",
+      "panel": null,
+      "sfctl": "recover --kill"
+    },
+    {
+      "api": null,
+      "description": "Kill every model child through the watchdog.",
+      "id": "recovery.nuke_all",
+      "mcp": {
+        "server": "watchdog",
+        "tool": "nuke_all_models"
+      },
+      "notes": "",
+      "panel": null,
+      "sfctl": "recover --nuke"
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/api/vram/reclaim"
+      },
+      "description": "Kill leaked llama-server processes that hold VRAM with no parent.",
+      "id": "recovery.reclaim_orphans",
+      "mcp": {
+        "server": "watchdog",
+        "tool": "reclaim_orphan_engines"
+      },
+      "notes": "",
+      "panel": "Dashboard tab: Reclaim",
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/api/restart/server"
+      },
+      "description": "Restart the server process (drops in-flight requests and unloads every model).",
+      "id": "server.restart",
+      "mcp": {
+        "server": "watchdog",
+        "tool": "restart_server"
+      },
+      "notes": "",
+      "panel": "Dashboard tab: Restart server",
+      "sfctl": "recover --restart"
+    },
+    {
+      "api": {
+        "method": "GET",
+        "path": "/api/status"
+      },
+      "description": "VRAM per GPU, loaded models, queue depth, engine and uptime.",
+      "id": "status.get",
+      "mcp": {
+        "server": "gateway",
+        "tool": "server_status"
+      },
+      "notes": "",
+      "panel": "Dashboard tab",
+      "sfctl": "status"
+    },
+    {
+      "api": {
+        "method": "GET",
+        "path": "/api/tenants"
+      },
+      "description": "List the registry of programs sharing the GPUs.",
+      "id": "tenants.list",
+      "mcp": {
+        "server": "gateway",
+        "tool": "gpu_tenants"
+      },
+      "notes": "",
+      "panel": "Dashboard tab: tenants",
+      "sfctl": "tenants list"
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/api/update/install"
+      },
+      "description": "Install the latest release (restarts the server).",
+      "id": "update.apply",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": "update"
+    },
+    {
+      "api": {
+        "method": "GET",
+        "path": "/api/update"
+      },
+      "description": "Compare the running version with the latest release.",
+      "id": "update.check",
+      "mcp": null,
+      "notes": "The panel's `Check for engine update` checks llama.cpp builds, not the app.",
+      "panel": null,
+      "sfctl": "update --check"
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/api/update/rollback"
+      },
+      "description": "Roll back to the previous release.",
+      "id": "update.rollback",
+      "mcp": {
+        "server": "watchdog",
+        "tool": "rollback_update"
+      },
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    }
+  ],
+  "surfaces": [
+    "api",
+    "mcp",
+    "sfctl",
+    "panel"
+  ]
+}

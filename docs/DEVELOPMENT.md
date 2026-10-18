@@ -112,6 +112,12 @@ depends on nothing above it. A change that makes `core` import from `api` is a c
    (`tenants.registry`) is deliberately *not* generated: it needs a row widget, like
    `planner.reserved_mb` has on the GPU card. Add it to `gui/state.CUSTOM_WIDGET_KEYS` along with
    the widget, or the same test fails.
+6. **Regenerate the generated docs.** Run `uv run python scripts/gen_docs.py`: the key appears in
+   `docs/reference/settings.md` and `docs/contracts/settings-schema.json` (the settings registry,
+   `settings_schema.py`, walks the model). It needs a description - a comment above the field in
+   `config.py` or in `config.example.yaml` - or `tests/unit/test_settings_schema.py` fails. The same
+   command refreshes the OpenAPI, MCP tool, error and capability contracts; CI runs
+   `scripts/gen_docs.py --check`.
 
 ## GUI theming
 

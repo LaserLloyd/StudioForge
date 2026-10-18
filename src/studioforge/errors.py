@@ -5,13 +5,17 @@ Every error surfaced by the HTTP API is rendered as::
     {"error": {"message": ..., "type": ..., "code": ..., "param": ...}}
 
 which is what the ``openai`` client expects; it parses this envelope to build
-its exception hierarchy. Deviating from it breaks client-side error handling,
+its exception hierarchy. A catalogued code (:mod:`studioforge.error_catalog`)
+additionally carries the additive ``fix`` and ``docs`` keys. Deviating from the
+envelope breaks client-side error handling,
 so all API errors flow through :class:`StudioForgeError`.
 """
 
 from __future__ import annotations
 
 from typing import Any
+
+from studioforge.error_catalog import envelope_extras
 
 
 class StudioForgeError(Exception):
@@ -47,6 +51,10 @@ class StudioForgeError(Exception):
             "code": self.code,
             "param": self.param,
         }
+        # Additive and catalogue-driven: a code with a row in error_catalog gains
+        # `fix` (what to do about it) and `docs` (its slug). The four keys above
+        # are untouched, so every client keeps parsing exactly what it did.
+        error.update(envelope_extras(self.code))
         if self.details:
             # Extra diagnostic context (planner numbers, suggestions, stderr tail).
             # Additive only -- the four keys above stay exactly where clients expect them.

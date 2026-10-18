@@ -1914,6 +1914,20 @@ async def get_config(request: Request) -> dict[str, Any]:
     }
 
 
+@router.get("/settings/schema")
+async def settings_schema() -> dict[str, Any]:
+    """Every config key with its type, default, range, level and env override.
+
+    Read-only metadata derived from the config model itself
+    (:mod:`studioforge.settings_schema`); it carries defaults, never the
+    running values, so it needs no more protection than the other ``GET /api``
+    reads. The same body is committed as ``docs/contracts/settings-schema.json``.
+    """
+    from studioforge import settings_schema as registry
+
+    return registry.export()
+
+
 @router.patch("/config")
 async def set_config(request: Request, updates: dict[str, Any] = Body(...)) -> dict[str, Any]:
     """Apply dotted-path updates, validate, persist, and report restart needs.
@@ -2077,9 +2091,30 @@ async def unload_all(request: Request) -> dict[str, Any]:
     return {"unloaded": unloaded, "count": len(unloaded)}
 
 
+#: The API families this server speaks, each with its own version. Additive
+#: bookkeeping for clients and docs: ``openai`` is the OpenAI-compatible ``/v1``
+#: surface, ``lmstudio_v0`` the LM Studio ``/api/v0`` mirror, ``studioforge_api``
+#: this management API under ``/api``.
+API_VERSIONS: dict[str, str] = {
+    "openai": "v1",
+    "lmstudio_v0": "v0",
+    "studioforge_api": "v1",
+}
+
+
 @router.get("/version")
 async def version() -> dict[str, Any]:
-    return {"version": __version__, "build": build_id()}
+    """What this server is: product, release, build and the API versions it speaks.
+
+    ``version`` and ``build`` are what this route has always returned; ``product``
+    and ``api_versions`` were added alongside them.
+    """
+    return {
+        "product": "StudioForge",
+        "version": __version__,
+        "build": build_id(),
+        "api_versions": dict(API_VERSIONS),
+    }
 
 
 @router.get("/openclaw-setup")
