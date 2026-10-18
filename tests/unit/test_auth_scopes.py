@@ -552,3 +552,56 @@ def test_an_existing_config_keeps_its_explicit_values(tmp_path: Path) -> None:
         "the control panel",
         "the watchdog",
     ]
+
+
+# ---------------------------------------------------------------------------
+# the legacy key through its whole life
+# ---------------------------------------------------------------------------
+
+
+def test_setting_and_rotating_server_api_key_over_http_keeps_the_mirror_in_step(
+    tmp_path: Path,
+) -> None:
+    from studioforge.authkeys import hash_token
+
+    app = make_app(tmp_path)
+    accounts = app.state.accounts
+    with TestClient(app, client=LOOPBACK) as client:
+        # an open loopback install: the local caller may set the key
+        assert client.patch("/api/config", json={"server.api_key": LEGACY}).status_code == 200
+        live = [k for k in accounts.list_keys(include_revoked=False) if k.name == "legacy"]
+        assert len(live) == 1 and live[0].key_hash == hash_token(LEGACY)
+        assert client.get("/api/status").status_code == 401  # and now it is required
+        rotated = "rotated-key-9876543210"  # scrub-ok: fixture
+        assert (
+            client.patch(
+                "/api/config", json={"server.api_key": rotated}, headers=bearer(LEGACY)
+            ).status_code
+            == 200
+        )
+        live = [k for k in accounts.list_keys(include_revoked=False) if k.name == "legacy"]
+        assert len(live) == 1 and live[0].key_hash == hash_token(rotated)
+        assert client.get("/api/status", headers=bearer(LEGACY)).status_code == 401
+        assert client.get("/api/status", headers={"X-API-Key": rotated}).status_code == 200
+
+
+def test_revoking_legacy_disables_the_config_key_too(tmp_path: Path) -> None:
+    app = make_app(tmp_path, server={"api_key": LEGACY})
+    _record, admin = app.state.accounts.create_key("root", "admin")
+    with TestClient(app, client=LOOPBACK) as client:
+        assert client.get("/api/status", headers=bearer(LEGACY)).status_code == 200
+        assert client.delete("/api/keys/legacy", headers=bearer(admin)).status_code == 200
+        gone = client.get("/api/status", headers=bearer(LEGACY))
+        assert gone.status_code == 401 and gone.json()["error"]["code"] == "api_key_revoked"
+        assert client.get("/api/status", headers=bearer(admin)).status_code == 200
+
+
+def test_auth_status_is_honest_about_the_posture(tmp_path: Path) -> None:
+    app = make_app(tmp_path, server={"api_key": LEGACY, "host": "0.0.0.0"})
+    with TestClient(app, client=LAN) as client:
+        body = client.get("/api/auth/status", headers=bearer(LEGACY)).json()
+    assert body["auth_required"] is True and body["admin_credential_exists"] is True
+    assert body["legacy_api_key_set"] is True and body["mcp_pin_set"] is True
+    assert body["bind"]["remote"] == [{"service": "the gateway", "host": "0.0.0.0"}]
+    assert body["tls"]["mode"] == "off" and "owner_exists" in body
+    assert LEGACY not in json.dumps(body) and PIN not in json.dumps(body)

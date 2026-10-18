@@ -674,8 +674,13 @@ class LiveServices:
         else:
             raise RuntimeError(f"the download of {repo} did not finish in time")
         self.client.post("/api/models/scan", {})
-        for model in self.library_models():
-            if repo.split("/")[-1].lower().replace("-gguf", "") in str(model.get("id", "")).lower():
+        models = self.library_models()
+        stem = repo.split("/")[-1].lower().removesuffix("-gguf")
+        for model in models:
+            if str(model.get("repo") or "").lower() == repo.lower():
+                return {"model_id": model["id"]}
+        for model in models:
+            if stem and stem in str(model.get("id", "")).lower():
                 return {"model_id": model["id"]}
         raise RuntimeError(f"{repo} downloaded but no matching model appeared in the library")
 

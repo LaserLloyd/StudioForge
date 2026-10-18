@@ -244,8 +244,10 @@ print(client.models.list())   # every downloaded model; naming an unloaded one l
 ```
 
 `GET /v1/models` lists every **downloaded** model, like LM Studio, and a request that names an
-unloaded model just-in-time loads it. To use it from outside your LAN, set `server.api_key` on the
-Setup tab and pass that key — see [`docs/SETUP.md` §6](docs/SETUP.md#6-network--access).
+unloaded model just-in-time loads it. All three services listen on this machine only until you say
+otherwise: to use it from another machine run `studioforge setup` (account, HTTPS, an admin key),
+give each client its own key (`studioforge keys create`) and pass it as the `api_key` — see
+[`docs/SECURITY.md`](docs/SECURITY.md) and [`docs/SETUP.md` §6](docs/SETUP.md#6-network--access).
 
 ### C. With OpenClaw (or any MCP agent)
 
@@ -324,12 +326,13 @@ server is wedged.
 | Watchdog | `1235` | Recovery MCP sidecar (separate process) |
 | `llama-server` children | `18100–18200` | Internal, one port per loaded model |
 
-LM Studio also uses `1234`: quit it, or set `server.port`. With no `server.api_key` (the default)
-anyone on your LAN can read, chat and load/unload; anything that changes the *box* — config,
-engines, files, restarts — needs a browser or client on the machine itself, or the MCP PIN
-([DECISIONS.md](DECISIONS.md) D32). Set a key to manage it remotely: it is accepted on `/v1`,
-`/api`, `/mcp` and the watchdog, and it sits *beside* the PIN rather than replacing it — both MCP
-endpoints keep accepting either.
+LM Studio also uses `1234`: quit it, or set `server.port`. All three services bind `127.0.0.1`
+by default. Binding the network (`0.0.0.0`) requires an owner account or an admin key — the server
+refuses to start without one — and then every request needs a key: `read`, `inference` or `admin`
+(`studioforge keys create`). On a loopback-only install with no keys, anything that changes the *box*
+— config, engines, files, restarts — still needs a client on the machine itself, or the MCP PIN
+([DECISIONS.md](DECISIONS.md) D32). The old single `server.api_key` and the MCP PIN still work but
+are deprecated ([`docs/SECURITY.md`](docs/SECURITY.md)).
 
 ## Data directory
 
@@ -377,6 +380,8 @@ The same from a terminal, on any platform: `studioforge serve --open`, `studiofo
 
 ## Documentation
 
+- [`docs/SECURITY.md`](docs/SECURITY.md) — who may do what: bind rules, scoped keys, TLS, MCP, the audit log
+- [`docs/CLI.md`](docs/CLI.md) — every `studioforge` command (generated)
 - [`docs/SETUP.md`](docs/SETUP.md) — first run, tab by tab; GPUs, engine, network, downloads; headless
 - [`docs/OPENCLAW-SETUP.md`](docs/OPENCLAW-SETUP.md) — two-machine install, verified step by step
 - [`docs/OPENCLAW.md`](docs/OPENCLAW.md) — the tool list and the loop an agent runs; pins and leases

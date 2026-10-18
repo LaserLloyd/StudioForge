@@ -161,7 +161,9 @@ def test_a_fully_flagged_run_completes_every_step() -> None:
         "exposure": "done",
     }
     names = services.names()
-    assert names.index("create_owner") < names.index("detect_hardware") < names.index("ensure_engine")
+    assert (
+        names.index("create_owner") < names.index("detect_hardware") < names.index("ensure_engine")
+    )
     assert ("set_library", ("C:/lm",)) in services.calls
     assert ("download_model", ("unsloth/Qwen3-8B-GGUF",)) in services.calls
     assert ("load_model", ("Qwen3-8B-GGUF",)) in services.calls
@@ -348,7 +350,9 @@ def test_declining_the_engine_download_skips_it() -> None:
     services = FakeServices(engine={"active": None, "smoke_tested": False, "pinned_tag": "b1"})
     prompter = ScriptedPrompter(["", "", False, False, 0])
     wizard = SetupWizard(
-        services, WizardOptions(interactive=True, skip_model=True, skip_account=True), prompter=prompter
+        services,
+        WizardOptions(interactive=True, skip_model=True, skip_account=True),
+        prompter=prompter,
     )
     wizard.run()
     assert statuses(wizard)["engine"] == "skipped" and "ensure_engine" not in services.names()
@@ -459,3 +463,146 @@ def test_the_cli_runs_the_wizard_non_interactively(
     # no GPU under the null probe: that step fails honestly, and so the run says so
     assert by_key["hardware"] == "failed" and result.exit_code == 1
     assert "a-long-enough-password" not in result.output
+
+
+# ---------------------------------------------------------------------------
+# LiveServices over HTTP (a fake server behind the client)
+# ---------------------------------------------------------------------------
+
+
+def live_with(tmp_path: Path, routes: dict[tuple[str, str], Any]) -> tuple[LiveServices, list[Any]]:
+    import httpx
+
+    from studioforge.cli_client import LocalClient
+
+    seen: list[Any] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.url.path, json.loads(request.content or b"null")))
+        reply = routes.get((request.method, request.url.path))
+        if callable(reply):
+            reply = reply()
+        if reply is None:
+            return httpx.Response(404, json={"error": {"message": "nope", "code": "x"}})
+        return httpx.Response(200, json=reply)
+
+    config = scratch_config(tmp_path)
+    live = LiveServices(config)
+    live._client = LocalClient(config, transport=httpx.MockTransport(handler))
+    return live, seen
+
+
+def test_live_download_waits_for_the_group_then_finds_the_model_by_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import studioforge.setup_wizard as module
+
+    monkeypatch.setattr(module.time, "sleep", lambda _s: None)
+    polls = iter(
+        [
+            {
+                "downloads": [
+                    {"group_id": "g", "status": "running", "downloaded_bytes": 1, "total_bytes": 4}
+                ]
+            },
+            {
+                "downloads": [
+                    {
+                        "group_id": "g",
+                        "status": "completed",
+                        "downloaded_bytes": 4,
+                        "total_bytes": 4,
+                    }
+                ]
+            },
+        ]
+    )
+    live, seen = live_with(
+        tmp_path,
+        {
+            ("POST", "/api/downloads"): {"group_id": "g"},
+            ("GET", "/api/downloads"): lambda: next(polls),
+            ("POST", "/api/models/scan"): {},
+            ("GET", "/api/models"): {
+                "models": [
+                    {"id": "other/thing", "repo": "other/thing"},
+                    {
+                        "id": "unsloth/Qwen3-4B-GGUF/Qwen3-4B-Q4_K_M.gguf",
+                        "repo": "unsloth/Qwen3-4B-GGUF",
+                    },
+                ]
+            },
+        },
+    )
+    assert live.download_model("unsloth/Qwen3-4B-GGUF") == {
+        "model_id": "unsloth/Qwen3-4B-GGUF/Qwen3-4B-Q4_K_M.gguf"
+    }
+    assert [m for m, p, _ in seen if p == "/api/models/scan"]
+
+
+def test_live_download_failure_is_an_error_with_the_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import studioforge.setup_wizard as module
+
+    monkeypatch.setattr(module.time, "sleep", lambda _s: None)
+    live, _ = live_with(
+        tmp_path,
+        {
+            ("POST", "/api/downloads"): {"group_id": "g"},
+            ("GET", "/api/downloads"): {"downloads": [{"group_id": "g", "status": "failed"}]},
+        },
+    )
+    with pytest.raises(RuntimeError, match="failed"):
+        live.download_model("a/b")
+
+
+def test_live_load_uses_the_servers_own_recommendation_and_chat_reads_the_test(
+    tmp_path: Path,
+) -> None:
+    live, seen = live_with(
+        tmp_path,
+        {
+            ("POST", "/api/models/m/load-recommended"): {"ctx_size": 16384},
+            ("POST", "/api/models/m/test"): {"ok": True, "text": "hi", "tokens_per_second": 55.5},
+        },
+    )
+    assert live.load_model("m") == {"ctx_size": 16384}
+    assert ("POST", "/api/models/m/load-recommended", {"ctx_size": 8192}) in seen
+    assert live.test_chat("m") == {
+        "ok": True,
+        "reply": "hi",
+        "tokens_per_second": 55.5,
+        "error": None,
+    }
+    failing, _ = live_with(tmp_path / "b", {("POST", "/api/models/m/test"): {"ok": False}})
+    assert failing.test_chat("m")["ok"] is False
+
+
+def test_live_library_models_skips_virtual_ones(tmp_path: Path) -> None:
+    live, _ = live_with(
+        tmp_path,
+        {("GET", "/api/models"): {"models": [{"id": "a"}, {"id": "v", "is_virtual": True}]}},
+    )
+    assert [m["id"] for m in live.library_models()] == ["a"]
+
+
+def test_ensure_server_starts_one_only_when_none_answers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import studioforge.server_control as control
+
+    live = LiveServices(scratch_config(tmp_path))
+    started: list[bool] = []
+    monkeypatch.setattr(
+        control, "server_status", lambda config, **kw: control.ServerStatus(True, "http://up")
+    )
+    monkeypatch.setattr(control, "start_server", lambda config, **kw: started.append(True))
+    assert live.ensure_server() == "http://up" and not started
+    monkeypatch.setattr(
+        control, "server_status", lambda config, **kw: control.ServerStatus(False, "http://down")
+    )
+    monkeypatch.setattr(
+        control, "start_server", lambda config, **kw: control.ServerStatus(True, "http://now")
+    )
+    assert live.ensure_server() == "http://now"

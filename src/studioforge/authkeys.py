@@ -28,6 +28,7 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import os
 import secrets
 import threading
 import time
@@ -257,7 +258,8 @@ def write_snapshot(data_dir: Path, records: list[KeyRecord]) -> None:
         ],
     }
     target = snapshot_path(data_dir)
-    tmp = target.with_suffix(".tmp")
+    # Per-process temp name: the CLI and the server may write the snapshot at once.
+    tmp = target.with_name(f"{target.name}.{os.getpid()}.tmp")
     write_private(tmp, json.dumps(payload, indent=1))
     for attempt in range(6):
         try:
