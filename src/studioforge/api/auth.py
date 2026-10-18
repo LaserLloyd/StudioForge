@@ -714,7 +714,14 @@ def check_request(request: Request, config: Config, accounts: Any = None) -> Non
             GUARD.record_failure(client)
         raise
     if principal is not None:
-        GUARD.record_success(client)
+        if principal.allows("admin"):
+            # Only a credential as strong as the ones being guessed (the PIN,
+            # the owner password: both admin) forgives earlier failures. A
+            # read or inference key clearing the record would let its holder
+            # interleave one good request between every three PIN guesses and
+            # walk the 8-digit space with no lockout at all -- a privilege
+            # escalation from the weakest key to admin.
+            GUARD.record_success(client)
         _remember(request, principal)
         need = required_scope(request.method, path, config, deep=deep)
         if not principal.allows(need):

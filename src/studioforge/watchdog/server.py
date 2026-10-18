@@ -2601,7 +2601,10 @@ def wrap_asgi(
             elif pin_ok:
                 principal = Principal("pin", "", "mcp-pin", "admin")
             if principal is not None:
-                _CREDENTIAL_GUARD.record_success(peer)
+                if principal.allows("admin"):
+                    # Same rule as the gateway: a read/inference key must not
+                    # reset the lockout that protects the (admin) PIN.
+                    _CREDENTIAL_GUARD.record_success(peer)
             else:
                 if provided or pin_carrier:
                     _CREDENTIAL_GUARD.record_failure(peer)

@@ -280,6 +280,60 @@ def test_the_pin_is_admin_on_the_mcp_path(tmp_path: Path) -> None:
     assert request.state.principal.kind == "pin" and request.state.principal.scope == "admin"
 
 
+def test_a_weak_key_cannot_reset_the_pin_lockout(tmp_path: Path) -> None:
+    """A read key's success must not forgive wrong PIN guesses (escalation to admin)."""
+    from starlette.requests import Request
+
+    from studioforge.api.auth import GUARD, check_request
+
+    app = make_app(tmp_path)
+    tokens = keys_for(app)
+
+    def call(method: str, path: str, headers: list[tuple[bytes, bytes]]) -> str | None:
+        request = Request(
+            {
+                "type": "http",
+                "method": method,
+                "path": path,
+                "headers": headers,
+                "query_string": b"",
+                "client": LAN,
+                "app": app,
+                "scheme": "http",
+                "server": ("testserver", 80),
+            }
+        )
+        try:
+            check_request(request, app.state.config)
+        except AuthError as exc:
+            return exc.code
+        return None
+
+    wrong = [(b"x-mcp-pin", b"00000000")]
+    WRONG_PIN = {"invalid_api_key", "invalid_mcp_pin"}  # noqa: N806
+    read = [(b"authorization", f"Bearer {tokens['read']}".encode())]
+    GUARD.reset()
+    try:
+        for _ in range(3):  # the free attempts
+            assert call("POST", "/mcp", wrong) in WRONG_PIN
+        assert call("GET", "/api/status", read) is None  # a genuine, weak credential
+        assert call("POST", "/mcp", wrong) in WRONG_PIN  # 4th failure arms the lockout
+        assert call("POST", "/mcp", wrong) == "too_many_credential_attempts"
+        assert call("GET", "/api/status", read) == "too_many_credential_attempts"
+    finally:
+        GUARD.reset()
+    # An admin credential still forgives, as before.
+    try:
+        for _ in range(3):
+            call("POST", "/mcp", wrong)
+        admin = [(b"authorization", f"Bearer {tokens['admin']}".encode())]
+        assert call("GET", "/api/status", admin) is None
+        for _ in range(3):
+            assert call("POST", "/mcp", wrong) in WRONG_PIN
+    finally:
+        GUARD.reset()
+
+
 # ---------------------------------------------------------------------------
 # keys / users / audit over HTTP
 # ---------------------------------------------------------------------------
