@@ -909,6 +909,11 @@ def create_app(
         try:
             accounts.adopt_legacy_key(config.server.api_key)
             accounts.sync_snapshot()
+            if start_background and accounts.has_active_keys():
+                # Authentication is on, so the helpers on this machine (the CLI, the
+                # tray, the watchdog hand-off) need their own admin key; make sure
+                # <data-dir>/cli.key exists rather than waiting for the first 401.
+                accounts.local_cli_key()
         except Exception as exc:  # noqa: BLE001 - key bookkeeping must not stop the server booting
             log.warning("could not mirror server.api_key into the key table", error=str(exc))
     if "*" in [o.strip() for o in config.server.cors_origins]:

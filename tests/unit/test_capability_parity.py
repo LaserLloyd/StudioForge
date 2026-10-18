@@ -228,7 +228,12 @@ def test_report_surfaces_that_do_not_exist_yet() -> None:
     gaps = missing_surfaces()
     total = sum(len(v) for v in gaps.values())
     lines = [f"  {cap_id}: {', '.join(missing)}" for cap_id, missing in sorted(gaps.items())]
-    report = f"{total} missing surfaces across {len(gaps)} capabilities:\n" + "\n".join(lines)
+    no_cli = missing_cli()
+    report = (
+        f"{total} missing surfaces across {len(gaps)} capabilities:\n"
+        + "\n".join(lines)
+        + f"\n{len(no_cli)} capabilities have no `studioforge` command yet: {', '.join(no_cli)}"
+    )
     print("\n" + report)  # visible with -s
     if gaps:
         warnings.warn(report, UserWarning, stacklevel=1)

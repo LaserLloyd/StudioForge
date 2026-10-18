@@ -605,3 +605,28 @@ def test_auth_status_is_honest_about_the_posture(tmp_path: Path) -> None:
     assert body["bind"]["remote"] == [{"service": "the gateway", "host": "0.0.0.0"}]
     assert body["tls"]["mode"] == "off" and "owner_exists" in body
     assert LEGACY not in json.dumps(body) and PIN not in json.dumps(body)
+
+
+def test_a_running_server_makes_sure_local_helpers_have_a_key(tmp_path: Path) -> None:
+    """With authentication on, local helpers need ``cli.key`` before the first 401."""
+    config = make_config(tmp_path)
+    state = build_state(config)
+    state.accounts.create_key("someone", "read")
+    app = create_app(config, state=state, start_background=True)
+    try:
+        key_file = config.data_dir / "cli.key"
+        assert key_file.is_file()
+        principal = state.accounts.authenticate(key_file.read_text(encoding="utf-8").strip())
+        assert principal is not None and principal.scope == "admin"
+    finally:
+        lock = getattr(app.state, "instance_lock", None)
+        if lock is not None:
+            lock.release()
+    quiet = make_config(tmp_path / "quiet")
+    quiet_app = create_app(quiet, state=build_state(quiet), start_background=True)
+    try:
+        assert not (quiet.data_dir / "cli.key").exists()  # nothing asks for a credential yet
+    finally:
+        lock = getattr(quiet_app.state, "instance_lock", None)
+        if lock is not None:
+            lock.release()
