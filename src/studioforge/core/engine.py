@@ -39,6 +39,7 @@ import hashlib
 import json
 import os
 import platform
+import posixpath
 import re
 import shlex
 import shutil
@@ -1569,6 +1570,99 @@ def _common_prefix(names: Sequence[str]) -> str:
     return "/".join(prefix) + "/" if prefix else ""
 
 
+#: ``(path parts inside the extraction root, link target text, archive name)``.
+_PendingLink = tuple[list[str], str, str]
+
+
+def _link_target(parts: list[str], linkname: str) -> str | None:
+    """Where a link at ``parts`` points, as a path relative to the extraction root.
+
+    ``None`` when the target is absolute, empty or climbs out of the root. The
+    check is lexical (the link's own directory plus ``linkname``, normalised);
+    :func:`_finish_links` repeats it against the real filesystem afterwards,
+    because a chain of links can make a lexically safe path leave the root.
+    """
+    text = linkname.replace("\\", "/")
+    if not text or text.startswith("/") or re.match(r"^[A-Za-z]:", text):
+        return None
+    joined = posixpath.normpath(posixpath.join(*parts[:-1], text))
+    if joined in ("", ".") or joined == ".." or joined.startswith("../"):
+        return None
+    return joined
+
+
+def _within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root)
+    except (ValueError, OSError, RuntimeError):
+        return False
+    return True
+
+
+def _finish_links(
+    dest: Path, links: list[_PendingLink], binary: Path | None, *, kind: str
+) -> Path | None:
+    """Recreate an archive's symlinks once every regular file is on disk.
+
+    Upstream's Linux llama.cpp tarballs ship ``libllama.so -> libllama.so.0``
+    style links; dropping them leaves a binary whose dynamic loader cannot
+    find its libraries, so the engine fails its own smoke test. Links are made
+    *after* all files so no later member's write can follow one; only relative
+    targets that stay inside ``dest`` are honoured (absolute or ``..``-escaping
+    ones are skipped with a warning), and each created link is re-checked with
+    ``resolve()`` against ``dest``. Where a real symlink cannot be made
+    (Windows, a filesystem that refuses) the target file is copied instead.
+    """
+    root = dest.resolve()
+    pending: list[tuple[Path, Path, str]] = []
+    for parts, linkname, archive_name in links:
+        rel = _link_target(parts, linkname)
+        if rel is None:
+            log.warning(f"engine.{kind}.skip_unsafe_link", member=archive_name, link=linkname)
+            continue
+        pending.append((dest.joinpath(*parts), dest.joinpath(*rel.split("/")), archive_name))
+
+    def _make(link: Path, target: Path) -> bool:
+        if os.name != "nt":
+            try:
+                if link.is_symlink() or link.exists():
+                    link.unlink()
+                link.symlink_to(os.path.relpath(target, link.parent))
+            except OSError:
+                pass
+            else:
+                if _within(link, root):
+                    return True
+                link.unlink()
+                log.warning(f"engine.{kind}.skip_unsafe_link", link=str(link))
+                return True  # handled: refused, not retried
+        if target.is_file():  # Windows, or a filesystem without symlinks
+            shutil.copyfile(target, link)
+            shutil.copymode(target, link)
+            return True
+        return False
+
+    # A copy-fallback link whose target is itself a link made later needs
+    # another pass; stop when a pass makes no progress.
+    remaining = pending
+    while remaining:
+        left: list[tuple[Path, Path, str]] = []
+        for link, target, archive_name in remaining:
+            link.parent.mkdir(parents=True, exist_ok=True)
+            if not _make(link, target):
+                left.append((link, target, archive_name))
+        if len(left) == len(remaining):
+            for _link, _target, archive_name in left:
+                log.warning(f"engine.{kind}.skip_unresolved_link", member=archive_name)
+            break
+        remaining = left
+    if binary is None:
+        for link, _target, _name in pending:
+            if link.name == BIN_NAME and link.is_file():
+                return link
+    return binary
+
+
 def extract_engine_zip(zip_path: Path, dest: Path) -> Path | None:
     """Extract ``zip_path`` into ``dest``, flattening a shared top-level dir.
 
@@ -1578,6 +1672,7 @@ def extract_engine_zip(zip_path: Path, dest: Path) -> Path | None:
     """
     dest.mkdir(parents=True, exist_ok=True)
     binary: Path | None = None
+    links: list[_PendingLink] = []
     with zipfile.ZipFile(zip_path) as archive:
         prefix = _common_prefix(archive.namelist())
         for member in archive.infolist():
@@ -1592,11 +1687,18 @@ def extract_engine_zip(zip_path: Path, dest: Path) -> Path | None:
                 continue
             target = dest.joinpath(*parts)
             target.parent.mkdir(parents=True, exist_ok=True)
+            if stat.S_ISLNK(member.external_attr >> 16):
+                # A unix zip stores a symlink as a file whose content is the
+                # link target. Writing that text out as a file leaves a
+                # ``libllama.so`` that is a 14-byte string, not a library.
+                text = archive.read(member).decode("utf-8", "replace")
+                links.append((parts, text, member.filename))
+                continue
             with archive.open(member) as src, target.open("wb") as out:
                 shutil.copyfileobj(src, out)
             if target.name == BIN_NAME:
                 binary = target
-    return binary
+    return _finish_links(dest, links, binary, kind="zip")
 
 
 def _swap_engine_dir(staged: Path, dest: Path) -> None:
@@ -1663,18 +1765,38 @@ def _extract_engine_tar(tar_path: Path, dest: Path) -> Path | None:
     """
     dest.mkdir(parents=True, exist_ok=True)
     binary: Path | None = None
+    links: list[_PendingLink] = []
     with tarfile.open(tar_path, "r:*") as archive:
         members = archive.getmembers()
         prefix = _common_prefix([m.name for m in members if m.isfile()])
         for member in members:
-            if not member.isfile():
-                if member.issym() or member.islnk():
-                    log.warning("engine.tar.skip_link_member", member=member.name)
-                continue
             name = member.name.replace("\\", "/")
             if prefix and name.startswith(prefix):
                 name = name[len(prefix) :]
             parts = [p for p in name.split("/") if p not in ("", ".")]
+            if member.issym() or member.islnk():
+                if not parts or any(p == ".." for p in parts) or Path(name).is_absolute():
+                    log.warning("engine.tar.skip_unsafe_member", member=member.name)
+                    continue
+                linkname = member.linkname.replace("\\", "/")
+                if member.islnk():
+                    # A hard link names another archive member by its full
+                    # archive path; re-express it relative to the link's own
+                    # directory so both kinds share one containment check.
+                    other = linkname
+                    if prefix and other.startswith(prefix):
+                        other = other[len(prefix) :]
+                    other_parts = [p for p in other.split("/") if p not in ("", ".")]
+                    if linkname.startswith("/") or not other_parts:
+                        log.warning(
+                            "engine.tar.skip_unsafe_link", member=member.name, link=member.linkname
+                        )
+                        continue
+                    linkname = "/".join([".."] * (len(parts) - 1) + other_parts)
+                links.append((parts, linkname, member.name))
+                continue
+            if not member.isfile():
+                continue
             if not parts or any(p == ".." for p in parts) or Path(name).is_absolute():
                 log.warning("engine.tar.skip_unsafe_member", member=member.name)
                 continue
@@ -1690,7 +1812,7 @@ def _extract_engine_tar(tar_path: Path, dest: Path) -> Path | None:
                     target.chmod(target.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
             if target.name == BIN_NAME:
                 binary = target
-    return binary
+    return _finish_links(dest, links, binary, kind="tar")
 
 
 def _make_executable(directory: Path) -> None:
