@@ -26,13 +26,22 @@ log() { printf '%s sf-entrypoint: %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" 
 # --- 1. started as root: own the data dir, then drop ---------------------------
 if [ "$(id -u)" = "0" ] && [ "${1:-}" = "serve" ]; then
     log "started as root; chown ${DATA_DIR} to ${PUID}:${PGID} and drop privileges"
+    # Make the image's `studioforge` account BE PUID:PGID so setpriv can resolve
+    # the uid (--init-groups needs a passwd entry); -o allows a non-unique id.
+    if [ "$(id -u studioforge)" != "$PUID" ] || [ "$(id -g studioforge)" != "$PGID" ]; then
+        groupmod -o -g "$PGID" studioforge 2>/dev/null || true
+        usermod  -o -u "$PUID" -g "$PGID" studioforge 2>/dev/null || true
+    fi
     mkdir -p "$DATA_DIR"
     chown "$PUID:$PGID" "$DATA_DIR"
-    if [ -e "$DATA_DIR/registry.sqlite3" ] \
-       && [ "$(stat -c '%u' "$DATA_DIR/registry.sqlite3")" != "$PUID" ]; then
-        log "ownership mismatch on the registry: one-time recursive chown (may take a while)"
+    if [ -n "$(find "$DATA_DIR" -not -user "$PUID" -print -quit 2>/dev/null)" ]; then
+        log "files not owned by ${PUID} found: one-time recursive chown (may take a while on a big volume)"
         chown -R "$PUID:$PGID" "$DATA_DIR"
     fi
+    # docker sets HOME=/root for --user 0:0; the dropped user cannot read it.
+    APP_HOME="$(getent passwd studioforge | cut -d: -f6)"
+    chown "$PUID:$PGID" "$APP_HOME" 2>/dev/null || true
+    export HOME="$APP_HOME"
     exec setpriv --reuid="$PUID" --regid="$PGID" --init-groups --inh-caps=-all -- "$0" "$@"
 fi
 

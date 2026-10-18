@@ -95,8 +95,13 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # Application layer. --no-editable installs the built wheel into the venv, so
 # the runtime image does not need /src.
 COPY src/ ./src/
+# --reinstall-package: guard against uv serving the project's OWN previously built
+# wheel from the cache mount (uv only invalidates it when pyproject.toml changes; seen
+# in another repo's image). Not reproducible with uv 0.13.1 in this layout (a control
+# build without the flag picked up the edit), but it costs one wheel build and removes
+# the question. Verified: rebuild after a one-line source change, grep the venv.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --no-editable
+    uv sync --no-editable --reinstall-package studioforge
 
 RUN find /opt/studioforge -name '__pycache__' -type d -prune -exec rm -rf {} + \
  && find /opt/studioforge -name '*.pyc' -delete
