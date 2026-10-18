@@ -1,6 +1,6 @@
 {
   "name": "ThemeForge",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "themes": [
     {
       "slug": "purple",
@@ -91,6 +91,53 @@
         "JetBrains Mono"
       ],
       "description": "Clean white light theme with a blue accent."
+    },
+    {
+      "slug": "slate",
+      "name": "Slate",
+      "family": "slate",
+      "ground": "dark",
+      "colorScheme": "dark",
+      "themeColor": "#0f1318",
+      "set": "core",
+      "swatch": "#2f6db3",
+      "fonts": [
+        "Inter",
+        "JetBrains Mono"
+      ],
+      "description": "The neutral professional default: cool grey-blue ground, steel-blue accent, muted status colours and dense-but-calm geometry."
+    },
+    {
+      "slug": "high-contrast",
+      "name": "High Contrast",
+      "family": "high-contrast",
+      "ground": "dark",
+      "colorScheme": "dark",
+      "themeColor": "#000000",
+      "set": "core",
+      "swatch": "#ffd400",
+      "fonts": [
+        "Inter",
+        "JetBrains Mono"
+      ],
+      "contrastProfile": "high",
+      "description": "White on black with yellow actions: 7:1 text everywhere, solid colours only, strong edges."
+    },
+    {
+      "slug": "high-contrast-light",
+      "name": "High Contrast Light",
+      "family": "high-contrast",
+      "ground": "light",
+      "colorScheme": "light",
+      "themeColor": "#ffffff",
+      "set": "core",
+      "swatch": "#1a47c8",
+      "fonts": [
+        "Inter",
+        "JetBrains Mono"
+      ],
+      "contrastProfile": "high",
+      "description": "Black on white with blue actions: 7:1 text everywhere, solid colours only, black edges. The light partner of High Contrast."
     },
     {
       "slug": "electric-yellow",

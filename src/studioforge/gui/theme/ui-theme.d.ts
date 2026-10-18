@@ -17,6 +17,7 @@ declare global {
     set: 'core' | 'opt-in';
     swatch: string;
     fonts: string[];
+    contrastProfile: 'standard' | 'high' | 'night';
   }
 
   interface UIThemeChange {
@@ -70,11 +71,43 @@ declare global {
     type?: string;
   }
 
+  /** Words ui-components.js puts on the page; see locales/en.json. */
+  type UIStringKey = 'cancel' | 'ok' | 'confirm' | 'input' | 'message' | 'value' | 'copy' | 'copied' |
+    'copyFailed' | 'reset' | 'resetNamed' | 'basic' | 'advanced' | 'setByEnv';
+
+  interface UISettingController {
+    /** Re-read the control and show or hide the reset button. */
+    update(): void;
+    destroy(): void;
+  }
+
   interface UIComponentsApi {
     confirm(options: UIDialogOptions | string): Promise<boolean>;
     alert(options: UIDialogOptions | string): Promise<void>;
     prompt(options: UIPromptOptions | string): Promise<string | null>;
     toast(message: string, options?: { kind?: 'info' | 'success' | 'warning' | 'danger'; timeout?: number }): HTMLElement;
+    /** Copy an element's text (a .ui-copy, a code block, an input's value) or a string. Resolves true on success. */
+    copy(target: Element | string): Promise<boolean>;
+    /** Mark a field invalid with a message (aria-invalid, aria-describedby, announced); an empty message clears it. */
+    validate(field: Element, message: string | null | undefined, options?: { focus?: boolean; announce?: boolean }): HTMLElement | null;
+    /** Wire a .ui-setting row: reset-to-default, translated badges, env lock. */
+    setting(row: Element, options?: { default?: string | boolean; onReset?: (control: HTMLElement, row: Element) => void }): UISettingController;
+    /** Say something politely to assistive technology. */
+    announce(message: string): void;
+    /** Wire copy buttons and data-default settings rows under a root (default: the document). */
+    init(root?: ParentNode): void;
+    /** A word by key; data-ui-str-<key> on the element or an ancestor wins. {placeholders} are filled from vars. */
+    t(key: UIStringKey | (string & {}), element?: Element | null, vars?: Record<string, string | number>): string;
+    strings(): Record<string, string>;
+    /** Merge translated words over the table. */
+    setStrings(map: Partial<Record<UIStringKey, string>> & Record<string, string>): Record<string, string>;
+    resetStrings(): Record<string, string>;
+    /** Fetch locales/<lang>.json next to ui-components.js and merge it; resolves true when applied. */
+    loadLocale(lang?: string, url?: string): Promise<boolean>;
+    /** The page language (<html lang>), else the browser's. */
+    locale(): string;
+    formatNumber(value: number | bigint, options?: Intl.NumberFormatOptions): string;
+    formatDate(value: Date | number | string, options?: Intl.DateTimeFormatOptions): string;
   }
 
   interface Window {

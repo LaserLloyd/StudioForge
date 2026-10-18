@@ -79,6 +79,16 @@ jobs:
           uv venv --python 3.12 .venv
           uv pip install --python .venv -e ".[dev]"
 
+      - name: Vendored ForgeUI bundle matches forgeui.json
+        # gui/theme/ is the ForgeUI (ThemeForge) bundle, vendored whole. This fails on a
+        # different version, a stale or hand-edited bundle file, a missing or changed
+        # overlay, or settings naming a theme the bundle lacks. Fix: `python -m forgeui
+        # vendor` (docs/DEVELOPMENT.md, "GUI theming"). forgeui comes from the release tag,
+        # not PyPI (that name belongs to another project).
+        run: |
+          uv pip install --python .venv "forgeui @ git+https://github.com/LaserLloyd/ThemeForge@v1.2.0"
+          uv run --python .venv --no-sync python -m forgeui vendor --check
+
       - name: Lint (ruff check)
         run: uv run --python .venv ruff check src/ tests/ packages/
 
@@ -96,6 +106,9 @@ jobs:
       - name: Unit tests
         env:
           SF_GPU_PROBE: "null"
+          # tests/unit/test_forgeui_vendor.py runs `forgeui vendor --check` too; with this set a
+          # missing forgeui package fails the test instead of skipping it.
+          FORGEUI_REQUIRED: "1"
           # pystray's Linux backends want an X display at import time (the
           # xorg one opens it at module level, and the error it raises is not
           # an ImportError, so importorskip cannot skip it). The tray tests

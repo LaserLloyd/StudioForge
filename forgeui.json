@@ -1,0 +1,24 @@
+{
+  "dest": "src/studioforge/gui/theme",
+  "version": "1.2",
+  "adapters": ["quasar"],
+  "extra_files": {
+    "adapters/studioforge-extra.css": "src/studioforge/gui/overlays/studioforge-extra.css"
+  },
+  "settings": {
+    "themes": [
+      "purple",
+      "midnight-gold",
+      "glacier",
+      "forest",
+      "paper",
+      "daylight",
+      "slate",
+      "high-contrast",
+      "high-contrast-light",
+      "night-red"
+    ],
+    "default": "glacier",
+    "storage_key": "studioforge.theme"
+  }
+}

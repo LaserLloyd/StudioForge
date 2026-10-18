@@ -53,7 +53,7 @@ TIMEOUT = 60
 NAME = "ThemeForge"
 #: Names this bundle shipped under before; a folder whose VERSION carries one is
 #: still recognised as this bundle (ThemeForge was released as unifyingTheme).
-LEGACY_NAMES = ("unifyingTheme",)
+LEGACY_NAMES = ("unifyingTheme", "ui-theme")
 
 
 class UpdateError(Exception):
