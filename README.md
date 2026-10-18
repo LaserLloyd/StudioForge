@@ -150,86 +150,218 @@ the [VRAM Tenant Protocol](docs/TENANTS.md). StudioForge never starts or stops o
 
 ## Install
 
+Pick your platform below. Methods are listed simplest first, and each block runs top to bottom on a
+fresh machine. StudioForge serves models from GPU memory only. NVIDIA (CUDA) is the tested path; the
+AMD (ROCm) and Vulkan images build and boot but have not been run on real AMD or Intel hardware.
+With no usable GPU the server still starts and reports `can_serve=false`.
+
+**Ports:** `1234` gateway (`/v1`, `/api`, `/mcp`, `/health`), `8080` control panel, `1235` watchdog
+sidecar. All three bind `127.0.0.1` unless you change it (see [Ports](#ports)). LM Studio also uses
+`1234`: quit it first.
+
 ### Windows
 
-1. Install [Git](https://git-scm.com/download/win), [Python 3.12+](https://www.python.org/downloads/)
-   and [uv](https://docs.astral.sh/uv/getting-started/installation/). Have a current
-   [NVIDIA driver](https://www.nvidia.com/drivers/) — the CUDA 13 engine builds need a 580-series
-   driver or newer (no CUDA toolkit needed: the prebuilt engine ships its runtime).
-2. Clone:
+You need an NVIDIA driver from the 580 series or newer for the CUDA 13 engine builds (no CUDA toolkit
+needed: the prebuilt engine ships its runtime).
 
-   ```bash
-   git clone https://github.com/LaserLloyd/StudioForge.git
-   ```
+#### 1. Git + uv, run from a clone (simplest)
 
-3. Double-click **`launchers\Update StudioForge.bat`** — creates the virtualenv, installs the
-   dependencies, then installs the **newest** llama.cpp release that has a build your driver can
-   run, smoke-tests it, and only then activates and pins it. A build that fails its smoke test is
-   installed but never made active (D49). (`b10425` is the build the numbers in these docs were
-   measured on, not necessarily the one you will get.)
-4. Double-click **`launchers\Start StudioForge.bat`**. The control panel opens at
-   <http://127.0.0.1:8080> on its **Setup** tab — a checklist with a button for each unmet item.
-   (Prefer a notification-area icon that keeps the server alive and restarts it if it crashes?
-   Use **`launchers\StudioForge Tray.bat`** instead, and open the panel from the icon's menu.)
+Choose this for one Windows PC with an NVIDIA GPU. It uses the prebuilt llama.cpp engine, and
+`launchers\` adds a tray icon and start-at-login.
+
+```powershell
+winget install --id Git.Git -e
+winget install --id astral-sh.uv -e
+```
+
+Close PowerShell and open a new window so `git` and `uv` are on `PATH`, then:
+
+```powershell
+git clone https://github.com/LaserLloyd/StudioForge.git
+cd StudioForge
+uv venv --python 3.12 .venv
+uv pip install --python .venv\Scripts\python.exe -e .
+.venv\Scripts\python.exe -m studioforge serve --open
+```
+
+The first start downloads the pinned llama.cpp engine and checks its checksum. `serve --open` stays in
+the foreground and opens the control panel at <http://127.0.0.1:8080>. To check it, open a second
+PowerShell window:
+
+```powershell
+curl.exe -s http://127.0.0.1:1234/health
+```
+
+A later `studioforge engine --update` installs the newest llama.cpp build your driver can run and
+smoke-tests it before activating; the smoke test needs one GGUF in your library, and without one the
+command exits 1 and keeps the current engine. Prefer double-clicking? `launchers\Update StudioForge.bat`
+does the venv, install and engine steps,
+`launchers\Start StudioForge.bat` starts the server, and `launchers\StudioForge Tray.bat` runs it from
+the notification area (see [Windows launchers](#windows-launchers)).
+
+| Pros | Cons |
+| --- | --- |
+| Fewest steps, no container layer | You update Python packages and the engine yourself |
+| Prebuilt engine, nothing to compile | Windows only; data lives in `data\` inside the clone unless you set `SF_DATA_DIR` |
+| Tray, autostart and Update launchers included | Runs as your user, not isolated from the rest of the PC |
+
+#### 2. Docker Desktop
+
+Choose this to keep StudioForge in a container with its data on a Docker volume. The container is
+Linux, so the llama.cpp engine is compiled inside it on the first start (several minutes of CPU) and
+the image that can do that is large (about 14 GB).
+
+```powershell
+winget install --id Docker.DockerDesktop -e
+winget install --id Git.Git -e
+```
+
+Start Docker Desktop once and accept its first-run prompts (WSL 2 backend; the Windows NVIDIA driver
+gives containers GPU access). Then, in a new PowerShell window:
+
+```powershell
+git clone https://github.com/LaserLloyd/StudioForge.git
+cd StudioForge\deploy\compose
+@"
+SF_BACKEND=cuda-devel
+SF_MODELS=C:/Users/you/models
+SF_OWNER_PASSWORD=change-this-password
+"@ | Set-Content .env
+docker build --build-arg BACKEND=cuda --build-arg CUDA_FLAVOR=devel --build-arg VERSION=2.0.0 -t ghcr.io/laserlloyd/studioforge:2.0.0-cuda-devel ..\..
+docker compose -f compose.yml -f compose.cuda.yml up -d
+docker compose ps
+curl.exe -s http://127.0.0.1:1234/health
+```
+
+Edit the `SF_MODELS` path (your GGUF folder) and `SF_OWNER_PASSWORD` (10 or more characters) before you
+run it. Open <http://localhost:8080> and sign in as `owner` with that password; create one key per
+client under **Users & Keys**, and point clients at `http://localhost:1234/v1`. Leave
+`SF_OWNER_PASSWORD` out and the container generates one into `/data/owner-password.initial` on the
+volume. Once the image is published to the registry, replace the `docker build` line with
+`docker compose -f compose.yml -f compose.cuda.yml pull`. Do not add `--build` to `up` (see the Linux note below).
+
+| Pros | Cons |
+| --- | --- |
+| Data on a named volume, read-only image, pre-migration snapshots | About 14 GB image; engine compiles on first start |
+| Easy upgrade and rollback by tag | Needs Docker Desktop and its NVIDIA/WSL 2 GPU setup |
+| Nothing installed on Windows besides Docker | No tray icon; Docker Desktop must be running |
 
 ### Linux
 
-1. Install [Git](https://git-scm.com/downloads), [Python 3.12+](https://www.python.org/downloads/),
-   [uv](https://docs.astral.sh/uv/getting-started/installation/), `cmake`, and the
-   [CUDA toolkit](https://developer.nvidia.com/cuda-downloads) whose `nvcc` matches your driver.
-   Upstream ships no Linux CUDA archive, so the engine is **built from source once per version**.
-2. Clone and install:
+Ubuntu and Debian package names are shown; use your distribution's equivalents. NVIDIA is the tested
+GPU path. On Linux the pinned llama.cpp engine for NVIDIA is **built from source on the first start**
+(minutes of CPU, once per version), which needs `git`, `cmake`, a compiler and a CUDA toolkit whose
+`nvcc` matches your driver ([download](https://developer.nvidia.com/cuda-downloads)). The container
+method brings its own toolchain.
+AMD (ROCm) and Vulkan are untested on hardware.
 
-   ```bash
-   git clone https://github.com/LaserLloyd/StudioForge.git && cd StudioForge
-   uv venv --python 3.12 .venv
-   uv pip install --python .venv/bin/python -e ".[dev]"
-   ```
+#### 1. Installer script with a systemd user service (simplest)
 
-3. Start it (the first run builds the engine; watch the progress in the terminal):
+Choose this for a Linux box you want StudioForge to run on at login, with no `sudo` after the
+prerequisites. It installs `uv` if you lack it, makes a Python 3.12 environment under your home
+directory, and writes and starts two systemd **user** units (gateway and watchdog).
 
-   ```bash
-   .venv/bin/studioforge serve --open
-   ```
+```bash
+sudo apt-get update && sudo apt-get install -y git curl ca-certificates cmake build-essential
+git clone https://github.com/LaserLloyd/StudioForge.git
+cd StudioForge
+deploy/linux/install.sh --from .
+export PATH="$HOME/.local/bin:$PATH"
+studioforge version
+curl --retry 20 --retry-connrefused -s http://127.0.0.1:1234/health
+```
 
-4. To run it as a service that survives logout, use the systemd user units in
-   [`deploy/`](deploy/README.md).
+The service builds the engine on its first start; follow it with `journalctl --user -u studioforge -f`
+(`/health` reports `can_serve=false` until the engine and a model are in place). Skip the CUDA toolkit
+and use method 2 if you would rather not install one. Avoid `studioforge engine --update` on Linux for
+now: it fetches an upstream CUDA archive whose smoke test failed in our container test. Add `sudo loginctl enable-linger "$USER"` so the services keep running when
+you are logged out. The control panel is <http://localhost:8080>. Read the script first with
+`less deploy/linux/install.sh`, preview it with `--dry-run`, or use `--system` (run as root) for a
+system-wide install under `/opt/studioforge`. When a GitHub release exists you can skip the clone:
+`curl -fsSL https://raw.githubusercontent.com/LaserLloyd/StudioForge/main/deploy/linux/install.sh | bash`
+installs the latest release wheel after checking it against `SHA256SUMS.txt`.
 
-### Run in Docker
-
-Images: `ghcr.io/laserlloyd/studioforge:<version>-cuda` (NVIDIA), `-rocm` and `-vulkan` (build and
-boot today; they serve once the multi-backend engine lands). Docker or Podman.
-
-1. **Get the compose files:** `git clone https://github.com/LaserLloyd/StudioForge.git && cd StudioForge/deploy/compose && cp env.example .env`
-   (set `SF_MODELS` to your GGUF folder).
-2. **Start it:** `docker compose -f compose.yml -f compose.cuda.yml up -d`
-   (Podman: `podman-compose -f compose.yml -f compose.cuda.podman.yml up -d`).
-3. **Open** <http://localhost:8080> and sign in as the owner (`SF_OWNER_PASSWORD` from `.env`, or
-   the generated one in `/data/owner-password.initial` on the volume — `docker compose exec` into
-   the container and `cat` it). Create a key per client under **Users & Keys**; clients use
-   `http://localhost:1234/v1` with that key.
-
-| Port | What |
+| Pros | Cons |
 | --- | --- |
-| `1234` | Gateway: `/v1`, `/api`, `/mcp`, `/health` |
-| `8080` | Control panel |
-| `1235` | Watchdog sidecar |
+| Autostart, restart on failure and a watchdog, as user units | You install the CUDA toolkit for the engine build |
+| User-level: nothing outside your home directory, no `sudo` for the install | Needs a systemd user session (without one the script writes the units but cannot enable them, and says so) |
+| `--uninstall` removes the program and keeps your data | A script writes units for you; read it or use `--dry-run` first |
 
-GPU passthrough: Docker `--gpus all`; Podman `--device nvidia.com/gpu=all` (after
-`sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml`); AMD `--device /dev/kfd --device /dev/dri`.
-The llama.cpp engine is downloaded or built by the app on first start into the data volume (the slim
-`-cuda` image cannot compile it: use `-cuda-devel` once, or mount a built `engines/`).
+#### 2. Docker or Podman Compose
 
-**Your data survives updates.** Everything lives on the `studioforge-data` volume (`/data`), the image
-is read-only, and on the first start of a new version the entrypoint snapshots `registry.sqlite3` and
-`config.yaml` to `/data/backups/<oldversion>-<time>/` before migrations run (newest 5 kept).
-`docker compose pull && docker compose up -d` keeps it; **`docker compose down -v` deletes it**. Back
-it up with the app stopped:
-`docker run --rm -v studioforge-data:/data:ro -v "$PWD":/backup alpine tar czf /backup/studioforge-data.tgz -C /data .`
-(restore: extract into a fresh volume with the reverse `tar xzf`, then `chown -R 1000:1000 /data`).
-Full guide: [docs/deploy/docker.md](docs/deploy/docker.md).
+Choose this for isolation, a data volume that survives updates, and no CUDA toolkit on the host. It
+needs Docker with the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
+(the `nvidia-ctk runtime configure --runtime=docker` step), or Podman with a CDI spec.
 
-### First run, either platform
+```bash
+sudo apt-get update && sudo apt-get install -y git curl ca-certificates
+curl -fsSL https://get.docker.com | sh
+git clone https://github.com/LaserLloyd/StudioForge.git
+cd StudioForge/deploy/compose
+mkdir -p models
+cat > .env <<'EOF'
+SF_BACKEND=cuda-devel
+SF_MODELS=./models
+SF_OWNER_PASSWORD=change-this-password
+EOF
+sudo docker build --build-arg BACKEND=cuda --build-arg CUDA_FLAVOR=devel --build-arg VERSION=2.0.0 -t ghcr.io/laserlloyd/studioforge:2.0.0-cuda-devel ../..
+sudo docker compose -f compose.yml -f compose.cuda.yml up -d
+sudo docker compose ps
+curl --retry 20 --retry-connrefused -s http://127.0.0.1:1234/health
+```
+
+Put your GGUF files in `models/` (or set `SF_MODELS`), and choose your own `SF_OWNER_PASSWORD` (10 or
+more characters; leave it out to get a generated one in `/data/owner-password.initial`). Sign in at
+<http://localhost:8080>. The slim `-cuda` image cannot compile the engine: use `-cuda-devel` as above,
+or mount an engine you built once. Podman: `podman-compose -f compose.yml -f compose.cuda.podman.yml up -d`.
+Do not add `--build` to `up`: compose passes `SF_BACKEND` as the build argument, which only accepts
+`cuda`, `rocm` or `vulkan`. Once the image is published, replace the `docker build` line with `pull`. Full guide, the AMD and
+Vulkan overrides, and offline use: [docs/deploy/docker.md](docs/deploy/docker.md).
+
+| Pros | Cons |
+| --- | --- |
+| Data on the `studioforge-data` volume, read-only image, snapshot before each migration | About 14 GB devel image; first start compiles the engine |
+| Upgrade is a pull and `up -d`; rollback is the previous tag | Needs the NVIDIA Container Toolkit (or a CDI spec on Podman) |
+| No CUDA toolkit or Python on the host | No tray; models folder is mounted read-only |
+
+#### 3. From a clone with uv, no service (hackable)
+
+Choose this to read or change the code, or to run it in a terminal. Same prerequisites as method 1.
+
+```bash
+sudo apt-get update && sudo apt-get install -y git curl ca-certificates cmake build-essential
+curl -LsSf https://astral.sh/uv/install.sh | sh
+source "$HOME/.local/bin/env"
+git clone https://github.com/LaserLloyd/StudioForge.git
+cd StudioForge
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python -e ".[dev]"
+.venv/bin/studioforge serve
+```
+
+In a second terminal: `curl -s http://127.0.0.1:1234/health`. The first start builds the engine; watch the
+progress in the first terminal. To run it as a service later, use the units in [`deploy/`](deploy/README.md).
+
+| Pros | Cons |
+| --- | --- |
+| Editable install: change the code and restart | Most steps; you manage Python, uv and the CUDA toolkit |
+| Nothing written outside the clone and the data folder | No autostart until you add the systemd units yourself |
+
+### macOS
+
+Not supported. StudioForge's engines are CUDA, ROCm and Vulkan builds of llama.cpp, the installer
+refuses to run on anything but Linux, and Docker Desktop on a Mac cannot pass a GPU into a container.
+
+### Upgrade and uninstall
+
+| Method | Upgrade | Uninstall (your data is kept unless noted) |
+| --- | --- | --- |
+| Windows, clone | `git pull`, then `uv pip install --python .venv\Scripts\python.exe -e .`; stop the server first | `studioforge autostart disable` if you enabled it, then delete the folder. **Data is in `data\` inside the clone** unless `SF_DATA_DIR` points elsewhere: copy it out first |
+| Docker (Windows or Linux) | `git pull`, rebuild the image (or `docker compose pull` once it is published), then `docker compose up -d`. Roll back by setting `SF_VERSION` to the previous tag. The entrypoint snapshots `registry.sqlite3` and `config.yaml` to `/data/backups/` first | `docker compose down` keeps the `studioforge-data` volume; `docker compose down -v` deletes it. Backup and restore: [docs/deploy/docker.md](docs/deploy/docker.md#backup-and-restore) |
+| Linux installer | `git pull`, then `deploy/linux/install.sh --from .` again (replaces the program, keeps data); roll back with `git checkout <older tag>` and the same command | `deploy/linux/install.sh --uninstall`; data stays in `~/.local/share/studioforge` |
+| Linux, clone | `git pull`, then `uv pip install --python .venv/bin/python -e ".[dev]"` | Delete the clone; data is in `data/` inside it unless `SF_DATA_DIR` is set |
+
+### First run, any platform
 
 The panel opens on **Overview** with a *Finish setup* banner that leads to the setup guide
 (`/setup`, or `studioforge setup` in a terminal): owner account, hardware, engine, model library
