@@ -1094,6 +1094,7 @@ async def _serving_readiness(state: Any) -> dict[str, Any]:
         gpu_count = await asyncio.to_thread(lambda: len(state.planner.probe.list_gpus()))
     except Exception:  # noqa: BLE001
         gpu_count = 0
+    blocked = getattr(state.planner.probe, "blocked_reason", None) if gpu_count == 0 else None
     try:
         models_indexed = len(state.registry.all())
     except Exception:  # noqa: BLE001
@@ -1109,6 +1110,9 @@ async def _serving_readiness(state: Any) -> dict[str, Any]:
             "`studioforge engine --update`"
             + (f" ({engine.get('error')})" if engine.get("error") else "")
         )
+    elif blocked:
+        # A CUDA engine with a failing NVML: say so (and the fix), not "no GPU".
+        reason = str(blocked)
     elif gpu_count == 0:
         reason = (
             "no GPU detected (this server is GPU-only): check the driver and its query "

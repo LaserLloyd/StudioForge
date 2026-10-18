@@ -938,6 +938,17 @@ class MetalGpuProbe(_CliProbe):
 # ---------------------------------------------------------------------------
 
 
+def _nvml_blocked_reason(nvml_reason: str) -> str:
+    """The operator-facing message for "CUDA engine, NVML unavailable"."""
+    head = nvml_reason if "NVML" in nvml_reason else f"NVML unavailable: {nvml_reason}"
+    return (
+        f"{head}. The active llama.cpp engine is a CUDA build, which cannot drive a "
+        "Vulkan or ROCm device, so no other GPU backend was tried. Fix: make "
+        "`nvidia-smi` list the cards (reload or reinstall the NVIDIA driver, or reboot), "
+        "then restart StudioForge; or install a Vulkan engine build to use that backend."
+    )
+
+
 @dataclass(frozen=True)
 class ProbeAttempt:
     """One backend the auto-selector tried, and what came of it."""
@@ -959,6 +970,13 @@ class AutoGpuProbe:
     One backend per process: a box with an NVIDIA and an AMD card uses the
     first one that answers.
 
+    One exception to "first that lists a GPU wins": when the active llama.cpp
+    engine is a CUDA build (see :meth:`bind_engine_backend`) and NVML lists
+    nothing, the other backends are NOT tried. Vulkan would list the very same
+    NVIDIA cards and the CUDA build would then be launched with
+    ``--device Vulkan0``, which it cannot honour. The probe reports no GPUs and
+    :attr:`blocked_reason` says why and how to fix it.
+
     Resolution is lazy and sticky until :meth:`shutdown`. :attr:`attempts`
     records every backend tried and why the failures failed, which is what
     ``/api/gpus`` and the setup wizard should show.
@@ -970,6 +988,7 @@ class AutoGpuProbe:
         *,
         cache_s: float = DEFAULT_PROBE_CACHE_S,
         timeout_s: float = DEFAULT_PROBE_TIMEOUT_S,
+        engine_backend: Callable[[], str | None] | None = None,
     ) -> None:
         cli: dict[str, Any] = {"ttl_s": cache_s, "timeout_s": timeout_s}
         self._candidates: list[GpuProbe] = (
@@ -980,7 +999,28 @@ class AutoGpuProbe:
         self._lock = threading.Lock()
         self._selected: GpuProbe | None = None
         self._resolved = False
+        self._engine_backend = engine_backend
         self.attempts: list[ProbeAttempt] = []
+        #: Why detection stopped at NVML instead of trying the other backends
+        #: (a CUDA engine with a failing NVML), or ``None``.
+        self.blocked_reason: str | None = None
+
+    def bind_engine_backend(self, getter: Callable[[], str | None]) -> None:
+        """Say how to ask which backend the active llama.cpp engine targets.
+
+        Late-bound because the engine manager is built from the probe. Takes
+        effect for a resolution that has not happened yet (resolution is
+        lazy, and a result is kept until :meth:`shutdown`).
+        """
+        self._engine_backend = getter
+
+    def _engine_is_cuda(self) -> bool:
+        if self._engine_backend is None:
+            return False
+        try:
+            return self._engine_backend() == "cuda"
+        except Exception:  # noqa: BLE001 - detection must not depend on the engine inventory
+            return False
 
     def _resolve(self) -> GpuProbe | None:
         with self._lock:
@@ -988,6 +1028,7 @@ class AutoGpuProbe:
                 return self._selected
             attempts: list[ProbeAttempt] = []
             selected: GpuProbe | None = None
+            blocked: str | None = None
             for probe in self._candidates:
                 reason = ""
                 try:
@@ -1001,7 +1042,13 @@ class AutoGpuProbe:
                 if count > 0:
                     selected = probe
                     break
+                if probe.backend == "cuda" and self._engine_is_cuda():
+                    blocked = _nvml_blocked_reason(reason)
+                    break
             self.attempts, self._selected, self._resolved = attempts, selected, True
+            self.blocked_reason = blocked
+            if blocked is not None:
+                log.warning("gpu_probe_nvml_blocked", reason=blocked)
             log.info(
                 "gpu_probe_auto",
                 selected=selected.backend if selected else None,
@@ -1030,6 +1077,7 @@ class AutoGpuProbe:
                 for a in self.attempts
             ],
             "notes": notes,
+            "blocked": self.blocked_reason,
         }
 
     def available(self) -> bool:
@@ -1062,6 +1110,7 @@ class AutoGpuProbe:
                 with contextlib.suppress(Exception):
                     probe.shutdown()
             self._selected, self._resolved, self.attempts = None, False, []
+            self.blocked_reason = None
 
 
 # ---------------------------------------------------------------------------

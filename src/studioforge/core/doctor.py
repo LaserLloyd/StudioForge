@@ -152,6 +152,10 @@ def _check_gpu(report: DoctorReport, probe: Any) -> None:
             "Install or update the GPU driver, then run `studioforge doctor` again.",
         )
         return
+    blocked = getattr(probe, "blocked_reason", None)
+    if not gpus and blocked:
+        report.add("gpu.nvml_unavailable", "warn", "GPU", str(blocked))
+        return
     if not gpus:
         report.add(
             "gpu.none",
