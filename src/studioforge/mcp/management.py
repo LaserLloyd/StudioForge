@@ -64,7 +64,8 @@ from fastapi.concurrency import run_in_threadpool
 from mcp.server.mcpserver import MCPServer
 
 from studioforge import __version__
-from studioforge.api.auth import redact_config_dict
+from studioforge.api.auth import auth_enforced, redact_config_dict, resolve_principal
+from studioforge.authkeys import Principal
 from studioforge.build import build_id
 from studioforge.config import RESTART_REQUIRED_KEYS, Config, apply_overrides, load_config
 from studioforge.core import parallel_bench, throughput
@@ -77,6 +78,8 @@ from studioforge.core.model_gate import (
 )
 from studioforge.errors import BadRequestError, ModelNotFoundError, StudioForgeError
 from studioforge.logging import get_logger
+from studioforge.mcp_policy import PolicyExtension, annotations_for
+from studioforge.tlsutil import scheme_for
 from studioforge.types import GB
 
 #: Backwards-compatible alias: the SDK's ``FastMCP`` is now ``MCPServer``.
@@ -693,6 +696,60 @@ def _redacted_config(config: Config) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def _header(headers: Any, name: str) -> str | None:
+    """A header from a mapping, case-insensitively (Starlette's is; a plain dict is not)."""
+    getter = getattr(headers, "get", None)
+    value = getter(name) if callable(getter) else None
+    if value is None:
+        wanted = name.lower()
+        try:
+            for key in headers:
+                if str(key).lower() == wanted:
+                    value = headers[key]
+                    break
+        except TypeError:
+            return None
+    return str(value).strip() if value else None
+
+
+def _principal_resolver(state: Any) -> Any:
+    """``headers -> Principal | None`` for the tool-policy layer.
+
+    The HTTP middleware already authenticated the request; this re-derives *who*
+    from the same headers (without spending a key's rate budget) so each tool can
+    ask for its own scope. An install that needs no credential (loopback, no
+    keys) yields the local principal, exactly as the middleware let it through.
+    """
+
+    def resolve(headers: Any) -> Principal | None:
+        config = state.config
+        accounts = getattr(state, "accounts", None)
+        authorization = _header(headers, "authorization")
+        provided: str | None = None
+        if authorization:
+            prefix, _, token = authorization.partition(" ")
+            provided = (
+                token.strip()
+                if prefix.lower() == "bearer" and token.strip()
+                else (authorization if " " not in authorization else None)
+            )
+        provided = provided or _header(headers, "x-api-key")
+        header_pin = _header(headers, "x-mcp-pin") or _header(headers, "x-studioforge-pin")
+        try:
+            found = resolve_principal(
+                provided, header_pin, config, accounts, on_mcp=True, count=False
+            )
+        except StudioForgeError:
+            return None
+        if found is not None:
+            return found
+        if not auth_enforced(config, accounts):
+            return Principal("local", "", "unauthenticated", "admin")
+        return None
+
+    return resolve
+
+
 def build_management_mcp(state: Any) -> MCPServer:
     """Build the management MCP server over a composed app state.
 
@@ -707,6 +764,11 @@ def build_management_mcp(state: Any) -> MCPServer:
         title="StudioForge management",
         version=__version__,
         instructions=INSTRUCTIONS,
+        extensions=[
+            PolicyExtension(
+                "gateway", _principal_resolver(state), lambda: getattr(state, "audit", None)
+            )
+        ],
     )
 
     # -- models ----------------------------------------------------------
@@ -2239,8 +2301,11 @@ def build_management_mcp(state: Any) -> MCPServer:
 
         config: Config = state.config
         mcp_path = getattr(getattr(config, "mcp", None), "path", "/mcp")
-        endpoints = reachable_urls(config.server.port, mcp_path, host=config.server.host)
-        api = reachable_urls(config.server.port, "/v1", host=config.server.host)
+        scheme = scheme_for(config)
+        endpoints = reachable_urls(
+            config.server.port, mcp_path, host=config.server.host, scheme=scheme
+        )
+        api = reachable_urls(config.server.port, "/v1", host=config.server.host, scheme=scheme)
 
         buckets: dict[str, list[dict[str, str]]] = {"tailscale": [], "lan": [], "loopback": []}
         for entry in endpoints:
@@ -2410,7 +2475,7 @@ def build_management_mcp(state: Any) -> MCPServer:
         get_config,
         set_config,
     ):
-        server.add_tool(tool)
+        server.add_tool(tool, annotations=annotations_for("gateway", tool.__name__))
 
     return server
 
@@ -2456,7 +2521,18 @@ def mount_management_mcp(app: Any, state: Any, *, path: str = "/mcp") -> None:
     host = getattr(getattr(state, "config", None), "server", None)
     bind_host = getattr(host, "host", "0.0.0.0")
 
-    sub_app = server.streamable_http_app(streamable_http_path=path, host=bind_host)
+    # The SDK's DNS-rebinding guard turns itself on for a loopback bind and would
+    # 421 any Host it did not expect (a reverse proxy, `tailscale serve`, a test
+    # client). The protection that matters is StudioForge's own Origin allowlist
+    # on this path (api/app.py AuthMiddleware): a rebinding page always sends an
+    # Origin, and the allowlist refuses it.
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    sub_app = server.streamable_http_app(
+        streamable_http_path=path,
+        host=bind_host,
+        transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+    )
     session_manager = server.session_manager
 
     for route in sub_app.routes:

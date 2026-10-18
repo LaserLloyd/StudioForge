@@ -494,6 +494,7 @@ class AccountStore:
             "VALUES (?, ?, ?, ?, ?)",
             (account_id, name, role, now, now),
         )
+        self._invalidate_posture()
         log.info("account created", username=name, role=role)
         return Account(account_id, name, role, now)
 

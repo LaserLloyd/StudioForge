@@ -32,7 +32,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from studioforge.logfiles import MB, rotate_if_large
+from studioforge.logfiles import MB, backups_of, rotate_if_large
 from studioforge.secure_files import restrict_to_owner
 
 __all__ = ["AuditLog", "audit_path", "redact_update_keys"]
@@ -115,13 +115,23 @@ class AuditLog:
                 _log.warning("could not write the audit log %s: %s", self.path, exc)
 
     def tail(self, n: int = 100) -> list[dict[str, Any]]:
-        """The last ``n`` entries, oldest first. Unreadable lines are skipped."""
-        try:
-            lines = self.path.read_text(encoding="utf-8").splitlines()[-max(1, n) :]
-        except OSError:
-            return []
+        """The last ``n`` entries, oldest first, reaching into rotated files when needed.
+
+        Unreadable lines are skipped. Reading across a rotation matters: the file is
+        renamed away the moment it is large, so a tail of only the live file would
+        read empty right after the entries that most deserve a look.
+        """
+        wanted = max(1, n)
+        lines: list[str] = []
+        for path in [*reversed(backups_of(self.path)), self.path]:
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines() + lines
+            except OSError:
+                continue
+            if len(lines) >= wanted:
+                break
         out: list[dict[str, Any]] = []
-        for line in lines:
+        for line in lines[-wanted:]:
             try:
                 out.append(json.loads(line))
             except ValueError:
