@@ -38,6 +38,14 @@ async def test_a_trailing_event_without_a_blank_line_is_still_delivered() -> Non
     assert frames == [("data", {"x": 1})]
 
 
+async def test_an_invalid_byte_does_not_stall_the_rest_of_the_stream() -> None:
+    raw = b'data: {"a": "x\xff"}\n\n' + 'data: {"b": "é"}\n\n'.encode() + b"data: [DONE]\n\n"
+    # Byte-at-a-time also splits the two-byte e-acute across reads.
+    frames = await _frames([raw[i : i + 1] for i in range(len(raw))])
+    assert [k for k, _ in frames] == ["data", "data", "done"]
+    assert frames[0][1] == {"a": "x�"} and frames[1][1] == {"b": "é"}
+
+
 async def test_non_json_and_non_object_data_are_not_fatal() -> None:
     frames = await _frames([b"data: not json\n\n", b"data: [1, 2]\n\n", b'data: {"ok": true}\n\n'])
     assert frames[-1] == ("data", {"ok": True})
