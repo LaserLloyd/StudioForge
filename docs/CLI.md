@@ -495,7 +495,7 @@ studioforge setup
 | `--model` | str |  | Hugging Face repo to download, or a model id already in the library. |
 | `--skip-model` | flag |  |  |
 | `--skip-chat` | flag |  |  |
-| `--exposure` | str | `local` | local (default) \| lan (HTTPS on the network) \| peer (later). |
+| `--exposure` | str |  | local \| lan (HTTPS on the network) \| peer (later). Default: keep a network binding that is already configured, else local. |
 | `--no-start` | flag |  | Do not start the server for steps 5-6. |
 | `--json` | flag |  | Print machine-readable JSON. |
 | `--config`, `-c` | path |  | Path to config.yaml |

@@ -320,6 +320,25 @@ def test_peer_exposure_is_a_documented_placeholder() -> None:
     assert "apply_exposure" not in services.names()
 
 
+def test_an_unasked_exposure_keeps_an_existing_network_binding() -> None:
+    """Re-running setup (what the bind-rule refusal says to do) must not cut the LAN off."""
+    services = FakeServices(network_hosts=lambda: ["0.0.0.0"])
+    wizard = run(services, username="owner", password="a-long-enough-password", skip_model=True)
+    step = next(r for r in wizard.results if r.key == "exposure")
+    assert step.status == "done" and step.data["mode"] == "kept"
+    assert "0.0.0.0" in step.detail and "apply_exposure" not in services.names()
+    # Asked for explicitly, local still reverts it.
+    explicit = FakeServices(network_hosts=lambda: ["0.0.0.0"])
+    run(explicit, skip_account=True, skip_model=True, exposure="local")
+    assert ("apply_exposure", ("local",)) in explicit.calls
+
+
+def test_an_unasked_exposure_on_a_loopback_install_is_local() -> None:
+    services = FakeServices(network_hosts=lambda: [])
+    run(services, skip_account=True, skip_model=True)
+    assert ("apply_exposure", ("local",)) in services.calls
+
+
 def test_an_unknown_exposure_is_refused() -> None:
     wizard = run(FakeServices(), skip_model=True, exposure="everywhere")
     assert statuses(wizard)["exposure"] == "failed"
@@ -416,6 +435,13 @@ def test_live_exposure_edits_the_config_and_local_reverts_it(tmp_path: Path) -> 
     live.apply_exposure("local")
     saved = load_config(tmp_path / "data" / "config.yaml")
     assert saved.server.host == saved.gui.host == saved.watchdog.host == "127.0.0.1"
+
+
+def test_live_network_hosts_lists_only_exposed_listeners(tmp_path: Path) -> None:
+    config = scratch_config(tmp_path)
+    assert LiveServices(config).network_hosts() == []
+    config.server.host = "0.0.0.0"
+    assert LiveServices(config).network_hosts() == ["0.0.0.0"]
 
 
 def test_live_owner_and_admin_key(tmp_path: Path) -> None:

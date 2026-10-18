@@ -871,8 +871,13 @@ def setup_cmd(
     ),
     skip_model: bool = typer.Option(False, "--skip-model"),
     skip_chat: bool = typer.Option(False, "--skip-chat"),
-    exposure: str = typer.Option(
-        "local", "--exposure", help="local (default) | lan (HTTPS on the network) | peer (later)."
+    exposure: str | None = typer.Option(
+        None,
+        "--exposure",
+        help=(
+            "local | lan (HTTPS on the network) | peer (later). Default: keep a network "
+            "binding that is already configured, else local."
+        ),
     ),
     no_start: bool = typer.Option(
         False, "--no-start", help="Do not start the server for steps 5-6."
