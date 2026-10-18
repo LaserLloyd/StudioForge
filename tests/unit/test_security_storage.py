@@ -150,8 +150,8 @@ def test_a_keyring_that_refuses_falls_back_to_the_file_without_losing_the_secret
 ) -> None:
     fake_keyring.fail_set = True
     store = SecretStore(tmp_path)
-    assert store.set("owner.owner.hash", "$argon2id$x") == "file"
-    assert store.get("owner.owner.hash") == "$argon2id$x"
+    assert store.set("owner.owner.hash", "$argon2id$x") == "file"  # scrub-ok: fixture
+    assert store.get("owner.owner.hash") == "$argon2id$x"  # scrub-ok: fixture
 
 
 def test_two_data_directories_do_not_share_keyring_entries(
