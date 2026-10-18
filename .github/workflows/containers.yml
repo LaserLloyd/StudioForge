@@ -192,7 +192,7 @@ jobs:
 
       - name: Install cosign
         if: needs.prepare.outputs.push == 'true'
-        uses: sigstore/cosign-installer@v4
+        uses: sigstore/cosign-installer@v3
 
       - name: Sign the image (keyless, by digest)
         if: needs.prepare.outputs.push == 'true'
