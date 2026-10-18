@@ -207,3 +207,23 @@ def test_markdown_lists_every_key_once() -> None:
 
 def test_missing_descriptions_is_empty() -> None:
     assert settings_schema.missing_descriptions() == []
+
+
+def test_endpoint_has_the_same_gate_as_other_api_reads(tmp_path: Path) -> None:
+    """Open without a key (like every GET /api read); the key is required once one is set."""
+    config = Config(
+        data_dir=tmp_path / "data",
+        server={"host": "127.0.0.1", "port": 1234, "api_key": "sf-test-key-123456"},
+        models={"dir": tmp_path / "models"},
+        gui={"enabled": False},
+        watchdog={"enabled": False},
+        logging={"level": "ERROR"},
+    )
+    app = create_app(config, state=build_state(config), start_background=False)
+    with TestClient(app) as http:
+        assert http.get("/api/settings/schema").status_code == 401
+        assert http.get("/api/config").status_code == 401  # the read it must match
+        ok = http.get(
+            "/api/settings/schema", headers={"Authorization": "Bearer sf-test-key-123456"}
+        )
+    assert ok.status_code == 200 and ok.json()["count"] > 100
