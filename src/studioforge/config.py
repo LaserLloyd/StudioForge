@@ -46,6 +46,17 @@ SplitMode = Literal["none", "layer", "row", "tensor", "auto"]
 FlashAttn = Literal["on", "off", "auto"]
 EngineUpdateChannel = Literal["stable", "latest"]
 
+#: Which llama.cpp backend to favour when a box offers more than one (a Strix
+#: Halo has both HIP and Vulkan, an NVIDIA box with the Vulkan runtime has
+#: both CUDA and Vulkan). ``balanced`` weighs prompt processing and generation
+#: equally; the other two follow the measured pp512 / tg128 winner. See
+#: ``core/backend_select.py``.
+EnginePreference = Literal["balanced", "fastest_replies", "fastest_long_prompts"]
+
+#: ``gpu.backend``: how the GPU probe is chosen. ``auto`` tries NVML, then
+#: ROCm, then Vulkan, then Metal and uses the first that lists a device.
+GpuBackendChoice = Literal["auto", "nvml", "cuda", "rocm", "vulkan", "metal", "null", "fake"]
+
 #: Ceiling for the automatic host-RAM prompt cache, in MiB. 32 GiB on a 128 GiB
 #: box: big enough to hold many agent prefixes, small enough that the cache can
 #: never be the reason the machine starts swapping. Since D50 this is the size
@@ -372,6 +383,16 @@ class ModelsConfig(BaseModel):
         return v
 
 
+class GpuConfig(BaseModel):
+    """Hardware detection (``core/gpu.py``)."""
+
+    #: ``auto`` (default) = NVML -> ROCm -> Vulkan -> Metal, first one that
+    #: lists a GPU wins; an NVIDIA box with a working driver always gets NVML.
+    #: Force one backend to skip the others (``SF_GPU_PROBE`` is the env
+    #: equivalent and applies only while this stays ``auto``). Restart required.
+    backend: GpuBackendChoice = "auto"
+
+
 class EngineConfig(BaseModel):
     pinned_tag: str = "b10425"
     cuda_variant: str = "auto"  # e.g. "12.4" / "13.3" / "auto"
@@ -434,6 +455,25 @@ class EngineConfig(BaseModel):
     #: ``--split-mode tensor``. Off by default under the quality-first rule --
     #: only features that are lossless *and* not experimental ship enabled.
     backend_sampling: bool = False
+
+    #: STRICT_GPU (default on). With it on, every load is fully resident on the
+    #: GPU: ``--n-gpu-layers 999 --fit off`` are always passed and the
+    #: CPU-offload flags (``--cpu-moe``, ``--n-cpu-moe``, ``--no-kv-offload``,
+    #: ``--override-tensor`` ...) are refused. Turning it off does NOT change
+    #: any model by itself: it only makes the per-model, off-by-default
+    #: ``allow_partial_cpu_offload`` preset flag effective, and even then only
+    #: ``--n-cpu-moe`` and ``--no-kv-offload`` become legal. ``-ngl 999`` and
+    #: ``--fit off`` are passed either way. See ``docs/ENGINES.md``.
+    strict_gpu: bool = True
+    #: Which backend to prefer when more than one is installed and benchmarked
+    #: for a GPU (see :data:`EnginePreference`). Only consulted by
+    #: ``core.backend_select.select_backend``; nothing benchmarks on its own.
+    preference: EnginePreference = "balanced"
+    #: Refuse to install an engine archive that has no published SHA-256. Off
+    #: by default: llama.cpp does not publish a checksum for every release, and
+    #: the unverified install is recorded (``verified: false``) and warned
+    #: about rather than silent. Turn on for a hardened box.
+    require_verified: bool = False
 
     @field_validator("cache_ram_mb")
     @classmethod
@@ -1022,6 +1062,7 @@ class Config(BaseSettings):
     mcp: McpConfig = Field(default_factory=McpConfig)
     models: ModelsConfig = Field(default_factory=ModelsConfig)
     engine: EngineConfig = Field(default_factory=EngineConfig)
+    gpu: GpuConfig = Field(default_factory=GpuConfig)
     planner: PlannerConfig = Field(default_factory=PlannerConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     leases: LeasesConfig = Field(default_factory=LeasesConfig)
@@ -1326,9 +1367,9 @@ def load_config(path: Path | str | None = None, *, create: bool = False) -> Conf
         # the user tuning anything. Import lazily -- config must stay importable
         # on a machine with no NVML at all.
         try:
-            from studioforge.core.gpu import get_probe
+            from studioforge.core.gpu import probe_for_config
 
-            applied = tune_for_hardware(config, get_probe().list_gpus())
+            applied = tune_for_hardware(config, probe_for_config(config).list_gpus())
             if applied:
                 from studioforge.logging import get_logger
 
@@ -1459,6 +1500,7 @@ RESTART_REQUIRED_KEYS = frozenset(
         "watchdog.host",
         "watchdog.port",
         "data_dir",
+        "gpu.backend",
         "gateway.child_port_start",
         "gateway.child_port_end",
         # CORS origins are captured when the middleware is constructed, and the

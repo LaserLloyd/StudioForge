@@ -1018,7 +1018,9 @@ def _settings_dialog(ctx: GuiContext, record: Any, table: Any) -> None:  # noqa:
                 tag = settings.engine_tag or ctx.config.engine.pinned_tag
                 try:
                     errors = await ctx.engine_manager.validate_extra_flags(
-                        tag, settings.extra_flags
+                        tag,
+                        settings.extra_flags,
+                        allow_partial_cpu_offload=settings.allow_partial_cpu_offload,
                     )
                 except Exception as exc:  # noqa: BLE001
                     errors = [f"cannot validate flags: {exc}"]

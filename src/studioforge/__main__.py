@@ -19,6 +19,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -693,8 +694,167 @@ async def _activate_and_pin(manager: Any, config: Config, tag: str) -> None:
     )
 
 
-@app.command("engine")
+def _engine_records(manager: Any) -> list[dict[str, Any]]:
+    from studioforge.core.engine import engine_record
+
+    return [engine_record(entry) for entry in manager.installed()]
+
+
+def _print_engines(manager: Any) -> None:
+    """The installed-engine table: backend, checksum verdict, smoke result, install date."""
+    records = _engine_records(manager)
+    if not records:
+        typer.echo("no engines installed")
+        return
+    typer.echo(
+        f"   {'TAG':<16} {'BACKEND':<8} {'VARIANT':<14} {'VERIFIED':<9} {'SMOKE':<8} INSTALLED"
+    )
+    for record in records:
+        marker = "*" if record["active"] else " "
+        verified = record["verified"]
+        by = str(record.get("verified_by") or "")
+        if verified is None:
+            shown = "unknown"
+        elif verified:
+            shown = "yes"
+        elif by.startswith("source-build"):
+            shown = "source"
+        else:
+            shown = "NO"
+        installed = time.strftime("%Y-%m-%d", time.localtime(record["installed_at"]))
+        typer.echo(
+            f" {marker} {record['tag']:<16} {record['backend']:<8} {record['variant']:<14} "
+            f"{shown:<9} {record['smoke_result']:<8} {installed}"
+        )
+        for warning in record["warnings"]:
+            typer.echo(f"     ! {warning}")
+
+
+async def _engine_run(
+    config: Config,
+    manager: Any,
+    *,
+    install: str | None = None,
+    activate: str | None = None,
+    activate_after_install: bool = False,
+    smoke_test: bool = False,
+    check: bool = False,
+    update: bool = False,
+    list_releases: bool = False,
+) -> None:
+    """The body of ``studioforge engine`` and of ``engine install|update``."""
+    from studioforge.core.engine import describe_release_filter, describe_stable_channel
+
+    if list_releases:
+        tags = await manager.list_releases(limit=20)
+        typer.echo(" ".join(tags) or "no installable releases were returned")
+        # A list that silently differs from GitHub's front page has to say
+        # so, and say by how much: "none" and "all 100 were filtered" are
+        # very different problems (D49-3).
+        summary = describe_release_filter(getattr(manager, "last_release_scan", None))
+        note = (
+            "drafts and non-bNNNN tags are hidden; prereleases are NOT, "
+            "because upstream tags ordinary builds that way"
+        )
+        typer.echo(f"({summary}; {note})" if summary else f"({note})")
+        return
+    if activate:
+        await _activate_and_pin(manager, config, activate)
+        return
+    if check or update:
+        status = await manager.check_update(limit=10)
+        latest = status["latest"]
+        # The ACTIVE tag, not the pin: active.json wins at load time, so
+        # comparing against the pin can report an update for a build that is
+        # not the one running.
+        current = status["current"]
+        variant = status.get("latest_variant")
+        suffix = f" ({variant})" if variant else ""
+        typer.echo(f"active: {current}    newest installable: {latest or 'none'}{suffix}")
+        # D62: the stable channel beside the newest build, and which of the
+        # two this box follows -- the target of --update is the channel's.
+        # A payload from before the channel existed (no ``recommended_tag``
+        # key at all) recommends what it always did: ``latest``. A present
+        # ``None`` is the stable channel saying it has nothing to offer.
+        channel = status.get("update_channel") or "latest"
+        has_verdict = "recommended_tag" in status
+        target = status["recommended_tag"] if has_verdict else latest
+        target_variant = status.get("recommended_variant") if has_verdict else variant
+        target_suffix = f" ({target_variant})" if target_variant else ""
+        recommended = status["update_recommended"] if has_verdict else status["update_available"]
+        stable_text = describe_stable_channel(status)
+        if stable_text:
+            typer.echo(f"  stable channel: {stable_text}")
+        typer.echo(
+            f"  engine.update_channel: {channel} -> recommended: {target or 'none'}{target_suffix}"
+        )
+        filtered_line = status.get("filter_summary")
+        if filtered_line:
+            typer.echo(f"  {filtered_line}")
+        for entry in status.get("skipped") or []:
+            typer.echo(f"  skipped {entry['tag']}: {entry['reason']}")
+        if target is None:
+            typer.echo(
+                f"no llama.cpp release on the {channel} channel offers a build this "
+                "box can install",
+                err=True,
+            )
+            raise typer.Exit(1)
+        if not recommended:
+            typer.echo(f"already on the newest {channel} release")
+            if not smoke_test:
+                return
+        elif check:
+            typer.echo(f"run 'studioforge engine --update' to move to {target}")
+            return
+        else:
+            # Install, smoke-test, and only THEN activate and pin (D49-4).
+            # The old order installed *and activated* in one call and ran
+            # the smoke test afterwards, so this branch printed "keeping
+            # b10425" while active.json already said b10488 -- the failed
+            # build was live, and the message said the opposite.
+            typer.echo(f"installing {target} (not activating it yet) ...")
+            info = await manager.install(target, activate=False)
+            ok, detail = await manager.smoke_test(info.tag)
+            if not ok:
+                typer.echo(
+                    f"smoke test FAILED for {target}; keeping {current} active. "
+                    f"{target} stays installed but unused -- 'studioforge engine "
+                    f"--activate {target}' would switch to it anyway.\n{detail}"
+                )
+                raise typer.Exit(1)
+            await _activate_and_pin(manager, config, info.tag)
+    if install:
+        info = await manager.install(install, activate=activate_after_install)
+        typer.echo(f"installed {info.tag} ({info.variant}) at {info.path}")
+        if activate_after_install:
+            await _activate_and_pin(manager, config, info.tag)
+        else:
+            typer.echo(
+                f"the active engine is unchanged; run 'studioforge engine "
+                f"--activate {info.tag}' to switch to it"
+            )
+    else:
+        info = await manager.ensure_engine()
+        typer.echo(f"active engine: {info.tag} ({info.variant})")
+    _print_engines(manager)
+    if smoke_test:
+        ok, detail = await manager.smoke_test(info.tag)
+        typer.echo(f"smoke test: {'PASS' if ok else 'FAIL'}\n{detail}")
+
+
+engine_app = typer.Typer(
+    help="Inspect, install, activate or update llama.cpp engine builds.",
+    invoke_without_command=True,
+    no_args_is_help=False,
+    add_completion=False,
+)
+app.add_typer(engine_app, name="engine")
+
+
+@engine_app.callback()
 def engine_cmd(
+    ctx: typer.Context,
     config_path: Path | None = typer.Option(None, "--config", "-c"),
     install: str | None = typer.Option(None, help="Install a specific llama.cpp tag"),
     activate: str | None = typer.Option(
@@ -716,127 +876,201 @@ def engine_cmd(
 ) -> None:
     """Inspect, install, activate or update llama.cpp engine builds.
 
-    Installing and activating are separate (D49-4): ``--install`` unpacks a
-    build and leaves the live engine alone, ``--activate`` switches to one that
-    is already installed, and ``--update`` does both in the only safe order --
+    Subcommands: `engine list` (installed engines with backend, checksum and
+    smoke-test status), `engine install TAG`, `engine update`, `engine select`
+    and `engine benchmark`. The flags below are the original single-command
+    interface and keep working.
+
+    Installing and activating are separate (D49-4): `--install` unpacks a
+    build and leaves the live engine alone, `--activate` switches to one that
+    is already installed, and `--update` does both in the only safe order --
     install, smoke-test, and activate only if the test passed.
     """
-    from studioforge.core.engine import (
-        EngineManager,
-        describe_release_filter,
-        describe_stable_channel,
-    )
+    if ctx.invoked_subcommand is not None:
+        return
+    from studioforge.core.engine import EngineManager
 
     config = _load(config_path)
     config.ensure_dirs()
+    manager = EngineManager(config, probe=_engine_probe(config))
+    asyncio.run(
+        _engine_run(
+            config,
+            manager,
+            install=install,
+            activate=activate,
+            activate_after_install=activate_after_install,
+            smoke_test=smoke_test,
+            check=check,
+            update=update,
+            list_releases=list_releases,
+        )
+    )
+
+
+def _engine_probe(config: Config) -> Any:
+    from studioforge.core.gpu import probe_for_config
+
+    return probe_for_config(config)
+
+
+@engine_app.command("list")
+def engine_list_cmd(
+    config_path: Path | None = typer.Option(None, "--config", "-c"),
+    as_json: bool = typer.Option(False, "--json", help="Print the records as JSON"),
+) -> None:
+    """List installed engines: backend, checksum verification, smoke test, install date.
+
+    Read-only: nothing is downloaded, installed or started. VERIFIED is `yes`
+    (archive matched a published SHA-256), `NO` (installed without one -- see
+    the warning under the row), `source` (compiled locally) or `unknown`
+    (installed before checksums were recorded).
+    """
+    import json
+
+    from studioforge.core.engine import EngineManager
+
+    config = _load(config_path)
     manager = EngineManager(config)
+    if as_json:
+        typer.echo(json.dumps(_engine_records(manager), indent=2))
+        return
+    _print_engines(manager)
 
-    async def run() -> None:
-        if list_releases:
-            tags = await manager.list_releases(limit=20)
-            typer.echo(" ".join(tags) or "no installable releases were returned")
-            # A list that silently differs from GitHub's front page has to say
-            # so, and say by how much: "none" and "all 100 were filtered" are
-            # very different problems (D49-3).
-            summary = describe_release_filter(getattr(manager, "last_release_scan", None))
-            note = (
-                "drafts and non-bNNNN tags are hidden; prereleases are NOT, "
-                "because upstream tags ordinary builds that way"
-            )
-            typer.echo(f"({summary}; {note})" if summary else f"({note})")
-            return
-        if activate:
-            await _activate_and_pin(manager, config, activate)
-            return
-        if check or update:
-            status = await manager.check_update(limit=10)
-            latest = status["latest"]
-            # The ACTIVE tag, not the pin: active.json wins at load time, so
-            # comparing against the pin can report an update for a build that is
-            # not the one running.
-            current = status["current"]
-            variant = status.get("latest_variant")
-            suffix = f" ({variant})" if variant else ""
-            typer.echo(f"active: {current}    newest installable: {latest or 'none'}{suffix}")
-            # D62: the stable channel beside the newest build, and which of the
-            # two this box follows -- the target of --update is the channel's.
-            # A payload from before the channel existed (no ``recommended_tag``
-            # key at all) recommends what it always did: ``latest``. A present
-            # ``None`` is the stable channel saying it has nothing to offer.
-            channel = status.get("update_channel") or "latest"
-            has_verdict = "recommended_tag" in status
-            target = status["recommended_tag"] if has_verdict else latest
-            target_variant = status.get("recommended_variant") if has_verdict else variant
-            target_suffix = f" ({target_variant})" if target_variant else ""
-            recommended = (
-                status["update_recommended"] if has_verdict else status["update_available"]
-            )
-            stable_text = describe_stable_channel(status)
-            if stable_text:
-                typer.echo(f"  stable channel: {stable_text}")
-            typer.echo(
-                f"  engine.update_channel: {channel} -> recommended: "
-                f"{target or 'none'}{target_suffix}"
-            )
-            filtered_line = status.get("filter_summary")
-            if filtered_line:
-                typer.echo(f"  {filtered_line}")
-            for entry in status.get("skipped") or []:
-                typer.echo(f"  skipped {entry['tag']}: {entry['reason']}")
-            if target is None:
-                typer.echo(
-                    f"no llama.cpp release on the {channel} channel offers a build this "
-                    "box can install",
-                    err=True,
-                )
-                raise typer.Exit(1)
-            if not recommended:
-                typer.echo(f"already on the newest {channel} release")
-                if not smoke_test:
-                    return
-            elif check:
-                typer.echo(f"run 'studioforge engine --update' to move to {target}")
-                return
-            else:
-                # Install, smoke-test, and only THEN activate and pin (D49-4).
-                # The old order installed *and activated* in one call and ran
-                # the smoke test afterwards, so this branch printed "keeping
-                # b10425" while active.json already said b10488 -- the failed
-                # build was live, and the message said the opposite.
-                typer.echo(f"installing {target} (not activating it yet) ...")
-                info = await manager.install(target, activate=False)
-                ok, detail = await manager.smoke_test(info.tag)
-                if not ok:
-                    typer.echo(
-                        f"smoke test FAILED for {target}; keeping {current} active. "
-                        f"{target} stays installed but unused -- 'studioforge engine "
-                        f"--activate {target}' would switch to it anyway.\n{detail}"
-                    )
-                    raise typer.Exit(1)
-                await _activate_and_pin(manager, config, info.tag)
-        if install:
-            info = await manager.install(install, activate=activate_after_install)
-            typer.echo(f"installed {info.tag} ({info.variant}) at {info.path}")
-            if activate_after_install:
-                await _activate_and_pin(manager, config, info.tag)
-            else:
-                typer.echo(
-                    f"the active engine is unchanged; run 'studioforge engine "
-                    f"--activate {info.tag}' to switch to it"
-                )
-        else:
-            info = await manager.ensure_engine()
-            typer.echo(f"active engine: {info.tag} ({info.variant})")
-        for entry in manager.installed():
-            marker = "*" if entry.active else " "
-            typer.echo(
-                f" {marker} {entry.tag:<12} {entry.variant:<16} smoke_tested={entry.smoke_tested}"
-            )
-        if smoke_test:
-            ok, detail = await manager.smoke_test(info.tag)
-            typer.echo(f"smoke test: {'PASS' if ok else 'FAIL'}\n{detail}")
 
-    asyncio.run(run())
+@engine_app.command("install")
+def engine_install_cmd(
+    tag: str = typer.Argument(..., help="llama.cpp release tag, e.g. b10425"),
+    config_path: Path | None = typer.Option(None, "--config", "-c"),
+    activate: bool = typer.Option(
+        False, "--activate", help="Make it the live engine and pin it once installed"
+    ),
+) -> None:
+    """Install one llama.cpp build for the detected GPU backend (does not switch to it)."""
+    from studioforge.core.engine import EngineManager
+
+    config = _load(config_path)
+    config.ensure_dirs()
+    manager = EngineManager(config, probe=_engine_probe(config))
+    asyncio.run(_engine_run(config, manager, install=tag, activate_after_install=activate))
+
+
+@engine_app.command("update")
+def engine_update_cmd(
+    config_path: Path | None = typer.Option(None, "--config", "-c"),
+    check: bool = typer.Option(False, "--check", help="Report the newest release, install nothing"),
+) -> None:
+    """Install the newest release on the configured channel, smoke-test it, then activate it."""
+    from studioforge.core.engine import EngineManager
+
+    config = _load(config_path)
+    config.ensure_dirs()
+    manager = EngineManager(config, probe=_engine_probe(config))
+    asyncio.run(_engine_run(config, manager, check=check, update=not check))
+
+
+@engine_app.command("select")
+def engine_select_cmd(
+    config_path: Path | None = typer.Option(None, "--config", "-c"),
+    preference: str | None = typer.Option(
+        None,
+        "--preference",
+        help="balanced | fastest_replies | fastest_long_prompts (default: engine.preference)",
+    ),
+) -> None:
+    """Show which backend the cached benchmark results recommend per GPU.
+
+    Read-only. Results come from `engine benchmark`; with none cached this
+    says so and recommends nothing.
+    """
+    from studioforge.core.backend_select import BackendBenchCache, select_backend_per_gpu
+
+    config = _load(config_path)
+    chosen = preference or config.engine.preference
+    cache = BackendBenchCache.for_engines_dir(config.engines_dir)
+    try:
+        picks = select_backend_per_gpu(cache.results(), chosen)
+    except ValueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    if not picks:
+        typer.echo(
+            "no benchmark results cached: run `studioforge engine benchmark --model <gguf> --yes`"
+        )
+        return
+    for gpu, pick in picks.items():
+        typer.echo(f"{gpu}: {pick.reason}")
+
+
+@engine_app.command("benchmark")
+def engine_benchmark_cmd(
+    model: Path = typer.Option(..., "--model", help="A GGUF that fits the GPU entirely"),
+    config_path: Path | None = typer.Option(None, "--config", "-c"),
+    device: str | None = typer.Option(
+        None, "--device", help="llama.cpp device name (see `llama-server --list-devices`)"
+    ),
+    model_class: str = typer.Option("", "--model-class", help="Label stored with the result"),
+    yes: bool = typer.Option(
+        False, "--yes", help="Confirm: this loads the model onto the GPU and runs llama-bench"
+    ),
+) -> None:
+    """Measure pp512 / tg128 for the ACTIVE engine on this box and cache the result.
+
+    SPAWNS llama-bench ON THE GPU for up to several minutes, so it needs
+    --yes. Stop the models you care about first. STRICT_GPU applies
+    (-ngl 999). Nothing else in StudioForge ever runs this.
+    """
+    from studioforge.core.backend_bench import (
+        describe,
+        find_bench_binary,
+        run_backend_benchmark,
+    )
+    from studioforge.core.backend_select import BackendBenchCache
+    from studioforge.core.engine import EngineError, EngineManager
+
+    if not yes:
+        typer.echo(
+            "refusing to run: this loads the model onto the GPU and saturates it. "
+            "Re-run with --yes.",
+            err=True,
+        )
+        raise typer.Exit(2)
+    config = _load(config_path)
+    manager = EngineManager(config, probe=_engine_probe(config))
+    info = manager.active()
+    if info is None:
+        typer.echo("error: no engine installed (`studioforge engine install <tag>`)", err=True)
+        raise typer.Exit(1)
+    binary = find_bench_binary(info.server_binary)
+    if binary is None:
+        typer.echo(
+            f"error: engine {info.tag} ships no llama-bench (a source build compiles only "
+            "llama-server); install a prebuilt engine to benchmark",
+            err=True,
+        )
+        raise typer.Exit(1)
+    gpus = manager._gpus()
+    gpu_key = (gpus[0].gfx_target or gpus[0].name) if gpus else "unknown"
+
+    async def go() -> Any:
+        return await run_backend_benchmark(
+            binary,
+            model,
+            backend=info.backend or "unknown",
+            gpu=gpu_key,
+            engine_tag=info.tag,
+            model_class=model_class,
+            device=device,
+            confirm=True,
+        )
+
+    try:
+        result = asyncio.run(go())
+    except EngineError as exc:
+        typer.echo(f"error: {exc.message}", err=True)
+        raise typer.Exit(1) from exc
+    BackendBenchCache.for_engines_dir(config.engines_dir).put(result)
+    typer.echo(f"cached: {describe(result)}")
 
 
 @app.command("config")
@@ -995,7 +1229,7 @@ def capabilities_cmd(
     """Show the backend, what it can run, and what your hardware allows."""
     from studioforge.core.capabilities import build_report, format_bytes
     from studioforge.core.engine import EngineManager
-    from studioforge.core.gpu import get_probe
+    from studioforge.core.gpu import probe_for_config
     from studioforge.core.registry import Registry
     from studioforge.db import Database
 
@@ -1005,7 +1239,7 @@ def capabilities_cmd(
     db.migrate()
     registry = Registry(config, db)
     registry.scan()
-    probe = get_probe()
+    probe = probe_for_config(config)
     report = build_report(
         config,
         gpus=probe.list_gpus(),

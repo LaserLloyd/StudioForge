@@ -868,8 +868,15 @@ def _stub_prebuilt(
         seen["captures"].append(list(args))
         return 0, help_text
 
+    async def no_published_checksum(asset: EngineAsset) -> tuple[str | None, str]:
+        # Keeps these tests off the network: the fixture assets carry a sidecar
+        # URL that would otherwise be fetched. Verification has its own tests
+        # (test_engine_backends.py).
+        return None, "stubbed: no checksum in this test"
+
     monkeypatch.setattr(mgr, "list_assets", fake_assets)
     monkeypatch.setattr(mgr, "_download", fake_download)
+    monkeypatch.setattr(mgr, "_expected_digest", no_published_checksum)
     monkeypatch.setattr(mgr, "_smoke", fake_smoke)
     monkeypatch.setattr(mgr, "_capture", fake_capture)
     return seen

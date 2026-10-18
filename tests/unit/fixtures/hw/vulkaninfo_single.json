@@ -1,0 +1,24 @@
+{
+  "$schema": "https://schema.khronos.org/vulkan/profiles-0.8.2-276.json#",
+  "capabilities": {
+    "device": {
+      "properties": {
+        "VkPhysicalDeviceProperties": {
+          "apiVersion": 4206866,
+          "vendorID": 4098,
+          "deviceID": 29772,
+          "deviceType": "VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU",
+          "deviceName": "AMD Radeon RX 7900 XTX (RADV NAVI31)"
+        }
+      },
+      "memory": {
+        "VkPhysicalDeviceMemoryProperties": {
+          "memoryHeaps": [
+            {"flags": 1, "size": 25753026560},
+            {"flags": 0, "size": 67062644736}
+          ]
+        }
+      }
+    }
+  }
+}

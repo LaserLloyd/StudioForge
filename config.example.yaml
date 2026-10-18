@@ -156,6 +156,23 @@ engine:
   # it is off under the quality-first rule (only lossless, non-experimental
   # features ship enabled).
   backend_sampling: false
+  # STRICT_GPU: every load is fully resident on the GPU (`-ngl 999 --fit off`
+  # are always passed; --cpu-moe / --n-cpu-moe / --no-kv-offload and the other
+  # CPU-offload flags are refused). false only makes a model's own, off-by-
+  # default `allow_partial_cpu_offload` setting effective -- see docs/ENGINES.md.
+  strict_gpu: true
+  # Which backend to favour when several are benchmarked for a GPU: balanced,
+  # fastest_replies (token generation) or fastest_long_prompts (prompt
+  # processing). Nothing benchmarks on its own; see docs/ENGINES.md.
+  preference: balanced
+  # true = refuse to install an engine archive that has no published SHA-256.
+  # false (default) installs it, records verified: false and warns.
+  require_verified: false
+gpu:
+  # auto = NVML, then ROCm, then Vulkan, then Metal; the first that lists a
+  # GPU wins. Force nvml / cuda / rocm / vulkan / metal to skip the others.
+  # Restart required. (`SF_GPU_PROBE` is the env equivalent while this is auto.)
+  backend: auto
 planner:
   headroom_fraction: 0.1
   on_insufficient: evict

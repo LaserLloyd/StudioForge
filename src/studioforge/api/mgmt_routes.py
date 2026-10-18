@@ -293,11 +293,14 @@ def _attach_child_metrics(state: Any, data: dict[str, Any]) -> None:
 @router.get("/gpus")
 async def gpus(request: Request) -> dict[str, Any]:
     state = _state(request)
-    from studioforge.core.gpu import system_ram
+    from studioforge.core.gpu import probe_diagnostics, system_ram
 
     total_ram, used_ram = system_ram()
     return {
         "backend": state.probe.backend,
+        # Which backend the auto-selector used and why the earlier ones were
+        # skipped (empty for a forced / fake probe).
+        "probe": probe_diagnostics(state.probe),
         "driver_version": state.probe.driver_version(),
         "cuda_driver_version": state.probe.cuda_driver_version(),
         "gpus": [g.model_dump(mode="json") for g in state.probe.list_gpus()],
@@ -1411,7 +1414,11 @@ async def _validated_settings_save(state: Any, record: Any, settings: Any) -> di
 
     if settings.extra_flags.strip():
         tag = settings.engine_tag or state.config.engine.pinned_tag
-        errors = await state.engine_manager.validate_extra_flags(tag, settings.extra_flags)
+        errors = await state.engine_manager.validate_extra_flags(
+            tag,
+            settings.extra_flags,
+            allow_partial_cpu_offload=settings.allow_partial_cpu_offload,
+        )
         if errors:
             raise BadRequestError("extra_flags rejected: " + "; ".join(errors), param="extra_flags")
 

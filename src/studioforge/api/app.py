@@ -37,7 +37,7 @@ from studioforge.build import build_id
 from studioforge.config import Config, load_config
 from studioforge.core.downloader import Downloader
 from studioforge.core.engine import EngineManager
-from studioforge.core.gpu import get_probe
+from studioforge.core.gpu import probe_for_config
 from studioforge.core.health import PROBE_MAX_TOKENS, PROBE_TIMEOUT_S, deep_health
 from studioforge.core.leases import LeaseBook
 from studioforge.core.manager import ModelManager
@@ -573,7 +573,7 @@ def build_state(config: Config, *, version: str = __version__) -> Any:
     # the server (fresh DB, corrupt file kept aside), never stop it booting.
     db.migrate_with_recovery()
 
-    probe = get_probe()
+    probe = probe_for_config(config)
     engine_manager = EngineManager(config, probe=probe)
     registry = Registry(config, db)
     # One lease book shared by the planner (which honours leases) and the
@@ -975,8 +975,9 @@ def _serving_readiness(state: Any) -> dict[str, Any]:
         )
     elif gpu_count == 0:
         reason = (
-            "no NVIDIA GPU detected (this server is GPU-only): check the driver and "
-            "nvidia-smi, then re-probe from the Setup tab"
+            "no GPU detected (this server is GPU-only): check the driver and its query "
+            "tool (nvidia-smi, rocm-smi / amd-smi, vulkaninfo), then re-probe from the "
+            "Setup tab. GET /api/gpus shows which backends were tried and why they failed"
         )
     elif models_indexed == 0:
         reason = (
