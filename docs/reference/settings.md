@@ -109,8 +109,8 @@ Settings live in `<data dir>/config.yaml`. The machine-readable form of this pag
 | Key | Type | Default | Valid values | Level | Restart | Env | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `gpu.backend` | `"auto" \| "nvml" \| "cuda" \| "rocm" \| "vulkan" \| "metal" \| "null" \| "fake"` | `auto` | one of `auto`, `nvml`, `cuda`, `rocm`, `vulkan`, `metal`, `null`, `fake` | advanced | yes | `SF_GPU__BACKEND` | Auto = NVML, then ROCm, then Vulkan, then Metal; the first that lists a GPU wins. Force nvml / cuda / rocm / vulkan / metal to skip the others. Restart required. (`SF_GPU_PROBE` is the env equivalent while this is auto.) |
-| `gpu.probe_cache_s` | `float` | `2.0` | >= 0 | advanced | yes | `SF_GPU__PROBE_CACHE_S` | Seconds a ROCm / Vulkan / Metal probe result is reused before the vendor tool (`amd-smi`, `vulkaninfo`, `system_profiler`) runs again. The status page, `/metrics` and the planner all ask about once a second, so without this each of those polls would spawn a subprocess. |
-| `gpu.probe_timeout_s` | `float` | `15.0` | > 0 | advanced | yes | `SF_GPU__PROBE_TIMEOUT_S` | Most seconds one call waits for a vendor tool. Past it the call returns the last good answer (or "no GPUs" if there is none) and the tool keeps running in the background, so a hung tool cannot stall a request. Restart required. |
+| `gpu.probe_cache_s` | `float` | `2.0` | >= 0 | advanced | yes | `SF_GPU__PROBE_CACHE_S` | Seconds a ROCm / Vulkan / Metal probe result is reused before the vendor tool (amd-smi, vulkaninfo, system_profiler) runs again. NVML is not cached. 0 = query on every call. Restart required. |
+| `gpu.probe_timeout_s` | `float` | `15.0` | > 0 | advanced | yes | `SF_GPU__PROBE_TIMEOUT_S` | Most seconds one call waits for a vendor tool; past it the last good answer (or no GPUs) is returned and the tool finishes in the background. Restart required. |
 
 ## planner
 

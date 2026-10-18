@@ -892,7 +892,7 @@
         "ge": 0
       },
       "default": 2.0,
-      "description": "Seconds a ROCm / Vulkan / Metal probe result is reused before the vendor tool (`amd-smi`, `vulkaninfo`, `system_profiler`) runs again. The status page, `/metrics` and the planner all ask about once a second, so without this each of those polls would spawn a subprocess.",
+      "description": "Seconds a ROCm / Vulkan / Metal probe result is reused before the vendor tool (amd-smi, vulkaninfo, system_profiler) runs again. NVML is not cached. 0 = query on every call. Restart required.",
       "env": "SF_GPU__PROBE_CACHE_S",
       "key": "gpu.probe_cache_s",
       "level": "advanced",
@@ -907,7 +907,7 @@
         "gt": 0
       },
       "default": 15.0,
-      "description": "Most seconds one call waits for a vendor tool. Past it the call returns the last good answer (or \"no GPUs\" if there is none) and the tool keeps running in the background, so a hung tool cannot stall a request. Restart required.",
+      "description": "Most seconds one call waits for a vendor tool; past it the last good answer (or no GPUs) is returned and the tool finishes in the background. Restart required.",
       "env": "SF_GPU__PROBE_TIMEOUT_S",
       "key": "gpu.probe_timeout_s",
       "level": "advanced",
