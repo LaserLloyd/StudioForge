@@ -262,7 +262,7 @@ def test_owner_password_is_argon2id_and_not_in_the_database(
     account = store.create_account("owner", "correct horse battery")
     assert account.role == "owner" and store.has_owner()
     stored = store.secrets.get("owner.owner.hash")
-    prefix = "$argon2id" + "$"
+    prefix = "$argon2id" + "$"  # scrub-ok: argon2 hash prefix, not a secret
     assert stored is not None and stored.startswith(prefix)
     raw = (tmp_path / "registry.sqlite3").read_bytes()
     assert b"argon2" not in raw and b"correct horse" not in raw
