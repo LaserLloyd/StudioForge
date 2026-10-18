@@ -95,3 +95,22 @@ def test_the_compose_env_example_documents_the_owner_password() -> None:
     assert "SF_OWNER_PASSWORD" in env
     docs = (REPO / "docs" / "deploy" / "docker.md").read_text(encoding="utf-8")
     assert "SF_OWNER_PASSWORD" in docs and "owner-password.initial" in docs
+
+
+def test_the_entrypoint_installs_the_engine_on_a_fresh_volume() -> None:
+    """System test 2026-10-18: a fresh -cuda volume tried `git clone` (the slim image has no git).
+
+    The entrypoint now fetches upstream's prebuilt engine once, so the first model load works.
+    """
+    script = (DEPLOY / "compose" / "entrypoint.sh").read_text(encoding="utf-8")
+    assert "studioforge engine --update" in script
+    assert "engines/*/llama-server" in script, "only an empty engines/ dir may trigger the download"
+    assert "SF_ENGINE_BOOTSTRAP" in script, "air-gapped hosts need a switch"
+    # A partial smoke (no GGUF yet) must still end with an active engine, not the pinned source tag.
+    assert 'studioforge engine --activate "$TAG"' in script
+    # A failed download never stops the server from starting.
+    assert script.rstrip().endswith('exec studioforge "$@"')
+    compose = (DEPLOY / "compose" / "compose.yml").read_text(encoding="utf-8")
+    assert "SF_ENGINE_BOOTSTRAP" in compose
+    docs = (REPO / "docs" / "deploy" / "docker.md").read_text(encoding="utf-8")
+    assert "SF_ENGINE_BOOTSTRAP" in docs

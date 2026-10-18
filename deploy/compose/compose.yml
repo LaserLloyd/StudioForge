@@ -51,6 +51,8 @@ services:
       # generated password at /data/owner-password.initial (see docs/deploy/docker.md).
       SF_OWNER_USER: ${SF_OWNER_USER:-owner}
       SF_OWNER_PASSWORD: ${SF_OWNER_PASSWORD:-}
+      # 0 = skip the one-time download of the llama.cpp engine on a fresh volume (offline hosts).
+      SF_ENGINE_BOOTSTRAP: ${SF_ENGINE_BOOTSTRAP:-1}
     volumes:
       # config.yaml, registry, engines/ (llama.cpp builds), logs/, downloads/.
       - ${SF_DATA:-studioforge-data}:/data
