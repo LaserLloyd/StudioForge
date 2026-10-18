@@ -3654,13 +3654,26 @@ class EngineManager:
             return await self.install(tag, progress=progress, activate=True)
 
         if self.config.engine.allow_source_build:
+            if error:
+                # The release lookup failed (GitHub's anonymous rate limit, no network): say so
+                # BEFORE falling back, because a source build on a box without git/cmake/nvcc
+                # fails with an unrelated-looking message.
+                log.warning("engine.ensure.release_lookup_failed", tag=tag, detail=error)
             log.info("engine.ensure.source_build", tag=tag)
-            return await self.build_from_source(
-                tag,
-                arches=self.target_arches(detected_backend(self._gpus())),
-                progress=progress,
-                activate=True,
-            )
+            try:
+                return await self.build_from_source(
+                    tag,
+                    arches=self.target_arches(detected_backend(self._gpus())),
+                    progress=progress,
+                    activate=True,
+                )
+            except EngineError as exc:
+                if error:
+                    raise EngineError(
+                        f"{exc} (the prebuilt-engine lookup had failed first, so a source "
+                        f"build was tried: {error})"
+                    ) from exc
+                raise
 
         gpus = self._gpus()
         detected = ", ".join(f"{g.name} (sm_{g.sm_arch or '?'})" for g in gpus) or "no GPUs"

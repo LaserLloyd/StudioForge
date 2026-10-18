@@ -693,6 +693,30 @@ async def test_ensure_engine_raises_when_nothing_eligible(
 
 
 @pytest.mark.asyncio
+async def test_a_failed_release_lookup_is_named_when_the_source_build_fallback_fails(
+    tmp_config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """System test 2026-10-18: the lookup failed on GitHub's anonymous rate limit, the app fell back
+    to a source build, and the only error shown was git's ("clone failed")."""
+    mgr = EngineManager(tmp_config, probe=StubProbe(MIXED_GPUS, (12, 0)))
+    mgr.os_token, mgr.arch_token = "win", "x64"
+
+    async def rate_limited(tag: str) -> list[EngineAsset]:
+        raise EngineError("GitHub's API rate limit is exhausted; set GITHUB_TOKEN or GH_TOKEN")
+
+    async def no_git(tag: str, *, arches: Any, progress: Any = None, activate: bool = False):
+        raise EngineError("cannot build llama.cpp from source: git clone failed")
+
+    monkeypatch.setattr(mgr, "list_assets", rate_limited)
+    monkeypatch.setattr(mgr, "build_from_source", no_git)
+    with pytest.raises(EngineError) as excinfo:
+        await mgr.ensure_engine()
+    message = str(excinfo.value)
+    assert "git clone failed" in message
+    assert "rate limit" in message and "GITHUB_TOKEN" in message
+
+
+@pytest.mark.asyncio
 async def test_ensure_engine_falls_back_to_source_build(
     tmp_config: Config, monkeypatch: pytest.MonkeyPatch
 ) -> None:
