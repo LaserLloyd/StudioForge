@@ -106,6 +106,20 @@ fi
 VENV="$APP_DIR/venv"
 UV_BIN_DIR="$APP_DIR/uv"
 
+# How to run the studioforge CLI against THIS install's data. SF_DATA_DIR is only
+# set inside the systemd units, so a bare `studioforge` typed in a shell would use
+# the invoking user's own data dir (root's, for a --system install run with sudo),
+# and, run as root, leave root-owned files in the service's data directory.
+if [ "$SCOPE" = system ]; then
+    CLI="sudo -u studioforge env SF_DATA_DIR=$DATA_DIR $BIN_DIR/studioforge"
+elif [ -n "${SF_DATA_DIR:-}" ]; then
+    # `SF_DATA_DIR=/x ./install.sh` exports it to this script only, not to the
+    # shell the next commands are typed in.
+    CLI="env SF_DATA_DIR=$DATA_DIR studioforge"
+else
+    CLI="studioforge"
+fi
+
 render_gateway_unit() {
     if [ "$SCOPE" = system ]; then
         cat <<EOF
@@ -470,9 +484,9 @@ fi
 
 cat <<EOF
 
-Next steps
+Next steps$([ "$SCOPE" = system ] && printf ' (run as the studioforge service account; data in %s)' "$DATA_DIR")
   1. Open the control panel:   http://localhost:8080   (gateway: http://localhost:1234/v1)
-  2. Install an engine:        studioforge engine --update
+  2. Install an engine:        $CLI engine --update
 EOF
 if [ "$missing" = 1 ]; then
     cat <<EOF
@@ -482,7 +496,7 @@ if [ "$missing" = 1 ]; then
 EOF
 fi
 cat <<EOF
-  3. Point it at your GGUF library from the panel's Setup tab, or:  studioforge scan
+  3. Point it at your GGUF library from the panel's Setup tab, or:  $CLI scan
   Uninstall (keeps your data):  $0 --uninstall$([ "$SCOPE" = system ] && echo ' --system')
 EOF
 [ "$DRY" = 1 ] && printf '\n(dry run: nothing was changed)\n'
