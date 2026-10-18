@@ -116,9 +116,17 @@ corrupt, truncated or swapped download. It is **not** a signature and does not d
 compromised upstream release.
 
 `engines/<tag>/engine.json` records, per installed engine: `backend`, `variant`, `verified`,
-`verified_by`, `archive_sha256`, `smoke_result` (`passed` / `partial` / `failed` / `not_run`),
+`verified_by`, `archive_sha256`, `smoke_result` (`passed` / `binary-only (no model available)` / `failed` / `not_run`),
 `smoke_tested_at`, `installed_at`, `warnings`. Engines installed before this existed read as
 `verified: null` ("unknown"), not as unverified.
+
+`binary-only (no model available)` is what a fresh install records: the library has no GGUF to
+micro-load, so the smoke test ran `llama-server --version` and `--list-devices` only. That is an
+acceptable result (the install succeeds and `engine --update` activates the build) but not a full
+pass: `smoke_tested` stays false, and the next boot or `studioforge engine --smoke-test` with a
+model in the library runs the real micro-load. Builds recorded as `partial` before 2.0.0 read as
+`binary-only`. Archive symlinks (`libllama.so -> libllama.so.0` in the Linux tarballs) are recreated
+inside the engine directory; absolute or escaping link targets are skipped.
 
 ```
 studioforge engine list [--json]      # read-only: backend, verified, smoke, install date

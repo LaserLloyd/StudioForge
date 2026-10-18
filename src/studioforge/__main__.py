@@ -773,6 +773,13 @@ def _engine_records(manager: Any) -> list[dict[str, Any]]:
     return [engine_record(entry) for entry in manager.installed()]
 
 
+def _smoke_cell(result: str) -> str:
+    """The table spelling of ``smoke_result`` (the JSON keeps the full string)."""
+    from studioforge.core.engine import SMOKE_BINARY_ONLY
+
+    return "binary-only" if result == SMOKE_BINARY_ONLY else result
+
+
 def _print_engines(manager: Any) -> None:
     """The installed-engine table: backend, checksum verdict, smoke result, install date."""
     records = _engine_records(manager)
@@ -780,7 +787,7 @@ def _print_engines(manager: Any) -> None:
         typer.echo("no engines installed")
         return
     typer.echo(
-        f"   {'TAG':<16} {'BACKEND':<8} {'VARIANT':<14} {'VERIFIED':<9} {'SMOKE':<8} INSTALLED"
+        f"   {'TAG':<16} {'BACKEND':<8} {'VARIANT':<14} {'VERIFIED':<9} {'SMOKE':<11} INSTALLED"
     )
     for record in records:
         marker = "*" if record["active"] else " "
@@ -797,7 +804,7 @@ def _print_engines(manager: Any) -> None:
         installed = time.strftime("%Y-%m-%d", time.localtime(record["installed_at"]))
         typer.echo(
             f" {marker} {record['tag']:<16} {record['backend']:<8} {record['variant']:<14} "
-            f"{shown:<9} {record['smoke_result']:<8} {installed}"
+            f"{shown:<9} {_smoke_cell(record['smoke_result']):<11} {installed}"
         )
         for warning in record["warnings"]:
             typer.echo(f"     ! {warning}")
@@ -888,7 +895,7 @@ async def _engine_run(
             # build was live, and the message said the opposite.
             typer.echo(f"installing {target} (not activating it yet) ...")
             info = await manager.install(target, activate=False)
-            ok, detail = await manager.smoke_test(info.tag)
+            ok, result, detail = await manager.smoke_check(info.tag)
             if not ok:
                 typer.echo(
                     f"smoke test FAILED for {target}; keeping {current} active. "
@@ -896,6 +903,8 @@ async def _engine_run(
                     f"--activate {target}' would switch to it anyway.\n{detail}"
                 )
                 raise typer.Exit(1)
+            if result != "passed":
+                typer.echo(f"smoke test: {result} -- {detail}")
             await _activate_and_pin(manager, config, info.tag)
     if install:
         info = await manager.install(install, activate=activate_after_install)
@@ -912,8 +921,9 @@ async def _engine_run(
         typer.echo(f"active engine: {info.tag} ({info.variant})")
     _print_engines(manager)
     if smoke_test:
-        ok, detail = await manager.smoke_test(info.tag)
-        typer.echo(f"smoke test: {'PASS' if ok else 'FAIL'}\n{detail}")
+        ok, result, detail = await manager.smoke_check(info.tag)
+        verdict = "PASS" if ok and result == "passed" else ("PASS (binary-only)" if ok else "FAIL")
+        typer.echo(f"smoke test: {verdict}\n{detail}")
 
 
 engine_app = typer.Typer(

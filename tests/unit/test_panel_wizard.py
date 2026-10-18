@@ -92,6 +92,10 @@ class Engines:
         self.calls.append(("smoke_test", tag))
         return self.ok, "ran" if self.ok else "could not start"
 
+    async def smoke_check(self, tag: str) -> tuple[bool, str, str]:
+        ok, detail = await self.smoke_test(tag)
+        return ok, "passed" if ok else "failed", detail
+
 
 class Manager:
     def __init__(self) -> None:
