@@ -12,6 +12,37 @@ The panel (`:8080`) has exactly four top-level tabs, in this order:
 Advanced sub-pages: Serving & network, GPUs & placement, Accounts & keys, Engines, Watchdog & recovery,
 Catalog & downloads, Integrations, Peers, Logs & metrics, Config, Diagnostics, About & updates.
 
+## Screenshots
+
+Glacier theme, from a scratch rig (`scripts/panel_demo.py`: fake GPUs and invented models, nothing loads on a real
+GPU), captured by `scripts/capture_panel.py`. Both refuse any port outside 18080-18199.
+
+| | |
+|---|---|
+| ![Status](screenshots/readme/panel-status.png) | ![Models](screenshots/readme/panel-models.png) |
+| **Status**: health, GPUs, loaded models | **Models**: one table, chips, per-row state |
+| ![Model drawer](screenshots/readme/panel-model-drawer.png) | ![Downloads](screenshots/readme/panel-downloads.png) |
+| **The details drawer**: recommended placement pre-filled, per-GPU fit bars before Load | **Downloads chip**: add by repo id or link, search, queue |
+| ![Test Chat](screenshots/readme/panel-test-chat.png) | ![Advanced](screenshots/readme/panel-advanced.png) |
+| **Test Chat**: TTFT, tok/s, Copy as curl, Load options | **Advanced**: left menu (Integrations page shown) |
+
+## The Models page
+
+* The table: friendly name (the exact id under it), quant badge, size, family, "Fits on" (the catalog's recommended
+  placement for the model, in the planner's words: `2x RTX 5090 · 128k`), and state. Click a column header or use
+  the sort menu; the search box matches the id, the friendly name, quant, family and capabilities.
+* State is one of idle, loading (with how long it has been going), loaded (busy or idle, tok/s) or error (the
+  catalog's error code and its plain sentence, e.g. `[insufficient_vram] ...`), plus `pinned` and `leased` badges.
+* The drawer (click a row, or `?section=Models&model=<id>`): **Load** is pre-filled in this order, field by field:
+  what is running now (for a reload), the model's saved settings, the planner's recommended `load_args`, the
+  server's defaults. The per-GPU bars and the verdict come from `manager.plan_preview` and update as you change the
+  GPUs, context, KV type or slots; **Load** is withheld while the check says it cannot fit (a reload of a running model
+  is never withheld, because the dry run still counts the running copy). **Restart as it is** is the old "Reload
+  this model" (`manager.load(force=True)`, no arguments). Manage holds Pin, Test, Benchmark and Delete; Sampler
+  defaults, Virtual models & presets and Aliases follow. "All settings..." opens the original three-tier dialog.
+* Every box-changing control (pin, delete, save defaults, restart) is disabled with the reason for a remote viewer on
+  an open install (the D32 rule), exactly like the old table's. Loading and unloading stay open, as before.
+
 ## How it is built
 
 * `src/studioforge/gui/nav.py` is the single registry: `TOP_TABS` (four entries), `ADVANCED_PAGES`

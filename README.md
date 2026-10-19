@@ -6,12 +6,12 @@
 
 <table>
   <tr>
-    <td width="50%"><img src="docs/screenshots/readme/panel-overview.png" alt="StudioForge control panel Overview in the Glacier theme: base URL, four GPU cards with VRAM bars and no model loaded"><br><sub><b>Overview.</b> The base URL to paste into any OpenAI client, every GPU with its VRAM and load, and what is loaded right now.</sub></td>
-    <td width="50%"><img src="docs/screenshots/readme/panel-models.png" alt="StudioForge Models tab listing three indexed GGUF models with size, quant and architecture"><br><sub><b>Models.</b> Your GGUF library, indexed in place: size, quant, architecture and load state, with load, pin and benchmark actions.</sub></td>
+    <td width="50%"><img src="docs/screenshots/readme/panel-status.png" alt="StudioForge Status tab in the Glacier theme: health, four GPU cards with VRAM bars and what is on each, and two loaded models with busy or idle state and tokens per second"><br><sub><b>Status.</b> Health, every GPU and what is on it, and the loaded models: busy or idle, tokens per second. Nothing to configure here.</sub></td>
+    <td width="50%"><img src="docs/screenshots/readme/panel-model-drawer.png" alt="StudioForge Models tab with a model's details drawer open: the planner's recommended GPUs, context and KV type are pre-filled and a VRAM bar per GPU is drawn before the Load button"><br><sub><b>Models.</b> One searchable table and a details drawer per model: the planner's recommended GPUs, context and KV type are pre-filled, and the fit is drawn per GPU before you press Load.</sub></td>
   </tr>
   <tr>
-    <td width="50%"><img src="docs/screenshots/readme/panel-integrations.png" alt="StudioForge Integrations tab with copy-paste connection snippets for OpenClaw, the OpenAI and Anthropic Python SDKs and DisPatch"><br><sub><b>Integrations.</b> Copy-paste connection snippets for OpenAI-compatible clients, filled in with your server's address and a model.</sub></td>
-    <td width="50%"><img src="docs/screenshots/readme/setup-wizard.png" alt="StudioForge setup guide, step 1: create the owner account"><br><sub><b>Setup guide.</b> Eight optional steps from owner account to network exposure, starting with step 1 here.</sub></td>
+    <td width="50%"><img src="docs/screenshots/readme/panel-test-chat.png" alt="StudioForge Test Chat tab: a streamed reply with time to first token, prefill and decode speed, and a Copy as curl button"><br><sub><b>Test Chat.</b> Talk to a loaded model: streaming reply with time to first token and tokens per second, and a copy-as-curl button.</sub></td>
+    <td width="50%"><img src="docs/screenshots/readme/panel-advanced.png" alt="StudioForge Advanced tab: a left menu of Serving and network, GPUs and placement, Accounts and keys, Engines, Watchdog, Catalog, Integrations, Peers, Logs, Config, Diagnostics and About, with the Integrations page open"><br><sub><b>Advanced.</b> Everything else, in a left menu: serving and network, accounts and keys, engines, watchdog, integrations, logs, config, diagnostics.</sub></td>
   </tr>
 </table>
 
@@ -486,17 +486,15 @@ of priority tiers, the lease etiquette and one failure-code table for both servi
 
 ## What it looks like
 
-Every number in the panel is the *actual* one the engine reports — context, slots, VRAM per card:
+The panel has four tabs: **Status**, **Models**, **Test Chat** and **Advanced** (the old tab names still work in links;
+[`docs/panel.md`](docs/panel.md) maps every control to its place). Every number in it is the *actual* one the engine
+reports: context, slots, VRAM per card.
 
-![Dashboard: GPUs, who holds the VRAM, standing GPU leases, and each loaded model with its live slots](docs/images/dashboard.png)
-
-| Setup — a checklist, not a YAML file | Models — the library, indexed in place |
+| Models: search, filter, per-row state | Models > Downloads: add by repo id, search, queue |
 | --- | --- |
-| ![Setup checklist](docs/images/setup.png) | ![Model library](docs/images/models.png) |
+| ![Models: the library as one table with All, Loaded and Downloads chips, the quant, size, family, where it fits and its state](docs/screenshots/readme/panel-models.png) | ![Downloads: add a model by Hugging Face repo id or link, search, and the queue with progress](docs/screenshots/readme/panel-downloads.png) |
 
-![Download: search Hugging Face and queue GGUF downloads straight into your model directory](docs/images/download.png)
-
-![Server: health, bind address, gateway port, and every runtime setting in one place](docs/images/server.png)
+![Setup guide: eight optional steps from the owner account to network exposure, starting with step 1](docs/screenshots/readme/setup-wizard.png)
 
 On Windows, the tray starts the server, restarts it if it crashes, and keeps the everyday actions
 one right-click away:
@@ -581,6 +579,7 @@ The same from a terminal, on any platform: `studioforge serve --open`, `studiofo
 
 ## Documentation
 
+- [`docs/panel.md`](docs/panel.md) — the four-tab control panel: where every control lives, old links, screenshots
 - [`docs/SECURITY.md`](docs/SECURITY.md) — who may do what: bind rules, scoped keys, TLS, MCP, the audit log
 - [`docs/CLI.md`](docs/CLI.md) — every `studioforge` command (generated)
 - [`docs/SETUP.md`](docs/SETUP.md) — first run, page by page; GPUs, engine, network, downloads; headless
