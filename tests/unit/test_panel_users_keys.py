@@ -277,7 +277,9 @@ def test_the_page_shows_names_but_never_a_token_or_a_hash(
     store.create_account("alice", PASSWORD)
     record, token = store.create_key("ops-robot", "admin")
     with TestClient(create_gui_app(config, api_state=state)) as client:
-        text = client.get("/", headers={"Authorization": f"Bearer {token}"}).text
+        text = client.get(
+            "/?section=Advanced&page=accounts", headers={"Authorization": f"Bearer {token}"}
+        ).text
     assert "could not be rendered" not in text
     for needle in ("alice", "ops-robot", "Create an account", "Create a key", "Audit log"):
         assert needle in text, needle
@@ -289,6 +291,6 @@ def test_the_page_shows_names_but_never_a_token_or_a_hash(
 def test_the_page_without_accounts_says_so(config: Config) -> None:
     bare = _FakeState(config)
     with TestClient(create_gui_app(config, api_state=bare)) as client:
-        text = client.get("/").text
+        text = client.get("/?section=Advanced&page=accounts").text
     assert "Accounts are not available on this server build" in text
     assert "could not be rendered" not in text

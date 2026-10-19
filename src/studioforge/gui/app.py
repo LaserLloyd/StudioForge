@@ -55,6 +55,7 @@ from studioforge.authkeys import looks_like_key, scope_at_least
 from studioforge.config import Config
 from studioforge.credential_guard import client_key
 from studioforge.errors import AuthError
+from studioforge.gui import nav
 from studioforge.gui import state as st
 from studioforge.gui.state import UNKNOWN
 from studioforge.gui.tabs import GuiContext, panel_guard
@@ -94,42 +95,9 @@ _NICEGUI_MOUNTED = False
 #: ``create_gui_app`` call so the newest wiring wins.
 _CONTEXT: GuiContext | None = None
 
-#: The panel's sections, in the order the strip shows them. Each is a decision
-#: the owner makes, not a module of the code: first what is happening (Overview),
-#: then what is installed (Models), how it is served and run (Serving, Engines,
-#: Placement), how other programs connect (Integrations), who may (Users & Keys),
-#: and the upkeep pages. The 2.x panel's seven tabs (Dashboard, Setup, Models,
-#: Download, Chat, Server, Logs) were moved into these, not rewritten; old links
-#: keep working through :data:`LEGACY_TABS`.
-TAB_NAMES = (
-    "Overview",
-    "Models",
-    "Serving",
-    "Engines",
-    "Placement",
-    "Integrations",
-    "Users & Keys",
-    "Updates",
-    "Logs & Metrics",
-    "Diagnostics",
-    "Advanced",
-)
-
-#: What the old tab names in a deep link (``?tab=server``) now open:
-#: ``(section, Models sub-tab or None)``. Translated here rather than in
-#: ``gui/state.py`` so the link grammar the protocol handler writes does not change.
-LEGACY_TABS: Mapping[str, tuple[str, str | None]] = {
-    "Dashboard": ("Overview", None),
-    "Setup": ("Overview", None),
-    "Models": ("Models", "Library"),
-    "Download": ("Models", "Download"),
-    "Chat": ("Models", "Chat"),
-    "Server": ("Integrations", None),
-    "Logs": ("Logs & Metrics", None),
-}
-
-#: Sub-tabs of the Models section.
-MODELS_SUBTABS = ("Library", "Download", "Chat")
+#: The panel's top line: exactly four tabs (see :mod:`studioforge.gui.nav`, which also
+#: holds the Advanced sub-navigation and every old tab/section name that still redirects).
+TAB_NAMES = nav.TOP_TABS
 
 #: Where the first-run wizard lives.
 SETUP_PATH = "/setup"
@@ -1012,156 +980,122 @@ def _status_line(ctx: GuiContext) -> str:
     return f"{st.loaded_count_text(loaded)} · {gpu_text}"
 
 
-def _default_tab(ctx: GuiContext) -> str:
-    """Where the page lands with no deep link: always the Overview.
+class Shell:
+    """The four tabs for one browser page, each built the first time it is opened.
 
-    A fresh install used to land on the Setup tab. It now lands on the Overview
-    too, where a "Finish setup" banner (see
-    :func:`studioforge.gui.tabs.overview.needs_setup`) points at the first-run
-    wizard: one place that always answers "what is this box doing", with the
-    next step on top when there is one.
+    A tab nobody opens costs nothing: no widgets, no polling timers. ``go`` is what the
+    buttons inside a tab call to send the viewer somewhere else in the panel ("Open in
+    Models", "Open logs") without a page reload.
     """
-    return "Overview"
 
+    def __init__(self, ctx: GuiContext, location: nav.Location, params: Mapping[str, Any]) -> None:
+        self.ctx = ctx
+        self.location = location
+        self.params = params
+        self.tabs: Any = None
+        self.boxes: dict[str, Any] = {}
+        self.handles: dict[str, Any] = {}
+        self.built: set[str] = set()
+        self.pending: dict[str, nav.Location] = {}
+        self.ready = False
 
-#: Lower-case spellings accepted for ``?section=`` (the canonical names, plus
-#: the short forms a hand-typed link would use).
-_SECTION_ALIASES: Mapping[str, str] = {
-    **{name.lower(): name for name in TAB_NAMES},
-    "users": "Users & Keys",
-    "users-keys": "Users & Keys",
-    "keys": "Users & Keys",
-    "logs": "Logs & Metrics",
-    "metrics": "Logs & Metrics",
-    "logs-metrics": "Logs & Metrics",
-}
+    def build(self) -> None:
+        with (
+            ui.tabs(on_change=lambda e: self._on_change(str(e.value)))
+            .props("outside-arrows mobile-arrows")
+            .classes("w-full") as tabs
+        ):
+            for name in nav.TOP_TABS:
+                ui.tab(name)
+        self.tabs = tabs
+        with ui.tab_panels(tabs, value=self.location.tab).classes("w-full"):
+            for name in nav.TOP_TABS:
+                with ui.tab_panel(name).classes("p-0"):
+                    self.boxes[name] = ui.column().classes("w-full gap-0")
+        self.ensure(self.location.tab, self.pending.pop(self.location.tab, self.location))
+        self.ready = True
 
+    def go(self, location: nav.Location) -> None:
+        """Open ``location`` (a tab, plus a page or filter inside it)."""
+        if self.tabs.value == location.tab:
+            self.ensure(location.tab, location)
+        else:
+            self.pending[location.tab] = location
+            self.tabs.set_value(location.tab)
 
-def resolve_section(
-    params: Mapping[str, Any], query: Mapping[str, Any] | None, default: str
-) -> tuple[str, str | None]:
-    """``(section, Models sub-tab or None)`` the page opens on.
+    def _on_change(self, tab: str) -> None:
+        self.ensure(tab, self.pending.pop(tab, None))
+        self._sync_url(tab)
 
-    ``?section=Updates`` names a section directly. Otherwise the legacy
-    ``?tab=`` value that :func:`studioforge.gui.state.initial_tab` understood
-    (Dashboard, Setup, Models, Download, Chat, Server, Logs) is translated by
-    :data:`LEGACY_TABS`, so every link the protocol handler or an old bookmark
-    holds still lands somewhere sensible.
-    """
-    wanted = str((query or {}).get("section") or "").strip().lower()
-    if wanted in _SECTION_ALIASES:
-        section = _SECTION_ALIASES[wanted]
-        return section, ("Library" if section == "Models" else None)
-    legacy = st.initial_tab(params, default="")
-    if legacy in LEGACY_TABS:
-        return LEGACY_TABS[legacy]
-    return default, ("Library" if default == "Models" else None)
+    def ensure(self, tab: str, location: nav.Location | None = None) -> None:
+        if tab not in self.boxes:
+            return
+        if tab in self.built:
+            handle = self.handles.get(tab)
+            if location is not None and hasattr(handle, "apply"):
+                handle.apply(location)
+            return
+        self.built.add(tab)
+        where = location or nav.Location(tab)
+        with self.boxes[tab], panel_guard(f"The {tab} page"):
+            self.handles[tab] = self._build_tab(tab, where)
 
+    def _build_tab(self, tab: str, where: nav.Location) -> Any:
+        ctx = self.ctx
+        if tab == nav.STATUS:
+            from studioforge.gui.tabs import status
 
-def _models_section(ctx: GuiContext, params: Mapping[str, Any], sub: str) -> None:
-    """Library, Download and Chat as nested tabs of the Models section."""
-    from studioforge.gui.tabs import chat, download, models, setup
+            return status.render(ctx, self.go)
+        if tab == nav.MODELS:
+            from studioforge.gui.tabs import models_page
 
-    with ui.tabs().classes("w-full") as subtabs:
-        for name in MODELS_SUBTABS:
-            ui.tab(name)
-    with ui.tab_panels(subtabs, value=sub if sub in MODELS_SUBTABS else "Library").classes(
-        "w-full"
-    ):
-        with ui.tab_panel("Library"), panel_guard("The Library tab"):
-            models.render(ctx, params)
-            setup.library_cards(ctx)
-        with ui.tab_panel("Download"), panel_guard("The Download tab"):
-            download.render(ctx, params)
-        with ui.tab_panel("Chat"), panel_guard("The Chat tab"):
-            chat.render(ctx)
+            return models_page.render(ctx, where, self.go, self.params)
+        if tab == nav.TEST_CHAT:
+            from studioforge.gui.tabs import chat, models_page
+
+            drawer = models_page.ModelDrawer(ctx, self.go)
+            chat.render(ctx, open_drawer=drawer.open, go=self.go)
+            return drawer
+        from studioforge.gui.tabs import advanced
+
+        return advanced.render(ctx, where, self.go)
+
+    def _sync_url(self, tab: str) -> None:
+        if not self.ready or tab == nav.ADVANCED:
+            return  # the hub rewrites the address with its page
+        url = nav.canonical_url(nav.Location(tab))
+        try:
+            ui.run_javascript(f"history.replaceState(null, '', {json.dumps(url)})")
+        except Exception:  # noqa: BLE001 - no client (a test): nothing to rewrite
+            return
 
 
 def _render_index(query: Mapping[str, Any] | None = None) -> None:
-    """Build the single-page shell: header, the eleven sections, one panel each.
+    """Build the single-page shell: header, the four tabs.
 
-    ``query`` carries the deep-link intent (``?tab=download&repo=owner/repo``)
-    that the protocol handler produces from HuggingFace's download button, or a
-    direct ``?section=Updates``. With no query string the page opens on the
-    Overview.
+    ``query`` carries the deep-link intent: ``?section=Models&model=<id>``, the old
+    ``?tab=download&repo=owner/repo`` the protocol handler produces, or a bare ``/``
+    (Status). Old names are redirected before this runs (see :func:`_redirect_for`).
     """
     ctx = _context()
     ui.page_title("StudioForge")
     status = _header(ctx)
     params = st.deep_link_params(query)
-    section, sub = resolve_section(params, query, _default_tab(ctx))
-
-    from studioforge.gui.tabs import (
-        dashboard,
-        diagnostics,
-        integrations,
-        logs,
-        overview,
-        server,
-        serving,
-        setup,
-        updates,
-        users_keys,
-    )
-
-    def logs_and_metrics() -> None:
-        logs.render(ctx)
-        with ui.column().classes("w-full gap-2 p-2"):
-            logs.metrics_panel(ctx)
-
-    def column(*builders: Callable[[GuiContext], None]) -> Callable[[], None]:
-        def build() -> None:
-            with ui.column().classes("w-full gap-4 p-2"):
-                for builder in builders:
-                    builder(ctx)
-
-        return build
-
-    def placement() -> None:
-        with ui.column().classes("w-full gap-4 p-2"):
-            setup.placement_cards(ctx)
-            dashboard.placement_panels(ctx)
-            ui.label(
-                "Peers and the placement decision log arrive with multi-host support "
-                "(milestone M3)."
-            ).classes("text-xs opacity-70")
-
-    def advanced() -> None:
-        with ui.column().classes("w-full gap-4 p-2"):
-            setup.advanced_cards(ctx)
-            server.config_panels(ctx)
-            ui.label(
-                "Raw engine flags for one model are set in its settings: Models, Library, then "
-                "the model's settings, Extra flags."
-            ).classes("text-xs opacity-70")
-
-    renderers: dict[str, Callable[[], None]] = {
-        "Overview": lambda: overview.render(ctx),
-        "Models": lambda: _models_section(ctx, params, sub or "Library"),
-        "Serving": lambda: serving.render(ctx),
-        "Engines": column(lambda c: setup.engine_cards(c), lambda c: server.engine_panels(c)),
-        "Placement": placement,
-        "Integrations": lambda: integrations.render(ctx),
-        "Users & Keys": lambda: users_keys.render(ctx),
-        "Updates": lambda: updates.render(ctx),
-        "Logs & Metrics": logs_and_metrics,
-        "Diagnostics": lambda: diagnostics.render(ctx),
-        "Advanced": advanced,
-    }
-
-    with ui.tabs().props("outside-arrows mobile-arrows").classes("w-full") as tabs:
-        for name in TAB_NAMES:
-            ui.tab(name)
-    with ui.tab_panels(tabs, value=section).classes("w-full"):
-        for name in TAB_NAMES:
-            with ui.tab_panel(name), panel_guard(f"The {name} page"):
-                renderers[name]()
+    shell = Shell(ctx, nav.resolve_location(query), params)
+    shell.build()
 
     def tick() -> None:
         status.set_text(_status_line(ctx))
 
     tick()
     ui.timer(max(2.0, ctx.refresh_interval), tick)
+
+
+def _redirect_for(query: Mapping[str, Any]) -> Response | None:
+    """A 307 to the canonical form when the link uses a name from an older panel."""
+    if not nav.needs_redirect(query):
+        return None
+    return RedirectResponse(nav.canonical_url(nav.resolve_location(query)), status_code=307)
 
 
 def _register_pages() -> None:
@@ -1171,10 +1105,15 @@ def _register_pages() -> None:
     _PAGES_REGISTERED = True
 
     @ui.page("/")
-    def index(request: Request) -> None:
+    def index(request: Request) -> Response | None:
         # NiceGUI injects the Starlette request when the page declares it,
         # which is how the deep-link query string reaches the tabs.
-        _render_index(dict(request.query_params))
+        query = dict(request.query_params)
+        redirect = _redirect_for(query)
+        if redirect is not None:
+            return redirect
+        _render_index(query)
+        return None
 
     @ui.page(SETUP_PATH)
     def setup_page() -> None:
@@ -1284,7 +1223,6 @@ def create_gui_app(config: Config, *, api_state: Any) -> FastAPI:
 
 __all__ = [
     "COOKIE_NAME",
-    "LEGACY_TABS",
     "LOGIN_PATH",
     "LOGOUT_PATH",
     "SETUP_PATH",
@@ -1293,6 +1231,5 @@ __all__ = [
     "authorize",
     "create_gui_app",
     "make_session_cookie",
-    "resolve_section",
     "session_token",
 ]

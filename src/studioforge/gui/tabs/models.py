@@ -332,7 +332,8 @@ def _model_table(ctx: GuiContext, view: dict[str, Any]) -> Any:
                     ).classes("text-sm opacity-70")
                 else:
                     ui.label(
-                        "No models found. Check models.dir on the Server tab, then Rescan."
+                        "No models found. Check models.dir under Advanced > Catalog & downloads, "
+                        "then Rescan."
                     ).classes("text-sm opacity-70")
                 return
             shown = f"{len(records)} of {total}" if len(records) != total else f"{total}"
@@ -1423,7 +1424,9 @@ async def _scan_adapters(ctx: GuiContext, refresh_list: Any) -> None:
     refresh_list()
 
 
-def _persona_dialog(ctx: GuiContext, table: Any, record: Any = None) -> None:  # noqa: C901
+def _persona_dialog(  # noqa: C901
+    ctx: GuiContext, table: Any, record: Any = None, *, base_id: str | None = None
+) -> None:
     """Create or edit a virtual model: base + adapters + persona (D13).
 
     The instance-sharing indicator is the load-bearing part: it tells the user
@@ -1452,7 +1455,12 @@ def _persona_dialog(ctx: GuiContext, table: Any, record: Any = None) -> None:  #
             name.props("disable")
         base = ui.select(
             [r.id for r in bases],
-            value=(record.base_model_id if editing else (bases[0].id if bases else None)),
+            value=(
+                record.base_model_id
+                if editing
+                else (base_id if base_id and any(r.id == base_id for r in bases) else None)
+                or (bases[0].id if bases else None)
+            ),
             label="Base model",
         )
         base.props("dense outlined").classes("w-full")

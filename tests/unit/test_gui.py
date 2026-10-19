@@ -257,8 +257,8 @@ def test_a_failing_lease_book_is_a_stale_note_not_an_error_card(config: Config) 
     state.manager = SimpleNamespace(leases=_BrokenBook())
     app = create_gui_app(config, api_state=state)
     with TestClient(app) as client:
-        text = client.get("/").text
-    assert "The Dashboard tab could not be rendered" not in text
+        text = client.get("/?section=Advanced&page=placement").text
+    assert "could not be rendered" not in text
     assert "live refresh failed" in text and "book on fire" in text
 
 
@@ -2442,14 +2442,15 @@ def test_index_renders_a_persona_row_and_chat_note(config: Config) -> None:
     )
     app = create_gui_app(config, api_state=state)
     with TestClient(app) as client:
-        response = client.get("/")
+        response = client.get("/?section=Models")
+        chat = client.get("/?section=Test%20Chat")
     assert response.status_code == 200
     assert "my-persona" in response.text
     assert "persona" in response.text
     assert "shares its instance" in response.text
     assert "You are terse." in response.text
     # The chat tab explains the hidden embedding model instead of failing later.
-    assert "no chat endpoint" in response.text
+    assert "no chat endpoint" in chat.text
 
 
 # ---------------------------------------------------------------------------
