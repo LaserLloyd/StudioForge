@@ -49,6 +49,52 @@ the build implements, and the `build` field on `/health` names the exact commit.
   (`scripts/panel_demo.py`, `scripts/capture_panel.py`: fake GPUs and models on ports 18080-18199, no
   GPU, no live data). The capability registry names the new panel locations.
 
+## 2.1.0
+
+New commands, so a minor version. Nothing is removed or renamed; no route changed.
+
+### Added
+
+- D81: **account management from the CLI.** `studioforge users list | add <name> | passwd <name> |
+  delete <name>` (`add` is the old `create`). Passwords come from `--password-stdin`,
+  `--password-env VAR` or a hidden prompt, never from an argument. `delete` asks first (`--yes`
+  skips it), ends that account's panel sessions, keeps API keys, refuses a deletion that would
+  leave no enabled account and no active admin key unless `--force` (new error code
+  `last_account`; even forced, a running network-bound server keeps requiring a credential,
+  remembered in `<data>/.had-owner`) and promotes the oldest enabled account when the owner is
+  deleted.
+- D81: **lockout recovery without a working login.** Put a file named `RESET_LOGIN` in the data
+  directory and start the server: empty = a generated password for the owner, `name` = a generated
+  password for that account, `name:password` = that password. The account is created if missing. The
+  file is deleted before anything changes, so it can never replay; a generated password is written
+  to `RESET_LOGIN.password` (owner-only) and never logged. Read once, by `serve`, at start: no route
+  or tool can trigger it. README "Accounts and lockout recovery" has the commands for Windows, macOS,
+  Linux and Docker.
+- D81: `studioforge config check` validates `config.yaml` exactly as `serve` will load it, names every
+  key that is wrong (and `config.yaml.bak` when one exists), writes nothing, exits 1 on a problem.
+  `studioforge config` and `config --path` are unchanged.
+
+### Fixed
+
+- D81: **the CLI acted on the wrong data directory.** With no `--config`, `SF_CONFIG` or `SF_DATA_DIR`,
+  `users`, `keys`, `doctor`, `migrate`, `support-bundle` and the other CLI commands silently used
+  `<checkout>/data` (or the platform directory) even when the installed service ran from a data
+  directory named only by its Startup launcher, systemd unit or `local-env.bat`: a password reset
+  "worked" on an empty database. They now find the installed launcher's data directory (a running
+  instance's wins), and every command that manages credentials or touches the database prints
+  `studioforge: acting on <dir> (from <source>); database <path>` on stderr first. A launcher for a
+  different Python environment, or a data directory owned by another user, is never adopted: the
+  command prints where it is (with the `sudo -u <owner> env SF_DATA_DIR=...` form) and asks for
+  `--config`. `server`, `setup` and the model commands, the server, the tray and library callers
+  resolve the directory as before; `SF_NO_INSTALL_DISCOVERY=1` turns the lookup off. Scripts that parse `--json` output must read stdout only (the line is on stderr).
+- D81: **the panel could save a configuration `serve` refuses to start on** (`server.cors_allow_credentials:
+  true` with `server.cors_origins: ['*']`). `Config.save()` now validates the whole configuration
+  before writing and rejects with the validator's own message and writes nothing; the same wording
+  reaches the panel's notification, `PATCH /api/config`, the MCP `set_config` tool and the watchdog
+  editor. When a saved file is invalid, `serve` exits 2 naming the key and `studioforge config check`.
+- Known and not fixed here: a restart-required key saved to `config.yaml` is not applied to the running
+  config, so a later unrelated save from the panel writes the old value back (D81, "Not done").
+
 ## 2.0.1
 
 ### Fixed

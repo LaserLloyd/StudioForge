@@ -31,7 +31,8 @@ The watchdog has its own open `/health` on `:1235` that keeps answering when the
   Advanced > Serving & network. Exit code 3; the tray waits up to 120 s for whoever holds the port to answer as a
   StudioForge server before saying so (D28).
 * **`error: invalid configuration in .../config.yaml: <key> ...`** — one line, exit 2. The key is
-  named; `config.yaml.bak` next to it is the previous good file. A YAML syntax error is reported,
+  named, and `studioforge config check` lists every bad key without starting anything;
+  `config.yaml.bak` next to it is the previous good file (D81). A YAML syntax error is reported,
   never overwritten; an *empty* file is treated as missing and regenerated with a warning (D31).
 * **Nothing at all under `pythonw` / the tray** — logs are in `<data dir>/logs/studioforge.log`
   and `logs/tray-server.log`; a dead console cannot kill the server any more (D33), so if the log
@@ -42,6 +43,18 @@ The watchdog has its own open `/health` on `:1235` that keeps answering when the
   whichever is missing. `/health` shows the phase and percentage. Offline? `studioforge engine
   --list` says what it wants; Advanced > Engines offers Install once the boot has given
   up.
+
+## I cannot sign in to the panel
+
+* **Forgot the password / need another login / remove an old one:** `studioforge users passwd <name>
+  --password-stdin`, `users add`, `users delete` (README, "Accounts and lockout recovery"). The first
+  line they print names the data directory and database they act on; if it is not the one the
+  service uses, pass `--config <data dir>/config.yaml`.
+* **No working shell for StudioForge:** create a file named `RESET_LOGIN` in the data directory
+  (empty = generated owner password in `RESET_LOGIN.password`, or `name:password`) and restart; the
+  start-up log says `RESET_LOGIN consumed: ...`. Docker: `docs/deploy/docker.md`.
+* **Wrong password a few times:** the login shares the API's lockout (a doubling wait per client
+  address, cleared by a restart or 15 quiet minutes); it is not the password being wrong forever.
 
 ## A model will not load
 

@@ -104,7 +104,20 @@ def test_every_studioforge_command_named_in_the_docs_exists() -> None:
     # Prose like "studioforge is", "studioforge instance" should not trip this:
     # only check words that look like commands (present in a code context is
     # hard to detect cheaply, so intersect against an allowlist of nouns).
-    prose = {"is", "and", "the", "a", "an", "can", "does", "exists", "listens", "never"}
+    # "studioforge studioforge users ..." is `docker compose exec <service> <binary> ...`.
+    prose = {
+        "is",
+        "and",
+        "the",
+        "a",
+        "an",
+        "can",
+        "does",
+        "exists",
+        "listens",
+        "never",
+        "studioforge",
+    }
     unknown = used - known - prose
     assert not unknown, f"docs name studioforge commands that do not exist: {sorted(unknown)}"
 

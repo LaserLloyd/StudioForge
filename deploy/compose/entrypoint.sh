@@ -167,7 +167,7 @@ PY
                 log "created the owner account '${OWNER_USER}' with a generated password, stored"
                 log "owner-only at ${PW_FILE}. Read it with:"
                 log "    docker compose exec studioforge cat ${PW_FILE}"
-                log "then sign in on the panel, change it under Users & Keys, and delete the file."
+                log "then sign in on the panel, change it under Advanced > Accounts & keys, and delete the file."
             else
                 rm -f "$PW_FILE"
                 log "ERROR: could not create the owner account; the server will refuse to start."

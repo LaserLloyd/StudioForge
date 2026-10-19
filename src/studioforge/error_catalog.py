@@ -418,6 +418,17 @@ _ENTRIES: tuple[ErrorEntry, ...] = (
         "docs/reference/settings.md lists every key, its range and default.",
     ),
     _e(
+        "last_account",
+        400,
+        _INVALID,
+        "'{username}' is the last account that can sign in and no active admin key exists; "
+        "deleting it would leave nothing to sign in with.",
+        "Create another account first (`studioforge users add <name>`) or an admin key, or "
+        "pass --force to delete it anyway. Locked out instead? `studioforge users passwd "
+        "<name>` resets the password, or put a RESET_LOGIN file in the data directory "
+        "(README, 'Accounts and lockout recovery').",
+    ),
+    _e(
         "unsupported",
         400,
         _INVALID,

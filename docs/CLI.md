@@ -10,7 +10,8 @@ Every command accepts `--help`. Commands that read configuration take `--config 
 | --- | --- |
 | [`studioforge autostart`](#studioforge-autostart) | Start StudioForge automatically when you log in. |
 | [`studioforge capabilities`](#studioforge-capabilities) | Show the backend, what it can run, and what your hardware allows. |
-| [`studioforge config`](#studioforge-config) | Print the effective configuration (secrets redacted). |
+| [`studioforge config`](#studioforge-config) | Print the effective configuration (secrets redacted), or check config.yaml. |
+| [`studioforge config check`](#studioforge-config-check) | Validate config.yaml the way `serve` will load it; name every key that is wrong. |
 | [`studioforge doctor`](#studioforge-doctor) | Check ports, GPU, engine, disk, permissions, certificate, migrations and auth. |
 | [`studioforge engine`](#studioforge-engine) | Inspect, install, activate or update llama.cpp engine builds. |
 | [`studioforge engine benchmark`](#studioforge-engine-benchmark) | Measure pp512 / tg128 for the ACTIVE engine on this box and cache the result. |
@@ -47,7 +48,9 @@ Every command accepts `--help`. Commands that read configuration take `--config 
 | [`studioforge update check`](#studioforge-update-check) | Compare the running version with the latest release. |
 | [`studioforge update rollback`](#studioforge-update-rollback) | Go back to the previous release (restarts the server). |
 | [`studioforge users`](#studioforge-users) | Owner accounts for the control panel. |
+| [`studioforge users add`](#studioforge-users-add) | Create an account for the control panel (and satisfy the network-bind rule). |
 | [`studioforge users create`](#studioforge-users-create) | Create an account for the control panel (and satisfy the network-bind rule). |
+| [`studioforge users delete`](#studioforge-users-delete) | Delete an account and its password. Its panel sessions end; API keys are kept. |
 | [`studioforge users list`](#studioforge-users-list) | List accounts. |
 | [`studioforge users passwd`](#studioforge-users-passwd) | Change an account's password. |
 | [`studioforge version`](#studioforge-version) | Print the version. |
@@ -83,16 +86,30 @@ studioforge capabilities
 
 ## studioforge config
 
-Print the effective configuration (secrets redacted).
+Print the effective configuration (secrets redacted), or check config.yaml.
 
 ```
-studioforge config
+studioforge config COMMAND [ARGS]...
 ```
 
 | Option | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `--config`, `-c` | path |  |  |
 | `--path` | flag |  | Print the config file path only |
+
+## studioforge config check
+
+Validate config.yaml the way `serve` will load it; name every key that is wrong.
+
+Writes nothing and starts nothing. Exit 0 when it loads (or is missing), else 1.
+
+```
+studioforge config check
+```
+
+| Option | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `--config`, `-c` | path |  | Path to config.yaml |
 
 ## studioforge doctor
 
@@ -599,9 +616,28 @@ Owner accounts for the control panel.
 studioforge users COMMAND [ARGS]...
 ```
 
+## studioforge users add
+
+Create an account for the control panel (and satisfy the network-bind rule).
+
+``add`` is the same command. The password is read from ``--password-env`` or ``--password-stdin`` (or prompted for), never taken as an argument.
+
+```
+studioforge users add
+```
+
+| Option | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `username` | str |  | Username (the first account is the owner). |
+| `--password-env` | str |  | Read it from this env var. |
+| `--password-stdin` | flag |  | Read it from stdin. |
+| `--config`, `-c` | path |  | Path to config.yaml |
+
 ## studioforge users create
 
 Create an account for the control panel (and satisfy the network-bind rule).
+
+``add`` is the same command. The password is read from ``--password-env`` or ``--password-stdin`` (or prompted for), never taken as an argument.
 
 ```
 studioforge users create
@@ -612,6 +648,23 @@ studioforge users create
 | `username` | str |  | Username (the first account is the owner). |
 | `--password-env` | str |  | Read it from this env var. |
 | `--password-stdin` | flag |  | Read it from stdin. |
+| `--config`, `-c` | path |  | Path to config.yaml |
+
+## studioforge users delete
+
+Delete an account and its password. Its panel sessions end; API keys are kept.
+
+Refuses the last account that can sign in (with no admin key to fall back on) unless ``--force``: a network-bound server would refuse to start.
+
+```
+studioforge users delete
+```
+
+| Option | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `username` | str |  | The account to remove. |
+| `--yes`, `-y` | flag |  | Do not ask for confirmation. |
+| `--force` | flag |  | Allow deleting the last account that can sign in. |
 | `--config`, `-c` | path |  | Path to config.yaml |
 
 ## studioforge users list

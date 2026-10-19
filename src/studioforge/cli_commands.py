@@ -46,10 +46,54 @@ update_app = typer.Typer(help="Check for, install and roll back updates.", no_ar
 # ---------------------------------------------------------------------------
 
 
-def _config(config_path: Path | None) -> Any:
+def locate_install(config_path: Path | None) -> Any:
+    """Decide which install an account-managing command acts on (D81).
+
+    A foreign install -- a launcher for a different Python environment, or a data
+    directory owned by another user -- is never adopted silently: when that is all
+    there is, say where it is and stop, so the command is never run against the wrong
+    database (or quietly against an empty one).
+    """
+    from studioforge.install_locator import locate
+
+    located = locate(config_path)
+    if located.config_path is None and located.foreign:
+        typer.echo(
+            "error: StudioForge is installed here, but not as this command's own install:", err=True
+        )
+        for item in located.foreign:
+            typer.echo(f"  {item.describe()}", err=True)
+        typer.echo(
+            "  fix: pass --config <data dir>/config.yaml (or set SF_DATA_DIR) to say which "
+            "install to act on.",
+            err=True,
+        )
+        raise typer.Exit(2)
+    return located
+
+
+def _config(config_path: Path | None, *, announce: bool = False) -> Any:
+    """Load the config of the install this command is about.
+
+    ``announce`` marks the commands that manage credentials or open the database
+    directly (``users``, ``keys``, ``doctor``, ``migrate``, ``support-bundle``). Those
+    find the installed data directory (:func:`studioforge.install_locator.locate`) when
+    no ``--config`` / ``SF_CONFIG`` / ``SF_DATA_DIR`` is given -- so a plain
+    ``studioforge users passwd`` acts on the live install and not on an empty
+    ``<checkout>/data`` (D81) -- and print, on stderr so ``--json`` stays clean, which
+    data directory and database they are about to act on. Every other command (``server``,
+    ``setup``, the model commands) resolves the directory exactly as before.
+    """
     from studioforge.__main__ import _load
 
-    return _load(config_path)
+    if not announce:
+        return _load(config_path)
+    from studioforge.install_locator import describe
+
+    located = locate_install(config_path)
+    config = _load(located.config_path)
+    typer.echo(describe(config.data_dir, config.db_path, located.source), err=True)
+    return config
 
 
 def _emit(data: Any) -> None:
@@ -485,7 +529,7 @@ def keys_create_cmd(
     too) then needs a key. The CLI, the tray and the panel on this machine get
     their own automatically.
     """
-    config = _config(config_path)
+    config = _config(config_path, announce=True)
     db, store = _store(config)
     try:
         first = not store.has_active_keys()
@@ -525,7 +569,7 @@ def keys_list_cmd(
     config_path: Path | None = CONFIG_OPTION,
 ) -> None:
     """List keys (never the tokens)."""
-    config = _config(config_path)
+    config = _config(config_path, announce=True)
     db, store = _store(config)
     try:
         keys = store.list_keys(include_revoked=all_keys)
@@ -565,7 +609,7 @@ def keys_revoke_cmd(
     config_path: Path | None = CONFIG_OPTION,
 ) -> None:
     """Revoke a key. It stops working immediately."""
-    config = _config(config_path)
+    config = _config(config_path, announce=True)
     db, store = _store(config)
     try:
         record = store.revoke_key(key)
@@ -580,6 +624,7 @@ def keys_revoke_cmd(
 
 
 @users_app.command("create")
+@users_app.command("add")
 def users_create_cmd(
     username: str = typer.Argument(..., help="Username (the first account is the owner)."),
     password_env: str | None = typer.Option(
@@ -588,8 +633,12 @@ def users_create_cmd(
     password_stdin: bool = typer.Option(False, "--password-stdin", help="Read it from stdin."),
     config_path: Path | None = CONFIG_OPTION,
 ) -> None:
-    """Create an account for the control panel (and satisfy the network-bind rule)."""
-    config = _config(config_path)
+    """Create an account for the control panel (and satisfy the network-bind rule).
+
+    ``add`` is the same command. The password is read from ``--password-env`` or
+    ``--password-stdin`` (or prompted for), never taken as an argument.
+    """
+    config = _config(config_path, announce=True)
     db, store = _store(config)
     try:
         password = _read_password(
@@ -614,7 +663,7 @@ def users_passwd_cmd(
     config_path: Path | None = CONFIG_OPTION,
 ) -> None:
     """Change an account's password."""
-    config = _config(config_path)
+    config = _config(config_path, announce=True)
     db, store = _store(config)
     try:
         password = _read_password(
@@ -634,7 +683,7 @@ def users_passwd_cmd(
 @users_app.command("list")
 def users_list_cmd(json_out: bool = JSON_OPTION, config_path: Path | None = CONFIG_OPTION) -> None:
     """List accounts."""
-    config = _config(config_path)
+    config = _config(config_path, announce=True)
     db, store = _store(config)
     try:
         accounts = store.list_accounts()
@@ -647,6 +696,48 @@ def users_list_cmd(json_out: bool = JSON_OPTION, config_path: Path | None = CONF
         typer.echo("No accounts. Create the owner with `studioforge users create <name>`.")
         return
     typer.echo(_table([[a.username, a.role] for a in accounts], ["USERNAME", "ROLE"]))
+
+
+@users_app.command("delete")
+def users_delete_cmd(
+    username: str = typer.Argument(..., help="The account to remove."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Do not ask for confirmation."),
+    force: bool = typer.Option(
+        False, "--force", help="Allow deleting the last account that can sign in."
+    ),
+    config_path: Path | None = CONFIG_OPTION,
+) -> None:
+    """Delete an account and its password. Its panel sessions end; API keys are kept.
+
+    Refuses the last account that can sign in (with no admin key to fall back on) unless
+    ``--force``: a network-bound server would refuse to start.
+    """
+    config = _config(config_path, announce=True)
+    db, store = _store(config)
+    try:
+        account = store.get_account(username)
+        if account is None:
+            typer.echo(
+                f"error: there is no account named '{username}'. "
+                "List accounts with `studioforge users list`.",
+                err=True,
+            )
+            raise typer.Exit(1)
+        if not yes and not typer.confirm(f"Delete the account '{account.username}'?"):
+            typer.echo("Nothing deleted.")
+            return
+        store.delete_account(account.username, force=force)
+        remaining = len(store.list_accounts())
+    except typer.Exit:
+        raise
+    except Exception as exc:  # noqa: BLE001 - one readable line, not a traceback
+        typer.echo(f"error: {getattr(exc, 'message', exc)}", err=True)
+        raise typer.Exit(1) from exc
+    finally:
+        db.close()
+    typer.echo(f"Deleted the account '{account.username}'.")
+    if remaining == 0:
+        typer.echo("No accounts remain. Create one with `studioforge users add <name>`.")
 
 
 # ---------------------------------------------------------------------------
@@ -666,7 +757,7 @@ def doctor_cmd(
     from studioforge.core.engine import EngineManager
     from studioforge.core.gpu import get_probe
 
-    config = _config(config_path)
+    config = _config(config_path, announce=True)
     probe = get_probe()
     report = run_doctor(
         config,
@@ -710,7 +801,7 @@ def support_bundle_cmd(
     from studioforge.core.gpu import get_probe
     from studioforge.core.support_bundle import build_bundle
 
-    config = _config(config_path)
+    config = _config(config_path, announce=True)
     payload = build_bundle(config, probe=get_probe(), log_lines=lines)
     target = output or Path(f"studioforge-support-{time.strftime('%Y%m%d-%H%M%S')}.zip")
     target.write_bytes(payload)
@@ -730,7 +821,7 @@ def migrate_cmd(
 
     from studioforge.db import SCHEMA_VERSION, Database, _migration_sources
 
-    config = _config(config_path)
+    config = _config(config_path, announce=True)
     path = Path(config.db_path)
     applied: set[int] = set()
     if path.is_file():

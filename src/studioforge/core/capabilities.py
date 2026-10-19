@@ -74,7 +74,7 @@ FEATURE_NOTES: dict[str, str] = {
 #: on instead. **Bump it in the same commit that appends a decision**:
 #: ``tests/unit/test_capabilities_implemented.py`` reads the headings of
 #: ``DECISIONS.md`` and fails until the two agree.
-LATEST_DECISION = 80
+LATEST_DECISION = 81
 
 #: Every decision number this build includes, ``"D1"`` .. ``"D<LATEST_DECISION>"``.
 IMPLEMENTED_DECISIONS: tuple[str, ...] = tuple(f"D{n}" for n in range(1, LATEST_DECISION + 1))
@@ -128,6 +128,11 @@ SERVER_FEATURES: dict[str, str] = {
     # POST /api/leases takes devices "auto" (or none) with min_free_gib,
     # prefer, avoid; a refusal carries details.considered.
     "lease_auto_placement": "D78",
+    # `studioforge users add|delete`, the <data>/RESET_LOGIN lockout sentinel read
+    # once at `serve` start, `config check`, and a Config.save() that refuses a
+    # file `serve` could not load. Local operator tooling; no route changed.
+    "login_reset_sentinel": "D81",
+    "config_save_validated": "D81",
 }
 
 
