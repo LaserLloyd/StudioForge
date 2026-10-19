@@ -91,6 +91,15 @@ def _engine_tag(ctx: GuiContext) -> str:
     return str(tag) if tag else "none installed"
 
 
+def _boot_text(boot: dict[str, Any]) -> str:
+    """``ready (6.1s)`` / ``scanning models (2.0s)`` / a dash when the app reports no boot."""
+    if not boot:
+        return st.UNKNOWN
+    phase = str(boot.get("phase") or st.UNKNOWN)
+    elapsed = boot.get("elapsed_s")
+    return f"{phase} ({elapsed}s)" if isinstance(elapsed, int | float) else phase
+
+
 def _build() -> str:
     try:
         from studioforge.build import build_id
@@ -144,10 +153,11 @@ def _health_card(ctx: GuiContext, go: Go) -> None:
         chip.set_text(health.label)
         chip.props(f"color={health.colour}")
         detail.set_text(health.detail)
-        loaded = [i for i in instances if getattr(i, "state", "") == "ready"]
+        boot = _boot(ctx) or {}
         facts.clear()
         with facts:
             for label, value in (
+                ("Boot", _boot_text(boot)),
                 ("Loaded", st.loaded_count_text(instances)),
                 ("Active requests", str(sv.total_active_requests(instances))),
                 ("Engine", _engine_tag(ctx)),
@@ -157,7 +167,6 @@ def _health_card(ctx: GuiContext, go: Go) -> None:
                 with ui.column().classes("gap-0"):
                     ui.label(label).classes("text-xs opacity-60")
                     ui.label(value).classes("text-sm font-mono")
-            del loaded
 
     paint()
     ui.timer(max(2.0, ctx.refresh_interval), paint)

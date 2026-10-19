@@ -10,7 +10,7 @@
       "id": "audit.read",
       "mcp": null,
       "notes": "The file itself is logs/audit.jsonl.",
-      "panel": "Users & Keys page: audit log",
+      "panel": "Advanced > Accounts & keys: audit log",
       "sfctl": null
     },
     {
@@ -23,7 +23,7 @@
       "id": "auth.status",
       "mcp": null,
       "notes": "`studioforge doctor` reports the same posture as findings.",
-      "panel": "Users & Keys page: security posture",
+      "panel": "Advanced > Accounts & keys: security posture",
       "sfctl": null
     },
     {
@@ -39,7 +39,7 @@
         "tool": "get_config"
       },
       "notes": "",
-      "panel": "Serving page: settings",
+      "panel": "Advanced > Serving & network: settings",
       "sfctl": "config get"
     },
     {
@@ -68,7 +68,7 @@
         "tool": "set_config"
       },
       "notes": "",
-      "panel": "Serving page: Save",
+      "panel": "Advanced > Serving & network: Save",
       "sfctl": "config set"
     },
     {
@@ -91,7 +91,7 @@
       "id": "doctor.run",
       "mcp": null,
       "notes": "",
-      "panel": "Diagnostics page: Run checks",
+      "panel": "Advanced > Diagnostics: Run checks",
       "sfctl": null
     },
     {
@@ -104,7 +104,7 @@
       "id": "engine.activate",
       "mcp": null,
       "notes": "",
-      "panel": "Engines page: activate + reload",
+      "panel": "Advanced > Engines: activate + reload",
       "sfctl": null
     },
     {
@@ -117,7 +117,7 @@
       "id": "engine.install",
       "mcp": null,
       "notes": "",
-      "panel": "Engines page: Install",
+      "panel": "Advanced > Engines: Install",
       "sfctl": "update --engine"
     },
     {
@@ -130,7 +130,7 @@
       "id": "engine.list",
       "mcp": null,
       "notes": "`sfctl update --engine TAG --check` prints the engine block but is not a dedicated command.",
-      "panel": "Engines page: installed builds",
+      "panel": "Advanced > Engines: installed builds",
       "sfctl": null
     },
     {
@@ -146,7 +146,7 @@
         "tool": "health"
       },
       "notes": "`sfctl recover` with no flags prints the watchdog's health diagnosis.",
-      "panel": "Diagnostics page: Run checks",
+      "panel": "Advanced > Diagnostics: Run checks",
       "sfctl": "recover"
     },
     {
@@ -162,7 +162,7 @@
         "tool": "search_models"
       },
       "notes": "",
-      "panel": "Models page: Download > Search",
+      "panel": "Models tab: Add model, Search Hugging Face",
       "sfctl": "search"
     },
     {
@@ -175,7 +175,7 @@
       "id": "keys.create",
       "mcp": null,
       "notes": "",
-      "panel": "Users & Keys page: Create key",
+      "panel": "Advanced > Accounts & keys: Create key",
       "sfctl": null
     },
     {
@@ -188,7 +188,7 @@
       "id": "keys.list",
       "mcp": null,
       "notes": "Deliberately not an MCP tool: an agent must not manage the keys that bound it.",
-      "panel": "Users & Keys page: keys table",
+      "panel": "Advanced > Accounts & keys: keys table",
       "sfctl": null
     },
     {
@@ -201,7 +201,7 @@
       "id": "keys.revoke",
       "mcp": null,
       "notes": "",
-      "panel": "Users & Keys page: Revoke",
+      "panel": "Advanced > Accounts & keys: Revoke",
       "sfctl": null
     },
     {
@@ -233,7 +233,7 @@
         "tool": "gpu_leases"
       },
       "notes": "",
-      "panel": "Placement page: GPU leases",
+      "panel": "Advanced > GPUs & placement: GPU leases",
       "sfctl": "leases list"
     },
     {
@@ -249,7 +249,7 @@
         "tool": "release_gpus"
       },
       "notes": "",
-      "panel": "Placement page: Release lease",
+      "panel": "Advanced > GPUs & placement: Release lease",
       "sfctl": "leases release"
     },
     {
@@ -265,7 +265,7 @@
         "tool": "tail_logs"
       },
       "notes": "",
-      "panel": "Logs & Metrics page: Refresh",
+      "panel": "Advanced > Logs & metrics: Refresh",
       "sfctl": "logs"
     },
     {
@@ -278,7 +278,7 @@
       "id": "metrics.get",
       "mcp": null,
       "notes": "",
-      "panel": "Logs & Metrics page: Metrics",
+      "panel": "Advanced > Logs & metrics: Metrics",
       "sfctl": null
     },
     {
@@ -294,7 +294,7 @@
         "tool": "delete_model"
       },
       "notes": "",
-      "panel": "Models page: Delete",
+      "panel": "Models tab: details drawer, Manage, Delete",
       "sfctl": "models delete"
     },
     {
@@ -310,7 +310,7 @@
         "tool": "download_model"
       },
       "notes": "",
-      "panel": "Models page: Download",
+      "panel": "Models tab: Add model, Downloads",
       "sfctl": "download"
     },
     {
@@ -326,7 +326,7 @@
         "tool": "list_models"
       },
       "notes": "",
-      "panel": "Models page: Library",
+      "panel": "Models tab: library",
       "sfctl": "models list"
     },
     {
@@ -342,7 +342,7 @@
         "tool": "load_model"
       },
       "notes": "",
-      "panel": "Models page: Load",
+      "panel": "Models tab: details drawer, Load",
       "sfctl": "models load"
     },
     {
@@ -358,7 +358,7 @@
         "tool": "pin_model"
       },
       "notes": "",
-      "panel": "Models page: Pin",
+      "panel": "Models tab: details drawer, Manage, Pin",
       "sfctl": "models pin"
     },
     {
@@ -371,7 +371,7 @@
       "id": "models.scan",
       "mcp": null,
       "notes": "",
-      "panel": "Models page: Rescan",
+      "panel": "Models tab: Rescan",
       "sfctl": "models scan"
     },
     {
@@ -387,7 +387,7 @@
         "tool": "test_model"
       },
       "notes": "",
-      "panel": "Models page: Test",
+      "panel": "Models tab: details drawer, Manage, Test",
       "sfctl": "models test"
     },
     {
@@ -403,7 +403,7 @@
         "tool": "unload_model"
       },
       "notes": "",
-      "panel": "Models page: Unload",
+      "panel": "Models tab: details drawer, Unload",
       "sfctl": "models unload"
     },
     {
@@ -416,7 +416,7 @@
       "id": "models.unload_all",
       "mcp": null,
       "notes": "",
-      "panel": "Overview page: Unload all",
+      "panel": "Advanced > Watchdog & recovery: Unload all models",
       "sfctl": null
     },
     {
@@ -458,7 +458,7 @@
         "tool": "reclaim_orphan_engines"
       },
       "notes": "",
-      "panel": "Overview page: Reclaim",
+      "panel": "Advanced > GPUs & placement: Reclaim",
       "sfctl": null
     },
     {
@@ -474,7 +474,7 @@
         "tool": "restart_server"
       },
       "notes": "",
-      "panel": "Overview page: Restart server",
+      "panel": "Advanced > Watchdog & recovery: Restart server",
       "sfctl": "recover --restart"
     },
     {
@@ -523,7 +523,7 @@
         "tool": "server_status"
       },
       "notes": "",
-      "panel": "Overview page",
+      "panel": "Status tab",
       "sfctl": "status"
     },
     {
@@ -536,7 +536,7 @@
       "id": "support_bundle.create",
       "mcp": null,
       "notes": "",
-      "panel": "Diagnostics page: Download support bundle",
+      "panel": "Advanced > Diagnostics: Download support bundle",
       "sfctl": null
     },
     {
@@ -552,7 +552,7 @@
         "tool": "gpu_tenants"
       },
       "notes": "",
-      "panel": "Placement page: tenants",
+      "panel": "Advanced > GPUs & placement: tenants",
       "sfctl": "tenants list"
     },
     {
@@ -565,7 +565,7 @@
       "id": "update.apply",
       "mcp": null,
       "notes": "",
-      "panel": "Updates page: Install",
+      "panel": "Advanced > About & updates: Install",
       "sfctl": "update"
     },
     {
@@ -578,7 +578,7 @@
       "id": "update.check",
       "mcp": null,
       "notes": "The panel's `Check for engine update` checks llama.cpp builds, not the app.",
-      "panel": "Updates page: Check for updates",
+      "panel": "Advanced > About & updates: Check for updates",
       "sfctl": "update --check"
     },
     {
@@ -594,7 +594,7 @@
         "tool": "rollback_update"
       },
       "notes": "",
-      "panel": "Updates page: Roll back",
+      "panel": "Advanced > About & updates: Roll back",
       "sfctl": null
     },
     {
@@ -607,7 +607,7 @@
       "id": "users.create",
       "mcp": null,
       "notes": "",
-      "panel": "Users & Keys page: Create account",
+      "panel": "Advanced > Accounts & keys: Create account",
       "sfctl": null
     },
     {
@@ -620,7 +620,7 @@
       "id": "users.list",
       "mcp": null,
       "notes": "",
-      "panel": "Users & Keys page: accounts table",
+      "panel": "Advanced > Accounts & keys: accounts table",
       "sfctl": null
     },
     {
@@ -633,7 +633,7 @@
       "id": "users.password",
       "mcp": null,
       "notes": "",
-      "panel": "Users & Keys page: Change password",
+      "panel": "Advanced > Accounts & keys: Change password",
       "sfctl": null
     }
   ],

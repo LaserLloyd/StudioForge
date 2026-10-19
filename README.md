@@ -24,7 +24,7 @@ control panel, a system tray, and MCP tools so an agent can run it from another 
 replace LM Studio as the backend for [OpenClaw](docs/OPENCLAW.md) — it listens on LM Studio's port, so
 switching is a host change, not a rewrite.
 
-**Status:** v2.0.1. The first release on the new scheme: secure-by-default binds, scoped keys,
+**Status:** v2.2.0. The first release on the new scheme: secure-by-default binds, scoped keys,
 backend-aware engines (CUDA verified; ROCm and Vulkan not yet tested on real hardware, see
 [`docs/ENGINES.md`](docs/ENGINES.md)) and the LM Studio native API (see [`CHANGELOG.md`](CHANGELOG.md), **BREAKING**
 first). Windows is the reference platform and runs it daily; Linux is supported (CI runs both) and
@@ -34,11 +34,11 @@ less battle-tested. Questions and bug reports: [Contact](#contact).
 on LaserLloyd.com, and the author's other [AI projects](https://www.laserlloyd.com/ai/).
 
 **On versions.** StudioForge uses semantic versioning since 2.0.0. The version lives in
-`src/studioforge/__init__.py` — `2.0.1` — and is what `GET /api/version`, `GET /health`, the MCP
+`src/studioforge/__init__.py` — `2.2.0` — and is what `GET /api/version`, `GET /health`, the MCP
 `server_status` tool and `sfctl status` report; all three `pyproject.toml` files (the app,
 `packages/studioforge-companion` for `sfctl`, and `packages/studioforge-tenant`) carry the same string,
 the companion ships from the same release and carries the same version, and release tags are
-`v2.0.1`. Releases before 2.0.0 were calendar-versioned (`1.26-08-23` style); the updater reads both
+`v2.2.0`. Releases before 2.0.0 were calendar-versioned (`1.26-08-23` style); the updater reads both
 schemes, so a 1.x install sees 2.0.0 as the update it is. Check what a server is actually running with
 `curl -s <host>/api/version`. A server running a commit past its release still reports that release,
 but the `build` field beside `version` (on `/health`, `/api/version`, `/api/status`, `server_status`
