@@ -539,8 +539,9 @@ def auth_enforced(config: Config, accounts: Any = None) -> bool:
 
     True when ``server.api_key`` is set, when any active API key exists, or when
     a listener is reachable from the network *and* an owner account exists or
-    a key ever did (revoking the last key at runtime must not reopen a
-    network-bound server: the bind rule is only checked at start).
+    a key or an account ever did (revoking the last key, or deleting the last account,
+    at runtime must not reopen a network-bound server: the bind rule is only checked at
+    start).
     False for a loopback-only install with no credentials (the first-run state)
     -- and for a network-bound one that never had any, a state
     ``studioforge serve`` refuses to start in (:func:`check_bind_rule`), so it
@@ -556,7 +557,12 @@ def auth_enforced(config: Config, accounts: Any = None) -> bool:
     if not remote_services(config):
         return False
     had_keys = getattr(accounts, "had_keys_cached", None)
-    return bool(accounts.has_owner_cached() or (callable(had_keys) and had_keys()))
+    had_owner = getattr(accounts, "had_owner_cached", None)
+    return bool(
+        accounts.has_owner_cached()
+        or (callable(had_keys) and had_keys())
+        or (callable(had_owner) and had_owner())
+    )
 
 
 def has_admin_credential(config: Config, accounts: Any = None) -> bool:

@@ -104,12 +104,43 @@ def serve(
         config.watchdog.enabled = False
 
     _preflight_ports(config)
+    _apply_login_reset(config)
     _enforce_security_start(config)
     exit_code = asyncio.run(_serve(config, open_gui=open_gui))
     if exit_code:
         # A restart the server left to whoever launched it (D28): the tray
         # reads EXIT_RESTART_REQUESTED and respawns without counting a crash.
         raise typer.Exit(exit_code)
+
+
+def _apply_login_reset(config: Config) -> None:
+    """Consume ``<data>/RESET_LOGIN`` if it is there (D81): the lockout recovery.
+
+    Runs once per start, here and nowhere else -- no route, tool or watcher reads
+    the sentinel, so it cannot be triggered over the network. It never stops the
+    server from starting: a reset that fails says why and the boot goes on.
+    """
+    from studioforge.login_reset import apply_sentinel, sentinel_path
+
+    path = sentinel_path(config.data_dir)
+    if not path.exists() and not path.is_symlink():
+        return
+    from studioforge.core.accounts import AccountStore
+    from studioforge.db import Database
+
+    try:
+        db = Database(config.db_path)
+        try:
+            db.migrate_with_recovery()
+            result = apply_sentinel(config.data_dir, AccountStore(db, config.data_dir))
+        finally:
+            db.close()
+    except Exception as exc:  # noqa: BLE001 - recovery must never be the reason a boot fails
+        log.error("RESET_LOGIN was not applied", error=str(exc))
+        _console(f"error: RESET_LOGIN was not applied: {exc}", err=True)
+        return
+    if result is not None:
+        _console(result.describe(), err=not result.applied)
 
 
 def _enforce_security_start(config: Config) -> None:
@@ -1156,23 +1187,71 @@ def engine_benchmark_cmd(
     typer.echo(f"cached: {describe(result)}")
 
 
-@app.command("config")
+config_app = typer.Typer(
+    help="Print the effective configuration (secrets redacted), or check config.yaml.",
+    invoke_without_command=True,
+    add_completion=False,
+)
+app.add_typer(config_app, name="config")
+
+
+@config_app.callback()
 def config_cmd(
+    ctx: typer.Context,
     config_path: Path | None = typer.Option(None, "--config", "-c"),
     show_path: bool = typer.Option(False, "--path", help="Print the config file path only"),
 ) -> None:
-    """Print the effective configuration (secrets redacted)."""
+    """Print the effective configuration (secrets redacted).
+
+    ``config check`` validates ``config.yaml`` without starting anything.
+    """
+    if ctx.invoked_subcommand is not None:
+        ctx.obj = config_path  # `config --config X check` must honour X
+        return
     import yaml
 
     from studioforge.api.auth import redact_config_dict
 
+    located = cli_commands.locate_install(config_path)
     if show_path:
-        typer.echo(str(find_config_path(config_path)))
+        typer.echo(str(find_config_path(located.config_path)))
         return
-    config = _load(config_path)
+    config = _load(located.config_path)
     data = redact_config_dict(config.to_yaml_dict())
     typer.echo(f"# {config.config_path}")
     typer.echo(yaml.safe_dump(data, sort_keys=False))
+
+
+@config_app.command("check")
+def config_check_cmd(
+    ctx: typer.Context,
+    config_path: Path | None = typer.Option(None, "--config", "-c", help="Path to config.yaml"),
+) -> None:
+    """Validate config.yaml the way `serve` will load it; name every key that is wrong.
+
+    Writes nothing and starts nothing. Exit 0 when it loads (or is missing), else 1.
+    """
+    from studioforge.config import check_config_file
+
+    located = cli_commands.locate_install(config_path or ctx.obj)
+    result = check_config_file(located.config_path)
+    typer.echo(f"studioforge: checking {result.path} (from {located.source})", err=True)
+    if not result.exists:
+        typer.echo("No config.yaml yet: the defaults apply and the first start writes one.")
+        return
+    if result.ok:
+        typer.echo("OK: config.yaml loads cleanly.")
+        return
+    typer.echo(
+        f"INVALID: `studioforge serve` will refuse to start ({len(result.problems)} problem(s)):"
+    )
+    for key, reason in result.problems:
+        typer.echo(f"  {key}: {reason}")
+    typer.echo("")
+    typer.echo(f"Fix: edit {result.path} and correct the key(s) above, then run this again.")
+    if result.backup is not None:
+        typer.echo(f"The previous save is {result.backup}; copying it over config.yaml also works.")
+    raise typer.Exit(1)
 
 
 @app.command("open")

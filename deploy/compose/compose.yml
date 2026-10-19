@@ -15,13 +15,13 @@ name: studioforge
 
 services:
   studioforge:
-    image: ghcr.io/laserlloyd/studioforge:${SF_VERSION:-2.0.1}-${SF_BACKEND:-cuda}
+    image: ghcr.io/laserlloyd/studioforge:${SF_VERSION:-2.1.0}-${SF_BACKEND:-cuda}
     build:
       context: ../..
       dockerfile: Dockerfile
       args:
         BACKEND: ${SF_BACKEND:-cuda}
-        VERSION: ${SF_VERSION:-2.0.1}
+        VERSION: ${SF_VERSION:-2.1.0}
     container_name: studioforge
     hostname: studioforge
     # `init: true` is required: `serve` spawns a watchdog sidecar and one

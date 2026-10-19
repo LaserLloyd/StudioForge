@@ -121,6 +121,15 @@ password is hashed with argon2id and the hash is stored through the secret store
 `0600` file), not in `registry.sqlite3`, so a copied database carries no login material. Passwords
 must be at least 10 characters.
 
+Accounts are managed with `studioforge users list | add | passwd | delete` (the password on
+`--password-stdin` or `--password-env`, never an argument), and a locked-out operator with access to
+the data directory can drop a `RESET_LOGIN` file there (D81). Both are local operator tools: the CLI
+opens the database directly, and the sentinel is read once by `serve` at start, deleted before it is
+applied, and referenced by no route, panel action or MCP tool, so nothing over the network can
+reset a login. A person who can write to the data directory can already read the database and
+`cli.key`, which is why the file widens nothing. The commands per platform are in the README's
+[Accounts and lockout recovery](../README.md#accounts-and-lockout-recovery).
+
 ## The control panel
 
 - Sign in with the owner password or an `admin` key. A `read` or `inference` key cannot open the panel.

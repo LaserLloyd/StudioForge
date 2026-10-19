@@ -57,6 +57,10 @@ __all__ = ["Account", "AccountStore", "LEGACY_KEY_NAME", "MIN_PASSWORD_LENGTH"]
 LEGACY_KEY_NAME = "legacy"
 LOCAL_CLI_KEY_NAME = "local-cli"
 LOCAL_CLI_KEY_FILE = "cli.key"
+#: Written when an account is created or about to be deleted: "an owner existed here". Lets a
+#: network-bound server keep requiring a credential after its last account is force-deleted,
+#: the way ``had_keys_cached`` does for keys (a bind rule is only checked at start).
+OWNER_EVER_FILE = ".had-owner"
 
 #: Long enough that argon2id's cost is the weak point, not the password.
 MIN_PASSWORD_LENGTH = 10
@@ -133,7 +137,7 @@ class AccountStore:
         self._lock = threading.Lock()
         self._touched: dict[str, float] = {}
         self._windows: dict[str, deque[float]] = {}
-        self._posture: tuple[float, bool, bool, bool] | None = None
+        self._posture: tuple[float, bool, bool, bool, bool] | None = None
 
     # ------------------------------------------------------------------
     # Keys: create / list / revoke
@@ -247,15 +251,17 @@ class AccountStore:
         cached = self._cached_posture()
         return cached[1], cached[2]
 
-    def _cached_posture(self) -> tuple[float, bool, bool, bool]:
-        """``(stamp, any active key, any owner, any key ever -- revoked ones too)``."""
+    def _cached_posture(self) -> tuple[float, bool, bool, bool, bool]:
+        """``(stamp, active key, enabled account, any key ever, any account ever)``."""
         now = self._clock()
         with self._lock:
             cached = self._posture
             if cached is not None and now - cached[0] < _POSTURE_TTL_S:
                 return cached
         rows = self.list_keys()
-        fresh = (now, any(k.active(now) for k in rows), self.has_owner(), bool(rows))
+        owner = self.has_owner()
+        ever = owner or self._had_owner()
+        fresh = (now, any(k.active(now) for k in rows), owner, bool(rows), ever)
         with self._lock:
             self._posture = fresh
         return fresh
@@ -274,6 +280,22 @@ class AccountStore:
         key must not silently reopen the server to the network.
         """
         return self._cached_posture()[3]
+
+    def had_owner_cached(self) -> bool:
+        """Whether an account ever existed here (deleted ones count).
+
+        Same reason as :meth:`had_keys_cached`: deleting the last account must not
+        silently reopen a network-bound server whose bind rule is only checked at start.
+        """
+        return self._cached_posture()[4]
+
+    def _had_owner(self) -> bool:
+        return (self.data_dir / OWNER_EVER_FILE).is_file()
+
+    def _mark_had_owner(self) -> None:
+        with contextlib.suppress(OSError):
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+            (self.data_dir / OWNER_EVER_FILE).write_text("an account existed", encoding="utf-8")
 
     def has_active_admin_key(self) -> bool:
         return any(k.active(self._clock()) and k.scope == "admin" for k in self.list_keys())
@@ -516,6 +538,7 @@ class AccountStore:
             "VALUES (?, ?, ?, ?, ?)",
             (account_id, name, role, now, now),
         )
+        self._mark_had_owner()
         self._invalidate_posture()
         log.info("account created", username=name, role=role)
         return Account(account_id, name, role, now)
@@ -535,6 +558,77 @@ class AccountStore:
             "UPDATE accounts SET password_changed_at = ? WHERE id = ?", (self._clock(), account.id)
         )
         log.info("account password changed", username=account.username)
+        return account
+
+    def owner_username(self) -> str | None:
+        """The owner's username (else the oldest account's), ``None`` when there are none."""
+        accounts = self.list_accounts()
+        for account in accounts:
+            if account.role == "owner":
+                return account.username
+        return accounts[0].username if accounts else None
+
+    def reset_login(self, username: str, password: str) -> tuple[Account, bool]:
+        """Set ``username``'s password, creating the account when it does not exist.
+
+        Returns ``(account, created)``. An existing account is also re-enabled.
+        The lockout recovery path (``<data>/RESET_LOGIN``, see
+        :mod:`studioforge.login_reset`); the CLI uses ``create_account`` and
+        ``set_password`` directly.
+        """
+        existing = self.get_account(username)
+        if existing is None:
+            return self.create_account(username, password), True
+        account = self.set_password(existing.username, password)
+        if existing.disabled:
+            self.db.execute_write("UPDATE accounts SET disabled = 0 WHERE id = ?", (account.id,))
+            self._invalidate_posture()
+        return account, False
+
+    def delete_account(self, username: str, *, force: bool = False) -> Account:
+        """Remove an account and its password hash; its panel sessions end with it.
+
+        Refuses, unless ``force``, a deletion that would leave no ENABLED account and
+        no active admin key: nothing could sign in, and a network-bound server would
+        refuse to start (``auth_required_for_remote_bind``). Even forced, an account
+        having existed is remembered (``.had-owner``), so a running network-bound
+        server keeps requiring a credential instead of opening up. When the owner is
+        removed and enabled accounts remain, the oldest becomes the owner. API keys
+        are not touched (they are revoked with ``keys revoke``).
+        """
+        account = self.get_account(username)
+        if account is None:
+            raise BadRequestError(
+                f"There is no account named '{username}'. List accounts with "
+                "`studioforge users list`.",
+                code="invalid_request",
+                param="username",
+            )
+        others = [a for a in self.list_accounts() if a.id != account.id]
+        enabled_others = [a for a in others if not a.disabled]
+        if not enabled_others and not self.has_active_admin_key() and not force:
+            raise BadRequestError(
+                f"'{account.username}' is the last account that can sign in and no active admin "
+                "key exists; deleting it would leave nothing to sign in with (and a "
+                "network-bound server would keep refusing everyone). Create another with "
+                "`studioforge users add <name>` or an admin key (`studioforge keys create "
+                "--scope admin`) first, or pass --force to delete it anyway.",
+                code="last_account",
+                param="username",
+            )
+        self._mark_had_owner()
+        self.db.execute_write("DELETE FROM accounts WHERE id = ?", (account.id,))
+        self.secrets.delete(self._hash_name(account.username))
+        if (
+            account.role == "owner"
+            and enabled_others
+            and not any(a.role == "owner" for a in enabled_others)
+        ):
+            self.db.execute_write(
+                "UPDATE accounts SET role = 'owner' WHERE id = ?", (enabled_others[0].id,)
+            )
+        self._invalidate_posture()
+        log.info("account deleted", username=account.username, role=account.role)
         return account
 
     def verify_password(self, username: str, password: str) -> Account | None:

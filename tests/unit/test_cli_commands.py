@@ -457,13 +457,13 @@ def test_new_lines_overlap_detection() -> None:
 def test_keys_create_list_revoke(scratch: Path) -> None:
     created = invoke(scratch, "keys", "create", "--name", "agent", "--scope", "read", "--json")
     assert created.exit_code == 0, created.output
-    payload = json.loads(created.output)
+    payload = json.loads(created.stdout)
     token = payload["token"]
     assert token.startswith("sf-r-") and payload["key"]["scope"] == "read"
     listed = invoke(scratch, "keys", "list")
     assert "agent" in listed.output and token not in listed.output
     assert "local-cli" in listed.output  # the first key also gives local tools their own
-    as_json = json.loads(invoke(scratch, "keys", "list", "--json").output)
+    as_json = json.loads(invoke(scratch, "keys", "list", "--json").stdout)
     assert token not in json.dumps(as_json)
     revoked = invoke(scratch, "keys", "revoke", payload["key"]["id"])
     assert revoked.exit_code == 0 and "Revoked" in revoked.output
@@ -537,7 +537,7 @@ def test_migrate_dry_run_changes_nothing(scratch: Path) -> None:
     old_database(db)
     before = db.read_bytes()
     result = invoke(scratch, "migrate", "--dry-run", "--json")
-    summary = json.loads(result.output)
+    summary = json.loads(result.stdout)
     assert summary["current"] == 9 and summary["pending"] == [
         {"version": 10, "name": "010_lease_holder_key.sql"}
     ]
@@ -552,7 +552,7 @@ def test_migrate_applies_after_taking_a_backup(scratch: Path) -> None:
     db = scratch.parent / "registry.sqlite3"
     old_database(db)
     result = invoke(scratch, "migrate", "--json")
-    summary = json.loads(result.output)
+    summary = json.loads(result.stdout)
     assert summary["applied"] == [10] and summary["current"] == 10
     backup = Path(summary["backup"])
     assert backup.is_file() and backup.name == "registry.sqlite3"
@@ -584,19 +584,19 @@ def test_migrate_prunes_only_its_own_backup_folders(scratch: Path) -> None:
         os.utime(folder, (1.0, 1.0))  # older than anything migrate writes
     db = scratch.parent / "registry.sqlite3"
     old_database(db)
-    summary = json.loads(invoke(scratch, "migrate", "--json").output)
+    summary = json.loads(invoke(scratch, "migrate", "--json").stdout)
     assert Path(summary["backup"]).is_file()
     assert all(folder.is_dir() for folder in foreign)
 
 
 def test_migrate_with_no_database_previews_the_whole_chain(scratch: Path) -> None:
-    summary = json.loads(invoke(scratch, "migrate", "--dry-run", "--json").output)
+    summary = json.loads(invoke(scratch, "migrate", "--dry-run", "--json").stdout)
     assert summary["exists"] is False and summary["current"] == 0 and len(summary["pending"]) == 10
 
 
 def test_doctor_text_and_json_and_exit_codes(scratch: Path) -> None:
     ok = invoke(scratch, "doctor", "--json")
-    payload = json.loads(ok.output)
+    payload = json.loads(ok.stdout)
     assert payload["findings"] and ok.exit_code in (0, 1)
     text = invoke(scratch, "doctor")
     assert "Authentication" in text.output and "ok," in text.output
