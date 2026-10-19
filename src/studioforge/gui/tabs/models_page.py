@@ -19,6 +19,7 @@ Failures show in the row with the catalog's error code and the plain sentence it
 
 from __future__ import annotations
 
+import contextlib
 import time
 from collections.abc import Callable, Mapping
 from typing import Any
@@ -185,7 +186,14 @@ async def run_load(
     exactly what the catalog's ``load_args`` carry (``ctx_size``, ``kv_cache_type``,
     ``parallel``, ``devices``), so the planner stays the only decider.
     """
-    _PENDING[model_id] = time.time()
+    marked = {model_id}
+    # A persona loads its base's instance: the base's row is the one that should spin. No
+    # registry or manager (a degraded start) just means the model itself.
+    with contextlib.suppress(Exception):
+        marked.add(str(ctx.manager.serving_record(ctx.registry.resolve(model_id)).id))
+    now = time.time()
+    for mid in marked:
+        _PENDING[mid] = now
     _ERRORS.pop(model_id, None)
     try:
         return await ctx.manager.load(model_id, **dict(kwargs), force=force, source="gui")
@@ -193,7 +201,8 @@ async def run_load(
         _ERRORS[model_id] = error_of(exc)
         raise
     finally:
-        _PENDING.pop(model_id, None)
+        for mid in marked:
+            _PENDING.pop(mid, None)
 
 
 # ---------------------------------------------------------------------------
@@ -236,7 +245,12 @@ class ModelsPage:
             # A link to a model this library does not have: show the empty result saying so.
             self.view["needle"] = location.model
         refresh = _Refresher(lambda: self.refresh_all())
-        self.drawer = ModelDrawer(ctx, self.go, on_change=refresh.refresh)
+        self.drawer = ModelDrawer(
+            ctx,
+            self.go,
+            on_change=refresh.refresh,
+            entry_source=lambda model_id: self.view["fits"].get(model_id),
+        )
 
         @ui.refreshable
         def body() -> None:
@@ -287,11 +301,19 @@ class ModelsPage:
 
     # -- refresh -----------------------------------------------------------------
 
-    def refresh_all(self) -> None:
+    def refresh_all(self, *, rebuild_downloads: bool = False) -> None:
+        """Repaint the chips and the body.
+
+        The Downloads view holds what is being typed (the add box, the search results, an open
+        quant picker), so it is rebuilt only when asked to be -- never by a background tick,
+        a catalog refresh or a drawer action.
+        """
         self.view["sig"] = None
         if self.chips is not None:
             self.chips.refresh()
-        if self.body is not None:
+        if self.body is not None and (
+            self.view["chip"] != nav.FILTER_DOWNLOADS or rebuild_downloads
+        ):
             self.body.refresh()
 
     def _signature(self) -> tuple[Any, ...]:
@@ -344,7 +366,7 @@ class ModelsPage:
         self.view["fits"] = mv.catalog_by_id(payload)
         self.view["fits_at"] = time.time()
         self.view["sig"] = None
-        if self.body is not None:
+        if self.body is not None and self.view["chip"] != nav.FILTER_DOWNLOADS:
             self.body.refresh()
 
     def _serving_id(self, record: Any) -> str:
@@ -412,7 +434,7 @@ class ModelsPage:
 
     def _set_chip(self, chip: str) -> None:
         self.view["chip"] = chip
-        self.refresh_all()
+        self.refresh_all(rebuild_downloads=True)
 
     def _set_sort(self, key: str) -> None:
         if key == self.view["sort"]:
@@ -460,10 +482,15 @@ class ModelsPage:
     def _empty(self, total: int) -> None:
         with ui.column().classes("w-full items-start gap-2 p-4"):
             if total:
-                ui.label(
-                    f"No model matches '{self.view['needle']}'"
-                    + (" among the loaded ones." if self.view["chip"] == nav.FILTER_LOADED else ".")
-                ).classes("text-sm opacity-80")
+                loaded_only = self.view["chip"] == nav.FILTER_LOADED
+                needle = str(self.view["needle"] or "").strip()
+                if needle:
+                    text = f"No model matches '{needle}'" + (
+                        " among the loaded ones." if loaded_only else "."
+                    )
+                else:
+                    text = "Nothing is loaded right now. Pick a model and load it from its details."
+                ui.label(text).classes("text-sm opacity-80")
                 return
             ui.label("No models yet.").classes("text-base font-medium")
             ui.label(
@@ -532,7 +559,10 @@ class ModelsPage:
         hint = mv.fits_hint(self.view["fits"].get(record.id))
         name = mv.friendly_name(record)
         row = ui.element("div").classes("sfp-row sfp-body border-b border-white/10")
-        row.props(f'role="button" tabindex="0" aria-label="Open details for {_attr(name)}"')
+        spoken = f"Open details for {_attr(name)}, {state.primary}"
+        if state.error is not None:
+            spoken += f", {_attr(state.error.code)}"
+        row.props(f'role="button" tabindex="0" aria-label="{spoken}"')
         row.on("click", lambda _=None, r=record.id: self._open(r))
         row.on("keydown.enter", lambda _=None, r=record.id: self._open(r))
         row.on("keydown.space.prevent", lambda _=None, r=record.id: self._open(r))
@@ -557,7 +587,7 @@ class ModelsPage:
                             ui.badge(text, color="secondary").classes("text-xs")
                 ui.label(
                     f"{record.quant} · {st.format_gib(record.size_bytes, precision=1)} · "
-                    f"{mv.family_label(record)}"
+                    f"{mv.family_label(record)} · {hint.text}"
                 ).classes("sfp-narrow sfp-txt text-xs opacity-80")
             ui.badge(record.quant, color=mv.quant_colour(record.quant)).classes(
                 "sfp-wide text-xs justify-self-start"
@@ -588,7 +618,7 @@ class ModelsPage:
         elif state.error is not None:
             ui.label(f"[{state.error.code}] {state.error.message}").classes(
                 "text-xs text-negative whitespace-normal break-words"
-            ).props('role="alert"')
+            )
 
     def _open(self, model_id: str) -> None:
         if self.drawer is not None:
@@ -600,7 +630,7 @@ class ModelsPage:
         """Switch to the Downloads chip, with the add-a-model box ready (and a repo looked up)."""
         self.link_params = dict(params) if params else None
         self.view["chip"] = nav.FILTER_DOWNLOADS
-        self.refresh_all()
+        self.refresh_all(rebuild_downloads=True)
 
     def _downloads_view(self) -> None:
         """Add by repo id or link, search Hugging Face, and the queue: the old Download tab."""
@@ -667,10 +697,17 @@ class ModelDrawer:
         go: Callable[[nav.Location], None],
         *,
         on_change: Callable[[], Any] | None = None,
+        entry_source: Callable[[str], Mapping[str, Any] | None] | None = None,
     ) -> None:
         self.ctx = ctx
         self.go = go
         self.on_change = on_change or (lambda: None)
+        #: Where to find a model's catalog row without computing it: the Models page's table
+        #: cache. Test Chat has none, so the drawer fetches the row off the event loop.
+        self.entry_source = entry_source
+        self._entries: dict[str, Mapping[str, Any] | None] = {}
+        self._fetching: set[str] = set()
+        self._loaded_flag: bool | None = None
         self.model_id: str | None = None
         self.dialog = ui.dialog().props("position=right full-height")
         with (
@@ -715,6 +752,12 @@ class ModelDrawer:
         if record is None:
             return
         instance = _instances(self.ctx).get(legacy._serving_id(self.ctx, record))
+        loaded = instance is not None and str(getattr(instance, "state", "")) != "stopped"
+        if self._loaded_flag is not None and loaded != self._loaded_flag:
+            # Something outside this drawer loaded or unloaded the model: the Load section's
+            # buttons and its form's starting values are wrong now, so start it over.
+            self._build()
+            return
         sig = (
             str(getattr(instance, "state", "")),
             int(getattr(instance, "active_requests", 0) or 0),
@@ -825,14 +868,21 @@ class ModelDrawer:
         serving_id = legacy._serving_id(ctx, record)
         gpus = _gpus(ctx)
         refusal = legacy._arch_refusal_text(ctx, record)
-        loaded = serving_id in _instances(ctx)
+        running = _instances(ctx).get(serving_id)
+        loaded = running is not None
+        self._loaded_flag = loaded
         shared = st.shares_base_instance(record)
         entry = self._catalog_entry(record)
         rec = entry.get("recommended") if isinstance(entry, Mapping) else None
-        args: dict[str, Any] = dict((rec or {}).get("load_args") or {})
+        form = mv.load_form_defaults(
+            running_plan=getattr(running, "plan", None),
+            settings=record.settings,
+            recommended_args=(rec or {}).get("load_args") if rec else None,
+            default_ctx=ctx.config.models.default_ctx,
+        )
 
         with ui.expansion(
-            "Load" if not loaded else "Reload or unload", icon="play_arrow", value=True
+            "Reload or unload" if loaded else "Load", icon="play_arrow", value=True
         ).classes("w-full"):
             if refusal:
                 with ui.row().classes("items-start gap-2 no-wrap"):
@@ -853,9 +903,16 @@ class ModelDrawer:
                     else "The recommendation is still being computed; the fields below use "
                     "your defaults."
                 ).classes("text-xs opacity-70")
+            source_note = {
+                "running": "Pre-filled with what is running now, so a reload changes nothing "
+                "you do not change here.",
+                "saved": "Pre-filled with this model's saved settings (All settings).",
+            }.get(form.source)
+            if source_note:
+                ui.label(source_note).classes("text-xs opacity-70")
 
             ui.label("GPUs").classes("text-xs font-medium mt-1")
-            chosen = {int(d) for d in (args.get("devices") or [])}
+            chosen = set(form.devices)
             gpu_boxes: dict[int, Any] = {}
             with ui.row().classes("gap-3 flex-wrap"):
                 for gpu in gpus:
@@ -872,7 +929,7 @@ class ModelDrawer:
                 ctx_input = (
                     ui.number(
                         "Context (tokens per conversation)",
-                        value=args.get("ctx_size") or ctx.config.models.default_ctx,
+                        value=form.ctx_size,
                         precision=0,
                     )
                     .props("dense outlined")
@@ -881,7 +938,7 @@ class ModelDrawer:
                 kv = (
                     ui.select(
                         list(_KV_TYPES),
-                        value=str(args.get("kv_cache_type") or ""),
+                        value=form.kv_cache_type,
                         label="KV cache type (K)",
                     )
                     .props("dense outlined")
@@ -901,14 +958,14 @@ class ModelDrawer:
             with ui.expansion("Advanced options", icon="settings").classes("w-full"):
                 with ui.row().classes("w-full gap-3 flex-wrap items-end"):
                     parallel = (
-                        ui.number("Parallel slots", value=args.get("parallel"), precision=0)
+                        ui.number("Parallel slots", value=form.parallel, precision=0)
                         .props("dense outlined clearable")
                         .classes("w-40")
                     )
                     kv_v = (
                         ui.select(
                             list(_KV_TYPES),
-                            value=str(args.get("kv_cache_type_v") or ""),
+                            value=form.kv_cache_type_v,
                             label="KV cache type (V)",
                         )
                         .props("dense outlined")
@@ -928,7 +985,8 @@ class ModelDrawer:
                 ).props("outline dense no-caps")
 
             fit_box = ui.column().classes("w-full gap-1 mt-1")
-            preview_cell: dict[str, Any] = {"preview": None}
+            preview_cell: dict[str, Any] = {"preview": None, "evict": []}
+            buttons: dict[str, Any] = {}
 
             def selected_devices() -> list[int] | None:
                 picked = sorted(i for i, box in gpu_boxes.items() if box.value)
@@ -949,18 +1007,37 @@ class ModelDrawer:
                     out["devices"] = devices
                 return out
 
+            def gate(fits: bool) -> None:
+                """Load is a button for a load that can work: say why when it cannot."""
+                button = buttons.get("load")
+                if button is None:
+                    return
+                allowed = refusal is None and (fits or loaded)
+                button.set_enabled(allowed)
+                if refusal is not None:
+                    button.tooltip(f"Cannot load: {refusal}")
+                elif not allowed:
+                    button.tooltip(
+                        "The fit check says this does not fit: change the GPUs, the context "
+                        "or the KV type until it does."
+                    )
+
             def recompute() -> None:
                 fit_box.clear()
                 with fit_box:
                     try:
                         preview = ctx.manager.plan_preview(record.id, **load_kwargs())
                     except Exception as exc:  # noqa: BLE001 - a bad combination is an answer
-                        preview_cell["preview"] = None
+                        preview_cell.update(preview=None, evict=[])
                         ui.label(f"Fit check: {getattr(exc, 'message', None) or exc}").classes(
                             "text-xs text-warning"
                         )
+                        gate(False)
                         return
-                    preview_cell["preview"] = preview
+                    # A reload frees the running copy first; the dry run still counts it, so
+                    # never offer to "unload" the very model being reloaded.
+                    evict = mv.evictions_for(preview, (serving_id, record.id))
+                    preview_cell.update(preview=preview, evict=evict)
                     verdict = st.fit_verdict(preview)
                     with ui.row().classes("items-center gap-2"):
                         ui.icon(
@@ -969,8 +1046,9 @@ class ModelDrawer:
                         ui.label(verdict.headline).classes(
                             f"text-{verdict.colour} font-medium text-sm"
                         ).props('role="status"')
-                    own = _instances(ctx).get(serving_id)
-                    footprint = dict(getattr(getattr(own, "plan", None), "per_gpu_bytes", {}) or {})
+                    footprint = dict(
+                        getattr(getattr(running, "plan", None), "per_gpu_bytes", {}) or {}
+                    )
                     for bar in mv.fit_bars(preview, gpus, credit=footprint):
                         _draw_fit_bar(bar)
                     for line in verdict.detail_lines:
@@ -979,31 +1057,47 @@ class ModelDrawer:
                         ui.label(f"note: {note}").classes("text-xs opacity-70")
                     for suggestion in verdict.suggestions:
                         ui.label(f"try: {suggestion}").classes("text-xs text-warning")
+                    if loaded and not verdict.fits:
+                        ui.label(
+                            "This check counts the running copy as still loaded. A reload frees "
+                            "it first, so the real load can fit when this says it does not."
+                        ).classes("text-xs opacity-70")
+                    gate(verdict.fits)
 
             for widget in (ctx_input, kv, kv_v, parallel, *gpu_boxes.values()):
                 widget.on_value_change(lambda _: recompute())
-            if ctx.manager is not None:
-                recompute()
 
             async def do_load() -> None:
-                await self._load(record, load_kwargs(), preview_cell["preview"], force=loaded)
+                await self._load(record, load_kwargs(), preview_cell["evict"])
 
-            with ui.row().classes("w-full gap-2 mt-1"):
-                load_button = ui.button(
+            async def restart_same() -> None:
+                from studioforge.gui.tabs import dashboard
+
+                async def after() -> None:
+                    self.changed()
+
+                await dashboard._restart_model(ctx, serving_id, after)
+
+            with ui.row().classes("w-full gap-2 mt-1 items-center flex-wrap"):
+                buttons["load"] = ui.button(
                     "Reload with these settings" if loaded else "Load",
                     icon="restart_alt" if loaded else "play_arrow",
                     on_click=do_load,
                 ).props("color=primary no-caps")
-                if refusal:
-                    load_button.disable()
-                    load_button.tooltip(f"Cannot load: {refusal}")
+                if loaded:
+                    ui.button(
+                        "Restart as it is",
+                        icon="autorenew",
+                        on_click=restart_same,
+                    ).props("outline no-caps").tooltip(
+                        "Reload this model's llama-server with its current saved settings. "
+                        "The planner runs again against current free VRAM."
+                    )
                 if loaded and not shared:
                     ui.button(
                         "Unload",
                         icon="stop_circle",
-                        on_click=lambda: legacy._unload(
-                            ctx, self._record() or record, _Refresher(self.changed)
-                        ),
+                        on_click=lambda: self._unload(self._record() or record),
                     ).props("outline color=negative no-caps")
                 elif loaded and shared:
                     base = self._record_of(record.base_model_id)
@@ -1011,11 +1105,19 @@ class ModelDrawer:
                         ui.button(
                             f"Unload {mv.friendly_name(base)}",
                             icon="stop_circle",
-                            on_click=lambda: legacy._unload(ctx, base, _Refresher(self.changed)),
+                            on_click=lambda: self._unload(base),
                         ).props("outline color=negative no-caps").tooltip(
                             "This persona runs on its base model's instance; unloading stops "
                             "it for every persona built on that base."
                         )
+            if ctx.manager is not None:
+                recompute()
+            else:
+                gate(False)
+
+    async def _unload(self, record: Any) -> None:
+        await legacy._unload(self.ctx, record, _Refresher(self.changed))
+        _ERRORS.pop(record.id, None)
 
     def _record_of(self, model_id: str | None) -> Any | None:
         if not model_id or self.ctx.registry is None:
@@ -1026,26 +1128,43 @@ class ModelDrawer:
             return None
 
     def _catalog_entry(self, record: Any) -> Mapping[str, Any] | None:
-        """The catalog row for ``record``: from the table's cache, else the manager's cache."""
-        manager = self.ctx.manager
-        if manager is None:
-            return None
-        try:
-            payload = manager.catalog(model=record.id, compact=True)
-        except Exception as exc:  # noqa: BLE001 - the recommendation is a nicety
-            log.debug("catalog entry unavailable", model_id=record.id, error=str(exc))
-            return None
-        models = payload.get("models") or [] if isinstance(payload, Mapping) else []
-        return models[0] if models else None
+        """The catalog row for ``record`` without computing it on the event loop.
 
-    async def _load(
-        self, record: Any, kwargs: dict[str, Any], preview: Mapping[str, Any] | None, *, force: bool
-    ) -> None:
+        From the drawer's own cache, then from the table's (``entry_source``); otherwise the
+        row is fetched in a worker thread and the drawer is rebuilt when it arrives. The
+        planner walk a catalog build costs is arithmetic, but enough of it to stall every
+        viewer's page if it ran inline.
+        """
+        if record.id in self._entries:
+            return self._entries[record.id]
+        if self.entry_source is not None:
+            found = self.entry_source(record.id)
+            if found is not None:
+                return found
+        if self.ctx.manager is not None and record.id not in self._fetching:
+            self._fetching.add(record.id)
+            with self.dialog:
+                ui.timer(0.05, lambda mid=record.id: self._fetch_entry(mid), once=True)
+        return None
+
+    async def _fetch_entry(self, model_id: str) -> None:
+        try:
+            payload = await run_blocking(self.ctx.manager.catalog, model=model_id, compact=True)
+        except Exception as exc:  # noqa: BLE001 - the recommendation is a nicety
+            log.debug("catalog entry unavailable", model_id=model_id, error=str(exc))
+            payload = None
+        finally:
+            self._fetching.discard(model_id)
+        models = (payload or {}).get("models") or [] if isinstance(payload, Mapping) else []
+        self._entries[model_id] = models[0] if models else None
+        if self.model_id == model_id and self.dialog.value:
+            self._build()
+
+    async def _load(self, record: Any, kwargs: dict[str, Any], evict: list[str]) -> None:
         from studioforge.gui.tabs.dashboard import _Page
 
         ctx = self.ctx
         page = _Page.capture()
-        evict = [str(m) for m in ((preview or {}).get("evict_model_ids") or [])]
         if evict and not await legacy._confirm(
             f"Loading {record.id} needs {len(evict)} model(s) unloaded: {', '.join(evict)}. "
             "Continue?"
@@ -1057,7 +1176,9 @@ class ModelDrawer:
             self.on_change()  # the row starts showing "loading" now
             started = time.time()
             try:
-                instance = await run_load(ctx, record.id, kwargs, force=force)
+                # force=True, as every GUI load has always been: the user has just confirmed
+                # whatever it displaces, so a busy resident must not refuse it a second time.
+                instance = await run_load(ctx, record.id, kwargs, force=True)
             except Exception as exc:  # noqa: BLE001 - the refusal is the useful part
                 page.error(exc, what="load")
                 return

@@ -172,7 +172,7 @@ def test_every_settings_key_the_old_panel_rendered_is_still_rendered(config: Con
 def test_every_old_name_redirects_to_a_canonical_page_that_renders(config: Config) -> None:
     state = _FakeState(config)
     with TestClient(create_gui_app(config, api_state=state)) as client:
-        names = [("section", name) for name in OLD_SECTIONS if name not in ("Models", "Advanced")]
+        names = [("section", name) for name in OLD_SECTIONS if name != "Models"]
         names += [("tab", name) for name in OLD_TABS if name not in ("models",)]
         names += [("section", name.lower()) for name in OLD_SECTIONS if name == "Overview"]
         for key, value in names:
@@ -207,6 +207,7 @@ def test_every_old_name_redirects_to_a_canonical_page_that_renders(config: Confi
         ({"section": "Updates"}, "/?section=Advanced&page=about"),
         ({"section": "Logs & Metrics"}, "/?section=Advanced&page=logs"),
         ({"section": "Diagnostics"}, "/?section=Advanced&page=diagnostics"),
+        ({"section": "Advanced"}, "/?section=Advanced&page=config"),
     ],
 )
 def test_the_old_names_map_to_their_new_home(query: dict[str, str], expected: str) -> None:
@@ -250,7 +251,6 @@ def test_a_canonical_link_and_a_bare_slash_are_not_redirected(config: Config) ->
         "/",
         "/?section=Models",
         "/?section=Test%20Chat",
-        "/?section=Advanced",
         "/?section=Advanced&page=logs",
         "/?section=Models&filter=loaded",
     ):
@@ -261,6 +261,11 @@ def test_an_unknown_name_opens_status_not_an_error() -> None:
     assert nav.resolve_location({"tab": "nonsense"}).tab == nav.STATUS
     assert nav.resolve_location({"section": "nonsense", "page": "zzz"}).tab == nav.STATUS
     assert nav.resolve_location({"section": "Advanced", "page": "zzz"}).page == "serving"
+    # a bare "Advanced" is a 2.0.x link: it meant the page of every setting
+    assert nav.resolve_location({"section": "Advanced"}).page == "config"
+    assert nav.needs_redirect({"section": "Advanced"}) is True
+    assert nav.needs_redirect({"section": "Advanced", "page": "config"}) is False
+    assert nav.needs_redirect({"model_repo": "owner/repo"}) is True
     assert nav.resolve_location(None).tab == nav.STATUS
 
 
@@ -660,7 +665,13 @@ def _register_drawer_page() -> None:
     def _page(model: str = "alpha-8b") -> None:
         from studioforge.gui.tabs import models_page
 
-        drawer = models_page.ModelDrawer(_DRAWER_STATE["ctx"], lambda loc: None)
+        ctx = _DRAWER_STATE["ctx"]
+
+        def entry(model_id: str) -> Any:
+            rows = ctx.manager.catalog(model=model_id, compact=True)["models"]
+            return rows[0] if rows else None
+
+        drawer = models_page.ModelDrawer(ctx, lambda loc: None, entry_source=entry)
         drawer.open(model)
 
 
@@ -933,3 +944,278 @@ def test_interactive_controls_carry_accessible_names(config: Config) -> None:
     drawer = _drawer_html(config, _models_state(config))
     for needle in ('"aria-label":"Close the details"', '"aria-label":"Copy the model id"'):
         assert needle in drawer, needle
+
+
+# ---------------------------------------------------------------------------
+# Review fixes: what the Load form starts from, refresh discipline, the shell, gating
+# ---------------------------------------------------------------------------
+
+
+def _button(text: str, label: str) -> str | None:
+    """The props of the ``q-btn`` labelled ``label`` in the rendered element tree."""
+    pattern = r'\{"tag":"q-btn"[^{}]*\{[^{}]*"label":"' + re.escape(label) + r'"[^{}]*\}'
+    found = re.search(pattern, text)
+    return found.group(0) if found else None
+
+
+def test_the_load_form_starts_from_what_runs_then_saved_settings_then_the_recommendation() -> None:
+    from studioforge.types import ModelSettings
+
+    rec = {"ctx_size": 131072, "parallel": 2, "kv_cache_type": "f16", "devices": [0, 1]}
+    plan = LoadPlan(
+        model_id="m",
+        devices=[2],
+        ctx_size=16384,
+        ctx_per_slot=16384,
+        parallel=3,
+        kv_cache_type="q8_0",
+        kv_cache_type_v="q8_0",
+    )
+    running = mv.load_form_defaults(
+        running_plan=plan,
+        settings=ModelSettings(ctx_size=4096),
+        recommended_args=rec,
+        default_ctx=8192,
+    )
+    assert (running.source, running.ctx_size, running.devices, running.parallel) == (
+        "running",
+        16384,
+        (2,),
+        3,
+    )
+    assert running.kv_cache_type == "q8_0"
+    saved = mv.load_form_defaults(
+        running_plan=None,
+        settings=ModelSettings(ctx_size=4096, kv_cache_type="q4_0"),
+        recommended_args=rec,
+        default_ctx=8192,
+    )
+    assert saved.source == "saved" and saved.ctx_size == 4096 and saved.kv_cache_type == "q4_0"
+    assert saved.devices == (0, 1) and saved.parallel == 2  # unset fields take the recommendation
+    pinned_devices = mv.load_form_defaults(
+        running_plan=None,
+        settings=ModelSettings(device_override=[3]),
+        recommended_args=rec,
+        default_ctx=8192,
+    )
+    assert pinned_devices.devices == (3,)
+    recommended = mv.load_form_defaults(
+        running_plan=None, settings=ModelSettings(), recommended_args=rec, default_ctx=8192
+    )
+    assert recommended.source == "recommended" and recommended.ctx_size == 131072
+    bare = mv.load_form_defaults(
+        running_plan=None, settings=ModelSettings(), recommended_args=None, default_ctx=8192
+    )
+    assert (bare.source, bare.ctx_size, bare.devices) == ("defaults", 8192, ())
+
+
+def test_a_reload_never_offers_to_unload_the_model_being_reloaded() -> None:
+    preview = {"evict_model_ids": ["alpha-8b", "other", "beta-70b"]}
+    assert mv.evictions_for(preview, ("alpha-8b", "beta-70b")) == ["other"]
+    assert mv.evictions_for(None, ("x",)) == [] and mv.evictions_for({}, ()) == []
+
+
+def test_the_drawer_starts_from_the_models_saved_settings_not_only_the_recommendation(
+    config: Config,
+) -> None:
+    from studioforge.types import ModelSettings
+
+    state = _models_state(config)
+    record = state.registry._records[0]
+    state.registry._records[0] = record.model_copy(
+        update={"settings": ModelSettings(ctx_size=12288, kv_cache_type="q8_0")}
+    )
+    text = _drawer_html(config, state)
+    assert "12288" in text and "saved settings" in text
+    assert "131072" not in text.split("Context (tokens per conversation)")[1][:400]
+
+
+def test_the_drawer_of_a_running_model_reloads_what_runs_and_can_restart_it_as_it_is(
+    config: Config,
+) -> None:
+    state = _models_state(config, loaded=[_instance("alpha-8b", devices=(2,))])
+    text = _drawer_html(config, state)
+    assert "Pre-filled with what is running now" in text
+    assert _button(text, "Restart as it is") is not None  # the old "Reload this model" control
+    assert _button(text, "Reload with these settings") is not None
+    assert _button(text, "Unload") is not None
+
+
+def _refusing_preview(name: str, **kwargs: Any) -> dict[str, Any]:
+    return {
+        "fits": False,
+        "model_id": name,
+        "reason": "insufficient_vram",
+        "required_bytes": 40 * GB,
+        "available_bytes": 30 * GB,
+        "per_gpu_free": {0: 30 * GB},
+        "notes": [],
+        "suggestions": [],
+    }
+
+
+def test_load_is_withheld_when_the_fit_check_says_no_but_never_for_a_running_model(
+    config: Config,
+) -> None:
+    cold = _models_state(config)
+    cold.manager.plan_preview = _refusing_preview
+    assert '"disable":true' in (_button(_drawer_html(config, cold), "Load") or "")
+    ok = _models_state(config)
+    assert '"disable"' not in (_button(_drawer_html(config, ok), "Load") or "")
+    running = _models_state(config, loaded=[_instance("alpha-8b")])
+    running.manager.plan_preview = _refusing_preview
+    reload_props = _button(_drawer_html(config, running), "Reload with these settings") or ""
+    assert reload_props and '"disable"' not in reload_props
+
+
+def test_a_remote_viewer_on_an_open_install_cannot_pin_delete_or_save_defaults_but_can_load(
+    config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(tabs, "viewer_host", lambda: "192.168.1.50")
+    text = _drawer_html(config, _models_state(config))
+    for label in ("Pin", "Delete…", "Save defaults"):
+        assert '"disable":true' in (_button(text, label) or ""), label
+    assert '"disable"' not in (_button(text, "Load") or "")  # residency stays open (D32)
+    monkeypatch.setattr(tabs, "viewer_host", lambda: "127.0.0.1")
+    local = _drawer_html(config, _models_state(config))
+    for label in ("Pin", "Delete…", "Save defaults"):
+        assert '"disable"' not in (_button(local, label) or ""), label
+
+
+class _Refreshable:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def refresh(self) -> None:
+        self.calls += 1
+
+
+def _page_with_fakes(config: Config, state: Any, chip: str) -> Any:
+    from studioforge.gui.tabs import models_page
+
+    page = models_page.ModelsPage(tabs.GuiContext(config=config, api_state=state), lambda loc: None)
+    page.body, page.chips = _Refreshable(), _Refreshable()
+    page.view["chip"] = chip
+    return page
+
+
+async def test_the_downloads_view_is_not_rebuilt_under_the_person_typing_in_it(
+    config: Config,
+) -> None:
+    """A catalog refresh, a tick or a drawer action used to wipe the add box and the picker."""
+    state = _models_state(config)
+    page = _page_with_fakes(config, state, nav.FILTER_DOWNLOADS)
+    await page._load_fits()  # the first catalog answer arrives 50 ms after the page does
+    assert page.body.calls == 0 and page.view["fits"], "fits are stored, the view is left alone"
+    state.supervisor.instances.append(_instance("alpha-8b"))
+    await page._tick()
+    assert page.body.calls == 0 and page.chips.calls == 1  # the chips (counts) still update
+    page.refresh_all()
+    assert page.body.calls == 0
+    page.refresh_all(rebuild_downloads=True)  # a click on the chip does rebuild it
+    assert page.body.calls == 1
+
+
+async def test_the_table_view_is_repainted_when_the_catalog_or_the_state_changes(
+    config: Config,
+) -> None:
+    state = _models_state(config)
+    page = _page_with_fakes(config, state, nav.FILTER_ALL)
+    await page._load_fits()
+    assert page.body.calls == 1
+    state.supervisor.instances.append(_instance("alpha-8b"))
+    await page._tick()
+    assert page.body.calls == 2 and page.chips.calls == 1
+    await page._tick()  # nothing changed: nothing is sent to the browser
+    assert page.body.calls == 2
+
+
+def test_the_shell_opens_what_a_button_asked_for_and_rewrites_the_address(
+    config: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import contextlib
+
+    from studioforge.gui import app as app_module
+
+    urls: list[str] = []
+    monkeypatch.setattr(app_module.ui, "run_javascript", lambda js: urls.append(js))
+    built: list[tuple[str, nav.Location]] = []
+
+    class Handle:
+        def __init__(self, tab: str) -> None:
+            self.tab = tab
+            self.applied: list[nav.Location] = []
+
+        def apply(self, location: nav.Location) -> None:
+            self.applied.append(location)
+
+        def sync_url(self) -> None:
+            urls.append(f"advanced:{self.tab}")
+
+    shell = app_module.Shell(
+        tabs.GuiContext(config=config, api_state=_FakeState(config)), nav.Location(nav.STATUS), {}
+    )
+    shell.boxes = {name: contextlib.nullcontext() for name in nav.TOP_TABS}
+    shell.ready = True
+
+    def build_tab(tab: str, where: nav.Location) -> Handle:
+        built.append((tab, where))
+        return Handle(tab)
+
+    monkeypatch.setattr(shell, "_build_tab", build_tab)
+
+    class Tabs:
+        value = nav.STATUS
+
+        def set_value(self, value: str) -> None:  # NiceGUI fires the change handler synchronously
+            self.value = value
+            shell._on_change(value)
+
+    shell.tabs = Tabs()
+    shell.ensure(nav.STATUS, nav.Location(nav.STATUS))
+    shell.go(nav.Location(nav.MODELS, model="alpha-8b"))
+    assert built[-1] == (nav.MODELS, nav.Location(nav.MODELS, model="alpha-8b"))
+    assert any("section=Models" in js for js in urls)
+    # already open: applied to the page that exists, not rebuilt
+    shell.go(nav.Location(nav.MODELS, filter=nav.FILTER_LOADED))
+    assert len([b for b in built if b[0] == nav.MODELS]) == 1
+    assert shell.handles[nav.MODELS].applied == [nav.Location(nav.MODELS, filter="loaded")]
+    shell.go(nav.Location(nav.ADVANCED, page="logs"))
+    assert built[-1] == (nav.ADVANCED, nav.Location(nav.ADVANCED, page="logs"))
+    assert "advanced:Advanced" in urls  # the first open of Advanced writes its page, too
+    urls.clear()
+    shell.go(nav.Location(nav.STATUS))
+    shell.go(nav.Location(nav.ADVANCED, page="engines"))  # coming back: apply + address again
+    assert shell.handles[nav.ADVANCED].applied == [nav.Location(nav.ADVANCED, page="engines")]
+    assert "advanced:Advanced" in urls
+
+
+def test_status_keeps_every_detail_the_overview_card_had(config: Config) -> None:
+    state = _FakeState(config)
+    state.supervisor = SimpleNamespace(list=lambda: [_instance("alpha-8b", active=1)])
+    state.manager = SimpleNamespace(draining=False, leases=SimpleNamespace(all=lambda: []))
+    text = fetch(config, state).text
+    for needle in ("TTL", "tier", "active requests 1", "modalities", "generated"):
+        assert needle in text, needle
+
+
+async def test_a_persona_load_marks_its_base_row_as_loading(config: Config) -> None:
+    from studioforge.gui.tabs import models_page
+
+    state = _models_state(config)
+    persona = make_record("alpha-persona", virtual=True, base_model_id="alpha-8b")
+    state.registry._records.append(persona)
+    seen: list[set[str]] = []
+
+    async def slow_load(model_id: str, **kwargs: Any) -> Any:
+        seen.append(set(models_page._PENDING))
+        return _instance("alpha-8b")
+
+    state.manager.load = slow_load
+    state.manager.serving_record = lambda rec: (
+        state.registry.resolve(rec.base_model_id) if rec.is_virtual and rec.base_model_id else rec
+    )
+    ctx = tabs.GuiContext(config=config, api_state=state)
+    await models_page.run_load(ctx, "alpha-persona", {}, force=True)
+    assert seen == [{"alpha-persona", "alpha-8b"}]  # the base row spins too
+    assert not models_page._PENDING

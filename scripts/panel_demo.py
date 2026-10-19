@@ -289,6 +289,18 @@ def build_state(data_dir: Path) -> Any:
         last_tokens_per_second=84.2, total_requests=37,
     )
 
+    # A second resident, busy right now, so Status shows both states.
+    busy = records[4]
+    busy_plan = LoadPlan(
+        model_id=busy.id, devices=[3], ctx_size=32768, parallel=1, ctx_per_slot=32768,
+        kv_cache_type="q8_0", per_gpu_bytes={3: int(busy.size_bytes + 2.5 * GIB)},
+    )
+    supervisor.instances[busy.id] = InstanceInfo(
+        model_id=busy.id, state="ready", port=CHILD_PORT, pid=4143, plan=busy_plan, priority=2,
+        started_at=now - 1900, last_activity_at=now - 1, resolved_engine_tag="b11370",
+        last_tokens_per_second=47.2, total_requests=12, active_requests=1,
+    )
+
     class Downloads:
         """Two invented transfers: one running, one waiting."""
 

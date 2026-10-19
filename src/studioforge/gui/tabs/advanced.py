@@ -34,9 +34,11 @@ _ADV_CSS = """
 .sf-adv{flex-wrap:nowrap;gap:.5rem;align-items:flex-start;}
 .sf-adv-nav{min-width:13.5rem;max-width:13.5rem;}
 .sf-adv-nav .q-tab{justify-content:flex-start;}
+.sf-adv-pick{display:none!important;width:100%;}
 @media (max-width:820px){
   .sf-adv{flex-wrap:wrap;}
-  .sf-adv-nav{min-width:100%;max-width:100%;}
+  .sf-adv-navwrap{display:none!important;}
+  .sf-adv-pick{display:inline-flex!important;}
 }
 """
 
@@ -279,26 +281,49 @@ class AdvancedHub:
         self.boxes: dict[str, Any] = {}
         self.built: set[str] = set()
         self.tabs: Any = None
+        self.pick: Any = None
         self.ready = False
 
     def build(self, location: nav.Location) -> None:
         ui.add_css(_ADV_CSS)
         initial = location.page or nav.DEFAULT_ADVANCED_PAGE
-        with ui.row().classes("w-full sf-adv"):
-            self.tabs = (
-                ui.tabs(value=initial, on_change=lambda e: self.ensure(str(e.value)))
-                .props('vertical inline-label aria-label="Advanced pages"')
-                .classes("sf-adv-nav")
+        with ui.column().classes("w-full gap-1 p-0"):
+            # The same choice as the left navigation, as a menu: twelve stacked tabs would
+            # push the page a screen down on a phone, so CSS swaps one for the other.
+            self.pick = (
+                ui.select(
+                    {page.slug: page.label for page in nav.ADVANCED_PAGES},
+                    value=initial,
+                    label="Advanced page",
+                    on_change=lambda e: self.select(str(e.value)),
+                )
+                .props('dense outlined options-dense aria-label="Advanced page"')
+                .classes("sf-adv-pick")
             )
-            with self.tabs:
-                for page in nav.ADVANCED_PAGES:
-                    ui.tab(page.slug, label=page.label, icon=page.icon).tooltip(page.summary)
+        with ui.row().classes("w-full sf-adv"):
+            # The wrapper is what the phone CSS hides: Quasar's own tab styles win a fight
+            # over the tabs element's display.
+            with ui.element("div").classes("sf-adv-navwrap"):
+                self.tabs = (
+                    ui.tabs(value=initial, on_change=lambda e: self._on_tab(str(e.value)))
+                    .props('vertical inline-label aria-label="Advanced pages"')
+                    .classes("sf-adv-nav")
+                )
+                with self.tabs:
+                    for page in nav.ADVANCED_PAGES:
+                        ui.tab(page.slug, label=page.label, icon=page.icon).tooltip(page.summary)
             with ui.tab_panels(self.tabs, value=initial).props("vertical").classes("grow min-w-0"):
                 for page in nav.ADVANCED_PAGES:
                     with ui.tab_panel(page.slug).classes("p-0"):
                         self.boxes[page.slug] = ui.column().classes("w-full gap-0")
         self.ensure(initial)
         self.ready = True
+
+    def _on_tab(self, slug: str) -> None:
+        """A left-navigation click: keep the phone menu in step, then show the page."""
+        if self.pick is not None and self.pick.value != slug:
+            self.pick.set_value(slug)
+        self.ensure(slug)
 
     def ensure(self, slug: str) -> None:
         """Build ``slug`` the first time it is shown; then keep the address bar in step."""
@@ -317,16 +342,23 @@ class AdvancedHub:
     def select(self, slug: str) -> None:
         if slug not in self.boxes:
             return
+        if self.pick is not None and self.pick.value != slug:
+            self.pick.set_value(slug)  # no-op loop: the handler re-enters with the same slug
         if self.tabs.value != slug:
             self.tabs.set_value(slug)  # the change handler builds it
         else:
             self.ensure(slug)
 
+    def sync_url(self) -> None:
+        """Put the page being shown in the address bar (the shell calls this when Advanced is
+        opened, including the first time, when the hub was only just built)."""
+        self._sync_url(str(self.tabs.value), force=True)
+
     def apply(self, location: nav.Location) -> None:
         self.select(location.page or nav.DEFAULT_ADVANCED_PAGE)
 
-    def _sync_url(self, slug: str) -> None:
-        if not self.ready:
+    def _sync_url(self, slug: str, *, force: bool = False) -> None:
+        if not self.ready and not force:
             return  # still building: the address already says where we are
         url = nav.canonical_url(nav.Location(nav.ADVANCED, page=slug))
         try:

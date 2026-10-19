@@ -90,7 +90,7 @@ SHOTS = [
         ],
     ),
     Shot("panel-downloads", "/?section=Models&filter=downloads", wait=4.0),
-    Shot("panel-advanced", "/?section=Advanced&page=serving", wait=4.0),
+    Shot("panel-advanced", "/?section=Advanced&page=integrations", wait=4.0),
 ]
 
 

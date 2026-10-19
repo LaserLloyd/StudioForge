@@ -119,6 +119,8 @@ ADVANCED_PAGES: Final[tuple[AdvancedPage, ...]] = (
 
 ADVANCED_SLUGS: Final[tuple[str, ...]] = tuple(page.slug for page in ADVANCED_PAGES)
 DEFAULT_ADVANCED_PAGE: Final = ADVANCED_PAGES[0].slug
+#: Where an old ``?section=Advanced`` (the 2.0.x page of every setting) lands.
+LEGACY_ADVANCED_PAGE: Final = "config"
 
 _PAGE_BY_SLUG: Final[Mapping[str, AdvancedPage]] = {page.slug: page for page in ADVANCED_PAGES}
 
@@ -222,6 +224,7 @@ def resolve_location(query: Mapping[str, Any] | None) -> Location:
     repo = _clean(query.get("repo") or query.get("model_repo")) or None
     quant = _clean(query.get("quant")) or None
 
+    had_page = page is not None
     tab: str | None = _TAB_ALIASES.get(name)
     legacy = LEGACY_ROUTES.get(name)
     if tab is None and legacy is not None:
@@ -232,7 +235,16 @@ def resolve_location(query: Mapping[str, Any] | None) -> Location:
         # No (known) name: a bare repo/model link still means "the Models page".
         tab = MODELS if (repo or model) else STATUS
     if tab == ADVANCED:
-        page = page if page in ADVANCED_SLUGS else DEFAULT_ADVANCED_PAGE
+        if page not in ADVANCED_SLUGS:
+            # In 2.0.x "Advanced" was the page of every setting, and the only way to reach
+            # it was ``?section=Advanced``. The app itself always writes a ``page`` now, so
+            # a link without one is an old link: it keeps its meaning (Config) and is
+            # redirected to the canonical form. The top tab itself opens its first page.
+            page = (
+                LEGACY_ADVANCED_PAGE
+                if name == "advanced" and not had_page
+                else DEFAULT_ADVANCED_PAGE
+            )
         return Location(tab=tab, page=page)
     if tab == MODELS:
         flt = flt if flt in MODEL_FILTERS else None
@@ -282,15 +294,11 @@ def needs_redirect(query: Mapping[str, Any] | None) -> bool:
     """
     if not query:
         return False
-    if "tab" in query:
-        return True  # the 2.0 grammar: the canonical form never carries ``tab``
+    if "tab" in query or "model_repo" in query:
+        return True  # the 2.0 grammar: the canonical form carries neither
     if not any(key in query for key in ("section", "page", "filter", "repo", "model")):
         return False
-    location = resolve_location(query)
-    wanted = canonical_query(location)
-    if location.tab == ADVANCED and not _clean(query.get("page")):
-        # "Advanced" alone is already the canonical name of the tab: it opens its first page.
-        wanted.pop("page", None)
+    wanted = canonical_query(resolve_location(query))
     got = {
         key: _clean(value)
         for key, value in query.items()
@@ -309,6 +317,7 @@ __all__ = [
     "ADVANCED_PAGES",
     "ADVANCED_SLUGS",
     "DEFAULT_ADVANCED_PAGE",
+    "LEGACY_ADVANCED_PAGE",
     "FILTER_ALL",
     "FILTER_DOWNLOADS",
     "FILTER_LOADED",

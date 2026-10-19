@@ -157,6 +157,77 @@ def catalog_by_id(catalog: Mapping[str, Any] | None) -> dict[str, Mapping[str, A
 
 
 # ---------------------------------------------------------------------------
+# What the Load form starts from
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class LoadForm:
+    """The drawer's Load fields before the person touches them, and where they came from."""
+
+    ctx_size: int | None
+    kv_cache_type: str
+    kv_cache_type_v: str
+    parallel: int | None
+    devices: tuple[int, ...]
+    source: str  # "running" | "saved" | "recommended" | "defaults"
+
+
+def load_form_defaults(
+    *,
+    running_plan: Any,
+    settings: Any,
+    recommended_args: Mapping[str, Any] | None,
+    default_ctx: int | None,
+) -> LoadForm:
+    """Pre-fill the Load form: what is running now, else the model's saved settings, else the
+    planner's recommendation, else the server's defaults -- field by field.
+
+    A running model reloads onto what it runs on (so "reload" changes nothing it was not
+    asked to); a model whose settings were saved keeps them (the drawer must not override
+    what "All settings" stored); otherwise the catalog's ``load_args`` are used verbatim.
+    """
+    rec = dict(recommended_args or {})
+    if running_plan is not None:
+        return LoadForm(
+            ctx_size=int(getattr(running_plan, "ctx_per_slot", 0) or running_plan.ctx_size),
+            kv_cache_type=str(getattr(running_plan, "kv_cache_type", "") or ""),
+            kv_cache_type_v=str(getattr(running_plan, "kv_cache_type_v", "") or ""),
+            parallel=int(getattr(running_plan, "parallel", 0) or 0) or None,
+            devices=tuple(int(d) for d in (getattr(running_plan, "devices", None) or ())),
+            source="running",
+        )
+    saved_ctx = getattr(settings, "ctx_size", None)
+    saved_kv = getattr(settings, "kv_cache_type", None)
+    saved_kv_v = getattr(settings, "kv_cache_type_v", None)
+    saved_parallel = getattr(settings, "parallel", None)
+    saved_devices = getattr(settings, "device_override", None)
+    any_saved = any(
+        v not in (None, [], "")
+        for v in (saved_ctx, saved_kv, saved_kv_v, saved_parallel, saved_devices)
+    )
+    devices = saved_devices or rec.get("devices") or ()
+    return LoadForm(
+        ctx_size=int(saved_ctx or rec.get("ctx_size") or default_ctx or 0) or None,
+        kv_cache_type=str(saved_kv or rec.get("kv_cache_type") or ""),
+        kv_cache_type_v=str(saved_kv_v or rec.get("kv_cache_type_v") or ""),
+        parallel=int(saved_parallel or rec.get("parallel") or 0) or None,
+        devices=tuple(int(d) for d in devices),
+        source="saved" if any_saved else ("recommended" if rec else "defaults"),
+    )
+
+
+def evictions_for(preview: Mapping[str, Any] | None, own_ids: Iterable[str]) -> list[str]:
+    """The models a load would have to unload, never counting the model being (re)loaded.
+
+    A reload frees the running copy first, but the dry run still counts it as resident, so
+    it can name the very model being reloaded as something to evict.
+    """
+    own = {str(i) for i in own_ids}
+    return [str(m) for m in ((preview or {}).get("evict_model_ids") or []) if str(m) not in own]
+
+
+# ---------------------------------------------------------------------------
 # Row state
 # ---------------------------------------------------------------------------
 
@@ -494,6 +565,7 @@ __all__ = [
     "FitBar",
     "FitHint",
     "LoadError",
+    "LoadForm",
     "RowState",
     "catalog_by_id",
     "chat_curl",
@@ -502,8 +574,10 @@ __all__ = [
     "fit_bars",
     "fits_hint",
     "fmt_ctx",
+    "evictions_for",
     "friendly_name",
     "leased_model_ids",
+    "load_form_defaults",
     "parse_hf_reference",
     "quant_colour",
     "row_state",

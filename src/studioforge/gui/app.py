@@ -980,6 +980,16 @@ def _status_line(ctx: GuiContext) -> str:
     return f"{st.loaded_count_text(loaded)} · {gpu_text}"
 
 
+#: Four tabs and their padding do not fit a 390 px phone with Quasar's defaults, which hid
+#: "Advanced" behind the scroll arrow.
+_TOP_CSS = """
+@media (max-width:520px){
+  .sf-top .q-tab{padding:0 .6rem;min-width:0;}
+  .sf-top .q-tab__label{font-size:.78rem;letter-spacing:0;}
+}
+"""
+
+
 class Shell:
     """The four tabs for one browser page, each built the first time it is opened.
 
@@ -1000,10 +1010,14 @@ class Shell:
         self.ready = False
 
     def build(self) -> None:
+        # Any change event NiceGUI fires while the tabs are being wired up must find the
+        # location the link asked for, not a bare default.
+        self.pending[self.location.tab] = self.location
+        ui.add_css(_TOP_CSS)
         with (
             ui.tabs(on_change=lambda e: self._on_change(str(e.value)))
             .props("outside-arrows mobile-arrows")
-            .classes("w-full") as tabs
+            .classes("w-full sf-top") as tabs
         ):
             for name in nav.TOP_TABS:
                 ui.tab(name)
@@ -1026,6 +1040,21 @@ class Shell:
     def _on_change(self, tab: str) -> None:
         self.ensure(tab, self.pending.pop(tab, None))
         self._sync_url(tab)
+
+    def sync_url(self, tab: str) -> None:
+        """Rewrite the address bar for ``tab`` (Advanced writes its own, with its page)."""
+        if not self.ready:
+            return
+        if tab == nav.ADVANCED:
+            handle = self.handles.get(tab)
+            if handle is not None and hasattr(handle, "sync_url"):
+                handle.sync_url()
+            return
+        url = nav.canonical_url(nav.Location(tab))
+        try:
+            ui.run_javascript(f"history.replaceState(null, '', {json.dumps(url)})")
+        except Exception:  # noqa: BLE001 - no client (a test): nothing to rewrite
+            return
 
     def ensure(self, tab: str, location: nav.Location | None = None) -> None:
         if tab not in self.boxes:
@@ -1061,13 +1090,7 @@ class Shell:
         return advanced.render(ctx, where, self.go)
 
     def _sync_url(self, tab: str) -> None:
-        if not self.ready or tab == nav.ADVANCED:
-            return  # the hub rewrites the address with its page
-        url = nav.canonical_url(nav.Location(tab))
-        try:
-            ui.run_javascript(f"history.replaceState(null, '', {json.dumps(url)})")
-        except Exception:  # noqa: BLE001 - no client (a test): nothing to rewrite
-            return
+        self.sync_url(tab)
 
 
 def _render_index(query: Mapping[str, Any] | None = None) -> None:

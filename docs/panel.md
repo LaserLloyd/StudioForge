@@ -53,7 +53,7 @@ canonical form above, keeping `repo`, `quant` and `model`. The protocol handler'
 | `?section=Users & Keys` (also `users`, `keys`) | Advanced > Accounts & keys |
 | `?section=Updates` | Advanced > About & updates |
 | `?section=Diagnostics` | Advanced > Diagnostics |
-| `?section=Advanced` (no `page`) | Advanced (first page) |
+| `?section=Advanced` (no `page`: the 2.0.x page of every setting) | Advanced > Config |
 | `/setup` (first-run guide) | unchanged |
 
 ## Old control to new place
@@ -69,7 +69,7 @@ canonical form above, keeping `repo`, `quant` and `model`. The protocol handler'
 | Loaded models cards (busy/idle, slots, tok/s, active requests, engine drift, tier) | Status, loaded models list (same detail lines) |
 | Loaded card **Unload** | Status (Unload), Models drawer |
 | Loaded card **Pin** | Models drawer, Models row state |
-| Loaded card **Reload** (restart model) | Models drawer |
+| Loaded card **Reload** (restart model) | Models drawer > "Restart as it is" (the same `manager.load(force=True)` with no arguments) |
 | **Unload all** | Advanced > Watchdog & recovery |
 | **Restart engines** | Advanced > Engines |
 | **Restart server** | Advanced > Watchdog & recovery |
@@ -81,9 +81,9 @@ canonical form above, keeping `repo`, `quant` and `model`. The protocol handler'
 |---|---|
 | Library table, search box, sort by column header | Models table, search, same sort headers |
 | Row badge: status (loaded/loading/unloaded/failed) | Row state chip (idle, loading with progress, loaded, error with code) plus pinned and leased badges |
-| Row: copy model id | Row and drawer |
+| Row: copy model id | Drawer header |
 | Row: Load / edit settings (three-tier dialog, optimal settings per GPU set, Load here, Measure parallel, Load at exactly N tokens) | Drawer > Load (recommended placement pre-filled, fit bars); Advanced options expander; "All settings..." opens the original three-tier dialog unchanged |
-| Row: Unload | Row and drawer |
+| Row: Unload | Drawer (and Status, for a loaded model) |
 | Row: Pin / unpin | Drawer |
 | Row: Test (one short completion) and A/B the draft model | Drawer > Manage |
 | Row: Benchmark | Drawer > Manage |

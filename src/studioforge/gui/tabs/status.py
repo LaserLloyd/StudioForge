@@ -251,8 +251,10 @@ def _loaded_section(ctx: GuiContext, go: Go) -> None:
                         on_click=lambda: go(nav.Location(nav.MODELS)),
                     ).props("flat dense no-caps")
                 return
+            # Once per repaint, not once per card: ``active()`` reads disk.
+            active_engine = dashboard._active_engine_tag(ctx)
             for instance, introspection, pinned in entries:
-                _loaded_row(ctx, instance, introspection, pinned, refresh, go)
+                _loaded_row(ctx, instance, introspection, pinned, refresh, go, active_engine)
 
     async def refresh() -> None:
         if not element_alive(container) or in_flight["busy"]:
@@ -292,6 +294,7 @@ def _loaded_row(
     pinned: bool,
     refresh: Any,
     go: Go,
+    active_engine: str | None = None,
 ) -> None:
     from studioforge.gui.tabs import dashboard
 
@@ -299,8 +302,29 @@ def _loaded_row(
     with ui.card().classes("w-full"), ui.column().classes("w-full gap-1"):
         with ui.row().classes("w-full items-center gap-2 no-wrap"):
             ui.label(instance.model_id).classes("font-medium text-sm grow truncate")
+            fp4_note = st.fp4_plan_note(instance)
+            if fp4_note:
+                # Informative, never alarming (D9): the model runs correctly here.
+                ui.badge("slower prefill", color="info").classes("text-xs").tooltip(
+                    f"{fp4_note}. Generation speed is unaffected; only prompt processing is "
+                    "slower than a Blackwell card would be."
+                )
+            if st.is_speculative(introspection):
+                ui.badge("draft", color="accent").classes("text-xs").tooltip(
+                    "Speculative decoding is armed on this instance"
+                )
             if pinned:
                 ui.badge("pinned", color="accent").classes("text-xs")
+            tier_badge = st.priority_badge_label(instance.priority)
+            if tier_badge:
+                ui.badge(tier_badge, color="secondary").classes("text-xs").tooltip(
+                    st.priority_tooltip(instance.priority)
+                )
+            drift = st.instance_engine_drift(
+                getattr(instance, "resolved_engine_tag", None), active_engine
+            )
+            if drift:
+                ui.badge(drift[0], color="warning").classes("text-xs").tooltip(drift[1])
             ui.badge(label, color=colour).classes("text-xs")
             speed = getattr(instance, "last_tokens_per_second", None)
             ui.label(f"{speed} tok/s" if speed else "— tok/s").classes("text-xs font-mono")
@@ -325,11 +349,17 @@ def _loaded_row(
             f" · ctx {_ctx_text(instance, introspection)}"
             f" · {_slots_text(instance, introspection)}"
             f" · {st.device_text(instance)}"
+            f" · TTL {st.instance_ttl_text(instance, pinned=pinned)}"
+            f" · tier {st.priority_label(instance.priority)}"
         ).classes("text-xs font-mono opacity-80")
         ui.label(
             f"active requests {instance.active_requests} · total {instance.total_requests}"
+            f" · generated {st.tokens_generated(introspection)} tokens"
+            f" · modalities {st.modalities_text(introspection)}"
             f" · build {_build_text(instance, introspection)}"
         ).classes("text-xs font-mono opacity-60")
+        for slot in st.activity_slot_rows(introspection) or []:
+            ui.label(st.slot_line(slot)).classes("text-xs font-mono opacity-70 pl-2")
         if instance.last_error:
             ui.label(str(instance.last_error)[:400]).classes(
                 "text-xs text-negative whitespace-pre-wrap"
