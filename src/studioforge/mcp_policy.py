@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -43,6 +44,7 @@ __all__ = [
     "PolicyExtension",
     "ToolPolicy",
     "annotations_for",
+    "current_principal",
     "policy_for",
 ]
 
@@ -150,6 +152,19 @@ def annotations_for(server: str, tool: str) -> ToolAnnotations:
 # ---------------------------------------------------------------------------
 # Enforcement and audit
 # ---------------------------------------------------------------------------
+
+#: The principal of the ``tools/call`` being served, for a tool whose rule is
+#: about *which* row it may touch rather than *whether* it may run (D80: an
+#: ``inference`` key releases only a lease its own key took). Unset (``None``)
+#: off this layer -- a direct in-process ``call_tool``, which is the local
+#: process itself.
+_CALLER: ContextVar[Principal | None] = ContextVar("studioforge_mcp_caller", default=None)
+
+
+def current_principal() -> Principal | None:
+    """Who is calling the MCP tool now running, or ``None`` for an in-process call."""
+    return _CALLER.get()
+
 
 #: ``headers -> Principal | None``. The gateway and the watchdog each supply the
 #: resolver that knows their credentials.
@@ -259,7 +274,11 @@ class PolicyExtension(Extension):
                     detail=f"needs {needed}",
                 )
             return _denial(tool, principal, needed)
-        result = await call_next(ctx)
+        caller = _CALLER.set(principal)
+        try:
+            result = await call_next(ctx)
+        finally:
+            _CALLER.reset(caller)
         if audit is not None and mutating:
             audit.record(
                 actor=actor,

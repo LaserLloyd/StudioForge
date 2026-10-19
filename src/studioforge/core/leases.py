@@ -188,6 +188,7 @@ def lease_row(lease: GpuLease) -> dict[str, Any]:
         "vacate_url": lease.vacate_url,
         "vacate_token": lease.vacate_token,
         "holder_peer": lease.holder_peer,
+        "holder_key": lease.holder_key,
         "updated_at": time.time(),
     }
 
@@ -208,6 +209,7 @@ def lease_from_row(row: Mapping[str, Any]) -> GpuLease:
         vacate_url=row.get("vacate_url") or None,
         vacate_token=row.get("vacate_token") or None,
         holder_peer=row.get("holder_peer") or None,
+        holder_key=row.get("holder_key") or None,
     )
 
 
@@ -348,6 +350,7 @@ class LeaseBook:
         vacate_url: str | None = None,
         vacate_token: str | None = None,
         holder_peer: str | None = None,
+        holder_key: str | None = None,
         now: float | None = None,
     ) -> GpuLease:
         """Record a lease, or raise :class:`LeaseConflictError` if a card is taken.
@@ -389,6 +392,7 @@ class LeaseBook:
             vacate_url=url,
             vacate_token=token,
             holder_peer=(holder_peer or "").strip() or None,
+            holder_key=(holder_key or "").strip() or None,
         )
         self._leases[lease.id] = lease
         self._persist(lease, at=stamp)
@@ -730,7 +734,7 @@ def lease_view(
     answer "is this lease still alive?".
 
     Three fields never travel by default: ``vacate_token`` (D56) and
-    ``holder_peer`` (D55) are excluded at the model and asserted absent here
+    ``holder_peer`` (D55), like ``holder_key``, are excluded at the model and asserted absent here
     anyway, and ``vacate_url`` is replaced by ``vacate_registered`` -- a
     holder's private endpoint is not something every LAN reader of
     ``GET /api/leases`` needs. Pass ``reveal_vacate_url`` only for a caller
@@ -741,6 +745,7 @@ def lease_view(
     data = lease.model_dump(mode="json")
     data.pop("vacate_token", None)
     data.pop("holder_peer", None)
+    data.pop("holder_key", None)
     url = data.pop("vacate_url", None)
     if reveal_vacate_url:
         data["vacate_url"] = url

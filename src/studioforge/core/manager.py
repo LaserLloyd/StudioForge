@@ -4625,6 +4625,7 @@ class ModelManager:
         vacate_url: str | None = None,
         vacate_token: str | None = None,
         holder_peer: str | None = None,
+        holder_key: str | None = None,
         min_free_gib: float | None = None,
         prefer: Sequence[int] = (),
         avoid: Sequence[int] = (),
@@ -4791,6 +4792,7 @@ class ModelManager:
             vacate_url=vacate_url,
             vacate_token=vacate_token,
             holder_peer=holder_peer,
+            holder_key=holder_key,
         )
         evicted_any = False
         try:

@@ -9,6 +9,28 @@ the decisions each one carries rather than repeating them.
 To see what a running server includes, ask it: `GET /api/capabilities` lists every decision number
 the build implements, and the `build` field on `/health` names the exact commit.
 
+## 2.0.1
+
+### Fixed
+
+- D80: the tenant side of the VRAM protocol no longer needs an `admin` key. `POST /api/leases`,
+  `POST /api/leases/{id}/touch`, `DELETE /api/leases/{id}`, `POST /api/tenants/register` and
+  `DELETE /api/tenants/{name}` are `inference` scope (were `admin`, so SpeechForge and ClawForge2,
+  which hold `inference` keys, got `403` taking a lease). Each lease and registration is bound to the
+  key that created it: another `inference` key cannot renew, release, re-register or deregister it
+  (`403 permission_denied`); an `admin` key still can. Warming a tenant stays `admin`. Schema 10 adds
+  `gpu_leases.holder_key` (migration 010, backed up first by `studioforge migrate`); a lease taken
+  before the upgrade, or with no scoped key, has no key owner: an `admin` caller, or its holder's D55
+  proof (its `X-SF-Client` label from the address it was taken from, or its own vacate token), may
+  release it -- so a tenant's boot-time `release_stale` still frees its own pre-upgrade lease. A lease
+  whose key was since revoked falls back to the same proof, and so does re-registering a tenant
+  whose registering key was revoked.
+- D80 (review): the MCP `release_gpus` tool (`inference` scope) applies the same ownership rule as
+  `DELETE /api/leases/{id}`; the D55 unload waiver no longer accepts "same peer + label" for a lease
+  a live key owns (every tenant on the rig is a loopback peer); and a lease `vacate_url` sent by a
+  non-admin caller must name a loopback, tailnet or `tenants.allowed_hosts` host
+  (`400 tenant_url_refused`), like a tenant URL.
+
 ## 2.0.0 (unreleased; branch `refactor/prosumer-2026`)
 
 The first release on the new version scheme: `2.0.0` follows `1.26-09-23`, and the updater orders

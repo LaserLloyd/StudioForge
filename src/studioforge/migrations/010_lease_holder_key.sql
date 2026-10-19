@@ -1,0 +1,14 @@
+-- 010_lease_holder_key.sql: which scoped key took a GPU lease (2.0.1).
+--
+-- The VRAM tenant protocol (take, renew and release a lease; register as a
+-- tenant) is an `inference`-scope surface from 2.0.1: a tenant such as
+-- SpeechForge or ClawForge2 holds an inference key, never an admin one. That
+-- makes lease ownership matter. A non-admin key may renew or release only a
+-- lease it created, so the creating key is stored with the lease -- as
+-- `key:<id>`, the principal's audit name -- and survives a restart with the
+-- rest of the row (migration 008).
+--
+-- NULL means "no scoped key took it" (an owner session, a local caller, or a
+-- lease written before this migration): only an admin caller may renew or
+-- release such a lease. Never shown in any API dump, like holder_peer.
+ALTER TABLE gpu_leases ADD COLUMN holder_key TEXT;

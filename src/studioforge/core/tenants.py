@@ -116,6 +116,10 @@ class TenantRecord:
     #: The address the registration came from. Stored like a lease's
     #: ``holder_peer`` (D55) and shown to nobody.
     peer: str | None = None
+    #: The scoped key that registered (``key:<id>``), when one did: the only
+    #: non-admin key that may refresh or deregister this row (2.0.1). Kept in
+    #: memory like the registration itself, which a restart clears.
+    owner: str | None = None
     health: TenantHealth = field(default_factory=TenantHealth)
 
     @classmethod
@@ -272,7 +276,12 @@ class TenantRegistry:
             raise BadRequestError(str(exc), code="tenant_url_refused", param=field) from exc
 
     def register(
-        self, payload: Mapping[str, Any], *, peer: str | None = None, now: float | None = None
+        self,
+        payload: Mapping[str, Any],
+        *,
+        peer: str | None = None,
+        owner: str | None = None,
+        now: float | None = None,
     ) -> TenantRecord:
         """Enter or refresh a tenant from its own announcement.
 
@@ -377,6 +386,7 @@ class TenantRegistry:
         record.deregistered_at = None
         record.last_seen = stamp
         record.peer = (peer or "").strip() or None
+        record.owner = (owner or "").strip() or None
         if record.health_url is None:
             record.health = TenantHealth()
         log.info(
@@ -403,6 +413,7 @@ class TenantRegistry:
             record.capabilities = []
             record.vacate_url = None
             record.peer = None
+            record.owner = None
         else:
             del self._records[name]
             record.registered = False

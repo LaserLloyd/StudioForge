@@ -1326,6 +1326,13 @@ class GpuLease(BaseModel):
     #: from every dump -- a LAN peer's address is nobody else's business and
     #: not part of the lease contract.
     holder_peer: str | None = Field(default=None, exclude=True, repr=False)
+    #: The scoped key that took the lease (``key:<id>``), when one did. The
+    #: tenant protocol is open to ``inference`` keys (2.0.1), so this is what
+    #: keeps one tenant's key from renewing or releasing another tenant's
+    #: lease: a non-admin key may touch only a lease it created. ``None`` (an
+    #: owner or local caller, or a lease from before this field) means only an
+    #: ``admin`` caller may touch it. Excluded from every dump.
+    holder_key: str | None = Field(default=None, exclude=True, repr=False)
 
     @property
     def idle_s(self) -> float:

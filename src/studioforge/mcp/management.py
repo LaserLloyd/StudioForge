@@ -64,7 +64,12 @@ from fastapi.concurrency import run_in_threadpool
 from mcp.server.mcpserver import MCPServer
 
 from studioforge import __version__
-from studioforge.api.auth import auth_enforced, redact_config_dict, resolve_principal
+from studioforge.api.auth import (
+    auth_enforced,
+    owner_check,
+    redact_config_dict,
+    resolve_principal,
+)
 from studioforge.authkeys import Principal
 from studioforge.build import build_id
 from studioforge.config import RESTART_REQUIRED_KEYS, Config, apply_overrides, load_config
@@ -78,7 +83,7 @@ from studioforge.core.model_gate import (
 )
 from studioforge.errors import BadRequestError, ModelNotFoundError, StudioForgeError
 from studioforge.logging import get_logger
-from studioforge.mcp_policy import PolicyExtension, annotations_for
+from studioforge.mcp_policy import PolicyExtension, annotations_for, current_principal
 from studioforge.tlsutil import scheme_for
 from studioforge.types import GB
 
@@ -1692,6 +1697,9 @@ def build_management_mcp(state: Any) -> MCPServer:
         release here -- that is the only way a vacate completes; nothing
         takes the lease from you.
 
+        A key with the ``inference`` scope may release only a lease that key
+        took (``permission_denied`` otherwise); an ``admin`` key any.
+
         Args:
             lease_id: The lease to release.
 
@@ -1699,6 +1707,12 @@ def build_management_mcp(state: Any) -> MCPServer:
             ``{"ok": true, "released": {...the lease as it stood...}}``, or an
             error result naming the id when no such lease exists.
         """
+        standing = state.manager.leases.get(lease_id)
+        if standing is not None:
+            # D80: the same ownership rule as ``DELETE /api/leases/{id}``. This
+            # tool is ``inference`` scope, so without it any inference key could
+            # take another tenant's card back over /mcp.
+            owner_check(current_principal(), standing.holder_key, f"lease {lease_id}")
         lease = state.manager.release_lease(lease_id)
         return {"ok": True, "released": lease_view(lease)}
 
