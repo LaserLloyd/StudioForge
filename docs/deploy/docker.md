@@ -33,7 +33,7 @@ docker compose -f compose.yml -f compose.cuda.yml up -d
 Open <http://localhost:8080> (control panel) and sign in as the owner. The account is created on
 the first start of a fresh volume: with `SF_OWNER_PASSWORD` from `.env` if you set it (10+
 characters, user `SF_OWNER_USER`, default `owner`), otherwise with a generated password saved
-owner-only on the volume -- read it, then change it under **Users & Keys** and delete the file:
+owner-only on the volume -- read it, then change it under **Advanced > Accounts & keys** and delete the file:
 
 ```bash
 docker compose exec studioforge \
@@ -43,7 +43,7 @@ docker compose exec studioforge \
 Why an account at all: the app refuses to listen beyond loopback with nothing to log in with
 (`auth_required_for_remote_bind`), and inside a container "beyond loopback" is the only way a
 published port can reach it. With the account in place every API request needs a key: create one
-per client on the Users & Keys page, or from a shell in the container
+per client on the Advanced > Accounts & keys page, or from a shell in the container
 (`docker compose exec studioforge bash`, then `studioforge keys create --name openclaw --scope
 inference`; the token is printed once). `/health` stays public. The OpenAI-compatible base URL for clients is
 `http://localhost:1234/v1`. Ports are published to `127.0.0.1` only; set `SF_BIND=0.0.0.0` to share
@@ -246,7 +246,7 @@ switch the two `uv sync` lines to `--locked` for reproducible images.
 | --- | --- |
 | `/health` says `can_serve=false`, `gpu_count=0` | No GPU passed through (`/api/gpus` lists what each probe tried). Check `docker run --gpus all … nvidia-smi -L`; for ROCm/Vulkan pass `/dev/kfd` / `/dev/dri` and the `video`/`render` gids. |
 | Container exits with code 4, log says `auth_required_for_remote_bind` | The volume has no owner account or admin key and the entrypoint could not create one (for example `SF_OWNER_PASSWORD` shorter than 10 characters). Fix the password, or run `docker compose run --rm -T studioforge users add owner --password-stdin` (password on stdin). Forgot it instead? See [Accounts and lockout recovery](#accounts-and-lockout-recovery). |
-| `401 invalid_api_key` from a client | Expected once the owner account exists: give each client a key (`studioforge keys create`, or Users & Keys). |
+| `401 invalid_api_key` from a client | Expected once the owner account exists: give each client a key (`studioforge keys create`, or Advanced > Accounts & keys). |
 | `engine not ready … No such file or directory: 'git'` in the log | The volume has no engine and the first-start download did not run or failed (`SF_ENGINE_BOOTSTRAP=0`, offline). Run `docker compose exec studioforge studioforge engine --update`, or use `-cuda-devel`, or mount a prepared `engines/`. |
 | `cannot build llama.cpp from source: no CUDA compute capability` | No GPU visible when the engine was needed. |
 | `… is not writable by uid 1000` | Bind-mounted data dir with the wrong owner; see above. |

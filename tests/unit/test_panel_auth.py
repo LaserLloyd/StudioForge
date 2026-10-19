@@ -147,7 +147,7 @@ def test_owner_signs_in_with_a_password_and_the_session_names_them(
     kind, ident, expiry, signature = cookie.split(".")
     assert (kind, ident) == ("owner", "alice")
     assert int(expiry) > time.time() + 29 * 86400 and len(signature) == 64
-    page = client.get("/", cookies={COOKIE_NAME: cookie})
+    page = client.get("/?section=Advanced&page=accounts", cookies={COOKIE_NAME: cookie})
     assert page.status_code == 200
     # viewer_actor() read the actor the gate put on the ASGI scope.
     assert "signed in as: owner:alice" in page.text

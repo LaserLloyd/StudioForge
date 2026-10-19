@@ -199,7 +199,7 @@ own:
 
 ## Who is holding the VRAM: what can and cannot be answered
 
-`GET /api/vram/holders`, the Dashboard's "VRAM holders" panel and `/api/status.vram_processes` name
+`GET /api/vram/holders`, the "VRAM holders" panel (Advanced > GPUs & placement) and `/api/status.vram_processes` name
 every process holding GPU memory and classify it (`ours`, `child-of-live-process`, `orphan`,
 `foreign`). Four honest limits (DECISIONS.md D23):
 
@@ -457,7 +457,7 @@ real:
   say that.
 * `draft-mtp` needs a GGUF with `nextn_predict_layers >= 1`. A repository *named* "...-MTP-GGUF"
   is not evidence: one such model in the reference library carries no such key and gets no MTP.
-  The Download tab, `GET /api/hf/repo` and `repo_details` therefore read each quant's own header
+  The Models tab's Add model dialog, `GET /api/hf/repo` and `repo_details` therefore read each quant's own header
   (one small range request that stops at the tokenizer) and badge only what the header proves; a
   name is shown as *likely MTP* until then, and as *no MTP heads* when the header disagrees.
 * `ngram-mod` learns from text it has already seen, so a benchmark that sends the same prompt
@@ -508,7 +508,7 @@ That guarantees a non-empty reply, but it means:
   setting still loads and saves, but it does nothing.
 * **Linux + NVIDIA has no prebuilt engine.** Upstream publishes no Linux CUDA archive at any tag
   (the `ubuntu` assets are cpu/vulkan/rocm/sycl/openvino), so every Linux install — first run,
-  the Setup tab, `engine --update`, the MCP tool — compiles the tag from source, which needs
+  Advanced > Engines, `engine --update`, the MCP tool — compiles the tag from source, which needs
   `git`, `cmake` and a CUDA toolkit with `nvcc` matching the driver and takes minutes. The build
   is reused on a repeat install, smoke-tested like a download, and bakes `$ORIGIN` into the
   binary's RUNPATH so `engines/<tag>-local/` is self-contained (D2/D3, amended). The command
@@ -531,7 +531,7 @@ That guarantees a non-empty reply, but it means:
   refuses nesting — a WARNING is logged once and loads continue *without* the net.
 * Registering the `lmstudio://` handler rebinds `HKCU\Software\Classes\lmstudio`. If LM Studio
   updates or re-registers itself it may silently take the scheme back. Nothing re-asserts it; the
-  Server tab shows the true current state.
+  Advanced > Integrations shows the true current state.
 
 ## Ports
 

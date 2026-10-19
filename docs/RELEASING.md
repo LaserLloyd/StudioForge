@@ -78,7 +78,7 @@ python scripts/refresh_engine_capabilities.py b10549
 ```
 
 `src/studioforge/data/engine_capabilities.json` is the architecture / ftype / ggml-type list behind
-`studioforge capabilities` and the Setup tab's library summary, and it is a **snapshot taken at one
+`studioforge capabilities` and the library summary on Advanced > Engines, and it is a **snapshot taken at one
 tag**. The script shallow-clones `ggml-org/llama.cpp` at the tag (`git clone --branch <tag>
 --depth 1`, so it needs `git` and network), runs the same `extract_from_checkout` parser the live
 report uses — a second parser here would drift — and rewrites the file with `source_tag` set. It
@@ -127,7 +127,7 @@ the source tree and something `pip install`-able.
 ## What an installed StudioForge expects to find
 
 Self-update is off until someone sets `update.repo` to the GitHub `owner/name` that publishes these
-releases (Setup tab, or `config.yaml`). Unset — or left as the shipped `studioforge/studioforge`
+releases (Advanced > Config, or `config.yaml`). Unset — or left as the shipped `studioforge/studioforge`
 placeholder — the check reports `configured: false` and makes no network call at all, which is why a
 build with no public home does not spend a 404 against the anonymous rate limit every 24 hours.
 

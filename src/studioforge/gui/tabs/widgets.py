@@ -10,7 +10,6 @@ from __future__ import annotations
 import time
 from contextlib import nullcontext
 from typing import Any
-from urllib.parse import quote
 
 from nicegui import ui
 
@@ -19,13 +18,16 @@ from studioforge.gui.tabs import GuiContext
 NEVER = "never"
 DASH = "—"
 
-#: Query parameter that opens a panel section directly (``/?section=Updates``).
-SECTION_PARAM = "section"
-
 
 def section_url(name: str) -> str:
-    """A relative link to one of the panel's sections (never an absolute URL)."""
-    return f"/?{SECTION_PARAM}={quote(name)}"
+    """A relative link to a tab or an old section name (never an absolute URL).
+
+    Takes any name the panel has ever had ("Users & Keys", "Updates", "Models") and returns
+    the canonical link for where it lives now (``/?section=Advanced&page=accounts``).
+    """
+    from studioforge.gui import nav
+
+    return nav.canonical_url(nav.resolve_location({"section": name}))
 
 
 def fmt_ts(value: float | None, *, empty: str = DASH) -> str:

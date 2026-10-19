@@ -28,15 +28,15 @@ from studioforge.gui.tabs import (
     viewer_may_change_box,
 )
 from studioforge.gui.tabs.dashboard import _Page
-from studioforge.gui.tabs.widgets import confirm, fmt_ts, section_url
+from studioforge.gui.tabs.widgets import confirm, fmt_ts
 from studioforge.logging import get_logger
 
 log = get_logger(__name__)
 
 NOT_CONFIGURED = (
     "No update source is set, so StudioForge does not look for new versions. Set update.repo "
-    "(the GitHub repository that publishes releases, as owner/name) on the Advanced page to turn "
-    "this on."
+    "(the GitHub repository that publishes releases, as owner/name) under Advanced > "
+    "Config to turn this on."
 )
 
 
@@ -119,7 +119,9 @@ def render(ctx: GuiContext) -> None:
                 for line in summary_lines(status):
                     ui.label(line).classes("text-sm")
                 if not configured:
-                    ui.link("Open Advanced", section_url("Advanced")).classes("text-sm")
+                    ui.link("Open Advanced > Config", "/?section=Advanced&page=config").classes(
+                        "text-sm"
+                    )
                 with ui.row().classes("items-center gap-2"):
                     ui.button("Check for updates", icon="system_update_alt", on_click=check).props(
                         "outline dense"

@@ -1,10 +1,10 @@
 # First run
 
-Everything StudioForge needs to be told is on the control panel's **Setup** tab. This page walks
-through it once, and then gives the equivalent YAML and CLI for a box with no browser.
+Everything StudioForge needs to be told is on the control panel's **Advanced** tab (the layout is in
+[`panel.md`](panel.md)). This page walks through it once, and then gives the equivalent YAML and CLI for a box with no browser.
 
 You should not have to edit `config.yaml` by hand. If you find yourself doing it, that is a gap
-worth reporting — the Setup tab is generated from the configuration model itself, so every key it
+worth reporting — the Advanced tab is generated from the configuration model itself, so every key it
 has is reachable from a form (DECISIONS.md D26).
 
 ---
@@ -20,14 +20,14 @@ studioforge serve --open
 
 On Windows, **launchers\Start StudioForge.bat** does the same thing without a terminal.
 
-The panel opens on `http://localhost:8080`. On a fresh install it lands on **Setup** rather than the
-Dashboard, because a box with no engine and no model library has nothing to put on a dashboard.
+The panel opens on `http://localhost:8080`. On a fresh install it lands on **Status** with a *Finish setup* banner, because a box with no
+engine and no model library has nothing else to show.
 
 ---
 
 ## 2. Work down the checklist
 
-The card at the top is computed live every time you open the tab or press **Re-check**. Each line
+The **Readiness checklist** (Advanced > Diagnostics) is computed live every time you open the page or press **Re-check**. Each line
 is either green (done), amber (**required** — the server cannot load a model until it passes) or
 grey (**optional** — it changes what you can do, not whether the thing works). Unmet lines carry
 the one button that fixes them.
@@ -41,14 +41,16 @@ the one button that fixes them.
 | **llama.cpp engine** | A versioned engine is installed under `engines/<tag>/` and active | **Install engine `<the pinned tag>`** — the button names whatever `engine.pinned_tag` is set to |
 | **Gateway port** | Something is listening on `server.port`, and that something is us rather than LM Studio or a second copy of StudioForge | Quit the other one, or change the port |
 | **MCP pairing PIN** | Required while `mcp.pin_required` is on — and, with no `server.api_key`, for every MCP caller that is not on this machine whatever the toggle says (D32) | **Generate PIN** |
-| *HuggingFace token* | Optional. Only gated or private repositories need one | Paste one into **Downloads & HuggingFace** |
-| *Start at login* | Optional | **Enable** in **Startup & service** |
+| *HuggingFace token* | Optional. Only gated or private repositories need one | Paste one into **Advanced > Catalog & downloads** |
+| *Start at login* | Optional | **Enable** in **Advanced > Config** |
 
 When every required line is green the card's headline reads **Ready to serve**.
 
 ---
 
 ## 3. Model library
+
+*Advanced > Catalog & downloads.*
 
 `models.dir` is the root of your GGUF library. It is scanned **in place** — nothing is copied,
 moved or renamed, so an existing LM Studio library keeps working in LM Studio.
@@ -109,6 +111,8 @@ transient and you get a 503 `model_busy` with a `Retry-After` instead (D58).
 
 ## 4. GPUs & memory
 
+*Advanced > GPUs & placement.*
+
 The table is live: index, name, free/total VRAM, compute capability, and — where the platform can
 tell us — the processes currently holding memory on that card.
 
@@ -145,6 +149,8 @@ what it would do.
 
 ## 5. Engine
 
+*Advanced > Engines.*
+
 Engines are versioned artifacts under `engines/<tag>/`, never "whatever `llama-server` is on PATH"
 (D3). The panel shows the active tag, every installed tag, and offers **smoke test** and
 **activate + reload** per tag.
@@ -159,7 +165,7 @@ to activate the build you want. Rollback is the same move in the other direction
 still installed.
 
 Activating does not disturb running models: each `llama-server` child keeps the build it was
-launched with until it is reloaded. **Dashboard → Restart engines** is what moves the resident
+launched with until it is reloaded. **Advanced > Engines → Restart engines** is what moves the resident
 models onto the new build. Activating also re-validates every model's saved expert `extra_flags`
 against the new engine and warns about the ones it no longer accepts — llama-server *ignores* flags
 it does not recognise, so an engine switch can otherwise drop a setting silently (D2, D49-6).
@@ -196,10 +202,10 @@ CUDA variant*, not that no build exists — and both **Check for update** and **
 which it was, counted: *"checked 100 releases; 74 filtered (71 prerelease non-build tags, 3
 non-bNNNN tags)"*. `studioforge engine --check` and `--list` print the same sentence.
 
-**Who may press these buttons.** Install, activate + reload, smoke test and Dashboard → Restart
+**Who may press these buttons.** Install, activate + reload, smoke test and Advanced > Engines → Restart
 engines all change the box, so with no `server.api_key` set they are accepted only from a browser
 **on this machine** (D32). A viewer who cannot use them sees them disabled with the two ways in:
-open the panel on the box, or set `server.api_key` (Setup tab, on the box) and sign in with it.
+open the panel on the box, or set `server.api_key` (Advanced > Serving & network, on the box) and sign in with it.
 *Check for update* and *List releases* stay available to everyone — they read GitHub and change
 nothing.
 
@@ -218,12 +224,14 @@ one. The card says so when it does; nothing deletes your rollback engine while y
 
 ## 6. Network & access
 
+*Advanced > Serving & network.*
+
 | Field | Notes |
 | --- | --- |
 | `server.host` | A **bind** address. The default is `127.0.0.1`: this machine only, so no agent on another box can reach it. `0.0.0.0` listens on every interface, LAN and tailnet included, and the server then refuses to start until an owner account or an admin key exists (`studioforge setup`; see [`SECURITY.md`](SECURITY.md)) |
 | `server.port` | `1234` is LM Studio's default, which is the whole point — pointing an OpenAI client here is a host change, not a rewrite. They cannot share the port, though: quit LM Studio or move one of them |
 | `gui.port` / `watchdog.port` | This panel, and the recovery sidecar (a separate process) |
-| `server.api_key` | **Deprecated**: the single shared key. It still guards inference **and** this panel as an admin credential (and shows up as the key `legacy` in Users & Keys). Prefer scoped keys: `studioforge keys create`. With no key and a loopback bind, reads, inference and load/unload are open, but changing the box (config, files, engines, restarts, downloads) needs a browser on the machine itself, the same rule the API applies (D32) |
+| `server.api_key` | **Deprecated**: the single shared key. It still guards inference **and** this panel as an admin credential (and shows up as the key `legacy` in Accounts & keys). Prefer scoped keys: `studioforge keys create`. With no key and a loopback bind, reads, inference and load/unload are open, but changing the box (config, files, engines, restarts, downloads) needs a browser on the machine itself, the same rule the API applies (D32) |
 | `mcp.pin` | **Deprecated.** A short pairing code for the MCP path only — deliberately *not* the inference credential. Setting `server.api_key` does not retire it: the app's `/mcp` and the watchdog accept **either** credential, so a paired agent keeps working. **Generate new PIN** rotates it, which is the documented response to a leak; every already-paired agent then needs the new one |
 
 All three secrets render masked, with a reveal button. Leaving a masked field untouched keeps the
@@ -233,7 +241,7 @@ current value: the panel never posts the placeholder back over a working credent
 listeners: `server.host`, `gui.host`, `watchdog.host`) it is green and optional — nothing off this
 box can reach the API. Any of them bound to `0.0.0.0` (or a LAN address) with no owner account or
 admin key is **required and amber**, and the server will not start in that state. Create an
-account or a key on the Users & Keys page, then give each client its own scoped key
+account or a key on the Accounts & keys page, then give each client its own scoped key
 (`Authorization: Bearer <key>`). The same rule decides whether `GET /api/mcp/info` and
 `/api/openclaw-setup` will hand the PIN to a remote caller at all — with no key set they answer
 only on the machine itself.
@@ -264,6 +272,8 @@ is really serving on. Secrets are masked on screen; the copy buttons copy the re
 
 ## 7. Startup & service
 
+*Advanced > Config, and Advanced > Watchdog & recovery for restarts.*
+
 **Autostart** is a per-user mechanism, so neither half needs administrator rights: a hidden `.vbs`
 shim in the Startup folder on Windows (which launches the tray, and the tray brings up the server),
 a `systemd --user` unit on Linux. The system-wide units for a headless server are in [`deploy/`](../deploy).
@@ -281,7 +291,7 @@ data-directory rules produced the directory in force (D25, D31):
 warning — so copying a config file between installs cannot silently move the install.
 
 **Open data dir** and **Open logs** open a file manager **on the machine running StudioForge**, not
-on the machine you are browsing from. **Restart server** confirms first: it is the one control that
+on the machine you are browsing from. **Restart server** (Advanced > Watchdog & recovery) confirms first: it is the one control that
 takes the gateway down, and every client talking to it sees a connection error. Exactly one
 process brings it back (D28): the tray, when the tray launched the server (the server exits and
 the tray respawns it, without counting a crash); otherwise the watchdog. `GET /health` reports
@@ -297,7 +307,9 @@ button.
 
 ---
 
-## 8. Advanced
+## 8. Config
+
+*Advanced > Config.*
 
 Every remaining key, grouped by config section, generated from the pydantic model itself. A key
 added to StudioForge appears here without anyone remembering to add a form row.
@@ -317,7 +329,7 @@ mount path).
 
 ## 9. Downloading models
 
-The **Download** tab searches HuggingFace and queues a quant; `sfctl download <repo> --quant
+The **Models** tab (**Add model**, with the queue under the **Downloads** chip) searches HuggingFace and queues a quant; `sfctl download <repo> --quant
 <Q>` does the same from the agent's machine, and an agent uses `search_models` → `repo_details` →
 `download_model`. Downloads are resumable, verified (sha256 where the repository publishes one,
 byte count always) against what is actually on disk, survive a restart, and land in your library
@@ -334,7 +346,7 @@ studioforge protocol register --takeover-lmstudio
 
 Opt-in and reversible — LM Studio's handler is backed up first and restored by `studioforge
 protocol unregister`. Without the flag only the `studioforge://` scheme is claimed and LM Studio is
-left alone. The Server tab shows the handler's true current state.
+left alone. Advanced > Integrations shows the handler's true current state.
 
 ---
 
@@ -384,7 +396,7 @@ from the load. The shipped policy is `{1: 900, 2: 900, 3: 600}` with `default_tt
 model and an agent's model idle out after fifteen minutes without a request, background work — and
 every load that named no tier at all, which is a background load (D46) — after ten. Set a tier to
 `0` to never idle-unload it, as `0` means everywhere else; clear the map (`{}`) to give every tier
-`default_ttl_s`. The Setup tab edits the three rows directly. A request-level `ttl` (the LM Studio
+`default_ttl_s`. Advanced > Serving & network edits the three rows directly. A request-level `ttl` (the LM Studio
 field on `/v1/chat/completions` and `/v1/completions`) may shorten a model's idle timer below its
 tier's price but never lengthen it past it (D61) — a background turn asking `ttl: 3600` at tier 3
 gets the tier's 600 s — except where the tier is unpriced (an empty map, or a tier the map omits),
@@ -402,7 +414,7 @@ studioforge autostart enable        # Startup folder / systemd --user
 studioforge autostart disable
 ```
 
-Anything the Setup tab can change, `PATCH /api/config` can change, with the same validation and the
+Anything the Advanced tab can change, `PATCH /api/config` can change, with the same validation and the
 same restart-required reporting — the panel calls that route rather than reimplementing it:
 
 ```bash

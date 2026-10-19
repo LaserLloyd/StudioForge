@@ -1,6 +1,6 @@
 # winget locale manifest (SKELETON: prepared, NOT submitted).
 PackageIdentifier: LaserLloyd.StudioForge
-PackageVersion: 2.1.0
+PackageVersion: 2.2.0
 PackageLocale: en-US
 Publisher: LaserLloyd
 PublisherUrl: https://github.com/LaserLloyd

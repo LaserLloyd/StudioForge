@@ -496,7 +496,7 @@ if [ "$missing" = 1 ]; then
 EOF
 fi
 cat <<EOF
-  3. Point it at your GGUF library from the panel's Setup tab, or:  $CLI scan
+  3. Point it at your GGUF library from the panel's Advanced > Catalog & downloads page, or:  $CLI scan
   Uninstall (keeps your data):  $0 --uninstall$([ "$SCOPE" = system ] && echo ' --system')
 EOF
 [ "$DRY" = 1 ] && printf '\n(dry run: nothing was changed)\n'

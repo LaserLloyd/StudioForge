@@ -888,42 +888,46 @@ def test_where_things_live_lists_every_path_and_no_secret(config: Config) -> Non
 # ---------------------------------------------------------------------------
 
 
-def test_the_setup_tab_renders_every_section(config: Config) -> None:
+def _page(config: Config, path: str, **kwargs: Any) -> Any:
     app = create_gui_app(config, api_state=_State(config))
     with TestClient(app) as client:
-        response = client.get("/?tab=setup")
-    assert response.status_code == 200
-    for heading in (
-        "Model library",
-        "GPUs &amp; memory",
-        "llama.cpp engine",
-        "Network &amp; access",
-        "Downloads &amp; HuggingFace",
-        "Startup &amp; service",
-        "Where things live",
-    ):
-        assert heading in response.text, heading
+        return client.get(path, **kwargs)
 
 
-def test_the_setup_tab_shows_the_checklist_and_the_gpu_policy_controls(config: Config) -> None:
+def _advanced(config: Config, slug: str, **kwargs: Any) -> Any:
+    return _page(config, f"/?section=Advanced&page={slug}", **kwargs)
+
+
+def test_the_setup_cards_render_on_their_advanced_pages(config: Config) -> None:
+    where = {
+        "catalog": ("Model library", "Downloads &amp; HuggingFace"),
+        "placement": ("GPUs &amp; memory",),
+        "engines": ("llama.cpp engine",),
+        "serving": ("Network &amp; access",),
+        "config": ("Startup &amp; service", "Where things live"),
+    }
+    for slug, headings in where.items():
+        response = _advanced(config, slug)
+        assert response.status_code == 200
+        for heading in headings:
+            assert heading in response.text, (slug, heading)
+
+
+def test_the_checklist_and_the_gpu_policy_controls_render(config: Config) -> None:
     config.planner.excluded_devices = [3]
     config.planner.reserved_mb = {3: 8192}
-    app = create_gui_app(config, api_state=_State(config))
-    with TestClient(app) as client:
-        response = client.get("/?tab=setup")
-    text = response.text
-    assert "Data directory" in text
-    assert "MCP pairing PIN" in text
+    checklist = _advanced(config, "diagnostics").text
+    assert "Data directory" in checklist
+    assert "MCP pairing PIN" in checklist
+    text = _advanced(config, "placement").text
     assert "never place models here" in text
     assert "reserve (MiB)" in text
     assert "CUDA3" in text
     assert "8192 MiB reserved" in text
 
 
-def test_the_advanced_section_renders_the_generated_long_tail(config: Config) -> None:
-    app = create_gui_app(config, api_state=_State(config))
-    with TestClient(app) as client:
-        response = client.get("/?tab=setup")
+def test_the_config_page_renders_the_generated_long_tail(config: Config) -> None:
+    response = _advanced(config, "config")
     assert "Advanced — every other setting" in response.text
     assert "gateway.max_restarts" in response.text
     assert "update.check_interval_h" in response.text
@@ -934,48 +938,52 @@ def test_no_secret_reaches_the_rendered_page(config: Config) -> None:
     config.server.api_key = API_KEY
     config.hf.token = HF_TOKEN
     config.mcp.pin = MCP_PIN
-    app = create_gui_app(config, api_state=_State(config))
-    with TestClient(app) as client:
-        response = client.get("/?tab=setup", headers={"Authorization": f"Bearer {API_KEY}"})
-    assert response.status_code == 200
-    assert API_KEY not in response.text
-    assert HF_TOKEN not in response.text
-    assert MCP_PIN not in response.text
+    for path in (
+        "/",
+        "/?section=Models",
+        "/?section=Advanced&page=serving",
+        "/?section=Advanced&page=catalog",
+        "/?section=Advanced&page=config",
+        "/?section=Advanced&page=watchdog",
+        "/?section=Advanced&page=integrations",
+    ):
+        response = _page(config, path, headers={"Authorization": f"Bearer {API_KEY}"})
+        assert response.status_code == 200, path
+        assert API_KEY not in response.text, path
+        assert HF_TOKEN not in response.text, path
+        assert MCP_PIN not in response.text, path
 
 
-def test_setup_is_part_of_the_overview_and_old_links_still_open_it() -> None:
-    """The Setup tab became the Overview's checklist and the ``/setup`` wizard; the
-    old ``?tab=setup`` link is translated in the app, not in ``gui/state.py``."""
-    from studioforge.gui.app import LEGACY_TABS, TAB_NAMES, resolve_section
+def test_setup_is_part_of_status_and_old_links_still_open_it() -> None:
+    """The Setup tab became the Status banner and the ``/setup`` wizard; the old
+    ``?tab=setup`` link is translated by ``gui/nav.py``, not in ``gui/state.py``."""
+    from studioforge.gui import nav
 
-    assert "Setup" not in TAB_NAMES
+    assert "Setup" not in nav.TOP_TABS
     assert st.DEEP_LINK_TABS["setup"] == "Setup"  # the link grammar is unchanged
-    assert LEGACY_TABS["Setup"] == ("Overview", None)
     params = st.deep_link_params({"tab": "setup"})
     assert st.initial_tab(params) == "Setup"
-    assert resolve_section(params, {"tab": "setup"}, "Overview") == ("Overview", None)
+    assert nav.resolve_location({"tab": "setup"}).tab == nav.STATUS
 
 
-def test_every_install_lands_on_the_overview_and_only_a_fresh_one_shows_the_banner(
+def test_every_install_lands_on_status_and_only_a_fresh_one_shows_the_banner(
     config: Config,
 ) -> None:
-    from studioforge.gui.app import _default_tab
+    from studioforge.gui import nav
     from studioforge.gui.tabs import GuiContext
     from studioforge.gui.tabs.overview import needs_setup
 
     state = _State(config)
     ctx = GuiContext(config=config, api_state=state)
-    # No models indexed yet: the Overview has nothing to show but the banner.
-    assert _default_tab(ctx) == "Overview"
+    # No models indexed yet: Status has nothing to show but the banner.
+    assert nav.resolve_location({}).tab == nav.STATUS
     assert needs_setup(ctx) is True
 
     state.registry = _Registry([object()])
     state.engine_manager = None
-    assert _default_tab(ctx) == "Overview"
     assert needs_setup(ctx) is False
 
     config.models.dir = None
-    assert _default_tab(ctx) == "Overview"
     assert needs_setup(ctx) is True
 
 

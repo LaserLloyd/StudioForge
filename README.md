@@ -6,12 +6,12 @@
 
 <table>
   <tr>
-    <td width="50%"><img src="docs/screenshots/readme/panel-overview.png" alt="StudioForge control panel Overview in the Glacier theme: base URL, four GPU cards with VRAM bars and no model loaded"><br><sub><b>Overview.</b> The base URL to paste into any OpenAI client, every GPU with its VRAM and load, and what is loaded right now.</sub></td>
-    <td width="50%"><img src="docs/screenshots/readme/panel-models.png" alt="StudioForge Models tab listing three indexed GGUF models with size, quant and architecture"><br><sub><b>Models.</b> Your GGUF library, indexed in place: size, quant, architecture and load state, with load, pin and benchmark actions.</sub></td>
+    <td width="50%"><img src="docs/screenshots/readme/panel-status.png" alt="StudioForge Status tab in the Glacier theme: health, four GPU cards with VRAM bars and what is on each, and two loaded models with busy or idle state and tokens per second"><br><sub><b>Status.</b> Health, every GPU and what is on it, and the loaded models: busy or idle, tokens per second. Nothing to configure here.</sub></td>
+    <td width="50%"><img src="docs/screenshots/readme/panel-model-drawer.png" alt="StudioForge Models tab with a model's details drawer open: the planner's recommended GPUs, context and KV type are pre-filled and a VRAM bar per GPU is drawn before the Load button"><br><sub><b>Models.</b> One searchable table and a details drawer per model: the planner's recommended GPUs, context and KV type are pre-filled, and the fit is drawn per GPU before you press Load.</sub></td>
   </tr>
   <tr>
-    <td width="50%"><img src="docs/screenshots/readme/panel-integrations.png" alt="StudioForge Integrations tab with copy-paste connection snippets for OpenClaw, the OpenAI and Anthropic Python SDKs and DisPatch"><br><sub><b>Integrations.</b> Copy-paste connection snippets for OpenAI-compatible clients, filled in with your server's address and a model.</sub></td>
-    <td width="50%"><img src="docs/screenshots/readme/setup-wizard.png" alt="StudioForge setup guide, step 1: create the owner account"><br><sub><b>Setup guide.</b> Eight optional steps from owner account to network exposure, starting with step 1 here.</sub></td>
+    <td width="50%"><img src="docs/screenshots/readme/panel-test-chat.png" alt="StudioForge Test Chat tab: a streamed reply with time to first token, prefill and decode speed, and a Copy as curl button"><br><sub><b>Test Chat.</b> Talk to a loaded model: streaming reply with time to first token and tokens per second, and a copy-as-curl button.</sub></td>
+    <td width="50%"><img src="docs/screenshots/readme/panel-advanced.png" alt="StudioForge Advanced tab: a left menu of Serving and network, GPUs and placement, Accounts and keys, Engines, Watchdog, Catalog, Integrations, Peers, Logs, Config, Diagnostics and About, with the Integrations page open"><br><sub><b>Advanced.</b> Everything else, in a left menu: serving and network, accounts and keys, engines, watchdog, integrations, logs, config, diagnostics.</sub></td>
   </tr>
 </table>
 
@@ -24,7 +24,7 @@ control panel, a system tray, and MCP tools so an agent can run it from another 
 replace LM Studio as the backend for [OpenClaw](docs/OPENCLAW.md) — it listens on LM Studio's port, so
 switching is a host change, not a rewrite.
 
-**Status:** v2.1.0. The first release on the new scheme: secure-by-default binds, scoped keys,
+**Status:** v2.2.0. The first release on the new scheme: secure-by-default binds, scoped keys,
 backend-aware engines (CUDA verified; ROCm and Vulkan not yet tested on real hardware, see
 [`docs/ENGINES.md`](docs/ENGINES.md)) and the LM Studio native API (see [`CHANGELOG.md`](CHANGELOG.md), **BREAKING**
 first). Windows is the reference platform and runs it daily; Linux is supported (CI runs both) and
@@ -34,11 +34,11 @@ less battle-tested. Questions and bug reports: [Contact](#contact).
 on LaserLloyd.com, and the author's other [AI projects](https://www.laserlloyd.com/ai/).
 
 **On versions.** StudioForge uses semantic versioning since 2.0.0. The version lives in
-`src/studioforge/__init__.py` — `2.1.0` — and is what `GET /api/version`, `GET /health`, the MCP
+`src/studioforge/__init__.py` — `2.2.0` — and is what `GET /api/version`, `GET /health`, the MCP
 `server_status` tool and `sfctl status` report; all three `pyproject.toml` files (the app,
 `packages/studioforge-companion` for `sfctl`, and `packages/studioforge-tenant`) carry the same string,
 the companion ships from the same release and carries the same version, and release tags are
-`v2.1.0`. Releases before 2.0.0 were calendar-versioned (`1.26-08-23` style); the updater reads both
+`v2.2.0`. Releases before 2.0.0 were calendar-versioned (`1.26-08-23` style); the updater reads both
 schemes, so a 1.x install sees 2.0.0 as the update it is. Check what a server is actually running with
 `curl -s <host>/api/version`. A server running a commit past its release still reports that release,
 but the `build` field beside `version` (on `/health`, `/api/version`, `/api/status`, `server_status`
@@ -265,7 +265,7 @@ curl.exe -s http://127.0.0.1:1234/health
 
 Edit the `SF_MODELS` path (your GGUF folder) and `SF_OWNER_PASSWORD` (10 or more characters) before you
 run it. Open <http://localhost:8080> and sign in as `owner` with that password; create one key per
-client under **Users & Keys**, and point clients at `http://localhost:1234/v1`. Leave
+client under **Advanced > Accounts & keys**, and point clients at `http://localhost:1234/v1`. Leave
 `SF_OWNER_PASSWORD` out and the container generates one into `/data/owner-password.initial` on the
 volume. Once the image is published to the registry, replace the `docker build` line with
 `docker compose -f compose.yml -f compose.cuda.yml pull`. Do not add `--build` to `up` (see the Linux note below).
@@ -393,11 +393,11 @@ refuses to run on anything but Linux, and Docker Desktop on a Mac cannot pass a 
 
 ### First run, any platform
 
-The panel opens on **Overview** with a *Finish setup* banner that leads to the setup guide
+The panel opens on **Status** with a *Finish setup* banner that leads to the setup guide
 (`/setup`, or `studioforge setup` in a terminal): owner account, hardware, engine, model library
 (**Detect LM Studio library** finds an existing one — models are indexed in place, never copied),
 a starter model, a test chat, integration snippets and network exposure. Every step is optional on a
-local-only install. The tab-by-tab reference, with the headless YAML/CLI equivalent, is
+local-only install. The page-by-page reference, with the headless YAML/CLI equivalent, is
 [`docs/SETUP.md`](docs/SETUP.md).
 
 ---
@@ -487,17 +487,15 @@ of priority tiers, the lease etiquette and one failure-code table for both servi
 
 ## What it looks like
 
-Every number in the panel is the *actual* one the engine reports — context, slots, VRAM per card:
+The panel has four tabs: **Status**, **Models**, **Test Chat** and **Advanced** (the old tab names still work in links;
+[`docs/panel.md`](docs/panel.md) maps every control to its place). Every number in it is the *actual* one the engine
+reports: context, slots, VRAM per card.
 
-![Dashboard: GPUs, who holds the VRAM, standing GPU leases, and each loaded model with its live slots](docs/images/dashboard.png)
-
-| Setup — a checklist, not a YAML file | Models — the library, indexed in place |
+| Models: search, filter, per-row state | Models > Downloads: add by repo id, search, queue |
 | --- | --- |
-| ![Setup checklist](docs/images/setup.png) | ![Model library](docs/images/models.png) |
+| ![Models: the library as one table with All, Loaded and Downloads chips, the quant, size, family, where it fits and its state](docs/screenshots/readme/panel-models.png) | ![Downloads: add a model by Hugging Face repo id or link, search, and the queue with progress](docs/screenshots/readme/panel-downloads.png) |
 
-![Download: search Hugging Face and queue GGUF downloads straight into your model directory](docs/images/download.png)
-
-![Server: health, bind address, gateway port, and every runtime setting in one place](docs/images/server.png)
+![Setup guide: eight optional steps from the owner account to network exposure, starting with step 1](docs/screenshots/readme/setup-wizard.png)
 
 On Windows, the tray starts the server, restarts it if it crashes, and keeps the everyday actions
 one right-click away:
@@ -526,7 +524,7 @@ server is wedged.
 | `llama-server` children | `18100–18200` | Internal, one port per loaded model |
 
 LM Studio also uses `1234`: quit it, or set `server.port`. Change the ports with the config keys
-`server.port`, `gui.port` and `watchdog.port` (Setup tab or `config.yaml`; `SF_SERVER__PORT`-style
+`server.port`, `gui.port` and `watchdog.port` (Advanced > Serving & network, or `config.yaml`; `SF_SERVER__PORT`-style
 environment variables only seed first-run defaults, and `studioforge serve --port` overrides the
 gateway port only). All three services bind `127.0.0.1`
 by default. Binding the network (`0.0.0.0`) requires an owner account or an admin key — the server
@@ -654,7 +652,7 @@ docker compose restart studioforge
 docker run --rm -v studioforge-data:/data alpine cat /data/RESET_LOGIN.password
 ```
 
-Sign in with the new password, change it under **Users & Keys**, and delete
+Sign in with the new password, change it under **Advanced > Accounts & keys**, and delete
 `RESET_LOGIN.password`. The reset changes only that account's password (it re-enables the account
 if it was disabled); the other accounts, API keys, models and settings are kept. The start-up log
 shows one line, `RESET_LOGIN consumed: ...`, naming the account and never the password. If the file
@@ -702,9 +700,10 @@ The same from a terminal, on any platform: `studioforge serve --open`, `studiofo
 
 ## Documentation
 
+- [`docs/panel.md`](docs/panel.md) — the four-tab control panel: where every control lives, old links, screenshots
 - [`docs/SECURITY.md`](docs/SECURITY.md) — who may do what: bind rules, scoped keys, TLS, MCP, the audit log
 - [`docs/CLI.md`](docs/CLI.md) — every `studioforge` command (generated)
-- [`docs/SETUP.md`](docs/SETUP.md) — first run, tab by tab; GPUs, engine, network, downloads; headless
+- [`docs/SETUP.md`](docs/SETUP.md) — first run, page by page; GPUs, engine, network, downloads; headless
 - [`docs/OPENCLAW-SETUP.md`](docs/OPENCLAW-SETUP.md) — two-machine install, verified step by step
 - [`docs/OPENCLAW.md`](docs/OPENCLAW.md) — the tool list and the loop an agent runs; pins and leases
 - [`docs/OPENCLAW-RIG.md`](docs/OPENCLAW-RIG.md) — the whole rig for one agent: identity, priority, leases, every failure code

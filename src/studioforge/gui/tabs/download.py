@@ -165,7 +165,7 @@ def _repo_error_card(ctx: GuiContext, repo_id: str, exc: BaseException, *, retry
         else:
             ui.label(
                 "This repository is gated. Accept its licence on huggingface.co, then set "
-                "hf.token on the Server tab and retry."
+                "hf.token under Advanced > Catalog & downloads and retry."
             ).classes("text-xs text-warning")
     elif status == 404:
         ui.label(
@@ -391,7 +391,8 @@ def _repo_row(ctx: GuiContext, repo: Any, *, date_field: str = "updated", mtp: A
             ).tooltip(chip.tooltip)
         if repo.needs_token:
             ui.badge("gated", color="warning").classes("text-xs").tooltip(
-                "Accept the terms on HuggingFace and set hf.token on the Server tab"
+                "Accept the terms on HuggingFace and set hf.token under "
+                "Advanced > Catalog & downloads"
             )
         ui.link("model card", f"{HF_WEB_BASE}/{repo.repo_id}", new_tab=True).classes("text-xs")
         ui.button(

@@ -9,6 +9,46 @@ the decisions each one carries rather than repeating them.
 To see what a running server includes, ask it: `GET /api/capabilities` lists every decision number
 the build implements, and the `build` field on `/health` names the exact commit.
 
+## 2.2.0
+
+### Changed
+
+- **The control panel has four top-level tabs: Status, Models, Test Chat and Advanced.** The eleven
+  sections of 2.0.x are folded into them; nothing was removed, every control is reachable
+  (`docs/panel.md` has the control-by-control map, with screenshots). Presentation only: no
+  API, MCP tool, CLI command or setting changed, and every button calls the function it called before.
+
+  | 2.0.x | 2.2.0 |
+  |---|---|
+  | Overview | **Status**: health and boot phase, every GPU with what is on it, loaded models (busy or idle, tok/s), active requests, engine, version and build, uptime. Quick actions: Unload, Open in Models, Open logs |
+  | Models > Library | **Models**: one searchable table with All / Loaded / Downloads chips, per-row state (idle, loading with progress, loaded, error with its code), and a details drawer per model |
+  | Models > Download | **Models**: the Downloads chip (queue, disk line) and Add model (Hugging Face repo id, link or search) |
+  | Models > Chat | **Test Chat**: unchanged chat, plus Copy as curl and Load options (the same drawer) |
+  | Serving | Advanced > Serving & network |
+  | Placement | Advanced > GPUs & placement (and Peers) |
+  | Users & Keys | Advanced > Accounts & keys |
+  | Engines | Advanced > Engines (now with Restart engines) |
+  | Integrations | Advanced > Integrations |
+  | Logs & Metrics | Advanced > Logs & metrics |
+  | Diagnostics | Advanced > Diagnostics (now with the readiness checklist) |
+  | Updates | Advanced > About & updates |
+  | Advanced | Advanced > Config |
+  | Overview buttons Restart server, Unload all | Advanced > Watchdog & recovery (new page, with the watchdog's settings) |
+  | Library row buttons (load, unload, pin, test, benchmark, delete, edit) | The model's drawer |
+
+- **The Models drawer loads with the planner's recommendation.** GPUs, context and KV type are
+  pre-filled from the catalog's recommended `load_args`; the per-GPU VRAM bars and the fit verdict
+  (`plan_preview`) are drawn before the Load button is pressed and update as the fields change, so
+  nothing is loaded to find out. An "Advanced options" expander and "All settings…" keep the full
+  three-tier dialog one click away.
+- Old links keep working: every `?tab=` and `?section=` name from 2.0 and 2.0.x answers with a `307`
+  to its new place (`/?section=Advanced&page=serving`), keeping `repo`, `quant` and `model`. The
+  Hugging Face button's `?tab=download&repo=owner/repo` still opens the quant picker. Tabs and Advanced
+  pages are built the first time they are opened, so a closed page no longer runs polling timers.
+- `docs/panel.md`; README screenshots regenerated on the Glacier theme from a scratch rig
+  (`scripts/panel_demo.py`, `scripts/capture_panel.py`: fake GPUs and models on ports 18080-18199, no
+  GPU, no live data). The capability registry names the new panel locations.
+
 ## 2.1.0
 
 New commands, so a minor version. Nothing is removed or renamed; no route changed.

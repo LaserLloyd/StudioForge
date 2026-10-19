@@ -1,4 +1,4 @@
-"""The panel's information architecture: eleven sections, the old links, the new pages.
+"""The panel's pages as built into the four-tab shell (the IA itself is in test_panel_four_tabs).
 
 Pages are checked two ways: the rendered HTML through ``TestClient`` (a page that
 crashes becomes an error card with a 200, so the text is asserted), and the pure
@@ -25,29 +25,14 @@ from studioforge.db import Database
 from studioforge.errors import StudioForgeError
 from studioforge.gui import state as st
 from studioforge.gui import tabs
-from studioforge.gui.app import (
-    LEGACY_TABS,
-    MODELS_SUBTABS,
-    TAB_NAMES,
-    create_gui_app,
-    resolve_section,
-)
+from studioforge.gui.app import create_gui_app
 from studioforge.types import EngineInfo
 from tests.unit.test_gui import _FakeState, make_record
 
-SECTIONS = (
-    "Overview",
-    "Models",
-    "Serving",
-    "Engines",
-    "Placement",
-    "Integrations",
-    "Users & Keys",
-    "Updates",
-    "Logs & Metrics",
-    "Diagnostics",
-    "Advanced",
-)
+
+def adv(slug: str) -> str:
+    """The deep link to one Advanced page."""
+    return f"/?section=Advanced&page={slug}"
 
 
 @pytest.fixture(autouse=True)
@@ -117,51 +102,15 @@ def working(state: _FakeState) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_the_panel_has_exactly_these_eleven_sections_in_order() -> None:
-    assert TAB_NAMES == SECTIONS
-
-
-def test_every_section_renders_and_none_is_an_error_card(config: Config, state: _FakeState) -> None:
-    text = page(config, state)
-    assert "could not be rendered" not in text
-    for name in SECTIONS:
-        assert name.replace("&", "&amp;") in text, name
-    for sub in MODELS_SUBTABS:
-        assert sub in text
-
-
-@pytest.mark.parametrize(
-    ("query", "expected"),
-    [
-        ({}, ("Overview", None)),
-        ({"tab": "dashboard"}, ("Overview", None)),
-        ({"tab": "setup"}, ("Overview", None)),
-        ({"tab": "models"}, ("Models", "Library")),
-        ({"tab": "download"}, ("Models", "Download")),
-        ({"repo": "owner/name"}, ("Models", "Download")),
-        ({"tab": "chat"}, ("Models", "Chat")),
-        ({"tab": "server"}, ("Integrations", None)),
-        ({"tab": "settings"}, ("Integrations", None)),
-        ({"tab": "logs"}, ("Logs & Metrics", None)),
-        ({"tab": "nonsense"}, ("Overview", None)),
-        ({"section": "Updates"}, ("Updates", None)),
-        ({"section": "users"}, ("Users & Keys", None)),
-        ({"section": "Logs & Metrics"}, ("Logs & Metrics", None)),
-        ({"section": "models"}, ("Models", "Library")),
-    ],
-)
-def test_old_deep_links_land_on_the_new_sections(
-    query: dict[str, str], expected: tuple[str, str | None]
+def test_every_tab_and_every_advanced_page_renders_without_an_error_card(
+    config: Config, state: _FakeState
 ) -> None:
-    params = st.deep_link_params(query)
-    assert resolve_section(params, query, "Overview") == expected
+    from studioforge.gui import nav
 
-
-def test_every_legacy_tab_name_has_a_new_home() -> None:
-    assert set(LEGACY_TABS) == set(st.DEEP_LINK_TABS.values())
-    for section, sub in LEGACY_TABS.values():
-        assert section in TAB_NAMES
-        assert sub is None or sub in MODELS_SUBTABS
+    paths = ["/", "/?section=Models", "/?section=Test%20Chat"]
+    paths += [adv(slug) for slug in nav.ADVANCED_SLUGS]
+    for path in paths:
+        assert "could not be rendered" not in page(config, state, path), path
 
 
 def test_the_deep_link_grammar_in_state_is_unchanged() -> None:
@@ -170,7 +119,7 @@ def test_the_deep_link_grammar_in_state_is_unchanged() -> None:
 
 
 def test_a_deep_link_to_a_new_section_renders(config: Config, state: _FakeState) -> None:
-    assert "could not be rendered" not in page(config, state, "/?section=Diagnostics")
+    assert "could not be rendered" not in page(config, state, adv("diagnostics"))
 
 
 # ---------------------------------------------------------------------------
@@ -237,9 +186,9 @@ def test_serving_warns_when_the_server_would_refuse_to_start(
     config: Config, state: _FakeState
 ) -> None:
     config.server.host = "0.0.0.0"
-    text = page(config, state)
+    text = page(config, state, adv("serving"))
     assert "The server will refuse to start" in text
-    assert "section=Users" in text  # the link to Users &amp; Keys
+    assert "page=accounts" in text  # the link to Accounts &amp; keys
     from studioforge.gui.tabs.widgets import is_remote_without_admin
 
     ctx = ctx_of(config, state)
@@ -249,12 +198,12 @@ def test_serving_warns_when_the_server_would_refuse_to_start(
     # With the owner in place the panel is gated; an admin key gets through, with no warning.
     _, token = state.accounts.create_key("ops", "admin")  # type: ignore[attr-defined]
     with TestClient(create_gui_app(config, api_state=state)) as client:
-        signed_in = client.get("/", headers={"Authorization": f"Bearer {token}"})
+        signed_in = client.get(adv("serving"), headers={"Authorization": f"Bearer {token}"})
     assert "The server will refuse to start" not in signed_in.text
 
 
 def test_serving_has_no_warning_on_loopback(config: Config, state: _FakeState) -> None:
-    assert "The server will refuse to start" not in page(config, state)
+    assert "The server will refuse to start" not in page(config, state, adv("serving"))
 
 
 def test_serving_shows_the_certificate_fingerprint(
@@ -265,12 +214,12 @@ def test_serving_shows_the_certificate_fingerprint(
         "studioforge.tlsutil.describe_tls",
         lambda cfg: {"mode": "self_signed", "fingerprint_sha256": "AA:BB:CC", "not_after": None},
     )
-    text = page(config, state)
+    text = page(config, state, adv("serving"))
     assert "AA:BB:CC" in text and "Certificate fingerprint" in text
 
 
 def test_serving_offers_the_documented_settings(config: Config, state: _FakeState) -> None:
-    text = page(config, state)
+    text = page(config, state, adv("serving"))
     for needle in (
         "Server port",
         "Server bind address",
@@ -288,10 +237,8 @@ def test_serving_offers_the_documented_settings(config: Config, state: _FakeStat
 # ---------------------------------------------------------------------------
 
 
-def test_placement_says_peers_arrive_with_multi_host_support(
-    config: Config, state: _FakeState
-) -> None:
-    text = page(config, state)
+def test_peers_says_they_arrive_with_multi_host_support(config: Config, state: _FakeState) -> None:
+    text = page(config, state, adv("peers"))
     assert "Peers and the placement decision log arrive with multi-host support" in text
     assert "milestone M3" in text
 
@@ -341,7 +288,7 @@ def test_snippets_use_the_servers_address_and_never_carry_a_token(
 
 
 def test_integrations_page_renders_every_snippet_block(config: Config, state: _FakeState) -> None:
-    text = page(config, state)
+    text = page(config, state, adv("integrations"))
     for title in (
         "OpenClaw",
         "OpenAI Python SDK",
@@ -412,13 +359,13 @@ class _Updater:
 def test_updates_page_without_a_source_explains_how_to_turn_it_on(
     config: Config, state: _FakeState
 ) -> None:
-    text = page(config, state)  # the fake state has no updater at all
+    text = page(config, state, adv("about"))  # the fake state has no updater at all
     assert "Updates are not available on this server build" in text or "update.repo" in text
 
 
 def test_updates_page_lists_the_installed_releases(config: Config, state: _FakeState) -> None:
     state.updater = _Updater()  # type: ignore[attr-defined]
-    text = page(config, state)
+    text = page(config, state, adv("about"))
     assert "Running version 9.9.9" in text
     assert "rel-2 (running)" in text and "Previous release: rel-1" in text
 
@@ -482,7 +429,7 @@ async def test_install_and_roll_back_are_refused_for_a_remote_viewer(
 def test_logs_and_metrics_has_the_collapsible_metrics_block(
     config: Config, state: _FakeState
 ) -> None:
-    text = page(config, state)
+    text = page(config, state, adv("logs"))
     assert "Metrics (Prometheus text)" in text
     assert "/metrics" in text
 
@@ -528,7 +475,7 @@ def test_diagnostics_orders_the_worst_findings_first_and_summarises() -> None:
 
 
 def test_diagnostics_page_renders_with_the_buttons(config: Config, state: _FakeState) -> None:
-    text = page(config, state)
+    text = page(config, state, adv("diagnostics"))
     assert "Run checks" in text and "Download support bundle" in text
     assert "removed" in text  # the sentence about credentials
 

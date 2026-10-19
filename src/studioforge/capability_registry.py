@@ -95,7 +95,7 @@ CAPABILITIES: tuple[Capability, ...] = (
         api=("GET", "/api/models"),
         mcp=_g("list_models"),
         sfctl="models list",
-        panel="Models page: Library",
+        panel="Models tab: library",
         cli="ls",
     ),
     Capability(
@@ -104,7 +104,7 @@ CAPABILITIES: tuple[Capability, ...] = (
         api=("POST", "/api/models/{model_id}/load"),
         mcp=_g("load_model"),
         sfctl="models load",
-        panel="Models page: Load",
+        panel="Models tab: details drawer, Load",
         cli="load",
     ),
     Capability(
@@ -113,14 +113,14 @@ CAPABILITIES: tuple[Capability, ...] = (
         api=("POST", "/api/models/{model_id}/unload"),
         mcp=_g("unload_model"),
         sfctl="models unload",
-        panel="Models page: Unload",
+        panel="Models tab: details drawer, Unload",
         cli="unload",
     ),
     Capability(
         "models.unload_all",
         "Unload every loaded model.",
         api=("POST", "/api/models/unload-all"),
-        panel="Overview page: Unload all",
+        panel="Advanced > Watchdog & recovery: Unload all models",
         cli="unload --all",
     ),
     Capability(
@@ -129,7 +129,7 @@ CAPABILITIES: tuple[Capability, ...] = (
         api=("DELETE", "/api/models/{model_id}"),
         mcp=_g("delete_model"),
         sfctl="models delete",
-        panel="Models page: Delete",
+        panel="Models tab: details drawer, Manage, Delete",
     ),
     Capability(
         "models.download",
@@ -137,7 +137,7 @@ CAPABILITIES: tuple[Capability, ...] = (
         api=("POST", "/api/downloads"),
         mcp=_g("download_model"),
         sfctl="download",
-        panel="Models page: Download",
+        panel="Models tab: Add model, Downloads",
         cli="get",
     ),
     Capability(
@@ -146,7 +146,7 @@ CAPABILITIES: tuple[Capability, ...] = (
         api=("POST", "/api/models/{model_id}/test"),
         mcp=_g("test_model"),
         sfctl="models test",
-        panel="Models page: Test",
+        panel="Models tab: details drawer, Manage, Test",
     ),
     Capability(
         "models.pin",
@@ -154,7 +154,7 @@ CAPABILITIES: tuple[Capability, ...] = (
         api=("POST", "/api/models/{model_id}/pin"),
         mcp=_g("pin_model"),
         sfctl="models pin",
-        panel="Models page: Pin",
+        panel="Models tab: details drawer, Manage, Pin",
     ),
     Capability(
         "models.scan",
@@ -162,7 +162,7 @@ CAPABILITIES: tuple[Capability, ...] = (
         api=("POST", "/api/models/scan"),
         cli="scan",
         sfctl="models scan",
-        panel="Models page: Rescan",
+        panel="Models tab: Rescan",
     ),
     Capability(
         "hf.search",
@@ -170,14 +170,14 @@ CAPABILITIES: tuple[Capability, ...] = (
         api=("GET", "/api/hf/search"),
         mcp=_g("search_models"),
         sfctl="search",
-        panel="Models page: Download > Search",
+        panel="Models tab: Add model, Search Hugging Face",
     ),
     # --- engines -----------------------------------------------------------
     Capability(
         "engine.list",
         "Show the installed llama.cpp builds and which is active.",
         api=("GET", "/api/engine"),
-        panel="Engines page: installed builds",
+        panel="Advanced > Engines: installed builds",
         notes="`sfctl update --engine TAG --check` prints the engine block but is not a "
         "dedicated command.",
         cli="engine list",
@@ -187,14 +187,14 @@ CAPABILITIES: tuple[Capability, ...] = (
         "Download, verify and smoke-test a llama.cpp build.",
         api=("POST", "/api/engine/install"),
         sfctl="update --engine",
-        panel="Engines page: Install",
+        panel="Advanced > Engines: Install",
         cli="engine install",
     ),
     Capability(
         "engine.activate",
         "Make an installed llama.cpp build the active engine.",
         api=("POST", "/api/engine/activate"),
-        panel="Engines page: activate + reload",
+        panel="Advanced > Engines: activate + reload",
         cli="engine install --activate",
     ),
     # --- configuration -----------------------------------------------------
@@ -204,7 +204,7 @@ CAPABILITIES: tuple[Capability, ...] = (
         api=("GET", "/api/config"),
         mcp=_g("get_config"),
         sfctl="config get",
-        panel="Serving page: settings",
+        panel="Advanced > Serving & network: settings",
         cli="config",
     ),
     Capability(
@@ -213,7 +213,7 @@ CAPABILITIES: tuple[Capability, ...] = (
         api=("PATCH", "/api/config"),
         mcp=_g("set_config"),
         sfctl="config set",
-        panel="Serving page: Save",
+        panel="Advanced > Serving & network: Save",
     ),
     Capability(
         "config.schema",
@@ -227,7 +227,7 @@ CAPABILITIES: tuple[Capability, ...] = (
         api=("POST", "/api/restart/server"),
         mcp=_w("restart_server"),
         sfctl="recover --restart",
-        panel="Overview page: Restart server",
+        panel="Advanced > Watchdog & recovery: Restart server",
     ),
     Capability(
         "status.get",
@@ -235,7 +235,7 @@ CAPABILITIES: tuple[Capability, ...] = (
         api=("GET", "/api/status"),
         mcp=_g("server_status"),
         sfctl="status",
-        panel="Overview page",
+        panel="Status tab",
         cli="ps",
     ),
     Capability(
@@ -244,7 +244,7 @@ CAPABILITIES: tuple[Capability, ...] = (
         api=("GET", "/health"),
         mcp=_w("health"),
         sfctl="recover",
-        panel="Diagnostics page: Run checks",
+        panel="Advanced > Diagnostics: Run checks",
         notes="`sfctl recover` with no flags prints the watchdog's health diagnosis.",
         cli="server status",
     ),
@@ -254,7 +254,7 @@ CAPABILITIES: tuple[Capability, ...] = (
         api=("GET", "/api/logs"),
         mcp=_w("tail_logs"),
         sfctl="logs",
-        panel="Logs & Metrics page: Refresh",
+        panel="Advanced > Logs & metrics: Refresh",
         cli="log stream",
     ),
     # --- GPU sharing -------------------------------------------------------
@@ -264,7 +264,7 @@ CAPABILITIES: tuple[Capability, ...] = (
         api=("GET", "/api/leases"),
         mcp=_g("gpu_leases"),
         sfctl="leases list",
-        panel="Placement page: GPU leases",
+        panel="Advanced > GPUs & placement: GPU leases",
     ),
     Capability(
         "leases.acquire",
@@ -279,7 +279,7 @@ CAPABILITIES: tuple[Capability, ...] = (
         api=("DELETE", "/api/leases/{lease_id}"),
         mcp=_g("release_gpus"),
         sfctl="leases release",
-        panel="Placement page: Release lease",
+        panel="Advanced > GPUs & placement: Release lease",
     ),
     Capability(
         "tenants.list",
@@ -287,7 +287,7 @@ CAPABILITIES: tuple[Capability, ...] = (
         api=("GET", "/api/tenants"),
         mcp=_g("gpu_tenants"),
         sfctl="tenants list",
-        panel="Placement page: tenants",
+        panel="Advanced > GPUs & placement: tenants",
     ),
     # --- updates and recovery ---------------------------------------------
     Capability(
@@ -295,7 +295,7 @@ CAPABILITIES: tuple[Capability, ...] = (
         "Compare the running version with the latest release.",
         api=("GET", "/api/update"),
         sfctl="update --check",
-        panel="Updates page: Check for updates",
+        panel="Advanced > About & updates: Check for updates",
         notes="The panel's `Check for engine update` checks llama.cpp builds, not the app.",
         cli="update check",
     ),
@@ -304,7 +304,7 @@ CAPABILITIES: tuple[Capability, ...] = (
         "Install the latest release (restarts the server).",
         api=("POST", "/api/update/install"),
         sfctl="update",
-        panel="Updates page: Install",
+        panel="Advanced > About & updates: Install",
         cli="update apply",
     ),
     Capability(
@@ -312,7 +312,7 @@ CAPABILITIES: tuple[Capability, ...] = (
         "Roll back to the previous release.",
         api=("POST", "/api/update/rollback"),
         mcp=_w("rollback_update"),
-        panel="Updates page: Roll back",
+        panel="Advanced > About & updates: Roll back",
         cli="update rollback",
     ),
     Capability(
@@ -332,7 +332,7 @@ CAPABILITIES: tuple[Capability, ...] = (
         "Kill leaked llama-server processes that hold VRAM with no parent.",
         api=("POST", "/api/vram/reclaim"),
         mcp=_w("reclaim_orphan_engines"),
-        panel="Overview page: Reclaim",
+        panel="Advanced > GPUs & placement: Reclaim",
     ),
     # --- accounts, keys and audit (W3) -------------------------------------
     Capability(
@@ -340,7 +340,7 @@ CAPABILITIES: tuple[Capability, ...] = (
         "Is a credential required, who exists, and which listeners are on the network?",
         api=("GET", "/api/auth/status"),
         cli="doctor",
-        panel="Users & Keys page: security posture",
+        panel="Advanced > Accounts & keys: security posture",
         notes="`studioforge doctor` reports the same posture as findings.",
     ),
     Capability(
@@ -348,7 +348,7 @@ CAPABILITIES: tuple[Capability, ...] = (
         "List API keys (never the tokens).",
         api=("GET", "/api/keys"),
         cli="keys list",
-        panel="Users & Keys page: keys table",
+        panel="Advanced > Accounts & keys: keys table",
         notes="Deliberately not an MCP tool: an agent must not manage the keys that bound it.",
     ),
     Capability(
@@ -356,41 +356,41 @@ CAPABILITIES: tuple[Capability, ...] = (
         "Create a named, scoped (read | inference | admin) key; the token is shown once.",
         api=("POST", "/api/keys"),
         cli="keys create",
-        panel="Users & Keys page: Create key",
+        panel="Advanced > Accounts & keys: Create key",
     ),
     Capability(
         "keys.revoke",
         "Revoke a key; it stops working immediately.",
         api=("DELETE", "/api/keys/{key_id}"),
         cli="keys revoke",
-        panel="Users & Keys page: Revoke",
+        panel="Advanced > Accounts & keys: Revoke",
     ),
     Capability(
         "users.list",
         "List the accounts that can sign in to the panel.",
         api=("GET", "/api/users"),
         cli="users list",
-        panel="Users & Keys page: accounts table",
+        panel="Advanced > Accounts & keys: accounts table",
     ),
     Capability(
         "users.create",
         "Create an account (the first is the owner, which satisfies the network-bind rule).",
         api=("POST", "/api/users"),
         cli="users create",
-        panel="Users & Keys page: Create account",
+        panel="Advanced > Accounts & keys: Create account",
     ),
     Capability(
         "users.password",
         "Change an account's password.",
         api=("POST", "/api/users/password"),
         cli="users passwd",
-        panel="Users & Keys page: Change password",
+        panel="Advanced > Accounts & keys: Change password",
     ),
     Capability(
         "audit.read",
         "Read the append-only audit log of admin mutations.",
         api=("GET", "/api/audit"),
-        panel="Users & Keys page: audit log",
+        panel="Advanced > Accounts & keys: audit log",
         notes="The file itself is logs/audit.jsonl.",
     ),
     # --- diagnostics and operations (W3) -----------------------------------
@@ -399,20 +399,20 @@ CAPABILITIES: tuple[Capability, ...] = (
         "Check ports, GPU, engine, disk, permissions, certificate, migrations and auth posture.",
         api=("GET", "/api/doctor"),
         cli="doctor",
-        panel="Diagnostics page: Run checks",
+        panel="Advanced > Diagnostics: Run checks",
     ),
     Capability(
         "support_bundle.create",
         "A zip for bug reports: redacted config, doctor, versions, GPUs and log tails.",
         api=("POST", "/api/support-bundle"),
         cli="support-bundle",
-        panel="Diagnostics page: Download support bundle",
+        panel="Advanced > Diagnostics: Download support bundle",
     ),
     Capability(
         "metrics.get",
         "Prometheus text: gateway counters, GPU memory and every loaded model's metrics.",
         api=("GET", "/metrics"),
-        panel="Logs & Metrics page: Metrics",
+        panel="Advanced > Logs & metrics: Metrics",
     ),
     Capability(
         "server.stop",

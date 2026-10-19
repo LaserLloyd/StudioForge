@@ -753,9 +753,8 @@ def test_the_models_tab_shows_the_badge_and_says_why_instead_of_loading(tmp_path
     app = create_gui_app(config, api_state=state)
     with TestClient(app) as client:
         text = client.get("/?tab=models").text
-    assert "Model library could not be rendered" not in text
-    assert st.UNSUPPORTED_ARCH_BADGE in text
-    assert "Cannot load:" in text, "the Load button's tooltip carries the reason"
+    assert "could not be rendered" not in text
+    assert st.UNSUPPORTED_ARCH_BADGE in text, "the row carries the badge, with the reason"
     assert "does not include" in text and "k2-horizon" in text
     assert text.count(st.UNSUPPORTED_ARCH_BADGE) >= 1
     assert plan.calls == 0 and sup.starts == 0

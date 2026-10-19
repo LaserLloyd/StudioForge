@@ -116,7 +116,7 @@ the panel on the same machine keep working: they use a local admin key kept in `
 
 ### The owner account
 
-`studioforge setup` (or `studioforge users create`, or the panel's Users & Keys page) creates it. The
+`studioforge setup` (or `studioforge users create`, or the panel's Advanced > Accounts & keys page) creates it. The
 password is hashed with argon2id and the hash is stored through the secret store (OS keyring, else a
 `0600` file), not in `registry.sqlite3`, so a copied database carries no login material. Passwords
 must be at least 10 characters.

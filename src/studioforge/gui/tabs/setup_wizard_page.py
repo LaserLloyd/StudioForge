@@ -287,7 +287,7 @@ class PanelServices:
                 break
             if status in ("failed", "canceled"):
                 raise RuntimeError(
-                    f"The download of {repo} {status}. Open the Models page, Download tab, to see "
+                    f"The download of {repo} {status}. Open Models, Downloads chip, to see "
                     "why and to retry."
                 )
             self._sleep(self._poll_s)
@@ -771,8 +771,8 @@ class WizardPage:
                 ):
                     code_block(title, snippets[name])
                 ui.label(
-                    "Replace the key placeholder with a key from the Users & Keys page once you "
-                    "require sign-in."
+                    "Replace the key placeholder with a key from Advanced > Accounts & keys "
+                    "once you require sign-in."
                 ).classes("text-xs opacity-70")
 
         ui.button("Show the connection details", icon="link", on_click=show).props("color=primary")

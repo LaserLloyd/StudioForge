@@ -36,7 +36,7 @@ from studioforge_tenant.vacate import (
     vacate_asgi_route,
 )
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 
 __all__ = [
     "PROTOCOL_VERSION",

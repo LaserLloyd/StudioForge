@@ -116,9 +116,9 @@ def _setup_panel(ctx: GuiContext) -> None:
                 )
                 ui.label("Ready to serve" if ready else "Setup").classes("font-medium")
                 ui.space()
-                ui.label("the Setup tab has the full checklist and every setting").classes(
-                    "text-xs opacity-60"
-                )
+                ui.label(
+                    "Advanced > Diagnostics has the full checklist, Config every setting"
+                ).classes("text-xs opacity-60")
             for item in items:
                 with ui.row().classes("items-center gap-2 w-full no-wrap"):
                     ui.icon(item.icon, color=item.colour, size="1rem")

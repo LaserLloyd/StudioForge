@@ -46,7 +46,7 @@ def _warning_card(ctx: GuiContext) -> None:
             "anyone on the network could drive this server. Create an owner account or an admin "
             "key first, or set the bind addresses back to 127.0.0.1 (this computer only)."
         ).classes("text-sm")
-        ui.link("Open Users & Keys", section_url("Users & Keys")).classes("text-sm")
+        ui.link("Open Accounts & keys", section_url("Users & Keys")).classes("text-sm")
 
 
 def _fingerprint_line(ctx: GuiContext) -> None:

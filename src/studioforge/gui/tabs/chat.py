@@ -34,6 +34,8 @@ from typing import Any
 import httpx
 from nicegui import ui
 
+from studioforge.gui import models_view as mv
+from studioforge.gui import nav
 from studioforge.gui import state as st
 from studioforge.gui.chat_assets import CHAT_CSS, CHAT_JS
 from studioforge.gui.chat_conversation import (
@@ -120,7 +122,19 @@ def _request_error(
     return ChatRequestError(text, context_full=full)
 
 
-def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one flow
+def render(  # noqa: C901, PLR0915 - one screen, one flow
+    ctx: GuiContext,
+    *,
+    open_drawer: Callable[[str], None] | None = None,
+    go: Callable[[nav.Location], None] | None = None,
+) -> None:
+    """The Test Chat tab.
+
+    ``open_drawer`` is the Models page's per-model drawer, so a model can be loaded with the
+    planner's recommended placement (GPUs, context, KV type) from here; without it the
+    Load button still loads with the model's saved settings, as it always did. ``go`` moves
+    to another tab.
+    """
     images: list[dict[str, str]] = []
     conversation = Conversation()
     #: One entry per message id: that block's elements (see ``add_block``).
@@ -169,6 +183,14 @@ def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one fl
                 with load_button:
                     load_tip = ui.tooltip("")
                 unload_button = ui.button("Unload", icon="stop_circle").props("flat dense no-caps")
+                if open_drawer is not None:
+                    options_button = ui.button(
+                        "Load options…", icon="tune", on_click=lambda: open_options()
+                    ).props("flat dense no-caps")
+                    options_button.tooltip(
+                        "Open the model's details: pick GPUs, context and KV type with the "
+                        "planner's recommendation and a fit check before loading"
+                    )
                 details_button = ui.button(
                     "Details", icon="expand_more", on_click=lambda: toggle_details()
                 ).props("flat dense no-caps")
@@ -198,6 +220,13 @@ def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one fl
                 "Copy all", icon="content_copy", on_click=lambda: copy_all()
             ).props("flat dense no-caps")
             copy_all_button.tooltip("Copy the whole conversation as Markdown")
+            curl_button = ui.button(
+                "Copy as curl", icon="terminal", on_click=lambda: copy_curl()
+            ).props("flat dense no-caps")
+            curl_button.tooltip(
+                "Copy a curl command that repeats this request against the OpenAI-compatible "
+                "address (the API key is never included)"
+            )
             clear_button = ui.button("Clear all", icon="clear_all", on_click=lambda: clear())
             clear_button.props("flat dense no-caps")
             clear_button.tooltip("Remove every message (nothing is saved)")
@@ -936,6 +965,45 @@ def render(ctx: GuiContext) -> None:  # noqa: C901, PLR0915 - one screen, one fl
     def copy_all() -> None:
         if len(conversation):
             _copy_text(conversation.as_markdown())
+
+    def open_options() -> None:
+        pick = pick_now()
+        if pick.model_id is None or open_drawer is None:
+            ui.notify("Pick a model first.", type="warning")
+            return
+        open_drawer(pick.model_id)
+
+    def copy_curl() -> None:
+        pick = pick_now()
+        if pick.model_id is None:
+            ui.notify("Pick a model first.", type="warning")
+            return
+        system_text = str(system.value or "").strip()
+        try:
+            messages = conversation.request_messages(
+                system=system_text or None, keep_history=bool(keep_history.value)
+            )
+        except ValueError:
+            # Nothing said yet: a minimal request the reader can edit.
+            messages = ([{"role": "system", "content": system_text}] if system_text else []) + [
+                {"role": "user", "content": "Say hello in one sentence."}
+            ]
+        sampler = st.build_sampler_payload({**sampler_values(), "thinking": thinking.value})
+        from studioforge.api.auth import auth_enforced
+        from studioforge.gui.tabs.overview import primary_base_url
+
+        text = mv.chat_curl(
+            base_url=primary_base_url(ctx),
+            model_id=pick.model_id,
+            messages=messages,
+            sampler=sampler,
+            needs_key=bool(
+                ctx.config.server.api_key
+                or auth_enforced(ctx.config, getattr(ctx.api_state, "accounts", None))
+            ),
+        )
+        _copy_text(text)
+        ui.notify("Copied a curl command", type="positive")
 
     def blocked() -> bool:
         if run["active"]:
