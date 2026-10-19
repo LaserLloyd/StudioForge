@@ -25,6 +25,8 @@ from studioforge.core.accounts import AccountStore
 from studioforge.db import Database
 from studioforge.login_reset import PASSWORD_FILE_NAME, SENTINEL_NAME, apply_sentinel, parse
 
+pytestmark = pytest.mark.usefixtures("restore_logging")
+
 OLD = "the-old-password-1"
 NEW = "a-brand-new-password"
 SRC = Path(__file__).resolve().parents[2] / "src" / "studioforge"

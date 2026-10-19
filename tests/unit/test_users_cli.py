@@ -18,6 +18,8 @@ from studioforge.config import Config
 from studioforge.core.accounts import AccountStore
 from studioforge.db import Database
 
+pytestmark = pytest.mark.usefixtures("restore_logging")
+
 runner = CliRunner()
 
 PW1 = "first-long-password"

@@ -28,6 +28,8 @@ from studioforge.config import (
 )
 from studioforge.errors import ConfigError
 
+pytestmark = pytest.mark.usefixtures("restore_logging")
+
 runner = CliRunner()
 
 BAD_PAIR = {"server": {"cors_origins": ["*"], "cors_allow_credentials": True}}

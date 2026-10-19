@@ -22,6 +22,8 @@ from studioforge.config import Config
 from studioforge.core import autostart
 from studioforge.core.instance_lock import InstanceLock
 
+pytestmark = pytest.mark.usefixtures("restore_logging")
+
 runner = CliRunner()
 
 
