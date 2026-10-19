@@ -80,8 +80,8 @@ core/
   benchmark.py / parallel_bench.py   the two benchmarks (docs/BENCHMARKING.md)
   downloader.py    resumable HF downloads, one writer per .part
   gpu.py           NVML probe
-gui/           NiceGUI panel; tabs/ is one module per tab (dashboard, models, download,
-               benchmark, chat, logs, server, setup)
+gui/           NiceGUI panel; nav.py is the four-tab registry (docs/panel.md); tabs/ is one
+               module per tab or Advanced page (status, models, chat, advanced, ...)
 mcp/           management-plane MCP server (23 tools)
 tray/          Windows notification-area app
 watchdog/      recovery sidecar: its own process, port and MCP server (10 tools)
@@ -102,7 +102,7 @@ depends on nothing above it. A change that makes `core` import from `api` is a c
    with `sort_keys=False` against a scratch `SF_DATA_DIR` and paste it under the hand-written
    header; then put back the inline comments (`engine.cache_ram_mb`, `planner.preference`,
    `update.repo`) and annotate the key in the header if it is one a new user has to think about.
-4. **The GUI needs no change.** The Setup tab's Advanced section is generated from the pydantic
+4. **The GUI needs no change.** The Advanced > Config page is generated from the pydantic
    model, so a new scalar key gets a type-aware widget automatically (DECISIONS.md D26). Two
    optional follow-ups: add a one-liner to `gui/state.CONFIG_FIELD_HELP` if the generated
    "`<kind>`, default `<x>`" is not explanation enough, and promote it out of Advanced into a named

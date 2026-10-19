@@ -264,7 +264,7 @@ curl.exe -s http://127.0.0.1:1234/health
 
 Edit the `SF_MODELS` path (your GGUF folder) and `SF_OWNER_PASSWORD` (10 or more characters) before you
 run it. Open <http://localhost:8080> and sign in as `owner` with that password; create one key per
-client under **Users & Keys**, and point clients at `http://localhost:1234/v1`. Leave
+client under **Advanced > Accounts & keys**, and point clients at `http://localhost:1234/v1`. Leave
 `SF_OWNER_PASSWORD` out and the container generates one into `/data/owner-password.initial` on the
 volume. Once the image is published to the registry, replace the `docker build` line with
 `docker compose -f compose.yml -f compose.cuda.yml pull`. Do not add `--build` to `up` (see the Linux note below).
@@ -392,11 +392,11 @@ refuses to run on anything but Linux, and Docker Desktop on a Mac cannot pass a 
 
 ### First run, any platform
 
-The panel opens on **Overview** with a *Finish setup* banner that leads to the setup guide
+The panel opens on **Status** with a *Finish setup* banner that leads to the setup guide
 (`/setup`, or `studioforge setup` in a terminal): owner account, hardware, engine, model library
 (**Detect LM Studio library** finds an existing one — models are indexed in place, never copied),
 a starter model, a test chat, integration snippets and network exposure. Every step is optional on a
-local-only install. The tab-by-tab reference, with the headless YAML/CLI equivalent, is
+local-only install. The page-by-page reference, with the headless YAML/CLI equivalent, is
 [`docs/SETUP.md`](docs/SETUP.md).
 
 ---
@@ -525,7 +525,7 @@ server is wedged.
 | `llama-server` children | `18100–18200` | Internal, one port per loaded model |
 
 LM Studio also uses `1234`: quit it, or set `server.port`. Change the ports with the config keys
-`server.port`, `gui.port` and `watchdog.port` (Setup tab or `config.yaml`; `SF_SERVER__PORT`-style
+`server.port`, `gui.port` and `watchdog.port` (Advanced > Serving & network, or `config.yaml`; `SF_SERVER__PORT`-style
 environment variables only seed first-run defaults, and `studioforge serve --port` overrides the
 gateway port only). All three services bind `127.0.0.1`
 by default. Binding the network (`0.0.0.0`) requires an owner account or an admin key — the server
@@ -583,7 +583,7 @@ The same from a terminal, on any platform: `studioforge serve --open`, `studiofo
 
 - [`docs/SECURITY.md`](docs/SECURITY.md) — who may do what: bind rules, scoped keys, TLS, MCP, the audit log
 - [`docs/CLI.md`](docs/CLI.md) — every `studioforge` command (generated)
-- [`docs/SETUP.md`](docs/SETUP.md) — first run, tab by tab; GPUs, engine, network, downloads; headless
+- [`docs/SETUP.md`](docs/SETUP.md) — first run, page by page; GPUs, engine, network, downloads; headless
 - [`docs/OPENCLAW-SETUP.md`](docs/OPENCLAW-SETUP.md) — two-machine install, verified step by step
 - [`docs/OPENCLAW.md`](docs/OPENCLAW.md) — the tool list and the loop an agent runs; pins and leases
 - [`docs/OPENCLAW-RIG.md`](docs/OPENCLAW-RIG.md) — the whole rig for one agent: identity, priority, leases, every failure code

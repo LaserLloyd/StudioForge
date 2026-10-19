@@ -27,8 +27,8 @@ The watchdog has its own open `/health` on `:1235` that keeps answering when the
 ## It will not start
 
 * **`startup port conflict`** in the console / `launchers\Start StudioForge.bat` names the port and the
-  holder ("LM Studio", "another StudioForge (pid N)"). Quit that, or change `server.port` on the
-  Setup tab. Exit code 3; the tray waits up to 120 s for whoever holds the port to answer as a
+  holder ("LM Studio", "another StudioForge (pid N)"). Quit that, or change `server.port` on
+  Advanced > Serving & network. Exit code 3; the tray waits up to 120 s for whoever holds the port to answer as a
   StudioForge server before saying so (D28).
 * **`error: invalid configuration in .../config.yaml: <key> ...`** — one line, exit 2. The key is
   named; `config.yaml.bak` next to it is the previous good file. A YAML syntax error is reported,
@@ -40,7 +40,7 @@ The watchdog has its own open `/health` on `:1235` that keeps answering when the
   from GitHub; on Linux + NVIDIA it is *compiling* the tag (upstream ships no Linux CUDA archive),
   which takes minutes and needs `git`, `cmake` and a CUDA toolkit with `nvcc` — a refusal names
   whichever is missing. `/health` shows the phase and percentage. Offline? `studioforge engine
-  --list` says what it wants; the Setup tab's engine row offers Install once the boot has given
+  --list` says what it wants; Advanced > Engines offers Install once the boot has given
   up.
 
 ## A model will not load
@@ -54,7 +54,7 @@ The watchdog has its own open `/health` on `:1235` that keeps answering when the
   (never retried); `CUDA error: out of memory` is retried once after evicting the LRU idle model.
 * **A forced reload was refused** — the model that was serving is still serving; nothing was
   unloaded (D30).
-* **`no llama-server engine is installed`** — Setup tab → Install, or `studioforge engine
+* **`no llama-server engine is installed`** — Advanced > Engines → Install, or `studioforge engine
   --update`. A model pinning `engine_tag` that is not installed says which model pins it.
 
 ## A load was refused and the box looks half empty
@@ -136,7 +136,7 @@ not be read: …"* names the step that failed — GitHub unreachable, the rate l
 `releases/latest` not a `vX.Y.Z` release, no `nightly-tag.txt` asset, a pointer that is not a
 `bNNNN` tag — and the channel then recommends **nothing** rather than quietly offering the newest
 build; it retries after a minute (a good answer is cached for 15 minutes, and `GET /api/engine`
-carries `stable` / `stable_error` between checks). Switch the channel on the Setup tab's engine card
+carries `stable` / `stable_error` between checks). Switch the channel on the Advanced > Engines page
 or in `config.yaml` to be offered the newest build regardless.
 
 **`GitHub's API rate limit is exhausted`** — unauthenticated calls get 60 per hour per IP and one
@@ -146,12 +146,12 @@ a personal access token (no scopes needed for a public repository) and restart; 
 
 **The pin and the active engine disagree** (`pin b10425 · active b10549` on the engine card, or
 `drift` non-null in `GET /api/engine`). `active.json` is read **before** `engine.pinned_tag`, so the
-active build is what every new load gets and editing the pin on its own — Setup tab, `PATCH
+active build is what every new load gets and editing the pin on its own — Advanced > Engines, `PATCH
 /api/config`, `config.yaml` — changes nothing at all. It is not an error state; it just means the
 two were written separately. Settle it by activating the build you actually want, which writes
 both:
 
-* GUI: **activate + reload** on that tag (Setup or Server tab);
+* GUI: **activate + reload** on that tag (Advanced > Engines);
 * REST: `POST /api/engine/activate {"tag": "b10549"}`;
 * CLI: `studioforge engine --activate b10549`.
 
@@ -159,7 +159,7 @@ both:
 back", which does nothing (this corrects D3's original update procedure; see D49). The previous
 directory is still under `engines/`; bare `studioforge engine`, `GET /api/engine` and the engine
 card each list what is installed (`studioforge engine --list` is the other question — which tags
-GitHub offers). Then **Dashboard → Restart engines** (`POST /api/restart/backend`), because every
+GitHub offers). Then **Advanced > Engines → Restart engines** (`POST /api/restart/backend`), because every
 `llama-server` child keeps the build it was launched with until it is reloaded.
 
 **"Installed, but the engine did not change."** Since D49-4 that is correct: `POST
@@ -191,7 +191,7 @@ moved off `1234` is not detected, so stop it yourself.
 
 ## VRAM is held and nothing is loaded
 
-`GET /api/vram/holders` (or the Dashboard's VRAM holders panel) names every process on every
+`GET /api/vram/holders` (or the VRAM holders panel under Advanced > GPUs & placement) names every process on every
 GPU. Ours are marked; an `orphan` is a `llama-server` from a dead StudioForge — `POST
 /api/vram/reclaim` (or the watchdog's `reclaim_orphan_engines`, or restart) kills only those. A
 `child-of-live-process` belongs to something running (another instance, a test) and is left alone
@@ -209,7 +209,7 @@ classified `other-instance` is a `llama-server` from a different install; its `d
 
 ## A tenant is missing, unhealthy, or holding a card
 
-The Tenants card (Dashboard), `GET /api/tenants`, `sfctl tenants list` and the MCP `gpu_tenants`
+The Tenants card (Advanced > GPUs & placement), `GET /api/tenants`, `sfctl tenants list` and the MCP `gpu_tenants`
 tool list every other program that shares the GPUs: the ones declared in `tenants.registry` and the
 ones that registered themselves (D77, [TENANTS.md](TENANTS.md)).
 
@@ -257,7 +257,7 @@ No code change was needed.
 ## Downloads
 
 * **`failed` with `gated or private`** — open the model page, accept the licence, set `hf.token`
-  (Setup tab), Resume. Not retried on its own.
+  (Advanced > Catalog & downloads), Resume. Not retried on its own.
 * **`not enough disk space on <drive>`** — refused up front with the shortfall; free space or move
   `models.dir`, then Resume. A transfer that hits ENOSPC keeps its `.part` and says the same.
 * **`could not be moved into place`** — the file is complete and verified; a loaded model has the
@@ -269,8 +269,8 @@ No code change was needed.
 
 ## Security
 
-* Anyone on the LAN can reach the gateway on the defaults. Set `server.api_key` on the Setup tab
-  (the checklist's *Network exposure* row is red until you do or you bind to `127.0.0.1`).
+* Anyone on the LAN can reach the gateway on the defaults. Set `server.api_key` on Advanced > Serving & network
+  (the Diagnostics checklist's *Network exposure* row is red until you do or you bind to `127.0.0.1`).
 * Without a key, routes that change the box are only accepted from the machine itself or with the
   MCP PIN (`403 remote_admin_requires_credential` otherwise) — D32. "The machine itself" means a
   loopback peer whose browser `Origin`, if any, is this server's own host and port: a page from
@@ -280,8 +280,8 @@ No code change was needed.
 * The MCP path is under the same rule: with no key, every tool call from off the box needs the PIN
   even with `mcp.pin_required: false`; `GET /api/mcp/info` reports the `pin_required` a caller is
   really held to.
-* The PIN is in the startup banner and `studioforge config` on the box; **Generate new PIN** on the
-  Setup tab rotates it after a leak. Send it as `X-MCP-Pin` or the bearer token. `?pin=` in the URL
+* The PIN is in the startup banner and `studioforge config` on the box; **Generate new PIN** on
+  Advanced > Serving & network rotates it after a leak. Send it as `X-MCP-Pin` or the bearer token. `?pin=` in the URL
   is refused: a URL lands in proxy logs, browser history and shell history.
 * Wrong credentials are rate-limited. Three free attempts per client address, then a doubling
   lockout (1s, 2s, 4s … capped at 5 minutes) that clears after 15 quiet minutes or on any
@@ -301,7 +301,7 @@ No code change was needed.
 * **What an open install shows a remote reader is shaped, not closed** (D55). `GET /api/logs`,
   `/api/logs/models/{id}` and `/api/vram/holders` answer a caller that is not an admin with paths
   reduced to basenames and every foreign command line removed, and say `redacted: true`; the same
-  request from the box, or with the PIN/key, is verbatim. The panel's Logs tab is local-only on an
+  request from the box, or with the PIN/key, is verbatim. The panel's Advanced > Logs & metrics page is local-only on an
   open install. The child's launch line is redacted wherever it is written, so a key in
   `extra_flags` never reaches a log. An unhandled 500 hands the caller `ref=<8 hex>`; grep the
   server log for that reference to find the exception text.

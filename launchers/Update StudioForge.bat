@@ -84,8 +84,8 @@ if defined SF_SERVER_LIVE (
   echo   SKIPPED: a StudioForge server is answering on http://127.0.0.1:1234.
   echo   Updating the engine under a running server would overwrite binaries its
   echo   loaded models are executing. Use the running server instead:
-  echo     - GUI: Setup tab ^(or Server tab^) - llama.cpp engine - Check / Install,
-  echo       then Activate; then Dashboard - Restart engines.
+  echo     - GUI: Advanced tab, Engines page - llama.cpp engine - Check / Install,
+  echo       then Activate; then Restart engines ^(same page^).
   echo     - REST: POST /api/engine/install then POST /api/engine/activate.
   echo   Or stop the server ^("Stop StudioForge.bat"^) and re-run this script.
 ) else (
