@@ -36,9 +36,9 @@ if str(COMPANION_SRC) not in sys.path:
 import studioforge_companion  # noqa: E402
 
 #: The human/display version, and the tag with its ``v``. SemVer since 2.0.0.
-DISPLAY_VERSION = "2.0.1"
+DISPLAY_VERSION = "2.1.0"
 #: The package metadata; identical to the display version under SemVer.
-PEP440_VERSION = "2.0.1"
+PEP440_VERSION = "2.1.0"
 #: The release before this one (the last calendar-versioned tag); the new
 #: version must sort above it across the two schemes.
 PREVIOUS_RELEASE = "1.26-09-23"
@@ -91,11 +91,11 @@ def test_semver_sorts_above_every_calendar_release() -> None:
     the 2.0.0 tag as the update it is.
     """
     new = _version_key(studioforge.__version__)
-    assert new == (2, 0, 1)
+    assert new == (2, 1, 0)
     for old in OLDER_CALENDAR_RELEASES + (PREVIOUS_RELEASE,):
         assert new > _version_key(old), old
-    assert _version_key("v2.0.1") == new
-    assert _version_key("2.0.2") > new > _version_key("1.99-12-31")
+    assert _version_key("v2.1.0") == new
+    assert _version_key("2.1.1") > new > _version_key("1.99-12-31")
 
 
 def test_the_docs_quote_the_current_version() -> None:

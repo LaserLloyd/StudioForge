@@ -7605,3 +7605,88 @@ SDK's `release_stale` got `403`, and the next grant collided with the tenant's o
 idle TTL (or forever with `idle_ttl_s: null`). Such a lease -- and one whose key was since revoked,
 and a registration whose key was revoked -- now also yields to the holder's D55 proof, the same
 proof that already let that holder unload its models.
+
+## D81 -- Locked out is recoverable from the filesystem; the CLI acts on the install that runs
+
+**Problem.** On 2026-10-19 the owner could not get back into the control panel, and the tools that
+should have fixed it did not. Two defects, both found on the rig the same day.
+
+1. `studioforge users passwd` (and `keys`, `doctor`, `migrate`) resolve the data directory the way
+   a server would -- `--config`, `SF_CONFIG`, `SF_DATA_DIR`, else `<checkout>/data`, else the platform
+   directory. The service never uses that fall-through: the tray is started by the Startup launcher
+   with an explicit `--config`, so its data lives wherever `autostart enable` / `local-env.bat` said.
+   A plain `studioforge users passwd` from a terminal therefore changed a password in an empty,
+   unrelated database, reported success, and the owner stayed locked out. There was also no way to
+   delete an account, and no way back in at all for someone who had the files but no working login
+   (the CLI needs the right data dir to be told, which is the thing nobody remembers).
+2. The Serving tab was reported to have saved `server.cors_allow_credentials: true` next to
+   `server.cors_origins: ['*']`. `Config` refuses that pair when it loads, so the file was valid
+   YAML that `serve` would have refused to start on at the next boot (the live file was fixed by
+   hand). On current main a single update carrying both keys is already refused by
+   `apply_overrides` -- but with pydantic's raw dump as the message -- and the write itself
+   (`Config.save()`) trusted whatever the in-memory model held: pydantic does not re-validate on
+   attribute assignment, and the running config is deliberately not swapped for restart-required
+   keys, so memory and disk can disagree. Nothing at the write stopped a file `serve` could not load.
+
+**Decision.**
+
+1. **The CLI finds the installed data directory** (`install_locator.locate`). With no `--config`,
+   `SF_CONFIG` or `SF_DATA_DIR`: the directory of a *running* instance (a live pid in
+   `.instance.lock`) wins; else the first existing candidate read from the installed Startup
+   launcher (`StudioForge.vbs`: its `--config`, else its working directory), the systemd user unit
+   then the system unit (`SF_DATA_DIR=` or `--config`), the checkout's `local-env.bat`; else the old
+   default. Read-only: it parses a launcher and a lock file. It lives in `cli_commands._config`, the
+   CLI's one loader, and in `config` -- **not** in `default_data_dir()`, so the server, the tray, the
+   tests and every library caller keep exactly the resolution they had. `SF_NO_INSTALL_DISCOVERY=1`
+   turns it off (the unit suite sets it for every test). Every command that manages credentials or
+   touches the database directly (`users`, `keys`, `doctor`, `migrate`, `support-bundle`,
+   `config check`) prints one line, on stderr so `--json` stays parseable, naming the data directory,
+   the database and where the decision came from: `studioforge: acting on <dir> (from <source>);
+   database <path>`. **A launcher is adopted only if it is ours**: its interpreter (the shim's
+   `pythonw`, the unit's `ExecStart`) must live in the Python environment the command runs from, and
+   the data directory must be owned by the current user; a foreign install is reported (directory,
+   source, the `sudo -u <owner> env SF_DATA_DIR=...` form) and the command stops, asking for
+   `--config`. Discovery runs only for the account-managing commands and `config`; `server`,
+   `setup` and the model commands resolve the directory exactly as before.
+2. **Account verbs, one noun.** `users list | add <name> | passwd <name> | delete <name>`; `add` is
+   `create` under its other name. The password comes from `--password-stdin`, `--password-env VAR`
+   or a hidden prompt, never from an argument. `delete` asks (or `--yes`), removes the row and the
+   password hash (the panel session bound to that password dies with it; API keys are untouched,
+   `keys revoke` them), refuses, without `--force`, a deletion that
+   would leave no ENABLED account and no active admin key (`last_account`), and promotes the oldest
+   enabled account to owner when the owner is removed. An account having existed is remembered
+   (`<data>/.had-owner`, `AccountStore.had_owner_cached`, consulted by `auth_enforced` like
+   `had_keys_cached`), so force-deleting the last account cannot reopen a running network-bound
+   server. Keys already had `keys list | create | revoke`.
+3. **`<data>/RESET_LOGIN`** (`login_reset`). A file in the data directory, read once by `serve`
+   after the port check and before the bind rule: empty = a generated password for the owner;
+   `name` = a generated password for that account; `name:password` = that password (the split is at
+   the first colon). The account is created if missing and re-enabled if disabled. A generated
+   password goes to `RESET_LOGIN.password`, owner-only, and never to a log or the console; the one
+   log line names the account and the file. **The sentinel is deleted before anything changes**, and
+   if it cannot be deleted nothing is applied, so it cannot replay however the start goes; a
+   rejected reset (under ten characters) still consumes the file. It cannot be triggered over the
+   network because nothing on a request path references it -- only `__main__.serve` imports the
+   module, nothing watches the file while the server runs, and the tests pin both. Whoever can
+   create a file in the data directory can already read the database and `cli.key`, so the sentinel
+   widens nothing. An environment-variable form was rejected: a compose file keeps the variable, and
+   "read once" would then mean "every start".
+4. **`Config.save()` validates the whole model before it writes a byte** and raises `invalid_config`
+   with the validator's own sentence (`server.cors_allow_credentials=true requires explicit
+   server.cors_origins ...`) instead of pydantic's dump; `apply_overrides`, `load_config` and the
+   panel's toast use the same wording. `load_config`'s error now ends with the command that explains
+   it. **`studioforge config check`** validates `config.yaml` exactly as `serve` will, lists every
+   bad key, names `config.yaml.bak` when there is one and exits 1; `studioforge config` and
+   `config --path` are unchanged.
+
+**Not done.** No `DELETE /api/users` route and no delete button in the panel: removing a login
+is an operator action with the files in hand, and an HTTP route would be one more way to lock the
+owner out. `keys` gained no `token` verb (the legacy `server.api_key` is deprecated and mirrored as
+the admin key `legacy`; `keys revoke legacy` ends it). The related drift -- a restart-required key
+saved to disk is not swapped into the running config, so the *next* unrelated save from memory
+writes the old value back -- is real and untouched here; `save()` makes it write a loadable file,
+not the file the owner meant.
+
+**Surfaces.** README "Accounts and lockout recovery", `docs/deploy/docker.md`, `docs/SECURITY.md`,
+`docs/RUNBOOK.md`, `docs/CLI.md` (generated), `CHANGELOG.md` 2.1.0, `tests/unit/test_users_cli.py`,
+`test_login_reset.py`, `test_install_locator.py`, `test_config_check.py`.

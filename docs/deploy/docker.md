@@ -17,6 +17,7 @@ Docker and with Podman.
 - [The engine: first run, and offline](#the-engine-first-run-and-offline)
 - [Your data survives updates](#your-data-survives-updates)
 - [Backup and restore](#backup-and-restore)
+- [Accounts and lockout recovery](#accounts-and-lockout-recovery)
 - [Podman notes](#podman-notes)
 - [Build it yourself](#build-it-yourself)
 - [Troubleshooting](#troubleshooting)
@@ -181,6 +182,44 @@ Copying only `registry.sqlite3` from a running instance can miss the `-wal` file
 under `/data/backups/` and the archive above are consistent, a raw copy of a live database may not
 be. For Podman, replace `docker` with `podman` (add `:z` to the bind mount on SELinux hosts).
 
+## Accounts and lockout recovery
+
+The panel's owner account and the API keys live on the `studioforge-data` volume (`/data`). Manage
+them with the CLI inside the container, which acts on `/data` (every command prints a
+`studioforge: acting on /data ...` line first). The password goes in on stdin, never as an argument.
+
+```bash
+docker compose exec studioforge studioforge users list
+read -rs -p "New password: " PW; echo
+printf '%s
+' "$PW" | docker compose exec -T studioforge studioforge users passwd owner --password-stdin
+printf '%s
+' "$PW" | docker compose exec -T studioforge studioforge users add alice --password-stdin
+docker compose exec studioforge studioforge users delete alice --yes
+docker compose exec studioforge studioforge keys list
+```
+
+The container will not start (for example `auth_required_for_remote_bind`, exit code 4)? Run the
+command one-off against the same volume: `printf '%s
+' "$PW" | docker compose run --rm -T
+studioforge users passwd owner --password-stdin`.
+
+No working CLI at all: drop a **`RESET_LOGIN`** file onto the volume and restart the container.
+`serve` reads it once at start, applies it and deletes it before anything changes. An empty file
+resets the owner to a generated password (written owner-only to `/data/RESET_LOGIN.password`);
+`name` does the same for that account (created if missing); `name:password` sets that password.
+
+```bash
+docker run --rm -v studioforge-data:/data alpine touch /data/RESET_LOGIN      # or: name:new-long-password
+docker compose restart studioforge
+docker run --rm -v studioforge-data:/data alpine cat /data/RESET_LOGIN.password   # then delete it
+```
+
+On a bind-mounted data directory just create the file in that folder. The file is read only at
+container start; it cannot be triggered over the network. The full table (what is reset, what is
+kept, native Windows and Linux commands) is the README's
+[Accounts and lockout recovery](../../README.md#accounts-and-lockout-recovery).
+
 ## Podman notes
 
 - Build with `podman build --format docker …`: the default OCI format silently drops `HEALTHCHECK`.
@@ -206,7 +245,7 @@ switch the two `uv sync` lines to `--locked` for reproducible images.
 | Symptom | Cause / fix |
 | --- | --- |
 | `/health` says `can_serve=false`, `gpu_count=0` | No GPU passed through (`/api/gpus` lists what each probe tried). Check `docker run --gpus all … nvidia-smi -L`; for ROCm/Vulkan pass `/dev/kfd` / `/dev/dri` and the `video`/`render` gids. |
-| Container exits with code 4, log says `auth_required_for_remote_bind` | The volume has no owner account or admin key and the entrypoint could not create one (for example `SF_OWNER_PASSWORD` shorter than 10 characters). Fix the password, or run `docker compose run --rm studioforge users create owner --password-stdin`. |
+| Container exits with code 4, log says `auth_required_for_remote_bind` | The volume has no owner account or admin key and the entrypoint could not create one (for example `SF_OWNER_PASSWORD` shorter than 10 characters). Fix the password, or run `docker compose run --rm -T studioforge users add owner --password-stdin` (password on stdin). Forgot it instead? See [Accounts and lockout recovery](#accounts-and-lockout-recovery). |
 | `401 invalid_api_key` from a client | Expected once the owner account exists: give each client a key (`studioforge keys create`, or Users & Keys). |
 | `engine not ready … No such file or directory: 'git'` in the log | The volume has no engine and the first-start download did not run or failed (`SF_ENGINE_BOOTSTRAP=0`, offline). Run `docker compose exec studioforge studioforge engine --update`, or use `-cuda-devel`, or mount a prepared `engines/`. |
 | `cannot build llama.cpp from source: no CUDA compute capability` | No GPU visible when the engine was needed. |

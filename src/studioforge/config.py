@@ -17,11 +17,13 @@ surfaces and hand edits round-trip through the same file. The file lives
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import json
 import os
 import re
 import time
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any, ClassVar, Literal
 
@@ -82,6 +84,28 @@ CACHE_RAM_AUTO_FALLBACK_MIB = 8192
 CACHE_RAM_MIN_GRANT_MIB = 4096
 
 APP_NAME = "studioforge"
+
+
+def explain_validation_error(exc: BaseException) -> str:
+    """The validator's own words, one ``key: reason`` per problem, no pydantic boilerplate.
+
+    ``str(ValidationError)`` carries the offending input dict and a docs URL; a
+    person fixing ``config.yaml`` by hand (or reading a panel toast) needs the key
+    and the reason. A model-level validator reports the section it guards
+    (``server``) and names the exact key in its own message.
+    """
+    errors = getattr(exc, "errors", None)
+    if not callable(errors):
+        return str(exc)
+    lines: list[str] = []
+    try:
+        for item in errors():
+            loc = ".".join(str(part) for part in item.get("loc", ())) or "(root)"
+            msg = str(item.get("msg", "")).removeprefix("Value error, ")
+            lines.append(f"{loc}: {msg}")
+    except Exception:  # noqa: BLE001 - never let the explanation hide the error
+        return str(exc)
+    return "; ".join(lines) or str(exc)
 
 
 def _checkout_data_dir() -> Path | None:
@@ -1267,8 +1291,23 @@ class Config(BaseSettings):
         loudly rather than silently leaving the file unwritten.
         """
         target = path or self.config_path
-        target.parent.mkdir(parents=True, exist_ok=True)
         data = self.to_yaml_dict()
+        # Validate the WHOLE config as it will be read back, before a byte is
+        # written. Pydantic does not re-validate on attribute assignment, so a
+        # config mutated in place (or assembled from two earlier saves) can hold a
+        # combination the model refuses to load: the panel once saved
+        # ``cors_allow_credentials: true`` next to ``cors_origins: ['*']`` and
+        # ``serve`` then refused to start at the next boot. A file that cannot be
+        # loaded is never written (D81).
+        try:
+            Config(data_dir=self.data_dir, **data)
+        except Exception as exc:  # noqa: BLE001 - pydantic ValidationError and friends
+            raise ConfigError(
+                f"refusing to save an invalid configuration (nothing was written to "
+                f"{target}): {explain_validation_error(exc)}",
+                code="invalid_config",
+            ) from exc
+        target.parent.mkdir(parents=True, exist_ok=True)
         self._park_hf_token(data)
         payload = yaml.safe_dump(data, sort_keys=False, default_flow_style=False)
         tmp = target.with_suffix(target.suffix + ".tmp")
@@ -1437,7 +1476,16 @@ def load_config(path: Path | str | None = None, *, create: bool = False) -> Conf
     try:
         config = Config(data_dir=data_dir, **raw)
     except Exception as exc:
-        raise ConfigError(f"invalid configuration in {config_path}: {exc}") from exc
+        raise ConfigError(
+            f"invalid configuration in {config_path}: {explain_validation_error(exc)}. "
+            "Run `studioforge config check` for the details"
+            + (
+                f"; the last good save may be {config_path}.bak"
+                if config_path.with_name(config_path.name + ".bak").is_file()
+                else ""
+            ),
+            code="invalid_config",
+        ) from exc
 
     config.source_path = config_path if file_present else None
 
@@ -1582,10 +1630,69 @@ def apply_overrides(config: Config, updates: dict[str, Any]) -> Config:
         # new object -- and its save() -- lands in the default data directory.
         updated = Config(data_dir=config.data_dir, **data)
     except Exception as exc:
-        raise ConfigError(f"invalid config update: {exc}") from exc
+        raise ConfigError(
+            f"invalid config update (nothing was saved): {explain_validation_error(exc)}"
+        ) from exc
     updated.source_path = config.source_path
     _register_secrets(updated)
     return updated
+
+
+@dataclass
+class ConfigCheck:
+    """What ``studioforge config check`` found in one ``config.yaml``."""
+
+    path: Path
+    #: The file exists. A missing file is fine (the defaults apply), not a problem.
+    exists: bool
+    #: ``(key, reason)`` per problem, in the validator's own words. Empty = loads.
+    problems: list[tuple[str, str]] = dataclasses.field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not self.problems
+
+    @property
+    def backup(self) -> Path | None:
+        bak = self.path.with_name(self.path.name + ".bak")
+        return bak if bak.is_file() else None
+
+
+def check_config_file(path: Path | str | None = None) -> ConfigCheck:
+    """Validate a ``config.yaml`` exactly as ``serve`` will load it, writing nothing.
+
+    Same steps as :func:`load_config` (YAML, mapping, ``data_dir`` ignored, the whole
+    :class:`Config` model) but it reports EVERY problem instead of raising on the
+    first, and it never creates the file, probes hardware or touches the secret store.
+    """
+    config_path = find_config_path(path)
+    explicit = path is not None or bool(os.environ.get("SF_CONFIG"))
+    result = ConfigCheck(path=config_path, exists=config_path.is_file())
+    if not result.exists:
+        return result
+    try:
+        loaded = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    except (yaml.YAMLError, OSError, UnicodeDecodeError) as exc:
+        result.problems.append(("(file)", f"not valid YAML: {exc}"))
+        return result
+    if loaded is None:
+        return result  # empty: treated as missing, defaults apply (D31)
+    if not isinstance(loaded, dict):
+        result.problems.append(("(file)", "must contain a YAML mapping of settings"))
+        return result
+    raw = {k: v for k, v in loaded.items() if k != "data_dir"}
+    try:
+        Config(data_dir=resolve_data_dir(config_path, explicit=explicit), **raw)
+    except Exception as exc:  # noqa: BLE001 - pydantic ValidationError and friends
+        errors = getattr(exc, "errors", None)
+        if callable(errors):
+            for item in errors():
+                key = ".".join(str(part) for part in item.get("loc", ())) or "(root)"
+                reason = str(item.get("msg", "")).removeprefix("Value error, ")
+                result.problems.append((key, reason))
+        if not result.problems:
+            result.problems.append(("(file)", str(exc)))
+    return result
 
 
 # Keys that only take effect after a restart; the GUI shows an indicator.

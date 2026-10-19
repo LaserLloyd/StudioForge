@@ -351,6 +351,15 @@
       "surface": "api"
     },
     {
+      "code": "last_account",
+      "docs": "errors/last_account",
+      "error_type": "invalid_request_error",
+      "fix": "Create another account first (`studioforge users add <name>`) or an admin key, or pass --force to delete it anyway. Locked out instead? `studioforge users passwd <name>` resets the password, or put a RESET_LOGIN file in the data directory (README, 'Accounts and lockout recovery').",
+      "http_status": 400,
+      "message": "'{username}' is the last account that can sign in and no active admin key exists; deleting it would leave nothing to sign in with.",
+      "surface": "api"
+    },
+    {
       "code": "lease_conflict",
       "docs": "errors/lease_conflict",
       "error_type": "invalid_request_error",

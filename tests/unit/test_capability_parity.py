@@ -82,6 +82,9 @@ def _cli_commands() -> set[str]:
             path = f"{prefix} {name}".strip()
             if getattr(sub, "commands", None):
                 walk(sub, path)
+                # A group that also runs on its own (`config`, `config check`) is a command too.
+                if getattr(sub, "invoke_without_command", False):
+                    found.add(path)
             else:
                 found.add(path)
 

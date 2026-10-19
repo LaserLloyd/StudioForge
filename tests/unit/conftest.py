@@ -33,3 +33,15 @@ def _plain_wide_cli_help(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(rich_utils, "FORCE_TERMINAL", False, raising=False)
     monkeypatch.setattr(rich_utils, "MAX_WIDTH", 200, raising=False)
     monkeypatch.setenv("NO_COLOR", "1")
+
+
+@pytest.fixture(autouse=True)
+def _no_install_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The CLI must never discover the developer's real install from a test (D81).
+
+    ``studioforge.install_locator`` reads the installed Startup launcher / systemd unit
+    to find the live data directory when no ``--config``/``SF_DATA_DIR`` is given. A test
+    that forgets to set either would otherwise act on that real install, so discovery is
+    off for the whole suite; the tests of the locator turn it on against fakes.
+    """
+    monkeypatch.setenv("SF_NO_INSTALL_DISCOVERY", "1")

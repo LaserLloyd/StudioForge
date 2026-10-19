@@ -77,7 +77,7 @@ Do this first. Every later step assumes it, and it is the single most common thi
 curl -s -m 8 http://<rig-ip>:1234/health
 ```
 
-Expected: `{"status":"ok","version":"2.0.1","build":"<short sha>",...}` — the version comes from
+Expected: `{"status":"ok","version":"2.1.0","build":"<short sha>",...}` — the version comes from
 this repository's `studioforge/__init__.py`, and `build` is the git commit the server runs from
 (`-dirty` when it carries uncommitted changes, `unknown` from a wheel). A different version means you
 are talking to another build, and these instructions may not match it.
