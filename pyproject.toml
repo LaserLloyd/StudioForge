@@ -12,7 +12,7 @@ requires-python = ">=3.12"
 # SPDX expression + license-files (PEP 639). Deliberately NOT a
 # `License :: OSI Approved :: ...` trove classifier as well: hatchling refuses
 # a build that carries both, and the expression is the machine-readable one.
-license = "MIT"
+license = "MIT-0"
 license-files = ["LICENSE"]
 keywords = [
     "llama.cpp", "llama-server", "llm", "llm-server", "openai-compatible", "gpu", "vram",

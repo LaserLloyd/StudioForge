@@ -143,6 +143,6 @@ dir — the second becomes a read-only *secondary* (D24) — so stop one before 
 
 ## Licensing of contributions
 
-The project is **MIT** ([`LICENSE`](LICENSE)). Contributions are accepted under the same terms:
-opening a pull request means you agree your work is licensed MIT and that you have the right to
+The project is **MIT-0** ([`LICENSE`](LICENSE)). Contributions are accepted under the same terms:
+opening a pull request means you agree your work is licensed MIT-0 and that you have the right to
 licence it. There is no separate CLA.

@@ -158,6 +158,5 @@ tool, or the watchdog's own rollback when the server is too wedged to answer.
 
 ## Licence
 
-**MIT** — see [`LICENSE`](../LICENSE) at the repository root; `pyproject.toml` carries the SPDX
-`license = "MIT"` expression. A release zip must include the `LICENSE` file, and the copyright
-notice must stay intact in anything packaged or redistributed.
+**MIT-0** (MIT No Attribution) — see [`LICENSE`](../LICENSE) at the repository root; `pyproject.toml`
+carries the SPDX `license = "MIT-0"` expression. A release zip should include the `LICENSE` file.

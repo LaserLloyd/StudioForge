@@ -8,7 +8,7 @@ readme = "README.md"
 # 3.12, like the server: a tenant runs on the GPU box beside StudioForge, and
 # the box already has 3.12 for the server itself.
 requires-python = ">=3.12"
-license = "MIT"
+license = "MIT-0"
 license-files = ["LICENSE"]
 keywords = ["studioforge", "gpu", "vram", "lease", "gpu-lease", "tenant", "multi-gpu"]
 classifiers = [

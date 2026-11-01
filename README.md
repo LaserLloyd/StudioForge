@@ -1,7 +1,7 @@
 # StudioForge
 
 [![CI](https://github.com/LaserLloyd/StudioForge/actions/workflows/ci.yml/badge.svg)](https://github.com/LaserLloyd/StudioForge/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![License: MIT-0](https://img.shields.io/badge/License-MIT--0-green.svg)](LICENSE)
 
 
 <table>
@@ -743,7 +743,7 @@ StudioForge is built and maintained by **Lloyd** — [LaserLloyd.com](https://la
 
 ## License
 
-**MIT** — see [`LICENSE`](LICENSE). Use it, fork it, ship it; keep the copyright notice.
+**MIT-0** (MIT No Attribution) — see [`LICENSE`](LICENSE). Use it, fork it, ship it; no attribution required.
 
 The dependencies are permissive too (MIT, BSD, Apache-2.0) with one exception worth naming:
 `pystray`, which draws the Windows system-tray icon, is **LGPL-3.0**. It is an unmodified

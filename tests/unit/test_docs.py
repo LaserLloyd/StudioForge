@@ -134,7 +134,7 @@ def test_the_repository_carries_a_licence_and_both_packages_declare_it() -> None
     licence = REPO_ROOT / "LICENSE"
     assert licence.is_file(), "no LICENSE file at the repository root"
     text = licence.read_text(encoding="utf-8")
-    assert "MIT License" in text
+    assert "MIT No Attribution" in text
     assert "Copyright (c)" in text
 
     for pyproject in (
@@ -142,7 +142,7 @@ def test_the_repository_carries_a_licence_and_both_packages_declare_it() -> None
         REPO_ROOT / "packages" / "studioforge-companion" / "pyproject.toml",
     ):
         project = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]
-        assert project.get("license") == "MIT", f"{pyproject} declares no licence"
+        assert project.get("license") == "MIT-0", f"{pyproject} declares no licence"
         assert project.get("license-files"), f"{pyproject} ships no licence file"
         # PEP 639: an SPDX expression and a trove classifier together is a
         # build error, so the classifier must stay out.

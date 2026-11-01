@@ -122,4 +122,4 @@ Neither repository is modified by this package existing; adoption is each projec
 
 ## Licence
 
-MIT, the same terms as StudioForge.
+MIT-0 (MIT No Attribution), the same terms as StudioForge.
