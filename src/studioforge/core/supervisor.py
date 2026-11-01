@@ -67,6 +67,7 @@ from studioforge.core.engine import (
     EngineFeatures,
     architecture_table,
     child_environment,
+    normalize_flag_token,
     partial_offload_allowance,
     policy_family,
     probe_engine_features,
@@ -288,7 +289,9 @@ def _parse_launch_argv(argv: Sequence[str]) -> tuple[dict[str, str], dict[str, b
 
     values: dict[str, str] = {}
     switches: dict[str, bool] = {}
-    tokens = list(argv[1:])  # argv[0] is the binary
+    # argv[0] is the binary. Read quoted / look-alike-dash spellings the way the
+    # policy does (the report is a check; the argv itself is never rewritten).
+    tokens = [normalize_flag_token(t) for t in argv[1:]]
     i = 0
     while i < len(tokens):
         token = tokens[i]
@@ -342,7 +345,7 @@ def launch_policy_violations(
         allow_partial_cpu_offload=bool(settings is not None and settings.allow_partial_cpu_offload),
     )
     found: list[str] = []
-    tokens = list(argv[1:])
+    tokens = [normalize_flag_token(t) for t in argv[1:]]
     i = 0
     while i < len(tokens):
         token = tokens[i]

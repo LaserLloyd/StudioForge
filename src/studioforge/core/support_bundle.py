@@ -14,7 +14,10 @@ layered, because any single layer can miss something:
 3. *Shapes.* Patterns that look like a credential whatever their source: StudioForge
    keys (``sf-r|i|a-...``), ``Bearer`` tokens, ``X-MCP-Pin`` headers, ``api_key=``
    / ``token=`` / ``password=`` assignments, argon2 hashes, HuggingFace tokens.
-4. *Paths.* The user's home directory becomes ``~``.
+4. *Paths.* The user's home directory becomes ``~`` (also in its JSON-escaped
+   spelling, where Windows backslashes are doubled).
+5. *Peers.* IP addresses other than loopback / unspecified (peer addresses,
+   tailnet and CGNAT ranges, LAN hosts) and ``owner:<username>`` actors are masked.
 
 Also never included: the database, the key snapshot, the CLI key, ``secrets/``,
 the TLS private key, models or any prompt/response content.
@@ -23,6 +26,7 @@ the TLS private key, models or any prompt/response content.
 from __future__ import annotations
 
 import io
+import ipaddress
 import json
 import platform
 import re
@@ -64,6 +68,24 @@ _SHAPES: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"[?&](pin|api_key|token|key)=[^&\s]+", re.IGNORECASE), r"?\1=[REDACTED]"),
 )
 
+_IPV4 = re.compile(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w]|\.\d)")
+_IPV6 = re.compile(
+    r"(?<![\w:.])[0-9A-Fa-f]{0,4}(?::[0-9A-Fa-f]{0,4}){2,7}(?:\.\d{1,3}){0,3}(?![\w:])"
+)
+_OWNER_ACTOR = re.compile(r"(?i)\bowner:[^\s'\",;)\]}]+")
+
+
+def _mask_ip(match: re.Match[str]) -> str:
+    """Replace one address unless it is loopback or the unspecified address."""
+    try:
+        address = ipaddress.ip_address(match.group(0))
+    except ValueError:
+        return match.group(0)
+    if address.is_loopback or address.is_unspecified:
+        return match.group(0)
+    return "[ip]"
+
+
 #: Log lines kept per file, and audit lines.
 DEFAULT_LOG_LINES = 2000
 AUDIT_LINES = 500
@@ -85,9 +107,16 @@ def redact_text(text: str, config: Config | None = None, *, extra: list[str] | N
         text = text.replace(value, "[REDACTED]")
     for pattern, replacement in _SHAPES:
         text = pattern.sub(replacement, text)
+    text = _OWNER_ACTOR.sub("owner:[user]", text)
+    text = _IPV4.sub(_mask_ip, text)
+    text = _IPV6.sub(_mask_ip, text)
     home = str(Path.home())
     if home and len(home) > 3:
-        text = text.replace(home, "~").replace(home.replace("\\", "/"), "~")
+        # Plain, JSON-escaped (Windows backslashes doubled, as in doctor.json and
+        # structured logs) and forward-slash spellings; longest first.
+        escaped = json.dumps(home)[1:-1]
+        for spelling in sorted({home, escaped, home.replace("\\", "/")}, key=len, reverse=True):
+            text = text.replace(spelling, "~")
     return text
 
 

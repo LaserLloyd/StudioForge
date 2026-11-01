@@ -74,28 +74,46 @@ def _windows_user() -> str:
     return f"{domain}\\{name}" if domain and name else name
 
 
+def _write_private_windows(target: Path, payload: bytes) -> None:
+    """Restrict first, verify, then write; never leave a secret under a loose ACL.
+
+    A new file is created empty and an existing one is restricted *before* it is
+    truncated and filled. If ``icacls`` failed and the file is verifiably open to
+    other accounts, nothing is written (a new file is removed) and ``PermissionError``
+    is raised. A filesystem that cannot tell (FAT, some shares: ``is_owner_only``
+    returns ``None``) keeps the old best-effort behaviour so a config save still works.
+    """
+    existed = target.exists()
+    if not existed:
+        target.touch()
+    if not restrict_to_owner(target) and is_owner_only(target) is False:
+        if not existed:
+            with contextlib.suppress(OSError):
+                target.unlink()
+        raise PermissionError(
+            f"could not restrict {target} to the current user, so it was not written"
+        )
+    with target.open("wb") as handle:
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
 def write_private(path: Path, data: bytes | str, *, encoding: str = "utf-8") -> None:
     """Write ``data`` to ``path`` so that no other account ever sees it.
 
     The file is created owner-only *before* the secret goes in (``0600`` at
     ``open(2)`` on POSIX; created empty, ACL-restricted, then filled on
     Windows), so there is no window in which it is world-readable. An existing
-    file is truncated in place, keeping its (already restricted) permissions.
+    file is re-restricted and then truncated in place; on Windows a restriction
+    that fails on a file that is verifiably open raises ``PermissionError``
+    before any secret is written.
     """
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     payload = data.encode(encoding) if isinstance(data, str) else data
     if os.name == "nt":
-        existed = target.exists()
-        if not existed:
-            target.touch()
-            restrict_to_owner(target)
-        with target.open("wb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        if existed:
-            restrict_to_owner(target)
+        _write_private_windows(target, payload)
         return
     descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     # The mode argument only applies to a NEW file: an existing 0644 one would

@@ -283,13 +283,34 @@ POLICY_FLAGS: dict[str, FlagFamily] = {
 }
 
 
+#: Dash look-alikes (hyphen, non-breaking hyphen, figure/en/em dash, horizontal
+#: bar, minus sign, small hyphen-minus, fullwidth hyphen-minus) read as ``-``.
+_DASH_LOOKALIKES = {
+    ord(c): "-" for c in "\u2010\u2011\u2012\u2013\u2014\u2015\u2212\ufe58\ufe63\uff0d"
+}
+
+
+def normalize_flag_token(token: str) -> str:
+    """The token as the policy must read it: unquoted, with look-alike dashes mapped to ``-``.
+
+    ``shlex.split(..., posix=False)`` (the Windows spelling) keeps the quotes,
+    so ``"--cpu-moe"`` would otherwise classify as a value; and a U+2010 or
+    U+2014 dash would not match any family. Whatever the engine would do with
+    such a token, a refusal must not depend on the spelling.
+    """
+    text = token.strip()
+    while len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        text = text[1:-1].strip()
+    return text.translate(_DASH_LOOKALIKES)
+
+
 def policy_family(token: str) -> FlagFamily | None:
     """The policy family an argv token belongs to, or ``None``.
 
     ``--flag=value`` spellings are recognised too: llama.cpp does not accept
     them, but a refusal must not depend on the parser the attacker expects.
     """
-    return POLICY_FLAGS.get(token.split("=", 1)[0])
+    return POLICY_FLAGS.get(normalize_flag_token(token).split("=", 1)[0])
 
 
 #: Every spelling that ``engine.strict_gpu: false`` plus a model's
@@ -328,7 +349,7 @@ def policy_refusal(token: str, allow: frozenset[str] = frozenset()) -> str | Non
     family = policy_family(token)
     if family is None:
         return None
-    base = token.split("=", 1)[0]
+    base = normalize_flag_token(token).split("=", 1)[0]
     if base in allow:
         return None
     alias = "" if base == family.canonical else f" ({family.canonical})"
@@ -349,8 +370,8 @@ def refuse_policy_flags(tokens: Iterable[str], allow: frozenset[str] = frozenset
     same rule :meth:`EngineManager.validate_extra_flags` applies.
     """
     refused: list[str] = []
-    for token in tokens:
-        base = token.split("=", 1)[0]
+    for raw in tokens:
+        base = normalize_flag_token(raw).split("=", 1)[0]
         if not _FLAG_START_RE.match(base) or not re.match(r"^-{1,2}[A-Za-z]", base):
             continue
         reason = policy_refusal(base, allow)
@@ -380,7 +401,17 @@ def refuse_policy_flags(tokens: Iterable[str], allow: frozenset[str] = frozenset
 #: ``planner.excluded_devices`` is the supported way to keep a card off the
 #: planner. :func:`warn_remapping_environment` says so once at start-up.
 _CHILD_ENV_PREFIXES: tuple[str, ...] = ("LLAMA_ARG_", "LLAMA_LOG_")
-_CHILD_ENV_REMAP_NAMES: frozenset[str] = frozenset({"CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER"})
+#: The ROCm and Vulkan device filters renumber cards the same way (and a child
+#: that inherited one would run on a card the plan never accounted for).
+_CHILD_ENV_REMAP_NAMES: frozenset[str] = frozenset(
+    {
+        "CUDA_VISIBLE_DEVICES",
+        "CUDA_DEVICE_ORDER",
+        "HIP_VISIBLE_DEVICES",
+        "ROCR_VISIBLE_DEVICES",
+        "GGML_VK_VISIBLE_DEVICES",
+    }
+)
 _CHILD_ENV_NAMES: frozenset[str] = (
     frozenset({"LLAMA_API_KEY", "MTMD_BACKEND_DEVICE"}) | _CHILD_ENV_REMAP_NAMES
 )
@@ -4321,7 +4352,7 @@ class EngineManager:
         )
         previous = ""
         for token in tokens:
-            base = token.split("=", 1)[0]
+            base = normalize_flag_token(token).split("=", 1)[0]
             relaxed = previous in _RELAXED_VALUE_FLAGS or base in _RELAXED_VALUE_FLAGS
             banned = _RELAXED_METACHARS if relaxed else _SHELL_METACHARS
             bad = sorted(set(token) & banned)

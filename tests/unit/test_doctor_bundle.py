@@ -356,3 +356,19 @@ def test_every_destructive_audit_action_is_in_the_bundle_audit_tail(tmp_path: Pa
     seed_logs(config)
     files = read_bundle(build_bundle(config, probe=FakeGpuProbe([])))
     assert json.loads(files["logs/audit.jsonl.tail"].splitlines()[0])["actor"] == "key:1"
+
+
+def test_redaction_masks_escaped_home_peer_ips_and_owner_actor(monkeypatch) -> None:
+    fake_home = Path("C:\\Users\\alice")  # scrub-ok: synthetic fixture user
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+    text = (
+        '{"path": "C:\\\\Users\\\\alice\\\\models", "peer": "100.101.102.103", '  # scrub-ok: synthetic fixture user
+        '"lan": "192.168.1.20:8080", "v6": "2001:db8::7", "actor": "owner:alice", '
+        '"loop": "127.0.0.1", "any": "0.0.0.0", "lo6": "::1", "ver": "2.2.0", "t": "12:34:56"}'
+    )
+    out = redact_text(text)
+    for leaked in ("alice\\\\", "100.101.102.103", "192.168.1.20", "2001:db8", "owner:alice"):
+        assert leaked not in out
+    assert "~" in out and "owner:[user]" in out
+    for kept in ("127.0.0.1", "0.0.0.0", "::1", "2.2.0", "12:34:56"):
+        assert kept in out

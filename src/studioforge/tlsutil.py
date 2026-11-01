@@ -6,8 +6,10 @@ watchdog:
 * ``off``          -- plain HTTP (the default; fine on loopback).
 * ``self_signed``  -- a certificate generated into ``<data-dir>/tls/`` the first
   time it is needed and reused afterwards. Its SHA-256 fingerprint is shown in
-  ``/api/status`` and the panel so a client can pin it. Regenerated when it is
-  about to expire or when this machine's addresses changed (the SANs).
+  ``/api/status`` and the panel so a client can pin it. Its names are loopback
+  plus the configured bind hosts only (never every local address or the machine
+  name), and it is regenerated when it is about to expire or a configured bind
+  host is not covered -- not when the machine's own addresses rotate.
 * ``cert``         -- the PEM files named by ``server.tls.cert_file`` / ``key_file``.
 
 A leaf module (``cryptography`` imported lazily, no other StudioForge imports
@@ -23,10 +25,13 @@ reverse proxy / ``tailscale serve``.
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import hashlib
 import ipaddress
-import socket
+import os
+import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -48,6 +53,10 @@ KEY_NAME = "selfsigned.key"
 #: Self-signed certificates are valid this long and renewed 30 days before the end.
 VALIDITY_DAYS = 825
 RENEW_BEFORE_DAYS = 30
+LOCK_NAME = ".tls.lock"
+#: How long a starting process waits for another one that is regenerating.
+_LOCK_WAIT_S = 30.0
+_WILDCARD_HOSTS = {"", "0.0.0.0", "::", "*"}  # noqa: S104 - compared, never bound
 
 
 class TlsError(ValueError):
@@ -117,23 +126,26 @@ def _not_after(cert_pem: bytes) -> str | None:
         return None
 
 
-def _local_names() -> tuple[list[str], list[str]]:
-    """``(dns names, ip addresses)`` this machine answers to."""
+def _san_names(config: Any) -> tuple[list[str], list[str]]:
+    """``(dns names, ip addresses)`` the certificate must cover.
+
+    Loopback always, plus each configured bind host (gateway, panel, watchdog)
+    that is a concrete name or address. A wildcard bind adds nothing: clients of
+    a self-signed certificate pin its fingerprint, and listing every local
+    address would tie the cert to addresses that rotate (IPv6 privacy addresses)
+    and disclose them to anyone who connects.
+    """
     dns = {"localhost"}
     ips = {"127.0.0.1", "::1"}
-    try:
-        host = socket.gethostname()
-        if host:
-            dns.add(host)
-        for info in socket.getaddrinfo(host, None):
-            address = str(info[4][0]).split("%", 1)[0]
-            try:
-                ipaddress.ip_address(address)
-            except ValueError:
-                continue
-            ips.add(address)
-    except OSError:
-        pass
+    for section in ("server", "gui", "watchdog"):
+        host = str(getattr(getattr(config, section, None), "host", "") or "").strip()
+        host = host.strip("[]").split("%", 1)[0]
+        if host in _WILDCARD_HOSTS:
+            continue
+        try:
+            ips.add(str(ipaddress.ip_address(host)))
+        except ValueError:
+            dns.add(host.lower())
     return sorted(dns), sorted(ips)
 
 
@@ -149,13 +161,12 @@ def _san_set(cert: Any) -> set[str]:
     return names
 
 
-def _generate_self_signed(cert_path: Path, key_path: Path) -> None:
+def _generate_self_signed(cert_path: Path, key_path: Path, dns: list[str], ips: list[str]) -> None:
     from cryptography import x509
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import ec
     from cryptography.x509.oid import NameOID
 
-    dns, ips = _local_names()
     key = ec.generate_private_key(ec.SECP256R1())
     name = x509.Name(
         [
@@ -180,29 +191,92 @@ def _generate_self_signed(cert_path: Path, key_path: Path) -> None:
     )
     cert_path.parent.mkdir(parents=True, exist_ok=True)
     restrict_to_owner(cert_path.parent, directory=True)
-    write_private(
-        key_path,
-        key.private_bytes(
-            serialization.Encoding.PEM,
-            serialization.PrivateFormat.PKCS8,
-            serialization.NoEncryption(),
-        ),
-    )
-    cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    # Both files are written beside their final names (the key owner-only from
+    # its first byte), then moved into place key first. Callers hold the folder
+    # lock, so no other StudioForge process reads a half-replaced pair, and
+    # `_self_signed_is_current` rejects a pair whose halves disagree.
+    suffix = f".{os.getpid()}.new"
+    new_key = key_path.with_name(key_path.name + suffix)
+    new_cert = cert_path.with_name(cert_path.name + suffix)
+    try:
+        write_private(
+            new_key,
+            key.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.PKCS8,
+                serialization.NoEncryption(),
+            ),
+        )
+        new_cert.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+        new_key.replace(key_path)
+        new_cert.replace(cert_path)
+    finally:
+        for leftover in (new_key, new_cert):
+            with contextlib.suppress(OSError):
+                leftover.unlink()
 
 
-def _self_signed_is_current(cert_path: Path, key_path: Path) -> bool:
-    """Exists, not near expiry, and covers every address this machine has now."""
+@contextlib.contextmanager
+def _folder_lock(folder: Path) -> Iterator[None]:
+    """Exclusive cross-process lock on ``folder`` (gateway and watchdog both start here)."""
+    folder.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(folder / LOCK_NAME, os.O_RDWR | os.O_CREAT, 0o600)
+    deadline = time.monotonic() + _LOCK_WAIT_S
+    try:
+        if os.name == "nt":  # pragma: no cover - exercised on Windows CI
+            import msvcrt
+
+            while True:
+                try:
+                    msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    if time.monotonic() > deadline:
+                        raise TlsError(f"timed out waiting for the TLS lock in {folder}") from None
+                    time.sleep(0.1)
+        else:
+            import fcntl
+
+            while True:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if time.monotonic() > deadline:
+                        raise TlsError(f"timed out waiting for the TLS lock in {folder}") from None
+                    time.sleep(0.05)
+        try:
+            yield
+        finally:
+            if os.name == "nt":  # pragma: no cover
+                import msvcrt
+
+                with contextlib.suppress(OSError):
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                    msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+    finally:
+        os.close(descriptor)
+
+
+def _self_signed_is_current(
+    cert_path: Path, key_path: Path, dns: list[str], ips: list[str]
+) -> bool:
+    """Exists, matches its key, not near expiry, and covers the wanted names."""
     if not (cert_path.is_file() and key_path.is_file()):
         return False
     try:
         from cryptography import x509
+        from cryptography.hazmat.primitives import serialization
 
         cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
         remaining = cert.not_valid_after_utc - datetime.datetime.now(datetime.UTC)
         if remaining < datetime.timedelta(days=RENEW_BEFORE_DAYS):
             return False
-        dns, ips = _local_names()
+        key = serialization.load_pem_private_key(key_path.read_bytes(), password=None)
+        spki = serialization.PublicFormat.SubjectPublicKeyInfo
+        pem = serialization.Encoding.PEM
+        if key.public_key().public_bytes(pem, spki) != cert.public_key().public_bytes(pem, spki):
+            return False
         return set(dns) | set(ips) <= _san_set(cert)
     except Exception:  # noqa: BLE001 - unreadable means regenerate
         return False
@@ -252,16 +326,17 @@ def resolve_tls(config: Any) -> TlsMaterial | None:
         )
     folder = Path(config.data_dir) / "tls"
     cert_path, key_path = folder / CERT_NAME, folder / KEY_NAME
-    if not _self_signed_is_current(cert_path, key_path):
-        try:
-            _generate_self_signed(cert_path, key_path)
-        except ImportError as exc:  # pragma: no cover
-            raise TlsError("the 'cryptography' package is required for self_signed TLS") from exc
-        except OSError as exc:
-            raise TlsError(
-                f"could not write the self-signed certificate to {folder}: {exc}"
-            ) from exc
-    pem = cert_path.read_bytes()
+    dns, ips = _san_names(config)
+    try:
+        with _folder_lock(folder):
+            # Re-checked under the lock: the other process may have just made it.
+            if not _self_signed_is_current(cert_path, key_path, dns, ips):
+                _generate_self_signed(cert_path, key_path, dns, ips)
+            pem = cert_path.read_bytes()
+    except ImportError as exc:  # pragma: no cover
+        raise TlsError("the 'cryptography' package is required for self_signed TLS") from exc
+    except OSError as exc:
+        raise TlsError(f"could not write the self-signed certificate to {folder}: {exc}") from exc
     return TlsMaterial(
         cert_path, key_path, certificate_fingerprint(pem), "self_signed", _not_after(pem)
     )
