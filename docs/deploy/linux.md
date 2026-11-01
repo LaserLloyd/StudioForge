@@ -47,7 +47,7 @@ driver; if you would rather not install a toolkit on the host, use the container
 Updating: re-run the installer (it replaces the venv, keeps data). Rolling back: re-run with
 `--version <older tag>`.
 
-## Immutable distros (Bazzite, Silverblue, Kinoite, SteamOS)
+## Immutable distros (Silverblue, Kinoite, SteamOS)
 
 Do not layer packages with `rpm-ostree`. Two supported ways:
 

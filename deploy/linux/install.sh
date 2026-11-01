@@ -34,7 +34,7 @@
 # CUDA toolkit or a llama.cpp engine. See "Next steps" printed at the end, and
 # docs/deploy/linux.md. It also never touches your model library.
 #
-# Immutable distros (Bazzite, Silverblue, Kinoite, SteamOS): do not layer
+# Immutable distros (Silverblue, Kinoite, SteamOS): do not layer
 # packages. Run the container image instead (docs/deploy/docker.md) or a
 # distrobox (docs/deploy/linux.md). This script detects them and says so.
 

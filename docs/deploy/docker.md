@@ -100,7 +100,7 @@ share `/usr/bin/python3.12`, so the venv's interpreter path survives the copy), 
 Check without loading anything: `docker run --rm --gpus all nvidia/cuda:13.0.1-base-ubuntu24.04 nvidia-smi -L`,
 then start the container and read `gpu_count` from `curl localhost:1234/health`.
 
-SELinux hosts (Fedora, Bazzite): the compose files add `:z` to bind mounts; for CDI devices also
+SELinux hosts (Fedora and its atomic spins): the compose files add `:z` to bind mounts; for CDI devices also
 `--security-opt label=disable`.
 
 ## The engine: first run, and offline
