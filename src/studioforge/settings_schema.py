@@ -108,6 +108,8 @@ class Setting:
     env: str
     restart_required: bool
     secret: bool = False
+    #: Short human name for forms ("Headroom fraction"); see :func:`label_for`.
+    label: str = ""
     #: ``{"ge": 1, "le": 65535}``-style bounds the model already enforces.
     constraints: dict[str, Any] = field(default_factory=dict)
     #: Allowed literal values, when the type is (or includes) a ``Literal``.
@@ -388,10 +390,16 @@ _FALLBACK_DESCRIPTIONS: dict[str, str] = {
     "and requires an owner account or admin key.",
     "server.port": "TCP port of the gateway. 1234 is LM Studio's port, so pointing an existing "
     "client here is a host change.",
-    "server.api_key": "Deprecated shared API key (at least 6 characters), mirrored into the "
-    "key table as the admin key 'legacy'. Prefer scoped keys (`studioforge keys create`).",
+    "server.api_key": "Deprecated shared API key (at least 16 characters when set), mirrored "
+    "into the key table as the admin key 'legacy'. Prefer scoped keys (`studioforge keys create`).",
     "server.cors_origins": "Origins allowed to call the API from a browser, and to reach the "
     "MCP endpoints from one. Empty (the default) allows none.",
+    "server.behind_proxy": "Turn on when a reverse proxy or `tailscale serve` forwards to this "
+    "server: a loopback peer is then the proxy, so the 'request from this machine is an admin' "
+    "shortcut is switched off and every change needs a real credential.",
+    "server.allowed_hosts": "Extra Host header values (host or host:port) treated as this "
+    "server for the same-machine admin shortcut, beyond loopback and the hosts of "
+    "server.cors_origins. A Host outside that set is refused (DNS-rebinding guard).",
     "server.cors_allow_credentials": "Let browsers send credentials cross-origin. Requires "
     'explicit cors_origins (no "*").',
     "server.tls.mode": "HTTPS for the gateway, panel and watchdog: off, self_signed (a "
@@ -501,8 +509,8 @@ _FALLBACK_DESCRIPTIONS: dict[str, str] = {
     "tailnet range.",
     "benchmark.lease_priority": "Priority class a benchmark's GPU lease is taken at.",
     "hf.token": "HuggingFace access token for gated repositories. A secret: never commit it.",
-    "hf.cache_dir": "Reserved: no code reads this key yet (the metadata cache lives under the "
-    "data directory).",
+    "hf.cache_dir": "Directory for the cache of parsed remote GGUF headers; empty uses "
+    "<data_dir>/cache/hf_meta.",
     "hf.max_concurrent_downloads": "Downloads that run at the same time.",
     "hf.chunk_bytes": "Bytes requested per HTTP range read while downloading.",
     "logging.level": "Minimum log level: DEBUG, INFO, WARNING or ERROR.",
@@ -512,8 +520,6 @@ _FALLBACK_DESCRIPTIONS: dict[str, str] = {
     "update.repo": "GitHub owner/repo the app checks for updates. Empty disables the check "
     "and no network call is made.",
     "update.channel": "Release channel the updater follows (stable or prerelease).",
-    "update.auto_check": "Reserved: not read by any code path yet.",
-    "update.check_interval_h": "Reserved: not read by any code path yet.",
     "update.health_check_timeout_s": "Seconds a freshly installed release gets to report "
     "healthy before it is rolled back.",
 }
@@ -541,6 +547,29 @@ def descriptions() -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 
+#: Labels that title-casing the last key segment gets wrong.
+_LABEL_OVERRIDES = {
+    "hf.token": "HuggingFace token",
+    "hf.cache_dir": "Header cache directory",
+    "logging.json": "JSON logs",
+    "update.repo": "Update repository",
+    "gui.port": "Panel port",
+    "models.dir": "Models directory",
+    "planner.headroom_fraction": "VRAM headroom fraction",
+    "benchmark.lease_priority": "Benchmark lease priority",
+}
+_LABEL_WORDS = {"ttl": "TTL", "gpu": "GPU", "api": "API", "id": "ID"}
+
+
+def label_for(key: str) -> str:
+    """A short form label for ``key``: an override, else the last segment in words."""
+    if key in _LABEL_OVERRIDES:
+        return _LABEL_OVERRIDES[key]
+    words = key.rsplit(".", 1)[-1].replace("_", " ").split()
+    text = " ".join(_LABEL_WORDS.get(w, w) for w in words)
+    return text[:1].upper() + text[1:]
+
+
 def build_registry() -> list[Setting]:
     """Every config key as a :class:`Setting`, in the model's own order."""
     texts = descriptions()
@@ -565,6 +594,7 @@ def build_registry() -> list[Setting]:
                 env=_env_name(key, attr, info),
                 restart_required=restart,
                 secret=key in secret_keys,
+                label=label_for(key),
                 constraints=constraints,
                 choices=_jsonable(choices) if choices else None,
             )

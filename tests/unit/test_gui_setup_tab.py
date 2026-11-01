@@ -848,9 +848,9 @@ def test_secret_state_text_never_returns_the_secret() -> None:
     assert st.secret_state_text("", unset_note="blank") == "blank"
     shown = st.secret_state_text(API_KEY)
     assert API_KEY not in shown
-    assert shown.endswith("34")
-    # An 8-character PIN is short enough that redact() shows nothing at all.
-    assert st.secret_state_text(MCP_PIN) == "***"
+    assert shown.startswith("redacted:") and not shown.endswith(API_KEY[-2:])
+    # An 8-character PIN is short enough that redact() fingerprints nothing at all.
+    assert st.secret_state_text(MCP_PIN) == "redacted:********"
 
 
 # ---------------------------------------------------------------------------
@@ -930,7 +930,7 @@ def test_the_config_page_renders_the_generated_long_tail(config: Config) -> None
     response = _advanced(config, "config")
     assert "Advanced — every other setting" in response.text
     assert "gateway.max_restarts" in response.text
-    assert "update.check_interval_h" in response.text
+    assert "update.health_check_timeout_s" in response.text
 
 
 def test_no_secret_reaches_the_rendered_page(config: Config) -> None:

@@ -11,6 +11,10 @@ has is reachable from a form (DECISIONS.md D26).
 
 ## 1. Start it
 
+On Linux install `git`, `curl`, `ca-certificates`, `cmake` and a C++ toolchain first (Debian and Ubuntu:
+`sudo apt-get install -y git curl ca-certificates cmake build-essential`); `curl` is what the installer
+and the health checks below use. `deploy/linux/install.sh` does the rest.
+
 ```bash
 git clone <repo> studioforge && cd studioforge
 uv venv --python 3.12 .venv
@@ -40,7 +44,7 @@ the one button that fixes them.
 | **GPUs** | NVML sees at least one card. StudioForge is GPU-only: no GPU, no inference | Check the driver, then **Re-probe** |
 | **llama.cpp engine** | A versioned engine is installed under `engines/<tag>/` and active | **Install engine `<the pinned tag>`** — the button names whatever `engine.pinned_tag` is set to |
 | **Gateway port** | Something is listening on `server.port`, and that something is us rather than LM Studio or a second copy of StudioForge | Quit the other one, or change the port |
-| **MCP pairing PIN** | Required while `mcp.pin_required` is on — and, with no `server.api_key`, for every MCP caller that is not on this machine whatever the toggle says (D32) | **Generate PIN** |
+| **MCP pairing PIN** | Legacy. Only shown while `mcp.pin_required` is on. The normal way to pair an agent is a scoped key (Advanced > Accounts & keys); the PIN still works on the MCP endpoints, and with no key it is what a caller off this machine needs (D32) | **Create a key** instead, or **Generate PIN** for an existing pairing |
 | *HuggingFace token* | Optional. Only gated or private repositories need one | Paste one into **Advanced > Catalog & downloads** |
 | *Start at login* | Optional | **Enable** in **Advanced > Config** |
 

@@ -85,6 +85,11 @@ _OPEN_PATHS = frozenset({LOGIN_PATH, LOGOUT_PATH, "/favicon.ico", "/gui-health"}
 #: not under it (e.g. "/sf-themex") still goes through the gate below.
 _THEME_URL_PREFIX = "/sf-theme/"
 
+#: The panel's own static assets (i18n catalogue and loader, accessibility CSS). Kept apart
+#: from the vendored theme bundle, which is checksummed and never hand-edited.
+_STATIC_DIR = Path(__file__).parent / "static"
+_STATIC_URL_PREFIX = "/sf-static/"
+
 #: NiceGUI's element tree and page routes are process-global singletons, so the
 #: pages are registered exactly once even if the app factory is called again
 #: (tests do; a reload could).
@@ -602,6 +607,14 @@ _QUASAR_JS_VERSION = _asset_version("adapters/quasar.js")
 _QUASAR_CSS_VERSION = _asset_version("adapters/quasar.css")
 
 
+def _static_version(name: str) -> str:
+    """Cache-busting hash of one of the panel's own static files (see _asset_version)."""
+    try:
+        return hashlib.sha256((_STATIC_DIR / name).read_bytes()).hexdigest()[:10]
+    except OSError:  # pragma: no cover
+        return "0" * 10
+
+
 def _theme_script_tag(name: str, version: str, attrs: str = "") -> str:
     return f'<script src="{_THEME_URL_PREFIX}{name}?v={version}"{attrs}></script>'
 
@@ -638,6 +651,14 @@ _THEME_HEAD_HTML = (
     + _theme_link_tag("ui-theme.css", _THEME_CSS_VERSION)
     + _theme_link_tag("adapters/quasar.css", _QUASAR_CSS_VERSION)
     + "".join(_theme_link_tag(rel, _asset_version(rel)) for rel in _THEME_OVERLAY_CSS)
+)
+
+#: The panel's own assets, injected after the theme (never on the login page).
+_PANEL_HEAD_HTML = (
+    f'<link rel="stylesheet" href="{_STATIC_URL_PREFIX}sf-a11y.css'
+    f'?v={_static_version("sf-a11y.css")}">'
+    f'<script defer src="{_STATIC_URL_PREFIX}sf-i18n.js'
+    f'?v={_static_version("sf-i18n.js")}"></script>'
 )
 
 
@@ -693,7 +714,9 @@ def _register_theme_assets() -> None:
     # actually recomputes the hash (see docs/DEVELOPMENT.md); this just stops
     # the browser from compounding that with its own long cache meanwhile.
     nicegui_app.add_static_files(_THEME_URL_PREFIX.rstrip("/"), _THEME_DIR, max_cache_age=0)
+    nicegui_app.add_static_files(_STATIC_URL_PREFIX.rstrip("/"), _STATIC_DIR, max_cache_age=0)
     ui.add_head_html(_THEME_HEAD_HTML, shared=True)
+    ui.add_head_html(_PANEL_HEAD_HTML, shared=True)
 
 
 _LOGIN_PAGE = """<!doctype html>
@@ -743,6 +766,18 @@ _LOGIN_PAGE = """<!doctype html>
 def _login_html(error: str = "") -> str:
     return _LOGIN_PAGE.format(
         login_path=LOGIN_PATH, error=html.escape(error), theme_head=_THEME_HEAD_HTML
+    )
+
+
+def _logout_html() -> str:
+    return (
+        '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+        "<title>Sign out - StudioForge</title>"
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        f'{_THEME_HEAD_HTML}</head><body style="font-family:sans-serif;padding:2rem">'
+        f'<form method="post" action="{LOGOUT_PATH}"><p>Sign out of the control panel?</p>'
+        '<button type="submit">Sign out</button> <a href="/">Cancel</a></form>'
+        "</body></html>"
     )
 
 
@@ -862,7 +897,17 @@ def _install_auth_routes(app: FastAPI, config: Config, api_state: Any = None) ->
         return HTMLResponse(_login_html(problem), status_code=401)
 
     @app.get(LOGOUT_PATH, include_in_schema=False)
-    async def logout() -> Response:
+    async def logout_form() -> HTMLResponse:
+        # A GET must not change state: any page could embed ``<img src=/logout>``
+        # and sign the operator out. This one only shows the button.
+        return HTMLResponse(_logout_html())
+
+    @app.post(LOGOUT_PATH, include_in_schema=False)
+    async def logout(request: Request) -> Response:
+        if not _same_origin_scope(request.scope):
+            return HTMLResponse(
+                _login_html("Refused: the form was not submitted from this page."), status_code=403
+            )
         response = RedirectResponse(LOGIN_PATH, status_code=303)
         response.delete_cookie(COOKIE_NAME, path="/")
         return response
@@ -908,7 +953,7 @@ def _theme_picker() -> None:
 
     select = (
         ui.select(options, value=_theme_default(), label="Theme")
-        .props("dense outlined options-dense")
+        .props('dense outlined options-dense data-i18n="theme.label"')
         .classes("sf-theme-picker")
     )
     # An icon rather than a tooltip: a tooltip stays up over the open menu.
@@ -945,6 +990,18 @@ def _theme_picker() -> None:
     ui.timer(0.0, sync_initial, once=True)
 
 
+def _language_switch() -> None:
+    """A plain <select> that static/sf-i18n.js owns: it persists the choice in localStorage and
+    sets <html lang>. Fixed literal markup, so no sanitising is needed."""
+    ui.html(
+        '<label class="sf-lang"><span data-i18n="lang.label">Language</span>'
+        '<select id="sf-lang-select" aria-label="Language" data-i18n-aria="lang.label">'
+        '<option value="en">English</option><option value="ja">日本語</option>'
+        "</select></label>",
+        sanitize=False,
+    )
+
+
 def _header(ctx: GuiContext) -> Any:
     with ui.header().classes("items-center justify-between px-4 py-2"):
         with ui.row().classes("items-center gap-3"):
@@ -952,11 +1009,16 @@ def _header(ctx: GuiContext) -> Any:
             ui.label("StudioForge").classes("text-lg font-semibold")
             ui.label(f"v{__version__}").classes("text-xs opacity-70")
         with ui.row().classes("items-center gap-2"):
-            status = ui.label("").classes("text-xs opacity-80 font-mono")
+            status = (
+                ui.label("").classes("text-xs opacity-80 font-mono").props('aria-live="polite"')
+            )
             _theme_picker()
-            ui.link("setup guide", SETUP_PATH).classes("text-xs")
+            _language_switch()
+            ui.link("setup guide", SETUP_PATH).classes("text-xs").props('data-i18n="link.setup"')
             if auth_enforced(ctx.config, getattr(ctx.api_state, "accounts", None)):
-                ui.link("sign out", LOGOUT_PATH).classes("text-xs")
+                ui.link("sign out", LOGOUT_PATH).classes("text-xs").props(
+                    'data-i18n="link.signout"'
+                )
     return status
 
 
@@ -1020,7 +1082,7 @@ class Shell:
             .classes("w-full sf-top") as tabs
         ):
             for name in nav.TOP_TABS:
-                ui.tab(name)
+                ui.tab(name).props(f'data-i18n="tab.{name.lower().replace(" ", "_")}"')
         self.tabs = tabs
         with ui.tab_panels(tabs, value=self.location.tab).classes("w-full"):
             for name in nav.TOP_TABS:

@@ -706,8 +706,10 @@ async def test_get_config_redacts_secrets_read_from_disk(harness: Harness) -> No
     assert "sf-super-secret-value" not in text
     assert "hf_super_secret_token_x" not in text
     payload = json.loads(text)
-    assert payload["config"]["server"]["api_key"] == "sf-s...ue"
-    assert payload["config"]["hf"]["token"] == "hf_s..._x"
+    from studioforge.config import redact
+
+    assert payload["config"]["server"]["api_key"] == redact("sf-super-secret-value")
+    assert payload["config"]["hf"]["token"] == redact("hf_super_secret_token_x")
 
 
 async def test_config_escape_hatch_repairs_an_unloadable_file(harness: Harness) -> None:
@@ -1521,6 +1523,7 @@ ALLOWED_STUDIOFORGE = (
     "studioforge.authkeys",
     "studioforge.config",
     "studioforge.credential_guard",
+    "studioforge.error_catalog",  # pure data (stdlib only): fix/docs on error results
     "studioforge.logfiles",
     "studioforge.mcp_policy",
     "studioforge.secure_files",

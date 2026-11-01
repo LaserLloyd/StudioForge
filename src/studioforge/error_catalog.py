@@ -656,6 +656,31 @@ _ENTRIES: tuple[ErrorEntry, ...] = (
         "Run `studioforge autostart status` for the mechanism and path, and fix the "
         "permission or missing tool it names.",
     ),
+    # --- framework-level HTTP errors ---------------------------------------
+    _e(
+        "not_found",
+        404,
+        _INVALID,
+        "No such endpoint: {path}",
+        "Check the path against docs/contracts/openapi.json (or /docs); model, key and "
+        "lease lookups have their own more specific codes.",
+    ),
+    _e(
+        "method_not_allowed",
+        405,
+        _INVALID,
+        "That endpoint does not accept this HTTP method.",
+        "Use the method the endpoint documents (see the Allow header and "
+        "docs/contracts/openapi.json).",
+    ),
+    _e(
+        "plan_unavailable",
+        502,
+        _SERVER,
+        "Could not check whether the model fits: {reason}.",
+        "Retry, or pass --force to load without the fit check. Raised client-side by "
+        "`sfctl load` when GET /plan fails.",
+    ),
     # --- server, MCP and watchdog -----------------------------------------
     _e(
         "internal_error",
@@ -715,6 +740,23 @@ def envelope_extras(code: str | None) -> dict[str, str]:
     if entry is None:
         return {}
     return {"fix": entry.fix, "docs": entry.docs}
+
+
+def with_error_extras(result: dict[str, Any]) -> dict[str, Any]:
+    """Add ``fix`` and ``docs`` to a ``{"ok": False, "error": {...}}`` tool result in place.
+
+    For the MCP and watchdog surfaces, which build their error dicts by hand.
+    Existing keys are never overwritten; an uncatalogued code is left alone.
+    """
+    error = result.get("error") if isinstance(result, dict) else None
+    if isinstance(error, dict):
+        for key, value in envelope_extras(error.get("code")).items():
+            error.setdefault(key, value)
+    return result
+
+
+#: Framework status -> catalogued code (only the ones with a stable meaning).
+HTTP_STATUS_CODES = {404: "not_found", 405: "method_not_allowed"}
 
 
 def export() -> list[dict[str, Any]]:

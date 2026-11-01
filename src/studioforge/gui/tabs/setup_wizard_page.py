@@ -488,7 +488,7 @@ class WizardPage:
             "An owner account lets you sign in to this panel and share the server on your "
             "network. You do not need one to use StudioForge on this computer only."
         ).classes("text-sm")
-        box = ui.column().classes("w-full")
+        box = ui.column().classes("w-full").props('aria-live="polite"')
         if has_owner:
             with box:
                 status_row("check_circle", "positive", "An owner account already exists")
@@ -525,6 +525,8 @@ class WizardPage:
                     password.set_value("")
                     again.set_value("")
 
+            for field in (username, password, again):
+                field.on("keydown.enter", create)
             ui.button("Create owner account", icon="person_add", on_click=create).props(
                 "color=primary"
             )
@@ -534,7 +536,7 @@ class WizardPage:
         ui.label(
             "StudioForge serves models from GPU memory. This looks for your graphics cards."
         ).classes("text-sm")
-        box = ui.column().classes("w-full")
+        box = ui.column().classes("w-full").props('aria-live="polite"')
 
         async def detect() -> None:
             result = await self.run(
@@ -558,7 +560,7 @@ class WizardPage:
             "The engine is the program that actually runs models (llama.cpp). StudioForge "
             "downloads a build for your GPUs and checks that it starts."
         ).classes("text-sm")
-        box = ui.column().classes("w-full")
+        box = ui.column().classes("w-full").props('aria-live="polite"')
         if state.get("active"):
             with box:
                 status_row(
@@ -575,7 +577,7 @@ class WizardPage:
             )
         progress = ui.linear_progress(value=0, show_value=False).classes("w-full")
         progress.set_visibility(False)
-        phase = ui.label("").classes("text-xs opacity-70")
+        phase = ui.label("").classes("text-xs opacity-70").props('aria-live="polite"')
 
         async def install() -> None:
             progress.set_visibility(True)
@@ -611,7 +613,7 @@ class WizardPage:
         ).classes("text-sm")
         configured = self.ctx.config.models.dir
         ui.label(f"Current library: {configured or 'none set'}").classes("text-xs font-mono")
-        box = ui.column().classes("w-full")
+        box = ui.column().classes("w-full").props('aria-live="polite"')
         choices = ui.column().classes("w-full gap-1")
         custom = ui.input("Or type a folder path").props('dense outlined autocomplete="off"')
         chosen: dict[str, str] = {"path": ""}
@@ -643,6 +645,7 @@ class WizardPage:
                 "library", "choose the model library", message="Saving the library…", box=box
             )
 
+        custom.on("keydown.enter", use)
         with ui.row().classes("gap-2"):
             ui.button("Look for model libraries", icon="search", on_click=look).props("outline")
             ui.button("Use this library", icon="folder", on_click=use).props("color=primary")
@@ -654,7 +657,7 @@ class WizardPage:
             "Pick a model you already have, or download a small one to start with. It is loaded "
             "so the next step can talk to it."
         ).classes("text-sm")
-        box = ui.column().classes("w-full")
+        box = ui.column().classes("w-full").props('aria-live="polite"')
         models = [m["id"] for m in self.services.library_models()]
         mode = {"value": "have" if models else "download"}
         have = ui.select(
@@ -682,7 +685,7 @@ class WizardPage:
 
         progress = ui.linear_progress(value=0, show_value=False).classes("w-full")
         progress.set_visibility(False)
-        phase = ui.label("").classes("text-xs opacity-70")
+        phase = ui.label("").classes("text-xs opacity-70").props('aria-live="polite"')
 
         async def go() -> None:
             wanted = str(have.value) if (mode["value"] == "have" and have.value) else repo.value
@@ -712,6 +715,7 @@ class WizardPage:
             self.services.cancelled.set()
             ui.notify("Stopping the download…")
 
+        repo.on("keydown.enter", go)
         with ui.row().classes("gap-2"):
             ui.button("Get this model ready", icon="play_arrow", on_click=go).props("color=primary")
             ui.button("Stop the download", icon="stop", on_click=stop).props("flat")
@@ -721,8 +725,12 @@ class WizardPage:
         ui.label(
             "Sends one short message to the loaded model and shows how quickly it answers."
         ).classes("text-sm")
-        box = ui.column().classes("w-full")
-        reply = ui.label("").classes("text-sm font-mono whitespace-pre-wrap")
+        box = ui.column().classes("w-full").props('aria-live="polite"')
+        reply = (
+            ui.label("")
+            .classes("text-sm font-mono whitespace-pre-wrap")
+            .props('aria-live="polite"')
+        )
 
         async def send() -> None:
             if self.wizard._model_id is None:
@@ -753,7 +761,7 @@ class WizardPage:
         ui.label(
             "The address other programs use, and ready-to-paste settings for the common ones."
         ).classes("text-sm")
-        box = ui.column().classes("w-full gap-2")
+        box = ui.column().classes("w-full gap-2").props('aria-live="polite"')
 
         def show() -> None:
             box.clear()
@@ -780,7 +788,7 @@ class WizardPage:
 
     def step_exposure(self) -> None:
         ui.label("Who should be able to reach this server?").classes("text-sm")
-        box = ui.column().classes("w-full")
+        box = ui.column().classes("w-full").props('aria-live="polite"')
         mode = {"value": "local"}
         ui.radio(
             {

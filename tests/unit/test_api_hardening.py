@@ -276,7 +276,8 @@ def test_origin_is_only_consulted_when_a_browser_sent_one() -> None:
     config = open_config()
     # No Origin: sfctl, the watchdog, curl, every OpenAI client.
     check_request(
-        make_request("/api/config", method="PATCH", headers={"Host": "x"}, client=LOOPBACK), config
+        make_request("/api/config", method="PATCH", headers={"Host": "127.0.0.1"}, client=LOOPBACK),
+        config,
     )
     # Origin without Host is not something a browser produces; pass.
     assert not cross_site_browser_request(

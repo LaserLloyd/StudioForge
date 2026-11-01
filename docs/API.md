@@ -5,7 +5,7 @@ does, so tools written for LM Studio, the OpenAI API or the Anthropic API work b
 This page is the contract: which endpoints exist, which are complete, which are partial, and which say
 "not supported" out loud instead of pretending.
 
-One server, one port, one key (if you set `server.api_key`):
+One server, one port, one credential per client (a scoped key, if you set up access control):
 
 | Base URL | Family |
 | --- | --- |
@@ -17,13 +17,21 @@ One server, one port, one key (if you set `server.api_key`):
 
 ## Authentication
 
-With `server.api_key` unset the server is open, like LM Studio out of the box. With it set, every route
-except the liveness probes takes the key in **either** header, on every surface:
+On a loopback-only install with no keys and no owner account the server is open, like LM Studio out of
+the box (changing the *box* still needs a caller on the machine). Once you create a scoped key
+(`studioforge keys create`, or Advanced > Accounts & keys in the panel) or an owner account, and always
+when you bind the network, every route except the liveness probes takes a key in **either** header, on
+every surface:
 
 ```
 Authorization: Bearer <key>
 x-api-key: <key>
 ```
+
+Keys have a scope (`read`, `inference`, `admin`) and may carry an expiry and a rate limit; a route above a
+key's scope answers `403 permission_denied`. The old single `server.api_key` still works as an `admin`
+credential and the MCP pairing PIN as an MCP-only one, but both are deprecated. The scope table and the
+rules are in [`SECURITY.md`](SECURITY.md).
 
 The `anthropic` SDK sends `x-api-key`, the `openai` SDK sends `Authorization: Bearer`; both work against
 every endpoint below.
@@ -40,7 +48,7 @@ notes column; **501** = answered with an explicit `not_implemented` error; **no*
 | `GET /api/v1/models` | yes | LM Studio's `models[]` entries: `key`, `type`, `publisher`, `display_name`, `architecture`, `quantization{name,bits_per_weight}`, `size_bytes`, `params_string`, `loaded_instances[]`, `max_context_length`, `format`, `capabilities{vision,trained_for_tool_use}`. Additive: `arch`, `state` (`loaded`/`loading`/`not-loaded`), `loaded_context_length`, `loaded_instances[].context_length`, and `object`/`data` mirroring the OpenAI list shape. `bits_per_weight` is `null` (not measured). |
 | `POST /api/v1/models/load` | yes | Same manager call as `POST /api/models/{id}/load`: the planner decides placement, and a model that cannot fit is its honest `507 insufficient_vram` with the numbers. `context_length` is the per-conversation window (`ctx_size`). `eval_batch_size`, `flash_attention` and `num_experts` are accepted and reported under `ignored` (the planner owns them). `offload_kv_cache_to_gpu: false` is a 400: the server is GPU-only. Extras: `ttl`, `priority`, `parallel`. |
 | `POST /api/v1/models/unload` | yes | `{instance_id}` (or `{model}`); 404 `instance_not_found` when nothing is loaded under that name. |
-| `POST /api/v1/models/download` | partial | `model` is a Hugging Face `owner/repo` id or link (`quantization` or `hf.co/owner/repo:QUANT` picks the quant); LM Studio's own catalog ids are not available. Needs a caller on the server's machine, the pairing PIN, or the API key (it writes to disk), exactly like `POST /api/downloads`. |
+| `POST /api/v1/models/download` | partial | `model` is a Hugging Face `owner/repo` id or link (`quantization` or `hf.co/owner/repo:QUANT` picks the quant); LM Studio's own catalog ids are not available. Needs a caller on the server's machine or an `admin` key (it writes to disk), exactly like `POST /api/downloads`. |
 | `GET /api/v1/models/download/status/{job_id}` | yes | `downloading`/`paused`/`completed`/`failed`. `job_id` is a StudioForge download group. |
 | `GET /api/v1/models/download/status` | extension | The same shape for every job (`{"jobs": [...]}`). |
 | `POST /api/v1/chat` | **501** | LM Studio's chat is stateful and MCP-aware; this server is stateless. Use `/v1/chat/completions`, `/v1/messages` or `/v1/responses`. |

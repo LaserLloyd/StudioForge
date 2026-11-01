@@ -32,6 +32,7 @@ from studioforge.core.attribution import attributed_source, client_of
 from studioforge.core.model_gate import approx_params_b
 from studioforge.core.planner import BUSY_RETRY_AFTER_S
 from studioforge.core.priority import normalise_priority
+from studioforge.error_catalog import envelope_extras
 from studioforge.errors import (
     BadRequestError,
     ModelBusyError,
@@ -1220,7 +1221,9 @@ def _sse_error_frame(exc: StudioForgeError, *, default_code: str) -> bytes:
 
 
 def _sse_error(message: str, *, code: str, details: dict[str, Any] | None = None) -> bytes:
-    payload: dict[str, Any] = {"error": {"message": message, "type": "server_error", "code": code}}
+    payload: dict[str, Any] = {
+        "error": {"message": message, "type": "server_error", "code": code, **envelope_extras(code)}
+    }
     if details:
         # Same vendor block as the HTTP envelope (StudioForgeError.to_payload),
         # so a client parses one error shape whether or not it streamed.

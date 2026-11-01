@@ -77,7 +77,7 @@ Do this first. Every later step assumes it, and it is the single most common thi
 curl -s -m 8 http://<rig-ip>:1234/health
 ```
 
-Expected: `{"status":"ok","version":"2.2.0","build":"<short sha>",...}` — the version comes from
+Expected: `{"status":"ok","version":"2.3.0","build":"<short sha>",...}` — the version comes from
 this repository's `studioforge/__init__.py`, and `build` is the git commit the server runs from
 (`-dirty` when it carries uncommitted changes, `unknown` from a wheel). A different version means you
 are talking to another build, and these instructions may not match it.
@@ -201,12 +201,18 @@ profile *without* a key and inference will work fine while every MCP tool call r
 sfctl servers add rig http://<rig-ip>:1234 --api-key <PIN> --use
 ```
 
+Migrating an existing OpenClaw or `sfctl` setup: after the 2.x upgrade the server can require a
+key. Put the same key in `sfctl servers add ... --api-key` (or `SF_API_KEY`) and in OpenClaw's
+provider `apiKey` for `/v1` and the MCP entry. A missing key shows up as 401 on every call.
+
 Notes on that command:
 
 - The URL is a **positional argument**. There is no `--url` option on `servers add`.
 - `--use` makes it the default profile, so later commands need no `-s rig`.
-- The watchdog URL is derived automatically as the same host on port `1235`. Override with
-  `--watchdog-url` only if you changed `watchdog.port` on the rig.
+- The watchdog URL is derived automatically as the same host on the gateway port plus one (`1235`
+  for the default `1234`). If you moved the gateway, set the rig's `watchdog.port` to the gateway
+  port plus one, or pass `--watchdog-url`; otherwise `sfctl recover` and the watchdog tools fail
+  and only the main server's tools remain.
 - The PIN travels as a bearer token. The rig accepts it on `/mcp`; on `/v1` it is ignored, because
   no API key is configured there yet. When you later set a real `server.api_key`, put *that* here
   instead — it is valid on every surface, PIN included.

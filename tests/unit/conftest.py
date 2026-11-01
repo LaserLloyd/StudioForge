@@ -64,3 +64,31 @@ def restore_logging() -> Iterator[None]:
     from studioforge.logging import configure_logging
 
     configure_logging("INFO")
+
+
+@pytest.fixture(autouse=True)
+def _testclient_host_is_this_server(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test clients' default hosts are this server.
+
+    Starlette's ``TestClient`` sends ``Host: testserver``; NiceGUI's ``User`` sends ``test``.
+
+    ``studioforge.api.auth.host_header_trusted`` refuses any ``Host`` that is not a
+    loopback literal or a configured one (the DNS-rebinding guard), and a unit test that
+    simulates "a caller on this machine" with ``TestClient(app, client=("127.0.0.1", n))``
+    would otherwise be refused for its default ``testserver`` host. Tests of the guard
+    itself send an explicit foreign ``Host`` (``evil.test``), which still fails.
+    """
+    from studioforge.api import auth
+
+    original = auth.host_header_trusted
+
+    def patched(request: object, config: object) -> bool:
+        headers = getattr(request, "headers", None)
+        if headers is not None and (headers.get("host") or "").strip().lower() in {
+            "testserver",
+            "test",
+        }:
+            return True
+        return original(request, config)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(auth, "host_header_trusted", patched)

@@ -2,6 +2,45 @@
   "capabilities": [
     {
       "api": {
+        "method": "DELETE",
+        "path": "/api/adapters/{adapter_id}"
+      },
+      "cli": null,
+      "description": "Delete an adapter file.",
+      "id": "adapters.delete",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "GET",
+        "path": "/api/adapters"
+      },
+      "cli": null,
+      "description": "List LoRA adapters found on disk.",
+      "id": "adapters.list",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/api/adapters/scan"
+      },
+      "cli": null,
+      "description": "Rescan the adapter directory.",
+      "id": "adapters.scan",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
         "method": "GET",
         "path": "/api/audit"
       },
@@ -24,6 +63,152 @@
       "mcp": null,
       "notes": "`studioforge doctor` reports the same posture as findings.",
       "panel": "Advanced > Accounts & keys: security posture",
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "GET",
+        "path": "/api/models/{model_id}/benchmarks"
+      },
+      "cli": null,
+      "description": "Stored benchmark results for a model.",
+      "id": "benchmark.history",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "DELETE",
+        "path": "/api/benchmark/jobs/{job_id}"
+      },
+      "cli": null,
+      "description": "Cancel or remove a benchmark job.",
+      "id": "benchmark.jobs_delete",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "GET",
+        "path": "/api/benchmark/jobs/{job_id}"
+      },
+      "cli": null,
+      "description": "One benchmark job's state and result.",
+      "id": "benchmark.jobs_get",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "GET",
+        "path": "/api/benchmark/jobs"
+      },
+      "cli": null,
+      "description": "List benchmark jobs.",
+      "id": "benchmark.jobs_list",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "GET",
+        "path": "/api/models/{model_id}/benchmark/modes"
+      },
+      "cli": null,
+      "description": "The benchmark modes available for one model.",
+      "id": "benchmark.model_modes",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "GET",
+        "path": "/api/benchmark/modes"
+      },
+      "cli": null,
+      "description": "The benchmark modes available, globally and for one model.",
+      "id": "benchmark.modes",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "GET",
+        "path": "/api/models/{model_id}/parallel-observations"
+      },
+      "cli": null,
+      "description": "What parallel-slot runs have observed for a model.",
+      "id": "benchmark.parallel_observations",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/api/models/{model_id}/benchmark"
+      },
+      "cli": null,
+      "description": "Benchmark a model (prompt and generation throughput).",
+      "id": "benchmark.run",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/api/models/{model_id}/benchmark-parallel"
+      },
+      "cli": null,
+      "description": "Measure how many concurrent slots a model is actually worth running.",
+      "id": "benchmark.run_parallel",
+      "mcp": {
+        "server": "gateway",
+        "tool": "benchmark_parallel"
+      },
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "GET",
+        "path": "/api/capabilities"
+      },
+      "cli": "capabilities",
+      "description": "What this server and engine can do, with an optional update check.",
+      "id": "capabilities.get",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "GET",
+        "path": "/api/catalog"
+      },
+      "cli": null,
+      "description": "The curated model catalog.",
+      "id": "catalog.list",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
       "sfctl": null
     },
     {
@@ -96,6 +281,58 @@
     },
     {
       "api": {
+        "method": "DELETE",
+        "path": "/api/downloads/{group_id}"
+      },
+      "cli": null,
+      "description": "Cancel a download group.",
+      "id": "downloads.cancel",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "GET",
+        "path": "/api/downloads"
+      },
+      "cli": null,
+      "description": "List download groups and their progress.",
+      "id": "downloads.list",
+      "mcp": null,
+      "notes": "",
+      "panel": "Models tab: Add model, Downloads",
+      "sfctl": "download"
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/api/downloads/{group_id}/pause"
+      },
+      "cli": null,
+      "description": "Pause a download group.",
+      "id": "downloads.pause",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/api/downloads/{group_id}/resume"
+      },
+      "cli": null,
+      "description": "Resume a paused download group.",
+      "id": "downloads.resume",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
         "method": "POST",
         "path": "/api/engine/activate"
       },
@@ -136,6 +373,87 @@
     {
       "api": {
         "method": "GET",
+        "path": "/api/engine/releases"
+      },
+      "cli": null,
+      "description": "Engine releases available to install.",
+      "id": "engine.releases",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/api/engine/smoke-test"
+      },
+      "cli": null,
+      "description": "Smoke test an installed engine build.",
+      "id": "engine.smoke_test",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/api/engine/validate-flags"
+      },
+      "cli": null,
+      "description": "Check extra engine flags against the active build before saving them.",
+      "id": "engine.validate_flags",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "GET",
+        "path": "/api/evictions"
+      },
+      "cli": null,
+      "description": "Recent evictions and why.",
+      "id": "evictions.list",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "GET",
+        "path": "/api/gpus"
+      },
+      "cli": null,
+      "description": "Per-GPU VRAM, utilisation and temperature.",
+      "id": "gpus.status",
+      "mcp": {
+        "server": "watchdog",
+        "tool": "gpu_status"
+      },
+      "notes": "",
+      "panel": null,
+      "sfctl": "recover --gpus"
+    },
+    {
+      "api": {
+        "method": "GET",
+        "path": "/api/health"
+      },
+      "cli": null,
+      "description": "The detailed health report (the open /health is the probe).",
+      "id": "health.detail",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "GET",
         "path": "/health"
       },
       "cli": "server status",
@@ -152,6 +470,22 @@
     {
       "api": {
         "method": "GET",
+        "path": "/api/hf/repo/{repo_id}"
+      },
+      "cli": null,
+      "description": "Details of one Hugging Face repository and its quantizations.",
+      "id": "hf.repo",
+      "mcp": {
+        "server": "gateway",
+        "tool": "repo_details"
+      },
+      "notes": "",
+      "panel": null,
+      "sfctl": "models repo"
+    },
+    {
+      "api": {
+        "method": "GET",
         "path": "/api/hf/search"
       },
       "cli": null,
@@ -164,6 +498,123 @@
       "notes": "",
       "panel": "Models tab: Add model, Search Hugging Face",
       "sfctl": "search"
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/v1/chat/completions"
+      },
+      "cli": null,
+      "description": "OpenAI-compatible chat completions (streaming and tools).",
+      "id": "inference.chat",
+      "mcp": null,
+      "notes": "",
+      "panel": "Test Chat tab",
+      "sfctl": "chat"
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/v1/completions"
+      },
+      "cli": null,
+      "description": "OpenAI-compatible text completions.",
+      "id": "inference.completions",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/v1/embeddings"
+      },
+      "cli": null,
+      "description": "OpenAI-compatible embeddings.",
+      "id": "inference.embeddings",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/v1/messages"
+      },
+      "cli": null,
+      "description": "Anthropic-compatible Messages API.",
+      "id": "inference.messages",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "GET",
+        "path": "/v1/models/{model_id}"
+      },
+      "cli": null,
+      "description": "OpenAI-compatible single model.",
+      "id": "inference.models_get",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "GET",
+        "path": "/v1/models"
+      },
+      "cli": null,
+      "description": "OpenAI-compatible model list.",
+      "id": "inference.models_list",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/v1/rerank"
+      },
+      "cli": null,
+      "description": "Rerank documents against a query.",
+      "id": "inference.rerank",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/v1/responses"
+      },
+      "cli": null,
+      "description": "OpenAI Responses API.",
+      "id": "inference.responses",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/v1/tokenize"
+      },
+      "cli": null,
+      "description": "Tokenize text with the loaded model's tokenizer.",
+      "id": "inference.tokenize",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
     },
     {
       "api": {
@@ -254,6 +705,19 @@
     },
     {
       "api": {
+        "method": "POST",
+        "path": "/api/leases/{lease_id}/touch"
+      },
+      "cli": null,
+      "description": "Extend a standing lease's time to live.",
+      "id": "leases.touch",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": "leases touch"
+    },
+    {
+      "api": {
         "method": "GET",
         "path": "/api/logs"
       },
@@ -271,6 +735,22 @@
     {
       "api": {
         "method": "GET",
+        "path": "/api/mcp/info"
+      },
+      "cli": null,
+      "description": "How to connect an MCP client (URLs, auth).",
+      "id": "mcp.info",
+      "mcp": {
+        "server": "gateway",
+        "tool": "connection_info"
+      },
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "GET",
         "path": "/metrics"
       },
       "cli": null,
@@ -279,6 +759,45 @@
       "mcp": null,
       "notes": "",
       "panel": "Advanced > Logs & metrics: Metrics",
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "GET",
+        "path": "/api/model-gate"
+      },
+      "cli": null,
+      "description": "The model gate (architecture support and size limits) in force.",
+      "id": "model_gate.get",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/api/models/{model_id}/adapter-scales"
+      },
+      "cli": null,
+      "description": "Set LoRA adapter scales on a loaded model.",
+      "id": "models.adapter_scales",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": null,
+      "cli": null,
+      "description": "Ask whether the already-loaded model is good enough before loading another.",
+      "id": "models.check_loaded",
+      "mcp": {
+        "server": "gateway",
+        "tool": "check_loaded_model"
+      },
+      "notes": "MCP only: an agent decision aid, no REST route or panel control.",
+      "panel": null,
       "sfctl": null
     },
     {
@@ -316,6 +835,22 @@
     {
       "api": {
         "method": "GET",
+        "path": "/api/models/{model_id}/introspect"
+      },
+      "cli": null,
+      "description": "Full detail for one model, including what it is actually running as.",
+      "id": "models.introspect",
+      "mcp": {
+        "server": "gateway",
+        "tool": "model_info"
+      },
+      "notes": "",
+      "panel": null,
+      "sfctl": "models info"
+    },
+    {
+      "api": {
+        "method": "GET",
         "path": "/api/models"
       },
       "cli": "ls",
@@ -348,6 +883,51 @@
     {
       "api": {
         "method": "POST",
+        "path": "/api/models/{model_id}/load-recommended"
+      },
+      "cli": null,
+      "description": "Load a model at the recommended context and parallel slots.",
+      "id": "models.load_recommended",
+      "mcp": {
+        "server": "gateway",
+        "tool": "load_recommended"
+      },
+      "notes": "",
+      "panel": null,
+      "sfctl": "models load-recommended"
+    },
+    {
+      "api": {
+        "method": "GET",
+        "path": "/api/logs/models/{model_id}"
+      },
+      "cli": null,
+      "description": "The log of one model's engine process.",
+      "id": "models.log",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "GET",
+        "path": "/api/models/{model_id}/options"
+      },
+      "cli": null,
+      "description": "The load options a model supports (context, KV types, slots).",
+      "id": "models.options",
+      "mcp": {
+        "server": "gateway",
+        "tool": "model_options"
+      },
+      "notes": "",
+      "panel": null,
+      "sfctl": "models options"
+    },
+    {
+      "api": {
+        "method": "POST",
         "path": "/api/models/{model_id}/pin"
       },
       "cli": null,
@@ -363,6 +943,74 @@
     },
     {
       "api": {
+        "method": "GET",
+        "path": "/api/models/{model_id}/plan"
+      },
+      "cli": null,
+      "description": "Dry-run a load: placement, context and VRAM, without loading anything.",
+      "id": "models.plan",
+      "mcp": {
+        "server": "gateway",
+        "tool": "plan_load"
+      },
+      "notes": "",
+      "panel": null,
+      "sfctl": "models plan"
+    },
+    {
+      "api": {
+        "method": "GET",
+        "path": "/api/models/{model_id}/plan-recommended"
+      },
+      "cli": null,
+      "description": "The plan for the recommended context and parallel slots.",
+      "id": "models.plan_recommended",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/api/models/{model_id}/probe"
+      },
+      "cli": null,
+      "description": "Probe a loaded model with a short request.",
+      "id": "models.probe",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "GET",
+        "path": "/api/models/{model_id}/profiles"
+      },
+      "cli": null,
+      "description": "Saved load profiles for a model.",
+      "id": "models.profiles",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/api/models/{model_id}/restart"
+      },
+      "cli": null,
+      "description": "Reload a loaded model with its saved settings.",
+      "id": "models.restart",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
         "method": "POST",
         "path": "/api/models/scan"
       },
@@ -373,6 +1021,45 @@
       "notes": "",
       "panel": "Models tab: Rescan",
       "sfctl": "models scan"
+    },
+    {
+      "api": {
+        "method": "GET",
+        "path": "/api/models/{model_id}/settings"
+      },
+      "cli": null,
+      "description": "A model's saved settings (priority, TTL, context, flags).",
+      "id": "models.settings_get",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": "models settings"
+    },
+    {
+      "api": {
+        "method": "PATCH",
+        "path": "/api/models/{model_id}/settings"
+      },
+      "cli": null,
+      "description": "Change some of a model's saved settings; a literal null clears one.",
+      "id": "models.settings_patch",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": "models settings"
+    },
+    {
+      "api": {
+        "method": "PUT",
+        "path": "/api/models/{model_id}/settings"
+      },
+      "cli": null,
+      "description": "Replace a model's saved settings.",
+      "id": "models.settings_replace",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
     },
     {
       "api": {
@@ -420,6 +1107,32 @@
       "sfctl": null
     },
     {
+      "api": {
+        "method": "GET",
+        "path": "/api/openclaw-setup"
+      },
+      "cli": null,
+      "description": "The OpenClaw provider snippet for this server.",
+      "id": "openclaw.setup",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": "openclaw-setup"
+    },
+    {
+      "api": null,
+      "cli": null,
+      "description": "Read the configuration through the watchdog (works while the server is down).",
+      "id": "recovery.get_config",
+      "mcp": {
+        "server": "watchdog",
+        "tool": "get_config"
+      },
+      "notes": "The server's own route is config.get; this one answers when the server does not.",
+      "panel": null,
+      "sfctl": "recover --config"
+    },
+    {
       "api": null,
       "cli": null,
       "description": "Kill one model's llama-server child through the watchdog.",
@@ -459,6 +1172,45 @@
       },
       "notes": "",
       "panel": "Advanced > GPUs & placement: Reclaim",
+      "sfctl": null
+    },
+    {
+      "api": null,
+      "cli": null,
+      "description": "Change configuration through the watchdog (works while the server is down).",
+      "id": "recovery.set_config",
+      "mcp": {
+        "server": "watchdog",
+        "tool": "set_config"
+      },
+      "notes": "Watchdog MCP only; the server's own route is config.set.",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/api/restart/backend"
+      },
+      "cli": null,
+      "description": "Restart the engine backend without restarting the gateway.",
+      "id": "restart.backend",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "GET",
+        "path": "/api/restart/status"
+      },
+      "cli": null,
+      "description": "Whether a restart is in progress and how it is going.",
+      "id": "restart.status",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
       "sfctl": null
     },
     {
@@ -541,6 +1293,32 @@
     },
     {
       "api": {
+        "method": "DELETE",
+        "path": "/api/tenants/{name}"
+      },
+      "cli": null,
+      "description": "Remove a registered tenant.",
+      "id": "tenants.delete",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "GET",
+        "path": "/api/tenants/{name}"
+      },
+      "cli": null,
+      "description": "One registered tenant.",
+      "id": "tenants.get",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
         "method": "GET",
         "path": "/api/tenants"
       },
@@ -554,6 +1332,32 @@
       "notes": "",
       "panel": "Advanced > GPUs & placement: tenants",
       "sfctl": "tenants list"
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/api/tenants/register"
+      },
+      "cli": null,
+      "description": "Register a VRAM tenant (name, vacate endpoint).",
+      "id": "tenants.register",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/api/tenants/{name}/warm"
+      },
+      "cli": null,
+      "description": "Ask a tenant to warm up (take its GPUs back).",
+      "id": "tenants.warm",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": "tenants warm"
     },
     {
       "api": {
@@ -580,6 +1384,19 @@
       "notes": "The panel's `Check for engine update` checks llama.cpp builds, not the app.",
       "panel": "Advanced > About & updates: Check for updates",
       "sfctl": "update --check"
+    },
+    {
+      "api": {
+        "method": "GET",
+        "path": "/api/update/releases"
+      },
+      "cli": "update check",
+      "description": "Releases available to update to.",
+      "id": "update.releases",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
     },
     {
       "api": {
@@ -634,6 +1451,58 @@
       "mcp": null,
       "notes": "",
       "panel": "Advanced > Accounts & keys: Change password",
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "GET",
+        "path": "/api/version"
+      },
+      "cli": "version",
+      "description": "Server and engine versions and build id.",
+      "id": "version.get",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/api/virtual-models"
+      },
+      "cli": null,
+      "description": "Create a virtual model (an alias with its own settings).",
+      "id": "virtual_models.create",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "DELETE",
+        "path": "/api/virtual-models/{model_id}"
+      },
+      "cli": null,
+      "description": "Delete a virtual model.",
+      "id": "virtual_models.delete",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "GET",
+        "path": "/api/vram/holders"
+      },
+      "cli": null,
+      "description": "Which processes hold VRAM.",
+      "id": "vram.holders",
+      "mcp": null,
+      "notes": "",
+      "panel": "Advanced > GPUs & placement: GPU leases",
       "sfctl": null
     }
   ],

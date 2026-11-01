@@ -169,6 +169,19 @@ port) or is listed in `server.cors_origins`. A wildcard `*` is deliberately **no
 means "any page may read the API", not "any page may drive the management tools". This is what stops
 DNS rebinding and drive-by cross-site pages, which always send an `Origin`.
 
+### "A caller on this machine" on an open install
+
+With no key and no `server.api_key`, the box-changing routes and the MCP PIN reveal accept a loopback
+caller without a credential. That shortcut needs all of: a loopback peer, no cross-site `Origin`, and
+a `Host` header that names this server (a loopback literal, `localhost`, a host of an explicit
+`server.cors_origins` entry, or an entry of `server.allowed_hosts`). A page on `evil.test` re-pointed
+at 127.0.0.1 sends `Host: evil.test` and is refused. If a reverse proxy or `tailscale serve` forwards
+to the server, set `server.behind_proxy: true`: every proxied client arrives from 127.0.0.1, so the
+shortcut is switched off and each change needs the owner session or an admin key (`studioforge
+doctor` warns about an owner account with no keys). A new `server.api_key` must be at least 16
+characters; config dumps show `redacted:` plus a fixed eight-character fingerprint, never a
+character of the key.
+
 ## MCP
 
 - **Annotations.** Every tool is published with `readOnlyHint`, `destructiveHint` and

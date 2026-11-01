@@ -43,6 +43,21 @@ GPU), captured by `scripts/capture_panel.py`. Both refuse any port outside 18080
 * Every box-changing control (pin, delete, save defaults, restart) is disabled with the reason for a remote viewer on
   an open install (the D32 rule), exactly like the old table's. Loading and unloading stay open, as before.
 
+## Language and accessibility
+
+* **Language.** The header has a language switch (English, 日本語). The choice is kept in the browser's
+  `localStorage` (`studioforge.lang`) and sets `<html lang>`. The catalogues are
+  `gui/static/locales/en.json` and `ja.json` (plus the ForgeUI helper strings from
+  `gui/theme/locales/`); elements opt in with a `data-i18n="key"` attribute and `gui/static/sf-i18n.js`
+  fills them. Today the shell chrome is translated (the four tabs, the Advanced menu, the header
+  links and pickers); tab bodies are still English. To translate more, add the key to both
+  catalogues and a `data-i18n` prop to the widget; a test keeps the two catalogues in step.
+* **Keyboard and screen readers.** Enter submits the account, key and setup-guide forms and the search
+  boxes. In-place status text (health detail, setup progress, restart and benchmark messages) is an
+  `aria-live` region. Helper text is never dimmed below 85 % and is full strength in the two
+  high-contrast themes (`gui/static/sf-a11y.css`). Verifying the wizard buttons' accessible names with a
+  real screen reader is still open.
+
 ## How it is built
 
 * `src/studioforge/gui/nav.py` is the single registry: `TOP_TABS` (four entries), `ADVANCED_PAGES`

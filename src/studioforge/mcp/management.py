@@ -81,6 +81,7 @@ from studioforge.core.model_gate import (
     parse_min_params,
     parse_tags,
 )
+from studioforge.error_catalog import with_error_extras
 from studioforge.errors import BadRequestError, ModelNotFoundError, StudioForgeError
 from studioforge.logging import get_logger
 from studioforge.mcp_policy import PolicyExtension, annotations_for, current_principal
@@ -342,15 +343,17 @@ def _error_result(exc: BaseException) -> dict[str, Any]:
             payload["param"] = exc.param
         if exc.details:
             payload["details"] = exc.details
-        return {"ok": False, "error": payload}
-    return {
-        "ok": False,
-        "error": {
-            "message": str(exc) or exc.__class__.__name__,
-            "code": "internal_error",
-            "type": exc.__class__.__name__,
-        },
-    }
+        return with_error_extras({"ok": False, "error": payload})
+    return with_error_extras(
+        {
+            "ok": False,
+            "error": {
+                "message": str(exc) or exc.__class__.__name__,
+                "code": "internal_error",
+                "type": exc.__class__.__name__,
+            },
+        }
+    )
 
 
 def _guard[**P](
@@ -366,7 +369,7 @@ def _guard[**P](
     @functools.wraps(func)
     async def wrapper(*args: P.args, **kwargs: P.kwargs) -> dict[str, Any]:
         try:
-            return await func(*args, **kwargs)
+            return with_error_extras(await func(*args, **kwargs))
         except StudioForgeError as exc:
             log.info("mcp tool rejected", tool=func.__name__, error=exc.message)
             return _error_result(exc)

@@ -445,6 +445,7 @@ def test_redact_config_dict_covers_every_secret_including_the_pin() -> None:
     config.hf.token = "hf_abcdefghijklmnopqrstuvwxyz"
     data = redact_config_dict(config.to_yaml_dict())
     assert data["server"]["api_key"] != "key-value-1234567890"
-    assert data["mcp"]["pin"] == "***"
-    assert data["hf"]["token"].startswith("hf_a") and "..." in data["hf"]["token"]
+    assert data["mcp"]["pin"] == "redacted:********"
+    assert data["hf"]["token"].startswith("redacted:") and "hf_a" not in data["hf"]["token"]
+    assert len(data["hf"]["token"]) == len("redacted:") + 8
     assert ("mcp", "pin") in SECRET_CONFIG_PATHS

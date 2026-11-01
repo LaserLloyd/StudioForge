@@ -113,6 +113,14 @@ def _swap_port(url: str, port: int) -> str:
     return f"{parts.scheme}://{host}:{port}"
 
 
+def derived_watchdog_port(url: str) -> int:
+    """Gateway port + 1 (the watchdog's default placement); 1235 if no explicit port."""
+    port = urlsplit(url).port
+    if port is None or port >= 65535:
+        return DEFAULT_WATCHDOG_PORT
+    return port + 1
+
+
 class ServerProfile(BaseModel):
     """One reachable StudioForge server."""
 
@@ -153,14 +161,18 @@ class ServerProfile(BaseModel):
 
     @property
     def effective_watchdog_url(self) -> str:
-        """Explicit ``watchdog_url``, else the same host on port 1235.
+        """Explicit ``watchdog_url``, else the same host on gateway port + 1.
+
+        On the default gateway port 1234 that is 1235. A server on another port
+        needs ``watchdog.port`` set to match (gateway + 1) or an explicit
+        ``watchdog_url``.
 
         Deriving it keeps the common case zero-config: the watchdog runs beside
         the server, so only the port differs.
         """
         if self.watchdog_url:
             return self.watchdog_url
-        return _swap_port(self.url, DEFAULT_WATCHDOG_PORT)
+        return _swap_port(self.url, derived_watchdog_port(self.url))
 
     @property
     def watchdog_mcp_url(self) -> str:

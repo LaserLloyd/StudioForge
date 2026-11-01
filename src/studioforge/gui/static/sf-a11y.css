@@ -1,0 +1,25 @@
+/* StudioForge panel accessibility overrides. Loaded after the theme.
+   Helper text is dimmed with Tailwind's opacity-50..80 utilities all over the panel; at those
+   levels it falls under 4.5:1 on most themes, and under the 7:1 the two high-contrast themes
+   promise. Keep a visible hierarchy on the standard themes (never below .85) and use full
+   strength on the high-contrast ones. */
+.opacity-50, .opacity-60, .opacity-70 { opacity: .85; }
+.opacity-80 { opacity: .9; }
+[data-contrast-profile="high"] .opacity-50,
+[data-contrast-profile="high"] .opacity-60,
+[data-contrast-profile="high"] .opacity-70,
+[data-contrast-profile="high"] .opacity-80,
+[data-palette="high-contrast"] .opacity-50,
+[data-palette="high-contrast"] .opacity-60,
+[data-palette="high-contrast"] .opacity-70,
+[data-palette="high-contrast"] .opacity-80,
+[data-palette="high-contrast-light"] .opacity-50,
+[data-palette="high-contrast-light"] .opacity-60,
+[data-palette="high-contrast-light"] .opacity-70,
+[data-palette="high-contrast-light"] .opacity-80 { opacity: 1; }
+.sf-lang { display: inline-flex; align-items: center; gap: .35rem; font-size: .75rem; }
+.sf-lang select {
+  background: transparent; color: inherit; border: 1px solid currentColor;
+  border-radius: 4px; padding: .1rem .3rem; font: inherit;
+}
+.sf-lang select option { color: initial; }

@@ -26,9 +26,8 @@ from fastapi import APIRouter, Body, Request
 
 from studioforge.api.auth import (
     PIN_WITHHELD_NOTE,
-    cross_site_browser_request,
-    is_local_request,
     may_reveal_pin,
+    trusted_local_request,
 )
 from studioforge.core.ports import EXIT_RESTART_REQUESTED, supervised_by, supervising_tray_is_alive
 from studioforge.errors import AuthError, BadRequestError, ModelNotFoundError
@@ -643,9 +642,7 @@ async def mcp_info(request: Request) -> dict[str, Any]:
     # needs the PIN on the MCP plane even with `mcp.pin_required` off (D32,
     # amended). A paired agent told "no PIN needed" that then meets a 403 is
     # worse than being told the truth here.
-    off_box = not config.server.api_key and (
-        not is_local_request(request) or cross_site_browser_request(request)
-    )
+    off_box = not config.server.api_key and not trusted_local_request(request, config)
     pin_needed = bool(mcp.pin) and (bool(mcp.pin_required) or off_box)
     payload: dict[str, Any] = {
         "enabled": mcp.enabled,

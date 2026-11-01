@@ -377,6 +377,8 @@ def _accounts_card(ctx: GuiContext, refresh: Any) -> None:
                 )
                 refresh()
 
+            for field in (username, password, again):
+                field.on("keydown.enter", make)
             ui.button("Create account", icon="person_add", on_click=make).props(
                 "color=primary dense"
             )
@@ -407,6 +409,8 @@ def _accounts_card(ctx: GuiContext, refresh: Any) -> None:
                     )
                     refresh()
 
+                for field in (new, repeat):
+                    field.on("keydown.enter", change)
                 ui.button("Change password", icon="password", on_click=change).props(
                     "color=primary dense"
                 )
@@ -535,6 +539,7 @@ def create_key_form(ctx: GuiContext, refresh: Any, *, default_scope: str = "infe
             )
             refresh()
 
+        name.on("keydown.enter", make)
         ui.button("Create key", icon="vpn_key", on_click=make).props("color=primary dense")
 
 

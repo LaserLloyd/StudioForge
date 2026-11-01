@@ -503,8 +503,8 @@ def _loaded_panel(ctx: GuiContext) -> None:
     # Annotated because the "Restart server" handler above closes over it
     # before this line runs -- fine at runtime (the click cannot happen until
     # the page is built) but mypy needs the type stated.
-    banner: ui.label = ui.label("").classes("text-sm text-warning")
-    stale = ui.label("").classes("text-xs text-warning")
+    banner: ui.label = ui.label("").classes("text-sm text-warning").props('aria-live="polite"')
+    stale = ui.label("").classes("text-xs text-warning").props('aria-live="polite"')
     container = ui.column().classes("w-full gap-2")
 
     async def refresh() -> None:

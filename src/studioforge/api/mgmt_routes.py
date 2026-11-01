@@ -21,6 +21,7 @@ from studioforge import __version__
 from studioforge.api.auth import (
     PIN_WITHHELD_NOTE,
     _matches,
+    check_bind_rule,
     is_admin_caller,
     key_owner_of,
     may_reveal_pin,
@@ -2065,6 +2066,10 @@ async def settings_schema() -> dict[str, Any]:
     return registry.export()
 
 
+#: Config keys that decide which address a service listens on.
+_BIND_HOST_KEYS = ("server.host", "gui.host", "watchdog.host")
+
+
 @router.patch("/config")
 async def set_config(request: Request, updates: dict[str, Any] = Body(...)) -> dict[str, Any]:
     """Apply dotted-path updates, validate, persist, and report restart needs.
@@ -2077,6 +2082,11 @@ async def set_config(request: Request, updates: dict[str, Any] = Body(...)) -> d
     """
     state = _state(request)
     updated = apply_overrides(state.config, updates)
+    if any(key in updates for key in _BIND_HOST_KEYS):
+        # The next start enforces the bind rule and exits 4 when a network-bound
+        # service has no owner account or admin key; refuse the edit now rather
+        # than save a config that takes the server down at its next restart.
+        check_bind_rule(updated, getattr(state, "accounts", None))
     updated.save()
     changed = sorted(updates)
     needs_restart = [k for k in changed if k in RESTART_REQUIRED_KEYS]

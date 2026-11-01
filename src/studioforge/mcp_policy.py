@@ -183,6 +183,33 @@ def _headers_of(ctx: Any) -> Mapping[str, str] | None:
     return getattr(transport, "headers", None)
 
 
+def _transport_kind(ctx: Any) -> str | None:
+    """The SDK's transport identifier for this call (``"streamable-http"``, ``"jsonrpc"``...)."""
+    session = getattr(ctx, "session", None)
+    dispatch = getattr(session, "_dispatch_context", None) or getattr(session, "dctx", None)
+    transport = getattr(dispatch, "transport", None)
+    kind = getattr(transport, "kind", None)
+    return str(kind) if kind else None
+
+
+def _is_http_call(ctx: Any) -> bool:
+    """Whether this call crossed HTTP, decided from the transport, not from headers.
+
+    "No headers, therefore stdio, therefore local admin" fails open if an SDK
+    upgrade moves the headers somewhere :func:`_headers_of` does not look: every
+    HTTP tool call would then run as :data:`LOCAL_ADMIN`. So HTTP is recognised
+    by any one of: a transport kind that names HTTP or SSE, an HTTP request on
+    the context, or headers found. Only a call showing none of those (stdio, an
+    in-process client) is the local process.
+    """
+    kind = (_transport_kind(ctx) or "").lower()
+    if "http" in kind or "sse" in kind:
+        return True
+    if getattr(ctx, "request", None) is not None:
+        return True
+    return _headers_of(ctx) is not None
+
+
 def _target(tool: str, arguments: Mapping[str, Any]) -> str:
     """A short, secret-free description of what a call is aimed at."""
     if tool in {"set_config"}:
@@ -253,9 +280,15 @@ class PolicyExtension(Extension):
         tool = params.name
         arguments = params.arguments or {}
         headers = _headers_of(ctx)
-        # No HTTP headers = not the HTTP transport (stdio, an in-process client):
-        # the local process itself.
-        principal = LOCAL_ADMIN if headers is None else self._resolve(headers)
+        if headers is not None:
+            principal = self._resolve(headers)
+        elif _is_http_call(ctx):
+            # An HTTP call whose headers cannot be read has no credential we can
+            # check: deny rather than assume the local process.
+            principal = None
+        else:
+            # Not HTTP (stdio, an in-process client): the local process itself.
+            principal = LOCAL_ADMIN
         row = policy_for(self._server, tool)
         needed = row.scope
         if row.admin_arg and arguments.get(row.admin_arg):

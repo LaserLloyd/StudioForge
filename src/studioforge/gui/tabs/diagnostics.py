@@ -121,7 +121,7 @@ def render(ctx: GuiContext) -> None:
             ).classes("text-xs opacity-70")
             if not may_change:
                 remote_viewer_banner()
-            summary = ui.label("").classes("text-sm")
+            summary = ui.label("").classes("text-sm").props('aria-live="polite"')
             results = ui.column().classes("w-full gap-2")
 
             async def run() -> None:

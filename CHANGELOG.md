@@ -9,6 +9,41 @@ the decisions each one carries rather than repeating them.
 To see what a running server includes, ask it: `GET /api/capabilities` lists every decision number
 the build implements, and the `build` field on `/health` names the exact commit.
 
+## 2.3.0
+
+### Changed
+
+- **Licence: MIT-0 (MIT No Attribution), author Laser Lloyd.** Repository, both packages, SPDX
+  metadata, image label and winget manifest.
+
+### Security
+
+- Same-machine admin trust now requires a loopback `Host` (or `server.allowed_hosts` / a configured
+  CORS origin), closing the DNS-rebinding shape (#4). New `server.behind_proxy` turns the shortcut
+  off for proxied deployments, with a `doctor` warning (#5).
+- Legacy `server.api_key`: redaction no longer shows plaintext characters, a 16-character minimum
+  applies on write, and legacy-key adoption is cached (#7, #34).
+- MCP policy fails closed when an HTTP call carries no readable headers (#33). `PATCH /api/config`
+  refuses a non-loopback bind without an admin credential (#35). `GET /logout` no longer signs out;
+  unknown mutating `/api/v1/*` routes need admin (#17).
+- Self-signed TLS: SANs are loopback plus configured bind hosts, regeneration only on expiry,
+  missing bind host or key mismatch, under a cross-process lock with an atomic pair write (#6, #37).
+- STRICT_GPU normalises quoted and Unicode-dash flags and strips the HIP/ROCR/Vulkan visible-device
+  variables (#8). Support bundles mask escaped home paths, peer addresses and `owner:` actors, and
+  Windows secret files are restricted before they are written (#9).
+
+### Fixed
+
+- Interleaved streamed tool arguments are buffered per index, not dropped (#32). Route labels use the
+  matched route template (#36). `fix`/`docs` now ride on framework 404/405, MCP, watchdog and SSE
+  errors (#14). Capability registry covers every route, with cross-checks (#15). Dead settings
+  removed or wired, ranges added (#16). `sfctl` derives the watchdog URL from the gateway port (#11).
+
+### Panel
+
+- Enter-to-submit, `aria-live` status text and contrast fixes (#12); en/ja catalogue wired for the
+  navigation chrome with a language switch (#13). Docs swept for the four-tab panel and scoped keys (#10).
+
 ## 2.2.0
 
 ### Changed

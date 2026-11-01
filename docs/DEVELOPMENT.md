@@ -63,7 +63,7 @@ api/         FastAPI app and routes
   mgmt_routes.py   /api/* — catalog, models, downloads, leases, status
   admin_routes.py  restart, update, connection info, /api/mcp/info
   health_routes.py /health
-  auth.py          one dependency: API key, MCP pin, the D32 admin gate
+  auth.py          one dependency: scoped keys, owner sessions, legacy API key and MCP pin, the D32 admin gate
 netguard.py    which hosts a tenant URL may name (loopback, tailnet, allowed_hosts)
   vision.py        image fetching for multimodal requests (SSRF guard)
 core/
@@ -106,7 +106,8 @@ depends on nothing above it. A change that makes `core` import from `api` is a c
    model, so a new scalar key gets a type-aware widget automatically (DECISIONS.md D26). Two
    optional follow-ups: add a one-liner to `gui/state.CONFIG_FIELD_HELP` if the generated
    "`<kind>`, default `<x>`" is not explanation enough, and promote it out of Advanced into a named
-   section by adding a `fields.row(...)` in `gui/tabs/setup.py` **and** listing it in that module's
+   section by adding a `fields.row(...)` in `gui/tabs/setup.py` (it renders the Advanced > Serving & network
+   and Config pages; the four-tab layout is in [`panel.md`](panel.md)) **and** listing it in that module's
    `COVERED_KEYS` — a test asserts every key has exactly one control.
 5. A key whose type is a mapping (`dict[int, int]`) or a list of nested models
    (`tenants.registry`) is deliberately *not* generated: it needs a row widget, like

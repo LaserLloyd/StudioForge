@@ -169,7 +169,19 @@ def viewer_may_change_box(ctx: GuiContext) -> bool:
     from studioforge.api.auth import _is_loopback
 
     host = viewer_host()
-    return not host or _is_loopback(host)
+    if not host:
+        return True
+    # A reverse proxy makes every viewer a loopback peer; a ``Host`` that is not
+    # this server's is the DNS-rebinding shape. Same two rules as the API.
+    if getattr(ctx.config.server, "behind_proxy", False) or not _is_loopback(host):
+        return False
+    from studioforge.api.auth import host_header_trusted
+
+    try:
+        request = ui.context.client.request
+    except (RuntimeError, AttributeError):
+        return True
+    return host_header_trusted(request, ctx.config)
 
 
 def audit_panel(

@@ -273,7 +273,7 @@ GGUF's own metadata — `n_ctx_train`, layer counts, KV head counts, the sliding
 `full_attention_interval` — then combined with live VRAM. A model downloaded tomorrow is planned
 the same way:
 
-1. Download it (`repo_details` → `download_model`, the GUI **Download** tab, or `sfctl download`).
+1. Download it (`repo_details` → `download_model`, the panel's **Models** tab (**Add model**), or `sfctl download`).
    A finished download triggers a rescan automatically.
 2. Ask for it by name, or read its catalog row first if you want to choose deliberately.
 

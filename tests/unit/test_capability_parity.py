@@ -246,3 +246,96 @@ def test_report_surfaces_that_do_not_exist_yet() -> None:
 def test_export_lists_every_capability_once() -> None:
     rows = export()["capabilities"]
     assert [r["id"] for r in rows] == sorted(BY_ID)
+
+
+# ---------------------------------------------------------------------------
+# Coverage and cross-checks (monthly review, F-15)
+# ---------------------------------------------------------------------------
+
+#: Route families deliberately outside the registry, each with the reason.
+_EXEMPT_ROUTE_PREFIXES = {
+    "/api/v0/": "LM Studio compatibility shim: mirrors /v1 under another prefix",
+    "/api/v1/": "LM Studio compatibility shim: mirrors the management API under another prefix",
+}
+
+
+def test_every_route_is_registered_or_explicitly_exempt(
+    surfaces: tuple[dict[str, Any], list[dict[str, Any]]],
+) -> None:
+    """The registry must keep pace with the API: a new route needs a row or an exemption."""
+    openapi, _ = surfaces
+    claimed = {c.api for c in CAPABILITIES if c.api}
+    unclaimed = sorted(
+        f"{m} {p}"
+        for m, p in _routes(openapi)
+        if (m, p) not in claimed and not any(p.startswith(x) for x in _EXEMPT_ROUTE_PREFIXES)
+    )
+    assert not unclaimed, (
+        "routes with no capability_registry row (add one, or exempt the family in this "
+        "test with a reason): " + ", ".join(unclaimed)
+    )
+
+
+def test_every_declared_panel_location_names_a_real_tab_or_page() -> None:
+    """``panel`` strings were never checked; the tab / Advanced page they name must exist."""
+    from studioforge.gui import nav
+
+    pages = {page.label for page in nav.ADVANCED_PAGES}
+    tabs = set(nav.TOP_TABS)
+    bad: list[str] = []
+    for cap in CAPABILITIES:
+        panel = cap.panel
+        if panel is None or panel == "/setup page":
+            continue
+        if panel.startswith("Advanced > "):
+            page = panel.removeprefix("Advanced > ").split(":", 1)[0]
+            ok = page in pages
+        else:
+            head = panel.split(":", 1)[0]
+            ok = head in {f"{t} tab" for t in tabs}
+        if not ok:
+            bad.append(f"{cap.id}: {panel!r}")
+    assert not bad, f"panel locations that name no real tab/page: {bad}"
+
+
+def test_every_mcp_tool_and_sfctl_command_is_in_the_registry_or_exempt(
+    surfaces: tuple[dict[str, Any], list[dict[str, Any]]],
+) -> None:
+    """Reverse direction: an MCP tool or sfctl command that no capability names is a gap."""
+    _, tools = surfaces
+    declared = {(c.mcp.server, c.mcp.tool) for c in CAPABILITIES if c.mcp}
+    undeclared = sorted(
+        f"{t['server']}:{t['name']}" for t in tools if (t["server"], t["name"]) not in declared
+    )
+    assert not undeclared, f"MCP tools with no capability row: {undeclared}"
+
+    declared_cmds = {_command_path(c.sfctl) for c in CAPABILITIES if c.sfctl}
+    # Client-side plumbing with no server capability behind it.
+    local_only = {
+        "servers add",
+        "servers list",
+        "servers remove",
+        "servers use",
+        "config-local",
+        "config get",
+        "config set",
+        "models scan",
+        "mcp",
+        "recover",
+        "logs",
+        "search",
+        "status",
+        "update",
+        "models list",
+        "models load",
+        "models unload",
+        "models delete",
+        "models pin",
+        "models test",
+        "leases add",
+        "leases list",
+        "leases release",
+        "tenants list",
+    }
+    missing = sorted(_sfctl_commands() - declared_cmds - local_only)
+    assert not missing, f"sfctl commands no capability names: {missing}"

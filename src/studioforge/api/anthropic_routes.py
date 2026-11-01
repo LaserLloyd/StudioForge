@@ -507,6 +507,26 @@ async def anthropic_stream(
         )
         return frames
 
+    # Tool calls that started while another tool block was open. Anthropic
+    # streams one content block at a time, so a call that interleaves with the
+    # open one is buffered whole (id, name, arguments by tool index) and emitted
+    # as its own block once the open one can close -- never dropped.
+    pending: dict[int, dict[str, Any]] = {}
+
+    def flush_pending() -> list[bytes]:
+        frames: list[bytes] = []
+        for call in pending.values():
+            frames.extend(
+                start_block(
+                    "tool",
+                    {"type": "tool_use", "id": call["id"], "name": call["name"], "input": {}},
+                )
+            )
+            if call["args"]:
+                frames.append(delta("input_json_delta", partial_json="".join(call["args"])))
+        pending.clear()
+        return frames
+
     def delta(kind: str, **fields: Any) -> bytes:
         return sse_event(
             "content_block_delta",
@@ -521,6 +541,8 @@ async def anthropic_stream(
                 if not context.get("thinking"):
                     continue
                 deltas += 1
+                for frame in flush_pending():
+                    yield frame
                 if open_kind != "thinking":
                     for frame in start_block(
                         "thinking", {"type": "thinking", "thinking": "", "signature": ""}
@@ -529,12 +551,17 @@ async def anthropic_stream(
                 yield delta("thinking_delta", thinking=event.text)
             elif event.kind == "text":
                 deltas += 1
+                for frame in flush_pending():
+                    yield frame
                 if open_kind != "text":
                     for frame in start_block("text", {"type": "text", "text": ""}):
                         yield frame
                 yield delta("text_delta", text=event.text)
             elif event.kind == "tool_start":
                 saw_tool = True
+                if open_kind == "tool" and open_tool != event.index:
+                    pending[event.index] = {"id": event.call_id, "name": event.name, "args": []}
+                    continue
                 for frame in start_block(
                     "tool",
                     {"type": "tool_use", "id": event.call_id, "name": event.name, "input": {}},
@@ -543,10 +570,10 @@ async def anthropic_stream(
                 open_tool = event.index
             elif event.kind == "tool_args":
                 deltas += 1
-                # Calls arrive one after another from llama-server; a fragment
-                # for a call that is no longer the open block has nowhere to go.
                 if open_kind == "tool" and open_tool == event.index:
                     yield delta("input_json_delta", partial_json=event.text)
+                elif event.index in pending:
+                    pending[event.index]["args"].append(event.text)
             elif event.kind == "finish":
                 finish, word = event.reason, event.stopping_word
             elif event.kind == "usage":
@@ -555,6 +582,10 @@ async def anthropic_stream(
             elif event.kind == "error":
                 err = event.error
                 code = err.get("code") if isinstance(err.get("code"), str) else None
+                for frame in flush_pending():
+                    yield frame
+                for frame in stop_block():
+                    yield frame
                 yield sse_event(
                     "error",
                     error_body(str(err.get("message") or "upstream error"), 502, code),
@@ -563,6 +594,8 @@ async def anthropic_stream(
             elif event.kind == "done":
                 break
 
+    for frame in flush_pending():
+        yield frame
     for frame in stop_block():
         yield frame
     reason, sequence = stop_reason(

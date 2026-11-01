@@ -88,6 +88,7 @@ from studioforge.config import (
     resolve_data_dir,
 )
 from studioforge.credential_guard import CredentialGuard, client_key
+from studioforge.error_catalog import with_error_extras
 from studioforge.logfiles import backups_of
 from studioforge.mcp_policy import PolicyExtension, annotations_for
 from studioforge.secure_files import write_private
@@ -255,25 +256,27 @@ def _tail_lines(path: Path, n: int) -> list[str]:
 
 
 def _needs_confirmation(what: str, consequence: str) -> dict[str, Any]:
-    return {
-        "ok": False,
-        "confirmed": False,
-        "error": {
-            "message": (
-                f"Refusing to {what} without confirmation. {consequence} "
-                f"Re-call this tool with confirm=true if that is what you want."
-            ),
-            "code": "confirmation_required",
-            "type": "invalid_request_error",
-            "param": "confirm",
-        },
-    }
+    return with_error_extras(
+        {
+            "ok": False,
+            "confirmed": False,
+            "error": {
+                "message": (
+                    f"Refusing to {what} without confirmation. {consequence} "
+                    f"Re-call this tool with confirm=true if that is what you want."
+                ),
+                "code": "confirmation_required",
+                "type": "invalid_request_error",
+                "param": "confirm",
+            },
+        }
+    )
 
 
 def _error(message: str, code: str, **extra: Any) -> dict[str, Any]:
     payload: dict[str, Any] = {"message": message, "code": code, "type": "watchdog_error"}
     payload.update(extra)
-    return {"ok": False, "error": payload}
+    return with_error_extras({"ok": False, "error": payload})
 
 
 def _guard[**P](
@@ -289,7 +292,7 @@ def _guard[**P](
     @functools.wraps(func)
     async def wrapper(*args: P.args, **kwargs: P.kwargs) -> dict[str, Any]:
         try:
-            return await func(*args, **kwargs)
+            return with_error_extras(await func(*args, **kwargs))
         except Exception as exc:  # noqa: BLE001 - intentional catch-all
             log.exception("watchdog tool failed: %s", func.__name__)
             return _error(

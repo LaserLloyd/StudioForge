@@ -134,7 +134,7 @@ def tls_card(ctx: GuiContext) -> None:
             cert.bind_visibility_from(mode, "value", backward=lambda v: v == "cert")
             key.bind_visibility_from(mode, "value", backward=lambda v: v == "cert")
             _fingerprint_line(ctx)
-            result = ui.label("").classes("text-xs")
+            result = ui.label("").classes("text-xs").props('aria-live="polite"')
 
             async def save() -> None:
                 updates: dict[str, Any] = {}
@@ -166,7 +166,7 @@ def ttl_card(ctx: GuiContext) -> None:
         fields.row("models.default_ttl_s", label="Unload after idle (seconds)")
         fields.row("models.auto_unload_idle_s", label="Unload automatically when idle (seconds)")
         tiers = setup._ttl_by_priority_rows(ctx)
-        result = ui.label("").classes("text-xs")
+        result = ui.label("").classes("text-xs").props('aria-live="polite"')
 
         async def save() -> None:
             updates = fields.updates()

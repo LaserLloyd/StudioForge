@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import functools
+import re
 import time
 from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
@@ -56,7 +57,7 @@ from studioforge.core.registry import Registry
 from studioforge.core.supervisor import Supervisor
 from studioforge.core.updater import Updater
 from studioforge.db import Database
-from studioforge.error_catalog import envelope_extras
+from studioforge.error_catalog import HTTP_STATUS_CODES, envelope_extras
 from studioforge.errors import AuthError, StudioForgeError
 from studioforge.logging import configure_logging, get_logger
 
@@ -124,18 +125,27 @@ SCAN_WAIT_S = 60.0
 def _route_label(scope: Mapping[str, Any]) -> str:
     """The route *template* a request matched (``/api/models/{model_id}/load``), not its URL.
 
-    Metric labels must be bounded by the code, not by the traffic. A router that
-    was included with a prefix reports a path without it, so the template is
-    rebuilt from the real path and the matched path parameters.
+    Metric labels must be bounded by the code, not by the traffic. The matched
+    route's own ``path`` is the template, so nothing is rebuilt by substituting
+    parameter values into the URL (a value such as ``a`` or ``api`` that repeats a
+    substring of the path would mislabel it). A router included with a prefix
+    stores a path without it; the prefix is recovered as the part of the real path
+    in front of the route's own anchored pattern.
     """
-    if scope.get("route") is None:
+    route = scope.get("route")
+    template = getattr(route, "path", None)
+    if not template:
         return "(unmatched)"
-    label = str(scope.get("path", ""))
-    for name, value in (scope.get("path_params") or {}).items():
-        text = str(value)
-        if text:
-            label = label.replace(text, "{" + str(name) + "}", 1)
-    return label
+    prefix = ""
+    regex = getattr(route, "path_regex", None)
+    if regex is not None:
+        path = str(scope.get("path", ""))
+        pattern = regex.pattern.removeprefix("^")
+        found = re.search(pattern, path)
+        if found and found.end() == len(path):
+            prefix = path[: found.start()]
+    # ``{model_id:path}`` -> ``{model_id}``: the converter is routing detail, not label.
+    return prefix + re.sub(r"\{(\w+):\w+\}", r"{\1}", str(template))
 
 
 _MUTATING = frozenset({"POST", "PUT", "PATCH", "DELETE"})
@@ -1167,16 +1177,19 @@ def _install_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(StarletteHTTPException)
     async def _http_error(_request: Request, exc: StarletteHTTPException) -> JSONResponse:
         error_type = "invalid_request_error" if exc.status_code < 500 else "server_error"
+        code = HTTP_STATUS_CODES.get(exc.status_code)
         return JSONResponse(
             {
                 "error": {
                     "message": str(exc.detail),
                     "type": error_type,
-                    "code": None,
+                    "code": code,
                     "param": None,
+                    **envelope_extras(code),
                 }
             },
             status_code=exc.status_code,
+            headers=dict(exc.headers or {}),
         )
 
     @app.exception_handler(RequestValidationError)

@@ -23,7 +23,11 @@ from studioforge.errors import (
     StudioForgeError,
 )
 
-SRC = Path(__file__).resolve().parents[2] / "src" / "studioforge"
+ROOT = Path(__file__).resolve().parents[2]
+SRC = ROOT / "src" / "studioforge"
+#: ``packages/`` carries its own error surfaces (companion, tenant client); the scan
+#: covers them so a code spelled there cannot dodge the catalog.
+PACKAGES = ROOT / "packages"
 
 #: Keyword arguments / assignment targets whose string value is an error code.
 _CODE_NAMES = frozenset({"code", "reason_code"})
@@ -44,9 +48,14 @@ def raised_codes() -> dict[str, list[str]]:
 
     def add(code: str | None, path: Path, line: int) -> None:
         if code:
-            found.setdefault(code, []).append(f"{path.relative_to(SRC.parent).as_posix()}:{line}")
+            found.setdefault(code, []).append(f"{path.relative_to(ROOT).as_posix()}:{line}")
 
-    for path in sorted(SRC.rglob("*.py")):
+    paths = sorted(SRC.rglob("*.py")) + sorted(
+        p
+        for p in PACKAGES.rglob("*.py")
+        if not {".venv", "tests", "node_modules", "build"} & set(p.relative_to(ROOT).parts)
+    )
+    for path in paths:
         if "gui/theme" in path.as_posix():
             continue
         tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -68,6 +77,16 @@ def raised_codes() -> dict[str, list[str]]:
                 for key, value in zip(node.keys, node.values, strict=True):
                     if _str(key) == "code":
                         add(_str(value), path, key.lineno if key else node.lineno)
+            if (
+                isinstance(node, ast.Assign)
+                and isinstance(node.value, ast.Dict)
+                and any(
+                    isinstance(t, ast.Name) and t.id == "HTTP_STATUS_CODES" for t in node.targets
+                )
+            ):
+                # status -> code table for framework 404/405 (see error_catalog.py)
+                for value in node.value.values:
+                    add(_str(value), path, node.lineno)
     return found
 
 

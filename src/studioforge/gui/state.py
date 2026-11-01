@@ -57,9 +57,10 @@ _KEEP_EMPTY_TEXT: Final = frozenset({"extra_flags"})
 _DEVICE_LIST_FIELDS: Final = frozenset({"device_override", "draft_device_override"})
 
 #: Mirrors :func:`studioforge.api.auth.redact`'s output shape
-#: (``"abcd...yz"``). Anything matching it is treated as an untouched
-#: placeholder rather than a new secret.
-_REDACTION_RE: Final = re.compile(r"^\S{1,8}\.\.\.\S{1,4}$")
+#: (``"redacted:1a2b3c4d"``; the older ``"abcd...yz"`` shape is still recognised).
+#: Anything matching it is treated as an untouched placeholder rather than a new
+#: secret.
+_REDACTION_RE: Final = re.compile(r"^(?:redacted:[0-9a-f*]{8}|\S{1,8}\.\.\.\S{1,4})$")
 
 #: The planner's FP4 note (DECISIONS D9) is the one plan note users must not
 #: miss, so it is detected and promoted to a warning rather than buried.

@@ -387,6 +387,15 @@
       "surface": "api"
     },
     {
+      "code": "method_not_allowed",
+      "docs": "errors/method_not_allowed",
+      "error_type": "invalid_request_error",
+      "fix": "Use the method the endpoint documents (see the Allow header and docs/contracts/openapi.json).",
+      "http_status": 405,
+      "message": "That endpoint does not accept this HTTP method.",
+      "surface": "api"
+    },
+    {
       "code": "model_benchmarking",
       "docs": "errors/model_benchmarking",
       "error_type": "invalid_request_error",
@@ -477,6 +486,15 @@
       "surface": "api"
     },
     {
+      "code": "not_found",
+      "docs": "errors/not_found",
+      "error_type": "invalid_request_error",
+      "fix": "Check the path against docs/contracts/openapi.json (or /docs); model, key and lease lookups have their own more specific codes.",
+      "http_status": 404,
+      "message": "No such endpoint: {path}",
+      "surface": "api"
+    },
+    {
       "code": "not_implemented",
       "docs": "errors/not_implemented",
       "error_type": "not_implemented_error",
@@ -519,6 +537,15 @@
       "fix": "Check the NVIDIA driver (`nvidia-smi`), then retry; or pass an explicit device list.",
       "http_status": 400,
       "message": "Automatic placement needs the GPU probe and found no usable GPUs.",
+      "surface": "api"
+    },
+    {
+      "code": "plan_unavailable",
+      "docs": "errors/plan_unavailable",
+      "error_type": "server_error",
+      "fix": "Retry, or pass --force to load without the fit check. Raised client-side by `sfctl load` when GET /plan fails.",
+      "http_status": 502,
+      "message": "Could not check whether the model fits: {reason}.",
       "surface": "api"
     },
     {

@@ -415,8 +415,12 @@ def test_exposure_local_is_a_no_op_on_a_loopback_install(
 
 
 def test_exposure_lan_binds_the_network_with_https_and_says_restart(
-    ctx: tabs.GuiContext, state: _FakeState
+    ctx: tabs.GuiContext, state: _FakeState, store: AccountStore
 ) -> None:
+    # The wizard's account step comes first; PATCH /api/config now refuses a
+    # network bind while no owner account or admin key exists (it would exit 4
+    # at the next start).
+    store.create_account("owner", "a-long-enough-password")
     result = services(ctx).apply_exposure("lan")
     assert result == {"hosts": "0.0.0.0", "tls": "self_signed", "restart_required": True}
     line = next(e for e in state.audit.tail(5) if e["action"] == "panel.config.set")  # type: ignore[attr-defined]

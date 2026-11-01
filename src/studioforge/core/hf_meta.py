@@ -327,7 +327,10 @@ def _cache_key(repo_id: str, revision: str, filename: str) -> str:
 
 
 def cache_dir(config: Config) -> Path:
-    """Where parsed remote headers are kept between runs."""
+    """Where parsed remote headers are kept between runs (``hf.cache_dir`` or the data dir)."""
+    configured = getattr(getattr(config, "hf", None), "cache_dir", None)
+    if configured:
+        return Path(configured).expanduser()
     return Path(config.data_dir) / "cache" / "hf_meta"
 
 

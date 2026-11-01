@@ -361,8 +361,9 @@ def test_every_destructive_audit_action_is_in_the_bundle_audit_tail(tmp_path: Pa
 def test_redaction_masks_escaped_home_peer_ips_and_owner_actor(monkeypatch) -> None:
     fake_home = Path("C:\\Users\\alice")  # scrub-ok: synthetic fixture user
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+    esc_home = "C:\\\\Users\\\\alice"  # scrub-ok: fixture
     text = (
-        '{"path": "C:\\\\Users\\\\alice\\\\models", "peer": "100.101.102.103", '  # scrub-ok: synthetic fixture user
+        '{"path": "' + esc_home + '\\\\models", "peer": "100.101.102.103", '
         '"lan": "192.168.1.20:8080", "v6": "2001:db8::7", "actor": "owner:alice", '
         '"loop": "127.0.0.1", "any": "0.0.0.0", "lo6": "::1", "ver": "2.2.0", "t": "12:34:56"}'
     )

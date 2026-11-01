@@ -345,6 +345,68 @@ def cross_site_browser_request(request: Any) -> bool:
     return origin_key != host_key
 
 
+def host_header_trusted(request: Any, config: Config) -> bool:
+    """Whether the ``Host`` header names this server, not an attacker's domain.
+
+    DNS rebinding: a page on ``evil.test`` whose name is re-pointed at 127.0.0.1
+    reaches this server from a loopback peer, and (for a same-origin request)
+    its ``Origin`` equals its ``Host``, so :func:`cross_site_browser_request`
+    waves it through. Only the ``Host`` it must send gives it away. Accepted:
+    no ``Host`` at all (HTTP/1.0, an in-process call), a loopback literal or
+    ``localhost`` (any port), the host of an explicit ``server.cors_origins``
+    entry, or an entry of ``server.allowed_hosts`` (host or host:port).
+    """
+    headers = getattr(request, "headers", None)
+    if headers is None:
+        return True
+    raw = headers.get("host")
+    if not raw or not raw.strip():
+        return True
+    key = _origin_key(raw, "http")
+    if key is None:
+        return False
+    hostname, port = key
+    if is_loopback_host(hostname):
+        return True
+    server = getattr(config, "server", None)
+    for entry in list(getattr(server, "allowed_hosts", None) or []):
+        entry_key = _origin_key(str(entry), "http")
+        if entry_key is None:
+            continue
+        explicit_port = ":" in str(entry).rsplit("]", 1)[-1]
+        if entry_key[0] == hostname and (not explicit_port or entry_key[1] == port):
+            return True
+    for origin in list(getattr(server, "cors_origins", None) or []):
+        text = str(origin).strip()
+        if not text or text == "*":
+            continue
+        origin_key = _origin_key(text, "http")
+        if origin_key is not None and origin_key[0] == hostname:
+            return True
+    return False
+
+
+def trusted_local_request(request: Any, config: Config) -> bool:
+    """The "caller on this machine" shortcut behind every D32 / PIN-reveal decision.
+
+    True only for: an in-process call (no peer), or a loopback peer that is
+    not a cross-site browser page, whose ``Host`` names this server
+    (:func:`host_header_trusted`), on an install that is not
+    ``server.behind_proxy`` (where a loopback peer is the proxy, so it says
+    nothing about the real client).
+    """
+    client = getattr(request, "client", None)
+    if not getattr(client, "host", None):
+        return True
+    if getattr(getattr(config, "server", None), "behind_proxy", False):
+        return False
+    return (
+        is_local_request(request)
+        and not cross_site_browser_request(request)
+        and host_header_trusted(request, config)
+    )
+
+
 REMOTE_ADMIN_NOTE = (
     "this management route changes the server itself and server.api_key is not set, so it "
     "is only accepted from this machine or with the MCP pairing PIN (header 'X-MCP-Pin', "
@@ -390,7 +452,7 @@ def is_admin_caller(request: Any, config: Config) -> bool:
         return established.allows("admin")
     if config.server.api_key:
         return True
-    if is_local_request(request) and not cross_site_browser_request(request):
+    if trusted_local_request(request, config):
         return True
     mcp_config = getattr(config, "mcp", None)
     pin = getattr(mcp_config, "pin", None) if mcp_config else None
@@ -436,7 +498,7 @@ def require_admin_action(request: Request, config: Config, action: str) -> None:
         raise deny_scope(established, "admin", action)
     if config.server.api_key:
         return
-    if is_local_request(request) and not cross_site_browser_request(request):
+    if trusted_local_request(request, config):
         return
 
     mcp_config = getattr(config, "mcp", None)
@@ -476,7 +538,13 @@ _INFERENCE_MODEL_SUFFIXES: tuple[str, ...] = ("/load", "/load-recommended", "/un
 #: Browser-reachable inference surfaces (prefix-matched, so routes added later
 #: -- LM Studio's ``/api/v1``, Anthropic's ``/v1/messages`` -- are covered
 #: without an edit here).
-_INFERENCE_PREFIXES: tuple[str, ...] = ("/v1/", "/api/v0/", "/api/v1/")
+_INFERENCE_PREFIXES: tuple[str, ...] = ("/v1/", "/api/v0/")
+#: LM Studio's native ``/api/v1`` is NOT prefix-matched: a mutating route added
+#: there later must be a deliberate decision (``admin`` until listed here), not
+#: an ``inference`` key's accidental permission. Model download stays ``admin``.
+_INFERENCE_NATIVE_POSTS: frozenset[str] = frozenset(
+    {"/api/v1/chat", "/api/v1/models/load", "/api/v1/models/unload"}
+)
 
 
 def required_scope(
@@ -487,8 +555,9 @@ def required_scope(
     * ``/mcp``: ``read`` here -- each tool then demands its own scope
       (:mod:`studioforge.mcp_policy`).
     * Reads (GET/HEAD) are ``read``, except the account/audit/doctor pages.
-    * ``/v1/*``, ``/api/v0/*``, ``/api/v1/*`` POSTs (chat, completions, embeddings,
-      native load/unload) are ``inference``; the native model download is ``admin``.
+    * ``/v1/*`` and ``/api/v0/*`` POSTs, plus the three native ``/api/v1`` ones (chat,
+      models/load, models/unload), are ``inference``; the native model download and any
+      other ``/api/v1`` write are ``admin``.
     * The tenant half of the VRAM protocol (:func:`is_tenant_protocol`: take,
       renew or release a lease; register or deregister a tenant) is
       ``inference``; the handlers then bind each lease and registration to the
@@ -511,7 +580,7 @@ def required_scope(
         return "admin"
     if path.startswith("/api/v1/models/download"):
         return "admin"
-    if path.startswith(_INFERENCE_PREFIXES):
+    if path.startswith(_INFERENCE_PREFIXES) or path.rstrip("/") in _INFERENCE_NATIVE_POSTS:
         return "inference"
     if (
         path.startswith("/api/models/")
@@ -854,7 +923,7 @@ def check_request(request: Request, config: Config, accounts: Any = None) -> Non
         gated = is_admin_mutation(request.method, path) or (
             on_mcp and (request.method or "").upper() in _MUTATING_METHODS
         )
-        local = is_local_request(request) and not cross_site_browser_request(request)
+        local = trusted_local_request(request, config)
         if gated and not local:
             candidate = header_pin or provided
             if pin and candidate and _matches(candidate, str(pin)):
@@ -929,13 +998,7 @@ def may_reveal_pin(request: Any, config: Config) -> bool:
         return established.allows("admin")
     if config.server.api_key:
         return True
-    if cross_site_browser_request(request):
-        return False
-    client = getattr(request, "client", None)
-    host = getattr(client, "host", None)
-    if not host:
-        return True
-    return _is_loopback(str(host))
+    return trusted_local_request(request, config)
 
 
 #: What to say instead of the PIN when it is withheld. Actionable on purpose:

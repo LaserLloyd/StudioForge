@@ -138,6 +138,11 @@ class AccountStore:
         self._touched: dict[str, float] = {}
         self._windows: dict[str, deque[float]] = {}
         self._posture: tuple[float, bool, bool, bool, bool] | None = None
+        #: ``hash -> (stamp, record)`` for the live ``legacy`` mirror, so a
+        #: request carrying ``server.api_key`` does not scan the key table each
+        #: time (:meth:`adopt_legacy_key`). Dropped on any key write here and
+        #: after ``_POSTURE_TTL_S`` for a revoke made by another process (the CLI).
+        self._legacy_mirror: dict[str, tuple[float, KeyRecord]] = {}
 
     # ------------------------------------------------------------------
     # Keys: create / list / revoke
@@ -303,6 +308,7 @@ class AccountStore:
     def _invalidate_posture(self) -> None:
         with self._lock:
             self._posture = None
+            self._legacy_mirror.clear()
 
     def sync_snapshot(self) -> None:
         """Rewrite ``keys.snapshot.json`` (what the watchdog verifies against)."""
@@ -404,6 +410,13 @@ class AccountStore:
         revoked (the hash is remembered), so ``keys revoke legacy`` really
         disables the config key too.
         """
+        if api_key:
+            digest = hash_token(api_key)
+            now = self._clock()
+            with self._lock:
+                hit = self._legacy_mirror.get(digest)
+            if hit is not None and now - hit[0] < _POSTURE_TTL_S:
+                return hit[1]
         live = [k for k in self.list_keys() if k.name == LEGACY_KEY_NAME and not k.revoked]
         if not api_key:
             for key in live:
@@ -412,7 +425,11 @@ class AccountStore:
         digest = hash_token(api_key)
         existing = self.db.query("SELECT * FROM api_keys WHERE key_hash = ?", (digest,))
         if existing:
-            return _row_to_key(existing[0])
+            found = _row_to_key(existing[0])
+            if not found.revoked:
+                with self._lock:
+                    self._legacy_mirror[digest] = (self._clock(), found)
+            return found
         for key in live:
             self.revoke_key(key.id)
         record = KeyRecord(
@@ -420,10 +437,12 @@ class AccountStore:
             name=LEGACY_KEY_NAME,
             scope="admin",
             key_hash=digest,
-            prefix=(api_key[:4] + "...")[:9],
+            prefix="legacy",  # constant: no plaintext character of the config key is stored
             created_at=self._clock(),
         )
         self._insert(record, created_by="migration")
+        with self._lock:
+            self._legacy_mirror[digest] = (self._clock(), record)
         log.info(
             "server.api_key migrated into the key table as the admin key 'legacy'; the config "
             "key still works but is deprecated (create scoped keys with `studioforge keys create`)"

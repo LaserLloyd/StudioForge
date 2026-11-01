@@ -9,6 +9,9 @@ layout below; edit the three paths at the top of each unit if yours differs.
 | virtualenv | `~/studioforge/.venv` (`uv venv --python 3.12 .venv && uv pip install -e ".[dev]"`) |
 | data dir (`SF_DATA_DIR`) | `~/studioforge/data` — config.yaml, registry, engines, logs |
 
+Prerequisites: `git`, `curl`, `ca-certificates`, `cmake` and a C++ toolchain (Debian and Ubuntu:
+`sudo apt-get install -y git curl ca-certificates cmake build-essential`).
+
 ```bash
 mkdir -p ~/.config/systemd/user
 cp deploy/studioforge.service deploy/studioforge-watchdog.service ~/.config/systemd/user/
@@ -38,5 +41,8 @@ Notes
   (upstream publishes no Linux CUDA archive): it needs `git`, `cmake` and a CUDA toolkit whose
   `nvcc` matches the driver, takes minutes, and is reused on later installs of the same tag.
   See `docs/SETUP.md`.
+- The control panel is on `http://127.0.0.1:8080`. Nothing needs a key on a loopback-only install;
+  to bind the network, create an owner account or an admin key first (Advanced > Accounts & keys, or
+  `studioforge keys create`).
 - Windows uses the tray app / `StudioForge Autostart.bat` instead; `studioforge tray` refuses to run
   on Linux and points here.

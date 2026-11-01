@@ -544,10 +544,12 @@ library on disk, but not the same port — quit one or change `server.port`.
   [`COMPARISON.md`](COMPARISON.md) for what was considered and why.
 * No embedded model-quantization tooling — download the quant you want.
 * No multi-node / distributed inference (llama.cpp RPC exists but is not wired up).
-* No auth beyond a single shared API key. No per-user accounts, no rate limiting. With
-  `server.api_key` unset, inference and read-only REST (`/v1/*`, `GET /api/status`,
-  `GET /api/leases`) are open to anything that can reach the bind address; only *box changes* are
-  gated, by D32 locality or the `X-MCP-Pin` header. Until a key is set, `GET /api/status` →
+* No OIDC or single sign-in: an owner account (password) and scoped keys (`read`, `inference`,
+  `admin`, with optional expiry and per-key rate limit) are the only credentials. On a loopback-only
+  install with no keys and no owner account, inference and read-only REST (`/v1/*`,
+  `GET /api/status`, `GET /api/leases`) are open to anything that can reach the bind address; only
+  *box changes* are gated, by D32 locality (the legacy MCP PIN still opens them for an existing
+  pairing). Binding the network requires an account or an admin key. Until a key is set, `GET /api/status` →
   `clients` — the trailing-hour rollup by `X-SF-Client` label or peer IP — is the only attribution
   surface. There is no half-way setting on purpose: see `OPENCLAW-SETUP.md` § "turning on a real
   API key".

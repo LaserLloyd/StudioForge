@@ -86,6 +86,12 @@ server:
   # Empty = none; non-browser clients are unaffected.
   cors_origins: []
   cors_allow_credentials: false
+  # Set true behind a reverse proxy or `tailscale serve`: every request that
+  # arrives from a peer address is then treated as remote, never as this machine.
+  behind_proxy: false
+  # Extra Host header values accepted as this machine (besides loopback literals
+  # and the hosts of cors_origins). Empty = none.
+  allowed_hosts: []
   tls:
     # off | self_signed | cert. self_signed generates a certificate into the data
     # directory on first use and shows its SHA-256 fingerprint in the panel.
@@ -289,6 +295,7 @@ benchmark:
   lease_priority: 2
 hf:
   token: null
+  # Where parsed remote GGUF headers are cached; null = <data_dir>/cache/hf_meta.
   cache_dir: null
   max_concurrent_downloads: 2
   chunk_bytes: 8388608
@@ -310,6 +317,4 @@ update:
   # the same as null.)
   repo: null
   channel: stable
-  auto_check: true
-  check_interval_h: 24.0
   health_check_timeout_s: 60.0

@@ -282,19 +282,22 @@ No code change was needed.
 
 ## Security
 
-* Anyone on the LAN can reach the gateway on the defaults. Set `server.api_key` on Advanced > Serving & network
-  (the Diagnostics checklist's *Network exposure* row is red until you do or you bind to `127.0.0.1`).
-* Without a key, routes that change the box are only accepted from the machine itself or with the
-  MCP PIN (`403 remote_admin_requires_credential` otherwise) — D32. "The machine itself" means a
+* The defaults bind `127.0.0.1`, so nothing off the machine can reach the gateway. To serve other
+  machines, create an owner account and scoped keys on Advanced > Accounts & keys (or
+  `studioforge keys create`); the Diagnostics checklist's *Network exposure* row is red while a
+  network bind has neither. `server.api_key` and the MCP PIN are deprecated.
+* Without a key, routes that change the box are only accepted from the machine itself, or, for an
+  existing pairing, with the legacy MCP PIN (`403 remote_admin_requires_credential` otherwise) — D32. "The machine itself" means a
   loopback peer whose browser `Origin`, if any, is this server's own host and port: a page from
   another site or another local app is refused even from `127.0.0.1`, and so is the panel on
   `:8080` for a LAN viewer. A `403` on a loopback request is therefore a cross-site page, or a
   reverse proxy rewriting `Host` — the log line names which.
-* The MCP path is under the same rule: with no key, every tool call from off the box needs the PIN
-  even with `mcp.pin_required: false`; `GET /api/mcp/info` reports the `pin_required` a caller is
+* The MCP path is under the same rule: with no key, every tool call from off the box needs a key (or
+  the legacy PIN) even with `mcp.pin_required: false`; `GET /api/mcp/info` reports the `pin_required` a caller is
   really held to.
-* The PIN is in the startup banner and `studioforge config` on the box; **Generate new PIN** on
-  Advanced > Serving & network rotates it after a leak. Send it as `X-MCP-Pin` or the bearer token. `?pin=` in the URL
+* If you still use the legacy PIN, it is in the startup banner and `studioforge config` on the box;
+  **Generate new PIN** on Advanced > Serving & network rotates it after a leak. Prefer a scoped key
+  per agent. Send either as `X-MCP-Pin` or the bearer token. `?pin=` in the URL
   is refused: a URL lands in proxy logs, browser history and shell history.
 * Wrong credentials are rate-limited. Three free attempts per client address, then a doubling
   lockout (1s, 2s, 4s … capped at 5 minutes) that clears after 15 quiet minutes or on any

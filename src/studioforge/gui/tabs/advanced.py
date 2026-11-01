@@ -311,7 +311,9 @@ class AdvancedHub:
                 )
                 with self.tabs:
                     for page in nav.ADVANCED_PAGES:
-                        ui.tab(page.slug, label=page.label, icon=page.icon).tooltip(page.summary)
+                        ui.tab(page.slug, label=page.label, icon=page.icon).props(
+                            f'data-i18n="adv.{page.slug}"'
+                        ).tooltip(page.summary)
             with ui.tab_panels(self.tabs, value=initial).props("vertical").classes("grow min-w-0"):
                 for page in nav.ADVANCED_PAGES:
                     with ui.tab_panel(page.slug).classes("p-0"):

@@ -25,6 +25,8 @@ Settings live in `<data dir>/config.yaml`. The machine-readable form of this pag
 | `server.api_key` (secret) | `string \| null` | `null` | min length 6 | basic | no | `SF_SERVER__API_KEY` | DEPRECATED (2.0). Still works, and is mirrored into the key table as an admin key named "legacy". Prefer `studioforge keys create`. |
 | `server.cors_origins` | `list[string]` | `[]` | - | advanced | yes | `SF_SERVER__CORS_ORIGINS` | Origins allowed to call the API from a browser (and to reach /mcp from one). Empty = none; non-browser clients are unaffected. |
 | `server.cors_allow_credentials` | `bool` | `false` | - | advanced | yes | `SF_SERVER__CORS_ALLOW_CREDENTIALS` | Let browsers send credentials cross-origin. Requires explicit cors_origins (no "*"). |
+| `server.behind_proxy` | `bool` | `false` | - | advanced | no | `SF_SERVER__BEHIND_PROXY` | Set true behind a reverse proxy or `tailscale serve`: every request that arrives from a peer address is then treated as remote, never as this machine. |
+| `server.allowed_hosts` | `list[string]` | `[]` | - | advanced | no | `SF_SERVER__ALLOWED_HOSTS` | Extra Host header values accepted as this machine (besides loopback literals and the hosts of cors_origins). Empty = none. |
 | `server.tls.mode` | `"off" \| "self_signed" \| "cert"` | `off` | one of `off`, `self_signed`, `cert` | advanced | yes | `SF_SERVER__TLS__MODE` | HTTPS for the gateway, panel and watchdog: off, self_signed (a certificate generated into the data directory, fingerprint shown in the panel) or cert (your own PEM files). |
 | `server.tls.cert_file` | `path \| null` | `null` | - | advanced | yes | `SF_SERVER__TLS__CERT_FILE` | PEM certificate (chain) served when server.tls.mode is cert. |
 | `server.tls.key_file` | `path \| null` | `null` | - | advanced | yes | `SF_SERVER__TLS__KEY_FILE` | PEM private key served when server.tls.mode is cert. |
@@ -116,7 +118,7 @@ Settings live in `<data dir>/config.yaml`. The machine-readable form of this pag
 
 | Key | Type | Default | Valid values | Level | Restart | Env | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `planner.headroom_fraction` | `float` | `0.1` | - | advanced | no | `SF_PLANNER__HEADROOM_FRACTION` | Fraction of every card left free (0.10 = 10%). |
+| `planner.headroom_fraction` | `float` | `0.1` | >= 0.0; < 0.9 | advanced | no | `SF_PLANNER__HEADROOM_FRACTION` | Fraction of every card left free (0.10 = 10%). |
 | `planner.on_insufficient` | `"evict" \| "reject"` | `evict` | one of `evict`, `reject` | advanced | no | `SF_PLANNER__ON_INSUFFICIENT` | What to do when a load does not fit: evict other models or reject the load. |
 | `planner.compute_overhead_fraction` | `float` | `0.06` | >= 0 | advanced | no | `SF_PLANNER__COMPUTE_OVERHEAD_FRACTION` | Compute/graph buffers scale with batch and model width; calibrated against observed loads and refined by predicted-vs-actual logging. See DECISIONS.md. |
 | `planner.compute_overhead_floor_mb` | `int` | `400` | >= 0 | advanced | no | `SF_PLANNER__COMPUTE_OVERHEAD_FLOOR_MB` | Minimum compute-buffer reserve per card, in MiB. |
@@ -174,14 +176,14 @@ Settings live in `<data dir>/config.yaml`. The machine-readable form of this pag
 
 | Key | Type | Default | Valid values | Level | Restart | Env | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `benchmark.lease_priority` | `int` | `2` | - | advanced | yes | `SF_BENCHMARK__LEASE_PRIORITY` | The D46 class this server's own benchmark leases carry: 2 may ask a background render tenant to vacate; 3 asks nobody (pre-D56 behaviour). |
+| `benchmark.lease_priority` | `int` | `2` | >= 1; <= 3 | advanced | yes | `SF_BENCHMARK__LEASE_PRIORITY` | The D46 class this server's own benchmark leases carry: 2 may ask a background render tenant to vacate; 3 asks nobody (pre-D56 behaviour). |
 
 ## hf
 
 | Key | Type | Default | Valid values | Level | Restart | Env | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `hf.token` (secret) | `string \| null` | `null` | - | advanced | no | `SF_HF__TOKEN` | HuggingFace token for gated repos. A secret: it is registered for log redaction, and it does not belong in version control. |
-| `hf.cache_dir` | `path \| null` | `null` | - | advanced | no | `SF_HF__CACHE_DIR` | Reserved: no code reads this key yet (the metadata cache lives under the data directory). |
+| `hf.cache_dir` | `path \| null` | `null` | - | advanced | no | `SF_HF__CACHE_DIR` | Where parsed remote GGUF headers are cached; null = <data_dir>/cache/hf_meta. |
 | `hf.max_concurrent_downloads` | `int` | `2` | > 0 | advanced | no | `SF_HF__MAX_CONCURRENT_DOWNLOADS` | Downloads that run at the same time. |
 | `hf.chunk_bytes` | `int` | `8388608` | > 0 | advanced | no | `SF_HF__CHUNK_BYTES` | Bytes requested per HTTP range read while downloading. |
 
@@ -202,6 +204,4 @@ Settings live in `<data dir>/config.yaml`. The machine-readable form of this pag
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `update.repo` | `string \| null` | `null` | - | basic | no | `SF_UPDATE__REPO` | GitHub `owner/name` that publishes StudioForge releases, or null when there is none yet: the self-update check then reports "not configured" without asking GitHub. (The old placeholder `studioforge/studioforge` is treated the same as null.) |
 | `update.channel` | `"stable" \| "prerelease"` | `stable` | one of `stable`, `prerelease` | advanced | no | `SF_UPDATE__CHANNEL` | Release channel the updater follows (stable or prerelease). |
-| `update.auto_check` | `bool` | `true` | - | advanced | no | `SF_UPDATE__AUTO_CHECK` | Reserved: not read by any code path yet. |
-| `update.check_interval_h` | `float` | `24.0` | > 0 | advanced | no | `SF_UPDATE__CHECK_INTERVAL_H` | Reserved: not read by any code path yet. |
 | `update.health_check_timeout_s` | `float` | `60.0` | > 0 | advanced | no | `SF_UPDATE__HEALTH_CHECK_TIMEOUT_S` | Seconds a freshly installed release gets to report healthy before it is rolled back. |

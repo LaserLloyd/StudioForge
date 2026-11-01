@@ -520,6 +520,30 @@ def _check_auth(report: DoctorReport, config: Config, accounts: Any) -> None:
             "Authentication",
             "All three services listen on this machine only.",
         )
+    has_owner = bool(accounts is not None and accounts.has_owner())
+    has_keys = bool(config.server.api_key or (accounts is not None and accounts.has_active_keys()))
+    if not exposed and not config.server.behind_proxy and has_owner and not has_keys:
+        report.add(
+            "auth.loopback_trust_owner_no_keys",
+            "warn",
+            "Authentication",
+            "The server listens on loopback only and an owner account exists, but no API key "
+            "does: any request from this machine is trusted as an admin without signing in. "
+            "If a reverse proxy or `tailscale serve` forwards to it, every proxied client "
+            "arrives from 127.0.0.1 and gets that trust too.",
+            "Set server.behind_proxy to true when something forwards to this server (loopback "
+            "trust is then off and every change needs the owner session or an admin key), or "
+            "create an admin key (`studioforge keys create --scope admin`).",
+        )
+    if config.server.behind_proxy and not has_admin:
+        report.add(
+            "auth.behind_proxy_without_credential",
+            "warn",
+            "Authentication",
+            "server.behind_proxy is on but no owner account or admin API key exists, so every "
+            "box-changing request is refused, including from this machine.",
+            "Run `studioforge setup` (or `studioforge keys create --scope admin`) on the box.",
+        )
     if config.server.api_key:
         report.add(
             "auth.legacy_api_key",

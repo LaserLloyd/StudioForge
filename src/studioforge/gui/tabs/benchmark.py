@@ -275,7 +275,11 @@ def _body(ctx: GuiContext, record: Any, dialog: Any) -> None:  # noqa: C901 - on
             return
         with progress_box:
             bar = ui.linear_progress(value=0.0, show_value=False, size="12px").props("rounded")
-            text = ui.label("starting…").classes("text-xs font-mono opacity-80")
+            text = (
+                ui.label("starting…")
+                .classes("text-xs font-mono opacity-80")
+                .props('aria-live="polite"')
+            )
             cancel_button = ui.button("Cancel", icon="cancel", on_click=cancel).props("flat dense")
 
         async def tick() -> None:

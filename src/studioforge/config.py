@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import hashlib
 import json
 import os
 import re
@@ -251,15 +252,31 @@ class ServerConfig(BaseModel):
     #: into the key table as an admin key named "legacy"; create named, scoped,
     #: revocable keys with `studioforge keys create` instead.
     #:
-    #: At least 6 characters so the log-redaction processor will register it:
-    #: shorter values are ignored there, and an unredactable key can surface
-    #: inside a logged command line or an httpx error repr.
+    #: A NEW key must be at least :data:`MIN_API_KEY_LENGTH` (16) characters
+    #: (enforced when it is set through ``apply_overrides``, i.e. PATCH
+    #: /api/config, MCP/GUI/CLI config edits). An older config.yaml holding a
+    #: shorter key (6+, the old floor) still loads: refusing it at start-up
+    #: would take the server down for a key that already works. The floor of 6
+    #: stays everywhere because the log-redaction processor ignores shorter
+    #: values and an unredactable key can surface inside a logged command line.
     api_key: str | None = Field(default=None, min_length=6)
     #: Origins allowed to call the API from a browser. Empty (the default) allows
     #: none: non-browser clients are unaffected. Also the Origin allowlist for the
     #: MCP endpoints, together with loopback pages.
     cors_origins: list[str] = Field(default_factory=list)
     cors_allow_credentials: bool = False
+    #: Set when a reverse proxy or ``tailscale serve`` forwards to this server.
+    #: Every proxied client then arrives from a loopback peer, so the "caller on
+    #: this machine is a local admin" shortcut would admit all of them. With
+    #: this on, the shortcut is off: every box-changing request needs a real
+    #: credential (an owner session or an admin key).
+    behind_proxy: bool = False
+    #: Extra ``Host`` header values (host or host:port) accepted as "this
+    #: server" for the same-machine admin shortcut, beyond the loopback
+    #: literals and the hosts of ``cors_origins``. A request whose ``Host`` is
+    #: none of those is not local, whatever its peer address says: that is the
+    #: DNS-rebinding shape (a page on ``evil.test`` resolving to 127.0.0.1).
+    allowed_hosts: list[str] = Field(default_factory=list)
     #: HTTPS settings shared by the gateway, the panel and the watchdog.
     tls: TlsConfig = Field(default_factory=TlsConfig)
     drain_timeout_s: NonNegativeFloat = 30.0
@@ -659,7 +676,7 @@ def default_quant_affinity() -> dict[str, QuantAffinity]:
 
 
 class PlannerConfig(BaseModel):
-    headroom_fraction: float = 0.10
+    headroom_fraction: float = Field(default=0.10, ge=0.0, lt=0.9)
     on_insufficient: Literal["evict", "reject"] = "evict"
     # Compute/graph buffers scale with batch and model width; calibrated against
     # observed loads and refined by predicted-vs-actual logging. See DECISIONS.md.
@@ -827,11 +844,25 @@ class McpConfig(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+#: Minimum length of a ``server.api_key`` set from now on (see ``ServerConfig``).
+MIN_API_KEY_LENGTH = 16
+REDACTED_PREFIX = "redacted:"
+
+
 def redact(value: str | None) -> str | None:
-    """Short prefix of a key, for logs and GUI display."""
+    """Constant-shape placeholder for a secret, for logs and config dumps.
+
+    ``redacted:`` plus a fixed eight-character fingerprint (a SHA-256 prefix),
+    so two dumps can be compared without disclosing any plaintext character.
+    A secret under 16 characters (the eight-digit MCP PIN) gets eight ``*``
+    instead: a hash prefix of a short, low-entropy value could be brute-forced
+    offline.
+    """
     if not value:
         return None
-    return f"{value[:4]}...{value[-2:]}" if len(value) > 8 else "***"
+    if len(value) < MIN_API_KEY_LENGTH:
+        return REDACTED_PREFIX + "*" * 8
+    return REDACTED_PREFIX + hashlib.sha256(value.encode("utf-8", "replace")).hexdigest()[:8]
 
 
 #: Every dotted config path whose value is a credential, and must therefore
@@ -1042,7 +1073,7 @@ class BenchmarkConfig(BaseModel):
     #: never the chat model's claim (class 1) and never another benchmark's
     #: (equal class is a plain conflict). 3 makes benchmarks the polite tenant
     #: they were before D56 -- they ask nobody.
-    lease_priority: int = 2
+    lease_priority: int = Field(default=2, ge=1, le=3)
 
     @field_validator("lease_priority")
     @classmethod
@@ -1054,6 +1085,8 @@ class BenchmarkConfig(BaseModel):
 
 class HfConfig(BaseModel):
     token: str | None = None
+    #: Where parsed remote GGUF headers are cached between runs. Unset = the
+    #: data directory's ``cache/hf_meta``.
     cache_dir: Path | None = None
     max_concurrent_downloads: PositiveInt = 2
     chunk_bytes: PositiveInt = 8 * 1024 * 1024
@@ -1107,8 +1140,6 @@ class UpdateConfig(BaseModel):
     #: does not exist (a 404 every 24 h against the anonymous rate limit).
     repo: str | None = None
     channel: Literal["stable", "prerelease"] = "stable"
-    auto_check: bool = True
-    check_interval_h: PositiveFloat = 24.0
     health_check_timeout_s: PositiveFloat = 60.0
 
     @property
@@ -1613,6 +1644,17 @@ def apply_overrides(config: Config, updates: dict[str, Any]) -> Config:
                 f"{dotted} is not stored in config.yaml: the data directory is set by "
                 "SF_DATA_DIR (local-env.bat in the repo root, or the shell/systemd "
                 "environment), see README 'Data directory'",
+                param=dotted,
+            )
+        if (
+            dotted == "server.api_key"
+            and isinstance(value, str)
+            and value
+            and len(value.strip()) < MIN_API_KEY_LENGTH
+        ):
+            raise ConfigError(
+                f"server.api_key must be at least {MIN_API_KEY_LENGTH} characters "
+                "(nothing was saved). Prefer a scoped key: `studioforge keys create`.",
                 param=dotted,
             )
         parts = dotted.split(".")

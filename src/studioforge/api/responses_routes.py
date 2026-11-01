@@ -54,6 +54,7 @@ from studioforge.api.openai_routes import (
     chat_stream,
     prepare_chat,
 )
+from studioforge.error_catalog import envelope_extras
 from studioforge.errors import BadRequestError
 
 router = APIRouter()
@@ -452,6 +453,43 @@ async def response_stream(
     completion_tokens: int | None = None
     cached_tokens: int | None = None
 
+    # Tool calls that started while another call item was open: buffered whole
+    # (by tool index) and emitted as their own items when the open one closes.
+    pending_calls: dict[int, dict[str, Any]] = {}
+
+    def open_call(call_id: str, name: str) -> list[bytes]:
+        nonlocal current
+        frames = close_item()
+        current = {"kind": "call", "id": _id("fc"), "call_id": call_id, "name": name, "text": ""}
+        frames.append(
+            emit(
+                "response.output_item.added",
+                output_index=len(done_items),
+                item=_call_item(call_id, name, "", item_id=current["id"], done=False),
+            )
+        )
+        return frames
+
+    def flush_calls() -> list[bytes]:
+        nonlocal current
+        frames: list[bytes] = []
+        for call in pending_calls.values():
+            frames.extend(open_call(call["call_id"], call["name"]))
+            assert current is not None
+            args = "".join(call["args"])
+            if args:
+                current["text"] += args
+                frames.append(
+                    emit(
+                        "response.function_call_arguments.delta",
+                        item_id=current["id"],
+                        output_index=len(done_items),
+                        delta=args,
+                    )
+                )
+        pending_calls.clear()
+        return frames
+
     def close_item() -> list[bytes]:
         nonlocal current
         if current is None:
@@ -527,6 +565,8 @@ async def response_stream(
             if event.kind == "ping":
                 yield b": keep-alive\n\n"
             elif event.kind == "text":
+                for frame in flush_calls():
+                    yield frame
                 if current is None or current["kind"] != "message":
                     for frame in open_message():
                         yield frame
@@ -541,25 +581,15 @@ async def response_stream(
                     logprobs=[],
                 )
             elif event.kind == "tool_start":
-                frames = close_item()
-                current = {
-                    "kind": "call",
-                    "id": _id("fc"),
-                    "call_id": event.call_id,
-                    "name": event.name,
-                    "text": "",
-                }
+                if current is not None and current["kind"] == "call" and tool_index != event.index:
+                    pending_calls[event.index] = {
+                        "call_id": event.call_id,
+                        "name": event.name,
+                        "args": [],
+                    }
+                    continue
                 tool_index = event.index
-                frames.append(
-                    emit(
-                        "response.output_item.added",
-                        output_index=len(done_items),
-                        item=_call_item(
-                            event.call_id, event.name, "", item_id=current["id"], done=False
-                        ),
-                    )
-                )
-                for frame in frames:
+                for frame in open_call(event.call_id, event.name):
                     yield frame
             elif event.kind == "tool_args":
                 if current is not None and current["kind"] == "call" and tool_index == event.index:
@@ -570,6 +600,8 @@ async def response_stream(
                         output_index=len(done_items),
                         delta=event.text,
                     )
+                elif event.index in pending_calls:
+                    pending_calls[event.index]["args"].append(event.text)
             elif event.kind == "finish":
                 finish = event.reason
             elif event.kind == "usage":
@@ -578,16 +610,24 @@ async def response_stream(
                 cached_tokens = event.cached_tokens
             elif event.kind == "error":
                 err = event.error
+                for frame in flush_calls():
+                    yield frame
+                for frame in close_item():
+                    yield frame
+                err_code = err.get("code") if isinstance(err.get("code"), str) else "upstream_error"
                 yield emit(
                     "error",
-                    code=err.get("code") if isinstance(err.get("code"), str) else "upstream_error",
+                    code=err_code,
                     message=str(err.get("message") or "upstream error"),
                     param=None,
+                    **envelope_extras(err_code),
                 )
                 return
             elif event.kind == "done":
                 break
 
+    for frame in flush_calls():
+        yield frame
     for frame in close_item():
         yield frame
     if not done_items:

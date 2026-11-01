@@ -1300,8 +1300,10 @@ async def test_get_config_redacts_both_secrets(state: State) -> None:
     assert API_KEY not in raw
     assert HF_TOKEN not in raw
     payload = json.loads(raw)
-    assert payload["config"]["server"]["api_key"] == "sf-s...56"
-    assert payload["config"]["hf"]["token"] == "hf_s...21"
+    from studioforge.config import redact
+
+    assert payload["config"]["server"]["api_key"] == redact(API_KEY)
+    assert payload["config"]["hf"]["token"] == redact(HF_TOKEN)
     assert "server.port" in payload["restart_required_keys"]
 
 

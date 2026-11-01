@@ -200,6 +200,9 @@ def test_watchdog_url_derivation() -> None:
     )
     assert explicit.effective_watchdog_url == "http://other:4321"
 
+    moved = ServerProfile(name="rig", url="http://100.64.0.3:2234")
+    assert moved.effective_watchdog_url == "http://100.64.0.3:2235"
+
     no_port = ServerProfile(name="rig", url="https://rig.example.com")
     assert no_port.effective_watchdog_url == "https://rig.example.com:1235"
 

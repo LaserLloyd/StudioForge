@@ -125,7 +125,7 @@ def _health_card(ctx: GuiContext, go: Go) -> None:
     with ui.card().classes("w-full"):
         with ui.row().classes("w-full items-center gap-3 flex-wrap"):
             chip = ui.badge("", color="grey").classes("text-sm").props('role="status"')
-            detail = ui.label("").classes("text-sm opacity-80 grow")
+            detail = ui.label("").classes("text-sm opacity-80 grow").props('aria-live="polite"')
             ui.button(
                 "Open logs",
                 icon="article",
@@ -234,7 +234,7 @@ def _loaded_section(ctx: GuiContext, go: Go) -> None:
 
     in_flight = {"busy": False}
     ui.label("Loaded models").classes("text-lg font-medium")
-    stale = ui.label("").classes("text-xs text-warning")
+    stale = ui.label("").classes("text-xs text-warning").props('aria-live="polite"')
     container = ui.column().classes("w-full gap-2")
 
     def paint(entries: list[Any]) -> None:
