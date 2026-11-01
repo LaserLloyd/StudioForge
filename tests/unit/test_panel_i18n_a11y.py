@@ -113,7 +113,12 @@ require(root + '/static/sf-i18n.js');
         encoding="utf-8",
     )
     out = subprocess.run(
-        ["node", str(harness), str(GUI)], capture_output=True, text=True, check=True, timeout=60
+        ["node", str(harness), str(GUI)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
+        timeout=60,
     )
     got = json.loads(out.stdout.strip().splitlines()[-1])
     assert got["lang"] == "ja" and got["stored"] == "ja"
