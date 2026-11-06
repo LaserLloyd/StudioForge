@@ -90,7 +90,37 @@ GGUF_MAGIC_SWAPPED: Final = b"FUGG"  # big-endian writers emit the magic reverse
 #:         the planner stops charging them to a GPU (D73).
 #: 6 -> 7: mtp_only -- an MTP draft-head file, which the registry no longer
 #:         lists as a model (D74).
-META_FORMAT_VERSION: Final = 7
+#: 7 -> 8: swa_pattern for an architecture whose GGUF carries only
+#:         ``attention.sliding_window`` and whose layer pattern llama.cpp sets
+#:         in code (gpt-oss: every other layer), so the planner stops charging
+#:         its window layers full context (D82).
+META_FORMAT_VERSION: Final = 8
+
+#: Architectures whose sliding-window layer pattern llama.cpp hard-codes
+#: rather than reads (``load_swa_pattern(ml, n_pattern, dense_first)`` in the
+#: model's ``load_hparams``), as ``(n_pattern, dense_first)``. llama.cpp marks
+#: layer ``il`` sliding-window when ``il % n_pattern != 0`` (dense first) or
+#: ``il % n_pattern < n_pattern - 1`` (otherwise). A GGUF that carries its own
+#: ``sliding_window_pattern`` array still wins, exactly as it does upstream.
+#: Each row is checked against the engine source, not inferred:
+#:
+#: * ``gpt-oss`` -- ``src/models/openai-moe.cpp`` at b11718: ``n_swa`` from
+#:   ``attention.sliding_window`` (128), ``load_swa_pattern(ml, 2)``: even
+#:   layers windowed, odd layers full. Without it the planner charged all 24
+#:   layers full context: 15,360 MiB of KV at 8 x 40,960 where the load used
+#:   ~7,700 (measured 2026-11-06, a -27% prediction error), and passed
+#:   ``--cache-reuse`` to a cache the engine then refused to reuse.
+ARCH_SWA_PATTERNS: Final[dict[str, tuple[int, bool]]] = {"gpt-oss": (2, False)}
+
+
+def arch_swa_pattern(n_layer: int, n_pattern: int, dense_first: bool) -> list[bool]:
+    """llama.cpp's ``llama_hparams::set_swa_pattern``: True marks a sliding-window layer."""
+    if n_pattern <= 0:
+        return [True] * n_layer
+    if dense_first:
+        return [il % n_pattern != 0 for il in range(n_layer)]
+    return [il % n_pattern < n_pattern - 1 for il in range(n_layer)]
+
 
 #: ``general.sampling.*`` keys llama.cpp's converter writes from a model's
 #: ``generation_config.json``, mapped to the OpenAI/llama-server request names.
@@ -1480,7 +1510,15 @@ def meta_from_gguf(
     # an order of magnitude on these architectures, which then refuses contexts
     # that fit with room to spare. Captured here; consumed by the planner.
     swa_window = _as_int(kv.get(f"{prefix}attention.sliding_window"))
-    swa_pattern = _array_items(kv.get(f"{prefix}attention.sliding_window_pattern"))
+    raw_pattern = kv.get(f"{prefix}attention.sliding_window_pattern")
+    swa_pattern = _array_items(raw_pattern)
+    arch_default = ARCH_SWA_PATTERNS.get(arch)
+    if swa_window and not swa_pattern and arch_default is not None and n_layer > 0:
+        # The engine sets this architecture's pattern in code; a scalar
+        # ``sliding_window_pattern`` overrides the period, as upstream (D82).
+        period = _as_int(raw_pattern)
+        n_pattern = int(period) if period is not None else arch_default[0]
+        swa_pattern = arch_swa_pattern(n_layer, n_pattern, arch_default[1])
     if swa_window and swa_pattern:
         extra["swa_window"] = int(swa_window)
         # True marks a sliding-window layer, False a full-attention one.

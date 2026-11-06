@@ -179,14 +179,14 @@ def test_the_documented_mcp_tool_counts_are_the_real_ones() -> None:
         downloader = None
 
     management = asyncio.run(build_management_mcp(_State()).list_tools())
-    assert len(management) == 23, [tool.name for tool in management]
+    assert len(management) == 27, [tool.name for tool in management]
 
     setup = (REPO_ROOT / "src" / "studioforge" / "api" / "mgmt_routes.py").read_text(
         encoding="utf-8"
     )
     assert f"app's {len(management)} management tools" in setup
-    # 23 + 10 watchdog tools. The total is what an operator reads in the README.
-    assert "33 MCP tools" in (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    # 27 + 10 watchdog tools. The total is what an operator reads in the README.
+    assert "37 MCP tools" in (REPO_ROOT / "README.md").read_text(encoding="utf-8")
 
 
 def test_the_recovery_prefix_rule_is_described_as_the_allowlist_it_is() -> None:

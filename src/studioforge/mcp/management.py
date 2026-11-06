@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+import re
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, cast
@@ -74,6 +75,13 @@ from studioforge.authkeys import Principal
 from studioforge.build import build_id
 from studioforge.config import RESTART_REQUIRED_KEYS, Config, apply_overrides, load_config
 from studioforge.core import parallel_bench, throughput
+from studioforge.core.chat_template import (
+    diagnose,
+    effective_template,
+    save_override,
+    validate_template_text,
+)
+from studioforge.core.harmony import effective_reasoning_format, record_uses_harmony
 from studioforge.core.leases import lease_view
 from studioforge.core.model_gate import (
     GateRequirement,
@@ -86,7 +94,7 @@ from studioforge.errors import BadRequestError, ModelNotFoundError, StudioForgeE
 from studioforge.logging import get_logger
 from studioforge.mcp_policy import PolicyExtension, annotations_for, current_principal
 from studioforge.tlsutil import scheme_for
-from studioforge.types import GB
+from studioforge.types import GB, ModelSettings
 
 #: Backwards-compatible alias: the SDK's ``FastMCP`` is now ``MCPServer``.
 FastMCP = MCPServer
@@ -1603,6 +1611,174 @@ def build_management_mcp(state: Any) -> MCPServer:
             "loaded": instance is not None and instance.state == "ready",
         }
 
+    # -- chat templates (D82) ---------------------------------------------
+
+    def _template_report(record: Any, *, include_text: bool, max_chars: int) -> dict[str, Any]:
+        template = effective_template(record)
+        harmony = record_uses_harmony(record)
+        reasoning, reasoning_source = effective_reasoning_format(
+            record.settings.reasoning_format,
+            state.config.models.default_reasoning_format,
+            harmony=harmony,
+        )
+        instance = state.supervisor.get(state.manager.serving_record(record).id)
+        report: dict[str, Any] = {
+            "ok": True,
+            "model_id": record.id,
+            "source": template.source,
+            "override_file": str(template.path) if template.path else None,
+            "length": len(template.text) if template.text else 0,
+            "sha256": template.sha256,
+            "harmony": harmony,
+            "reasoning_format": {
+                "setting": record.settings.reasoning_format,
+                "effective": reasoning,
+                "why": reasoning_source,
+            },
+            "diagnostics": diagnose(record, state.config.models.default_reasoning_format),
+            "loaded": instance is not None,
+        }
+        if include_text:
+            text = template.text or ""
+            report["template"] = text[: max(0, max_chars)]
+            report["truncated"] = len(text) > max(0, max_chars)
+        return report
+
+    @_guard
+    async def get_model_template(
+        model_id: str, include_text: bool = True, max_chars: int = 20000
+    ) -> dict[str, Any]:
+        """Show the chat template a model loads with, and what is known to be wrong with it.
+
+        Use this when a model answers ``HTTP 500`` from the engine on chat or
+        tool requests (for example "does not match the expected peg-native
+        format", or a Jinja error such as "Function is not a bool value"), or
+        when tool calls / reasoning come back in the wrong field. Then fix it
+        with ``set_model_template``.
+
+        Args:
+            model_id: The ``id`` from ``list_models`` (an alias also works).
+            include_text: Return the template text itself (it can be ~16k
+                characters; ``false`` returns only the summary and diagnostics).
+            max_chars: Cut the returned text at this many characters
+                (``truncated`` says whether it was cut).
+
+        Returns:
+            ``source`` (``override`` = a saved ``chat_template_file``, ``gguf`` =
+            the file's embedded template, ``engine_default`` = none at all),
+            ``override_file``, ``sha256``, ``harmony`` (gpt-oss format),
+            ``reasoning_format`` (``setting`` / ``effective`` / ``why``),
+            ``diagnostics`` (a list of ``{code, severity, message, fix}``; empty
+            means no known problem), ``loaded``, and ``template`` + ``truncated``.
+        """
+        record = state.registry.resolve(model_id)
+        if record is None:
+            raise ModelNotFoundError(model_id, known=state.registry.known_ids())
+        return _template_report(record, include_text=include_text, max_chars=max_chars)
+
+    @_guard
+    async def set_model_template(
+        model_id: str,
+        template: str | None = None,
+        reset: bool = False,
+        reasoning_format: str | None = None,
+    ) -> dict[str, Any]:
+        """Override a model's chat template and/or how its reasoning is parsed.
+
+        Admin only. Saved as a per-model setting, so it applies from the model's
+        NEXT load (and every load after); a model that is loaded now keeps the
+        old template until it reloads -- ``unload_model`` it and the next
+        request reloads it with the new one.
+
+        The calls you will make::
+
+            # gpt-oss / harmony answering 500 "does not match the expected peg-native format"
+            set_model_template(model_id="unsloth/gpt-oss-20b-GGUF/gpt-oss-20b-Q8_0",
+                              reasoning_format="deepseek")
+            # replace a broken template with a corrected one
+            set_model_template(model_id="vendor/Model-GGUF/Model-Q4_K_M",
+                               template="{%- for message in messages %}...")
+            # go back to the template inside the GGUF
+            set_model_template(model_id="vendor/Model-GGUF/Model-Q4_K_M", reset=True)
+
+        Args:
+            model_id: The ``id`` from ``list_models``. Not a preset-only virtual
+                model: set it on the base model it shares.
+            template: The full Jinja chat template text. Checked (size, reads
+                ``messages``, Jinja syntax) and written to
+                ``<data_dir>/templates/``; the engine's own Jinja may still
+                reject it at load, which the load reports.
+            reset: Drop the override and use the GGUF's embedded template again
+                (the file stays on disk). Not together with ``template``.
+            reasoning_format: How the engine splits reasoning from the answer:
+                ``deepseek`` (reasoning goes to ``reasoning_content``),
+                ``none`` (left inline in ``content``), ``deepseek-legacy``, or
+                ``default`` to clear the model's own choice.
+
+        Returns:
+            What ``get_model_template`` returns for the saved state (without the
+            text), plus ``changed`` (the settings fields written) and
+            ``applies`` (``"next load"``).
+        """
+        record = state.registry.resolve(model_id)
+        if record is None:
+            raise ModelNotFoundError(model_id, known=state.registry.known_ids())
+        if record.is_virtual and record.base_model_id:
+            raise BadRequestError(
+                f"{record.id} is served by {record.base_model_id}'s instance; set the "
+                "template on that model",
+                param="model_id",
+            )
+        if template is not None and reset:
+            raise BadRequestError("pass either template or reset=true, not both", param="reset")
+        updates: dict[str, Any] = {}
+        if template is not None:
+            try:
+                text = validate_template_text(template)
+            except ValueError as exc:
+                raise BadRequestError(str(exc), param="template") from exc
+            path = await run_in_threadpool(save_override, state.config.data_dir, record.id, text)
+            updates["chat_template_file"] = str(path)
+        elif reset:
+            updates["chat_template_file"] = None
+        if reasoning_format is not None:
+            allowed = ("none", "deepseek", "deepseek-legacy", "default")
+            if reasoning_format not in allowed:
+                raise BadRequestError(
+                    f"reasoning_format must be one of {', '.join(allowed)}",
+                    param="reasoning_format",
+                )
+            updates["reasoning_format"] = (
+                None if reasoning_format == "default" else reasoning_format
+            )
+        if not updates:
+            raise BadRequestError(
+                "nothing to change: pass template, reset=true or reasoning_format",
+                param="template",
+            )
+        benchmarker = getattr(state, "benchmarker", None)
+        if benchmarker is not None and getattr(benchmarker, "benchmarking", None) == record.id:
+            raise BadRequestError(
+                f"{record.id} is being benchmarked right now and the run would overwrite "
+                "this save; wait for it to finish",
+                code="model_benchmarking",
+                param="model_id",
+            )
+        try:
+            settings = ModelSettings.model_validate(
+                {**record.settings.model_dump(mode="json"), **updates}
+            )
+        except Exception as exc:
+            raise BadRequestError(f"invalid settings: {exc}") from exc
+        updated = state.registry.save_settings(record.id, settings)
+        log.info(
+            "chat template settings changed via mcp", model_id=updated.id, fields=sorted(updates)
+        )
+        report = _template_report(updated, include_text=False, max_chars=0)
+        report["changed"] = sorted(updates)
+        report["applies"] = "next load"
+        return report
+
     @_guard
     async def reserve_gpus(
         devices: list[int],
@@ -2467,6 +2643,181 @@ def build_management_mcp(state: Any) -> MCPServer:
             "config_path": str(updated.config_path),
         }
 
+    # -- engine updates (D82) ------------------------------------------------
+
+    def _children_on_other_builds(active_tag: str | None) -> list[dict[str, Any]]:
+        return [
+            {"model_id": inst.model_id, "engine_tag": inst.resolved_engine_tag}
+            for inst in state.supervisor.list()
+            if inst.resolved_engine_tag and active_tag and inst.resolved_engine_tag != active_tag
+        ]
+
+    @_guard
+    async def check_updates() -> dict[str, Any]:
+        """Is there a newer llama.cpp engine this box can install, and is StudioForge current?
+
+        Read-only; one GitHub listing (cached briefly). Use it when a model fails
+        in the engine itself -- a template or parser error, an architecture the
+        build cannot load -- to see whether a newer build exists before asking
+        for ``update_engine``.
+
+        Returns:
+            ``engine``: ``active`` / ``pinned`` tag, ``installed`` tags,
+            ``update_channel`` (``stable`` = upstream's blessed build, ``latest``
+            = newest build), ``recommended_tag`` and ``update_recommended`` (the
+            channel's verdict; what ``update_engine`` installs by default),
+            ``latest`` / ``update_available`` (newest installable build),
+            ``recommended_variant`` (``source`` means no prebuilt asset fits this
+            box, which ``update_engine`` refuses), ``filter_summary``, and
+            ``children_on_other_builds`` (loaded models still running another
+            build). ``app``: StudioForge's own release check (``configured:
+            false`` when no release repo is set -- a source checkout updates by
+            git, not here).
+        """
+        manager = state.engine_manager
+        active = manager.active()
+        active_tag = active.tag if active else None
+        engine: dict[str, Any] = {
+            "active": active_tag,
+            "pinned": state.config.engine.pinned_tag,
+            "installed": [info.tag for info in manager.installed()],
+            "update_channel": state.config.engine.update_channel,
+            "children_on_other_builds": _children_on_other_builds(active_tag),
+        }
+        try:
+            verdict = await manager.check_update()
+        except Exception as exc:  # noqa: BLE001 - a check reports, never fails the call
+            engine["error"] = str(exc)
+        else:
+            for key in (
+                "latest",
+                "update_available",
+                "latest_variant",
+                "stable",
+                "stable_error",
+                "recommended_tag",
+                "recommended_variant",
+                "update_recommended",
+                "filter_summary",
+            ):
+                engine[key] = verdict.get(key)
+        app: dict[str, Any] | None = None
+        updater = getattr(state, "updater", None)
+        if updater is not None:
+            try:
+                app = (await updater.check()).to_dict()
+            except Exception as exc:  # noqa: BLE001 - same
+                app = {"error": str(exc)}
+        return {"ok": True, "engine": engine, "app": app}
+
+    @_guard
+    async def update_engine(
+        tag: str | None = None, activate: bool = False, confirm: bool = False
+    ) -> dict[str, Any]:
+        """Install a newer llama.cpp engine build, smoke-test it, and optionally switch to it.
+
+        Admin only, and ``confirm=true`` is required. The steps, each reported:
+
+        1. **install** -- download the official ggml-org build ``tag`` (default:
+           the channel's ``recommended_tag`` from ``check_updates``) into
+           ``engines/``. Prebuilt assets only: a build that would have to be
+           compiled from source is refused. The live engine is untouched.
+        2. **smoke test** -- a real micro-load on a GPU (a few seconds).
+        3. **activate** -- only with ``activate=true`` and a passing smoke test:
+           the build becomes the engine for NEW loads and is pinned
+           (``engine.pinned_tag``), and every saved ``extra_flags`` is
+           re-checked against it (``offenders``).
+
+        Loaded models are never touched: each keeps the build it started with
+        until it reloads (``children_on_other_builds``). Undo with
+        ``update_engine(tag=<previous>, activate=true, confirm=true)`` -- the
+        old build stays installed.
+
+        The two calls you will make::
+
+            update_engine(confirm=True)                 # install + smoke-test the recommended build
+            update_engine(tag="b11800", activate=True, confirm=True)
+
+        Args:
+            tag: A ``bNNNN`` build tag; omit for the recommended one.
+            activate: Switch new loads to it after a passing smoke test.
+            confirm: Must be true; this downloads ~600 MB and uses a GPU briefly.
+
+        Returns:
+            ``tag``, ``installed`` (variant), ``smoke`` (``ok``, ``result``,
+            ``detail``), ``activated``, ``previous`` (the build that was live),
+            ``offenders``, ``children_on_other_builds`` and a ``note``.
+        """
+        if not confirm:
+            return _needs_confirmation(
+                "install a new engine build",
+                "It downloads ~600 MB from GitHub, runs a short GPU smoke test and, with "
+                "activate=true, changes the build every new model load uses.",
+            )
+        manager = state.engine_manager
+        before = manager.active()
+        previous = before.tag if before else None
+        if tag is None:
+            verdict = await manager.check_update()
+            tag = verdict.get("recommended_tag")
+            if not tag:
+                raise BadRequestError(
+                    "no recommended engine build: "
+                    + str(verdict.get("stable_error") or verdict.get("filter_summary") or "")
+                    + " -- pass tag explicitly (see check_updates)",
+                    param="tag",
+                )
+            if verdict.get("recommended_variant") == "source":
+                raise BadRequestError(
+                    f"{tag} has no prebuilt asset for this box; building llama.cpp from "
+                    "source is not offered over MCP",
+                    param="tag",
+                )
+        if not re.fullmatch(r"b\d+", str(tag)):
+            raise BadRequestError("tag must be an upstream build tag like b11718", param="tag")
+        info = await manager.install(tag, activate=False)
+        variant = getattr(info, "variant", None)
+        if variant == "source":
+            raise BadRequestError(
+                f"{tag} was built from source; MCP installs only prebuilt builds", param="tag"
+            )
+        ok, smoke_result, detail = await manager.smoke_check(tag)
+        result: dict[str, Any] = {
+            "ok": True,
+            "tag": tag,
+            "installed": variant,
+            "smoke": {"ok": ok, "result": smoke_result, "detail": detail},
+            "activated": False,
+            "previous": previous,
+            "offenders": [],
+        }
+        if activate and ok:
+            from studioforge.api.mgmt_routes import (  # noqa: PLC0415 - avoid an import cycle
+                ENGINE_ACTIVATE_NOTE,
+                _flag_revalidation_sweep,
+            )
+
+            await manager.activate(tag)
+            pinned = apply_overrides(state.config, {"engine.pinned_tag": tag})
+            pinned.save()
+            state.config.engine = pinned.engine
+            result["activated"] = True
+            result["offenders"] = await _flag_revalidation_sweep(state, tag)
+            result["note"] = ENGINE_ACTIVATE_NOTE
+            log.info("engine activated via mcp", tag=tag, previous=previous)
+        elif activate:
+            result["ok"] = False
+            result["note"] = "smoke test failed; the build is installed but NOT activated"
+        else:
+            result["note"] = (
+                "installed and smoke-tested, not activated; call again with "
+                "activate=true to switch new loads to it"
+            )
+        result["children_on_other_builds"] = _children_on_other_builds(
+            tag if result["activated"] else previous
+        )
+        return result
+
     for tool in (
         connection_info,
         list_models,
@@ -2478,6 +2829,8 @@ def build_management_mcp(state: Any) -> MCPServer:
         load_recommended,
         unload_model,
         pin_model,
+        get_model_template,
+        set_model_template,
         reserve_gpus,
         release_gpus,
         gpu_leases,
@@ -2491,6 +2844,8 @@ def build_management_mcp(state: Any) -> MCPServer:
         benchmark_parallel,
         get_config,
         set_config,
+        check_updates,
+        update_engine,
     ):
         server.add_tool(tool, annotations=annotations_for("gateway", tool.__name__))
 

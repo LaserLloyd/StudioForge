@@ -75,6 +75,7 @@ from studioforge.core.engine import (
 )
 from studioforge.core.gguf import is_mtp_draft
 from studioforge.core.gpu import llama_device_name
+from studioforge.core.harmony import effective_reasoning_format, record_uses_harmony
 from studioforge.core.planner import attention_kind, effective_ubatch, is_moe
 from studioforge.errors import ModelLoadError, ModelUnloadError
 from studioforge.logging import get_logger
@@ -2071,11 +2072,14 @@ class Supervisor:
         # on b10425: content len 0, reasoning_content len 316. Any OpenAI client
         # (OpenClaw included) then sees an empty reply. 'none' keeps the thoughts
         # inline in content, which also keeps SSE pass-through correct. See
-        # DECISIONS.md D12.
-        reasoning_format = (
-            settings.reasoning_format
-            if settings.reasoning_format is not None
-            else self._config.models.default_reasoning_format
+        # DECISIONS.md D12. EXCEPT harmony (gpt-oss): there 'none' hands the
+        # client raw channel markup, the client feeds it back, and by turn 3-4
+        # the engine's gpt-oss parser 500s on every reply -- so with no
+        # per-model choice a harmony model extracts its analysis (D82).
+        reasoning_format, _source = effective_reasoning_format(
+            settings.reasoning_format,
+            self._config.models.default_reasoning_format,
+            harmony=record_uses_harmony(record),
         )
         if reasoning_format:
             args += ["--reasoning-format", reasoning_format]

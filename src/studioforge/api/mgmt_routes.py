@@ -2356,7 +2356,7 @@ async def openclaw_setup(request: Request) -> JSONResponse:
                 "New model: search_models -> repo_details(repo_id) -> download_model.",
                 "VRAM missing: server_status names every holder; reclaim_orphan_engines "
                 "(watchdog) kills leaked engine processes and nothing else.",
-                "`sfctl mcp` merges the app's 23 management tools with the "
+                "`sfctl mcp` merges the app's 27 management tools with the "
                 "watchdog's 10 recovery tools into one stdio tool list (31).",
             ],
         }

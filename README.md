@@ -88,7 +88,7 @@ the [VRAM Tenant Protocol](docs/TENANTS.md). StudioForge never starts or stops o
 | Component | Runs on | Role |
 | --- | --- | --- |
 | **Host machine** | The box with the NVIDIA GPUs and the GGUF library | Runs everything below. The only machine that installs anything. |
-| **Gateway** (`:1234`, one process) | Host | Four surfaces: `/v1` the OpenAI-compatible API; `/mcp` an MCP server with 23 management tools; `/api` the management REST; `:8080` the control panel (plus a system tray on Windows). Inside: the registry, the VRAM planner and the supervisor. |
+| **Gateway** (`:1234`, one process) | Host | Four surfaces: `/v1` the OpenAI-compatible API; `/mcp` an MCP server with 27 management tools; `/api` the management REST; `:8080` the control panel (plus a system tray on Windows). Inside: the registry, the VRAM planner and the supervisor. |
 | **Backends** — `llama-server` | Host, one process per loaded model, each on its own internal port | [llama.cpp](https://github.com/ggml-org/llama.cpp)'s server, pinned to a tested build and fetched automatically. Spawned on demand, placed by the planner, idled out on a TTL, kept resident when pinned, given a card of their own when leased. A crash takes down one model, never the gateway. |
 | **Model library** | Host, on disk (`models.dir`) | Your GGUF Transformer models, indexed in place — the same folder LM Studio uses; nothing is copied or moved. |
 | **Watchdog sidecar** (`:1235`) | Host, a separate process | Its **own MCP server** with 10 recovery tools — restart the gateway, kill a stuck backend, reclaim VRAM, tail logs — reachable when the gateway is wedged, because it is not the gateway. |
@@ -134,7 +134,7 @@ the [VRAM Tenant Protocol](docs/TENANTS.md). StudioForge never starts or stops o
   ([`DECISIONS.md`](DECISIONS.md) D46, D48).
 - **Drop-in for LM Studio.** Same port, same `/v1/models` behaviour, same library on disk —
   switching a client is a host change.
-- **Built for agents.** 33 MCP tools with a catalog that hands an agent the exact load
+- **Built for agents.** 37 MCP tools with a catalog that hands an agent the exact load
   arguments, a benchmarking playbook it can follow, and recovery tools that survive a wedged server.
 - **One call answers "do I even need to load anything?"** `check_loaded_model(min_params="20b",
   vision=true)` asks whether what is *already* resident clears the bar — size, and capabilities
@@ -475,7 +475,7 @@ Claude Code, Cline, LibreChat and other clients that take the generic map want t
 { "mcpServers": { "studioforge": { "command": "sfctl", "args": ["mcp"] } } }
 ```
 
-That gives the agent 33 tools: the server's 23 management tools plus the watchdog's 10 recovery
+That gives the agent 37 tools: the server's 27 management tools plus the watchdog's 10 recovery
 tools, so it still holds `restart_server` when the main server is wedged. The step-by-step
 two-machine install with a check after each step is
 [`docs/OPENCLAW-SETUP.md`](docs/OPENCLAW-SETUP.md); the loop an agent actually runs is

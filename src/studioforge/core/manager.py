@@ -29,6 +29,7 @@ from studioforge.core.arch_support import (
     startup_rejection,
 )
 from studioforge.core.gpu import vram_processes
+from studioforge.core.harmony import effective_reasoning_format, record_uses_harmony
 from studioforge.core.leases import (
     DEFAULT_IDLE_TTL_S,
     LEASE_OPEN_ENDED_RETRY_S,
@@ -3514,7 +3515,39 @@ class ModelManager:
         # here, and the build may have changed while this load queued.
         self._refuse_unsupported(record)
         record, parallel_auto = self._apply_lease_profile(record)
-        if record.capabilities.thinking and not (
+        harmony = record_uses_harmony(record)
+        reasoning_format, reasoning_source = effective_reasoning_format(
+            record.settings.reasoning_format,
+            self.config.models.default_reasoning_format,
+            harmony=harmony,
+        )
+        if harmony and reasoning_source == "harmony":
+            # D82: said once per model so an operator reading the launch line
+            # knows why this child got a flag the global default does not give.
+            emit = log.info if first_time("harmony_reasoning", record.id) else log.debug
+            emit(
+                "harmony model extracts its analysis",
+                model_id=record.id,
+                reasoning_format=reasoning_format,
+                detail=(
+                    "gpt-oss/harmony under reasoning_format none returns raw channel "
+                    "markup in content and breaks multi-turn chats (D82); set the "
+                    "model's reasoning_format to override"
+                ),
+            )
+        elif harmony and reasoning_format == "none":
+            emit = log.warning if first_time("harmony_reasoning", record.id) else log.debug
+            emit(
+                "harmony model loads with reasoning_format none",
+                model_id=record.id,
+                detail=(
+                    "content will carry raw harmony markup; a client that sends it back "
+                    "as history gets 500s from the engine's gpt-oss parser a few turns "
+                    "in. StudioForge repairs such history on the way in (D82), but "
+                    "'deepseek' is the setting that avoids it"
+                ),
+            )
+        elif record.capabilities.thinking and not (
             record.settings.reasoning_format
             or self.config.models.default_reasoning_format != "none"
         ):

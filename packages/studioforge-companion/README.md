@@ -138,9 +138,9 @@ others — want this shape:
 
 Add `"args": ["-s", "rig", "mcp"]` to pin a profile.
 
-`sfctl mcp` merges **two** upstream MCP servers into one list of **33 tools**.
+`sfctl mcp` merges **two** upstream MCP servers into one list of **37 tools**.
 
-**Management** (the main app, `<url>/mcp`) — 23 tools:
+**Management** (the main app, `<url>/mcp`) — 27 tools:
 
 | Tool | What it does |
 | --- | --- |
@@ -152,6 +152,8 @@ Add `"args": ["-s", "rig", "mcp"]` to pin a profile.
 | `load_recommended` | Name the model and the context; the server picks the GPUs, KV cache and slots and loads at exactly that window, or refuses with numbers |
 | `unload_model` | Free its VRAM immediately |
 | `pin_model` | Keep a model loaded at all times (no idle TTL, never evicted, auto-loaded and reloaded); `pinned=false` unpins |
+| `get_model_template` | The chat template a model loads with, its reasoning format, and `diagnostics` for known template failures (e.g. gpt-oss 500s) — read-only |
+| `set_model_template` | Admin: override a model's chat template and/or `reasoning_format` from its next load; `reset=true` goes back to the GGUF's template |
 | `reserve_gpus` | Give specific GPUs to one model (loaded there at its measured-fastest settings, auto-sized slots) or hold them for an outside program; auto-releases after `idle_ttl_s` |
 | `release_gpus` | End a reservation early by its lease id |
 | `gpu_leases` | Every standing lease with its clocks, class and `kind` — read-only |
@@ -165,6 +167,8 @@ Add `"args": ["-s", "rig", "mcp"]` to pin a profile.
 | `server_status` | VRAM per GPU, **who is holding it**, loaded models, queue, engine |
 | `connection_info` | Every address this server answers on, best first |
 | `get_config` / `set_config` | The server's configuration, secrets redacted |
+| `check_updates` | Is a newer llama.cpp engine installable (and is StudioForge current)? Read-only |
+| `update_engine` | Admin, `confirm=true`: install + smoke-test an official prebuilt engine build; `activate=true` switches new loads to it |
 
 **Recovery** (the watchdog, `<watchdog_url>/mcp`, default port 1235) — 10 tools:
 `restart_server`, `kill_model`, `nuke_all_models`, `reclaim_orphan_engines`, `tail_logs`,

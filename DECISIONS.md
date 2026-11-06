@@ -7690,3 +7690,110 @@ not the file the owner meant.
 **Surfaces.** README "Accounts and lockout recovery", `docs/deploy/docker.md`, `docs/SECURITY.md`,
 `docs/RUNBOOK.md`, `docs/CLI.md` (generated), `CHANGELOG.md` 2.1.0, `tests/unit/test_users_cli.py`,
 `test_login_reset.py`, `test_install_locator.py`, `test_config_check.py`.
+
+## D82 -- A harmony model's markup never comes back as its own history, and a template problem is something an agent can fix
+
+**Problem.** On 2026-11-06 a benchmark run against `unsloth/gpt-oss-20b-GGUF/gpt-oss-20b-Q8_0`
+(engine b11718) aborted the model: every multi-turn role-play case answered HTTP 500 `The model
+produced output that does not match the expected peg-native format`, three in a row, and the tool
+cases hit a second 500, `Function is not a bool value` at `{%- if param_spec['items'] -%}`. The
+client had already tried `reasoning_format: "none"` per request, which changed nothing.
+
+Both were reproduced on 2026-11-07 against a scratch `llama-server` of the same build:
+
+1. **The 500 is self-inflicted, by D12's default.** llama.cpp's gpt-oss handler parses a reply with
+   a strict PEG grammar (`<|start|>assistant` + optional analysis/commentary blocks + a final
+   block) and THROWS when the text does not fit; nothing degrades to plain content. Under
+   `--reasoning-format none` the handler returns `message.content` = the analysis block *with its
+   tags* (`<|channel|>analysis<|message|>...<|end|>`) followed by the answer with its
+   `<|start|>assistant<|channel|>final<|message|>` header dropped. A multi-turn client sends that
+   back as the assistant turn; the template wraps it in a final-channel message and the engine
+   tokenizes the markup as real control tokens, so the prompt's history shows answers that follow
+   `<|end|>` with no header. The model copies the shape: by turn 3-4 it writes its reply straight
+   after `<|start|>assistant`, and the parser throws. 7-turn session, temperature 0, seed 42: 500 at
+   turn 4 under `none`; 7/7 under `deepseek` or `auto`. That is also why the client's
+   `reasoning_format: "none"` did nothing: it was already the server's setting.
+2. **The template crash is a request shape.** gpt-oss's template indexes `param_spec['items']` for
+   an array parameter. When a tool sends `{"type": "array"}` with no `items`, a Jinja subscript on a
+   missing key falls back to the attribute -- the dict's built-in `items` method -- and
+   `{% if <function> %}` is an error in the engine's Jinja (Python Jinja returns a truthy bound
+   method and fails one line later). The render dies before any token. OpenAI's API refuses such a
+   schema outright.
+
+**Decision.**
+
+1. **Harmony models extract their analysis by default** (`core/harmony.py`). A model is harmony
+   when its embedded template has `<|start|>`, `<|channel|>` and `<|message|>`, or its architecture
+   is `gpt-oss`. With no per-model `reasoning_format`, and the global default `none`, the launch
+   passes `--reasoning-format deepseek`; the model's own setting still wins, either way. The
+   supervisor and the load-time log share one function, `effective_reasoning_format`, which also
+   says why (`setting` / `harmony` / `default`). D12's reason for `none` -- an empty `content` when
+   the budget is spent thinking -- does not hold here: a reply cut off mid-analysis comes back with
+   the analysis text in `content` and `finish_reason: length` (measured), so a client still sees
+   text.
+2. **Harmony markup in assistant history is cut back to the answer** before the request reaches
+   the engine (`repair_history`, called from `prepare_chat`, so `/v1/chat/completions`,
+   `/v1/messages` and `/v1/responses` all get it). Text under no header -- including text after an
+   `<|end|>` with no new header, the exact shape above -- is the answer; `analysis` bodies are
+   dropped (harmony drops a finished turn's thought anyway) unless the message carries `tool_calls`
+   and no reasoning of its own, where the thought moves to `reasoning_content`; a recipient-less
+   `commentary` preamble stays in the answer (llama.cpp returns it as content too); a body addressed
+   to a recipient (a tool call) is dropped. This repairs histories already stored by clients and
+   covers a client that asks for `reasoning_format: none` per request. Only assistant turns, only
+   harmony models.
+3. **An array tool parameter with no `items` is sent on with `items: {}`** -- the same schema, "any
+   item" -- for every model (`guard_tool_schemas`): a deep copy, nested schemas included
+   (properties, anyOf/oneOf/allOf, items, additionalProperties, $defs...), the caller's object
+   never mutated, nothing copied when nothing needs it.
+4. **Two MCP tools make a template problem diagnosable and fixable by an agent.**
+   `get_model_template` (read) returns the template a launch would use (`override` / `gguf` /
+   `engine_default`), its sha256, whether it is harmony, the reasoning format (setting, effective,
+   why) and `diagnostics`, static checks for failures seen on this rig: `harmony_reasoning_none`,
+   `items_subscript`, `no_template`, `override_unreadable`. `set_model_template` (admin) writes a
+   template override into `<data_dir>/templates/<model>-<sha8>.jinja` (content-addressed, never
+   overwritten in place; size cap 256 KiB; must read `messages`; Python Jinja parse when available)
+   and points `chat_template_file` at it, and/or sets `reasoning_format` (`default` clears it), or
+   `reset=true` drops the override. Saved settings, so they apply from the next load; a running
+   child is never touched. Refused for a preset-only virtual model (set it on the base) and while
+   the model is being benchmarked. The names avoid "chat" because the control plane must not look
+   like it offers inference (`test_no_inference_tool_exists`).
+5. **An agent can ask for a newer engine, and StudioForge installs it** (owner, 2026-11-07: "a
+   request to update the engine (MCP request, StudioForge updates)"). `check_updates` (read) puts
+   the engine verdict (`recommended_tag`, `update_recommended`, `latest`, the channel, installed
+   builds, loaded models still on another build) beside the app's own release check.
+   `update_engine` (admin, destructive, `confirm=true` required) installs the channel's recommended
+   build -- or a named `bNNNN` -- from the official ggml-org releases, smoke-tests it with a real
+   micro-load, and only with `activate=true` and a passing test makes it the engine for new loads,
+   pinned, with every saved `extra_flags` re-checked (the same path as `POST /api/engine/activate`).
+   **Prebuilt assets only**: a build that would have to be compiled from source is refused over
+   MCP. Loaded models are never touched; the previous build stays installed for an undo. The app's
+   own self-update stays REST/CLI only: it restarts the server the MCP call is running in, and a
+   source checkout (this rig) updates by git.
+6. **gpt-oss is planned as the engine runs it: every other layer windowed.** The GGUF carries
+   `attention.sliding_window` (128) and no pattern; llama.cpp sets the pattern in code
+   (`src/models/openai-moe.cpp`, `load_swa_pattern(ml, 2)`: even layers windowed). The reader only
+   built `swa_pattern` from a pattern array, so the planner charged all 24 layers full context --
+   15,360 MiB of KV at 8 x 40,960 where the load used ~7,700, a -27% prediction error on every
+   gpt-oss load (-33% at 8 x 73,728) -- and, not seeing iSWA, passed `--cache-reuse`, which the
+   engine then disabled ("cache_reuse is not supported by this context"). `gguf.ARCH_SWA_PATTERNS`
+   now mirrors upstream's hard-coded patterns, one verified row per architecture (gpt-oss only); a
+   pattern array or scalar in the file still wins, as upstream. META_FORMAT_VERSION 7 -> 8 re-reads
+   every header once. Laguna's window-without-pattern stays unsized (D69 §13): its upstream
+   behaviour is still unverified.
+
+**Not done.** No retry of a reply the parser rejects: the gateway does not know whether a retry is
+safe for the client, and the cause above was the history, not chance. gpt-oss-20b also, rarely,
+writes `<|channel|>final <|constrain|>...` (seen once in a coding case), which the same grammar
+rejects; that one is upstream's. `GgufMeta.supports_thinking` still does not count harmony templates
+(it would move gpt-oss onto the D14 thinking floor, a planning change this fix does not need). No
+REST route for template text: REST keeps the raw `chat_template_file` setting, which must name a
+path already on the box.
+
+**Surfaces.** `core/harmony.py`, `core/chat_template.py`, `core/gguf.py` (`ARCH_SWA_PATTERNS`),
+`core/supervisor.py` (launch flag), `core/manager.py` (load log), `api/openai_routes.py`
+(`_repair_for_template`), `mcp/management.py` (`get_model_template`, `set_model_template`,
+`check_updates`, `update_engine`; 27 management tools), `mcp_policy.py`, `capability_registry.py`,
+the companion's fallback tool list, capabilities `harmony_reasoning_default`,
+`harmony_history_repair`, `tool_array_items_guard`, `model_template_tools`, `engine_update_tools`,
+`gpt_oss_swa_sizing`; `tests/unit/test_harmony.py`, `test_chat_template.py`,
+`test_gguf_capture.py`, `test_mcp.py`.

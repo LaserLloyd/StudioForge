@@ -74,7 +74,7 @@ FEATURE_NOTES: dict[str, str] = {
 #: on instead. **Bump it in the same commit that appends a decision**:
 #: ``tests/unit/test_capabilities_implemented.py`` reads the headings of
 #: ``DECISIONS.md`` and fails until the two agree.
-LATEST_DECISION = 81
+LATEST_DECISION = 82
 
 #: Every decision number this build includes, ``"D1"`` .. ``"D<LATEST_DECISION>"``.
 IMPLEMENTED_DECISIONS: tuple[str, ...] = tuple(f"D{n}" for n in range(1, LATEST_DECISION + 1))
@@ -133,6 +133,21 @@ SERVER_FEATURES: dict[str, str] = {
     # file `serve` could not load. Local operator tooling; no route changed.
     "login_reset_sentinel": "D81",
     "config_save_validated": "D81",
+    # Harmony (gpt-oss) models launch with --reasoning-format deepseek unless the
+    # model's own setting says otherwise, and harmony markup in assistant history
+    # is cut back to the answer before it reaches the engine.
+    "harmony_reasoning_default": "D82",
+    "harmony_history_repair": "D82",
+    # An array tool parameter with no `items` is sent on with `items: {}`.
+    "tool_array_items_guard": "D82",
+    # MCP get_model_template / set_model_template (admin).
+    "model_template_tools": "D82",
+    # MCP check_updates (read) / update_engine (admin, confirm): an agent can ask
+    # for a newer official prebuilt llama.cpp build to be installed, tested, and
+    # (with activate) used for new loads.
+    "engine_update_tools": "D82",
+    # gpt-oss is planned as iSWA (every other layer windowed), as the engine runs it.
+    "gpt_oss_swa_sizing": "D82",
 }
 
 

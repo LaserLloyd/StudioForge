@@ -29,6 +29,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from studioforge.api.vision import prepare_messages
 from studioforge.core.attribution import attributed_source, client_of
+from studioforge.core.harmony import guard_tool_schemas, record_uses_harmony, repair_history
 from studioforge.core.model_gate import approx_params_b
 from studioforge.core.planner import BUSY_RETRY_AFTER_S
 from studioforge.core.priority import normalise_priority
@@ -41,7 +42,7 @@ from studioforge.errors import (
     StudioForgeError,
     UpstreamError,
 )
-from studioforge.logging import get_logger
+from studioforge.logging import first_time, get_logger
 from studioforge.types import InstanceInfo, ModelRecord
 
 log = get_logger(__name__)
@@ -346,7 +347,40 @@ async def prepare_chat(request: Request, body: dict[str, Any]) -> PreparedChat:
     # The X-SF-Client label (else the peer address) rides on the load's
     # ``source`` and on the in-flight record for this request (D70).
     client = client_of(request)
+    _repair_for_template(payload, serving, client)
     return PreparedChat(state, record, serving, payload, ttl_override, priority, client)
+
+
+def _repair_for_template(payload: dict[str, Any], serving: ModelRecord, client: str | None) -> None:
+    """Fix the two request shapes that crash a chat template or its parser (D82).
+
+    * An ``array`` tool parameter with no ``items`` gets ``items: {}`` -- the
+      same schema; without it a template's ``param_spec['items']`` resolves to
+      Jinja's built-in ``items`` method and the render dies (a 500 before any
+      token, every tool request of gpt-oss's template).
+    * For a harmony model (gpt-oss), assistant history that still carries
+      harmony channel markup is cut back to the answer: that markup, sent back
+      as history, is what makes the engine's gpt-oss parser 500 a few turns
+      into a chat.
+
+    Both are logged once per (model, client) at INFO, then at DEBUG.
+    """
+    tools, added = guard_tool_schemas(payload.get("tools"))
+    if added:
+        payload["tools"] = tools
+        emit = log.info if first_time("tool_items_guard", f"{serving.id}|{client}") else log.debug
+        emit("array tool parameters given items", model_id=serving.id, schemas=added, client=client)
+    if record_uses_harmony(serving):
+        messages, repaired = repair_history(payload["messages"])
+        if repaired:
+            payload["messages"] = messages
+            emit = log.info if first_time("harmony_repair", f"{serving.id}|{client}") else log.debug
+            emit(
+                "harmony markup removed from assistant history",
+                model_id=serving.id,
+                messages=repaired,
+                client=client,
+            )
 
 
 def admit_stream(prepared: PreparedChat) -> None:

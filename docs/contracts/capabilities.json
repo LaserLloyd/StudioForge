@@ -339,7 +339,10 @@
       "cli": "engine install --activate",
       "description": "Make an installed llama.cpp build the active engine.",
       "id": "engine.activate",
-      "mcp": null,
+      "mcp": {
+        "server": "gateway",
+        "tool": "update_engine"
+      },
       "notes": "",
       "panel": "Advanced > Engines: activate + reload",
       "sfctl": null
@@ -352,7 +355,10 @@
       "cli": "engine install",
       "description": "Download, verify and smoke-test a llama.cpp build.",
       "id": "engine.install",
-      "mcp": null,
+      "mcp": {
+        "server": "gateway",
+        "tool": "update_engine"
+      },
       "notes": "",
       "panel": "Advanced > Engines: Install",
       "sfctl": "update --engine"
@@ -1062,6 +1068,32 @@
       "sfctl": null
     },
     {
+      "api": null,
+      "cli": null,
+      "description": "The chat template a model loads with, its reasoning format, and known template problems.",
+      "id": "models.template_get",
+      "mcp": {
+        "server": "gateway",
+        "tool": "get_model_template"
+      },
+      "notes": "D82. REST has the raw setting (GET /api/models/{model_id}/settings) but no diagnostics.",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": null,
+      "cli": null,
+      "description": "Override a model's chat template or reasoning format, or go back to the GGUF's template.",
+      "id": "models.template_set",
+      "mcp": {
+        "server": "gateway",
+        "tool": "set_model_template"
+      },
+      "notes": "D82. REST equivalent for the setting: PATCH /api/models/{model_id}/settings with chat_template_file (a path already on the rig) or reasoning_format.",
+      "panel": null,
+      "sfctl": null
+    },
+    {
       "api": {
         "method": "POST",
         "path": "/api/models/{model_id}/test"
@@ -1380,7 +1412,10 @@
       "cli": "update check",
       "description": "Compare the running version with the latest release.",
       "id": "update.check",
-      "mcp": null,
+      "mcp": {
+        "server": "gateway",
+        "tool": "check_updates"
+      },
       "notes": "The panel's `Check for engine update` checks llama.cpp builds, not the app.",
       "panel": "Advanced > About & updates: Check for updates",
       "sfctl": "update --check"

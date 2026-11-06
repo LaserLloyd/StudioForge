@@ -186,6 +186,7 @@ CAPABILITIES: tuple[Capability, ...] = (
         "engine.install",
         "Download, verify and smoke-test a llama.cpp build.",
         api=("POST", "/api/engine/install"),
+        mcp=_g("update_engine"),
         sfctl="update --engine",
         panel="Advanced > Engines: Install",
         cli="engine install",
@@ -194,6 +195,7 @@ CAPABILITIES: tuple[Capability, ...] = (
         "engine.activate",
         "Make an installed llama.cpp build the active engine.",
         api=("POST", "/api/engine/activate"),
+        mcp=_g("update_engine"),
         panel="Advanced > Engines: activate + reload",
         cli="engine install --activate",
     ),
@@ -294,6 +296,7 @@ CAPABILITIES: tuple[Capability, ...] = (
         "update.check",
         "Compare the running version with the latest release.",
         api=("GET", "/api/update"),
+        mcp=_g("check_updates"),
         sfctl="update --check",
         panel="Advanced > About & updates: Check for updates",
         notes="The panel's `Check for engine update` checks llama.cpp builds, not the app.",
@@ -509,6 +512,24 @@ CAPABILITIES: tuple[Capability, ...] = (
         "Change some of a model's saved settings; a literal null clears one.",
         api=("PATCH", "/api/models/{model_id}/settings"),
         sfctl="models settings",
+    ),
+    Capability(
+        "models.template_get",
+        "The chat template a model loads with, its reasoning format, and known template problems.",
+        mcp=_g("get_model_template"),
+        notes=(
+            "D82. REST has the raw setting (GET /api/models/{model_id}/settings) "
+            "but no diagnostics."
+        ),
+    ),
+    Capability(
+        "models.template_set",
+        "Override a model's chat template or reasoning format, or go back to the GGUF's template.",
+        mcp=_g("set_model_template"),
+        notes=(
+            "D82. REST equivalent for the setting: PATCH /api/models/{model_id}/settings "
+            "with chat_template_file (a path already on the rig) or reasoning_format."
+        ),
     ),
     Capability(
         "models.log",

@@ -80,6 +80,11 @@ EXPECTED_TOOLS = {
     # could *read* pinned off list_models but had no way to set it short of
     # set_config, which is the wrong altitude for a per-model flag.
     "pin_model",
+    # A model's chat template (D82): read it with diagnostics for the failures
+    # seen on the rig, and override it / its reasoning format (admin). Named
+    # without "chat" on purpose: see test_no_inference_tool_exists.
+    "get_model_template",
+    "set_model_template",
     # GPU leases (D43): a card that is one model's alone until released or
     # idle. Two tools, because "hold" and "let go" are different decisions
     # and an agent that only sees reserve_gpus does not know release exists.
@@ -106,6 +111,10 @@ EXPECTED_TOOLS = {
     "benchmark_parallel",
     "get_config",
     "set_config",
+    # Engine updates on request (D82): check what is newer, then install +
+    # smoke-test (+ activate) an official prebuilt llama.cpp build. Admin.
+    "check_updates",
+    "update_engine",
 }
 
 #: Substrings that would betray an inference tool sneaking onto the control plane.
@@ -2045,3 +2054,214 @@ async def test_load_recommended_honours_the_models_saved_device_override(state: 
     assert excluded["ok"] is False
     assert "device_override" in excluded["error"]["message"]
     assert state.supervisor.get(TINY) is None
+
+
+# ---------------------------------------------------------------------------
+# get_model_template / set_model_template (D82)
+# ---------------------------------------------------------------------------
+
+
+async def test_get_model_template_reports_source_reasoning_and_diagnostics(state: State) -> None:
+    server = build_management_mcp(state)
+    report = await call(server, "get_model_template", model_id=TINY, max_chars=50)
+    assert report["ok"] is True
+    assert report["source"] == "gguf" and report["override_file"] is None
+    assert report["harmony"] is False
+    assert report["reasoning_format"] == {"setting": None, "effective": "none", "why": "default"}
+    assert report["diagnostics"] == []
+    assert len(report["template"]) == 50 and report["truncated"] is True
+    assert report["length"] == len(BIG_TEMPLATE)
+    summary = await call(server, "get_model_template", model_id=TINY, include_text=False)
+    assert "template" not in summary
+
+
+async def test_set_model_template_writes_an_override_and_resets_it(state: State) -> None:
+    server = build_management_mcp(state)
+    text = "{% for m in messages %}[{{ m.role }}] {{ m.content }}\n{% endfor %}"
+    saved = await call(server, "set_model_template", model_id=TINY, template=text)
+    assert saved["ok"] is True, saved
+    assert saved["changed"] == ["chat_template_file"] and saved["applies"] == "next load"
+    path = Path(saved["override_file"])
+    assert path.parent == state.config.data_dir / "templates"
+    assert path.read_text(encoding="utf-8") == text  # noqa: ASYNC240 - a test's own tmp file
+    record = state.registry.resolve(TINY)
+    assert record is not None and Path(str(record.settings.chat_template_file)) == path
+    shown = await call(server, "get_model_template", model_id=TINY)
+    assert shown["source"] == "override" and shown["template"] == text
+
+    reset = await call(server, "set_model_template", model_id=TINY, reset=True)
+    assert reset["source"] == "gguf"
+    record = state.registry.resolve(TINY)
+    assert record is not None and record.settings.chat_template_file is None
+    assert path.exists()  # noqa: ASYNC240 - the file stays, to go back to
+
+
+async def test_set_model_template_sets_and_clears_the_reasoning_format(state: State) -> None:
+    server = build_management_mcp(state)
+    saved = await call(server, "set_model_template", model_id=TINY, reasoning_format="deepseek")
+    assert saved["reasoning_format"] == {
+        "setting": "deepseek",
+        "effective": "deepseek",
+        "why": "setting",
+    }
+    cleared = await call(server, "set_model_template", model_id=TINY, reasoning_format="default")
+    assert cleared["reasoning_format"]["setting"] is None
+    # Nothing else in the saved settings moved.
+    record = state.registry.resolve(TINY)
+    assert record is not None and record.settings == ModelSettings()
+
+
+@pytest.mark.parametrize(
+    ("arguments", "param"),
+    [
+        ({}, "template"),
+        ({"template": "{{ messages }}", "reset": True}, "reset"),
+        ({"template": "{% for m in messages %}"}, "template"),
+        ({"reasoning_format": "auto"}, "reasoning_format"),
+    ],
+)
+async def test_set_model_template_refuses_bad_calls(
+    state: State, arguments: dict[str, Any], param: str
+) -> None:
+    server = build_management_mcp(state)
+    result = await call(server, "set_model_template", model_id=TINY, **arguments)
+    assert result["ok"] is False
+    assert result["error"]["param"] == param
+    record = state.registry.resolve(TINY)
+    assert record is not None and record.settings == ModelSettings()
+
+
+# ---------------------------------------------------------------------------
+# check_updates / update_engine (D82)
+# ---------------------------------------------------------------------------
+
+
+class FakeEngineUpdates:
+    """An engine manager that records calls instead of downloading or touching a GPU."""
+
+    def __init__(self, root: Path, *, recommended_variant: str = "cuda-13.4") -> None:
+        self.root = root
+        self.current = self._info("b10425", "cuda-13.3")
+        self.calls: list[tuple[Any, ...]] = []
+        self.smoke_ok = True
+        self.recommended_variant = recommended_variant
+
+    def _info(self, tag: str, variant: str) -> EngineInfo:
+        return EngineInfo(
+            tag=tag, path=self.root, server_binary=self.root / "llama-server.exe", variant=variant
+        )
+
+    def active(self) -> EngineInfo:
+        return self.current
+
+    def installed(self) -> list[EngineInfo]:
+        return [self.current]
+
+    async def check_update(self) -> dict[str, Any]:
+        return {
+            "latest": "b11800",
+            "update_available": True,
+            "latest_variant": "cuda-13.4",
+            "stable": {"version": "v0.7.0", "tag": "b11718", "published_at": "2026-10-30"},
+            "stable_error": None,
+            "recommended_tag": "b11718",
+            "recommended_variant": self.recommended_variant,
+            "update_recommended": True,
+            "filter_summary": "checked 5 releases",
+        }
+
+    async def install(self, tag: str, *, force: bool = False, activate: bool = False) -> EngineInfo:
+        self.calls.append(("install", tag, activate))
+        return self._info(tag, "cuda-13.4")
+
+    async def smoke_check(self, tag: str) -> tuple[bool, str, str]:
+        self.calls.append(("smoke", tag))
+        return (self.smoke_ok, "passed" if self.smoke_ok else "failed", "")
+
+    async def activate(self, tag: str) -> EngineInfo:
+        self.calls.append(("activate", tag))
+        self.current = self._info(tag, "cuda-13.4")
+        return self.current
+
+    async def revalidate_extra_flags(self, tag: str, records: Any) -> list[dict[str, Any]]:
+        return []
+
+
+@pytest.fixture()
+def engines(state: State, tmp_path: Path) -> FakeEngineUpdates:
+    fake = FakeEngineUpdates(tmp_path / "data" / "engines" / "b10425")
+    state.engine_manager = fake  # type: ignore[assignment]
+    return fake
+
+
+async def test_check_updates_reports_the_engine_verdict(
+    state: State, engines: FakeEngineUpdates
+) -> None:
+    report = await call(build_management_mcp(state), "check_updates")
+    assert report["ok"] is True
+    engine = report["engine"]
+    assert (engine["active"], engine["recommended_tag"], engine["latest"]) == (
+        "b10425",
+        "b11718",
+        "b11800",
+    )
+    assert engine["update_recommended"] is True and engine["installed"] == ["b10425"]
+    assert engine["children_on_other_builds"] == []
+    assert report["app"] is None  # no updater on this state
+    assert engines.calls == []  # a check never installs
+
+
+async def test_update_engine_needs_confirm(state: State, engines: FakeEngineUpdates) -> None:
+    result = await call(build_management_mcp(state), "update_engine")
+    assert result["ok"] is False and result["confirmed"] is False
+    assert engines.calls == []
+
+
+async def test_update_engine_installs_and_tests_the_recommended_build_without_switching(
+    state: State, engines: FakeEngineUpdates
+) -> None:
+    result = await call(build_management_mcp(state), "update_engine", confirm=True)
+    assert result["ok"] is True and result["tag"] == "b11718"
+    assert result["smoke"]["ok"] is True and result["activated"] is False
+    assert engines.calls == [("install", "b11718", False), ("smoke", "b11718")]
+    assert engines.active().tag == "b10425"
+
+
+async def test_update_engine_activates_and_pins_after_a_passing_smoke_test(
+    state: State, engines: FakeEngineUpdates
+) -> None:
+    result = await call(
+        build_management_mcp(state), "update_engine", tag="b11718", activate=True, confirm=True
+    )
+    assert result["activated"] is True and result["previous"] == "b10425"
+    assert engines.calls[-1] == ("activate", "b11718")
+    assert state.config.engine.pinned_tag == "b11718"
+
+
+async def test_a_failed_smoke_test_never_activates(
+    state: State, engines: FakeEngineUpdates
+) -> None:
+    engines.smoke_ok = False
+    result = await call(
+        build_management_mcp(state), "update_engine", tag="b11718", activate=True, confirm=True
+    )
+    assert result["ok"] is False and result["activated"] is False
+    assert ("activate", "b11718") not in engines.calls
+    assert engines.active().tag == "b10425"
+
+
+@pytest.mark.parametrize("tag", ["v0.7.0", "b11718-extra", "latest"])
+async def test_update_engine_takes_only_build_tags(
+    state: State, engines: FakeEngineUpdates, tag: str
+) -> None:
+    result = await call(build_management_mcp(state), "update_engine", tag=tag, confirm=True)
+    assert result["ok"] is False and result["error"]["param"] == "tag"
+    assert engines.calls == []
+
+
+async def test_update_engine_refuses_a_source_build(state: State, tmp_path: Path) -> None:
+    fake = FakeEngineUpdates(tmp_path, recommended_variant="source")
+    state.engine_manager = fake  # type: ignore[assignment]
+    result = await call(build_management_mcp(state), "update_engine", confirm=True)
+    assert result["ok"] is False and "source" in result["error"]["message"]
+    assert fake.calls == []

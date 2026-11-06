@@ -83,7 +83,9 @@ def _destructive(*, idempotent: bool = False) -> ToolPolicy:
 GATEWAY_TOOLS: dict[str, ToolPolicy] = {
     # reads
     "check_loaded_model": _read(),
+    "check_updates": _read(),
     "connection_info": _read(),
+    "get_model_template": _read(),
     "get_config": _read(),
     "gpu_leases": _read(),
     "gpu_tenants": _read(),
@@ -102,12 +104,17 @@ GATEWAY_TOOLS: dict[str, ToolPolicy] = {
     "test_model": _mutate(),
     # pinning persists across restarts (the REST route is an admin route, D32)
     "pin_model": _mutate(idempotent=True, scope="admin"),
+    # rewrites how every prompt to one model is rendered/parsed, from its next
+    # load; reversible (reset / reasoning_format "default"), so not destructive
+    "set_model_template": _mutate(idempotent=True, scope="admin"),
     # destructive: removes files, rewrites configuration, evicts or reserves cards
     "delete_model": _destructive(),
     "download_model": _destructive(),
     "reserve_gpus": _destructive(),
     "set_config": _destructive(idempotent=True),
     "unload_model": _destructive(idempotent=True),
+    # downloads and (with activate) switches the engine every new load uses
+    "update_engine": _destructive(),
 }
 
 #: The recovery watchdog's tools.

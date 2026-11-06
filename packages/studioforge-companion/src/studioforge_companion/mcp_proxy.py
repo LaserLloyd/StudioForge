@@ -131,6 +131,16 @@ MANAGEMENT_FALLBACK_TOOLS: tuple[tuple[str, str], ...] = (
         "needed for on-demand use -- any model loads itself when /v1 names it.",
     ),
     (
+        "get_model_template",
+        "The chat template a model loads with, its reasoning format, and known "
+        "template problems (e.g. why a model answers HTTP 500 on chat or tool requests).",
+    ),
+    (
+        "set_model_template",
+        "Admin: override a model's chat template or reasoning format (applies at its "
+        "next load), or reset=true to go back to the GGUF's own template.",
+    ),
+    (
         "reserve_gpus",
         "Give specific GPUs to one model (or hold them for an outside program) until "
         "released or idle; nothing else loads there meanwhile.",
@@ -155,6 +165,15 @@ MANAGEMENT_FALLBACK_TOOLS: tuple[tuple[str, str], ...] = (
     ),
     ("get_config", "Read the effective configuration, with secrets redacted."),
     ("set_config", "Change configuration values, validate them, and persist to disk."),
+    (
+        "check_updates",
+        "Is a newer llama.cpp engine build installable on this box, and is StudioForge current?",
+    ),
+    (
+        "update_engine",
+        "Admin, confirm=true: install and smoke-test an official prebuilt llama.cpp build; "
+        "activate=true switches new loads to it (loaded models keep theirs).",
+    ),
     ("connection_info", "Every address this server can be reached on, best first."),
 )
 

@@ -46,6 +46,7 @@ DESTRUCTIVE_GATEWAY = {
     "download_model",
     "reserve_gpus",
     "unload_model",
+    "update_engine",
 }
 DESTRUCTIVE_WATCHDOG = {
     "restart_server",

@@ -67,8 +67,8 @@ def test_mcp_contract_lists_both_servers(generated: dict[str, str]) -> None:
         servers[tool["server"]] = servers.get(tool["server"], 0) + 1
         assert tool["description"].strip() and isinstance(tool["input_schema"], dict)
         assert "annotations" in tool  # placeholder until MCP hardening fills it
-    assert servers == {"gateway": 23, "watchdog": 10}
-    assert doc["count"] == 33
+    assert servers == {"gateway": 27, "watchdog": 10}
+    assert doc["count"] == 37
 
 
 def test_contract_json_is_canonical(generated: dict[str, str]) -> None:

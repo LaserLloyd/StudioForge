@@ -82,7 +82,7 @@ core/
   gpu.py           NVML probe
 gui/           NiceGUI panel; nav.py is the four-tab registry (docs/panel.md); tabs/ is one
                module per tab or Advanced page (status, models, chat, advanced, ...)
-mcp/           management-plane MCP server (23 tools)
+mcp/           management-plane MCP server (27 tools)
 tray/          Windows notification-area app
 watchdog/      recovery sidecar: its own process, port and MCP server (10 tools)
 ```

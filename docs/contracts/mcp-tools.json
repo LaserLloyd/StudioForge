@@ -1,5 +1,5 @@
 {
-  "count": 33,
+  "count": 37,
   "format": 1,
   "tools": [
     {
@@ -157,6 +157,27 @@
         "open_world_hint": false,
         "read_only_hint": true
       },
+      "description": "Is there a newer llama.cpp engine this box can install, and is StudioForge current?\n\nRead-only; one GitHub listing (cached briefly). Use it when a model fails\nin the engine itself -- a template or parser error, an architecture the\nbuild cannot load -- to see whether a newer build exists before asking\nfor ``update_engine``.\n\nReturns:\n    ``engine``: ``active`` / ``pinned`` tag, ``installed`` tags,\n    ``update_channel`` (``stable`` = upstream's blessed build, ``latest``\n    = newest build), ``recommended_tag`` and ``update_recommended`` (the\n    channel's verdict; what ``update_engine`` installs by default),\n    ``latest`` / ``update_available`` (newest installable build),\n    ``recommended_variant`` (``source`` means no prebuilt asset fits this\n    box, which ``update_engine`` refuses), ``filter_summary``, and\n    ``children_on_other_builds`` (loaded models still running another\n    build). ``app``: StudioForge's own release check (``configured:\n    false`` when no release repo is set -- a source checkout updates by\n    git, not here).",
+      "input_schema": {
+        "properties": {},
+        "title": "check_updatesArguments",
+        "type": "object"
+      },
+      "name": "check_updates",
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "check_updatesDictOutput",
+        "type": "object"
+      },
+      "server": "gateway"
+    },
+    {
+      "annotations": {
+        "destructive_hint": false,
+        "idempotent_hint": true,
+        "open_world_hint": false,
+        "read_only_hint": true
+      },
       "description": "Every address this server can be reached on, best first.\n\nUse this when you want to move an existing connection somewhere better.\nA tailnet (Tailscale) address is returned first because it keeps working\nacross network changes; a LAN address is faster but only valid while you\nare on the same network, so ask for ``prefer=\"lan\"`` when you know you\nare local and want the shortest hop.\n\nArgs:\n    prefer: ``\"auto\"`` (tailnet, then LAN, then loopback), ``\"lan\"`` for\n        a direct local address, ``\"tailscale\"``, or ``\"loopback\"``.\n\nReturns the recommended URL plus every alternative, the OpenAI base URL\nfor inference, and whether a pairing PIN is required.",
       "input_schema": {
         "properties": {
@@ -279,6 +300,45 @@
       "output_schema": {
         "additionalProperties": true,
         "title": "get_configDictOutput",
+        "type": "object"
+      },
+      "server": "gateway"
+    },
+    {
+      "annotations": {
+        "destructive_hint": false,
+        "idempotent_hint": true,
+        "open_world_hint": false,
+        "read_only_hint": true
+      },
+      "description": "Show the chat template a model loads with, and what is known to be wrong with it.\n\nUse this when a model answers ``HTTP 500`` from the engine on chat or\ntool requests (for example \"does not match the expected peg-native\nformat\", or a Jinja error such as \"Function is not a bool value\"), or\nwhen tool calls / reasoning come back in the wrong field. Then fix it\nwith ``set_model_template``.\n\nArgs:\n    model_id: The ``id`` from ``list_models`` (an alias also works).\n    include_text: Return the template text itself (it can be ~16k\n        characters; ``false`` returns only the summary and diagnostics).\n    max_chars: Cut the returned text at this many characters\n        (``truncated`` says whether it was cut).\n\nReturns:\n    ``source`` (``override`` = a saved ``chat_template_file``, ``gguf`` =\n    the file's embedded template, ``engine_default`` = none at all),\n    ``override_file``, ``sha256``, ``harmony`` (gpt-oss format),\n    ``reasoning_format`` (``setting`` / ``effective`` / ``why``),\n    ``diagnostics`` (a list of ``{code, severity, message, fix}``; empty\n    means no known problem), ``loaded``, and ``template`` + ``truncated``.",
+      "input_schema": {
+        "properties": {
+          "include_text": {
+            "default": true,
+            "title": "Include Text",
+            "type": "boolean"
+          },
+          "max_chars": {
+            "default": 20000,
+            "title": "Max Chars",
+            "type": "integer"
+          },
+          "model_id": {
+            "title": "Model Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "model_id"
+        ],
+        "title": "get_model_templateArguments",
+        "type": "object"
+      },
+      "name": "get_model_template",
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "get_model_templateDictOutput",
         "type": "object"
       },
       "server": "gateway"
@@ -1151,6 +1211,64 @@
     {
       "annotations": {
         "destructive_hint": false,
+        "idempotent_hint": true,
+        "open_world_hint": false,
+        "read_only_hint": false
+      },
+      "description": "Override a model's chat template and/or how its reasoning is parsed.\n\nAdmin only. Saved as a per-model setting, so it applies from the model's\nNEXT load (and every load after); a model that is loaded now keeps the\nold template until it reloads -- ``unload_model`` it and the next\nrequest reloads it with the new one.\n\nThe calls you will make::\n\n    # gpt-oss / harmony answering 500 \"does not match the expected peg-native format\"\n    set_model_template(model_id=\"unsloth/gpt-oss-20b-GGUF/gpt-oss-20b-Q8_0\",\n                      reasoning_format=\"deepseek\")\n    # replace a broken template with a corrected one\n    set_model_template(model_id=\"vendor/Model-GGUF/Model-Q4_K_M\",\n                       template=\"{%- for message in messages %}...\")\n    # go back to the template inside the GGUF\n    set_model_template(model_id=\"vendor/Model-GGUF/Model-Q4_K_M\", reset=True)\n\nArgs:\n    model_id: The ``id`` from ``list_models``. Not a preset-only virtual\n        model: set it on the base model it shares.\n    template: The full Jinja chat template text. Checked (size, reads\n        ``messages``, Jinja syntax) and written to\n        ``<data_dir>/templates/``; the engine's own Jinja may still\n        reject it at load, which the load reports.\n    reset: Drop the override and use the GGUF's embedded template again\n        (the file stays on disk). Not together with ``template``.\n    reasoning_format: How the engine splits reasoning from the answer:\n        ``deepseek`` (reasoning goes to ``reasoning_content``),\n        ``none`` (left inline in ``content``), ``deepseek-legacy``, or\n        ``default`` to clear the model's own choice.\n\nReturns:\n    What ``get_model_template`` returns for the saved state (without the\n    text), plus ``changed`` (the settings fields written) and\n    ``applies`` (``\"next load\"``).",
+      "input_schema": {
+        "properties": {
+          "model_id": {
+            "title": "Model Id",
+            "type": "string"
+          },
+          "reasoning_format": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reasoning Format"
+          },
+          "reset": {
+            "default": false,
+            "title": "Reset",
+            "type": "boolean"
+          },
+          "template": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Template"
+          }
+        },
+        "required": [
+          "model_id"
+        ],
+        "title": "set_model_templateArguments",
+        "type": "object"
+      },
+      "name": "set_model_template",
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "set_model_templateDictOutput",
+        "type": "object"
+      },
+      "server": "gateway"
+    },
+    {
+      "annotations": {
+        "destructive_hint": false,
         "idempotent_hint": false,
         "open_world_hint": false,
         "read_only_hint": false
@@ -1219,6 +1337,50 @@
       "output_schema": {
         "additionalProperties": true,
         "title": "unload_modelDictOutput",
+        "type": "object"
+      },
+      "server": "gateway"
+    },
+    {
+      "annotations": {
+        "destructive_hint": true,
+        "idempotent_hint": false,
+        "open_world_hint": false,
+        "read_only_hint": false
+      },
+      "description": "Install a newer llama.cpp engine build, smoke-test it, and optionally switch to it.\n\nAdmin only, and ``confirm=true`` is required. The steps, each reported:\n\n1. **install** -- download the official ggml-org build ``tag`` (default:\n   the channel's ``recommended_tag`` from ``check_updates``) into\n   ``engines/``. Prebuilt assets only: a build that would have to be\n   compiled from source is refused. The live engine is untouched.\n2. **smoke test** -- a real micro-load on a GPU (a few seconds).\n3. **activate** -- only with ``activate=true`` and a passing smoke test:\n   the build becomes the engine for NEW loads and is pinned\n   (``engine.pinned_tag``), and every saved ``extra_flags`` is\n   re-checked against it (``offenders``).\n\nLoaded models are never touched: each keeps the build it started with\nuntil it reloads (``children_on_other_builds``). Undo with\n``update_engine(tag=<previous>, activate=true, confirm=true)`` -- the\nold build stays installed.\n\nThe two calls you will make::\n\n    update_engine(confirm=True)                 # install + smoke-test the recommended build\n    update_engine(tag=\"b11800\", activate=True, confirm=True)\n\nArgs:\n    tag: A ``bNNNN`` build tag; omit for the recommended one.\n    activate: Switch new loads to it after a passing smoke test.\n    confirm: Must be true; this downloads ~600 MB and uses a GPU briefly.\n\nReturns:\n    ``tag``, ``installed`` (variant), ``smoke`` (``ok``, ``result``,\n    ``detail``), ``activated``, ``previous`` (the build that was live),\n    ``offenders``, ``children_on_other_builds`` and a ``note``.",
+      "input_schema": {
+        "properties": {
+          "activate": {
+            "default": false,
+            "title": "Activate",
+            "type": "boolean"
+          },
+          "confirm": {
+            "default": false,
+            "title": "Confirm",
+            "type": "boolean"
+          },
+          "tag": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Tag"
+          }
+        },
+        "title": "update_engineArguments",
+        "type": "object"
+      },
+      "name": "update_engine",
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "update_engineDictOutput",
         "type": "object"
       },
       "server": "gateway"

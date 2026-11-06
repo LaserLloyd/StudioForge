@@ -130,3 +130,58 @@ def test_an_ordinary_model_gains_none_of_the_new_keys(tmp_path: Path) -> None:
     meta = read_meta(write_gguf(tmp_path / "plain.gguf", kv))
     for key in NEW_KEYS:
         assert key not in meta.extra, key
+
+
+# ---------------------------------------------------------------------------
+# D82: an architecture whose window pattern the engine sets in code
+# ---------------------------------------------------------------------------
+
+
+def _gpt_oss(tmp_path: Path, *extra: KvEntry) -> GgufMeta:
+    """gpt-oss-20b's attention keys as the real file declares them (2026-11-07)."""
+    kv: list[KvEntry] = [
+        ("general.architecture", STRING, "gpt-oss"),
+        ("gpt-oss.block_count", UINT32, 24),
+        ("gpt-oss.embedding_length", UINT32, 2880),
+        ("gpt-oss.attention.head_count", UINT32, 64),
+        ("gpt-oss.attention.head_count_kv", UINT32, 8),
+        ("gpt-oss.attention.key_length", UINT32, 64),
+        ("gpt-oss.attention.value_length", UINT32, 64),
+        ("gpt-oss.attention.sliding_window", UINT32, 128),
+        *extra,
+    ]
+    return read_meta(write_gguf(tmp_path / "gpt-oss.gguf", kv))
+
+
+def test_gpt_oss_gets_the_engines_every_other_layer_window(tmp_path: Path) -> None:
+    """llama.cpp's openai-moe.cpp: load_swa_pattern(ml, 2) -- even layers windowed."""
+    meta = _gpt_oss(tmp_path)
+    assert meta.extra["swa_window"] == 128
+    assert meta.extra["swa_pattern"] == [True, False] * 12
+    layers = kv_layers(meta)
+    assert [layer.kind for layer in layers] == ["swa", "full"] * 12
+    # The 2026-11-06 load: 8 slots x 40,960. Charged as 24 full layers that is
+    # 15,360 MiB; the engine used ~7,700. Half the layers now cost a window.
+    full_only = 12 * 327680 * (8 * 64 * 2 + 8 * 64 * 2)
+    charged = kv_alloc_bytes(
+        meta, ctx_total=327680, kv_k="f16", kv_v="f16", parallel=8, ubatch=1024
+    )
+    assert full_only <= charged < full_only * 1.01
+    assert gguf.META_FORMAT_VERSION >= 8
+
+
+def test_a_scalar_pattern_in_the_file_sets_the_period(tmp_path: Path) -> None:
+    meta = _gpt_oss(tmp_path, ("gpt-oss.attention.sliding_window_pattern", UINT32, 3))
+    assert meta.extra["swa_pattern"] == [True, True, False] * 8
+
+
+def test_a_pattern_array_in_the_file_still_wins(tmp_path: Path) -> None:
+    pattern = [1, 1, 1, 0] * 6
+    meta = _gpt_oss(tmp_path, ("gpt-oss.attention.sliding_window_pattern", ARRAY, Arr(1, pattern)))
+    assert meta.extra["swa_pattern"] == [bool(x) for x in pattern]
+
+
+def test_the_engine_pattern_rule_matches_llama_hparams() -> None:
+    assert gguf.arch_swa_pattern(6, 2, False) == [True, False, True, False, True, False]
+    assert gguf.arch_swa_pattern(6, 3, True) == [False, True, True, False, True, True]
+    assert gguf.arch_swa_pattern(3, 0, False) == [True, True, True]

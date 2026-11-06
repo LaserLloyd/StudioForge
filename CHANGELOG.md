@@ -9,6 +9,31 @@ the decisions each one carries rather than repeating them.
 To see what a running server includes, ask it: `GET /api/capabilities` lists every decision number
 the build implements, and the `build` field on `/health` names the exact commit.
 
+## Unreleased (dev)
+
+### Fixed
+
+- **gpt-oss multi-turn chats no longer end in HTTP 500 "does not match the expected peg-native
+  format" (D82).**
+  - **Cause:** under the `--reasoning-format none` default, the engine returned harmony channel
+    markup in `content`. Clients sent it back as history, and a few turns in the model wrote replies
+    the engine's parser rejects.
+  - **Fix:** harmony models now extract their analysis by default (`deepseek`), and harmony markup
+    in assistant history is cut back to the answer before it reaches the engine.
+- An `array` tool parameter with no `items` no longer crashes chat templates that index
+  `param_spec['items']` (gpt-oss's did, before any token). It is sent on as `items: {}`.
+- gpt-oss is planned as the engine runs it, with every other layer sliding-window: its KV estimate
+  is about halved (the old one was 27-33% too high), and it no longer gets a `--cache-reuse` the
+  engine refuses.
+
+### Added
+
+- MCP `get_model_template` / `set_model_template` (admin): read a model's chat template with
+  diagnostics for known failures, upload an override, set or clear its reasoning format.
+- MCP `check_updates` / `update_engine` (admin, `confirm=true`): ask for a newer official prebuilt
+  llama.cpp build to be installed and smoke-tested, and with `activate=true` used for new loads.
+- 27 management MCP tools (37 with the watchdog's).
+
 ## 2.3.0
 
 ### Changed
