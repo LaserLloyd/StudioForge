@@ -50,6 +50,7 @@ try:  # the MCP SDK builds its client with httpx2; match it exactly
 except ImportError:  # pragma: no cover - older SDKs are on httpx
     from httpx import Timeout as _Timeout
 import contextlib
+import json
 import time
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack
@@ -72,7 +73,7 @@ from mcp.client.streamable_http import (  # type: ignore[attr-defined]
 from mcp.server.context import ServerRequestContext
 from mcp.server.lowlevel import Server
 
-from studioforge_companion.config import ServerProfile
+from studioforge_companion.config import ServerProfile, valid_port
 
 PROXY_NAME = "studioforge"
 # Derived, not hardcoded: this read 0.1.0 out of a 0.2.0 package, and the
@@ -594,6 +595,30 @@ class McpProxy:
             return own
         return f"{own}\n\n{UPSTREAM_DIVIDER}\n\n{text}"
 
+    async def adopt_reported_watchdog_port(self) -> int | None:
+        """Point the recovery upstream at the port the server says its watchdog uses.
+
+        The profile's fallback is the default ``watchdog.port`` (1235) on the
+        gateway's host; a rig that moved its watchdog reports the real port in
+        ``connection_info``. Skipped when the profile names a ``watchdog_url``
+        (an explicit URL always wins). Best-effort and bounded like the
+        instructions fetch: any failure keeps the fallback. Returns the port
+        adopted, or ``None``.
+        """
+        if self.profile.watchdog_url:
+            return None
+        port: int | None = None
+        try:
+            with anyio.move_on_after(INSTRUCTIONS_FETCH_TIMEOUT_S):
+                port = reported_watchdog_port(await self.management.call("connection_info", {}))
+        except Exception:  # noqa: BLE001 - an older or unreachable server keeps the default
+            return None
+        if port is None:
+            return None
+        self.profile = self.profile.with_reported_watchdog_port(port)
+        self.watchdog.url = self.profile.watchdog_mcp_url
+        return port
+
     def build_server(self, upstream_instructions: str | None = None) -> Server[Any]:
         return Server(
             PROXY_NAME,
@@ -611,7 +636,11 @@ class McpProxy:
         # client in the `initialize` result, so there is no later moment to
         # deliver it. A down server costs one short connect attempt and the
         # proxy serves its own text, exactly as it did before.
-        server = self.build_server(await self.management.instructions())
+        upstream_text = await self.management.instructions()
+        if upstream_text is not None:
+            # The server answered, so it can also say where its watchdog is.
+            await self.adopt_reported_watchdog_port()
+        server = self.build_server(upstream_text)
         async with stdio_server() as (read_stream, write_stream):
             await server.run(read_stream, write_stream, server.create_initialization_options())
 
@@ -684,6 +713,25 @@ async def probe_watchdog_auth(profile: ServerProfile, *, timeout_s: float = 5.0)
     if response.status_code in (401, 403):
         return "unauthorized"
     return "ok"
+
+
+def reported_watchdog_port(result: types.CallToolResult) -> int | None:
+    """``watchdog_port`` from a ``connection_info`` result, or ``None``.
+
+    Read from the structured content when there is one (bare, or wrapped in
+    ``result``), else from the JSON text block every StudioForge tool returns.
+    """
+    if result.is_error:
+        return None
+    payload: Any = result.structured_content
+    if isinstance(payload, dict) and "watchdog_port" not in payload:
+        payload = payload.get("result")
+    if not isinstance(payload, dict):
+        try:
+            payload = json.loads(result_text(result))
+        except ValueError:
+            return None
+    return valid_port(payload.get("watchdog_port")) if isinstance(payload, dict) else None
 
 
 def result_text(result: types.CallToolResult) -> str:

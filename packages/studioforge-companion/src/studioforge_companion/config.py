@@ -32,7 +32,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import tomli_w
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, PrivateAttr, field_validator
 
 APP_NAME = "studioforge"
 CONFIG_FILENAME = "companion.toml"
@@ -113,12 +113,11 @@ def _swap_port(url: str, port: int) -> str:
     return f"{parts.scheme}://{host}:{port}"
 
 
-def derived_watchdog_port(url: str) -> int:
-    """Gateway port + 1 (the watchdog's default placement); 1235 if no explicit port."""
-    port = urlsplit(url).port
-    if port is None or port >= 65535:
-        return DEFAULT_WATCHDOG_PORT
-    return port + 1
+def valid_port(value: Any) -> int | None:
+    """``value`` when it is a usable TCP port number, else ``None``."""
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 < value < 65536:
+        return None
+    return value
 
 
 class ServerProfile(BaseModel):
@@ -131,6 +130,9 @@ class ServerProfile(BaseModel):
     # Model loads legitimately take minutes (a 70B off a cold disk), so the
     # default read timeout is generous; connect timeouts stay short in client.py.
     timeout_s: float = 600.0
+    # The server's own ``watchdog.port``, when it told us (``connection_info``).
+    # Session-only: never written to the config file.
+    _reported_watchdog_port: int | None = PrivateAttr(default=None)
 
     @field_validator("url")
     @classmethod
@@ -161,18 +163,31 @@ class ServerProfile(BaseModel):
 
     @property
     def effective_watchdog_url(self) -> str:
-        """Explicit ``watchdog_url``, else the same host on gateway port + 1.
+        """Explicit ``watchdog_url``, else the same host on the watchdog's port.
 
-        On the default gateway port 1234 that is 1235. A server on another port
-        needs ``watchdog.port`` set to match (gateway + 1) or an explicit
-        ``watchdog_url``.
+        That port is the server's ``watchdog.port``: the one the server
+        reported (:meth:`with_reported_watchdog_port`, which ``sfctl mcp`` asks
+        for at start) or the default 1235. It is a setting of its own, not
+        derived from ``server.port``, so a gateway moved off 1234 still has its
+        watchdog on 1235. A watchdog moved off 1235 needs ``watchdog_url`` for
+        ``sfctl recover``, which runs exactly when the server cannot be asked.
 
         Deriving it keeps the common case zero-config: the watchdog runs beside
         the server, so only the port differs.
         """
         if self.watchdog_url:
             return self.watchdog_url
-        return _swap_port(self.url, derived_watchdog_port(self.url))
+        return _swap_port(self.url, self._reported_watchdog_port or DEFAULT_WATCHDOG_PORT)
+
+    def with_reported_watchdog_port(self, port: Any) -> ServerProfile:
+        """A copy whose derived watchdog URL uses the port the server reported.
+
+        An explicit ``watchdog_url`` still wins; an unusable ``port`` changes
+        nothing.
+        """
+        copy = self.model_copy()
+        copy._reported_watchdog_port = valid_port(port) or self._reported_watchdog_port
+        return copy
 
     @property
     def watchdog_mcp_url(self) -> str:

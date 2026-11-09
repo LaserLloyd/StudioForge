@@ -200,11 +200,37 @@ def test_watchdog_url_derivation() -> None:
     )
     assert explicit.effective_watchdog_url == "http://other:4321"
 
+    # watchdog.port is its own setting (default 1235), not server.port + 1: a
+    # gateway moved off 1234 still has its watchdog on 1235.
     moved = ServerProfile(name="rig", url="http://100.64.0.3:2234")
-    assert moved.effective_watchdog_url == "http://100.64.0.3:2235"
+    assert moved.effective_watchdog_url == "http://100.64.0.3:1235"
 
     no_port = ServerProfile(name="rig", url="https://rig.example.com")
     assert no_port.effective_watchdog_url == "https://rig.example.com:1235"
+
+
+def test_the_watchdog_port_the_server_reports_is_preferred(tmp_path: Path) -> None:
+    profile = ServerProfile(name="rig", url="http://100.64.0.3:2234")
+    reported = profile.with_reported_watchdog_port(4321)
+    assert reported.effective_watchdog_url == "http://100.64.0.3:4321"
+    assert reported.watchdog_mcp_url == "http://100.64.0.3:4321/mcp"
+    assert profile.effective_watchdog_url == "http://100.64.0.3:1235"  # a copy, not a mutation
+
+    # Nonsense from the server changes nothing.
+    for bad in (None, 0, 70000, True, "4321"):
+        assert profile.with_reported_watchdog_port(bad).effective_watchdog_url.endswith(":1235")
+
+    # An explicit watchdog_url always wins.
+    explicit = ServerProfile(
+        name="rig", url="http://100.64.0.3:1234", watchdog_url="http://other:9999"
+    )
+    assert explicit.with_reported_watchdog_port(4321).effective_watchdog_url == "http://other:9999"
+
+    # Session-only: the reported port is never written to the config file.
+    path = tmp_path / "companion.toml"
+    save_companion_config(CompanionConfig(servers={"rig": reported}), path)
+    assert "4321" not in path.read_text(encoding="utf-8")
+    assert load_companion_config(path).profile("rig").effective_watchdog_url.endswith(":1235")
 
 
 @on_posix
@@ -1126,6 +1152,75 @@ async def test_proxy_served_over_the_real_protocol(
 
         instructions = client.instructions or ""
         assert RECOVERY_PREFIX in instructions
+
+
+class _CannedManagement(Upstream):
+    """A management upstream whose ``connection_info`` answer is canned (no network)."""
+
+    def __init__(self, answer: Any) -> None:
+        super().__init__(label="management", url="http://127.0.0.1:1/mcp")
+        self.answer = answer
+        self.asked: list[str] = []
+
+    async def call(self, name: str, arguments: dict[str, Any] | None) -> Any:
+        import mcp.types as types
+
+        self.asked.append(name)
+        if isinstance(self.answer, Exception):
+            raise self.answer
+        if isinstance(self.answer, types.CallToolResult):
+            return self.answer
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text=json.dumps(self.answer))]
+        )
+
+
+async def test_proxy_adopts_the_watchdog_port_the_server_reports() -> None:
+    import mcp.types as types
+
+    proxy = McpProxy(ServerProfile(name="rig", url="http://100.64.0.3:2234"))
+    assert proxy.watchdog.url == "http://100.64.0.3:1235/mcp"  # the default, not 2235
+    proxy.management = _CannedManagement({"ok": True, "watchdog_port": 4321})
+    assert await proxy.adopt_reported_watchdog_port() == 4321
+    assert proxy.watchdog.url == "http://100.64.0.3:4321/mcp"
+    assert proxy.profile.effective_watchdog_url == "http://100.64.0.3:4321"
+    assert "http://100.64.0.3:4321" in proxy.instructions()
+
+    # Structured content is read too, bare or wrapped in "result".
+    wrapped = McpProxy(ServerProfile(name="rig", url="http://100.64.0.3:1234"))
+    wrapped.management = _CannedManagement(
+        types.CallToolResult(content=[], structured_content={"result": {"watchdog_port": 5555}})
+    )
+    assert await wrapped.adopt_reported_watchdog_port() == 5555
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        RuntimeError("server down"),
+        {"ok": True},  # an older server: no watchdog_port
+        {"ok": True, "watchdog_port": "1236"},
+        {"ok": True, "watchdog_port": 0},
+    ],
+)
+async def test_proxy_keeps_the_default_watchdog_port_when_the_server_cannot_say(
+    answer: Any,
+) -> None:
+    proxy = McpProxy(ServerProfile(name="rig", url="http://100.64.0.3:1234"))
+    proxy.management = _CannedManagement(answer)
+    assert await proxy.adopt_reported_watchdog_port() is None
+    assert proxy.watchdog.url == "http://100.64.0.3:1235/mcp"
+
+
+async def test_an_explicit_watchdog_url_is_never_second_guessed() -> None:
+    proxy = McpProxy(
+        ServerProfile(name="rig", url="http://100.64.0.3:1234", watchdog_url="http://wd:9999")
+    )
+    canned = _CannedManagement({"ok": True, "watchdog_port": 4321})
+    proxy.management = canned
+    assert await proxy.adopt_reported_watchdog_port() is None
+    assert canned.asked == []  # not even asked
+    assert proxy.watchdog.url == "http://wd:9999/mcp"
 
 
 def test_describe_exception_unwraps_and_trims() -> None:

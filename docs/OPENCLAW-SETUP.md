@@ -209,10 +209,11 @@ Notes on that command:
 
 - The URL is a **positional argument**. There is no `--url` option on `servers add`.
 - `--use` makes it the default profile, so later commands need no `-s rig`.
-- The watchdog URL is derived automatically as the same host on the gateway port plus one (`1235`
-  for the default `1234`). If you moved the gateway, set the rig's `watchdog.port` to the gateway
-  port plus one, or pass `--watchdog-url`; otherwise `sfctl recover` and the watchdog tools fail
-  and only the main server's tools remain.
+- The watchdog URL is derived automatically as the same host on the rig's `watchdog.port` — `1235`
+  unless you changed it, whatever port the gateway uses. `sfctl mcp` asks the running server for
+  its actual watchdog port at start; `sfctl recover` cannot (it is for when the server is down),
+  so if you moved `watchdog.port`, pass `--watchdog-url`, or `sfctl recover` fails and the proxy's
+  watchdog tools disappear whenever the main server is down.
 - The PIN travels as a bearer token. The rig accepts it on `/mcp`; on `/v1` it is ignored, because
   no API key is configured there yet. When you later set a real `server.api_key`, put *that* here
   instead — it is valid on every surface, PIN included.
