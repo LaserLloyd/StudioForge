@@ -73,6 +73,8 @@ _IPV6 = re.compile(
     r"(?<![\w:.])[0-9A-Fa-f]{0,4}(?::[0-9A-Fa-f]{0,4}){2,7}(?:\.\d{1,3}){0,3}(?![\w:])"
 )
 _OWNER_ACTOR = re.compile(r"(?i)\bowner:[^\s'\",;)\]}]+")
+#: A drive-letter or UNC path: the home directory of a Windows account.
+_WINDOWS_PATH = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\)")
 
 
 def _mask_ip(match: re.Match[str]) -> str:
@@ -113,10 +115,15 @@ def redact_text(text: str, config: Config | None = None, *, extra: list[str] | N
     home = str(Path.home())
     if home and len(home) > 3:
         # Plain, JSON-escaped (Windows backslashes doubled, as in doctor.json and
-        # structured logs) and forward-slash spellings; longest first.
+        # structured logs) and forward-slash spellings; longest first. A Windows
+        # path is case-insensitive, and tools print the profile path in whatever
+        # case they were handed (an all-lower-case drive and folder from one, the
+        # canonical capitalisation from another), so there the match ignores
+        # case; a POSIX home is matched exactly.
+        flags = re.IGNORECASE if _WINDOWS_PATH.match(home) else 0
         escaped = json.dumps(home)[1:-1]
         for spelling in sorted({home, escaped, home.replace("\\", "/")}, key=len, reverse=True):
-            text = text.replace(spelling, "~")
+            text = re.sub(re.escape(spelling), "~", text, flags=flags)
     return text
 
 

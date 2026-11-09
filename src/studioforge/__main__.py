@@ -31,7 +31,7 @@ from studioforge.config import Config, find_config_path, load_config
 from studioforge.errors import AuthError, ConfigError
 from studioforge.logfiles import MB
 from studioforge.logging import configure_logging, get_logger
-from studioforge.tlsutil import TlsError, resolve_tls, scheme_for
+from studioforge.tlsutil import TlsError, load_listeners, resolve_tls, scheme_for
 
 if TYPE_CHECKING:
     from studioforge.core.ports import PortConflict
@@ -514,6 +514,10 @@ async def _serve(config: Config, *, open_gui: bool = False) -> int:
     elif open_gui:
         log.warning("--open was requested but the GUI is disabled")
 
+    # uvicorn reads the certificate pair under the same lock a regeneration
+    # takes, so a pair rewritten by the watchdog starting beside us is never
+    # read half-old (tlsutil.load_listeners).
+    load_listeners(config, [getattr(server, "config", None) for server in servers])
     try:
         await asyncio.gather(*(server.serve() for server in servers))
     finally:

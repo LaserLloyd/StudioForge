@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any
 
 from studioforge.authkeys import (
+    OWNER_EVER_FILE,
     SCOPES,
     KeyRecord,
     Principal,
@@ -57,10 +58,14 @@ __all__ = ["Account", "AccountStore", "LEGACY_KEY_NAME", "MIN_PASSWORD_LENGTH"]
 LEGACY_KEY_NAME = "legacy"
 LOCAL_CLI_KEY_NAME = "local-cli"
 LOCAL_CLI_KEY_FILE = "cli.key"
-#: Written when an account is created or about to be deleted: "an owner existed here". Lets a
-#: network-bound server keep requiring a credential after its last account is force-deleted,
-#: the way ``had_keys_cached`` does for keys (a bind rule is only checked at start).
-OWNER_EVER_FILE = ".had-owner"
+#: ``OWNER_EVER_FILE`` (defined in :mod:`studioforge.authkeys` so the watchdog can read it)
+#: is written when an account is created or about to be deleted: "an owner existed here".
+#: Lets a network-bound server keep requiring a credential after its last account is
+#: force-deleted, the way ``had_keys_cached`` does for keys (a bind rule is only checked
+#: at start).
+
+#: The constant ``prefix`` of the ``legacy`` mirror: no plaintext character of the config key.
+LEGACY_KEY_PREFIX = "legacy"
 
 #: Long enough that argon2id's cost is the weak point, not the password.
 MIN_PASSWORD_LENGTH = 10
@@ -437,7 +442,7 @@ class AccountStore:
             name=LEGACY_KEY_NAME,
             scope="admin",
             key_hash=digest,
-            prefix="legacy",  # constant: no plaintext character of the config key is stored
+            prefix=LEGACY_KEY_PREFIX,  # no plaintext character of the config key is stored
             created_at=self._clock(),
         )
         self._insert(record, created_by="migration")
@@ -448,6 +453,25 @@ class AccountStore:
             "key still works but is deprecated (create scoped keys with `studioforge keys create`)"
         )
         return record
+
+    def scrub_legacy_prefixes(self) -> int:
+        """Replace the plaintext head a pre-2.3.0 ``legacy`` mirror stored as its prefix.
+
+        Before 2.3.0 the mirror of ``server.api_key`` kept the key's first four
+        characters as its display prefix (``abcd...``), so ``keys list``, the panel
+        and the database itself held part of the secret. New mirrors store the
+        constant :data:`LEGACY_KEY_PREFIX`; this rewrites the old rows, revoked ones
+        included. Idempotent and cheap (one UPDATE on a small table),
+        so it runs at every start. Returns the number of rows rewritten.
+        """
+        changed = self.db.execute_write(
+            "UPDATE api_keys SET prefix = ? WHERE name = ? AND created_by = ? AND prefix <> ?",
+            (LEGACY_KEY_PREFIX, LEGACY_KEY_NAME, "migration", LEGACY_KEY_PREFIX),
+        )
+        if changed:
+            self._invalidate_posture()
+            log.info("scrubbed the stored prefix of old legacy key rows", rows=changed)
+        return int(changed or 0)
 
     def authenticate_legacy(self, api_key: str) -> Principal | None:
         """The principal for a presented ``server.api_key`` that matched the config.

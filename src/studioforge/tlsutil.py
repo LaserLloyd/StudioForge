@@ -31,7 +31,7 @@ import hashlib
 import ipaddress
 import os
 import time
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -44,6 +44,7 @@ __all__ = [
     "certificate_fingerprint",
     "describe_tls",
     "internal_verify",
+    "load_listeners",
     "resolve_tls",
     "scheme_for",
 ]
@@ -340,3 +341,40 @@ def resolve_tls(config: Any) -> TlsMaterial | None:
     return TlsMaterial(
         cert_path, key_path, certificate_fingerprint(pem), "self_signed", _not_after(pem)
     )
+
+
+def load_listeners(config: Any, listeners: Iterable[Any]) -> bool:
+    """Let uvicorn read the self-signed pair while the TLS folder lock is held.
+
+    :func:`resolve_tls` hands back *paths*; uvicorn opens them later, in its
+    ``Config.load()`` at serve time. A second StudioForge process regenerating
+    the pair in that gap (the gateway, the panel and the watchdog all start
+    together, and an edited bind host widens the names) could give this listener
+    the new certificate with the old key -- a listener whose TLS setup fails -- or
+    a certificate other than the one whose fingerprint was just advertised.
+    Loading under the lock that every regeneration takes closes the gap.
+
+    ``listeners`` are ``uvicorn.Config`` objects; one already loaded (or anything
+    without ``load``/``loaded``) is left alone, and ``serve()`` does not load a
+    loaded config twice. Only ``self_signed``: ``cert`` files are the operator's
+    own, which StudioForge never rewrites. Returns whether the lock was used; a
+    lock that cannot be had in time falls back to uvicorn's own load at serve
+    time, which is how every listener started before this existed.
+    """
+    tls = getattr(getattr(config, "server", None), "tls", None)
+    if tls is None or tls.mode != "self_signed":
+        return False
+    pending = [
+        listener
+        for listener in listeners
+        if callable(getattr(listener, "load", None)) and getattr(listener, "loaded", True) is False
+    ]
+    if not pending:
+        return False
+    try:
+        with _folder_lock(Path(config.data_dir) / "tls"):
+            for listener in pending:
+                listener.load()
+    except TlsError:
+        return False
+    return True

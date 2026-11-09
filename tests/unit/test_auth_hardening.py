@@ -18,7 +18,7 @@ from fastapi.testclient import TestClient
 
 from studioforge.api.app import build_state, create_app
 from studioforge.api.auth import host_header_trusted, required_scope, trusted_local_request
-from studioforge.authkeys import LOCAL_ADMIN
+from studioforge.authkeys import LOCAL_ADMIN, KeyRecord
 from studioforge.config import (
     MIN_API_KEY_LENGTH,
     Config,
@@ -203,6 +203,29 @@ def test_the_config_route_and_the_legacy_mirror_leak_no_plaintext(tmp_path: Path
         assert body["config"]["server"]["api_key"] == redact(GOOD_KEY)
     legacy = [k for k in app.state.accounts.list_keys() if k.name == "legacy"]
     assert legacy and all(GOOD_KEY[:4] not in k.prefix for k in legacy)
+
+
+def test_old_legacy_key_prefixes_are_scrubbed_at_start(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    state = build_state(config)
+    accounts = state.accounts
+    old = KeyRecord(
+        id="oldlegacy001",
+        name="legacy",
+        scope="admin",
+        key_hash="0" * 64,
+        prefix="abcd...",
+        created_at=1.0,
+        revoked_at=2.0,
+    )
+    accounts._insert(old, created_by="migration")
+    # A key the operator happened to name "legacy" keeps its own (non-secret) prefix.
+    mine, _token = accounts.create_key("legacy", "read")
+    create_app(config, state=state, start_background=False)
+    prefixes = {k.id: k.prefix for k in accounts.list_keys()}
+    assert prefixes["oldlegacy001"] == "legacy"
+    assert prefixes[mine.id] == mine.prefix and mine.prefix.startswith("sf-r-")
+    assert accounts.scrub_legacy_prefixes() == 0, "idempotent"
 
 
 # ---------------------------------------------------------------------------

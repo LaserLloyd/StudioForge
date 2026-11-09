@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import threading
 from pathlib import Path
+from typing import Any
 
+import pytest
 from cryptography import x509
 
 from studioforge import tlsutil
@@ -96,3 +98,66 @@ def test_concurrent_starts_agree_on_one_pair(tmp_path: Path) -> None:
     final = resolve_tls(config)
     assert final is not None and final.fingerprint_sha256 == results[0]
     assert not list((tmp_path / "data" / "tls").glob("*.new"))
+
+
+# uvicorn reads the pair under the lock a regeneration takes (review 2026-11-09)
+
+
+class _Listener:
+    def __init__(self, folder: Path) -> None:
+        self.folder = folder
+        self.loaded = False
+        self.lock_held_during_load: bool | None = None
+
+    def load(self) -> None:
+        errors: list[BaseException] = []
+
+        def contend() -> None:
+            try:
+                with tlsutil._folder_lock(self.folder):
+                    pass
+            except tlsutil.TlsError as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(target=contend)
+        worker.start()
+        worker.join()
+        self.lock_held_during_load = bool(errors)
+        self.loaded = True
+
+
+def test_load_listeners_loads_under_the_tls_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(tlsutil, "_LOCK_WAIT_S", 0.3)
+    config = _config(tmp_path)
+    assert tlsutil.resolve_tls(config) is not None
+    listener = _Listener(Path(config.data_dir) / "tls")
+    done = _Listener(Path(config.data_dir) / "tls")
+    done.loaded = True
+    assert tlsutil.load_listeners(config, [listener, done, None]) is True
+    assert listener.loaded and listener.lock_held_during_load is True
+    assert done.lock_held_during_load is None, "an already-loaded config is left alone"
+
+
+def test_load_listeners_leaves_plain_http_and_own_certs_to_uvicorn(tmp_path: Path) -> None:
+    listener = _Listener(tmp_path)
+    assert tlsutil.load_listeners(Config(data_dir=tmp_path / "data"), [listener]) is False
+    assert listener.loaded is False
+
+
+def test_a_real_uvicorn_config_loads_the_self_signed_pair(tmp_path: Path) -> None:
+    import ssl
+
+    import uvicorn
+
+    config = _config(tmp_path)
+    material = tlsutil.resolve_tls(config)
+    assert material is not None
+
+    async def app(scope: Any, receive: Any, send: Any) -> None:  # pragma: no cover
+        return None
+
+    listener = uvicorn.Config(app, log_config=None, **material.uvicorn_kwargs())
+    assert tlsutil.load_listeners(config, [listener]) is True
+    assert listener.loaded and isinstance(listener.ssl, ssl.SSLContext)

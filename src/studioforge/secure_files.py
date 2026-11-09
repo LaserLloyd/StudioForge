@@ -78,20 +78,31 @@ def _write_private_windows(target: Path, payload: bytes) -> None:
     """Restrict first, verify, then write; never leave a secret under a loose ACL.
 
     A new file is created empty and an existing one is restricted *before* it is
-    truncated and filled. If ``icacls`` failed and the file is verifiably open to
-    other accounts, nothing is written (a new file is removed) and ``PermissionError``
-    is raised. A filesystem that cannot tell (FAT, some shares: ``is_owner_only``
-    returns ``None``) keeps the old best-effort behaviour so a config save still works.
+    truncated and filled. The result is then verified every time, not only when
+    ``icacls`` failed: ``/inheritance:r /grant:r`` drops the inherited entries and
+    replaces the user's own, but an *explicit* entry another account already holds
+    on an existing file survives it while ``icacls`` reports success. If the file
+    is verifiably open to other accounts, nothing is written (a new file is
+    removed) and ``PermissionError`` is raised. A filesystem that cannot tell
+    (FAT, some shares: ``is_owner_only`` returns ``None``) keeps the old
+    best-effort behaviour so a config save still works.
     """
     existed = target.exists()
     if not existed:
         target.touch()
-    if not restrict_to_owner(target) and is_owner_only(target) is False:
+    restricted = restrict_to_owner(target)
+    if is_owner_only(target) is False:
         if not existed:
             with contextlib.suppress(OSError):
                 target.unlink()
+        why = (
+            "other accounts keep explicit access entries on it"
+            if restricted
+            else "could not restrict it to the current user"
+        )
         raise PermissionError(
-            f"could not restrict {target} to the current user, so it was not written"
+            f"{target} was not written: {why}. Remove the extra entries (for example "
+            f"`icacls <file> /reset`) and try again."
         )
     with target.open("wb") as handle:
         handle.write(payload)
@@ -166,7 +177,10 @@ def is_owner_only(path: Path) -> bool | None:
     principals: list[str] = []
     for line in result.stdout.splitlines():
         text = line.strip()
-        if not text or text.lower().startswith("successfully processed"):
+        # Only access entries ("principal:(perms)") count. The summary line is
+        # localised ("Successfully processed 1 files" in English only), so it is
+        # recognised by shape, not by its words.
+        if ":(" not in text:
             continue
         # First line is "<path> <principal>:(perms)"; the rest are indented entries.
         entry = text[len(str(target)) :].strip() if text.startswith(str(target)) else text

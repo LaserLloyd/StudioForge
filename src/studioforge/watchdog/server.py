@@ -101,7 +101,7 @@ from studioforge.error_catalog import with_error_extras
 from studioforge.logfiles import backups_of
 from studioforge.mcp_policy import PolicyExtension, annotations_for
 from studioforge.secure_files import write_private
-from studioforge.tlsutil import TlsError, resolve_tls, scheme_for
+from studioforge.tlsutil import TlsError, load_listeners, resolve_tls, scheme_for
 
 log = logging.getLogger("studioforge.watchdog")
 
@@ -3061,6 +3061,10 @@ async def serve(
             **ssl_kwargs,
         )
     )
+    if tls is not None:
+        # Read the pair under the lock a regeneration takes (the gateway may be
+        # regenerating it right now); see tlsutil.load_listeners.
+        load_listeners(config, [uv.config])
     try:
         await uv.serve()
     finally:

@@ -916,6 +916,13 @@ def create_app(
     # keeps authenticating from config either way.
     accounts = getattr(app.state, "accounts", None)
     if accounts is not None:
+        # A pre-2.3.0 mirror stored the key's first characters as its prefix.
+        scrub = getattr(accounts, "scrub_legacy_prefixes", None)
+        if callable(scrub):
+            try:
+                scrub()
+            except Exception as exc:  # noqa: BLE001 - cosmetic; must not stop the boot
+                log.warning("could not scrub old legacy key prefixes", error=str(exc))
         try:
             accounts.adopt_legacy_key(config.server.api_key)
             accounts.sync_snapshot()

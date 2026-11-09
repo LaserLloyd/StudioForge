@@ -373,3 +373,33 @@ def test_redaction_masks_escaped_home_peer_ips_and_owner_actor(monkeypatch) -> N
     assert "~" in out and "owner:[user]" in out
     for kept in ("127.0.0.1", "0.0.0.0", "::1", "2.2.0", "12:34:56"):
         assert kept in out
+
+
+# Home masking ignores case on a Windows path (review 2026-11-09)
+
+
+def test_a_windows_home_is_masked_in_any_case(monkeypatch: pytest.MonkeyPatch) -> None:
+    home = Path("C:\\Users\\Alice")  # scrub-ok: synthetic fixture user
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    text = (
+        "a c:\\users\\alice\\models\\x.gguf b C:/USERS/ALICE/y "  # scrub-ok: fixture
+        '{"p": "C:\\\\USERS\\\\alice\\\\z"} c C:\\Users\\Alice\\w'  # scrub-ok: fixture
+    )
+    redacted = redact_text(text)
+    assert "alice" not in redacted.lower()
+    assert redacted.count("~") == 4
+
+
+def test_a_posix_home_is_still_matched_exactly(monkeypatch: pytest.MonkeyPatch) -> None:
+    from studioforge.core import support_bundle
+
+    monkeypatch.setattr(support_bundle, "Path", _PosixHome)
+    sample = "one /home/Alice/x two /home/alice/y"  # scrub-ok: synthetic fixture user
+    redacted = support_bundle.redact_text(sample)
+    assert redacted == "one ~/x two /home/alice/y"  # scrub-ok: synthetic fixture user
+
+
+class _PosixHome:
+    @staticmethod
+    def home() -> str:
+        return "/home/Alice"
