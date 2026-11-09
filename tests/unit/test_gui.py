@@ -2031,6 +2031,24 @@ def test_reasoning_format_help_warns_about_empty_replies() -> None:
     assert "empty reply" in risky
 
 
+def test_reasoning_format_hint_knows_the_harmony_default() -> None:
+    """A gpt-oss model launches with deepseek under the 'none' default (D82)."""
+    harmony = st.reasoning_format_hint(None, "none", harmony=True)
+    assert harmony.startswith("reasoning_format = deepseek")
+    assert "harmony" in harmony and "empty reply" not in harmony
+    # The model's own choice still wins, and says what it does.
+    chosen = st.reasoning_format_hint("none", "none", harmony=True)
+    assert chosen.startswith("reasoning_format = none") and "message.content" in chosen
+    # A non-'none' global default is what a harmony model gets, like any other.
+    assert st.reasoning_format_hint(None, "deepseek", harmony=True).startswith(
+        "reasoning_format = deepseek:"
+    )
+    # Not harmony: unchanged.
+    assert st.reasoning_format_hint(None, "none", harmony=False) == st.reasoning_format_hint(
+        None, "none"
+    )
+
+
 # ---------------------------------------------------------------------------
 # First-run setup
 # ---------------------------------------------------------------------------

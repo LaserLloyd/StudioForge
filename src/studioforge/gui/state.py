@@ -37,6 +37,7 @@ from pydantic import BaseModel
 
 from studioforge.api.auth import redact
 from studioforge.config import RESTART_REQUIRED_KEYS
+from studioforge.core.harmony import effective_reasoning_format
 from studioforge.core.model_gate import modalities_from
 from studioforge.types import GpuInfo, InstanceInfo, ModelRecord, ModelSettings, VirtualPreset
 
@@ -2771,8 +2772,20 @@ REASONING_FORMAT_HELP: Final = (
 )
 
 
-def reasoning_format_hint(value: str | None, default: str) -> str:
-    effective = value or default
+def reasoning_format_hint(value: str | None, default: str, *, harmony: bool = False) -> str:
+    """What a launch will pass as ``--reasoning-format``, and what that means for clients.
+
+    ``harmony`` is :func:`~studioforge.core.harmony.record_uses_harmony` for the
+    model: with no choice of its own, a gpt-oss model launches with ``deepseek``
+    instead of a ``none`` default (D82), so the hint must say that too.
+    """
+    effective, source = effective_reasoning_format(value or None, default, harmony=harmony)
+    if source == "harmony":
+        return (
+            f"reasoning_format = {effective} (gpt-oss/harmony default): the analysis goes to "
+            "message.reasoning_content and the answer stays in message.content. 'none' would "
+            "put raw harmony markup into content and break the next turn."
+        )
     if effective == "none":
         return f"reasoning_format = {effective} (inline in message.content — safe for any client)"
     return (

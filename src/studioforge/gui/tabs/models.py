@@ -24,6 +24,7 @@ from typing import Any, Final
 
 from nicegui import ui
 
+from studioforge.core.harmony import record_uses_harmony
 from studioforge.gui import state as st
 from studioforge.gui.tabs import (
     GuiContext,
@@ -913,6 +914,8 @@ def _settings_dialog(ctx: GuiContext, record: Any, table: Any) -> None:  # noqa:
                 reasoning_budget = _num("reasoning-budget", form["reasoning_budget"])
             ui.label(st.REASONING_FORMAT_HELP).classes("text-xs opacity-70")
             reasoning_hint = ui.label("").classes("text-xs text-warning")
+            # A gpt-oss model's launch moves the 'none' default to deepseek (D82).
+            harmony = record_uses_harmony(record)
             ui.label("Default sampler parameters").classes("text-xs font-medium mt-1")
             with ui.row().classes("w-full gap-3 flex-wrap"):
                 temperature = _num("temperature", form["temperature"], precision=None)
@@ -997,6 +1000,7 @@ def _settings_dialog(ctx: GuiContext, record: Any, table: Any) -> None:  # noqa:
                 st.reasoning_format_hint(
                     str(reasoning_format.value or "") or None,
                     ctx.config.models.default_reasoning_format,
+                    harmony=harmony,
                 )
             )
             chosen = next((r for r in drafts if r.id == draft.value), None)
