@@ -25,6 +25,32 @@ the build implements, and the `build` field on `/health` names the exact commit.
 - gpt-oss is planned as the engine runs it, with every other layer sliding-window: its KV estimate
   is about halved (the old one was 27-33% too high), and it no longer gets a `--cache-reuse` the
   engine refuses.
+- **Review fixes for 2.3.0 and D82** (an independent code review of the deployed build):
+  - `server.behind_proxy` and `server.allowed_hosts` now take effect as soon as they are saved
+    (before, the reply said no restart was needed but the running server kept the old values).
+  - A redacted placeholder (`redacted:...`) can no longer be saved back as a secret. Sending a whole
+    section from `GET /api/config` back unchanged is refused with a message naming the field.
+  - Behind a proxy with an owner account but no keys, the panel now asks for the owner's sign-in
+    instead of becoming read-only for everyone; the doctor's advice says so.
+  - The non-loopback bind rule and the 16-character key minimum now apply to every config edit
+    (section form, MCP, watchdog, setup wizard), not only to dotted `PATCH` keys.
+  - The watchdog's detailed `/health` follows the same Host and `behind_proxy` rule as the gateway.
+  - The self-signed certificate and key are read while the folder lock is held, so a concurrent
+    regeneration cannot pair a new key with an old certificate.
+  - An `allowed_hosts` entry written with a scheme and no port (`http://name`) matches any port.
+  - Support bundles mask Windows home paths regardless of case; owner-only secret files are
+    verified after every permission change; legacy key prefixes from before 2.3.0 are scrubbed.
+  - MCP `update_engine` refuses a tag with no prebuilt download before installing anything (it
+    could start a full source build), and smoke-tests and activates the build it actually installed.
+  - The companion finds the watchdog on its configured port (1235 by default, or what the server
+    reports), not at the gateway port + 1.
+  - `/v1/messages` and `/v1/responses` stream sequential tool calls live again; only genuinely
+    interleaved calls are buffered.
+  - The gpt-oss history repair only touches real harmony structure; prose that mentions the control
+    tokens is kept as written.
+  - Chat-template overrides accept `{% break %}`, `{% continue %}` and `{% generation %}` like
+    Hugging Face, and are written only after every check passes.
+  - The panel's reasoning-format hint shows the gpt-oss default.
 
 ### Added
 
