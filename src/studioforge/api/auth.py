@@ -33,11 +33,18 @@ from fastapi import Request
 from studioforge.authkeys import (
     LOCAL_ADMIN,
     Principal,
-    is_loopback_host,
+    cross_site_origin,
+    host_names_this_server,
     looks_like_key,
     origin_allowed,
 )
-from studioforge.config import SECRET_CONFIG_PATHS, Config, redact, redact_config_dict
+from studioforge.config import (
+    SECRET_CONFIG_PATHS,
+    Config,
+    redact,
+    redact_config_dict,
+    remote_services,
+)
 from studioforge.credential_guard import CredentialGuard, client_key
 
 # Re-exported: these live in ``studioforge.config`` (a leaf the watchdog may import)
@@ -48,6 +55,7 @@ __all__ = [
     "origin_allowed",
     "redact",
     "redact_config_dict",
+    "remote_services",
 ]
 from studioforge.errors import AuthError
 
@@ -283,34 +291,6 @@ def is_local_request(request: Any) -> bool:
     return _is_loopback(str(host))
 
 
-_DEFAULT_PORTS = {"http": 80, "https": 443, "ws": 80, "wss": 443}
-
-
-def _origin_key(value: str, scheme: str) -> tuple[str, int] | None:
-    """``(hostname, port)`` for an origin or a ``Host`` header, defaults filled in.
-
-    Both are parsed with ``urlsplit`` so IPv6 brackets, case and an implicit
-    port are handled one way. ``None`` means unparseable, which the caller
-    treats as foreign.
-    """
-    from urllib.parse import urlsplit
-
-    text = (value or "").strip()
-    if not text:
-        return None
-    try:
-        parts = urlsplit(text if "//" in text else "//" + text)
-        hostname = (parts.hostname or "").lower()
-        port = parts.port
-    except ValueError:
-        return None
-    if not hostname:
-        return None
-    if port is None:
-        port = _DEFAULT_PORTS.get((parts.scheme or scheme or "http").lower(), 80)
-    return hostname, port
-
-
 def cross_site_browser_request(request: Any) -> bool:
     """True for a browser request whose ``Origin`` is not this server's own origin.
 
@@ -331,18 +311,8 @@ def cross_site_browser_request(request: Any) -> bool:
     headers = getattr(request, "headers", None)
     if headers is None:
         return False
-    origin = headers.get("origin")
-    host = headers.get("host")
-    if not origin or not host:
-        return False
-    if origin.strip().lower() == "null":
-        return True
     scheme = str(getattr(getattr(request, "url", None), "scheme", "") or "http")
-    origin_key = _origin_key(origin, scheme)
-    host_key = _origin_key(host, scheme)
-    if origin_key is None or host_key is None:
-        return True
-    return origin_key != host_key
+    return cross_site_origin(headers.get("origin"), headers.get("host"), scheme)
 
 
 def host_header_trusted(request: Any, config: Config) -> bool:
@@ -354,36 +324,20 @@ def host_header_trusted(request: Any, config: Config) -> bool:
     waves it through. Only the ``Host`` it must send gives it away. Accepted:
     no ``Host`` at all (HTTP/1.0, an in-process call), a loopback literal or
     ``localhost`` (any port), the host of an explicit ``server.cors_origins``
-    entry, or an entry of ``server.allowed_hosts`` (host or host:port).
+    entry, or an entry of ``server.allowed_hosts`` (host, host:port or a URL;
+    without a port it matches any port). The rule itself lives in
+    :func:`studioforge.authkeys.host_names_this_server` so the watchdog applies
+    the same one.
     """
     headers = getattr(request, "headers", None)
     if headers is None:
         return True
-    raw = headers.get("host")
-    if not raw or not raw.strip():
-        return True
-    key = _origin_key(raw, "http")
-    if key is None:
-        return False
-    hostname, port = key
-    if is_loopback_host(hostname):
-        return True
     server = getattr(config, "server", None)
-    for entry in list(getattr(server, "allowed_hosts", None) or []):
-        entry_key = _origin_key(str(entry), "http")
-        if entry_key is None:
-            continue
-        explicit_port = ":" in str(entry).rsplit("]", 1)[-1]
-        if entry_key[0] == hostname and (not explicit_port or entry_key[1] == port):
-            return True
-    for origin in list(getattr(server, "cors_origins", None) or []):
-        text = str(origin).strip()
-        if not text or text == "*":
-            continue
-        origin_key = _origin_key(text, "http")
-        if origin_key is not None and origin_key[0] == hostname:
-            return True
-    return False
+    return host_names_this_server(
+        headers.get("host"),
+        allowed_hosts=list(getattr(server, "allowed_hosts", None) or []),
+        cors_origins=list(getattr(server, "cors_origins", None) or []),
+    )
 
 
 def trusted_local_request(request: Any, config: Config) -> bool:
@@ -591,18 +545,6 @@ def required_scope(
     return "admin"
 
 
-def remote_services(config: Config) -> list[tuple[str, str]]:
-    """``(service, host)`` for every enabled listener that is not loopback-only."""
-    found: list[tuple[str, str]] = []
-    if not is_loopback_host(config.server.host):
-        found.append(("the gateway", config.server.host))
-    if config.gui.enabled and not is_loopback_host(config.gui.host):
-        found.append(("the control panel", config.gui.host))
-    if config.watchdog.enabled and not is_loopback_host(config.watchdog.host):
-        found.append(("the watchdog", config.watchdog.host))
-    return found
-
-
 def auth_enforced(config: Config, accounts: Any = None) -> bool:
     """Whether a request must carry a valid credential.
 
@@ -632,6 +574,25 @@ def auth_enforced(config: Config, accounts: Any = None) -> bool:
         or (callable(had_keys) and had_keys())
         or (callable(had_owner) and had_owner())
     )
+
+
+def panel_sign_in_required(config: Config, accounts: Any = None) -> bool:
+    """Whether the control panel asks for a sign-in: :func:`auth_enforced`, plus one case.
+
+    ``server.behind_proxy`` with an owner account and no API key. The API stays
+    open there (inference keeps its LM Studio parity; box changes need an admin
+    key or the PIN, since loopback trust is off), but the panel cannot tell this
+    machine from a proxied client either, so without a sign-in nobody -- the
+    owner included -- could change anything from it, and the owner session the
+    doctor points at would be unreachable. Asking for the owner's sign-in gives
+    that session back. Only when an owner exists: a sign-in page nobody can pass
+    would lock the panel's reads away too.
+    """
+    if auth_enforced(config, accounts):
+        return True
+    if accounts is None or not getattr(config.server, "behind_proxy", False):
+        return False
+    return bool(accounts.has_owner_cached())
 
 
 def has_admin_credential(config: Config, accounts: Any = None) -> bool:

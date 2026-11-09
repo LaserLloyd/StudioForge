@@ -32,7 +32,8 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from studioforge.errors import ConfigError
+from studioforge.authkeys import is_loopback_host
+from studioforge.errors import AuthError, ConfigError
 from studioforge.secret_store import SecretStore
 from studioforge.secure_files import write_private
 
@@ -271,7 +272,8 @@ class ServerConfig(BaseModel):
     #: this on, the shortcut is off: every box-changing request needs a real
     #: credential (an owner session or an admin key).
     behind_proxy: bool = False
-    #: Extra ``Host`` header values (host or host:port) accepted as "this
+    #: Extra ``Host`` header values (host, host:port, or a URL; without a port
+    #: an entry matches any port) accepted as "this
     #: server" for the same-machine admin shortcut, beyond the loopback
     #: literals and the hosts of ``cors_origins``. A request whose ``Host`` is
     #: none of those is not local, whatever its peer address says: that is the
@@ -1630,13 +1632,142 @@ def _register_secrets(config: Config) -> None:
     register_secret(config.mcp.pin)
 
 
-def apply_overrides(config: Config, updates: dict[str, Any]) -> Config:
+def remote_services(config: Config) -> list[tuple[str, str]]:
+    """``(service, host)`` for every enabled listener that is not loopback-only."""
+    found: list[tuple[str, str]] = []
+    if not is_loopback_host(config.server.host):
+        found.append(("the gateway", config.server.host))
+    if config.gui.enabled and not is_loopback_host(config.gui.host):
+        found.append(("the control panel", config.gui.host))
+    if config.watchdog.enabled and not is_loopback_host(config.watchdog.host):
+        found.append(("the watchdog", config.watchdog.host))
+    return found
+
+
+def refuse_secret_writes(before: dict[str, Any], after: dict[str, Any]) -> None:
+    """The checks a credential in a config edit must pass, on the MERGED tree.
+
+    Run after the update is merged, so the dotted form (``"server.api_key": ...``)
+    and the section form (``"server": {...}``) are held to the same rules -- the
+    section form used to skip them. Only a value that actually changes is
+    checked: a config already holding an old short key keeps saving.
+
+    * A redaction placeholder (``redacted:...``, what every config dump shows in
+      place of a secret) is refused: written back it would *become* the secret.
+    * A new ``server.api_key`` must be at least :data:`MIN_API_KEY_LENGTH` long.
+    """
+    for section, key in SECRET_CONFIG_PATHS:
+        old_section = before.get(section)
+        new_section = after.get(section)
+        old = old_section.get(key) if isinstance(old_section, dict) else None
+        new = new_section.get(key) if isinstance(new_section, dict) else None
+        if not isinstance(new, str) or new == old:
+            continue
+        dotted = f"{section}.{key}"
+        if new.strip().startswith(REDACTED_PREFIX):
+            raise ConfigError(
+                f"{dotted} was given its redacted placeholder ('{REDACTED_PREFIX}...') from a "
+                "config dump, not a secret; nothing was saved. Send the real value to change it, "
+                f"null to clear it, or leave {dotted} out of the update to keep the current one "
+                "(dotted keys for the other settings leave it alone; sending the whole "
+                f"'{section}' section back does not).",
+                param=dotted,
+            )
+        if dotted == "server.api_key" and new and len(new.strip()) < MIN_API_KEY_LENGTH:
+            raise ConfigError(
+                f"server.api_key must be at least {MIN_API_KEY_LENGTH} characters "
+                "(nothing was saved). Prefer a scoped key: `studioforge keys create`.",
+                param=dotted,
+            )
+
+
+def refuse_new_exposure(before: Config, after: Config, accounts: Any = None) -> None:
+    """The start-time bind rule, applied to a config edit before it is saved.
+
+    ``studioforge serve`` refuses to start (exit 4) when a listener is reachable
+    from the network and no owner account or admin key exists. An edit that
+    puts a service on the network in that state is refused now, rather than
+    saved into a config that takes the server down at its next restart.
+
+    Only a service that was loopback-only (or disabled) and is now exposed
+    counts, so moving an already-exposed listener, or fixing an unrelated key on
+    an exposed install, is not blocked. ``accounts`` is anything with
+    ``has_admin_credential()`` (the account store, or the watchdog's view of the
+    key snapshot); without one only ``server.api_key`` counts.
+    """
+    was = {service for service, _host in remote_services(before)}
+    newly = [(service, host) for service, host in remote_services(after) if service not in was]
+    if not newly or after.server.api_key:
+        return
+    probe = getattr(accounts, "has_admin_credential", None)
+    if callable(probe) and probe():
+        return
+    services = ", ".join(name for name, _host in newly)
+    hosts = ", ".join(host for _name, host in newly)
+    raise AuthError(
+        f"Refusing this change (nothing was saved): {services} would listen on a non-loopback "
+        f"address ({hosts}) but no owner account or admin API key exists, so the server would "
+        "refuse to start with it. Create the owner account first (`studioforge setup`, or the "
+        "Users & Keys page) or an admin key (`studioforge keys create --name admin --scope "
+        "admin`), then make this change again.",
+        code="auth_required_for_remote_bind",
+        status_code=503,
+        details={"exposed": [{"service": n, "host": h} for n, h in newly]},
+    )
+
+
+#: Sections a running server reads from the shared Config on every use, so
+#: swapping them in place takes effect without a restart. ``mcp`` is here because
+#: ``check_request`` reads pin/pin_required live (it was once missing, and a PATCH
+#: reported "no restart needed" while the old PIN kept being enforced);
+#: ``mcp.path``/``mcp.enabled`` are restart-required -- they decide where the app mounts.
+LIVE_SECTIONS: tuple[str, ...] = (
+    "models",
+    "planner",
+    "gateway",
+    "hf",
+    "logging",
+    "update",
+    "engine",
+    "mcp",
+)
+
+#: ``server.*`` keys read per request. ``behind_proxy`` and ``allowed_hosts``
+#: decide the same-machine admin shortcut on every request; they were saved but
+#: not applied, while the reply said no restart was needed.
+LIVE_SERVER_FIELDS: tuple[str, ...] = (
+    "api_key",
+    "cors_origins",
+    "drain_timeout_s",
+    "request_timeout_s",
+    "behind_proxy",
+    "allowed_hosts",
+)
+
+
+def apply_live(config: Config, updated: Config) -> None:
+    """Copy what can take effect in place from ``updated`` into the running ``config``.
+
+    Every component holds the same Config by reference, which is what makes a
+    change live. One helper for ``PATCH /api/config`` (and the panel, which
+    calls it) and the management MCP ``set_config``, so the two cannot drift.
+    """
+    for section in LIVE_SECTIONS:
+        setattr(config, section, getattr(updated, section))
+    for field in LIVE_SERVER_FIELDS:
+        setattr(config.server, field, getattr(updated.server, field))
+
+
+def apply_overrides(config: Config, updates: dict[str, Any], *, accounts: Any = None) -> Config:
     """Apply dotted-path updates (``"models.default_ctx": 4096``) and validate.
 
     Returns a NEW validated Config; the caller decides whether to persist. Used
     by both the GUI/MCP ``set_config`` and the watchdog's on-disk editor, so
-    validation lives in exactly one place.
+    validation lives in exactly one place -- including the credential rules
+    (:func:`refuse_secret_writes`) and the bind rule (:func:`refuse_new_exposure`,
+    which consults ``accounts`` for an owner account or admin key).
     """
+    before = config.to_yaml_dict()
     data = config.to_yaml_dict()
     for dotted, value in updates.items():
         if dotted.split(".")[0] in Config.UNPERSISTED_KEYS:
@@ -1644,17 +1775,6 @@ def apply_overrides(config: Config, updates: dict[str, Any]) -> Config:
                 f"{dotted} is not stored in config.yaml: the data directory is set by "
                 "SF_DATA_DIR (local-env.bat in the repo root, or the shell/systemd "
                 "environment), see README 'Data directory'",
-                param=dotted,
-            )
-        if (
-            dotted == "server.api_key"
-            and isinstance(value, str)
-            and value
-            and len(value.strip()) < MIN_API_KEY_LENGTH
-        ):
-            raise ConfigError(
-                f"server.api_key must be at least {MIN_API_KEY_LENGTH} characters "
-                "(nothing was saved). Prefer a scoped key: `studioforge keys create`.",
                 param=dotted,
             )
         parts = dotted.split(".")
@@ -1667,6 +1787,7 @@ def apply_overrides(config: Config, updates: dict[str, Any]) -> Config:
         if not isinstance(cursor, dict) or leaf not in cursor:
             raise ConfigError(f"unknown config key: {dotted}")
         cursor[leaf] = value
+    refuse_secret_writes(before, data)
     try:
         # data_dir is not in the dump (never persisted); carry it over or the
         # new object -- and its save() -- lands in the default data directory.
@@ -1675,6 +1796,7 @@ def apply_overrides(config: Config, updates: dict[str, Any]) -> Config:
         raise ConfigError(
             f"invalid config update (nothing was saved): {explain_validation_error(exc)}"
         ) from exc
+    refuse_new_exposure(config, updated, accounts)
     updated.source_path = config.source_path
     _register_secrets(updated)
     return updated

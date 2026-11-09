@@ -21,7 +21,6 @@ from studioforge import __version__
 from studioforge.api.auth import (
     PIN_WITHHELD_NOTE,
     _matches,
-    check_bind_rule,
     is_admin_caller,
     key_owner_of,
     may_reveal_pin,
@@ -31,7 +30,7 @@ from studioforge.api.auth import (
     require_owner,
 )
 from studioforge.build import build_id
-from studioforge.config import RESTART_REQUIRED_KEYS, apply_overrides
+from studioforge.config import RESTART_REQUIRED_KEYS, apply_live, apply_overrides
 from studioforge.core import parallel_bench
 from studioforge.core.attribution import attributed_source, client_of
 from studioforge.core.benchmark import (
@@ -2066,10 +2065,6 @@ async def settings_schema() -> dict[str, Any]:
     return registry.export()
 
 
-#: Config keys that decide which address a service listens on.
-_BIND_HOST_KEYS = ("server.host", "gui.host", "watchdog.host")
-
-
 @router.patch("/config")
 async def set_config(request: Request, updates: dict[str, Any] = Body(...)) -> dict[str, Any]:
     """Apply dotted-path updates, validate, persist, and report restart needs.
@@ -2081,36 +2076,19 @@ async def set_config(request: Request, updates: dict[str, Any] = Body(...)) -> d
     engines -- it does both, and revalidates saved expert flags (D49-5).
     """
     state = _state(request)
-    updated = apply_overrides(state.config, updates)
-    if any(key in updates for key in _BIND_HOST_KEYS):
-        # The next start enforces the bind rule and exits 4 when a network-bound
-        # service has no owner account or admin key; refuse the edit now rather
-        # than save a config that takes the server down at its next restart.
-        check_bind_rule(updated, getattr(state, "accounts", None))
+    # apply_overrides also enforces the bind rule (the next start exits 4 when a
+    # network-bound service has no owner account or admin key, so such an edit is
+    # refused now) and the credential rules, for dotted and section-form updates.
+    updated = apply_overrides(state.config, updates, accounts=getattr(state, "accounts", None))
     updated.save()
     changed = sorted(updates)
     needs_restart = [k for k in changed if k in RESTART_REQUIRED_KEYS]
 
     # Apply live where it is safe to do so: the running config object is shared
     # by reference with every component, so mutating the sub-models in place is
-    # what makes a change take effect without a restart.
-    for section in (
-        "models",
-        "planner",
-        "gateway",
-        "hf",
-        "logging",
-        "update",
-        "engine",
-        # `mcp` was missing, so PATCH {"mcp.pin_required": false} answered
-        # {"updated": [...], "restart_required": []} while check_request kept
-        # reading the OLD mcp config and enforcing the old PIN. The caller was
-        # told a change was live that had not happened. (mcp.path/enabled are
-        # restart-required -- they decide where the app mounts.)
-        "mcp",
-    ):
-        setattr(state.config, section, getattr(updated, section))
-    state.config.server.api_key = updated.server.api_key
+    # what makes a change take effect without a restart. The list of what is
+    # live lives in config.apply_live, shared with the MCP set_config tool.
+    apply_live(state.config, updated)
     if "server.api_key" in updates:
         accounts = getattr(state, "accounts", None)
         if accounts is not None:
@@ -2120,9 +2098,6 @@ async def set_config(request: Request, updates: dict[str, Any] = Body(...)) -> d
     # The panel calls this handler with a stand-in request that has no .state.
     with contextlib.suppress(AttributeError):
         request.state.audit_target = ", ".join(changed)
-    state.config.server.cors_origins = updated.server.cors_origins
-    state.config.server.drain_timeout_s = updated.server.drain_timeout_s
-    state.config.server.request_timeout_s = updated.server.request_timeout_s
 
     log.info("config updated", keys=changed, restart_required=needs_restart)
     return {"updated": changed, "restart_required": needs_restart}

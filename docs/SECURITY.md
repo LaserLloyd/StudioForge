@@ -174,13 +174,19 @@ DNS rebinding and drive-by cross-site pages, which always send an `Origin`.
 With no key and no `server.api_key`, the box-changing routes and the MCP PIN reveal accept a loopback
 caller without a credential. That shortcut needs all of: a loopback peer, no cross-site `Origin`, and
 a `Host` header that names this server (a loopback literal, `localhost`, a host of an explicit
-`server.cors_origins` entry, or an entry of `server.allowed_hosts`). A page on `evil.test` re-pointed
-at 127.0.0.1 sends `Host: evil.test` and is refused. If a reverse proxy or `tailscale serve` forwards
-to the server, set `server.behind_proxy: true`: every proxied client arrives from 127.0.0.1, so the
-shortcut is switched off and each change needs the owner session or an admin key (`studioforge
-doctor` warns about an owner account with no keys). A new `server.api_key` must be at least 16
-characters; config dumps show `redacted:` plus a fixed eight-character fingerprint, never a
-character of the key.
+`server.cors_origins` entry, or an entry of `server.allowed_hosts`: a host, `host:port` or URL,
+where an entry without a port matches any port). A page on `evil.test` re-pointed at 127.0.0.1
+sends `Host: evil.test` and is refused. If a reverse proxy or `tailscale serve` forwards to the
+server, set `server.behind_proxy: true`: every proxied client arrives from 127.0.0.1, so the
+shortcut is switched off. The control panel then asks for the owner's sign-in (once an owner
+account exists) and a change through the API needs an admin key (`studioforge doctor` warns about
+an owner account with no keys). Both settings take effect at once, without a restart, and the
+watchdog applies the same rule before its `/health` shows more than the verdict. A new
+`server.api_key` must be at least 16 characters, whichever surface or form (dotted key or whole
+section) sets it; config dumps show `redacted:` plus a fixed eight-character fingerprint, never a
+character of the key, and sending such a placeholder back is refused rather than saved as the
+secret. An edit that would put a service on the network while no owner account or admin key exists
+is refused the same way the next start would refuse it.
 
 ## MCP
 

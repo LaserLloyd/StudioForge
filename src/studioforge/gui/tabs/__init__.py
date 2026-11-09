@@ -152,15 +152,16 @@ def viewer_actor() -> str:
 def viewer_may_change_box(ctx: GuiContext) -> bool:
     """Whether the current viewer passes the D32 rule.
 
-    When the server requires a credential (``server.api_key``, any API key, or
-    a network bind with an owner account), reaching the panel at all took an
-    admin credential -- the gate refuses anything less -- so being past it *is*
-    the permission, exactly as the API behaves. On an open install only a
-    viewer on this machine may change the box.
+    When the panel requires a sign-in (``server.api_key``, any API key, a
+    network bind with an owner account, or ``server.behind_proxy`` with an owner
+    account -- :func:`~studioforge.api.auth.panel_sign_in_required`), reaching
+    the panel at all took an admin credential -- the gate refuses anything less
+    -- so being past it *is* the permission, exactly as the API behaves. On an
+    open install only a viewer on this machine may change the box.
     """
-    from studioforge.api.auth import auth_enforced
+    from studioforge.api.auth import panel_sign_in_required
 
-    if ctx.config.server.api_key or auth_enforced(
+    if ctx.config.server.api_key or panel_sign_in_required(
         ctx.config, getattr(ctx.api_state, "accounts", None)
     ):
         return True

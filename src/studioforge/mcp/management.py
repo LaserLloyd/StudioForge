@@ -2617,35 +2617,19 @@ def build_management_mcp(state: Any) -> MCPServer:
                 param="updates",
             )
         config: Config = state.config
-        updated = apply_overrides(config, updates)
+        # Same validation as PATCH /api/config, bind rule and credential rules
+        # included (it used to skip the bind rule entirely).
+        updated = apply_overrides(config, updates, accounts=getattr(state, "accounts", None))
         updated.save()
         changed = sorted(updates)
         needs_restart = [key for key in changed if key in RESTART_REQUIRED_KEYS]
 
-        # Mutate the shared config in place for the sections that are safe to
-        # swap live; every component holds the same Config by reference, which
-        # is what makes a change take effect without a restart. Mirrors
-        # mgmt_routes.set_config deliberately -- both surfaces must behave the
-        # same way.
-        for section in (
-            "models",
-            "planner",
-            "gateway",
-            "hf",
-            "logging",
-            "update",
-            "engine",
-            # "mcp" too: pin/pin_required are read live by check_request, and
-            # the HTTP route swaps it (its comment records the incident of a
-            # PATCH that reported "no restart needed" while the old PIN kept
-            # being enforced). This tool claims to mirror that route.
-            "mcp",
-        ):
-            setattr(config, section, getattr(updated, section))
-        config.server.api_key = updated.server.api_key
-        config.server.cors_origins = updated.server.cors_origins
-        config.server.drain_timeout_s = updated.server.drain_timeout_s
-        config.server.request_timeout_s = updated.server.request_timeout_s
+        # Mutate the shared config in place for what is safe to swap live; every
+        # component holds the same Config by reference. One helper with
+        # mgmt_routes.set_config, so both surfaces behave the same way.
+        from studioforge.config import apply_live
+
+        apply_live(config, updated)
 
         log.info("config updated via mcp", keys=changed, restart_required=needs_restart)
         return {

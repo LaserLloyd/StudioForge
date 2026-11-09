@@ -16,7 +16,10 @@ HTTPS front end.
 
 **Auth mirrors the gateway's.** Whenever the server requires a credential
 (:func:`studioforge.api.auth.auth_enforced`: ``server.api_key`` is set, any API
-key exists, or a network bind has an owner account) the panel is gated too. A
+key exists, or a network bind has an owner account) the panel is gated too --
+and also behind a proxy (``server.behind_proxy``) once an owner account exists,
+where loopback trust is off and the owner's sign-in is the only way to change
+the box from the panel (:func:`studioforge.api.auth.panel_sign_in_required`). A
 browser gets a small sign-in page that takes the owner's username and password,
 or an *admin* API key, and exchanges it for a signed cookie; an API client can
 present the same ``Authorization: Bearer`` header the gateway accepts. On an open
@@ -50,7 +53,7 @@ from nicegui import ui
 from starlette.datastructures import Headers
 
 from studioforge import __version__
-from studioforge.api.auth import GUARD, auth_enforced
+from studioforge.api.auth import GUARD, panel_sign_in_required
 from studioforge.authkeys import looks_like_key, scope_at_least
 from studioforge.config import Config
 from studioforge.credential_guard import client_key
@@ -490,7 +493,9 @@ class GuiAuthGate:
             # response-returning middleware: the page, its assets and the
             # polling transport all come out of NiceGUI's mount, below us.
             send = _with_frame_headers(send)
-        if kind not in ("http", "websocket") or not auth_enforced(self.config, self.accounts):
+        if kind not in ("http", "websocket") or not panel_sign_in_required(
+            self.config, self.accounts
+        ):
             await self.app(scope, receive, send)
             return
 
@@ -838,7 +843,7 @@ def _install_auth_routes(app: FastAPI, config: Config, api_state: Any = None) ->
                 _login_html("Refused: the form was not submitted from this page."), status_code=403
             )
         store = accounts()
-        if not auth_enforced(config, store):
+        if not panel_sign_in_required(config, store):
             return RedirectResponse("/", status_code=303)
         client = client_key(request.client.host if request.client else None)
         wait = GUARD.retry_after(client)
@@ -1015,7 +1020,7 @@ def _header(ctx: GuiContext) -> Any:
             _theme_picker()
             _language_switch()
             ui.link("setup guide", SETUP_PATH).classes("text-xs").props('data-i18n="link.setup"')
-            if auth_enforced(ctx.config, getattr(ctx.api_state, "accounts", None)):
+            if panel_sign_in_required(ctx.config, getattr(ctx.api_state, "accounts", None)):
                 ui.link("sign out", LOGOUT_PATH).classes("text-xs").props(
                     'data-i18n="link.signout"'
                 )
@@ -1301,7 +1306,7 @@ def create_gui_app(config: Config, *, api_state: Any) -> FastAPI:
     log.info(
         "gui app created",
         port=config.gui.port,
-        auth=auth_enforced(config, getattr(api_state, "accounts", None)),
+        auth=panel_sign_in_required(config, getattr(api_state, "accounts", None)),
     )
     return app
 

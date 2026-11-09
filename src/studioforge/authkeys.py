@@ -39,16 +39,21 @@ from typing import Any, Literal
 from studioforge.secure_files import write_private
 
 __all__ = [
+    "OWNER_EVER_FILE",
     "SCOPES",
     "SCOPE_LETTER",
     "KeyRecord",
     "Principal",
     "SnapshotVerifier",
+    "cross_site_origin",
     "generate_token",
     "hash_token",
+    "host_names_this_server",
     "is_loopback_host",
     "looks_like_key",
     "origin_allowed",
+    "origin_key",
+    "owner_marker_exists",
     "scope_at_least",
     "snapshot_path",
     "write_snapshot",
@@ -67,6 +72,11 @@ KEY_PREFIX = "sf-"
 
 #: File beside ``config.yaml`` that the watchdog reads (see module docstring).
 SNAPSHOT_NAME = "keys.snapshot.json"
+
+#: Written into the data directory by the account store when an account is created
+#: (or is about to be deleted): "an owner existed here". Defined in this leaf so the
+#: watchdog, which never opens the database, can read the same marker.
+OWNER_EVER_FILE = ".had-owner"
 
 
 def scope_at_least(have: str | None, need: str) -> bool:
@@ -152,6 +162,120 @@ def origin_allowed(origin: str | None, allowed: list[str] | tuple[str, ...] = ()
     except ValueError:
         return False
     return parts.scheme in {"http", "https"} and is_loopback_host(host)
+
+
+# ---------------------------------------------------------------------------
+# "Is this request addressed to this server?" (DNS rebinding), for every surface
+# ---------------------------------------------------------------------------
+
+_DEFAULT_PORTS = {"http": 80, "https": 443, "ws": 80, "wss": 443}
+
+
+def origin_key(value: str | None, scheme: str = "http") -> tuple[str, int] | None:
+    """``(hostname, port)`` for an origin or a ``Host`` header, defaults filled in.
+
+    Both are parsed with ``urlsplit`` so IPv6 brackets, case and an implicit
+    port are handled one way. ``None`` means unparseable, which callers treat
+    as foreign.
+    """
+    from urllib.parse import urlsplit
+
+    text = (value or "").strip()
+    if not text:
+        return None
+    try:
+        parts = urlsplit(text if "//" in text else "//" + text)
+        hostname = (parts.hostname or "").lower()
+        port = parts.port
+    except ValueError:
+        return None
+    if not hostname:
+        return None
+    if port is None:
+        port = _DEFAULT_PORTS.get((parts.scheme or scheme or "http").lower(), 80)
+    return hostname, port
+
+
+def _explicit_port(entry: str) -> int | None:
+    """The port an ``allowed_hosts`` entry spells out, or ``None`` for "any port".
+
+    Read with ``urlsplit`` rather than by looking for a colon: ``http://box.lan``
+    has one (the scheme's) and no port, and treating it as port 80 made the entry
+    match nothing on a server listening anywhere else.
+    """
+    from urllib.parse import urlsplit
+
+    text = entry.strip()
+    try:
+        return urlsplit(text if "//" in text else "//" + text).port
+    except ValueError:
+        return None
+
+
+def host_names_this_server(
+    raw_host: str | None,
+    *,
+    allowed_hosts: list[str] | tuple[str, ...] = (),
+    cors_origins: list[str] | tuple[str, ...] = (),
+) -> bool:
+    """Whether a ``Host`` header names this server, not an attacker's domain.
+
+    DNS rebinding: a page on ``evil.test`` whose name is re-pointed at 127.0.0.1
+    reaches this server from a loopback peer, and only the ``Host`` it must send
+    gives it away. Accepted: no ``Host`` at all (HTTP/1.0, an in-process call), a
+    loopback literal or ``localhost`` (any port), the host of an explicit
+    ``server.cors_origins`` entry, or an ``allowed_hosts`` entry (``host``,
+    ``host:port`` or a URL; without a port it matches any port).
+    """
+    if not raw_host or not raw_host.strip():
+        return True
+    key = origin_key(raw_host, "http")
+    if key is None:
+        return False
+    hostname, port = key
+    if is_loopback_host(hostname):
+        return True
+    for entry in list(allowed_hosts or []):
+        entry_key = origin_key(str(entry), "http")
+        if entry_key is None or entry_key[0] != hostname:
+            continue
+        wanted = _explicit_port(str(entry))
+        if wanted is None or wanted == port:
+            return True
+    for origin in list(cors_origins or []):
+        text = str(origin).strip()
+        if not text or text == "*":
+            continue
+        cors_key = origin_key(text, "http")
+        if cors_key is not None and cors_key[0] == hostname:
+            return True
+    return False
+
+
+def cross_site_origin(origin: str | None, host: str | None, scheme: str = "http") -> bool:
+    """True for a browser request whose ``Origin`` is not the origin it was sent to.
+
+    Host *and* port are compared: a page served by another local web app is a
+    loopback peer too, and it is not this server. No ``Origin`` (a non-browser
+    client) or no ``Host`` passes; ``Origin: null`` is foreign.
+    """
+    if not origin or not host:
+        return False
+    if origin.strip().lower() == "null":
+        return True
+    origin_parts = origin_key(origin, scheme)
+    host_parts = origin_key(host, scheme)
+    if origin_parts is None or host_parts is None:
+        return True
+    return origin_parts != host_parts
+
+
+def owner_marker_exists(data_dir: Path | Any) -> bool:
+    """Whether an owner account was ever created in ``data_dir`` (:data:`OWNER_EVER_FILE`)."""
+    try:
+        return (Path(data_dir) / OWNER_EVER_FILE).is_file()
+    except (OSError, TypeError, ValueError):
+        return False
 
 
 @dataclass(frozen=True)

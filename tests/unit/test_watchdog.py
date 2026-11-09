@@ -617,7 +617,10 @@ async def test_plain_health_endpoint_reports_wedged_without_an_mcp_handshake(
     asgi, _server = create_asgi_app(watchdog)
 
     transport = httpx.ASGITransport(app=asgi)
-    async with httpx.AsyncClient(transport=transport, base_url="http://watchdog") as client:
+    # The poller on this machine addresses the watchdog by a loopback name; the
+    # full verdict follows the gateway's "this machine" rule, Host included.
+    base = "http://127.0.0.1:1235"
+    async with httpx.AsyncClient(transport=transport, base_url=base) as client:
         response = await client.get("/health")
     assert response.status_code == 503
     body = response.json()

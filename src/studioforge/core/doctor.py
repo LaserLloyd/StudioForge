@@ -532,8 +532,9 @@ def _check_auth(report: DoctorReport, config: Config, accounts: Any) -> None:
             "If a reverse proxy or `tailscale serve` forwards to it, every proxied client "
             "arrives from 127.0.0.1 and gets that trust too.",
             "Set server.behind_proxy to true when something forwards to this server (loopback "
-            "trust is then off and every change needs the owner session or an admin key), or "
-            "create an admin key (`studioforge keys create --scope admin`).",
+            "trust is then off: the control panel asks for the owner's sign-in, and a change "
+            "through the API needs an admin key), or create an admin key "
+            "(`studioforge keys create --scope admin`).",
         )
     if config.server.behind_proxy and not has_admin:
         report.add(

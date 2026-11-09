@@ -427,6 +427,9 @@ def test_live_find_libraries_reports_configured_and_lm_studio(tmp_path: Path, ho
 def test_live_exposure_edits_the_config_and_local_reverts_it(tmp_path: Path) -> None:
     config = scratch_config(tmp_path)
     live = LiveServices(config)
+    # The wizard's account step comes first: a network bind with no owner account
+    # or admin key is refused (the server would not start with it).
+    live.create_owner("owner", "a-long-enough-password")
     result = live.apply_exposure("lan")
     assert result["restart_required"] is True
     saved = load_config(tmp_path / "data" / "config.yaml")

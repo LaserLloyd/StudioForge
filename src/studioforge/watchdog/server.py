@@ -79,12 +79,21 @@ import yaml
 from mcp.server.mcpserver import MCPServer
 
 from studioforge.auditlog import AuditLog
-from studioforge.authkeys import LOCAL_ADMIN, Principal, SnapshotVerifier, origin_allowed
+from studioforge.authkeys import (
+    LOCAL_ADMIN,
+    Principal,
+    SnapshotVerifier,
+    cross_site_origin,
+    host_names_this_server,
+    origin_allowed,
+    owner_marker_exists,
+)
 from studioforge.config import (
     RESTART_REQUIRED_KEYS,
     Config,
     apply_overrides,
     find_config_path,
+    refuse_secret_writes,
     resolve_data_dir,
 )
 from studioforge.credential_guard import CredentialGuard, client_key
@@ -2008,6 +2017,20 @@ class _Access:
     def origins(self) -> list[str]:
         return list(self.config().server.cors_origins)
 
+    def has_admin_credential(self) -> bool:
+        """The bind rule's "an owner account or admin key exists", as far as this process can see.
+
+        Used by ``set_config`` (through ``apply_overrides``) before it saves an edit
+        that puts a service on the network. The watchdog never opens the database,
+        so: an active admin key in ``keys.snapshot.json``, or the account store's
+        marker that an owner account was created here. The marker means "ever",
+        not "now" -- after the last account is deleted such an edit is still saved,
+        and the server's own start-time check, which does see the accounts, refuses
+        to start as it always did.
+        """
+        data_dir = resolve_data_dir(self.watchdog.config_path, explicit=True)
+        return self.verifier().has_admin() or owner_marker_exists(data_dir)
+
     def enforced(self, api_key: str | None, pin: str | None) -> bool:
         return bool(api_key or pin or self.verifier().has_keys())
 
@@ -2145,16 +2168,23 @@ def build_watchdog_mcp(watchdog: Watchdog, access: _Access | None = None) -> MCP
         try:
             if base_error is None:
                 # Normal path: one validation implementation, shared with the
-                # main app's own set_config.
-                updated = apply_overrides(base, updates)
+                # main app's own set_config -- the credential rules and the bind
+                # rule included (``access`` answers the bind rule's question from
+                # the key snapshot, since this process never opens the database).
+                updated = apply_overrides(base, updates, accounts=access)
             else:
                 # Recovery path: the file on disk does not validate, so there is
                 # no valid base Config to layer onto. Merge into the RAW mapping
                 # instead -- checking each key against the schema's shape -- so
-                # the operator's other settings survive being fixed.
+                # the operator's other settings survive being fixed. The
+                # credential rules still apply; the bind rule does not (there is
+                # no valid "before" to compare exposure against, and the server's
+                # own start-time check still refuses an exposed, credential-less
+                # config).
                 raw, _ = watchdog.read_raw_config()
                 raw = {k: v for k, v in raw.items() if k != "data_dir"}
                 merged = _set_dotted(raw, updates, reference=Config().to_yaml_dict())
+                refuse_secret_writes(raw, merged)
                 updated = Config(
                     data_dir=resolve_data_dir(watchdog.config_path, explicit=True), **merged
                 )
@@ -2481,6 +2511,16 @@ def wrap_asgi(
     Without it the wrapper behaves as it always did.
     """
 
+    def _server_settings() -> Any:
+        """The ``server`` section, re-read per request like every watchdog setting."""
+        try:
+            if access is not None:
+                return access.config().server
+            loader = getattr(watchdog, "load_config", None)
+            return loader()[0].server if callable(loader) else None
+        except Exception:  # noqa: BLE001 - unreadable config: the defaults' rules apply
+            return None
+
     def _audit(
         action: str, *, actor: str, result: str, scope: dict[str, Any], detail: str = ""
     ) -> None:
@@ -2518,7 +2558,11 @@ def wrap_asgi(
             # anyone who could reach 0.0.0.0:1235 with no credential at all.
             # Liveness stays open, because that is what /health is for; the
             # detail now takes the same proof every other route here takes.
-            if not local_peer and not _credential_ok(scope, expected_key, expected_pin, verifier):
+            # "On this machine" is the gateway's rule, not just a loopback peer:
+            # behind a proxy every client is a loopback peer, and a rebinding
+            # page is one whose Host is not this server's.
+            trusted = local_peer and _trusted_local(scope, _server_settings())
+            if not trusted and not _credential_ok(scope, expected_key, expected_pin, verifier):
                 result = _public_health(result)
             await _send_json(send, status, result)
             return
@@ -2819,6 +2863,31 @@ def _peer_is_loopback(scope: dict[str, Any]) -> bool:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return False
+
+
+def _trusted_local(scope: dict[str, Any], server: Any) -> bool:
+    """The gateway's "caller on this machine" test, for a loopback peer here.
+
+    Mirrors ``studioforge.api.auth.trusted_local_request``: an in-process call
+    (no peer) is trusted; otherwise not when ``server.behind_proxy`` is on (the
+    loopback peer is the proxy, standing for any client), and only when the
+    ``Host`` names this server (a DNS-rebinding page's does not) and any
+    ``Origin`` is that same origin. The rule itself is shared through
+    :mod:`studioforge.authkeys`, so the two cannot disagree.
+    """
+    if not _peer_host(scope):
+        return True
+    if bool(getattr(server, "behind_proxy", False)) or not _peer_is_loopback(scope):
+        return False
+    host = _scope_header(scope, b"host")
+    if not host_names_this_server(
+        host,
+        allowed_hosts=list(getattr(server, "allowed_hosts", None) or []),
+        cors_origins=list(getattr(server, "cors_origins", None) or []),
+    ):
+        return False
+    scheme = str(scope.get("scheme") or "http")
+    return not cross_site_origin(_scope_header(scope, b"origin"), host, scheme)
 
 
 def _credential_ok(

@@ -560,7 +560,9 @@ class LiveServices:
     def _save_config(self, updates: dict[str, Any]) -> None:
         from studioforge.config import apply_overrides
 
-        updated = apply_overrides(self.config, updates)
+        # accounts=self: the bind rule asks has_admin_credential() only when the
+        # edit puts a service on the network, so the database is opened only then.
+        updated = apply_overrides(self.config, updates, accounts=self)
         updated.save()
         self.config = updated
         if self._client is not None:
@@ -572,6 +574,14 @@ class LiveServices:
         db, store = self._store()
         try:
             return bool(store.has_owner())
+        finally:
+            db.close()
+
+    def has_admin_credential(self) -> bool:
+        """An owner account or an active admin key exists (the bind rule's test)."""
+        db, store = self._store()
+        try:
+            return bool(store.has_admin_credential())
         finally:
             db.close()
 
