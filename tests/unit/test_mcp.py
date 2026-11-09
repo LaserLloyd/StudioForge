@@ -2145,6 +2145,8 @@ class FakeEngineUpdates:
         self.calls: list[tuple[Any, ...]] = []
         self.smoke_ok = True
         self.recommended_variant = recommended_variant
+        #: What the asset probe finds for an explicit tag (None = nothing prebuilt fits).
+        self.prebuilt: str | None = "cuda-13.4"
 
     def _info(self, tag: str, variant: str) -> EngineInfo:
         return EngineInfo(
@@ -2169,6 +2171,12 @@ class FakeEngineUpdates:
             "update_recommended": True,
             "filter_summary": "checked 5 releases",
         }
+
+    async def prebuilt_variant(self, tag: str) -> tuple[str | None, str | None]:
+        self.calls.append(("probe", tag))
+        if self.prebuilt is None:
+            return None, "no asset for win/x64 is compatible with this driver"
+        return self.prebuilt, None
 
     async def install(self, tag: str, *, force: bool = False, activate: bool = False) -> EngineInfo:
         self.calls.append(("install", tag, activate))
@@ -2265,3 +2273,54 @@ async def test_update_engine_refuses_a_source_build(state: State, tmp_path: Path
     result = await call(build_management_mcp(state), "update_engine", confirm=True)
     assert result["ok"] is False and "source" in result["error"]["message"]
     assert fake.calls == []
+
+
+async def test_an_explicit_tag_with_no_prebuilt_asset_is_refused_before_install(
+    state: State, engines: FakeEngineUpdates
+) -> None:
+    """install() would fall back to a git clone + cmake build; the probe stops it first."""
+    engines.prebuilt = None
+    result = await call(
+        build_management_mcp(state), "update_engine", tag="b11800", activate=True, confirm=True
+    )
+    assert result["ok"] is False and result["error"]["param"] == "tag"
+    assert "no prebuilt asset" in result["error"]["message"]
+    assert engines.calls == [("probe", "b11800")]  # never installed, smoke-tested or activated
+    assert state.config.engine.pinned_tag != "b11800"
+
+
+async def test_an_install_that_resolves_to_a_source_build_is_never_activated(
+    state: State, engines: FakeEngineUpdates
+) -> None:
+    """A source build is variant ``source-local`` under ``<tag>-local``, not ``source``."""
+
+    async def source_install(
+        tag: str, *, force: bool = False, activate: bool = False
+    ) -> EngineInfo:
+        engines.calls.append(("install", tag, activate))
+        return engines._info(f"{tag}-local", "source-local")
+
+    engines.install = source_install  # type: ignore[method-assign]
+    pinned_before = state.config.engine.pinned_tag
+    result = await call(
+        build_management_mcp(state), "update_engine", tag="b11800", activate=True, confirm=True
+    )
+    assert result["ok"] is False and "b11800-local" in result["error"]["message"]
+    assert [c[0] for c in engines.calls] == ["probe", "install"]
+    assert state.config.engine.pinned_tag == pinned_before
+
+
+async def test_a_prebuilt_build_already_on_disk_is_reinstalled_without_a_probe(
+    state: State, engines: FakeEngineUpdates
+) -> None:
+    """The documented undo (update_engine(tag=<previous>)) must not need GitHub."""
+    engines.prebuilt = None  # would refuse, if it were asked
+    result = await call(
+        build_management_mcp(state), "update_engine", tag="b10425", activate=True, confirm=True
+    )
+    assert result["ok"] is True and result["activated"] is True
+    assert engines.calls == [
+        ("install", "b10425", False),
+        ("smoke", "b10425"),
+        ("activate", "b10425"),
+    ]

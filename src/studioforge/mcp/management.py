@@ -404,6 +404,11 @@ def _needs_confirmation(what: str, consequence: str) -> dict[str, Any]:
     }
 
 
+def _is_source_build(variant: Any) -> bool:
+    """``source`` (check_update's verdict) or ``source-local`` (an installed build)."""
+    return isinstance(variant, str) and variant.startswith("source")
+
+
 # ---------------------------------------------------------------------------
 # Projections (kept small on purpose -- see the module docstring)
 # ---------------------------------------------------------------------------
@@ -2757,6 +2762,8 @@ def build_management_mcp(state: Any) -> MCPServer:
         manager = state.engine_manager
         before = manager.active()
         previous = before.tag if before else None
+        # check_update's verdict already probed the recommended tag's assets.
+        probed = False
         if tag is None:
             verdict = await manager.check_update()
             tag = verdict.get("recommended_tag")
@@ -2767,20 +2774,42 @@ def build_management_mcp(state: Any) -> MCPServer:
                     + " -- pass tag explicitly (see check_updates)",
                     param="tag",
                 )
-            if verdict.get("recommended_variant") == "source":
+            if _is_source_build(verdict.get("recommended_variant")):
                 raise BadRequestError(
                     f"{tag} has no prebuilt asset for this box; building llama.cpp from "
                     "source is not offered over MCP",
                     param="tag",
                 )
+            probed = True
         if not re.fullmatch(r"b\d+", str(tag)):
             raise BadRequestError("tag must be an upstream build tag like b11718", param="tag")
+        # install() falls back to a git clone + full cmake build when no prebuilt
+        # archive fits this box, so an explicit tag is probed first. A prebuilt
+        # build already on disk needs no probe (install() reuses it), which
+        # keeps the documented undo working without GitHub.
+        on_disk = any(
+            info.tag == tag and not _is_source_build(info.variant) for info in manager.installed()
+        )
+        if not (probed or on_disk):
+            prebuilt, why = await manager.prebuilt_variant(tag)
+            if prebuilt is None:
+                raise BadRequestError(
+                    f"{tag} has no prebuilt asset for this box ({why or 'no installable asset'}); "
+                    "building llama.cpp from source is not offered over MCP",
+                    param="tag",
+                )
         info = await manager.install(tag, activate=False)
         variant = getattr(info, "variant", None)
-        if variant == "source":
+        # A source build is variant "source-local" in engines/<tag>-local/, so the
+        # tag the build actually lives under is info.tag, not the one asked for.
+        installed_tag = getattr(info, "tag", None) or tag
+        if _is_source_build(variant):
             raise BadRequestError(
-                f"{tag} was built from source; MCP installs only prebuilt builds", param="tag"
+                f"{tag} resolved to a build from source ({installed_tag}); MCP installs and "
+                "activates only prebuilt builds, so nothing was activated",
+                param="tag",
             )
+        tag = installed_tag
         ok, smoke_result, detail = await manager.smoke_check(tag)
         result: dict[str, Any] = {
             "ok": True,

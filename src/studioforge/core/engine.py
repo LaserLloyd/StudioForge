@@ -2448,6 +2448,19 @@ class EngineManager:
             )
         return {"version": version, "tag": tag, "published_at": payload.get("published_at")}
 
+    async def prebuilt_variant(self, tag: str) -> tuple[str | None, str | None]:
+        """``(variant, reason)``: the prebuilt asset :meth:`install` would pick for ``tag``.
+
+        ``variant`` is ``None`` when no prebuilt archive fits this box (or the
+        release could not be read), with ``reason`` saying why -- the case in
+        which :meth:`install` falls back to :meth:`build_from_source`. The same
+        probe :meth:`check_update` runs per tag: one GitHub call, no download.
+        """
+        variant, reason, _missing = await self._installable_variant(
+            tag, gpus=self._gpus(), driver=self._cuda_driver_version()
+        )
+        return variant, reason
+
     async def _installable_variant(
         self, tag: str, *, gpus: Sequence[GpuInfo], driver: tuple[int, int] | None
     ) -> tuple[str | None, str | None, bool]:

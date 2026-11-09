@@ -2128,6 +2128,24 @@ async def test_check_update_offers_a_source_build_when_no_asset_fits(tmp_config:
 
 
 @pytest.mark.asyncio
+async def test_prebuilt_variant_names_the_asset_or_says_why_there_is_none(
+    tmp_config: Config,
+) -> None:
+    """The probe update_engine runs before install(): no download, no source build."""
+    tmp_config.engine.allow_source_build = True
+    fits = _github_manager(tmp_config, RELEASES_2026_08_18)
+    variant, reason = await fits.prebuilt_variant("b10488")
+    assert variant is not None and variant.startswith("cuda-") and reason is None
+
+    too_old = _github_manager(tmp_config, RELEASES_2026_08_18, cuda=(12, 0))
+    variant, reason = await too_old.prebuilt_variant("b10488")
+    assert variant is None and reason is not None and "CUDA 12.0" in reason
+
+    variant, reason = await fits.prebuilt_variant("b1")  # no such release upstream
+    assert variant is None and reason is not None and "does not exist" in reason
+
+
+@pytest.mark.asyncio
 async def test_check_update_offers_nothing_when_source_build_is_disabled(
     tmp_config: Config,
 ) -> None:
