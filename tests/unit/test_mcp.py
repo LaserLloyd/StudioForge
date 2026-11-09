@@ -20,6 +20,7 @@ import json
 import os
 from collections.abc import Iterator, Sequence
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -2127,6 +2128,28 @@ async def test_set_model_template_refuses_bad_calls(
     result = await call(server, "set_model_template", model_id=TINY, **arguments)
     assert result["ok"] is False
     assert result["error"]["param"] == param
+    record = state.registry.resolve(TINY)
+    assert record is not None and record.settings == ModelSettings()
+
+
+async def test_a_refused_template_save_leaves_no_file_behind(state: State) -> None:
+    """The override is written only after every check: reasoning_format, benchmarking."""
+    server = build_management_mcp(state)
+    folder = state.config.data_dir / "templates"
+    text = "{% for m in messages %}{{ m.content }}{% endfor %}"
+
+    bad_format = await call(
+        server, "set_model_template", model_id=TINY, template=text, reasoning_format="auto"
+    )
+    assert bad_format["ok"] is False and bad_format["error"]["param"] == "reasoning_format"
+
+    record = state.registry.resolve(TINY)
+    assert record is not None
+    state.benchmarker = SimpleNamespace(benchmarking=record.id)  # type: ignore[attr-defined]
+    busy = await call(server, "set_model_template", model_id=TINY, template=text)
+    assert busy["ok"] is False and busy["error"]["code"] == "model_benchmarking"
+
+    assert not folder.exists() or not list(folder.iterdir())  # noqa: ASYNC240 - tmp dir
     record = state.registry.resolve(TINY)
     assert record is not None and record.settings == ModelSettings()
 

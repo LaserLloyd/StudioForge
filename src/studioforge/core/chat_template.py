@@ -16,6 +16,7 @@ override applies from the model's next load.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import re
 from dataclasses import dataclass
@@ -29,6 +30,7 @@ __all__ = [
     "TemplateSource",
     "diagnose",
     "effective_template",
+    "override_path",
     "save_override",
     "validate_template_text",
 ]
@@ -153,10 +155,42 @@ def validate_template_text(text: Any) -> str:
     except ImportError:  # pragma: no cover - jinja2 ships with the GUI stack
         return text
     try:
-        jinja2.Environment().parse(text)
+        _syntax_environment().parse(text)
     except jinja2.TemplateSyntaxError as exc:
         raise ValueError(f"template does not parse: line {exc.lineno}: {exc.message}") from exc
     return text
+
+
+@functools.cache
+def _syntax_environment() -> Any:
+    """A Jinja environment that parses what Hugging Face chat templates may use.
+
+    transformers renders chat templates with ``jinja2.ext.loopcontrols``
+    (``{% break %}`` / ``{% continue %}``) and its own
+    ``{% generation %}...{% endgeneration %}`` block, which marks the
+    assistant's tokens for training masks and renders its body unchanged. A
+    bare ``Environment`` rejects all three as unknown tags, so a real
+    template would be refused here. The generation block is parsed as its
+    body: this environment only checks syntax, it never renders.
+    """
+    import jinja2  # noqa: PLC0415 - see validate_template_text
+    from jinja2.ext import Extension, loopcontrols  # noqa: PLC0415
+
+    class GenerationBlock(Extension):
+        tags = {"generation"}
+
+        def parse(self, parser: Any) -> Any:
+            next(parser.stream)  # the "generation" name
+            return parser.parse_statements(("name:endgeneration",), drop_needle=True)
+
+    return jinja2.Environment(extensions=[loopcontrols, GenerationBlock])
+
+
+def override_path(data_dir: Path, model_id: str, text: str) -> Path:
+    """Where :func:`save_override` writes ``text`` for ``model_id``; touches nothing."""
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", model_id).strip("._")[:120] or "model"
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:8]
+    return Path(data_dir) / "templates" / f"{slug}-{digest}.jinja"
 
 
 def save_override(data_dir: Path, model_id: str, text: str) -> Path:
@@ -164,13 +198,12 @@ def save_override(data_dir: Path, model_id: str, text: str) -> Path:
 
     Content-addressed, so saving the same text twice is one file, and an older
     override is never overwritten in place (a load that is reading it keeps a
-    consistent file; the previous text stays on disk to go back to).
+    consistent file; the previous text stays on disk to go back to). Callers
+    that still have checks to run use :func:`override_path` first and write
+    only once every check passed, so a refused save leaves no file behind.
     """
-    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", model_id).strip("._")[:120] or "model"
-    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:8]
-    folder = Path(data_dir) / "templates"
-    folder.mkdir(parents=True, exist_ok=True)
-    path = folder / f"{slug}-{digest}.jinja"
+    path = override_path(data_dir, model_id, text)
+    path.parent.mkdir(parents=True, exist_ok=True)
     if not path.exists():
         tmp = path.with_suffix(".jinja.tmp")
         tmp.write_text(text, encoding="utf-8", newline="")

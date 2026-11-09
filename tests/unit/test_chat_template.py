@@ -10,6 +10,7 @@ from studioforge.core.chat_template import (
     MAX_TEMPLATE_BYTES,
     diagnose,
     effective_template,
+    override_path,
     save_override,
     validate_template_text,
 )
@@ -92,6 +93,50 @@ def test_validate_accepts_the_engine_dialect_it_cannot_run() -> None:
     """Parse only: raise_exception and other engine globals are fine at save time."""
     text = "{% if not messages %}{{ raise_exception('no messages') }}{% endif %}{{ messages }}"
     assert validate_template_text(text) == text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param(
+            "{% for m in messages %}{{ m.content }}"
+            "{% if loop.index > 3 %}{% break %}{% endif %}{% endfor %}",
+            id="break",
+        ),
+        pytest.param(
+            "{% for m in messages %}{% if m.role == 'tool' %}{% continue %}{% endif %}"
+            "{{ m.content }}{% endfor %}",
+            id="continue",
+        ),
+        pytest.param(
+            "{% for m in messages %}{% if m.role == 'assistant' %}{% generation %}"
+            "{{ m.content }}{% endgeneration %}{% else %}{{ m.content }}{% endif %}{% endfor %}",
+            id="generation",
+        ),
+    ],
+)
+def test_validate_accepts_what_hugging_face_templates_use(text: str) -> None:
+    """transformers renders with loopcontrols and its own {% generation %} block."""
+    assert validate_template_text(text) == text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param("{% for m in messages %}{% generation %}{{ m }}{% endfor %}", id="unclosed"),
+        pytest.param("{{ messages }}{% endgeneration %}", id="stray-end"),
+        pytest.param("{{ messages }}{% frobnicate %}", id="unknown-tag"),
+    ],
+)
+def test_validate_still_refuses_broken_blocks(text: str) -> None:
+    with pytest.raises(ValueError, match="does not parse"):
+        validate_template_text(text)
+
+
+def test_override_path_is_where_save_override_writes(tmp_path: Path) -> None:
+    planned = override_path(tmp_path, "vendor/Model-GGUF/Model-Q4_K_M", "{{ messages }}")
+    assert not planned.exists() and not (tmp_path / "templates").exists()  # touches nothing
+    assert save_override(tmp_path, "vendor/Model-GGUF/Model-Q4_K_M", "{{ messages }}") == planned
 
 
 def test_save_override_is_content_addressed(tmp_path: Path) -> None:

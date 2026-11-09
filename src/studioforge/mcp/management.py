@@ -78,6 +78,7 @@ from studioforge.core import parallel_bench, throughput
 from studioforge.core.chat_template import (
     diagnose,
     effective_template,
+    override_path,
     save_override,
     validate_template_text,
 )
@@ -1737,13 +1738,17 @@ def build_management_mcp(state: Any) -> MCPServer:
         if template is not None and reset:
             raise BadRequestError("pass either template or reset=true, not both", param="reset")
         updates: dict[str, Any] = {}
+        # Written only once every check below has passed: a refused call must
+        # not leave a stray override file in <data_dir>/templates/.
+        override_text: str | None = None
         if template is not None:
             try:
-                text = validate_template_text(template)
+                override_text = validate_template_text(template)
             except ValueError as exc:
                 raise BadRequestError(str(exc), param="template") from exc
-            path = await run_in_threadpool(save_override, state.config.data_dir, record.id, text)
-            updates["chat_template_file"] = str(path)
+            updates["chat_template_file"] = str(
+                override_path(state.config.data_dir, record.id, override_text)
+            )
         elif reset:
             updates["chat_template_file"] = None
         if reasoning_format is not None:
@@ -1775,6 +1780,8 @@ def build_management_mcp(state: Any) -> MCPServer:
             )
         except Exception as exc:
             raise BadRequestError(f"invalid settings: {exc}") from exc
+        if override_text is not None:
+            await run_in_threadpool(save_override, state.config.data_dir, record.id, override_text)
         updated = state.registry.save_settings(record.id, settings)
         log.info(
             "chat template settings changed via mcp", model_id=updated.id, fields=sorted(updates)
