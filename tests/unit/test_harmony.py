@@ -172,6 +172,43 @@ def test_a_constrained_final_channel() -> None:
     assert split_harmony(text) == ("Implemented the fixes.", "")
 
 
+def test_a_reply_glued_to_the_role_with_no_message_token_is_kept() -> None:
+    """The turn-4 shape at its barest: ``<|start|>assistant`` then the reply, nothing else."""
+    assert split_harmony("Mina turned.<|end|><|start|>assistantMina nodded.") == (
+        "Mina turned.\n\nMina nodded.",
+        "",
+    )
+    assert split_harmony("<|start|>assistant Mina nodded.<|end|>") == ("Mina nodded.", "")
+    # ...but a role that names a recipient is still a tool call, not a reply.
+    assert split_harmony('<|start|>assistant to=functions.f {"a":1}') == ("", "")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Harmony uses <|start|>, <|channel|>, <|message|> and <|end|> tokens.",
+        "Example:\n```\n<|start|>assistant<|channel|>final<|message|>Hi<|end|>\n```\nThat's it.",
+        "Each turn ends with <|end|> and the last one with <|return|>.",
+        "Use the <|end|> token to stop.",
+        "The header is <|channel|>, then a name.",
+        "A body starts after <|message|>.",
+        "<|start|> opens a message.",
+    ],
+)
+def test_prose_that_names_the_tokens_is_left_alone(text: str) -> None:
+    assert split_harmony(text) is None
+    messages = [{"role": "assistant", "content": text}]
+    fixed, repaired = repair_history(messages)
+    assert repaired == 0 and fixed is messages
+
+
+def test_terminated_replies_still_count_as_structure() -> None:
+    assert split_harmony("Done.<|end|>") == ("Done.", "")
+    assert split_harmony("Done.<|end|>\n") == ("Done.", "")
+    # text after a header-opened body needs no header of its own: the none-format shape
+    assert split_harmony("<|channel|>final<|message|>A.<|end|> B.") == ("A.\n\nB.", "")
+
+
 # ---------------------------------------------------------------------------
 # repair_history
 # ---------------------------------------------------------------------------

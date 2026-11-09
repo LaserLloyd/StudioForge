@@ -105,24 +105,44 @@ def effective_reasoning_format(
     return default, "default"
 
 
+#: What may follow ``<|start|>``: a role (``functions.NAME`` is a tool's reply).
+#: No word boundary after it: the broken turn-4 shape is ``<|start|>assistantMina
+#: nodded.``, the reply glued to the role.
+_ROLE_RE = re.compile(r"\s*(?:assistant|user|system|developer|tool|functions\.[\w.-]+)")
+#: What may follow ``<|channel|>``: one of harmony's three channels.
+_CHANNEL_RE = re.compile(r"\s*(?:analysis|commentary|final)\b")
+
+
 def split_harmony(text: str) -> tuple[str, str] | None:
     """Split text that carries harmony markup into ``(answer, analysis)``.
 
-    ``None`` when the text has no harmony control token (leave it alone). Text
-    that is not under any header -- including text after an ``<|end|>`` with no
-    new header, the exact shape ``--reasoning-format none`` produces -- counts
-    as the answer. ``analysis`` bodies are the chain of thought; ``final`` and
-    a recipient-less ``commentary`` (a preamble, which llama.cpp also returns
-    as content) are the answer; a body addressed to a recipient (``to=...``, a
-    tool call) is dropped, since the message's ``tool_calls`` carry it.
+    ``None`` when there is nothing to repair: no harmony control token, or
+    tokens that do not form harmony structure -- prose or a code sample that
+    merely *names* ``<|start|>`` or ``<|end|>`` is left exactly as written.
+    Structure means: a header (``<|start|>`` + a role, or ``<|channel|>`` + a
+    channel name) opens only where a message can begin (the start of the text
+    or right after ``<|end|>`` / ``<|return|>`` / ``<|call|>``); ``<|message|>``
+    and ``<|constrain|>`` only inside a header; and a terminator that ends text
+    no header opened is followed by the next header or by nothing.
+
+    Text that is not under any header -- including text after an ``<|end|>``
+    with no new header, the exact shape ``--reasoning-format none`` produces,
+    and a reply written straight after ``<|start|>assistant`` with no
+    ``<|message|>`` -- counts as the answer. ``analysis`` bodies are the chain
+    of thought; ``final`` and a recipient-less ``commentary`` (a preamble,
+    which llama.cpp also returns as content) are the answer; a body addressed
+    to a recipient (``to=...``, a tool call) is dropped, since the message's
+    ``tool_calls`` carry it.
     """
-    if not HARMONY_CONTROL_RE.search(text):
+    matches = list(HARMONY_CONTROL_RE.finditer(text))
+    if not matches:
         return None
     answer: list[str] = []
     analysis: list[str] = []
     state = "body"  # body | role | channel | constrain
     channel = "final"
     recipient = False
+    headed = False  # the current body was opened by a header's <|message|>
     pos = 0
 
     def flush(chunk: str) -> None:
@@ -130,30 +150,57 @@ def split_harmony(text: str) -> tuple[str, str] | None:
             return
         (analysis if channel == "analysis" else answer).append(chunk)
 
-    for match in HARMONY_CONTROL_RE.finditer(text):
+    def flush_role(chunk: str) -> None:
+        # A role with no <|message|> after it: whatever follows the role word is
+        # the reply (the turn-4 shape), unless the header named a recipient.
+        if " to=" not in f" {chunk}":
+            role = _ROLE_RE.match(chunk)
+            flush(chunk[role.end() :] if role else chunk)
+
+    for i, match in enumerate(matches):
         chunk = text[pos : match.start()]
         token = match.group(1)
         pos = match.end()
-        if state == "body":
-            flush(chunk)
-        elif state in ("role", "channel") and " to=" in f" {chunk}":
-            recipient = True
-        if token == "start":
-            state, channel, recipient = "role", "final", False
-        elif token == "channel":
+        following = text[pos : matches[i + 1].start() if i + 1 < len(matches) else len(text)]
+        if token in ("start", "channel"):
+            opens = state == "body" and not headed and not chunk.strip()
+            if token == "start":
+                if not (opens and _ROLE_RE.match(following)):
+                    return None
+                state, channel, recipient = "role", "final", False
+                continue
+            if not (opens or state == "role") or not _CHANNEL_RE.match(following):
+                return None
+            if state == "role" and " to=" in f" {chunk}":
+                recipient = True
             state = "channel"
-        elif token == "constrain":
+        elif token in ("constrain", "message"):
+            if state == "body":
+                return None
+            if state in ("role", "channel") and " to=" in f" {chunk}":
+                recipient = True
             if state == "channel":
                 channel = (chunk.split() or ["final"])[0]
-            state = "constrain"
-        elif token == "message":
-            if state == "channel":
-                channel = (chunk.split() or ["final"])[0]
-            state = "body"
+            state = "constrain" if token == "constrain" else "body"
+            headed = token == "message"
         else:  # end / return / call: the body is over; bare text after it is answer
-            state, channel, recipient = "body", "final", False
+            if state in ("channel", "constrain"):
+                return None
+            if state == "role":
+                flush_role(chunk)
+            else:
+                flush(chunk)
+                if not headed:
+                    # Text no header opened ends only where the next header (or
+                    # the text) does: "the <|end|> token" in prose is not a turn.
+                    after_next = matches[i + 1].group(1) if i + 1 < len(matches) else None
+                    if following.strip() or after_next not in (None, "start", "channel"):
+                        return None
+            state, channel, recipient, headed = "body", "final", False, False
     if state == "body":
         flush(text[pos:])
+    elif state == "role":
+        flush_role(text[pos:])
     # One body per block; blocks are separate paragraphs, not one run-on line.
     return (
         "\n\n".join(part.strip() for part in answer if part.strip()),
