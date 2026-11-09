@@ -68,6 +68,26 @@ Tried in this order:
 
 Sessions in the panel use the owner password (argon2id) or an admin key; see below.
 
+The order in which a request is judged:
+
+```mermaid
+flowchart TD
+  req["Request"] --> pub{"Liveness probe<br/>(/health)?"}
+  pub -- "yes" --> ok["Served without a credential"]
+  pub -- "no" --> cred{"Credential<br/>presented?"}
+  cred -- "yes" --> who["Key, owner session, legacy key<br/>or MCP PIN (MCP path only)<br/>gives a scope"]
+  who --> enough{"Scope covers<br/>the route?"}
+  enough -- "yes" --> run["Run it"]
+  enough -- "no" --> d403["403 permission_denied"]
+  cred -- "no" --> enforced{"Auth enforced?<br/>(any key, server.api_key,<br/>or a network bind with an account)"}
+  enforced -- "yes" --> d401["401 key required"]
+  enforced -- "no" --> box{"Changes the box?"}
+  box -- "no" --> run
+  box -- "yes" --> local{"Trusted local caller?<br/>(loopback peer, loopback Host,<br/>not cross-site, not behind_proxy)"}
+  local -- "yes" --> run
+  local -- "no" --> d403b["403 remote_admin_requires_credential"]
+```
+
 ### Scopes
 
 | Scope | May | Examples |
@@ -127,8 +147,8 @@ the data directory can drop a `RESET_LOGIN` file there (D81). Both are local ope
 opens the database directly, and the sentinel is read once by `serve` at start, deleted before it is
 applied, and referenced by no route, panel action or MCP tool, so nothing over the network can
 reset a login. A person who can write to the data directory can already read the database and
-`cli.key`, which is why the file widens nothing. The commands per platform are in the README's
-[Accounts and lockout recovery](../README.md#accounts-and-lockout-recovery).
+`cli.key`, which is why the file widens nothing. The commands per platform are in
+[`ACCOUNTS.md`](ACCOUNTS.md).
 
 ## The control panel
 

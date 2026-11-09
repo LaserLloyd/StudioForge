@@ -57,6 +57,44 @@ acquire ──► (held) ──touch──► (held) ──release──► gone
                 └── idle for idle_ttl_s ────┘  (the sweep releases it)
 ```
 
+The same lifecycle with its states, including the vacate window (§4):
+
+```mermaid
+stateDiagram-v2
+  [*] --> active: acquire
+  active --> active: touch
+  active --> idle: quiet for half the TTL (at most 5 min)
+  idle --> active: touch
+  idle --> expiring: last quarter of the TTL
+  expiring --> active: touch
+  expiring --> [*]: idle sweep releases it
+  active --> vacating: better class asks, holder has a vacate_url
+  vacating --> [*]: holder releases
+  vacating --> active: window lapses (180 s)
+  active --> [*]: DELETE /api/leases/id
+```
+
+A tenant's whole conversation with StudioForge:
+
+```mermaid
+sequenceDiagram
+  participant T as Tenant
+  participant S as StudioForge
+  T->>S: POST /api/tenants/register
+  T->>S: GET /api/leases, release its own stale ones
+  T->>S: POST /api/leases (devices or "auto", priority, vacate_url)
+  S-->>T: lease id
+  loop while working
+    T->>S: POST /api/leases/{id}/touch
+  end
+  Note over S: a better class asks for the card
+  S->>T: POST vacate_url (token header, one try)
+  T->>S: DELETE /api/leases/{id}
+  loop every 30 s
+    S->>T: GET health_url
+  end
+```
+
 * **Acquire** — `POST /api/leases`. Name the devices, or let StudioForge choose (§5). Idle
   residents on the granted cards are unloaded as part of the grant; that is what "the card is
   yours" means. The reply is the lease record with its `id`.

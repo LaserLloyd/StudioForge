@@ -26,6 +26,10 @@ GPU), captured by `scripts/capture_panel.py`. Both refuse any port outside 18080
 | ![Test Chat](screenshots/readme/panel-test-chat.png) | ![Advanced](screenshots/readme/panel-advanced.png) |
 | **Test Chat**: TTFT, tok/s, Copy as curl, Load options | **Advanced**: left menu (Integrations page shown) |
 
+The setup guide the panel opens on first run, with its eight optional steps:
+
+![Setup guide: eight optional steps from the owner account to network exposure, starting with step 1](screenshots/readme/setup-wizard.png)
+
 ## The Models page
 
 * The table: friendly name (the exact id under it), quant badge, size, family, "Fits on" (the catalog's recommended

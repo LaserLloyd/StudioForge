@@ -121,7 +121,7 @@ The llama.cpp engine is **not** in the image: it is downloaded or built by the a
 - **Offline / air-gapped:** populate the volume while online, then block the network:
 
   ```bash
-  docker run --rm -v studioforge-data:/data ghcr.io/laserlloyd/studioforge:2.0.0-cuda-devel engine --update
+  docker run --rm -v studioforge-data:/data ghcr.io/laserlloyd/studioforge:2.3.0-cuda-devel engine --update
   # later, on the offline host, run the slim -cuda image against the same volume
   ```
 
@@ -217,8 +217,7 @@ docker run --rm -v studioforge-data:/data alpine cat /data/RESET_LOGIN.password 
 
 On a bind-mounted data directory just create the file in that folder. The file is read only at
 container start; it cannot be triggered over the network. The full table (what is reset, what is
-kept, native Windows and Linux commands) is the README's
-[Accounts and lockout recovery](../../README.md#accounts-and-lockout-recovery).
+kept, native Windows and Linux commands) is in [`ACCOUNTS.md`](../ACCOUNTS.md).
 
 ## Podman notes
 
@@ -232,7 +231,7 @@ kept, native Windows and Linux commands) is the README's
 ## Build it yourself
 
 ```bash
-docker build --build-arg BACKEND=cuda --build-arg VERSION=2.0.0 \
+docker build --build-arg BACKEND=cuda --build-arg VERSION=2.3.0 \
   -t ghcr.io/laserlloyd/studioforge:2.0.0-cuda .
 ```
 
