@@ -48,6 +48,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from studioforge.api.compat_stream import (
     ChatEvent,
+    arguments_complete,
     as_dict,
     chat_events,
     closing,
@@ -507,23 +508,29 @@ async def anthropic_stream(
         )
         return frames
 
-    # Tool calls that started while another tool block was open. Anthropic
-    # streams one content block at a time, so a call that interleaves with the
-    # open one is buffered whole (id, name, arguments by tool index) and emitted
-    # as its own block once the open one can close -- never dropped.
+    # Tool calls that started while another tool block was open and still
+    # incomplete. Anthropic streams one content block at a time, so a call that
+    # interleaves with the open one is buffered whole (id, name, arguments by
+    # tool index) and emitted as its own block once the open one can close --
+    # never dropped. A call that starts after the open one's arguments are
+    # complete is the ordinary sequential case and streams live.
     pending: dict[int, dict[str, Any]] = {}
+    open_args = ""  # the open tool block's arguments so far
+
+    def open_tool_block(tool_index: int, call_id: str, name: str, args: str = "") -> list[bytes]:
+        nonlocal open_tool, open_args
+        frames = start_block("tool", {"type": "tool_use", "id": call_id, "name": name, "input": {}})
+        open_tool, open_args = tool_index, args
+        if args:
+            frames.append(delta("input_json_delta", partial_json=args))
+        return frames
 
     def flush_pending() -> list[bytes]:
         frames: list[bytes] = []
-        for call in pending.values():
+        for tool_index, call in pending.items():
             frames.extend(
-                start_block(
-                    "tool",
-                    {"type": "tool_use", "id": call["id"], "name": call["name"], "input": {}},
-                )
+                open_tool_block(tool_index, call["id"], call["name"], "".join(call["args"]))
             )
-            if call["args"]:
-                frames.append(delta("input_json_delta", partial_json="".join(call["args"])))
         pending.clear()
         return frames
 
@@ -559,18 +566,20 @@ async def anthropic_stream(
                 yield delta("text_delta", text=event.text)
             elif event.kind == "tool_start":
                 saw_tool = True
-                if open_kind == "tool" and open_tool != event.index:
+                interleaved = (
+                    open_kind == "tool"
+                    and open_tool != event.index
+                    and (bool(pending) or not arguments_complete(open_args))
+                )
+                if interleaved:
                     pending[event.index] = {"id": event.call_id, "name": event.name, "args": []}
                     continue
-                for frame in start_block(
-                    "tool",
-                    {"type": "tool_use", "id": event.call_id, "name": event.name, "input": {}},
-                ):
+                for frame in open_tool_block(event.index, event.call_id, event.name):
                     yield frame
-                open_tool = event.index
             elif event.kind == "tool_args":
                 deltas += 1
                 if open_kind == "tool" and open_tool == event.index:
+                    open_args += event.text
                     yield delta("input_json_delta", partial_json=event.text)
                 elif event.index in pending:
                     pending[event.index]["args"].append(event.text)

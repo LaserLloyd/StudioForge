@@ -233,3 +233,21 @@ def parse_tool_arguments(raw: Any) -> Any:
         return json.loads(raw)
     except ValueError:
         return {}
+
+
+def arguments_complete(text: str) -> bool:
+    """Whether a streamed tool call's arguments so far are one whole JSON value.
+
+    Both translators stream one tool call at a time. When the next call
+    starts, an open call whose arguments are already complete is simply done
+    (sequential calls, the normal case: close it, stream the next one live);
+    one with no arguments yet, or half an object, means the calls interleave,
+    and the new one is buffered until the open one can close.
+    """
+    if not text.strip():
+        return False
+    try:
+        json.loads(text)
+    except ValueError:
+        return False
+    return True

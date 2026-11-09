@@ -45,7 +45,14 @@ from typing import Any
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from studioforge.api.compat_stream import ChatEvent, as_dict, chat_events, closing, sse_event
+from studioforge.api.compat_stream import (
+    ChatEvent,
+    arguments_complete,
+    as_dict,
+    chat_events,
+    closing,
+    sse_event,
+)
 from studioforge.api.openai_routes import (
     SSE_HEADERS,
     _json_body,
@@ -453,8 +460,10 @@ async def response_stream(
     completion_tokens: int | None = None
     cached_tokens: int | None = None
 
-    # Tool calls that started while another call item was open: buffered whole
-    # (by tool index) and emitted as their own items when the open one closes.
+    # Tool calls that started while another call item was open and still
+    # incomplete: buffered whole (by tool index) and emitted as their own items
+    # when the open one closes. A call that starts after the open one's
+    # arguments are complete is the ordinary sequential case and streams live.
     pending_calls: dict[int, dict[str, Any]] = {}
 
     def open_call(call_id: str, name: str) -> list[bytes]:
@@ -471,10 +480,11 @@ async def response_stream(
         return frames
 
     def flush_calls() -> list[bytes]:
-        nonlocal current
+        nonlocal current, tool_index
         frames: list[bytes] = []
-        for call in pending_calls.values():
+        for index, call in pending_calls.items():
             frames.extend(open_call(call["call_id"], call["name"]))
+            tool_index = index
             assert current is not None
             args = "".join(call["args"])
             if args:
@@ -581,7 +591,13 @@ async def response_stream(
                     logprobs=[],
                 )
             elif event.kind == "tool_start":
-                if current is not None and current["kind"] == "call" and tool_index != event.index:
+                interleaved = (
+                    current is not None
+                    and current["kind"] == "call"
+                    and tool_index != event.index
+                    and (bool(pending_calls) or not arguments_complete(current["text"]))
+                )
+                if interleaved:
                     pending_calls[event.index] = {
                         "call_id": event.call_id,
                         "name": event.name,
