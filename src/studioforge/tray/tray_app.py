@@ -58,9 +58,9 @@ APP_NAME = "StudioForge"
 
 SINGLE_INSTANCE_HOST = "127.0.0.1"
 #: Abstract mutex: a bound socket nobody else can take while we are alive.
-#: Deliberately *not* ClawForge's 47821 -- both trays are expected to run side
-#: by side on this machine, and a shared port would make each one look to the
-#: other like "already running".
+#: Deliberately *not* 47821, which another tray on the same box uses -- both
+#: are expected to run side by side on this machine, and a shared port would
+#: make each one look to the other like "already running".
 SINGLE_INSTANCE_PORT = 47823
 
 POLL_INTERVAL = 2.0  # seconds between child-process liveness polls
@@ -111,7 +111,7 @@ DOWN_STATES = (STATE_STOPPED, STATE_CRASHED)
 #: States in which a server process exists (or is on its way up).
 LIVE_STATES = (STATE_RUNNING, STATE_STARTING)
 
-# A cool blue/cyan rather than ClawForge's forge-orange: the two trays sit next
+# A cool blue/cyan rather than the neighbouring tray's orange: the two trays sit next
 # to each other in the same notification area and have to stay tellable apart
 # at 16 pixels.
 SF_CYAN = (56, 189, 248, 255)

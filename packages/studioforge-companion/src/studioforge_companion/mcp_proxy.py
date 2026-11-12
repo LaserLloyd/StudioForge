@@ -552,7 +552,7 @@ class McpProxy:
             "load_recommended larger. `server_status().leases[]` shows every lease with "
             "kind and retry_after_s before you meet it.\n\n"
             "IDENTIFY YOURSELF: X-SF-Client: <your agent name> on every /v1 request, the "
-            "same name as your ClawForge `client` tag; send `priority` (1 a person is "
+            "same name as your `client` tag on other rig services; send `priority` (1 a person is "
             "waiting, 2 a dispatched agent, 3/omitted background) in the chat body.\n\n"
             "START WITH `list_models` -- it returns the model catalog newest-download-first; "
             "every model has `options` rows (one per context size) with `fits`, `devices`, "

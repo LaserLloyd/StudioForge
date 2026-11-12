@@ -53,6 +53,8 @@ KvCacheType = Literal["auto", "f32", "f16", "bf16", "q8_0", "q5_1", "q5_0", "q4_
 #: buffers") -- see docs/LIMITATIONS.md.
 SplitMode = Literal["none", "layer", "row", "tensor", "auto"]
 FlashAttn = Literal["on", "off", "auto"]
+#: The descriptive lease ``kind`` (D53): what a client should do about a lease.
+LeaseKind = Literal["benchmark", "render", "agent", "other"]
 EngineUpdateChannel = Literal["stable", "latest"]
 
 #: Which llama.cpp backend to favour when a box offers more than one (a Strix
@@ -959,6 +961,29 @@ class LeasesConfig(BaseModel):
     #: collapsed the whole window to "undeliverable" for 180 s while the holder
     #: was in fact complying (audit 2026-09-09, F4).
     vacate_callback_timeout_s: PositiveFloat = 30.0
+    #: Extra ``holder_family -> kind`` entries for the descriptive lease
+    #: ``kind`` every lease view and ``gpu_leased`` refusal carries (D84),
+    #: merged over the built-in table (``core/leases.py`` ``LEASE_KINDS``).
+    #: For your own programs that lease under names this server does not know,
+    #: e.g. ``{"myrenderer": "render"}``: a client reads ``render``/``agent`` as
+    #: "wait and re-ask", ``benchmark`` as "stand down". Read at start.
+    holder_kinds: dict[str, LeaseKind] = Field(default_factory=dict)
+
+    @field_validator("holder_kinds")
+    @classmethod
+    def _holder_kind_families(cls, value: dict[str, LeaseKind]) -> dict[str, LeaseKind]:
+        """Families are matched lower-case, and a family never holds ``-``/``:``."""
+        out: dict[str, LeaseKind] = {}
+        for family, kind in value.items():
+            key = str(family).strip().lower()
+            if not re.fullmatch(r"[a-z0-9][a-z0-9._]{0,63}", key):
+                raise ValueError(
+                    f"holder_kinds key {family!r} is not a holder family: lower-case letters, "
+                    "digits, '.' and '_' only (a holder's family is the part before its first "
+                    "'-' or ':')"
+                )
+            out[key] = kind
+        return out
 
 
 #: The two shapes a tenant takes in the registry (D77). A ``module`` is an
@@ -1889,5 +1914,7 @@ RESTART_REQUIRED_KEYS = frozenset(
         # The log file handlers are built once, at start (D69 §15).
         "logging.file_max_mb",
         "logging.file_backups",
+        # Installed into the lease module when the app is built (D84).
+        "leases.holder_kinds",
     }
 )

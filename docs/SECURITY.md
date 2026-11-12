@@ -104,7 +104,7 @@ A scope is enforced whenever a credential is presented, even on an install that 
 key cannot `POST`.
 
 **Tenants hold `inference` keys (2.0.1, D80).** A program that shares the rig's cards (SpeechForge,
-ClawForge2, a benchmark harness) never needs `admin`: `POST /api/leases`,
+an image-generation tenant, a benchmark harness) never needs `admin`: `POST /api/leases`,
 `POST /api/leases/{id}/touch`, `DELETE /api/leases/{id}` (which is also how a holder answers a vacate
 request), `POST /api/tenants/register` and `DELETE /api/tenants/{name}` are `inference`
 (`api/auth.py:_TENANT_PROTOCOL_ROUTES`). Each lease and each registration is stamped with the key that

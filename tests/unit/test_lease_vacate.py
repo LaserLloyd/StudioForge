@@ -138,7 +138,7 @@ def test_priority_default_is_byte_identical_to_a_pre_d56_lease() -> None:
 
 def test_the_token_is_never_serialised_or_shown() -> None:
     book = LeaseBook()
-    lease = book.acquire([0], holder="clawforge2", vacate_url=HOLDER_URL, vacate_token=TOKEN)
+    lease = book.acquire([0], holder="imagegen", vacate_url=HOLDER_URL, vacate_token=TOKEN)
     assert lease.vacate_token == TOKEN, "stored -- it has to be sent back to the holder"
 
     assert TOKEN not in json.dumps(lease.model_dump(mode="json"))
@@ -156,7 +156,7 @@ def test_the_token_is_never_serialised_or_shown() -> None:
 
 def test_the_url_is_shown_only_on_request() -> None:
     book = LeaseBook()
-    lease = book.acquire([0], holder="clawforge2", vacate_url=HOLDER_URL)
+    lease = book.acquire([0], holder="imagegen", vacate_url=HOLDER_URL)
     plain = lease_view(lease)
     assert plain["vacate_registered"] is True and "vacate_url" not in plain
     assert lease_view(lease, reveal_vacate_url=True)["vacate_url"] == HOLDER_URL
@@ -184,13 +184,13 @@ def test_holder_family_splits_on_a_colon_too() -> None:
     assert lease_kind("benchmark:parallel") == "benchmark"
     assert holder_family("crucibleforge-judge") == "crucibleforge"
     assert holder_family("benchmark") == "benchmark"
-    assert holder_family("clawforge2") == "clawforge2"
+    assert holder_family("imagegen") == "imagegen"
 
 
 def test_vacating_outranks_every_other_state() -> None:
     book = LeaseBook()
     start = 1_000_000.0
-    lease = book.acquire([0], holder="clawforge2", idle_ttl_s=60.0, now=start)
+    lease = book.acquire([0], holder="imagegen", idle_ttl_s=60.0, now=start)
     assert lease_state(lease, start + 59) == "expiring"
     book.mark_vacating(lease.id, requested_by="benchmark", deadline_s=180.0, now=start + 59)
     assert lease_state(lease, start + 59) == "vacating"
@@ -246,7 +246,7 @@ async def test_a_vacate_url_onto_our_own_listener_is_refused() -> None:
         assert await vacate_url_targets_self(url, own_ports=own, own_addresses=["192.168.1.20"]), (
             url
         )
-    # Another port on this box is the expected deployment (ClawForge2 on :8700).
+    # Another port on this box is the expected deployment (the image gateway on :8700).
     assert not await vacate_url_targets_self(HOLDER_URL, own_ports=own)
     # A stranger's literal on our port is not us.
     assert not await vacate_url_targets_self("http://192.168.1.21:1234/x", own_ports=own)
@@ -288,7 +288,7 @@ async def test_the_manager_refuses_a_self_target_with_a_400_naming_the_param() -
 async def test_a_better_class_sends_one_vacate_and_gets_lease_vacating() -> None:
     manager, _supervisor, recorder = _rig()
     tenant = await manager.acquire_lease(
-        [2], holder="clawforge2", vacate_url=HOLDER_URL, vacate_token=TOKEN
+        [2], holder="imagegen", vacate_url=HOLDER_URL, vacate_token=TOKEN
     )
     assert tenant.priority == 3
 
@@ -341,7 +341,7 @@ async def test_a_better_class_sends_one_vacate_and_gets_lease_vacating() -> None
 async def test_the_sweep_releasing_the_tenant_also_ends_the_vacate() -> None:
     manager, _supervisor, recorder = _rig()
     tenant = await manager.acquire_lease(
-        [2], holder="clawforge2", vacate_url=HOLDER_URL, idle_ttl_s=60.0
+        [2], holder="imagegen", vacate_url=HOLDER_URL, idle_ttl_s=60.0
     )
     with pytest.raises(LeaseConflictError):
         await manager.acquire_lease([2], holder="benchmark", priority=PRIORITY_AGENT)
@@ -356,7 +356,7 @@ async def test_the_sweep_releasing_the_tenant_also_ends_the_vacate() -> None:
 
 async def test_a_lapsed_window_degrades_to_todays_conflict_then_may_be_asked_again() -> None:
     manager, _supervisor, recorder = _rig()
-    tenant = await manager.acquire_lease([2], holder="clawforge2", vacate_url=HOLDER_URL)
+    tenant = await manager.acquire_lease([2], holder="imagegen", vacate_url=HOLDER_URL)
     with pytest.raises(LeaseConflictError):
         await manager.acquire_lease([2], holder="crucibleforge", priority=PRIORITY_AGENT)
     await _settle()
@@ -395,7 +395,7 @@ async def test_a_lapsed_window_degrades_to_todays_conflict_then_may_be_asked_aga
 
 async def test_an_equal_or_worse_class_gets_the_plain_conflict_and_no_post() -> None:
     manager, _supervisor, recorder = _rig()
-    tenant = await manager.acquire_lease([2], holder="clawforge2", vacate_url=HOLDER_URL)
+    tenant = await manager.acquire_lease([2], holder="imagegen", vacate_url=HOLDER_URL)
 
     for priority in (None, PRIORITY_BACKGROUND):
         with pytest.raises(LeaseConflictError) as excinfo:
@@ -436,7 +436,7 @@ async def test_a_holder_without_a_url_is_never_asked_even_by_a_better_class() ->
 async def test_a_mixed_clash_asks_nobody() -> None:
     """One lease in the way that cannot be asked makes the whole ask pointless."""
     manager, _supervisor, recorder = _rig()
-    await manager.acquire_lease([2], holder="clawforge2", vacate_url=HOLDER_URL)
+    await manager.acquire_lease([2], holder="imagegen", vacate_url=HOLDER_URL)
     await manager.acquire_lease([3], holder="crucibleforge", priority=PRIORITY_AGENT)
     with pytest.raises(LeaseConflictError) as excinfo:
         await manager.acquire_lease([2, 3], holder="chat", priority=PRIORITY_CHAT)
@@ -447,7 +447,7 @@ async def test_a_mixed_clash_asks_nobody() -> None:
 
 async def test_force_never_overrides_a_standing_lease_vacating_or_not() -> None:
     manager, _supervisor, recorder = _rig()
-    tenant = await manager.acquire_lease([2], holder="clawforge2", vacate_url=HOLDER_URL)
+    tenant = await manager.acquire_lease([2], holder="imagegen", vacate_url=HOLDER_URL)
     with pytest.raises(LeaseConflictError) as first:
         await manager.acquire_lease([2], holder="api", force=True)
     assert first.value.code == "lease_conflict"
@@ -461,7 +461,7 @@ async def test_force_never_overrides_a_standing_lease_vacating_or_not() -> None:
 
 async def test_a_delivered_vacate_is_recorded_on_the_lease() -> None:
     manager, _supervisor, recorder = _rig()
-    tenant = await manager.acquire_lease([2], holder="clawforge2", vacate_url=HOLDER_URL)
+    tenant = await manager.acquire_lease([2], holder="imagegen", vacate_url=HOLDER_URL)
     assert tenant.vacate_delivery is None, "never asked"
     with pytest.raises(LeaseConflictError):
         await manager.acquire_lease([2], holder="crucibleforge", priority=2)
@@ -490,7 +490,7 @@ async def test_a_dead_holder_collapses_the_window_and_the_next_ask_is_undelivera
     manager._vacate_sender = recorder
     logged = LogRecorder()
     monkeypatch.setattr(manager_mod, "log", logged)
-    tenant = await manager.acquire_lease([2], holder="clawforge2", vacate_url=HOLDER_URL)
+    tenant = await manager.acquire_lease([2], holder="imagegen", vacate_url=HOLDER_URL)
     with pytest.raises(LeaseConflictError) as excinfo:
         await manager.acquire_lease([2], holder="crucibleforge", priority=2)
     assert excinfo.value.code == "lease_vacating", "the POST is in flight: the answer is honest"
@@ -539,7 +539,7 @@ async def test_a_release_while_the_post_is_in_flight_marks_nothing() -> None:
         return False, "ConnectError"
 
     manager._vacate_sender = slow
-    tenant = await manager.acquire_lease([2], holder="clawforge2", vacate_url=HOLDER_URL)
+    tenant = await manager.acquire_lease([2], holder="imagegen", vacate_url=HOLDER_URL)
     with pytest.raises(LeaseConflictError):
         await manager.acquire_lease([2], holder="crucibleforge", priority=2)
     manager.release_lease(tenant.id)
@@ -565,7 +565,7 @@ def test_a_jit_load_never_vacates_only_a_lease_acquire_does() -> None:
     from tests.unit.test_leases import make_record as planner_record
 
     book = LeaseBook()
-    tenant = book.acquire([0, 1, 2, 3], holder="clawforge2", vacate_url=HOLDER_URL)
+    tenant = book.acquire([0, 1, 2, 3], holder="imagegen", vacate_url=HOLDER_URL)
     planner = make_planner(book)
     for priority in (PRIORITY_CHAT, PRIORITY_AGENT, PRIORITY_BACKGROUND):
         record = planner_record("mine/model", priority=priority)
@@ -600,7 +600,7 @@ async def test_the_token_never_reaches_a_log_line(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(manager_mod, "log", logged)
     tenant = await manager.acquire_lease(
         [2],
-        holder="clawforge2",
+        holder="imagegen",
         vacate_url=HOLDER_URL + "?secret=no",
         vacate_token=TOKEN,
     )
@@ -667,7 +667,7 @@ async def test_send_vacate_request_posts_the_body_and_the_token_and_follows_no_r
     lease = GpuLease(
         id="abc123",
         devices=[2],
-        holder="clawforge2",
+        holder="imagegen",
         created_at=1.0,
         last_activity_at=1.0,
         vacate_url=HOLDER_URL,
@@ -698,7 +698,7 @@ async def test_send_vacate_request_reports_a_transport_error_by_class_name_only(
     lease = GpuLease(
         id="abc123",
         devices=[2],
-        holder="clawforge2",
+        holder="imagegen",
         created_at=1.0,
         last_activity_at=1.0,
         vacate_url=HOLDER_URL,
@@ -725,7 +725,7 @@ def test_post_leases_accepts_the_new_fields_and_both_409s_carry_retry_after(app:
             "/api/leases",
             json={
                 "devices": [0],
-                "holder": "clawforge2",
+                "holder": "imagegen",
                 "vacate_url": HOLDER_URL,
                 "vacate_token": TOKEN,
             },
@@ -777,7 +777,7 @@ def test_a_remote_reader_sees_registered_but_not_the_url(app: Any) -> None:
     PIN, a key) on ``/api/leases`` only, and the token appears nowhere."""
     app.state.config.mcp.pin = "24681357"
     app.state.manager.leases.acquire(
-        [0], holder="clawforge2", vacate_url=HOLDER_URL, vacate_token=TOKEN
+        [0], holder="imagegen", vacate_url=HOLDER_URL, vacate_token=TOKEN
     )
     http = TestClient(app, client=("10.0.0.7", 50000))
     row = http.get("/api/leases").json()["leases"][0]
@@ -800,15 +800,15 @@ def test_a_remote_reader_sees_registered_but_not_the_url(app: Any) -> None:
 def test_post_leases_holder_defaults_to_x_sf_client(app: Any) -> None:
     with TestClient(app, client=("127.0.0.1", 50000)) as http:
         # The fixture's fake rig has one card, so each claim is released first.
-        named = http.post("/api/leases", json={"devices": [0]}, headers={"X-SF-Client": "cf2"})
+        named = http.post("/api/leases", json={"devices": [0]}, headers={"X-SF-Client": "imagegen"})
         assert named.status_code == 200, named.text
-        assert named.json()["holder"] == "cf2"
+        assert named.json()["holder"] == "imagegen"
         http.delete(f"/api/leases/{named.json()['id']}")
         anonymous = http.post("/api/leases", json={"devices": [0]})
         assert anonymous.json()["holder"] == "api", "byte-identical without the header"
         http.delete(f"/api/leases/{anonymous.json()['id']}")
         explicit = http.post(
-            "/api/leases", json={"devices": [0], "holder": "x"}, headers={"X-SF-Client": "cf2"}
+            "/api/leases", json={"devices": [0], "holder": "x"}, headers={"X-SF-Client": "imagegen"}
         )
         assert explicit.json()["holder"] == "x", "the body wins"
 

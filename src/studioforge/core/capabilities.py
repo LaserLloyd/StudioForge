@@ -76,7 +76,7 @@ FEATURE_NOTES: dict[str, str] = {
 #: on instead. **Bump it in the same commit that appends a decision**:
 #: ``tests/unit/test_capabilities_implemented.py`` reads the headings of
 #: ``DECISIONS.md`` and fails until the two agree.
-LATEST_DECISION = 83
+LATEST_DECISION = 84
 
 #: Every decision number this build includes, ``"D1"`` .. ``"D<LATEST_DECISION>"``.
 IMPLEMENTED_DECISIONS: tuple[str, ...] = tuple(f"D{n}" for n in range(1, LATEST_DECISION + 1))
@@ -153,6 +153,8 @@ SERVER_FEATURES: dict[str, str] = {
     # split_mode tensor (and auto) accepts a hybrid model (Qwen3.5/3.6/3.8) when
     # the active engine is b12110 or newer; older servers refuse it as before.
     "tensor_split_hybrid": "D83",
+    # leases.holder_kinds: an operator's own holder families for the lease kind.
+    "lease_holder_kinds": "D84",
 }
 
 

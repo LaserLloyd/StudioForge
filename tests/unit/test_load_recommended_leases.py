@@ -1,7 +1,7 @@
 """`load_recommended` plans around a lease instead of refusing itself (D64, CR-9).
 
 The incident, 2026-09-12 22:29-22:36: CUDA 1 -- one of the two RTX 5090s -- was
-leased to ClawForge2 for ComfyUI. ``POST /api/models/{id}/load-recommended``
+leased to the image gateway for ComfyUI. ``POST /api/models/{id}/load-recommended``
 walked its hardware modes, chose ``dual_5090`` (``[0, 1]``), and its own real
 load then refused that placement with ``gpu_leased``; the client retried every
 60 s and got the identical placement and the identical refusal eight times,
@@ -42,14 +42,14 @@ from tests.unit.test_planner import StubProbe, gpu, make_config, rig_5090x2_3090
 def leased_manager(
     *, probe: Any = None, n_ctx_train: int = 131072, devices: list[int] | None = None
 ) -> tuple[Any, Any, LeaseBook, Any]:
-    """The incident's shape: CUDA 1 of two same-generation 5090s leased to ClawForge2."""
+    """The incident's shape: CUDA 1 of two same-generation 5090s leased to the image gateway."""
     manager, supervisor = make_manager(probe=probe, n_ctx_train=n_ctx_train)
     book = LeaseBook()
     manager.leases = book
     manager.planner.leases = book
     lease = book.acquire(
         devices or [1],
-        holder="clawforge2",
+        holder="imagegen",
         reason="ComfyUI (re-leased)",
         idle_ttl_s=600,
     )
@@ -100,7 +100,7 @@ async def test_without_the_lease_the_same_call_still_takes_the_headline_pair() -
 async def test_the_placement_taken_around_a_lease_says_so_in_its_notes() -> None:
     """A slower placement with no reason attached is how the JIT path's good note got lost.
 
-    The JIT load in the incident wrote "CUDA [1] is leased to clawforge2 ...
+    The JIT load in the incident wrote "CUDA [1] is leased to imagegen ...
     DELETE /api/leases/<id>" on its plan; the walk now writes the same, plus
     which mode it passed over.
     """
@@ -110,7 +110,7 @@ async def test_the_placement_taken_around_a_lease_says_so_in_its_notes() -> None
     notes = " ".join(instance.plan.notes)
     assert "passed over dual_5090" in notes
     assert "took dual_3090" in notes
-    assert "clawforge2" in notes
+    assert "imagegen" in notes
     assert lease.id in notes
     assert f"DELETE /api/leases/{lease.id}" in notes
     assert "600 s" in notes, "how the lease ends"
@@ -147,7 +147,7 @@ async def test_a_walk_refused_by_a_lease_never_advises_dropping_a_device_overrid
     assert error.code == "gpu_leased", "waiting for the release is what changes the answer"
     assert error.details["lease"]["id"] == lease.id
     assert error.details["retry_after_s"]
-    assert "clawforge2" in error.message
+    assert "imagegen" in error.message
     assert "dual_5090, all_gpus would fit at this context once that lease ends" in error.message
     modes = {m["mode"]: m for m in error.details["modes"]}
     assert modes["dual_5090"]["leased_devices"] == [1]
@@ -202,7 +202,7 @@ def _forced(devices: list[int]) -> Any:
 def test_a_caller_forced_placement_onto_a_lease_still_gets_the_override_advice() -> None:
     """The advice is right for a caller that sent ``devices`` -- only that caller."""
     book = LeaseBook()
-    book.acquire([1], holder="clawforge2")
+    book.acquire([1], holder="imagegen")
     planner = Planner(make_config(), rig_5090x2_3090x2(), log_plans=False, leases=book)
 
     by_caller = planner.plan_load(_forced([0, 1]), ctx_size=8192)
@@ -239,7 +239,7 @@ async def test_a_lease_granted_between_the_walk_and_the_load_walks_again_instead
         decision = real(prep, **kwargs)
         calls.append(decision)
         if len(calls) == 1:
-            book.acquire([1], holder="clawforge2", reason="ComfyUI")
+            book.acquire([1], holder="imagegen", reason="ComfyUI")
         return decision
 
     manager._decide_recommended = racing  # type: ignore[method-assign]
@@ -261,7 +261,7 @@ async def test_a_placement_leased_away_twice_is_refused_as_the_walks_not_the_cal
 
     def racing(prep: Any, **kwargs: Any) -> Any:
         decision = real(prep, **kwargs)
-        book.acquire(next(grabs), holder="clawforge2")
+        book.acquire(next(grabs), holder="imagegen")
         return decision
 
     manager._decide_recommended = racing  # type: ignore[method-assign]

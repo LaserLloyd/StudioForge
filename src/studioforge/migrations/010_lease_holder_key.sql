@@ -2,7 +2,7 @@
 --
 -- The VRAM tenant protocol (take, renew and release a lease; register as a
 -- tenant) is an `inference`-scope surface from 2.0.1: a tenant such as
--- SpeechForge or ClawForge2 holds an inference key, never an admin one. That
+-- a speech or image server holds an inference key, never an admin one. That
 -- makes lease ownership matter. A non-admin key may renew or release only a
 -- lease it created, so the creating key is stored with the lease -- as
 -- `key:<id>`, the principal's audit name -- and survives a restart with the

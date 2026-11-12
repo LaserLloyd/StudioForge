@@ -1,6 +1,6 @@
 """The tenant half of the VRAM protocol needs ``inference``, not ``admin`` (2.0.1).
 
-A program that shares this rig's cards (SpeechForge, ClawForge2, ...) holds an
+A program that shares this rig's cards (SpeechForge, the image gateway, ...) holds an
 ``inference`` key. Taking, renewing and releasing its own lease, and registering
 itself as a tenant, must work with that key -- and must not let it touch another
 tenant's lease. Everything that is genuinely administrative stays ``admin``.
@@ -86,7 +86,7 @@ def test_an_inference_key_takes_renews_and_releases_its_own_lease(app: Any) -> N
 
 
 def test_another_inference_key_cannot_renew_or_release_it(app: Any) -> None:
-    keys = _keys(app, "speechforge", "clawforge2")
+    keys = _keys(app, "speechforge", "imagegen")
     with TestClient(app, client=LOOPBACK) as http:
         lease_id = http.post(
             "/api/leases",
@@ -95,8 +95,8 @@ def test_another_inference_key_cannot_renew_or_release_it(app: Any) -> None:
         ).json()["id"]
 
         for denied in (
-            http.post(f"/api/leases/{lease_id}/touch", headers=keys["clawforge2"]),
-            http.delete(f"/api/leases/{lease_id}", headers=keys["clawforge2"]),
+            http.post(f"/api/leases/{lease_id}/touch", headers=keys["imagegen"]),
+            http.delete(f"/api/leases/{lease_id}", headers=keys["imagegen"]),
         ):
             assert denied.status_code == 403, denied.text
             error = denied.json()["error"]
@@ -104,7 +104,7 @@ def test_another_inference_key_cannot_renew_or_release_it(app: Any) -> None:
             assert "speechforge" not in error["message"], "the owner is not named to the asker"
 
         # still there, still its owner's
-        assert http.get("/api/leases", headers=keys["clawforge2"]).json()["count"] == 1
+        assert http.get("/api/leases", headers=keys["imagegen"]).json()["count"] == 1
         owner_touch = http.post(f"/api/leases/{lease_id}/touch", headers=keys["speechforge"])
         assert owner_touch.status_code == 200
 
@@ -158,7 +158,7 @@ def test_a_read_key_cannot_take_a_lease_and_admin_only_routes_still_need_admin(
 
 
 def test_tenant_registration_is_bound_to_the_registering_key(app: Any) -> None:
-    keys = _keys(app, "speechforge", "clawforge2")
+    keys = _keys(app, "speechforge", "imagegen")
     admin = _keys(app, "root", scope="admin")["root"]
     body = {"name": "speechforge", "version": "1.0"}
     with TestClient(app, client=LOOPBACK) as http:
@@ -168,16 +168,16 @@ def test_tenant_registration_is_bound_to_the_registering_key(app: Any) -> None:
         again = http.post("/api/tenants/register", json=body, headers=keys["speechforge"])
         assert again.status_code == 200
         # another inference key can neither take it over nor remove it
-        takeover = http.post("/api/tenants/register", json=body, headers=keys["clawforge2"])
+        takeover = http.post("/api/tenants/register", json=body, headers=keys["imagegen"])
         assert takeover.status_code == 403
-        removal = http.delete("/api/tenants/speechforge", headers=keys["clawforge2"])
+        removal = http.delete("/api/tenants/speechforge", headers=keys["imagegen"])
         assert removal.status_code == 403
         # an admin may
         assert http.delete("/api/tenants/speechforge", headers=admin).status_code == 200
         # and once it is gone the name is free for anyone
-        free = http.post("/api/tenants/register", json=body, headers=keys["clawforge2"])
+        free = http.post("/api/tenants/register", json=body, headers=keys["imagegen"])
         assert free.status_code == 200
-        own = http.delete("/api/tenants/speechforge", headers=keys["clawforge2"])
+        own = http.delete("/api/tenants/speechforge", headers=keys["imagegen"])
         assert own.status_code == 200
 
 
@@ -224,7 +224,7 @@ async def test_the_mcp_release_honours_the_owning_key(mcp_app: Any, mode: str) -
 
     accounts = mcp_app.state.accounts
     owner_record, owner = accounts.create_key("speechforge", "inference")
-    _r, other = accounts.create_key("clawforge2", "inference")
+    _r, other = accounts.create_key("imagegen", "inference")
     _r, admin = accounts.create_key("root", "admin")
     book = mcp_app.state.manager.leases
     lease = book.acquire([0], holder="speechforge", holder_key=f"key:{owner_record.id}")
@@ -289,7 +289,7 @@ def test_the_holder_waiver_is_bound_to_the_owning_key_not_the_shared_loopback_pe
         vacate_token="t" * 32,
     )
     a = Principal("key", "a", "speechforge", "inference")
-    b = Principal("key", "b", "clawforge2", "inference")
+    b = Principal("key", "b", "imagegen", "inference")
     assert lease_holder_may_act(_fake_request(a), state, lease)
     # another key on the same machine, spelling the holder's label: refused
     assert not lease_holder_may_act(_fake_request(b, label="speechforge"), state, lease)
@@ -298,7 +298,7 @@ def test_the_holder_waiver_is_bound_to_the_owning_key_not_the_shared_loopback_pe
     # once the owning key is revoked, the D55 peer proof reclaims it
     keys[0] = _Key("a", live=False)
     assert lease_holder_may_act(_fake_request(b, label="speechforge"), state, lease)
-    assert not lease_holder_may_act(_fake_request(b, label="clawforge2"), state, lease)
+    assert not lease_holder_may_act(_fake_request(b, label="imagegen"), state, lease)
     assert not lease_holder_may_act(
         _fake_request(b, label="speechforge", peer="10.0.0.9"), state, lease
     )
@@ -353,14 +353,14 @@ def test_a_non_admin_vacate_url_obeys_the_tenant_url_rule(app: Any) -> None:
 
 def test_a_lease_from_before_the_upgrade_is_released_by_its_holders_proof(app: Any) -> None:
     """``release_stale`` at a tenant's boot must not 403 on its own pre-2.0.1 lease."""
-    keys = _keys(app, "speechforge", "clawforge2")
+    keys = _keys(app, "speechforge", "imagegen")
     book = app.state.manager.leases
     with TestClient(app, client=LOOPBACK) as http:
         # as migration 010 leaves an older row: no holder_key, the registering peer kept
         legacy = book.acquire([0], holder="speechforge", holder_peer=LOOPBACK[0])
         stranger = http.delete(
             f"/api/leases/{legacy.id}",
-            headers={**keys["clawforge2"], "X-SF-Client": "clawforge2"},
+            headers={**keys["imagegen"], "X-SF-Client": "imagegen"},
         )
         assert stranger.status_code == 403, stranger.text
         unlabelled = http.delete(f"/api/leases/{legacy.id}", headers=keys["speechforge"])
@@ -373,7 +373,7 @@ def test_a_lease_from_before_the_upgrade_is_released_by_its_holders_proof(app: A
 
 
 def test_a_key_bound_lease_is_not_released_by_another_key_spelling_its_label(app: Any) -> None:
-    keys = _keys(app, "speechforge", "clawforge2")
+    keys = _keys(app, "speechforge", "imagegen")
     with TestClient(app, client=LOOPBACK) as http:
         lease_id = http.post(
             "/api/leases",
@@ -382,7 +382,7 @@ def test_a_key_bound_lease_is_not_released_by_another_key_spelling_its_label(app
         ).json()["id"]
         spoofed = http.delete(
             f"/api/leases/{lease_id}",
-            headers={**keys["clawforge2"], "X-SF-Client": "speechforge"},
+            headers={**keys["imagegen"], "X-SF-Client": "speechforge"},
         )
         assert spoofed.status_code == 403, spoofed.text
 

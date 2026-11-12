@@ -44,7 +44,7 @@ does not touch it. What a benchmark *can* do is **ask** a worse-class tenant to 
   dispatched agent, 3 background (the default). This server's own benchmarks lease at
   `benchmark.lease_priority` (default 2). An outside benchmark client (CrucibleForge) sends
   `"priority": 2` on `POST /api/leases` (or `reserve_gpus(priority=2)`); a lease that sends
-  nothing is class 3 and asks nobody. Render tenants (ClawForge2) lease at class 3 and register a
+  nothing is class 3 and asks nobody. Render tenants (an image-generation tenant) lease at class 3 and register a
   `vacate_url`.
 * **What `409 lease_vacating` means.** Every lease in your way is a worse class that registered a
   vacate endpoint, and the server has just POSTed it one vacate request. Nothing is yours yet.
@@ -69,23 +69,22 @@ does not touch it. What a benchmark *can* do is **ask** a worse-class tenant to 
   vacate endpoint. `Retry-After` carries the holder's own countdown; wait for its `expires_at`,
   or lease other cards.
 
-**Runbook when the tenant cannot vacate.** An *adopted* ComfyUI (one ClawForge2 found running
-rather than launched) is never killed or re-pinned by ClawForge2; the most it can do is
+**Runbook when the tenant cannot vacate.** An *adopted* ComfyUI (one the tenant found running
+rather than launched) is never killed or re-pinned by that tenant; the most it can do is
 `/free` — unload models and free memory — which leaves the CUDA context (~0.3–0.5 GB) on the
-card. If `lease_vacating` times out, or the tenant is a ClawForge2 build without the vacate
+card. If `lease_vacating` times out, or the tenant is a build without the vacate
 route:
 
-1. Quiesce it by hand: `comfy_control(action="free_vram")` on ClawForge2's MCP, the tray's
-   "Unload all models (free VRAM)", or `POST :8700/ui/api/control {"action": "free_vram"}`. Check
-   `GET /api/vram/holders`: ComfyUI's `per_gpu_bytes` on the card should be small.
+1. Quiesce it by hand: ask the tenant to free ComfyUI's VRAM (its own tool, tray or control API).
+   Check `GET /api/vram/holders`: ComfyUI's `per_gpu_bytes` on the card should be small.
 2. Release its lease: `release_gpus(lease_id=...)` / `sfctl leases release <id>` /
    `DELETE /api/leases/<id>` — or wait for its idle TTL. **Then take the benchmark lease at
    once**: any render submitted in the gap re-leases the card lazily.
-3. Stop new renders for the run's duration ("Stop server" on the ClawForge2 tray) — the
+3. Stop new renders for the run's duration (stop the tenant's server) — the
    adopted ComfyUI stays up at its residual footprint, which is acceptable.
 4. Run the benchmark; the residual VRAM is simply absent from what the planner can use, and a
    placement that needed it fails that mode by name.
-5. Resume: start the ClawForge2 server again, or do nothing — its next render re-leases the card
+5. Resume: start the tenant's server again, or do nothing — its next render re-leases the card
    through its own adopt path once the benchmark's lease is gone.
 
 ---

@@ -10,8 +10,8 @@ this server entirely (a ComfyUI run, a training job).
 The book lives in memory and is mirrored to the registry (D61). It was
 in-memory only until 2026-09-10, on the theory that a lease describes a live
 situation and a restart is a clean slate; that morning a restart emptied the
-book and two tenants' loads landed on the card ClawForge2 had leased for
-ComfyUI, and every re-ask since answered ``503 busy`` because a lease never
+book and two tenants' loads landed on the card an image-generation tenant had
+leased for ComfyUI, and every re-ask since answered ``503 busy`` because a lease never
 interrupts a stream (D36). Now every acquire, release and vacate mark is
 written through, touches are written on a coalesced clock, and a restart
 restores the standing leases with their clocks -- a holder that did
@@ -127,15 +127,26 @@ LEASE_OPEN_ENDED_RETRY_S = 60.0
 #: It exists because "stand down entirely" (a benchmark owns four cards for an
 #: hour) and "wait ninety seconds" (someone is rendering one picture) are
 #: opposite answers that a holder string could not tell apart.
+#:
+#: These are the built-in families. An operator whose own programs lease under
+#: other names adds them with ``leases.holder_kinds`` in config.yaml, which
+#: :func:`configure_holder_kinds` merges over this table.
 LEASE_KINDS: dict[str, str] = {
     "crucibleforge": "benchmark",
     "benchmark": "benchmark",
-    "clawforge": "render",
-    "clawforge2": "render",
+    "imagegen": "render",
     "comfyui": "render",
     "openclaw": "agent",
     "agent": "agent",
 }
+
+#: The values :data:`LEASE_KINDS` and ``leases.holder_kinds`` may map a family to.
+LEASE_KIND_VALUES: frozenset[str] = frozenset({"benchmark", "render", "agent", "other"})
+
+#: ``leases.holder_kinds`` from config.yaml, set by :func:`configure_holder_kinds`.
+#: Consulted before :data:`LEASE_KINDS`, so an operator can also re-describe a
+#: built-in family.
+_CONFIGURED_KINDS: dict[str, str] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -464,8 +475,8 @@ class LeaseBook:
         lease.vacate_deadline = stamp + deadline_s
         # A quiet period equal to the window follows a lapse: bounded on both
         # sides, so a requester that keeps re-asking costs the holder one POST
-        # per two windows, and a holder that restarted mid-window (ClawForge2
-        # re-adopts its lease) is asked again rather than never.
+        # per two windows, and a holder that restarted mid-window (and
+        # re-adopted its lease) is asked again rather than never.
         lease.vacate_reask_at = stamp + 2 * deadline_s
         lease.vacate_delivery = "pending"
         lease.vacate_delivery_status = None
@@ -667,9 +678,25 @@ def lease_kind(holder: str) -> str:
 
     Derived from :func:`holder_family` in this one place so the REST view, the
     MCP view and a 507's lease records cannot drift into three answers. See
-    :data:`LEASE_KINDS`: descriptive, never enforced.
+    :data:`LEASE_KINDS`: descriptive, never enforced. ``leases.holder_kinds``
+    from config.yaml is consulted first.
     """
-    return LEASE_KINDS.get(holder_family(holder), "other")
+    family = holder_family(holder)
+    return _CONFIGURED_KINDS.get(family) or LEASE_KINDS.get(family, "other")
+
+
+def configure_holder_kinds(mapping: Mapping[str, str] | None) -> None:
+    """Install ``leases.holder_kinds`` (family -> kind) over the built-in table.
+
+    Called whenever the config is built or saved. Keys are lower-cased the way
+    :func:`holder_family` lower-cases a holder; values must be one of
+    :data:`LEASE_KIND_VALUES` (the config model already refuses anything else).
+    ``None`` or ``{}`` restores the built-in table alone.
+    """
+    _CONFIGURED_KINDS.clear()
+    for family, kind in (mapping or {}).items():
+        if kind in LEASE_KIND_VALUES:
+            _CONFIGURED_KINDS[str(family).strip().lower()] = kind
 
 
 def lease_idle_after_s(lease: GpuLease) -> float:
@@ -927,7 +954,7 @@ async def vacate_url_targets_self(
     and the D32 gate trusts a loopback peer -- so a ``vacate_url`` aimed at
     ``/api/restart/...`` on our own port would be a remote restart button for
     anyone allowed to register a lease. Only our ports are refused: a holder
-    on the same box (ClawForge2 on :8700) is the expected deployment.
+    on the same box (an image gateway on its own port) is the expected deployment.
 
     Literals and ``localhost`` are decided without I/O. A name is resolved
     through the loop's executor with a short cap; a name that cannot be

@@ -276,7 +276,7 @@ async def test_the_unload_guard_composes_with_a_vacate_release() -> None:
     manager, supervisor = make_manager([tenant_model])
     manager._vacate_sender = Recorder()
     tenant = await manager.acquire_lease(
-        [2], holder="clawforge2", model_ids=[tenant_model.id], vacate_url=HOLDER_URL
+        [2], holder="imagegen", model_ids=[tenant_model.id], vacate_url=HOLDER_URL
     )
     supervisor.instances[tenant_model.id] = placed(tenant_model.id, [2])
 

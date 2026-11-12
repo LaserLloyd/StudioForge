@@ -131,7 +131,7 @@ def test_prefer_does_not_outrank_an_empty_card() -> None:
 
 def test_leased_busy_pinned_and_better_tier_cards_are_out() -> None:
     book = LeaseBook()
-    book.acquire([0], holder="clawforge2")
+    book.acquire([0], holder="imagegen")
     residents = [
         resident("busy/model", [1], busy=1),
         resident("pinned/model", [2], pinned=True),
@@ -153,7 +153,7 @@ def test_leased_busy_pinned_and_better_tier_cards_are_out() -> None:
 
 def test_force_admits_pinned_and_better_tier_cards_but_never_busy_or_leased() -> None:
     book = LeaseBook()
-    book.acquire([0], holder="clawforge2")
+    book.acquire([0], holder="imagegen")
     residents = [
         resident("busy/model", [1], busy=1),
         resident("pinned/model", [2], pinned=True),
@@ -220,7 +220,7 @@ async def test_auto_grants_on_the_chosen_card_and_evicts_only_there() -> None:
     assert lease.devices == [0] and placement.devices == [0]
     assert "bg/model" in supervisor.instances, "an unchosen card's resident is untouched"
     assert manager.leases.all() == [lease]
-    second = await manager.acquire_lease("auto", holder="clawforge2")
+    second = await manager.acquire_lease("auto", holder="imagegen")
     assert second.devices == [3], "the leased card is skipped; the 3090 with more free VRAM wins"
 
 
@@ -228,7 +228,7 @@ async def test_auto_refusals_carry_the_known_codes_and_the_considered_rows() -> 
     manager, supervisor = _manager(rig(31.0, 31.0))
     supervisor.instances["busy/model"] = resident("busy/model", [0], busy=1)
     supervisor.instances["bg/model"] = resident("bg/model", [1])
-    manager.leases.acquire([1], holder="clawforge2")
+    manager.leases.acquire([1], holder="imagegen")
     with pytest.raises(ModelBusyError) as busy:
         await manager.acquire_lease("auto", holder="speechforge")
     assert busy.value.details["retry_after_s"] and busy.value.details["placement"] == "auto"
@@ -314,7 +314,7 @@ def test_the_route_takes_auto_and_returns_the_placement(app: Any) -> None:
     body = reply.json()
     assert body["devices"] == [0] and body["placement"]["mode"] == "auto"
     assert body["placement"]["considered"][0]["verdict"] == VERDICT_CHOSEN
-    omitted = local.post("/api/leases", json={"holder": "clawforge2"})
+    omitted = local.post("/api/leases", json={"holder": "imagegen"})
     assert omitted.status_code == 200 and omitted.json()["devices"] == [1]
     explicit = local.post("/api/leases", json={"devices": [1], "holder": "again"})
     assert explicit.status_code == 409 and "placement" not in explicit.json()

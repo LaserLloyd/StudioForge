@@ -301,7 +301,7 @@ model_info mark such models arch_supported: false and recommend no load.
 
 SAY WHO YOU ARE AND WHAT THE WORK IS. Send X-SF-Client: <your agent name> on
 every /v1 request (server_status and GET /api/status.clients attribute traffic
-by it) and use the same name as your ClawForge `client` tag and as the holder
+by it) and use the same name as your `client` tag on other rig services and as the holder
 of any lease you take. Put `priority` in the chat body: 1 a person is waiting
 on this turn, 2 a dispatched agent, 3 or omitted background -- omitted is
 background and a tier-1/2 load holds it off with 503 priority_hold.

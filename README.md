@@ -463,7 +463,7 @@ There is also [a write-up](https://www.laserlloyd.com/projects/studioforge-gpu-o
 
 ## Related projects
 
-Same author, built to share one GPU box with StudioForge: [ClawForge](https://github.com/LaserLloyd/ClawForge) (image generation over ComfyUI), [SpeechForge](https://github.com/LaserLloyd/SpeechForge) (GPU speech server) and [DisPatch](https://github.com/LaserLloyd/DisPatch_Chat) (a self-hosted chat app). ClawForge and SpeechForge take a StudioForge lease before they use a card. The panel theme is [ThemeForge](https://github.com/LaserLloyd/ThemeForge).
+Same author, built to share one GPU box with StudioForge: [SpeechForge](https://github.com/LaserLloyd/SpeechForge) (GPU speech server) and [DisPatch](https://github.com/LaserLloyd/DisPatch_Chat) (a self-hosted chat app). SpeechForge takes a StudioForge lease before it uses a card. The panel theme is [ThemeForge](https://github.com/LaserLloyd/ThemeForge).
 
 ## Contact
 

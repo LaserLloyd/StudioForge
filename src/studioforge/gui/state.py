@@ -6242,6 +6242,9 @@ CUSTOM_WIDGET_KEYS: Final = frozenset(
         # which shows what the file declares; the file itself is edited by
         # hand, or tenants register themselves at runtime.
         "tenants.registry",
+        # A family -> lease-kind map (D84), read at start. Like the registry it
+        # is edited in config.yaml by hand: a text box would flatten the map.
+        "leases.holder_kinds",
     }
 )
 

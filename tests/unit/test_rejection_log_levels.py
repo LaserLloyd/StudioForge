@@ -108,7 +108,7 @@ def test_the_sets_are_disjoint_and_the_retry_set_is_the_documented_one() -> None
         "insufficient_vram",
         "unsupported_architecture",
     } == app_module.WARNING_REJECTION_CODES
-    # docs/OPENCLAW-RIG.md's closed list, less client_quota (a ClawForge2 code).
+    # docs/OPENCLAW-RIG.md's closed list, less client_quota (an image-gateway code).
     assert {
         "priority_hold",
         "model_busy",
@@ -121,7 +121,7 @@ def test_the_sets_are_disjoint_and_the_retry_set_is_the_documented_one() -> None
 
 def test_the_error_handler_uses_it(app: Any, recorded: RecordingLog) -> None:  # noqa: F811 - the imported fixture, by design
     async def refuse(*_a: Any, **_k: Any) -> Any:
-        raise LeaseConflictError("CUDA [1] is leased to clawforge2")
+        raise LeaseConflictError("CUDA [1] is leased to imagegen")
 
     app.state.manager.load = refuse
     with TestClient(app, client=("127.0.0.1", 50000)) as http:
@@ -132,6 +132,6 @@ def test_the_error_handler_uses_it(app: Any, recorded: RecordingLog) -> None:  #
         (
             "warning",
             "request rejected",
-            {"error": "CUDA [1] is leased to clawforge2", "code": "lease_conflict", "status": 409},
+            {"error": "CUDA [1] is leased to imagegen", "code": "lease_conflict", "status": 409},
         )
     ]

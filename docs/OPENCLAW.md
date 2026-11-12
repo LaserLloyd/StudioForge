@@ -6,8 +6,8 @@ is the section to read if you are the agent; everything else is tuning and troub
 > Looking for a step-by-step install for a two-machine (rig → agent box) deployment, with
 > verification at each step? See [OPENCLAW-SETUP.md](OPENCLAW-SETUP.md) — every hostname and
 > address on it is a placeholder to substitute. This page is the shorter reference.
-> If this rig also runs the ClawForge2 image service on the same GPUs, read
-> [OPENCLAW-RIG.md](OPENCLAW-RIG.md) as well — one page for an agent that uses both, covering the
+> If this rig also runs other programs that share the same GPUs, read
+> [OPENCLAW-RIG.md](OPENCLAW-RIG.md) as well — one page for an agent on a shared rig, covering the
 > identity string, the priority tiers, the lease etiquette and one failure-code table for both
 > services. For the formulas behind the catalog's columns see [CATALOG.md](CATALOG.md), and for
 > what long context costs on real models see [OPENCLAW-LONG-CONTEXT.md](OPENCLAW-LONG-CONTEXT.md)
@@ -476,7 +476,7 @@ same `vacate_url`, so keep touching and keep the id. What does not come back: a 
 its `idle_ttl_s` while the server was down (the sweep would have released it), and the server's
 own benchmark leases (their holder did not survive). A vacate that was in flight at the restart is
 forgotten; a better class asking again starts the protocol over. Before D61 a restart emptied the
-book, and on 2026-09-10 two other tenants' loads landed on the card ClawForge2 had leased for
+book, and on 2026-09-10 two other tenants' loads landed on the card an image-generation tenant had leased for
 ComfyUI — every re-ask since answered `503 busy`, because a lease never interrupts a stream.
 
 **Reading a lease record.** Every lease projection — `GET /api/leases`, `GET /api/status`,

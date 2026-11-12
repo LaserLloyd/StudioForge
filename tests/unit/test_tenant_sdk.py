@@ -228,7 +228,7 @@ async def test_touch_release_and_stale_release_by_family() -> None:
             "leases": [
                 lease_row(),
                 lease_row(id="gone", holder="speechforge-canary", holder_family="speechforge"),
-                lease_row(id="theirs", holder="clawforge2", holder_family="clawforge2"),
+                lease_row(id="theirs", holder="imagegen", holder_family="imagegen"),
             ]
         },
     )

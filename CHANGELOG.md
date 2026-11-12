@@ -187,7 +187,7 @@ New commands, so a minor version. Nothing is removed or renamed; no route change
 
 - D80: the tenant side of the VRAM protocol no longer needs an `admin` key. `POST /api/leases`,
   `POST /api/leases/{id}/touch`, `DELETE /api/leases/{id}`, `POST /api/tenants/register` and
-  `DELETE /api/tenants/{name}` are `inference` scope (were `admin`, so SpeechForge and ClawForge2,
+  `DELETE /api/tenants/{name}` are `inference` scope (were `admin`, so SpeechForge and an image-generation tenant,
   which hold `inference` keys, got `403` taking a lease). Each lease and registration is bound to the
   key that created it: another `inference` key cannot renew, release, re-register or deregister it
   (`403 permission_denied`); an `admin` key still can. Warming a tenant stays `admin`. Schema 10 adds

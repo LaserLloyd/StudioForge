@@ -255,10 +255,9 @@ def test_the_prefix_cache_doc_names_the_real_signals() -> None:
 
 
 # ---------------------------------------------------------------------------
-# OPENCLAW-RIG.md: the whole-rig page an agent reads before touching either
-# service. It is the one doc that names things in ANOTHER repository, so it
-# needs a guard on both halves: our own tool and code names are checked against
-# the code, and ClawForge2's are pinned as literals that a human re-checks.
+# OPENCLAW-RIG.md: the whole-rig page an agent reads before touching the rig.
+# It documents StudioForge only (other programs that lease cards document
+# their own errors), so its tool and code names are checked against the code.
 # ---------------------------------------------------------------------------
 
 RIG_DOC = REPO_ROOT / "docs" / "OPENCLAW-RIG.md"
@@ -279,47 +278,6 @@ _RIG_MANAGEMENT_TOOLS = (
 #: Watchdog tools the page names. They live in the sidecar, and the proxy's
 #: unprefixed allowlist is the authority on their exposed spelling.
 _RIG_WATCHDOG_TOOLS = ("restart_server", "reclaim_orphan_engines")
-
-#: ClawForge2 error codes quoted in the failure table. ClawForge2 is a separate
-#: repository, so this stays a literal: it is the list a human re-checks against
-#: `clawforge2/core/errors.py::ALL_CODES` when that build changes. Everything
-#: here must appear in the page; a code the page stops teaching is either a
-#: deliberate trim (update this tuple) or a hole in the table.
-_CLAWFORGE2_CODES = (
-    "gpu_leased",
-    "client_quota",
-    "insufficient_vram",
-    "insufficient_compute_cap",
-    "backend_unavailable",
-    "stalled",
-    "cancelled",
-    "workflow_not_found",
-    "unknown_shot",
-    "unknown_detector",
-    "invalid_priority",
-    "invalid_detail",
-    "invalid_scope",
-    "missing_client",
-    "empty_prompt",
-    "job_not_found",
-    "ambiguous_last",
-    "captioner_unavailable",
-    "not_privileged",
-    "egress_blocked",
-    "fetch_failed",
-    "adopted_backend",
-    "restart_no_op",
-)
-#: ClawForge2 `can_render_reason` values the page tells an agent to branch on.
-_CLAWFORGE2_CAN_RENDER_REASONS = (
-    "cards_leased",
-    "circuit_open",
-    "backoff",
-    "unmanaged_backend_down",
-    "comfyui_path_invalid",
-    "port_taken",
-    "no_suitable_gpu",
-)
 
 
 def _studioforge_error_codes() -> set[str]:
@@ -411,28 +369,23 @@ def test_the_rig_pages_failure_table_uses_real_codes() -> None:
             f"vacate.state {state!r} is not taught on the rig page"
         )
 
-    for code in _CLAWFORGE2_CODES:
-        assert f"`{code}`" in text, f"ClawForge2's `{code}` is missing from the failure table"
-    for reason in _CLAWFORGE2_CAN_RENDER_REASONS:
-        assert f"`{reason}`" in text, f"`can_render_reason: {reason}` is not covered"
-
 
 def test_the_rig_page_teaches_the_cross_service_rules() -> None:
-    """The four things that are true of the rig and of neither service alone:
-    one identity string, two different priority defaults, what a lease `kind`
-    obliges you to do, and that a stale MCP session is a 404 to re-initialise
-    through rather than an error to retry."""
+    """The things that are true of the rig and of no single service alone:
+    one identity string, the priority default, what a lease `kind` obliges you
+    to do, and that a stale MCP session is a 404 to re-initialise through
+    rather than an error to retry."""
     text = RIG_DOC.read_text(encoding="utf-8")
-    assert "X-SF-Client" in text and 'client="openclaw-<agent>"' in text
-    assert "**3 — background**" in text and "**2 — normal**" in text
+    assert "X-SF-Client" in text and 'holder="openclaw-<agent>"' in text
+    assert "**3 — background**" in text
     for kind in ("`benchmark`", "`render`", "`agent`", "`other`"):
         assert kind in text, kind
     assert "stand down" in text
     assert "Session not found" in text and "initialize" in text
     assert "`lease_vacating`" in text and "vacate_url" in text
-    # `foreign: null` is not `[]`, and the difference decides whether an agent
-    # stops working. It was the easiest thing to leave out.
-    assert "null" in text and "leases.foreign" in text
+    # A lease without `expires_at` is held until released, not stuck, and an
+    # agent reads the book through `server_status().leases`.
+    assert "expires_at" in text and "server_status().leases" in text
 
 
 def test_the_rig_page_keeps_the_rig_anonymous() -> None:

@@ -22,7 +22,7 @@ update path; the protocol is only how they share the cards.
 | --- | --- |
 | **tenant** | Any program other than StudioForge that allocates GPU memory on the box and takes a lease before it does. |
 | **module** | A tenant that is also an optional add-on StudioForge shows on its own Tenants card and may *ask* to warm (one POST to the module's `warm_url`). A module is still its own process with its own launcher; `kind: module` changes what the GUI offers, nothing about who starts it. |
-| **holder** | The `holder` string a lease carries, e.g. `speechforge`, `clawforge2`, `crucibleforge-judge`, `openclaw-main`. |
+| **holder** | The `holder` string a lease carries, e.g. `speechforge`, `imagegen`, `crucibleforge-judge`, `openclaw-main`. |
 | **holder family** | Everything before the first `-` or `:` in a holder, lower-cased: `crucibleforge-judge` → `crucibleforge`. Every lease view carries it as `holder_family`; a tenant's registry row carries it as `family`, and the row's `leases[]` are the book filtered by it. Match families, never exact holder strings (D53). |
 | **class** (`priority`) | The D46 tier of a claim: **1** the model a person is actively chatting with, **2** a dispatched agent's work (a voice session a person is waiting on belongs here too — see §2), **3** background (renders, benchmarks, anything that never said). The same three numbers a load carries. |
 | **lease** | An exclusive claim on one or more whole CUDA devices. While it stands StudioForge plans nothing else onto those cards (D43). |
@@ -38,7 +38,7 @@ item 6 wrote them down:
 | --- | --- | --- | --- |
 | 1 | `PRIORITY_CHAT` — "active chat" | the companion a person is typing to | an idle resident of class 2 or 3 |
 | 2 | `PRIORITY_AGENT` — "dispatched agent" | an agent's model; **a voice session** (SpeechForge S3: a person is waiting, but voice must never evict the chat model); StudioForge's own benchmarks (`benchmark.lease_priority`, default 2) | an idle resident of class 2 or 3 |
-| 3 | `PRIORITY_BACKGROUND` — the default | renders (ClawForge2), harness runs, anything that never said | an idle resident of class 3 |
+| 3 | `PRIORITY_BACKGROUND` — the default | renders (an image-generation tenant), harness runs, anything that never said | an idle resident of class 3 |
 
 Three rules hold at every class:
 
@@ -134,7 +134,7 @@ better class** asks for cards the lease holds, and every lease in the way regist
 
 What a tenant should do with the request is its own business and should be bounded: SpeechForge
 drains in-flight work for at most 15 s, unloads, releases and stays off the card for its
-`vacate_cooldown_s`; ClawForge2 stops accepting renders, lets the one inside ComfyUI finish, frees
+`vacate_cooldown_s`; an image-generation tenant stops accepting renders, lets the one inside ComfyUI finish, frees
 what it can and releases. The token comparison must be constant-time and the route should accept
 only loopback (StudioForge and the tenant share the box); `vacate_asgi_route` in the SDK does both.
 
@@ -168,7 +168,7 @@ noise. To invoke D56, name the card.
 1. **Lease before you allocate**, on the card you are about to use, under a stable `holder`
    whose family is your name. Send `X-SF-Client: <holder>` on every call too (D70).
 2. **Say your class** honestly (§2) and **never send `force`**. A pinned or deliberately placed
-   model is the operator's decision (ClawForge2's rule; SpeechForge S3).
+   model is the operator's decision (an image-generation tenant's rule; SpeechForge S3).
 3. **Release your own stale leases at boot.** D61 keeps a lease across a StudioForge restart and
    a crash of yours leaves one standing for up to its TTL: `GET /api/leases`, filter by your
    `holder_family`, `DELETE` each. Nothing of yours is loaded at boot, so all of them are stale.
@@ -312,7 +312,7 @@ tenants:
 ```
 
 A declared tenant appears on the Tenants card with live health before it has ever registered.
-`config.example.yaml` carries SpeechForge (a module) and ClawForge2 (a tenant), commented out.
+`config.example.yaml` carries SpeechForge (a module) and an image-generation tenant, commented out.
 
 ### `POST /api/tenants/register` — announce yourself (idempotent; send at every boot)
 
@@ -409,7 +409,7 @@ match outcome:
 app.mount("/v1/speech/vacate", vacate_asgi_route(client.token_matches, drain_and_release))
 ```
 
-Its README says how SpeechForge and ClawForge2 would adopt it without changing their behaviour.
+Its README says how SpeechForge and an image-generation tenant would adopt it without changing their behaviour.
 
 ## 12. Decisions
 

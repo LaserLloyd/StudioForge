@@ -63,7 +63,7 @@ async def test_a_load_that_fails_after_the_keepalives_ends_with_an_error_frame_t
     leased = InsufficientVramError(
         "Cannot load 'vendor/thing-Q4_K_M' entirely in VRAM: CUDA [1] is leased",
         code="gpu_leased",
-        details={"retry_after_s": 60, "lease": {"id": "4398b3afda14", "holder": "clawforge2"}},
+        details={"retry_after_s": 60, "lease": {"id": "4398b3afda14", "holder": "imagegen"}},
     )
     frames = await _frames(_state(leased))
 

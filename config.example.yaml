@@ -259,6 +259,11 @@ leases:
   vacate_timeout_s: 180.0
   vacate_retry_after_s: 15.0
   vacate_callback_timeout_s: 30.0
+  # Lease `kind` for holders this server does not know by name (D84):
+  # family -> benchmark | render | agent | other. A client reads render/agent
+  # as "wait and re-ask" and benchmark as "stand down". Read at start.
+  #   holder_kinds: {myrenderer: render}
+  holder_kinds: {}
 tenants:
   # The tenant registry (D77, docs/TENANTS.md): other programs that share
   # these GPUs. Declaring one here puts it on the Tenants card with live health
@@ -279,11 +284,11 @@ tenants:
   #     warm_url: http://127.0.0.1:1236/v1/speech/warm
   #     default_priority: 2
   #     notes: speech-to-text and text-to-speech; leases one card while a session is open
-  #   # ClawForge2, the image gateway: a plain tenant that leases ComfyUI's card.
-  #   - name: clawforge2
+  #   # An image gateway in front of ComfyUI: a plain tenant that leases ComfyUI's card.
+  #   - name: imagegen
   #     kind: tenant
-  #     health_url: http://127.0.0.1:8700/health
-  #     status_url: http://127.0.0.1:8700/ui/api/status
+  #     health_url: http://127.0.0.1:8710/health
+  #     status_url: http://127.0.0.1:8710/status
   #     default_priority: 3
   registry: []
   health_interval_s: 30.0

@@ -222,7 +222,7 @@ _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 #: the calls a program that SHARES this rig's cards makes about itself -- take,
 #: renew and release its own lease (a release is also the vacate
 #: acknowledgement: a holder asked to leave answers by releasing), register and
-#: deregister itself. A tenant such as SpeechForge or ClawForge2 holds an
+#: deregister itself. A tenant such as a speech or image server holds an
 #: ``inference`` key and must never need an ``admin`` one for these (2.0.1).
 #: The matching routes check ownership in the handler (:func:`require_owner`):
 #: a non-admin key reaches only what it created. Everything else under

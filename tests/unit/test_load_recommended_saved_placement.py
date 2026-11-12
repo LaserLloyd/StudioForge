@@ -201,7 +201,7 @@ async def test_a_lease_on_an_override_card_still_refuses_and_names_the_override(
     """Leases are unchanged (D43/D64): the walk never lands on a leased card,
     and because the override is the owner's own, the advice is to clear it."""
     book = LeaseBook()
-    book.acquire([2], holder="clawforge2", model_ids=["comfy/thing"])
+    book.acquire([2], holder="imagegen", model_ids=["comfy/thing"])
     manager, supervisor, _registry = make_manager(
         settings=ModelSettings(device_override=THREE_CARDS), leases=book
     )

@@ -127,7 +127,7 @@ def test_holder_family_collapses_a_phase_suffix() -> None:
 def test_lease_kind_is_descriptive_and_never_policy() -> None:
     book = LeaseBook()
     bench = book.acquire([0], holder="crucibleforge-judge", model_ids=["mine"])
-    render = book.acquire([1], holder="clawforge2")
+    render = book.acquire([1], holder="imagegen")
     stranger = book.acquire([2], holder="somebody")
 
     assert lease_kind(bench.holder) == "benchmark"
@@ -160,7 +160,7 @@ def test_lease_state_moves_through_active_idle_and_expiring() -> None:
 
 def test_lease_state_bands_are_relative_to_a_short_ttl() -> None:
     """W1 of the 2026-09-04 live review: with the thresholds absolute, a fresh
-    300 s lease read ``expiring`` from its first second and ClawForge2's 600 s
+    300 s lease read ``expiring`` from its first second and the image gateway's 600 s
     render lease read ``expiring`` for half its life. The bands are now
     ``min(absolute, fraction of the TTL)``: half the TTL to ``idle``, the
     last quarter ``expiring``, and the long lease keeps its 300 s numbers."""
@@ -175,7 +175,7 @@ def test_lease_state_bands_are_relative_to_a_short_ttl() -> None:
     book = LeaseBook()
     start = 1_000_000.0
     short = book.acquire([0], holder="api", idle_ttl_s=300.0, now=start)
-    render = book.acquire([1], holder="clawforge2", idle_ttl_s=600.0, now=start)
+    render = book.acquire([1], holder="imagegen", idle_ttl_s=600.0, now=start)
     long = book.acquire([2], holder="crucibleforge", idle_ttl_s=7200.0, now=start)
     forever = book.acquire([3], holder="api", idle_ttl_s=None, now=start)
 
@@ -696,12 +696,12 @@ def test_lease_check_refuses_a_saved_override_that_touches_one_leased_card() -> 
     straddling = make_record("straddling/model", device_override=[0, 1])
     clear = make_record("clear/model", device_override=[1, 2])
     manager, _supervisor = make_manager([straddling, clear])
-    manager.leases.acquire([0], holder="clawforge2", model_ids=[])
+    manager.leases.acquire([0], holder="imagegen", model_ids=[])
 
     with pytest.raises(InsufficientVramError) as excinfo:
         manager.lease_check("straddling/model")
     assert excinfo.value.code == "gpu_leased"
-    assert excinfo.value.details["lease"]["holder"] == "clawforge2"
+    assert excinfo.value.details["lease"]["holder"] == "imagegen"
     assert "[0]" in excinfo.value.message
 
     # An override that avoids the leased card is not this check's business.

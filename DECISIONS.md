@@ -2730,7 +2730,7 @@ the list -- the two shapes had diverged), `tests/unit/test_gui.py` (filtering on
 
 **Problem.** Placements accrete. Measured on this rig, 2026-08-20: at 13:42 a 27B was planned onto
 `[1, 3]` -- a 5090/3090 cross-tier split sharing GPU1 -- because the 31B then held `[1, 0, 2]` and
-ClawForge held 7.5 GiB of GPU2, so that genuinely was the best fit at that instant. At 13:53 the
+the image gateway held 7.5 GiB of GPU2, so that genuinely was the best fit at that instant. At 13:53 the
 31B was reloaded with a q8_0 cache and shrank to `[0, 1]`. From that moment `[2, 3]` sat free and
 strictly better -- no shared card, no cross-tier hop -- and the 27B stayed on `[1, 3]` anyway,
 contending with the 31B on GPU1 for every request either of them served. Every plan was optimal
@@ -3294,7 +3294,7 @@ hold an *idle* chat- or agent-tier resident (`LeaseConflictError`, `force=true` 
 exactly as it does for a pin) -- D46's rule that the lease plane must not be an end-run around the
 tiers. That branch was near-unreachable in practice while tiers died with the process: after any
 restart every resident was background. With tiers persisted it fires for real, so the workflows that
-lease cards on this rig -- ClawForge taking a card for a render, ClawChat reserving one for a
+lease cards on this rig -- the image gateway taking a card for a render, ClawChat reserving one for a
 companion -- should expect it and pass `force=true` deliberately rather than read it as a new
 refusal.
 
@@ -4165,7 +4165,7 @@ does not say it in a form a program can use.
 `_vram_error` passes `code=rejected.reason_code or None` into `InsufficientVramError` -- the D48
 `priority_hold` mechanism, where a per-raise code overrides the class default and `None` leaves it
 alone -- and puts `lease`, `leases` and `retry_after_s` in the details. The status stays **507** on
-purpose: ClawForge2 and the drafter already branch on it, and changing a status to carry
+purpose: the image gateway and the drafter already branch on it, and changing a status to carry
 information a body can carry breaks working clients for nothing. `api/app.py` now sets
 `Retry-After` for *any* status whose details know the wait, which subsumes the old 429-only branch
 and gives the leased 507 a header every HTTP client already understands. A genuine shortfall has no
@@ -4218,7 +4218,7 @@ lowercased: one rule, no registry, and both CrucibleForge phases answer `crucibl
 
 **Amended 2026-09-04 (round 2): the `state` bands are relative to the lease's own TTL.** The two
 thresholds above were absolute, and the live vacate test showed what that does to a short lease: a
-fresh `idle_ttl_s: 300` lease reported `expiring` from its first second, and ClawForge2's 600 s
+fresh `idle_ttl_s: 300` lease reported `expiring` from its first second, and an image tenant's 600 s
 render lease would read `expiring` for half its life -- the one word a waiting client reads, turned
 into noise. Now `idle` begins at `min(300 s, idle_ttl_s / 2)` of quiet and `expiring` covers the
 last `min(300 s, idle_ttl_s / 4)` (`lease_idle_after_s`, `lease_expiring_within_s`;
@@ -4643,13 +4643,13 @@ the Logs tab's refusal and its refresh guard, `_open_path`; the MCP unload waivi
 
 **Problem.** Two tenants share the four cards with a benchmark client, and the lease book is
 strictly first-come-first-served (D43). On 2026-09-04 that produced the shape the interaction
-research named Hole A/C: a CrucibleForge run wanting `[0,1,2,3]` met ClawForge2's standing render
+research named Hole A/C: a CrucibleForge run wanting `[0,1,2,3]` met an image tenant's standing render
 lease on `[2]` and had exactly two answers -- `409 lease_conflict` with no `Retry-After`, or
 `force`, which does not touch a standing lease at all (D43 item 3). The best case was "wait for
 the render tenant to idle out (600 s + sweep), provided no render arrives in between", and a
 trickle of renders holds the card indefinitely. Nothing could *ask* the tenant to leave, and
 StudioForge cannot free the tenant's VRAM itself: ComfyUI's process is `foreign` and D23 promises
-foreign holders are never killed from here. Only ClawForge2 can tell ComfyUI to `/free`, and only
+foreign holders are never killed from here. Only the image tenant can tell ComfyUI to `/free`, and only
 it knows whether a render is mid-flight.
 
 Two smaller defects rode along: the `409 lease_conflict` carried `retry_after_s` only inside its
@@ -4667,7 +4667,7 @@ lease read as kind `other` -- inverting the "stand down" advice a client derives
    through to today's 409. D53 declined a stored `priority` because it would have been
    descriptive only; here it *is* the preemption class, so storing it is honest (D47).
 2. **A holder may register where to be asked.** `vacate_url` (http(s), no credentials, never
-   this server's own listener -- the same self-target refusal ClawForge2's job callbacks make,
+   this server's own listener -- the same self-target refusal an image tenant's job callbacks make,
    with `127.1`-style literals, `localhost`, IPv4-mapped IPv6 and names that resolve to loopback
    all caught) and `vacate_token`, a bearer the *holder* minted. The token is excluded at the
    model (`Field(exclude=True, repr=False)`), popped from every view, keyed into the D6 redaction
@@ -4681,7 +4681,7 @@ lease read as kind `other` -- inverting the "stand down" advice a client derives
    leases.vacate_timeout_s`), spawns one POST per lease -- `{lease_id, devices, requester,
    requester_priority, deadline_s, deadline_at}` with `X-SF-Vacate-Token` and `X-SF-Lease-Id`,
    10 s timeout, no redirects, `trust_env=False`, a process-cached SSL context built off the
-   loop (the ClawForge2 callbacks lesson: a fresh `SSLContext` per client is 250 ms of blocking
+   loop (the image tenant's callbacks lesson: a fresh `SSLContext` per client is 250 ms of blocking
    work) -- and answers **`409 lease_vacating`** with `retry_after_s` (15) and a `Retry-After`
    header. The requester re-asks; inside the window nothing is re-sent (dedupe per lease, from
    any better-class asker); when the holder `DELETE`s its lease (or the sweep expires it) the
@@ -4763,8 +4763,8 @@ on both 409s and the remote/loopback URL visibility; MCP schema and defaults; th
 benchmark leasing at class 2; `benchmark:parallel` family/kind). `tests/unit/test_leases.py`
 untouched and green.
 
-**Not done here, on purpose.** The holder side -- ClawForge2's `POST /ui/api/vacate`, its drain
-and `/free`, `can_render: vacating` -- is the ClawForge2 change (research Q2 §2.2). A blocking
+**Not done here, on purpose.** The holder side -- the image tenant's own vacate route, its drain
+and `/free`, a `vacating` status -- is that tenant's change (research Q2 §2.2). A blocking
 `wait: true` on the acquire was declined (D29: never park a request behind another tenant's
 teardown; the client already re-asks). Foreign VRAM on a granted card is still not reported by
 the grant (research Q3 #15).
@@ -5100,7 +5100,7 @@ the deploy step. A live registry read found no model row with saved `extra_flags
 stricter save/launch refusal (item 6 of the lane's request file) refuses nothing that exists
 today.
 
-**Context.** A cross-repo regression review (StudioForge, ClawForge2, ClawChat V12→V13) ran on
+**Context.** A cross-repo regression review (StudioForge, the image gateway, ClawChat V12→V13) ran on
 2026-09-09 against a build spec whose Phases 3 and 5 asked for a "computed VRAM planner" and "one
 VRAM arbiter". Both already existed here (D14–D19, D36–D43, D46–D48, D51–D56); what the review found
 were gaps between what the decisions promised and what the code enforced, plus two owner-stated
@@ -5225,7 +5225,7 @@ first start. Nothing here changes a wire shape except by addition: every lease p
 **Context.** Three things went wrong on the morning of 2026-09-10, all downstream of one restart.
 At 03:32 a `POST /api/restart/server` emptied the in-memory lease book -- D43 kept it in memory on
 purpose, on the theory that a lease describes a live situation and a restart is a clean slate --
-and with it the lease ClawForge2 held on CUDA 2, the card ComfyUI renders on. At 03:45 a tier-3
+and with it the lease the image tenant held on CUDA 2, the card ComfyUI renders on. At 03:45 a tier-3
 `load_recommended` from a third tenant (`transforge`) placed a 30B model on CUDA [2, 3], exactly
 where the lease would have refused it. At 04:55 ClawChat V13's background work sent `ttl: 3600`
 with no `priority`; its JIT load landed a 27B on the same pair, and because a request's `ttl` could
@@ -5607,7 +5607,7 @@ one sub-section each; CR-8 was reviewed and rejected (no change).
 ### CR-9 -- `load_recommended` plans against the leases, instead of refusing its own choice
 
 **Incident, 2026-09-12 22:29-22:36.** CUDA 1 -- one of the two RTX 5090s -- was leased to
-ClawForge2 for ComfyUI (idle, 620 MiB, 0% utilisation). ClawChat's
+the image tenant for ComfyUI (idle, 620 MiB, 0% utilisation). ClawChat's
 `POST /api/models/{id}/load-recommended` (`{ctx_size: 131072, priority: 1, max_slots: 1}`, no
 devices, no saved `device_override`) logged `loading at the requested context mode=dual_5090
 devices=[0, 1]`, then `load rejected: device leased to another holder devices=[1]`, then a 507
@@ -5770,13 +5770,13 @@ assumed the retry family was already INFO; for the 503s it was not.
 `WARNING_REJECTION_CODES = {lease_conflict, insufficient_vram}` -> WARNING `request rejected`, and
 `RETRY_REJECTION_CODES = {priority_hold, model_busy, benchmark_busy, model_benchmarking,
 lease_vacating, gpu_leased}` -> INFO `request rejected` -- exactly the StudioForge codes
-`docs/OPENCLAW-RIG.md` lists as "wait and retry unchanged" (`client_quota` there is ClawForge2's).
+`docs/OPENCLAW-RIG.md` lists as "wait and retry unchanged".
 Any other code keeps the status rule, so a real fault (`model_load_failed`, `upstream_error`, an
 internal error) is still ERROR `request failed`. The two classified lines add `status`. A new code
 lands in neither set and behaves as before until someone decides; a test pins both sets so that
 decision is deliberate.
 
-**Deferred.** The rolling per-code refusal counter on `/api/status` (ClawForge2's `refusals` block)
+**Deferred.** The rolling per-code refusal counter on `/api/status` (the image tenant's `refusals` block)
 was not built.
 
 **Tests.** `tests/unit/test_rejection_log_levels.py`: `lease_conflict` and `insufficient_vram` are
@@ -5906,9 +5906,8 @@ unchanged and green.
 
 ### CR-8 -- two documentation nits, reviewed and rejected (no change)
 
-`client_quota` appears only in `docs/OPENCLAW-RIG.md`, a rig-wide page covering both StudioForge and
-ClawForge2, where every row names its service and `client_quota` is labelled `CF2`; it is a
-ClawForge2 code correctly documented there (and pinned by `test_docs.py`), not an inherited
+`client_quota` is not a StudioForge code: it belonged to the image tenant's own API and is no longer
+documented in this repository (it was once pinned by `test_docs.py`), not an inherited
 StudioForge one. `tag_in_use` is an internal hook (`EngineManager.tag_in_use`, D49 item 7) that
 guards an engine reinstall; it is not documented as an API error code anywhere. Neither page is
 changed.
@@ -5922,7 +5921,7 @@ of an error frame inside a 200), never a new refusal: the planner already refuse
 these loads.
 
 **Incident, 2026-09-13 15:11-19:52.** The OpenClaw agent's chat model
-(a 27B) carried a saved `device_override` of `[0, 1]`. At 15:02 ClawForge2
+(a 27B) carried a saved `device_override` of `[0, 1]`. At 15:02 the image tenant
 leased CUDA 0 for ComfyUI and re-leased it on idle all afternoon. From then on every load of the
 model met `forced & blocked` in `Planner.plan_load` and was refused `507 gpu_leased` -- about every
 ten minutes from 15:11 to 19:41 (a periodic caller; the log does not record the route, and an
@@ -7362,13 +7361,13 @@ margin band), and the uncorrectable-band walk runs at weight shares 0-95%.
 **Problem.** By D61 StudioForge was already the arbiter of the GPUs: leases (D43), the vacate ask
 (D56), persistence across its own restarts (D61), one failure-code table for two services
 (OPENCLAW-RIG.md). But every program that leased a card here was anonymous beyond a holder string,
-and every one of them had re-derived the same client from the route docstrings: ClawForge2's
-`comfy/lease.py` (adopt at boot, fail open, never force, a vacate route with a per-process token),
+and every one of them had re-derived the same client from the route docstrings: an image tenant's
+lease module (adopt at boot, fail open, never force, a vacate route with a per-process token),
 SpeechForge's `lease.py` (S3: class 2, never force; S16: on an unreachable StudioForge load only
 onto a clearly free card), CrucibleForge's harness. Three implementations of one unwritten
 contract, three places for it to drift, and an operator who could see *that* CUDA 3 was leased by
 `speechforge` but not whether SpeechForge was up, what version it was, or where to look. The owner's
-request on 2026-10-11 named the gap: a generic interface that lets DisPatch, ClawForge and
+request on 2026-10-11 named the gap: a generic interface that lets DisPatch, an image-generation tenant and
 StudioForge "operate independently but work in conjunction and juggle based on priority".
 
 **Decision.** The contract is written down, versioned and named -- `docs/TENANTS.md`, the **VRAM
@@ -7436,7 +7435,7 @@ tenants are.
    read-only tools `gpu_tenants` and `gpu_leases` (23 management tools now; both mirror the REST
    rows with URLs withheld, as `server_status` withholds a vacate URL); `GET /api/capabilities`
    features `tenant_registry`, `tenant_protocol_vt1`; `config.example.yaml` carries SpeechForge
-   (a module on `127.0.0.1:1236`) and ClawForge2 (a tenant) commented out, loopback only.
+   (a module on `127.0.0.1:1236`) and an image-generation tenant commented out, loopback only.
 8. **The SDK**: `packages/studioforge-tenant/` -- pure Python 3.12, `httpx` only, never imports
    `studioforge`. `TenantClient(url, holder, priority, vacate_url=, vacate_token=, api_key=)`
    with `acquire(devices="auto" | [n], *, min_free_gib, prefer, avoid, idle_ttl_s)` answering a
@@ -7445,7 +7444,7 @@ tenants are.
    (touches only on activity, ends when the lease is gone), `register` / `deregister`,
    `features` (D64 gating); and `vacate_asgi_route(token_matcher, on_vacate)` -- POST only,
    loopback only, constant-time token compare, a 64 KiB body cap, `202 {accepted, lease_id}`, a
-   handler failure reported without its text. Its README says how SpeechForge and ClawForge2
+   handler failure reported without its text. Its README says how SpeechForge and an image-generation tenant
    would adopt it; neither repository is changed by this decision.
 
 **Tests.** `tests/unit/test_tenants.py` (the host rule table including every loopback spelling,
@@ -7464,7 +7463,7 @@ route's checks in order). `tests/unit/test_gui.py` pins `_warm_tenant_dialog` to
 ## D78 -- `devices: "auto"`: the card chosen the way the grant judges one
 
 **Problem.** A tenant that wants "a card" had to pick one itself and discover the answer by
-refusal: SpeechForge walks `gpu.devices` in order and re-asks on a 503 or 409; ClawForge2 retries
+refusal: SpeechForge walks `gpu.devices` in order and re-asks on a 503 or 409; an image tenant retries
 up to three alternative cards after a 503. Each walk re-implements, badly, the judgement
 `acquire_lease` already makes per card -- is a resident busy, is one pinned, is one a better class,
 is the card leased -- and none of them can see free VRAM after the evictions the grant would make.
@@ -7526,11 +7525,11 @@ code and `considered`, no vacate clock touched, the steering validations and the
 ## D79 -- StudioForge never starts or stops a tenant
 
 **Problem.** Once a server lists other programs with their health and offers a Warm button, the
-next request is obvious: "start SpeechForge from the StudioForge tray", "restart ClawForge2 when it
+next request is obvious: "start SpeechForge from the StudioForge tray", "restart the image gateway when it
 goes unhealthy", "install the speech module from the Setup tab". Each of those turns StudioForge
 into a supervisor of processes it did not write, with their launchers, virtualenvs, update paths,
 crash loops and data directories -- the exact coupling the owner's request ruled out ("at the end
-each of these should operate independently"), and the exact failure that took ClawForge2 down for
+each of these should operate independently"), and the exact failure that took the image gateway down for
 three hours on 2026-09-02 when an agent ran another program's launchers from the wrong place.
 
 **Decision.** StudioForge **shows and asks; it never launches, stops, restarts, installs or updates
@@ -7563,7 +7562,7 @@ that the config model carries no command, launcher, argv or working-directory fi
 ## D80 -- The tenant half of the protocol is `inference` scope, bound to the creating key
 
 **Problem.** 2.0.0 classified every `/api/leases` and `/api/tenants` mutation `admin`
-(`api/auth.py`, the D32 prefix list reused as the scope table). SpeechForge and ClawForge2 hold
+(`api/auth.py`, the D32 prefix list reused as the scope table). SpeechForge and an image tenant hold
 `inference` keys, so taking a lease returned `403 permission_denied` on the first live rig that ran
 2.0.0 with keys enabled. Handing every tenant an `admin` key would have fixed the symptom by making
 each program able to rewrite the config, install engines and mint keys.
@@ -7877,3 +7876,35 @@ tensor modes), `core/capabilities.py` (`tensor_split_hybrid`, the `tensor_split`
 `core/manager.py` and `mcp/management.py` docstrings, docs `ENGINE-FEATURES.md`, `LIMITATIONS.md`,
 `BENCHMARKING.md`, `OPENCLAW.md`; `tests/unit/test_supervisor_features.py`, `test_throughput.py`,
 `test_benchmark.py`.
+
+## D84 -- The lease kind table ships generic families, and an operator names their own
+
+**Problem.** The descriptive lease `kind` (D53) tells a client what to do about a lease that holds
+the cards it wanted: `benchmark` means stand down, `render` and `agent` mean wait and re-ask. It is
+looked up by the holder's family in a built-in table, and that table named specific programs from
+the reference rig. A public build should not carry the names of one operator's private programs.
+And an operator with programs of their own had no way to describe them: an unknown family reads as
+`other`, which the MCP guidance does not tell a client how to handle.
+
+**Decision.**
+
+1. The built-in `LEASE_KINDS` keeps only generic families: `benchmark`, `crucibleforge`
+   (benchmark); `imagegen`, `comfyui` (render); `openclaw`, `agent` (agent). Anything else is
+   `other`, as before.
+2. New config key `leases.holder_kinds` (family -> `benchmark` | `render` | `agent` | `other`,
+   default empty) is merged over the built-in table and may also re-describe a built-in family. Keys
+   are lower-cased and must be a possible family (letters, digits, `.` and `_`; a holder's family is
+   the part before its first `-` or `:`), so a key that could never match is refused when the config
+   loads instead of silently doing nothing. It is installed when the app is built
+   (`leases.configure_holder_kinds`) and is in `RESTART_REQUIRED_KEYS`.
+3. Still descriptive only: nothing preempts or places on the kind (D43, D53).
+
+**Upgrading.** An install whose own tenant leased under a family the old table knew, and no longer
+does, gets `kind: other` for those leases until it adds the family to `leases.holder_kinds` with
+the kind it had (`render` for an image server). Capability `lease_holder_kinds` names the key.
+
+**Surfaces.** `core/leases.py` (`LEASE_KINDS`, `LEASE_KIND_VALUES`, `configure_holder_kinds`,
+`lease_kind`), `config.py` (`LeaseKind`, `LeasesConfig.holder_kinds`, `RESTART_REQUIRED_KEYS`),
+`api/app.py`, `config.example.yaml`, generated `docs/reference/settings.md` and
+`docs/contracts/settings-schema.json`, capabilities `lease_holder_kinds`;
+`tests/unit/test_lease_holder_kinds.py`, and the lease tests' example holder renamed to `imagegen`.

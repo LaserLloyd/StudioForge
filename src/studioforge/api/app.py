@@ -49,7 +49,7 @@ from studioforge.core.downloader import Downloader
 from studioforge.core.engine import EngineManager
 from studioforge.core.gpu import probe_for_config
 from studioforge.core.health import PROBE_MAX_TOKENS, PROBE_TIMEOUT_S, deep_health
-from studioforge.core.leases import LeaseBook
+from studioforge.core.leases import LeaseBook, configure_holder_kinds
 from studioforge.core.manager import ModelManager
 from studioforge.core.metrics import GatewayMetrics
 from studioforge.core.planner import Planner
@@ -691,6 +691,8 @@ def build_state(config: Config, *, version: str = __version__) -> Any:
     # One lease book shared by the planner (which honours leases) and the
     # manager (which grants and expires them) -- D43.
     leases = LeaseBook()
+    # The operator's own holder families for the descriptive lease kind (D84).
+    configure_holder_kinds(config.leases.holder_kinds)
     planner = Planner(
         config,
         probe,

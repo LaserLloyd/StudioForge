@@ -270,13 +270,15 @@ def test_field_specs_cover_every_scalar_key_of_every_section() -> None:
             key = f"{section_name}.{info.alias or name}"
             if key not in generated:
                 missing.append(key)
-    # Three are mappings -- keyed by CUDA index, quant family and load tier --
-    # and two are nested models: the tenant registry (D77), a list of them, and
-    # ``server.tls`` (HTTPS), one. They get widgets of their own (the registry is
-    # read on the Placement page's Tenants card and written in config.yaml; HTTPS
-    # is the Serving page's HTTPS card), not a text box, because rendering one
-    # as a text box would silently destroy the other entries.
+    # Four are mappings -- keyed by CUDA index, quant family, load tier and lease
+    # holder family (D84) -- and two are nested models: the tenant registry
+    # (D77), a list of them, and ``server.tls`` (HTTPS), one. They get widgets
+    # of their own (the registry is read on the Placement page's Tenants card
+    # and written in config.yaml, as are the holder kinds; HTTPS is the Serving
+    # page's HTTPS card), not a text box, because rendering one as a text box
+    # would silently destroy the other entries.
     assert sorted(missing) == [
+        "leases.holder_kinds",
         "models.ttl_by_priority",
         "planner.quant_affinity",
         "planner.reserved_mb",

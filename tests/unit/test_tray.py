@@ -330,7 +330,7 @@ def test_single_instance_guard_is_exclusive_and_releasable() -> None:
     second.close()
 
 
-def test_the_guard_port_does_not_collide_with_clawforge() -> None:
+def test_the_guard_port_does_not_collide_with_the_other_tray() -> None:
     """Both trays live in the same notification area; a shared mutex port would
     make each look 'already running' to the other."""
     assert tray_app.SINGLE_INSTANCE_PORT != 47821

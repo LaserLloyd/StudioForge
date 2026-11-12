@@ -150,7 +150,7 @@ def test_the_manager_carries_the_busy_detail_into_its_507() -> None:
 def test_a_leased_refusal_becomes_a_507_that_says_gpu_leased() -> None:
     """The twin of the busy case (D53): same status, a different code.
 
-    507 is kept on purpose -- ClawForge and the story drafter already branch on
+    507 is kept on purpose -- an image-generation tenant and the story drafter already branch on
     it -- but a lease is not a shortfall, and a client that had to
     substring-match the word "leased" now switches on ``error.code``.
     """

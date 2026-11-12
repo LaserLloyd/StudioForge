@@ -104,11 +104,11 @@ residency.vacate))`. Behaviour it keeps unchanged: class 2, never `force`, the i
 `kind="module"`, `health_url` and `warm_url`, so the Tenants card shows it and the operator can warm
 it from StudioForge's panel.
 
-## How ClawForge2 would adopt it
+## How an image-generation tenant would adopt it
 
-ClawForge2's `comfy/lease.py` holds ComfyUI's card as `clawforge2` at class 3 (the job's class
+Such a tenant holds ComfyUI's card under its own holder name at class 3 (the job's class
 when a job re-asks), registers `VACATE_PATH` with a per-process token, adopts an existing lease
-at boot and fails open. With this package: `TenantClient("...:1234", "clawforge2", 3,
+at boot and fails open. With this package: `TenantClient("...:1234", "imagegen", 3,
 vacate_url=..., vacate_token=...)`; the pinned card is `acquire([pin.index])` (explicit, so a
 better class can still ask it to vacate — automatic placement never triggers D56); the boot-time
 adoption becomes `release_stale()` followed by a fresh `acquire`, or stays as it is (adoption is

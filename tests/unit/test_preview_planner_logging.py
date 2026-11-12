@@ -78,7 +78,7 @@ def test_a_saved_override_on_a_leased_card_follows_the_log_plans_flag(
     recorder: _LevelRecorder, log_plans: bool, level: str
 ) -> None:
     book = LeaseBook()
-    book.acquire([0], holder="clawforge2")
+    book.acquire([0], holder="imagegen")
     planner = Planner(make_config(), rig_5090x2_3090x2(), leases=book, log_plans=log_plans)
     record = make_record(settings=ModelSettings(device_override=[0]))
 

@@ -5,7 +5,7 @@
 -- describes a live situation and a restart was to be a clean slate, with the
 -- idle TTL as the safety net. That design failed live on 2026-09-10. A
 -- POST /api/restart/server at 03:32 emptied the book, and with it the lease
--- ClawForge2 held on CUDA 2 -- the card ComfyUI renders on. At 03:45 a tier-3
+-- an image-generation tenant held on CUDA 2 -- the card ComfyUI renders on. At 03:45 a tier-3
 -- load_recommended from a third tenant (transforge) placed a 30B model on
 -- CUDA [2, 3], exactly where the lease would have refused it; at 04:55 a JIT
 -- load from ClawChat V13 landed a 27B on the same pair the same way. Every

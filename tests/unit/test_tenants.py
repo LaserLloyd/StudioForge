@@ -146,7 +146,7 @@ def test_a_declared_module_round_trips_with_its_urls_validated() -> None:
         {"name": "SpeechForge"},
         {"name": "speechforge", "default_priority": 4},
         {"name": "speechforge", "health_url": "http://192.168.1.50:1236/health"},
-        {"name": "clawforge2", "kind": "tenant", "warm_url": SPEECH_WARM},
+        {"name": "imagegen", "kind": "tenant", "warm_url": SPEECH_WARM},
         {"name": "speechforge", "family": "Speech Forge"},
     ],
 )
@@ -183,7 +183,7 @@ def _declared() -> TenantsConfig:
                 warm_url=SPEECH_WARM,
                 default_priority=2,
             ),
-            TenantEntry(name="clawforge2", health_url="http://127.0.0.1:8700/health"),
+            TenantEntry(name="imagegen", health_url="http://127.0.0.1:8700/health"),
         ]
     )
 
@@ -191,7 +191,7 @@ def _declared() -> TenantsConfig:
 def test_declared_tenants_appear_unregistered_and_unpolled() -> None:
     registry = TenantRegistry(_declared())
     names = [record.name for record in registry.all()]
-    assert names == ["clawforge2", "speechforge"]
+    assert names == ["imagegen", "speechforge"]
     speech = registry.require("speechforge")
     assert speech.source == "config" and speech.kind == "module"
     assert speech.registered is False and speech.health.state == "unpolled"
@@ -424,7 +424,7 @@ async def test_warm_refuses_a_plain_tenant_and_reports_a_module_that_will_not_an
     backend.responses["/v1/speech/warm"] = httpx.ConnectError("refused")
     registry = TenantRegistry(_declared(), transport=backend.transport())
     with pytest.raises(BadRequestError) as refused:
-        await registry.warm("clawforge2")
+        await registry.warm("imagegen")
     assert refused.value.code == "tenant_not_warmable"
     with pytest.raises(TenantUnreachableError) as unreachable:
         await registry.warm("speechforge")
@@ -505,7 +505,7 @@ def test_status_carries_the_tenant_rows_and_a_state_without_a_registry_still_ans
 ) -> None:
     _wire(app)
     payload = TestClient(app, client=LAN).get("/api/status").json()
-    assert [row["name"] for row in payload["tenants"]] == ["clawforge2", "speechforge"]
+    assert [row["name"] for row in payload["tenants"]] == ["imagegen", "speechforge"]
     assert "health_url" not in payload["tenants"][0]
     del app.state.tenants
     again = TestClient(app, client=LAN).get("/api/status").json()
@@ -540,12 +540,12 @@ def test_the_admin_prefix_covers_every_tenant_mutation() -> None:
 
 
 def test_the_example_config_names_the_two_commented_tenants_and_no_real_hosts() -> None:
-    """The shipped example shows SpeechForge as a module and ClawForge2 as a tenant,
+    """The shipped example shows SpeechForge as a module and the image gateway as a tenant,
     commented out, on loopback only."""
     from pathlib import Path
 
     text = (Path(__file__).resolve().parents[2] / "config.example.yaml").read_text(encoding="utf-8")
-    assert "- name: speechforge" in text and "- name: clawforge2" in text
+    assert "- name: speechforge" in text and "- name: imagegen" in text
     assert "kind: module" in text and "http://127.0.0.1:1236/v1/speech/warm" in text
     section = text[text.index("tenants:") : text.index("benchmark:")]
     import re

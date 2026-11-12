@@ -141,7 +141,7 @@ class TenantClient:
 
     Construct once per process. ``holder`` is the name every lease carries
     (and the registry ``name`` by default); make it your ``holder_family``
-    (lower-case, no suffix -- ``speechforge``, ``clawforge2``) so
+    (lower-case, no suffix -- ``speechforge``, ``imagegen``) so
     StudioForge's views group your leases under you. ``priority`` is the D46
     class of your claims. ``vacate_url``/``vacate_token`` register where a
     better class may ask you to leave (D56); mount :func:`vacate_asgi_route`
@@ -264,7 +264,7 @@ class TenantClient:
         """Take an exclusive lease on ``devices`` (``"auto"`` lets StudioForge pick).
 
         Never ``force``: a pinned or deliberately placed model is the
-        operator's decision (ClawForge2's rule, SpeechForge S3).
+        operator's decision (the same rule every tenant on the reference rig follows).
         """
         auto = isinstance(devices, str)
         body: dict[str, Any] = {

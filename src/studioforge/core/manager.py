@@ -2602,7 +2602,7 @@ class ModelManager:
         # The walk's planner reads the SAME lease book the real load's planner
         # reads (D64). It used to be built without one, so every mode looked
         # lease-free: on 2026-09-12 the walk chose dual_5090 while CUDA 1 was
-        # leased to ClawForge2, and the real load -- whose planner does read
+        # leased to an image-generation tenant, and the real load -- whose planner does read
         # the book -- refused that placement with gpu_leased, identically,
         # every retry, with dual_3090 free the whole time. With the book, a
         # mode that needs someone else's card is refused inside the walk and
@@ -4868,7 +4868,7 @@ class ModelManager:
         if evicted_any:
             # The holder starts allocating the moment it has the lease; give the
             # driver the same beat the supervisor gives its own VRAM sample, or
-            # ClawForge2 allocates into memory that has not been handed back.
+            # the holder allocates into memory that has not been handed back.
             await self._settle_vram()
         # The host:port only -- a path or query is the holder's business, and
         # the token never reaches a log line at all (D6, D56).

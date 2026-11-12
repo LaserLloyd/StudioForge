@@ -1,7 +1,7 @@
 """GPU leases survive a restart (D61).
 
 The book was in-memory only until 2026-09-10, when ``POST /api/restart/server``
-emptied it and two tenants' loads landed on the card ClawForge2 had leased for
+emptied it and two tenants' loads landed on the card the image gateway had leased for
 ComfyUI. Pinned here, layer by layer: the registry's rows carry every field a
 restore needs (the vacate token and the peer included); the book writes
 through on every mutation and coalesces touches; a fresh book from the same
@@ -38,7 +38,7 @@ from studioforge.types import GpuLease
 from tests.unit.test_gateway_lifecycle import CountingSupervisor, StubRegistry, make_manager
 
 HOLDER_URL = "http://10.0.0.7:8700/vacate"
-TOKEN = "cf2-secret-token"
+TOKEN = "imagegen-secret-token"
 PEER = "10.0.0.7"
 HOLDER_KEY = "key:k-full"
 
@@ -128,7 +128,7 @@ def acquire_full(book: LeaseBook, *, now: float, devices: list[int] | None = Non
     """A lease with every optional field set, so a restore has something to lose."""
     return book.acquire(
         devices or [2],
-        holder="clawforge2",
+        holder="imagegen",
         model_ids=["pub/render-helper"],
         reason="ComfyUI render",
         idle_ttl_s=3600.0,
@@ -295,7 +295,7 @@ def test_acquire_writes_a_row_with_every_field_including_token_and_peer(db: Data
     assert row == {
         "id": lease.id,
         "devices": [2],
-        "holder": "clawforge2",
+        "holder": "imagegen",
         "model_ids": ["pub/render-helper"],
         "reason": "ComfyUI render",
         "created_at": 1000.0,
@@ -378,7 +378,7 @@ def test_a_failed_write_is_retried_by_the_next_touch(db: Database) -> None:
     real = DatabaseLeaseStore(db)
     flaky = BrokenStore()
     book = LeaseBook(flaky)
-    lease = book.acquire([2], holder="clawforge2", now=1000.0)
+    lease = book.acquire([2], holder="imagegen", now=1000.0)
     assert db.list_leases() == [], "the acquire's write failed"
 
     book.bind_store(real)
@@ -442,7 +442,7 @@ def test_restore_is_idempotent_and_never_duplicates_a_standing_lease(db: Databas
 
 def test_expired_rows_are_dropped_and_deleted_at_restore(db: Database) -> None:
     first = LeaseBook(DatabaseLeaseStore(db))
-    stale = first.acquire([2], holder="clawforge2", idle_ttl_s=600.0, now=1000.0)
+    stale = first.acquire([2], holder="imagegen", idle_ttl_s=600.0, now=1000.0)
     open_ended = first.acquire([3], holder="training", idle_ttl_s=None, now=1000.0)
     fresh = first.acquire([0], holder="agent", idle_ttl_s=3600.0, now=1000.0)
 
@@ -503,7 +503,7 @@ def test_a_store_that_raises_never_breaks_the_book(monkeypatch: pytest.MonkeyPat
     store = BrokenStore()
     book = LeaseBook(store)
 
-    lease = book.acquire([2], holder="clawforge2", now=1000.0)
+    lease = book.acquire([2], holder="imagegen", now=1000.0)
     assert book.get(lease.id) is lease, "the in-memory book is authoritative"
     book.touch(lease.id, at=1010.0)
     book.mark_vacating(lease.id, requested_by="chat", deadline_s=180.0, now=1010.0)
@@ -574,7 +574,7 @@ def test_unknown_devices_are_dropped_at_manager_start(
     db: Database, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     seed = LeaseBook(DatabaseLeaseStore(db))
-    ours = seed.acquire([2], holder="clawforge2", idle_ttl_s=3600.0, now=time.time())
+    ours = seed.acquire([2], holder="imagegen", idle_ttl_s=3600.0, now=time.time())
     gone = seed.acquire([5], holder="moved-rig", idle_ttl_s=3600.0, now=time.time())
 
     import studioforge.core.manager as manager_mod
@@ -591,7 +591,7 @@ def test_unknown_devices_are_dropped_at_manager_start(
     assert [f["unknown_devices"] for f in dropped] == [[5]]
     restored = [f for e, f in recorder.infos if e == "gpu lease restored"]
     assert [f["lease_id"] for f in restored] == [ours.id]
-    assert restored[0]["devices"] == [2] and restored[0]["holder"] == "clawforge2"
+    assert restored[0]["devices"] == [2] and restored[0]["holder"] == "imagegen"
     assert restored[0]["expires_in"] is not None and restored[0]["idle_s"] >= 0
     summary = [f for e, f in recorder.infos if e == "gpu leases restored from the registry"]
     assert summary == [{"restored": 1, "dropped": 1}]
@@ -666,7 +666,7 @@ async def test_stop_leaves_the_rows_in_place_and_the_next_start_restores_them(
 ) -> None:
     manager, _ = build_manager(db, known_devices=[0, 1, 2, 3])
     await manager.start()
-    lease = await manager.acquire_lease([2], holder="clawforge2", reason="ComfyUI render")
+    lease = await manager.acquire_lease([2], holder="imagegen", reason="ComfyUI render")
     await manager.stop(drain_timeout_s=0.1)
     assert [row["id"] for row in db.list_leases()] == [lease.id], "stop() is not a release"
 
@@ -674,7 +674,7 @@ async def test_stop_leaves_the_rows_in_place_and_the_next_start_restores_them(
     await replacement.start()
     try:
         back = replacement.leases.get(lease.id)
-        assert back is not None and back.holder == "clawforge2" and back.devices == [2]
+        assert back is not None and back.holder == "imagegen" and back.devices == [2]
         assert back.restored_at is not None
         assert [row["restored_at"] for row in (lease_view(x) for x in replacement.leases.all())]
         replacement.release_lease(lease.id)
