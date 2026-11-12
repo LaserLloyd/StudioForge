@@ -5300,8 +5300,9 @@ class ModelManager:
         the cards are its alone, so: the placement is forced onto the lease's
         devices; the split mode (and micro-batch) come from the model's latest
         benchmark *on exactly those devices* when one exists -- tensor split
-        measured slower than layer on this rig for a small model and is
-        unmeasured for large ones (D38), so only a measurement may pick it;
+        measured slower than layer on this rig for a small model (D38) and
+        faster at decode but slower at prefill for 27-31B ones (D83), so only
+        a measurement may pick it;
         and the slot count is sized by the estimator even when
         ``models.default_parallel`` is an integer. An explicit per-model
         ``device_override``, ``split_mode`` or ``parallel`` still wins.

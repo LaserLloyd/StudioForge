@@ -474,7 +474,9 @@ def test_tensor_modes_are_offered_only_for_an_eligible_model() -> None:
         n_head_kv=4,
         extra={"full_attention_interval": 4},
     )
-    assert bench.split_modes_for(hybrid) == ["layer"]
+    # D83: a hybrid is offered tensor modes; whether the engine build can run
+    # one is decided at launch (tensor_split_hybrid_blocker).
+    assert bench.split_modes_for(hybrid) == ["layer", "tensor"]
 
 
 def test_a_tensor_mode_is_planned_and_run_with_the_same_settings() -> None:

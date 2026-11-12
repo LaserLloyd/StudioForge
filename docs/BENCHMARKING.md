@@ -101,8 +101,10 @@ GET /api/models/{id}/benchmark/modes
 Each entry has `key`, `devices`, `split_mode`, `applicable` and, when not applicable, the reason
 (typically "does not fit on one card"). On the reference rig (2× RTX 5090 + 2× RTX 3090) the keys
 are `rtx-5090-x1`, `rtx-5090-x2`, `rtx-5090-x2-tensor`, `rtx-3090-x1`, `rtx-3090-x2`,
-`rtx-3090-x2-tensor`, `all`, `all-tensor`. The `-tensor` variants exist only for models that
-pass the tensor-split gates (dense, non-hybrid, flash attention on, unquantized KV).
+`rtx-3090-x2-tensor`, `all`, `all-tensor`. The `-tensor` variants are offered for every model that
+is not MoE and whose layout can be read. When the mode runs, the launch also needs flash attention
+on, an unquantized KV cache, and, for a hybrid such as Qwen3.8, engine b12110 or newer. A mode
+that fails one of those reports the reason as its `error`.
 
 **Start it** — a background job, because a four-mode run on a 30 GB model is minutes:
 
@@ -146,8 +148,10 @@ second client (or the same one after a crash) recovers a run without colliding w
 agree; when they do not, pick by the workload (long prompts → prompt winner).
 
 **On tensor split:** do not assume it is faster. On the reference rig it measured *slower* than
-layer split for a small model (D38). Compare `rtx-5090-x2` against `rtx-5090-x2-tensor` for the
-model in hand and trust the measurement, not the intuition.
+layer split for a small model (D38) and for a MoE, and about 1.5x faster at generation but
+about a quarter slower at prompt processing for 27-31B dense and hybrid models on the 5090 pair
+(D83). Compare `rtx-5090-x2` against `rtx-5090-x2-tensor` for the model in hand and pick by the
+workload: `best_generation_mode` for long outputs, `best_prompt_mode` for long cold prompts.
 
 History: `GET /api/models/{id}/benchmarks` (newest first). The latest report is also what a
 lease reads (step 3).

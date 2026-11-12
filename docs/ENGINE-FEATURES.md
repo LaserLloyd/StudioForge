@@ -40,7 +40,7 @@ the full runs are in DECISIONS.md **D38**.
 | Partitioned KV pool | `--no-kv-unified` | **on** above one slot | none (a capacity trade, not a quality one) |
 | Engine auto-fit | `--fit off` | **off** | n/a — it would break the GPU-only policy (D11) |
 | Larger micro-batch | `-ub` | off (engine's 512) | none, costs VRAM (modelled per device, D40) |
-| Tensor parallelism | `--split-mode tensor` | off | none, but EXPERIMENTAL upstream |
+| Tensor parallelism | `--split-mode tensor` | off | none with an f16 KV cache (D83); trades prefill for decode |
 | GPU sampling | `--backend-sampling` | off | none claimed, but EXPERIMENTAL upstream |
 | Engine idle sleep | `--sleep-idle-seconds` | **never passed** | StudioForge owns TTL; two idle timers would fight |
 
@@ -259,8 +259,18 @@ unless every gate passes.
 | two, `row` | fails: `device CUDA2 does not support split buffers` | |
 
 A small model is the worst case for tensor mode — the per-layer sync is fixed while the halved
-weight read shrinks with the model — so a 31B may well win. **Measure it**: the benchmark now
-offers a tensor variant of every multi-GPU mode for an eligible model.
+weight read shrinks with the model. A large one does win at decode (D83, b12110, two RTX 5090s):
+
+| model | decode, layer → tensor | 8 streams, layer → tensor | prefill, tensor ÷ layer |
+| --- | --- | --- | --- |
+| Qwen3.8-27B Q8_0 (hybrid), f16 KV | 50.8 → 77.8 tok/s | 321 → 481 tok/s | 0.67 |
+| gemma-4-31B Q8_0, q8_0 KV → f16 KV | 44.2 → 70.0 tok/s | 267 → 400 tok/s | 0.79 |
+| gemma-4-26B-A4B (MoE) | 293 → 238 tok/s | | 0.60 |
+
+So tensor mode trades prompt speed for generation speed. It pays for generation-heavy work
+(judges, long reasoning, chats whose prompt is mostly cached) and costs on a long cold prompt.
+**Measure it**: the benchmark offers a tensor variant of every multi-GPU mode for an eligible
+model.
 
 **Prerequisites**, all checked before the child is launched:
 
@@ -268,9 +278,14 @@ offers a tensor variant of every multi-GPU mode for an eligible model.
 * the engine lists `tensor` in `--split-mode`;
 * flash attention on — llama.cpp exits with `SPLIT_MODE_TENSOR requires flash_attn to be enabled`;
 * an unquantized KV cache (f16/bf16/f32). Upstream documents quantized KV as unimplemented here.
-  b10425 does *not* enforce it — a scratch load with `q8_0` started and answered correctly — so
-  this one is StudioForge policy, and it is the gate most likely to be relaxed later;
-* a dense, non-hybrid model: MoE and state-space/recurrent architectures are refused upstream.
+  The engine does not enforce it, but on b12110 gemma-4-31B in tensor mode with a `q8_0` cache
+  scored 19% worse perplexity than the layer split, and within 0.24% with an f16 cache — so this
+  gate stays;
+* not a mixture-of-experts model: b12110 runs MoE in tensor mode, but slower (table above);
+* a hybrid (recurrent + attention) model, such as Qwen3.5/3.6/3.8, only on engine b12110 or newer.
+  Older builds refused recurrent layers in tensor mode. On b12110 Qwen3.8-27B in tensor mode is
+  within KL divergence 0.0006 of the layer split (same top token 99.0%). Capability
+  `tensor_split_hybrid` says a server knows this (D83).
 
 Set `split_mode: tensor` and an ineligible model is **refused with the reasons**. Set
 `split_mode: auto` and it silently falls back to `layer` with the reason recorded on the plan. The

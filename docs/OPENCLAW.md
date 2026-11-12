@@ -459,8 +459,9 @@ binds nothing but the call that carries it, and it cannot take a card away from 
 
 While a lease stands nobody else is planned onto those cards; the named model is loaded onto exactly
 them, sized for as many slots as its context allows, in the split mode its own benchmark measured
-fastest there (tensor split is never assumed -- it measured *slower* than layer split on the
-reference rig, so benchmark first if you want it considered). Idle residents on the cards are
+fastest there (tensor split is never assumed -- on the reference rig it was slower for small and
+MoE models and about 1.5x faster at generation, but slower at prompt processing, for 27-31B
+ones, so benchmark first if you want it considered). Idle residents on the cards are
 unloaded; a model mid-request refuses the call, including one that picked up a request between
 the scan and its unload; a pinned one needs `force=true`. Two overlapping grants conflict before
 either unloads anything. Benchmarks take their own leases, which is what keeps a neighbour's load

@@ -194,6 +194,25 @@ MOE_PROMPT_EFFICIENCY = 0.4
 #: Q4_K_M on 2x RTX 3090, 8k context: layer 344 tok/s, tensor 294 tok/s, single
 #: card 353 tok/s (DECISIONS.md D38). Calibration corrects the rest.
 T_TENSOR_SYNC_S = 60e-6
+#
+# Checked against the large-model end on 2026-11-12 (D83, b12110, 2x RTX 5090,
+# measured with llama-bench, the same KV type in both runs): Qwen3.8-27B Q8_0
+# decode 50.8 -> 77.8 tok/s (1.53x) and gemma-4-31B Q8_0 44.2 -> 67.3 tok/s
+# (1.52x) under tensor mode. This
+# constant and the max-of-devices rule predict 1.47x and 1.52x for those two
+# placements. The absolute numbers are calibration's job; the ratio is this one's.
+
+#: Prompt-processing speed under ``--split-mode tensor`` as a fraction of the
+#: layer split on the same cards (D83). Tensor mode parallelises the GEMMs, but
+#: every layer all-reduces its partial results over PCIe, and for a long prompt
+#: that sync costs more than the parallel GEMMs save. Measured on 2x RTX 5090,
+#: b12110, unquantized KV under tensor mode, Qwen3.8-27B and gemma-4-31B Q8_0:
+#: 0.67 and 0.79 at a 2k prompt, 0.73 and 0.92 at 16k depth, 0.62 and 0.73 for
+#: eight parallel 1k prompts. 0.73 is the median. The 1.5B on two 3090s that D38
+#: measured came out at 0.43, but a model that small never reaches tensor mode
+#: on purpose: the sync term above already makes its decode slower than the
+#: layer split.
+TENSOR_PROMPT_FACTOR = 0.73
 
 #: Bumped whenever :func:`estimate` changes shape. Every observation records the
 #: version that produced its ``est_*`` columns, and :func:`calibrate` reads only
@@ -513,12 +532,20 @@ def estimate(
     *slower* than the layer split and slower than one card (D38), which is what
     the constant is calibrated to reproduce.
 
-    **Prefill is deliberately modelled the same for both modes.** Tensor mode
-    parallelises the GEMMs, so a roofline would predict a prefill win -- and the
-    rig measured a 57% prefill *loss* on the same 1.5B. Claiming the win would be
-    a fabrication and claiming the loss would be an unmeasured constant, so
-    prefill keeps the pipeline arithmetic and the benchmark's layer-vs-tensor
-    modes are the honest way to know.
+    **Prefill under tensor mode is the pipeline arithmetic times**
+    :data:`TENSOR_PROMPT_FACTOR`. Tensor mode parallelises the GEMMs, so a
+    roofline would predict a prefill win, and the rig measured the opposite
+    every time: a 57% loss on a 1.5B (D38) and an 8-38% loss on 27-31B models on
+    two 5090s (D83). Until D83 this charged no factor at all, because a single
+    small-model measurement was not enough to make a constant from. It is now
+    a measured fraction, and the benchmark's layer-vs-tensor modes are still
+    the way to know for a particular model.
+
+    Bumping :data:`ESTIMATOR_VERSION` for this would throw away every
+    calibration row the rig has, and the layer-split estimate is unchanged
+    byte for byte. Observation rows do not record the split mode, so a tensor
+    run and a layer run of the same model on the same cards calibrate each
+    other; that was true before D83 too (docs/LIMITATIONS.md).
     """
     split = {int(k): max(0, int(v)) for k, v in devices_split.items() if int(v) > 0}
     total_split = sum(split.values())
@@ -555,9 +582,10 @@ def estimate(
         perf_by_device[index] = perf.label
         weight_times.append((active * share) / perf.bw_bytes_per_s)
         kv_times.append((kv_per_slot * share) / perf.bw_bytes_per_s)
-        # Prefill uses the pipeline sum for BOTH split modes -- see the
-        # docstring: the rig measured tensor prefill *slower*, so a parallel
-        # roofline here would advertise a win that does not exist.
+        # Prefill uses the pipeline sum for BOTH split modes, and tensor mode
+        # then pays TENSOR_PROMPT_FACTOR -- see the docstring: the rig measured
+        # tensor prefill *slower*, so a parallel roofline here would advertise
+        # a win that does not exist.
         t_prompt_raw += (2.0 * params_active * share) / perf.flops_fp16
 
     if not split:
@@ -589,8 +617,9 @@ def estimate(
     # A batch can never be slower in aggregate than a single stream.
     gen_tps_batched = max(gen_tps_batched, gen_tps)
 
+    prompt_factor = TENSOR_PROMPT_FACTOR if tensor_parallel else 1.0
     if params_active > 0 and t_prompt_raw > 0:
-        prompt_tps = max(0.0, prompt_efficiency) * eff_prompt / t_prompt_raw
+        prompt_tps = max(0.0, prompt_efficiency) * eff_prompt * prompt_factor / t_prompt_raw
     else:
         prompt_tps = 0.0
 
@@ -611,6 +640,7 @@ def estimate(
             "t_token_s": t_token,
             "t_overhead_s": T_TOKEN_OVERHEAD_S,
             "t_tensor_sync_s": t_sync,
+            "tensor_prompt_factor": prompt_factor,
             "split_mode": split_mode,
             "slots_used": slots,
             "is_moe": moe,
@@ -644,6 +674,7 @@ def _unknown_result(
             "t_token_s": 0.0,
             "t_overhead_s": T_TOKEN_OVERHEAD_S,
             "t_tensor_sync_s": 0.0,
+            "tensor_prompt_factor": 1.0,
             "split_mode": "layer",
             "slots_used": 0,
             "is_moe": False,

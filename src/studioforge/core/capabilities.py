@@ -60,8 +60,10 @@ FEATURE_NOTES: dict[str, str] = {
     ),
     "tensor_split": (
         "opt-in tensor parallelism (--split-mode tensor): weights and KV shard "
-        "across GPUs. EXPERIMENTAL upstream and measured SLOWER than the layer "
-        "split on this PCIe rig, so it is something to benchmark, not a default"
+        "across GPUs. Dense and hybrid models with an unquantized KV cache: about "
+        "1.5x faster decode and about 25% slower prefill for 27-31B models on two "
+        "5090s, slower for small and MoE models, so it is something to benchmark, "
+        "not a default"
     ),
 }
 
@@ -74,7 +76,7 @@ FEATURE_NOTES: dict[str, str] = {
 #: on instead. **Bump it in the same commit that appends a decision**:
 #: ``tests/unit/test_capabilities_implemented.py`` reads the headings of
 #: ``DECISIONS.md`` and fails until the two agree.
-LATEST_DECISION = 82
+LATEST_DECISION = 83
 
 #: Every decision number this build includes, ``"D1"`` .. ``"D<LATEST_DECISION>"``.
 IMPLEMENTED_DECISIONS: tuple[str, ...] = tuple(f"D{n}" for n in range(1, LATEST_DECISION + 1))
@@ -148,6 +150,9 @@ SERVER_FEATURES: dict[str, str] = {
     "engine_update_tools": "D82",
     # gpt-oss is planned as iSWA (every other layer windowed), as the engine runs it.
     "gpt_oss_swa_sizing": "D82",
+    # split_mode tensor (and auto) accepts a hybrid model (Qwen3.5/3.6/3.8) when
+    # the active engine is b12110 or newer; older servers refuse it as before.
+    "tensor_split_hybrid": "D83",
 }
 
 

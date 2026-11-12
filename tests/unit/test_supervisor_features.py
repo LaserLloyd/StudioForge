@@ -38,12 +38,15 @@ from studioforge.core.supervisor import (
     ENGINE_DEFAULT_CTX_CHECKPOINTS,
     ENGINE_DEFAULT_SLOT_PROMPT_SIMILARITY,
     ENGINE_DEFAULT_UBATCH_SIZE,
+    TENSOR_SPLIT_HYBRID_MIN_BUILD,
     Supervisor,
     _Instance,
     effective_launch,
+    engine_build_number,
     redact_argv,
     resolve_spec_type,
     tensor_split_blockers,
+    tensor_split_model_blockers,
 )
 from studioforge.errors import ModelLoadError
 from studioforge.types import (
@@ -435,6 +438,86 @@ def test_auto_reaches_tensor_when_it_can(config: Config, tmp_path: Path) -> None
     decided = sup(config, binary).resolve(record, make_plan(split_mode="auto"), B10425)
     assert decided.split_mode == "tensor"
     assert decided.split_mode_reason is None
+
+
+def hybrid_meta() -> GgufMeta:
+    """A Qwen3.5-family layout: every fourth layer has a KV cache, the rest are recurrent."""
+    return dense_meta(extra={"full_attention_interval": 4})
+
+
+def on_build(tag: str) -> EngineFeatures:
+    """b10425's feature list under another tag: only the build number matters to D83."""
+    return dataclasses.replace(B10425, tag=tag)
+
+
+@pytest.mark.parametrize(
+    ("tag", "number"),
+    [
+        ("b12110", 12110),
+        ("b9", 9),
+        (" b12318 ", 12318),
+        ("", None),
+        ("v0.9.0", None),
+        ("b12x", None),
+    ],
+)
+def test_engine_build_number_reads_only_real_build_tags(tag: str, number: int | None) -> None:
+    assert engine_build_number(tag) == number
+
+
+def test_a_hybrid_model_may_use_tensor_mode_on_a_verified_engine(tmp_path: Path) -> None:
+    """D83: Qwen3.8-27B ran tensor mode on b12110 at KL divergence 0.0006 from the
+    layer split, so a hybrid is no longer refused on that build or newer."""
+    record = make_record(tmp_path, meta=hybrid_meta())
+    for tag in (f"b{TENSOR_SPLIT_HYBRID_MIN_BUILD}", "b12318"):
+        assert tensor_split_blockers(record, make_plan(), on_build(tag)) == []
+
+
+@pytest.mark.parametrize("tag", ["b12109", "b10425", "", "custom-build"])
+def test_a_hybrid_model_is_still_refused_on_an_older_or_unnumbered_engine(
+    tmp_path: Path, tag: str
+) -> None:
+    """Older builds refused recurrent layers in tensor mode; a build that cannot be
+    numbered is unverified, so it keeps the refusal -- and the reason names the fix."""
+    record = make_record(tmp_path, meta=hybrid_meta())
+    blockers = tensor_split_blockers(record, make_plan(), on_build(tag))
+    assert len(blockers) == 1, blockers
+    assert "hybrid" in blockers[0]
+    assert f"b{TENSOR_SPLIT_HYBRID_MIN_BUILD}" in blockers[0]
+
+
+def test_the_model_only_gate_leaves_hybrids_to_the_engine_check(tmp_path: Path) -> None:
+    """The benchmark offers modes from the model-only gate, which has no engine to
+    ask -- so a hybrid passes it and the launch decides."""
+    assert tensor_split_model_blockers(make_record(tmp_path, meta=hybrid_meta())) == []
+    moe = make_record(tmp_path, meta=dense_meta(n_expert=128, n_expert_used=8))
+    assert any("mixture-of-experts" in r for r in tensor_split_model_blockers(moe))
+
+
+def test_auto_reaches_tensor_for_a_hybrid_on_a_verified_engine(
+    config: Config, tmp_path: Path
+) -> None:
+    binary = make_binary(tmp_path)
+    record = make_record(tmp_path, settings=ModelSettings(split_mode="auto"), meta=hybrid_meta())
+    supervisor = sup(config, binary)
+    plan = make_plan(split_mode="auto")
+    decided = supervisor.resolve(record, plan, on_build("b12110"))
+    assert decided.split_mode == "tensor"
+    assert decided.split_mode_reason is None
+    argv = supervisor.build_command(
+        record, plan, port=18100, features=on_build("b12110"), resolved=decided
+    )
+    assert value_after(argv, "--split-mode") == "tensor"
+
+
+def test_a_hybrid_still_needs_an_unquantized_kv_cache(tmp_path: Path) -> None:
+    """D83 relaxes the hybrid gate only: tensor mode with q8_0 KV measured 19%
+    worse perplexity than the layer split, so that gate stays for every model."""
+    record = make_record(tmp_path, meta=hybrid_meta())
+    plan = make_plan(kv_cache_type="q8_0", kv_cache_type_v="q8_0")
+    blockers = tensor_split_blockers(record, plan, on_build("b12110"))
+    assert any("unquantized KV" in reason for reason in blockers)
+    assert not any("hybrid" in reason for reason in blockers)
 
 
 def test_a_single_gpu_plan_still_says_split_mode_none(config: Config, tmp_path: Path) -> None:

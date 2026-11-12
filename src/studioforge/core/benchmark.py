@@ -221,9 +221,10 @@ class BenchmarkMode:
     devices: list[int]
     gpu_name: str | None
     #: ``--split-mode`` for this mode. Only ever something other than ``layer``
-    #: on a multi-device mode, and only when the model is eligible: tensor mode
-    #: is experimental upstream and measured slower than layer on this rig, so
-    #: it is offered as something to *measure*, never as a default.
+    #: on a multi-device mode, and only when the model is eligible. Tensor mode
+    #: measured slower than layer for a 1.5B (D38) and ~1.5x faster decode with
+    #: ~25% slower prefill for 27-31B models on two 5090s (D83), so it is offered
+    #: as something to *measure*, never as a default.
     split_mode: str = "layer"
     #: ``-ub/--ubatch-size`` for this mode, or ``None`` for the engine's 512.
     #: Trades compute-buffer VRAM for prompt-processing speed, so it is a
@@ -574,7 +575,8 @@ class Benchmarker:
         decided at launch by the supervisor, which is the one place that knows
         both. Offering a mode the launch then refuses costs one clearly-worded
         error; hiding a mode the launch would have accepted costs a measurement
-        the user asked for.
+        the user asked for. That includes hybrid models: since D83 the engine
+        build decides whether they can run in tensor mode, so they are offered.
         """
         if tensor_split_model_blockers(record):
             return ["layer"]

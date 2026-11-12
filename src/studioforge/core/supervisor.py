@@ -40,6 +40,7 @@ import atexit
 import builtins
 import contextlib
 import os
+import re
 import shlex
 import socket
 import subprocess
@@ -1090,7 +1091,28 @@ def _port_is_bindable(port: int, host: str = CHILD_HOST) -> bool:
 #: started and answered correctly -- so this list is policy, not a crash guard:
 #: a quality-first server does not run a combination its own engine documents as
 #: unimplemented just because it happens not to fall over on a 1.5B.
+#:
+#: Measured since (D83, b12110, gemma-4-31B Q8_0 on 2x RTX 5090, KL divergence
+#: run with the same evaluation): tensor with an f16 cache scored within 0.24%
+#: of the layer split's perplexity, tensor with a q8_0 cache 19% worse. So the
+#: gate is a quality guard now, not only policy.
 TENSOR_SPLIT_KV_TYPES = frozenset({"f32", "f16", "bf16"})
+
+#: The first llama.cpp build StudioForge has *verified* to run a hybrid
+#: (recurrent + attention) model under ``--split-mode tensor`` (D83). Measured on
+#: the rig 2026-11-12 with Qwen3.8-27B Q8_0 on 2x RTX 5090: KL divergence against
+#: the layer split 0.0006, the same top token 99.0% of the time, perplexity
+#: within 0.2% -- and decode 50.8 -> 77.8 tok/s (8 streams: 321 -> 481 tok/s).
+#: Older builds refused recurrent layers in tensor mode, which is what the
+#: hybrid gate was written for. A build that cannot be numbered (a source
+#: build, an unreadable tag) keeps the old refusal: unverified is not verified.
+TENSOR_SPLIT_HYBRID_MIN_BUILD = 12110
+
+
+def engine_build_number(tag: str | None) -> int | None:
+    """``12110`` for ``"b12110"``; ``None`` for anything that is not a build tag."""
+    match = re.fullmatch(r"b(\d+)", (tag or "").strip())
+    return int(match.group(1)) if match else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1253,22 +1275,44 @@ def tensor_split_model_blockers(record: ModelRecord) -> list[str]:
     """Reasons *this model* cannot use ``--split-mode tensor``, model-only.
 
     Split out from :func:`tensor_split_blockers` so the benchmark can decide
-    which modes to even offer without a plan or an engine in hand.
+    which modes to even offer without a plan or an engine in hand. A hybrid
+    model is *not* refused here: whether it can run in tensor mode depends on
+    the engine build (D83), which only :func:`tensor_split_blockers` knows.
     """
     reasons: list[str] = []
     meta = record.meta
     if meta is None:
         return ["the model's GGUF metadata could not be read, so it cannot be proven dense"]
     if is_moe(meta):
-        reasons.append("it is a mixture-of-experts model (llama.cpp refuses MoE in tensor mode)")
-    kind = attention_kind(meta)
-    if kind == "hybrid":
+        # b12110 runs MoE in tensor mode, but slower: gemma-4-26B-A4B on 2x RTX
+        # 5090 decoded 293 -> 238 tok/s and prefilled 15.9k -> 9.5k tok/s (D83).
+        # A few billion active parameters are too little work to hide the sync.
         reasons.append(
-            "it is a hybrid/state-space model (recurrent layers are not supported in tensor mode)"
+            "it is a mixture-of-experts model (tensor mode measured slower than the layer "
+            "split for MoE: too few active weights per token to pay for the per-layer sync)"
         )
-    elif kind == "unknown":
+    if attention_kind(meta) == "unknown":
         reasons.append("its attention layout could not be determined from the GGUF")
     return reasons
+
+
+def tensor_split_hybrid_blocker(record: ModelRecord, features: EngineFeatures) -> str | None:
+    """Why this *hybrid* model cannot use tensor mode on this engine, or ``None``.
+
+    ``None`` for every non-hybrid model, and for a hybrid one on a build at or
+    after :data:`TENSOR_SPLIT_HYBRID_MIN_BUILD`.
+    """
+    if record.meta is None or attention_kind(record.meta) != "hybrid":
+        return None
+    build = engine_build_number(features.tag)
+    if build is not None and build >= TENSOR_SPLIT_HYBRID_MIN_BUILD:
+        return None
+    engine = features.tag or "the active engine"
+    return (
+        f"it is a hybrid/state-space model, and {engine} predates "
+        f"b{TENSOR_SPLIT_HYBRID_MIN_BUILD}, the first build verified to run recurrent "
+        "layers in tensor mode (update the engine to use it)"
+    )
 
 
 def tensor_split_blockers(
@@ -1306,6 +1350,9 @@ def tensor_split_blockers(
             "(lower the context, or set kv_cache_type f16, to get one)"
         )
     reasons.extend(tensor_split_model_blockers(record))
+    hybrid = tensor_split_hybrid_blocker(record, features)
+    if hybrid is not None:
+        reasons.append(hybrid)
     return reasons
 
 

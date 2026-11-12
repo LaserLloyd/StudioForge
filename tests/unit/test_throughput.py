@@ -1215,7 +1215,33 @@ def test_tensor_split_on_one_device_is_just_the_single_card_estimate() -> None:
     assert tensor["basis"]["t_tensor_sync_s"] == 0.0
 
 
-def test_prefill_is_deliberately_unchanged_by_the_split_mode() -> None:
-    """A parallel roofline would advertise a prefill win; the rig measured a
-    57% prefill LOSS on the same placement. See estimate()'s docstring."""
-    assert split_pair(split_mode="tensor")["prompt_tps"] == split_pair()["prompt_tps"]
+def test_tensor_prefill_pays_the_measured_factor_not_a_roofline_win() -> None:
+    """A parallel roofline would advertise a prefill win; the rig measured a loss
+    every time (D38: 57% on a 1.5B; D83: 8-38% on 27-31B models on two 5090s).
+    The estimate charges the median measured fraction, and says so in basis."""
+    layer = split_pair()
+    tensor = split_pair(split_mode="tensor")
+    assert tensor["prompt_tps"] == pytest.approx(
+        layer["prompt_tps"] * throughput.TENSOR_PROMPT_FACTOR, rel=1e-3
+    )
+    assert tensor["prompt_tps"] < layer["prompt_tps"]
+    assert tensor["basis"]["tensor_prompt_factor"] == throughput.TENSOR_PROMPT_FACTOR
+    assert layer["basis"]["tensor_prompt_factor"] == 1.0
+
+
+def test_the_layer_split_estimate_is_unchanged_by_d83() -> None:
+    """D83 did not bump ESTIMATOR_VERSION because the layer arithmetic is
+    untouched; a layer estimate must not pay the tensor prefill factor."""
+    assert throughput.ESTIMATOR_VERSION == 2
+    layer = split_pair()
+    assert layer["basis"]["split_mode"] == "layer"
+    assert layer["basis"]["tensor_prompt_factor"] == 1.0
+
+
+def test_tensor_decode_reproduces_the_d83_measured_ratio() -> None:
+    """2x RTX 5090, b12110: Qwen3.8-27B Q8_0 decoded 1.53x and gemma-4-31B Q8_0
+    1.52x faster under tensor mode. The max-of-devices rule plus the per-layer
+    sync must land in that neighbourhood for a 31B-class dense model on two
+    equal cards -- not at 2x (no sync) and not below 1.3x."""
+    ratio = split_pair(split_mode="tensor")["gen_tps"] / split_pair()["gen_tps"]
+    assert 1.3 < ratio < 1.8

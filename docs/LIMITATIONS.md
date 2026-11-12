@@ -295,22 +295,28 @@ with `error loading model: device CUDA2 does not support split buffers`. It is r
 per-model `split_mode` and is left in the type only because the engine still lists it. Reproduced
 on b10425 with two RTX 3090s.
 
-### `--split-mode tensor` is opt-in and was slower here
+### `--split-mode tensor` is opt-in: faster decode, slower prefill
 
-Tensor parallelism is marked EXPERIMENTAL upstream and is never chosen by default. Measured on
-b10425, Qwen2.5-1.5B Q4_K_M on two RTX 3090s at 8k context: **layer 344 tok/s, tensor 294 tok/s,
-one card alone 353 tok/s**; prompt processing 2722 vs 1182 tok/s. A small model is the worst case
-(the per-layer all-reduce is fixed while the halved weight read shrinks with the model), so a large
-one may well win — which is why the benchmark now offers a tensor variant of every multi-GPU mode.
-Measure before you enable it.
+Tensor parallelism is never chosen by default. It is slower for small models: on b10425,
+Qwen2.5-1.5B Q4_K_M on two RTX 3090s at 8k context measured **layer 344 tok/s, tensor 294 tok/s,
+one card alone 353 tok/s**; prompt processing 2722 vs 1182 tok/s. It is faster at decode for large
+ones: on b12110 with two RTX 5090s, Qwen3.8-27B Q8_0 decoded 50.8 → 77.8 tok/s and gemma-4-31B
+Q8_0 44.2 → 70.0 tok/s, while prompt processing ran at 0.62-0.92 of the layer split (D83). MoE
+models are slower in it. The 3090 pair has not been measured with a large model. Measure before
+you enable it: the benchmark offers a tensor variant of every multi-GPU mode.
 
 Its prerequisites are enforced *before* the child is launched, because llama.cpp enforces one of
 them by exiting: flash attention must be on (`SPLIT_MODE_TENSOR requires flash_attn to be
-enabled`), the placement needs at least two devices, and the model must be dense and
-non-hybrid — MoE and state-space/recurrent architectures are refused upstream by name. An
-unquantized KV cache is required by upstream's documentation and is *not* enforced by b10425
-(a scratch load with `-sm tensor --cache-type-k q8_0` started and answered correctly), but
-StudioForge still declines the combination rather than run something documented as unimplemented.
+enabled`), the placement needs at least two devices, the model must not be MoE, and a hybrid
+(recurrent) model needs engine b12110 or newer. An unquantized KV cache is required by upstream's
+documentation and is not enforced by the engine, but StudioForge declines the combination: in
+tensor mode a `q8_0` cache measured 19% worse perplexity than the layer split (D83). So a model
+that runs with a `q8_0` cache has to move to f16 to use tensor mode, which doubles its KV bytes.
+
+The planner prices tensor-mode VRAM like the layer split. On the first live tensor load (gemma-4-31B,
+f16 KV, two 5090s) the total was right (-1.5%), but the first card held 2.5 GiB more than planned
+and the second 3.3 GiB less. The headroom absorbed it; a plan that fills the first card to within
+a few GiB may not.
 
 Note also that `--backend-sampling` is silently downgraded under tensor mode: the engine logs
 `backend sampling not supported with SPLIT_MODE_TENSOR; using CPU` and starts anyway.

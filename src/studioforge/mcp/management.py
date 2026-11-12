@@ -1814,10 +1814,12 @@ def build_management_mcp(state: Any) -> MCPServer:
         named model is loaded onto exactly them (pin it too if it must also
         survive restarts), sized for as many parallel slots as its context
         allows, and in the split mode its own benchmark measured fastest on
-        those cards -- tensor split is never assumed, because it measured
-        slower than layer split on this rig; run a benchmark if you want it
-        considered. Idle residents on the cards are unloaded to make room; a
-        model mid-request refuses the call (retry when idle); a pinned idle
+        those cards -- tensor split is never assumed, because whether it wins
+        depends on the model (slower for small and MoE models, about 1.5x
+        faster decode but slower prefill for large dense ones); run a
+        benchmark if you want it considered. Idle residents on the cards are
+        unloaded to make room; a model mid-request refuses the call (retry
+        when idle); a pinned idle
         resident refuses unless ``force=true``.
 
         **A card already leased is a conflict, never a takeover** -- but a

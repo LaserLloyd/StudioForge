@@ -7797,3 +7797,83 @@ the companion's fallback tool list, capabilities `harmony_reasoning_default`,
 `harmony_history_repair`, `tool_array_items_guard`, `model_template_tools`, `engine_update_tools`,
 `gpt_oss_swa_sizing`; `tests/unit/test_harmony.py`, `test_chat_template.py`,
 `test_gguf_capture.py`, `test_mcp.py`.
+
+## D83 -- Tensor split is measured for large models: hybrids may use it, and prefill pays for it
+
+**Problem.** D38 made `--split-mode tensor` opt-in and refused it for hybrid (recurrent) models,
+from one measurement: a 1.5B on two 3090s ran slower under tensor mode than under the layer split.
+It said a 31B "may well win" and left that unmeasured. On 2026-11-12 the rig's NVIDIA driver went
+to 621.14 (CUDA 13.5), which makes llama.cpp's `cuda-13.5` Windows builds usable, and the owner
+asked whether anything got faster. It measured the two benchmark judges on the 5090 pair (CUDA 0,1)
+with `llama-bench` / `llama-batched-bench` / `llama-perplexity`, each run under a lease:
+
+| Qwen3.8-27B Q8_0 (hybrid), f16 KV | layer | tensor |
+| --- | --- | --- |
+| decode, 1 stream | 50.8 tok/s | 77.8 tok/s (1.53x) |
+| decode, 8 parallel streams (aggregate) | 321 tok/s | 481 tok/s (1.50x) |
+| prefill, 2k prompt | 6477 tok/s | 4343 tok/s (0.67x) |
+
+| gemma-4-31B Q8_0 (iSWA) | layer, q8_0 KV (as served) | tensor, f16 KV |
+| --- | --- | --- |
+| decode, 1 stream | 44.2 tok/s | 70.0 tok/s (1.58x) |
+| decode, 1 stream at 16k depth | 40.5 tok/s | 66.2 tok/s (1.63x) |
+| decode, 8 parallel streams (aggregate) | 267 tok/s | 400 tok/s (1.50x) |
+| prefill, 2k prompt | 5969 tok/s | 4726 tok/s (0.79x) |
+
+- The driver and the newer build did nothing on their own: b12318 (`cuda-13.5`) against b12110
+  (`cuda-13.4`, live), same cards, decode within 0.3% and prefill 1-4.5% slower; the Qwen judge
+  decoded 51.3 tok/s single-stream in serving before the driver change, and `llama-bench` measures
+  50.8 after. The tensor-mode gain is the same on both builds, so it was available and unused.
+- Correctness. Qwen3.8 tensor against layer: KL divergence 0.0006, same top token 99.0%,
+  perplexity within 0.2%. So the hybrid refusal is out of date on b12110. gemma-4-31B, evaluated the
+  same way: tensor with f16 KV within 0.24% of the layer split's perplexity, tensor with q8_0 KV
+  19% worse. So the unquantized-KV gate stays, now as a measured quality guard.
+- MoE: b12110 runs gemma-4-26B-A4B in tensor mode, but slower (decode 293 -> 238 tok/s, prefill
+  15.9k -> 9.5k). The MoE refusal stays, with that reason.
+- FP8 KV (`f8_e4m3`, new in b12274) is not a speed win here: on b12318, gemma-4-31B's 8-stream
+  decode drops from 267 to 172 tok/s with it against q8_0. Not added to `KvCacheType`.
+
+**Decision.**
+
+1. A hybrid model may use tensor mode when the active engine's tag is `b12110` or newer
+   (`supervisor.TENSOR_SPLIT_HYBRID_MIN_BUILD`, `engine_build_number`). The check moved from the
+   model-only `tensor_split_model_blockers` (which the benchmark uses to choose which modes to offer)
+   to a new engine-aware `tensor_split_hybrid_blocker`, called by `tensor_split_blockers`. So the
+   benchmark now offers `-tensor` modes for hybrids, and the launch decides per engine. On an older
+   build, or one whose tag is not `bNNNN`, the refusal stays and names the build to update to.
+2. The throughput estimate charges tensor-mode prefill `TENSOR_PROMPT_FACTOR = 0.73` of the layer
+   arithmetic, the median of six measurements between 0.62 and 0.92 (2k prompt, 16k depth and eight
+   parallel 1k prompts, both models, unquantized KV). Decode was already right: the max-of-devices
+   rule plus `T_TENSOR_SYNC_S` predicts 1.47x and 1.52x against the measured 1.53x and 1.52x (same
+   KV type in both runs).
+   `ESTIMATOR_VERSION` is not bumped: the layer estimate is unchanged byte for byte, and bumping
+   would throw away every calibration row. `basis.tensor_prompt_factor` shows the factor used.
+3. Nothing switches by itself. `layer` stays the default and `auto` still means "tensor when every
+   gate passes". Tensor mode trades prefill for decode, so it pays for generation-heavy work (judges,
+   long reasoning, chat whose prompt is mostly cached) and costs on cold long prompts. It is a
+   per-model `split_mode` setting, and a model that is to use it needs `kv_cache_type` f16 (twice
+   the KV bytes of q8_0).
+
+**Live check.** Through the live 2.3.0 server (which already allows tensor mode for a non-hybrid
+model with f16 KV), a temporary virtual copy of gemma-4-31B with `split_mode: tensor`, f16 KV,
+49152 tokens x 4 slots on [0,1] loaded in 13 s and decoded 64.9 tok/s (greedy, 300 tokens). The
+planner predicted 55,335 MiB and the load used 54,492 MiB (-1.5%). **Per card it did not match:**
+CUDA0 used 29,950 MiB against 27,470 planned (+2.5 GiB) and CUDA1 24,542 against 27,865 (-3.3 GiB).
+Tensor mode puts more on the first device than the `--tensor-split` proportions say. The 7%
+headroom absorbed it here.
+
+**Not done.** The planner still prices tensor-mode VRAM per card exactly like the layer split.
+One load is not enough to model the skew; until it is modelled, a tensor plan that fills CUDA0 to
+within ~2.5 GiB could fail to load there. D51's observed correction keys on the total, not the
+split mode or the card, so it neither catches the skew nor stays out of layer-mode plans of the
+same model and card count. The 3090 pair was not measured
+(CUDA 3 was leased); D38's 1.5B is still the only 3090 data point. Capability `tensor_split_hybrid`
+lets a client tell a D83 server from an older one, which refuses the same request.
+
+**Surfaces.** `core/supervisor.py` (`TENSOR_SPLIT_HYBRID_MIN_BUILD`, `engine_build_number`,
+`tensor_split_hybrid_blocker`, MoE reason text, KV-gate note), `core/throughput.py`
+(`TENSOR_PROMPT_FACTOR`, `basis.tensor_prompt_factor`), `core/benchmark.py` (hybrids offered
+tensor modes), `core/capabilities.py` (`tensor_split_hybrid`, the `tensor_split` note),
+`core/manager.py` and `mcp/management.py` docstrings, docs `ENGINE-FEATURES.md`, `LIMITATIONS.md`,
+`BENCHMARKING.md`, `OPENCLAW.md`; `tests/unit/test_supervisor_features.py`, `test_throughput.py`,
+`test_benchmark.py`.
