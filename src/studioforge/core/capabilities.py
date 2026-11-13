@@ -76,7 +76,7 @@ FEATURE_NOTES: dict[str, str] = {
 #: on instead. **Bump it in the same commit that appends a decision**:
 #: ``tests/unit/test_capabilities_implemented.py`` reads the headings of
 #: ``DECISIONS.md`` and fails until the two agree.
-LATEST_DECISION = 87
+LATEST_DECISION = 88
 
 #: Every decision number this build includes, ``"D1"`` .. ``"D<LATEST_DECISION>"``.
 IMPLEMENTED_DECISIONS: tuple[str, ...] = tuple(f"D{n}" for n in range(1, LATEST_DECISION + 1))
@@ -180,6 +180,15 @@ SERVER_FEATURES: dict[str, str] = {
     # A lease 409 names its case in error.studioforge.code (lease_outranked,
     # resident_outranks, resident_pinned, lease_conflict).
     "lease_refusal_codes": "D87",
+    # Fit and refusal bodies carry needs/usable/margin bytes (per card too),
+    # observed_applied, formula/observed bytes, max_parallel_that_fits and
+    # alternatives; the walk prices the same D51 history the load applies.
+    "plan_margin": "D88",
+    # A real-load insufficient_vram re-walks load-recommended once with one
+    # slot fewer (never below min_slots) instead of failing.
+    "load_recommended_step_down": "D88",
+    # The D51 observation key names the card classes, split mode and GGUF size.
+    "observation_class_key": "D88",
 }
 
 

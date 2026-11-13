@@ -40,6 +40,15 @@ inside `per_gpu_planned` (total, weights, the overhead fraction it was computed 
 `planned_bytes` for what was actually reserved); a row without the block predates D63 and may hold
 a corrected total, which is why it is read only in the direction that cannot be the band.
 
+A "configuration" for D51 is the model id, context, slots, both cache types, the shared-pool flag,
+the device count and, since D88 (migration 011), the cards' classes (`sm_86-24g+sm_86-24g`), the
+split mode and the GGUF's size. Rows written before migration 011 cannot name the last three and
+are still used, as legacy matches, when no row of the exact class exists -- so until a placement
+has been measured once under D88, a correction learned on another card class of the same count can
+still be spent on it. The `load-recommended` walk and its dry run read the same history as the real
+load, so a fit response's `margin_bytes` and `alternatives` are what the load will be charged
+(docs/CATALOG.md, "Margins, near misses and the slot step-down").
+
 The calibrator moves in both directions, worst case first. **Up** as before: three rows the formula
 fell short on, raised to cover the worst of them, rounded up to 0.5%. **Down** only on rows that
 carry the formula: at least 5 of them, none short, no pre-D63 row short either, and then to the

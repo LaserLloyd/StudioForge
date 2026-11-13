@@ -398,7 +398,13 @@ def _capacity_for(planner: Planner, devices: Sequence[int], *, forced: bool) -> 
     return sum(planner.usable_bytes(gpu_map[d], forced=forced) for d in devices if d in gpu_map)
 
 
-def slots_for_plan(planner: Planner, record: ModelRecord, plan: LoadPlan) -> tuple[int, str, int]:
+def slots_for_plan(
+    planner: Planner,
+    record: ModelRecord,
+    plan: LoadPlan,
+    *,
+    extra_free: Mapping[int, int] | None = None,
+) -> tuple[int, str, int]:
     """``(slots, bound, vram_bytes)`` for this placement.
 
     One call to :meth:`Planner.size_slots` -- **the same function a real load
@@ -422,9 +428,24 @@ def slots_for_plan(planner: Planner, record: ModelRecord, plan: LoadPlan) -> tup
 
     A plan whose slots share one KV pool (``plan.kv_unified``, D72) is sized as
     one: another slot costs its sliding window and state, not ``ctx`` of KV.
+
+    **The capacity is the one the fit was decided on** (D88, A-13): a plan
+    records what each of its cards offered (``plan.usable_bytes_per_gpu``),
+    eviction and priority-preemption credit included, and the slots are sized
+    against that. Measured off the live probe alone, a placement that fits only
+    once its victims leave was sized as if nothing were freed -- one slot, or
+    the ``min_slots`` floor -- for a load that was about to free the room for
+    more. A plan without the record (made before D88, or built by hand) falls
+    back to the live probe plus ``extra_free`` on its own devices.
     """
-    forced = bool(record.settings.device_override)
-    capacity = _capacity_for(planner, plan.devices, forced=forced)
+    recorded = plan.usable_bytes_per_gpu or {}
+    if recorded and all(int(d) in recorded for d in plan.devices):
+        capacity = sum(int(recorded[int(d)]) for d in plan.devices)
+    else:
+        forced = bool(record.settings.device_override)
+        capacity = _capacity_for(planner, plan.devices, forced=forced)
+        if extra_free:
+            capacity += sum(int(extra_free.get(int(d), 0)) for d in plan.devices)
     estimate, slots, _max_parallel, bound = planner.size_slots(
         record,
         ctx=plan.ctx_size,

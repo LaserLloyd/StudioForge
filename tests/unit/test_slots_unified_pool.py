@@ -700,8 +700,13 @@ def test_a_pool_row_and_a_partitioned_row_never_stand_in_for_each_other(db: Data
 
 
 def test_the_lookup_is_asked_about_a_pool_only_for_a_pool() -> None:
-    """Every partitioned lookup keeps the call shape it always had."""
+    """Every partitioned lookup keeps the call shape it always had.
+
+    Apart from the D88 placement keys (card classes, split mode, file size),
+    which every lookup now carries and ``test_planner_observation_key.py``
+    pins; they are set aside here so this stays about the pool flag."""
     seen: list[dict[str, Any]] = []
+    placement_keys = {"class_key", "split_mode", "gguf_size"}
 
     def strict_lookup(
         model_id: str,
@@ -713,7 +718,7 @@ def test_the_lookup_is_asked_about_a_pool_only_for_a_pool() -> None:
         device_count: int,
         **extra: Any,
     ) -> None:
-        seen.append(dict(extra))
+        seen.append({k: v for k, v in extra.items() if k not in placement_keys})
 
     planner = Planner(make_config(), rig_5090x2_3090x2(), observation_lookup=strict_lookup)
     rec = _dense()

@@ -600,17 +600,54 @@ It always answers `200`:
 | `ctx_per_slot`, `ctx_total`, `kv_unified` | what one conversation may use, what reaches `--ctx-size`, and whether the slots share one pool (all three equal `ctx_size` for a pool, D72) | -- |
 | `evict_model_ids` | the idle models the load would stop | `[]` |
 | `notes`, `lease_skipped_modes`, `placement_tier` | the plan's notes, incl. a lease routed around | -- |
-| `estimate_bytes` | every estimate term in **bytes**, plus `total` | -- |
+| `estimate_bytes` | every estimate term in **bytes**, plus `total` (D51-corrected where measured, D88) | -- |
 | `already_loaded` | `true` when the call would hand back the resident unchanged | -- |
+| `needs_bytes`, `usable_bytes`, `usable_bytes_per_gpu`, `margin_bytes`, `margin_bytes_per_gpu` | what the load reserves, what the cards offered when the fit was decided (after `headroom_fraction`, with any eviction credit), and the room left (D88) | the closest mode's miss at the floor: `margin_bytes` is negative ("refused by 0.03 GiB") |
+| `observed_applied`, `formula_bytes`, `observed_bytes`, `observed_legacy`, `headroom_fraction` | whether a D51 measurement moved the estimate, the formula it replaced and the measurement; `observed_legacy` when that row predates the D88 card-class key | `observed_applied`, `headroom_fraction` |
+| `alternatives`, `max_parallel_that_fits` | every slot count from the floor to the most that fit plus the first that does not, most first, each `{parallel, fits, needs_bytes, usable_bytes, margin_bytes, observed_applied, chosen}`; the most slots this placement holds at the window | the fewer-slot loads that do fit (per mode); the most slots any mode holds, `null` when not even the floor does |
 | `status_code`, `code`, `message`, `error` | -- | the status and the exact error body the call would answer with (`507` / `503`) |
 | `retry_after_s`, `shortfall_bytes`, `largest_term`, `max_ctx_that_fits` | -- | lifted from the refusal |
-| `kv_unified`, `max_parallel_that_fits` | -- | the pool shape the refusal was judged in, and the most slots any mode holds at the window when a `min_slots` floor was the obstacle (D72) |
-| `modes` | every mode tried, with `fits`, `reason`, `leased_devices`, `max_parallel_that_fits` | the same |
+| `kv_unified` | -- | the pool shape the refusal was judged in (D72) |
+| `modes` | every mode tried, with `fits`, `reason`, `leased_devices`, `max_parallel_that_fits`, `parallel`, `margin_bytes` | the same |
 | `dry_run`, `model_id`, `requested_ctx`, `priority`, `allowed_devices`, `min_slots` | always | always |
 
 Not previewed: the D46 `503 priority_hold` (a transient admission wait while a better-tier load is
-in flight, not a placement decision), and the D51 observed correction the real load may apply to the
-estimate after the walk -- the placement agrees, the last megabyte of `estimate_bytes` may not.
+in flight, not a placement decision). The D51 observed correction **is** previewed since D88: the
+walk reads the same history the load applies, so the estimate, the slot count and the verdict are the
+load's.
+
+### Margins, near misses and the slot step-down (D88)
+
+Before D88 the walk priced every mode on the formula while the real load applied the D51 correction
+on top. On 2026-11-09 that meant: two 24 GiB cards, a 33.8 GB Q8 judge at 16384 tokens per slot with
+a q8_0 cache, the formula said 6 slots fit, the last measurement of exactly that load (a little under
+its estimate) plus D51's 10% band put 6 slots 0.03 GiB over the pair's usable VRAM, and the load was
+refused. Now:
+
+- the walk, `/profiles` and the lease-free twin of the walk read the main planner's D51 history, so
+  the dry run above says `parallel: 5` and lists `{"parallel": 6, "fits": false, "margin_bytes":
+  -32212255, "observed_applied": true}` among the `alternatives`;
+- the history is keyed by **where** too (migration 011): `class_key` (the cards' classes, e.g.
+  `sm_86-24g+sm_86-24g`), `split_mode` (`none` on one card) and the GGUF's size. A correction
+  learned on two 5090s is not spent on two 3090s, a tensor split does not borrow a layer split's
+  row, and a replaced file starts fresh. Rows recorded before migration 011 have none of the three
+  and are still used as **legacy** matches when no exact row exists (`observed_legacy: true`). A
+  virtual copy with no history of its own, no adapters and no draft model uses its base's rows;
+- if the real load still refuses (free VRAM moved, or a measurement landed between the walk and the
+  load), `load-recommended` walks once more with `max_slots = refused - 1` (never below
+  `min_slots`) and loads that; the plan's `notes` say "stepped down from 6 to 5 slot(s): the load at
+  6 was refused by 0.03 GiB". When it cannot step down, the `507` carries `requested_parallel`,
+  `max_parallel_that_fits`, `refused_load {needs_bytes, usable_bytes, margin_bytes}` and
+  `alternatives`; the planner's own message and fields are unchanged;
+- slot sizing counts the eviction credit the fit was decided with (A-13): a mode that fits only once
+  an idle model leaves is sized against the room that model frees, not as one slot.
+
+`GET /api/models/{id}/plan` (the dry run of `/load`) carries the same `needs_bytes`, `usable_bytes`,
+`usable_bytes_per_gpu`, `margin_bytes`, `observed_applied` and `headroom_fraction` on a fit and on a
+refusal. The canonical dry run is `POST /models/load?dryRun=true` (k8s `dryRun` semantics): a body
+that names `devices`, `parallel` or a KV cache type, or no `context_length`, is previewed as `/load`;
+a body that names only the window is previewed as `load-recommended`; the answer says which in
+`dry_run_of`.
 
 `max_slots` caps the slot count for this call alone. The walk asks for `recommended_parallel` slots
 by default, and every one of them has its KV cache priced into the fit; a caller who knows there

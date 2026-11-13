@@ -74,6 +74,7 @@ from studioforge.errors import (
 )
 from studioforge.logging import first_time, get_logger
 from studioforge.types import (
+    GB,
     MB,
     AdapterRecord,
     GpuLease,
@@ -499,9 +500,14 @@ def _attempt_summary(attempt: Mapping[str, Any]) -> dict[str, Any]:
         "busy_models": list(attempt.get("busy_models") or []),
         "leased_devices": attempt.get("leased_devices"),
         "fits_once_lease_released": attempt.get("fits_once_lease_released"),
-        # The most slots this mode holds at the asked context when a
-        # ``min_slots`` floor did not fit (D72); None otherwise.
+        # The most slots this mode holds at the asked context: on a fit, from
+        # the slot table (D88); on a refusal, when a ``min_slots`` floor was
+        # the obstacle (D72); None when not even one slot fits.
         "max_parallel_that_fits": attempt.get("max_parallel_that_fits"),
+        # The slot count chosen on a fit, and how much room the fit (or how far
+        # the refusal at the floor) leaves, in bytes (D88).
+        "parallel": attempt.get("parallel"),
+        "margin_bytes": (attempt.get("margin") or {}).get("margin_bytes"),
     }
 
 
@@ -589,6 +595,46 @@ class LeaseRelease:
     kept: list[dict[str, Any]] = field(default_factory=list)
 
 
+def _margin_fields(margin: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The four numbers a slot-table row carries, off a planner margin (D88)."""
+    margin = margin or {}
+    return {
+        "needs_bytes": margin.get("needs_bytes"),
+        "usable_bytes": margin.get("usable_bytes"),
+        "margin_bytes": margin.get("margin_bytes"),
+        "observed_applied": bool(margin.get("observed_applied")),
+    }
+
+
+def _refused_load_numbers(exc: Any) -> dict[str, Any]:
+    """``needs_bytes`` / ``usable_bytes`` / ``margin_bytes`` of a real load's 507 (D88).
+
+    Read off the details :meth:`ModelManager._vram_error` always writes
+    (``required_bytes``, ``available_bytes``). All three ``None`` when the
+    refusal estimated nothing (a lease, an unknown placement).
+    """
+    details = getattr(exc, "details", None) or {}
+    needs = details.get("required_bytes")
+    usable = details.get("available_bytes")
+    if not needs and not usable:
+        return {"needs_bytes": None, "usable_bytes": None, "margin_bytes": None}
+    return {
+        "needs_bytes": int(needs or 0),
+        "usable_bytes": int(usable or 0),
+        "margin_bytes": int(usable or 0) - int(needs or 0),
+    }
+
+
+def _short_by(missed: Mapping[str, Any]) -> str:
+    """``"by 0.03 GiB"`` -- how far a refused load missed, for a note or a message."""
+    margin = missed.get("margin_bytes")
+    if margin is None:
+        return "(the refusal carried no VRAM figures)"
+    if margin < 0:
+        return f"by {-int(margin) / GB:.2f} GiB"
+    return "although its estimate fit on paper"
+
+
 @dataclass
 class _RecommendedPrep:
     """A ``load_recommended`` request resolved and validated, before any planning."""
@@ -654,6 +700,9 @@ class RecommendedDecision:
     #: What the saved placement did to the walk, in words, for the plan's
     #: notes and the refusal (D76). Empty when the model saves none.
     placement_notes: list[str] = field(default_factory=list)
+    #: The walk's planner (D88): it holds the D51 corrections the walk spent,
+    #: which the dry run reports as ``formula_bytes`` / ``observed_bytes``.
+    planner: Planner | None = None
 
 
 class ModelManager:
@@ -2399,8 +2448,20 @@ class ModelManager:
                     )
                 except InsufficientVramError as exc:
                     if exc.code != "gpu_leased":
-                        raise
-                    if walk_pass == 1:
+                        # D88 (B.5): the real load refused what the walk chose
+                        # -- free VRAM moved, or a measurement landed in
+                        # between. One fewer slot is re-walked once rather
+                        # than failing a load that fits with it.
+                        instance = await self._step_down_after_refusal(
+                            prep,
+                            winner,
+                            exc,
+                            prefer_modes=prefer_modes,
+                            kv_min=kv_min,
+                            source=source,
+                            hold=hold,
+                        )
+                    elif walk_pass == 1:
                         log.info(
                             "the walk's placement was leased away before the load began; "
                             "walking again",
@@ -2409,7 +2470,8 @@ class ModelManager:
                             devices=winner["devices"],
                         )
                         continue
-                    raise self._walk_placement_leased(record, winner, exc) from exc
+                    else:
+                        raise self._walk_placement_leased(record, winner, exc) from exc
                 if instance.plan is not None:
                     # The real load re-plans onto the chosen devices, so it
                     # knows nothing of the modes the walk passed over; say so
@@ -2463,10 +2525,20 @@ class ModelManager:
         included) and ``estimate_bytes``; or ``fits: false`` with
         ``status_code`` and ``error`` -- exactly the body the real call would
         have answered with -- plus ``shortfall_bytes``, ``largest_term`` and
-        ``max_ctx_that_fits`` lifted to the top. The estimate is the walk's
-        formula estimate; the real load re-plans onto the chosen devices and
-        may apply a D51 observed correction on top, so the chosen placement is
-        what is guaranteed to agree, not the last megabyte.
+        ``max_ctx_that_fits`` lifted to the top.
+
+        Since D88 the walk reads the same D51 history the real load applies
+        (A-3), so ``estimate_bytes`` is what the load will reserve, and the
+        body says how much room that leaves: ``needs_bytes``, ``usable_bytes``
+        (after ``headroom_fraction``, with any eviction credit),
+        ``usable_bytes_per_gpu``, ``margin_bytes``, ``observed_applied``,
+        ``formula_bytes`` / ``observed_bytes`` when a measurement moved the
+        estimate, ``max_parallel_that_fits`` and ``alternatives`` -- every slot
+        count from the floor to the most that fit plus the first that does
+        not, most first, each with ``fits``, ``needs_bytes``,
+        ``usable_bytes`` and ``margin_bytes`` (negative: refused by that
+        much). A refusal carries the closest mode's miss the same way, and its
+        ``alternatives`` are the fewer-slot loads that do fit.
 
         ``min_slots`` and ``kv_unified`` (D72) are the real call's, with the
         same 400s; a fit reports ``kv_unified``, ``ctx_per_slot`` and
@@ -2901,7 +2973,13 @@ class ModelManager:
         # mode that needs someone else's card is refused inside the walk and
         # the next fitting mode wins; a lease is still never overridden (D53).
         leases = getattr(self.planner, "leases", None)
-        planner = Planner(self.config, probe, log_plans=False, leases=leases)
+        # ...and the SAME D51 history (D88, A-3). Built without the lookup,
+        # the walk priced every mode on the formula while the real load --
+        # planned by the main planner, which reads it -- applied the observed
+        # correction on top: six slots "fit" in the walk and the load refused
+        # them by 0.03 GiB. With it, the walk's verdict is the load's.
+        planner = self._walk_planner(probe, leases=leases)
+        decision.planner = planner
         loaded = [i for i in self.supervisor.list() if i.model_id != record.id]
 
         # A chat/agent load (D46) walks with eviction of worse-tier idle
@@ -2951,7 +3029,7 @@ class ModelManager:
             # so the refusal can say whether waiting for the release is what
             # changes the answer (gpu_leased) or the box is simply too small
             # either way (insufficient_vram, the lease named as context, D53).
-            free_planner = Planner(self.config, probe, log_plans=False)
+            free_planner = self._walk_planner(probe)
             for attempt in attempts:
                 if not attempt.get("leased_devices"):
                     continue
@@ -2986,6 +3064,27 @@ class ModelManager:
         )
         return decision
 
+    def _walk_planner(self, probe: Any, *, leases: Any = None) -> Planner:
+        """A throwaway planner over ``probe`` that reads the main planner's history (D88).
+
+        The load-recommended walk, its lease-free twin and ``/profiles`` each
+        plan against their own view of the cards (credited, lease-free, per
+        mode), and each used to be a bare ``Planner(config, probe)``: formula
+        only, while the load that followed applied the D51 correction (A-3).
+        Every such planner now gets the main planner's ``observation_lookup``
+        and ``observation_sink``, so a placement the walk accepts is one the
+        load accepts. Quiet (``log_plans=False``): planning is not loading.
+        """
+        main = self.planner
+        return Planner(
+            self.config,
+            probe,
+            log_plans=False,
+            leases=leases,
+            observation_lookup=getattr(main, "observation_lookup", None),
+            observation_sink=getattr(main, "observation_sink", None),
+        )
+
     @staticmethod
     def _lease_skip_notes(
         planner: Planner, winner: Mapping[str, Any], skipped: Sequence[Mapping[str, Any]]
@@ -3010,6 +3109,174 @@ class ModelManager:
         ]
         notes.extend(planner.lease_lines(leased))
         return notes
+
+    async def _step_down_after_refusal(
+        self,
+        prep: _RecommendedPrep,
+        winner: Mapping[str, Any],
+        exc: InsufficientVramError,
+        *,
+        prefer_modes: Sequence[str] | None,
+        kv_min: str | None,
+        source: str,
+        hold: bool,
+    ) -> InstanceInfo:
+        """The real load refused the walk's slot count: walk once more with one fewer (D88).
+
+        The walk and the load now price a placement from the same D51 history
+        (A-3), so this is the race path: free VRAM moved between the walk and
+        the load, or a measurement landed in between. The 2026-11-09 shape --
+        six slots chosen, refused by 0.03 GiB -- used to end the call with a
+        507 for a load that fitted at five.
+
+        Exactly one re-walk, with ``max_slots = refused - 1`` (the walk's own
+        descent then goes down to ``min_slots``), so the context, the KV rung
+        rules, the lease book and the tier all decide again exactly as the
+        first walk did; it may land on another mode. Never below the call's
+        ``min_slots``: a floor is a requirement, and the refusal is surfaced
+        instead. A refusal that is not a VRAM shortfall (another code) is
+        re-raised untouched, and so is a lease refusal from the second load.
+
+        The loaded plan's notes say what happened and by how much the first
+        load missed; a refusal carries ``requested_parallel``,
+        ``max_parallel_that_fits``, the miss's ``needs_bytes`` /
+        ``usable_bytes`` / ``margin_bytes`` and the walk's ``alternatives``.
+        """
+        record = prep.record
+        floor = max(1, int(prep.min_slots or 1))
+        refused = int(winner["parallel"])
+        missed = _refused_load_numbers(exc)
+        if exc.code not in (None, InsufficientVramError.code):
+            raise exc
+        if refused - 1 < floor:
+            raise self._slot_refusal(
+                exc,
+                requested=refused,
+                missed=missed,
+                alternatives=[a for a in winner.get("alternatives") or [] if a.get("fits")],
+                most=exc.details.get("max_parallel_that_fits"),
+                extra=(
+                    f"load-recommended did not step down: {refused - 1} slot(s) would be "
+                    f"below this call's min_slots ({floor})."
+                ),
+            ) from exc
+        log.info(
+            "the load refused the walk's slot count; walking again with one fewer",
+            model_id=record.id,
+            mode=winner["mode"],
+            devices=winner["devices"],
+            refused_parallel=refused,
+            short_by_mb=(round(-missed["margin_bytes"] / MB) if missed["margin_bytes"] else None),
+            source=source,
+        )
+        if hold:
+            # The inner load() popped the D46 hold on its way out; re-arm it
+            # for the second walk and load, exactly as a second walk pass does.
+            self._priority_holds[record.id] = prep.tier
+        # A lease-bound walk is told as the lease's on the second walk too (D87).
+        retry = self._lease_bound_decision(
+            prep,
+            self._decide_recommended(
+                prep, prefer_modes=prefer_modes, kv_min=kv_min, max_slots=refused - 1
+            ),
+        )
+        if retry.refusal is not None:
+            again = retry.refusal
+            if not isinstance(again, InsufficientVramError):
+                raise again from exc
+            raise self._slot_refusal(
+                again,
+                requested=refused,
+                missed=missed,
+                alternatives=list(again.details.get("alternatives") or []),
+                most=again.details.get("max_parallel_that_fits"),
+                extra=(
+                    f"The first load, at {refused} slot(s), was refused "
+                    f"{_short_by(missed)}; walking again with at most {refused - 1} found "
+                    f"no placement either."
+                ),
+            ) from exc
+        if retry.already_loaded and retry.resident is not None:
+            return retry.resident
+        step = retry.winner
+        assert step is not None  # a decision is a refusal, a resident or a winner
+        try:
+            instance = await self.load(
+                record.id,
+                ctx_size=int(prep.ctx_size),
+                kv_cache_type=step["kv_cache_type"],
+                kv_cache_type_v=step["kv_cache_type_v"],
+                parallel=step["parallel"],
+                devices=step["devices"],
+                force=True,
+                source=source,
+                evict_busy=False,
+                priority=prep.tier,
+                kv_unified=bool(step.get("kv_unified")),
+            )
+        except InsufficientVramError as second:
+            if second.code not in (None, InsufficientVramError.code):
+                raise
+            raise self._slot_refusal(
+                second,
+                requested=refused,
+                missed=missed,
+                alternatives=[a for a in step.get("alternatives") or [] if a.get("fits")],
+                most=second.details.get("max_parallel_that_fits"),
+                extra=(
+                    f"load-recommended stepped down from {refused} to {step['parallel']} "
+                    f"slot(s) after the first load was refused {_short_by(missed)}, and that "
+                    f"load was refused too."
+                ),
+            ) from second
+        if instance.plan is not None:
+            stepped = (
+                f"load-recommended stepped down from {refused} to {step['parallel']} slot(s): "
+                f"the load at {refused} was refused {_short_by(missed)}"
+                + (
+                    f" ({missed['needs_bytes'] / GB:.2f} GiB needed, "
+                    f"{missed['usable_bytes'] / GB:.2f} GiB usable)"
+                    if missed["needs_bytes"] is not None and missed["usable_bytes"] is not None
+                    else ""
+                )
+                + f", and {step['mode']} (CUDA {list(step['devices'])}) was walked again"
+            )
+            for note in [stepped, *retry.notes]:
+                if note not in instance.plan.notes:
+                    instance.plan.notes.append(note)
+        return instance
+
+    @staticmethod
+    def _slot_refusal(
+        exc: InsufficientVramError,
+        *,
+        requested: int,
+        missed: Mapping[str, Any],
+        alternatives: Sequence[Mapping[str, Any]],
+        most: Any,
+        extra: str,
+    ) -> InsufficientVramError:
+        """A load-recommended refusal after a real load missed, with its numbers (D88).
+
+        The planner's own message and every detail it carried stay verbatim
+        (clients match ``reduce parallel from N to M``); added beside them:
+        ``requested_parallel``, ``max_parallel_that_fits``, the miss's
+        ``needs_bytes`` / ``usable_bytes`` / ``margin_bytes`` and the
+        ``alternatives`` the walk had priced.
+        """
+        details = dict(exc.details)
+        details["requested_parallel"] = int(requested)
+        details["max_parallel_that_fits"] = most
+        details["refused_load"] = dict(missed)
+        for key in ("needs_bytes", "usable_bytes", "margin_bytes"):
+            if details.get(key) is None:
+                details[key] = missed.get(key)
+        details["alternatives"] = [dict(a) for a in alternatives]
+        return InsufficientVramError(
+            f"{exc.message} {extra}".strip(),
+            code=exc.code,
+            details=details,
+        )
 
     def _walk_placement_leased(
         self, record: ModelRecord, winner: Mapping[str, Any], exc: InsufficientVramError
@@ -3076,6 +3343,14 @@ class ModelManager:
                 "max_parallel_that_fits": details.get("max_parallel_that_fits"),
                 "evict_model_ids": [],
                 "notes": list(decision.placement_notes),
+                # How far the closest mode missed, in the numbers it was judged
+                # on, and the fewer-slot loads that DO fit (D88).
+                "needs_bytes": details.get("needs_bytes"),
+                "usable_bytes": details.get("usable_bytes"),
+                "margin_bytes": details.get("margin_bytes"),
+                "observed_applied": bool(details.get("observed_applied")),
+                "headroom_fraction": float(self.config.planner.headroom_fraction),
+                "alternatives": list(details.get("alternatives") or []),
             }
         resident = decision.resident
         if decision.already_loaded and resident is not None and resident.plan is not None:
@@ -3101,6 +3376,9 @@ class ModelManager:
                 "placement_tier": standing.placement_tier,
                 "per_gpu_bytes": dict(standing.per_gpu_bytes),
                 "estimate_bytes": _estimate_bytes(standing),
+                # The resident's own numbers from when it was planned (D88);
+                # nothing is re-walked, so no slot table.
+                **self._fit_report(None, standing, None),
             }
         winner = decision.winner
         assert winner is not None
@@ -3137,8 +3415,66 @@ class ModelManager:
             "notes": notes,
             "placement_tier": walk_plan.placement_tier if walk_plan is not None else None,
             "per_gpu_bytes": dict(walk_plan.per_gpu_bytes) if walk_plan is not None else {},
+            # The walk's estimate: since D88 the walk reads the D51 history, so
+            # this is the corrected total the load will reserve (= needs_bytes).
             "estimate_bytes": _estimate_bytes(walk_plan) if walk_plan is not None else None,
+            **self._fit_report(decision.planner, walk_plan, winner),
         }
+
+    def _fit_report(
+        self,
+        planner: Planner | None,
+        plan: LoadPlan | None,
+        winner: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        """The D88 margin block of a fit response (B.5).
+
+        ``needs_bytes`` (what the load reserves, D51-corrected where a
+        measurement of this configuration exists), ``usable_bytes`` and
+        ``usable_bytes_per_gpu`` (what the cards offered when the fit was
+        decided, after ``headroom_fraction`` and with any eviction credit),
+        ``margin_bytes`` / ``margin_bytes_per_gpu`` (usable minus needs),
+        ``observed_applied``, ``formula_bytes`` and ``observed_bytes`` (the
+        estimate a correction replaced and the measurement it came from;
+        ``observed_bytes`` is ``None`` on a formula-only plan),
+        ``observed_legacy`` (the measurement is a pre-D88 row that could not
+        name its card class), plus the walk's ``alternatives`` and
+        ``max_parallel_that_fits``.
+        """
+        asker = (
+            planner
+            if planner is not None
+            else Planner(self.config, self.planner.probe, log_plans=False)
+        )
+        report: dict[str, Any] = {
+            "needs_bytes": None,
+            "usable_bytes": None,
+            "usable_bytes_per_gpu": None,
+            "margin_bytes": None,
+            "margin_bytes_per_gpu": None,
+            "observed_applied": False,
+            "headroom_fraction": float(self.config.planner.headroom_fraction),
+            "formula_bytes": None,
+            "observed_bytes": None,
+            "observed_legacy": False,
+            "alternatives": list((winner or {}).get("alternatives") or []),
+            "max_parallel_that_fits": (winner or {}).get("max_parallel_that_fits"),
+        }
+        if plan is None:
+            return report
+        report.update(asker.fit_margin(plan))
+        applied = asker.applied_correction_for(plan.model_id, plan) if planner else None
+        if applied is not None:
+            report["formula_bytes"] = int(applied.formula.total_bytes)
+            report["observed_bytes"] = int(applied.correction.observed_bytes)
+            report["observed_legacy"] = bool(applied.correction.legacy)
+            report["observed_applied"] = True
+        elif not report["observed_applied"]:
+            # On the formula alone, the formula IS what is reserved. A plan
+            # whose note says it was corrected by a planner that no longer
+            # knows the formula (a resident) leaves it None, never a guess.
+            report["formula_bytes"] = int(plan.estimate.total_bytes)
+        return report
 
     def _modes_for_recommendation(
         self,
@@ -3308,6 +3644,9 @@ class ModelManager:
             attempt["busy_models"] = list(result.busy_models)
             attempt["vram_holders"] = [h.model_dump() for h in result.vram_holders]
             attempt["rejected"] = result
+            # How far the floor missed, in the numbers it was judged on (D88).
+            attempt["margin"] = planner.refusal_margin(result)
+            attempt["max_parallel_that_fits"] = None
             if result.reason_code == "gpu_leased":
                 # Which of this mode's cards a lease holds for someone else:
                 # the walk moves on, and says why it did (D64).
@@ -3339,6 +3678,24 @@ class ModelManager:
                         <= kv_quality_rank(kv_min, kv_min)
                     ):
                         attempt["max_parallel_that_fits"] = fewer
+                        # The fewer-slot load that DOES fit, beside the floor
+                        # that did not, both with their margins (D88).
+                        attempt["alternatives"] = [
+                            {
+                                "parallel": floor,
+                                "fits": False,
+                                **_margin_fields(attempt["margin"]),
+                                "chosen": False,
+                            },
+                            {
+                                "parallel": fewer,
+                                "fits": True,
+                                **_margin_fields(planner.fit_margin(trial)),
+                                "kv_cache_type": trial.kv_cache_type,
+                                "kv_cache_type_v": trial.kv_cache_type_v,
+                                "chosen": False,
+                            },
+                        ]
                         break
             return attempt
 
@@ -3355,7 +3712,13 @@ class ModelManager:
             attempt["vram_holders"] = []
             return attempt
 
-        slots, _bound, _vram = catalog_mod.slots_for_plan(planner, pinned, result)
+        # Sized inside a planning pass, so every slot count is priced with the
+        # D51 correction the load will apply, and against the capacity the fit
+        # above was decided on -- eviction and preemption credit included
+        # (D88; A-13: sized off the live probe alone, a mode that fits only
+        # once its victims leave was given one slot).
+        with planner.observation_pass():
+            slots, _bound, _vram = catalog_mod.slots_for_plan(planner, pinned, result)
         if max_slots is not None:
             # Applied here rather than inside the planner's capacity sizing:
             # the catalog's concurrency numbers describe what a placement
@@ -3369,6 +3732,7 @@ class ModelManager:
         parallel = max(int(wanted["value"]), floor)
         if max_slots is not None:
             parallel = min(parallel, int(max_slots))
+        refused_at: dict[int, LoadRejected] = {}
         while parallel > floor:
             candidate = planner.plan_load(
                 pinned,
@@ -3390,8 +3754,18 @@ class ModelManager:
             if isinstance(candidate, LoadPlan):
                 plan = candidate
                 break
+            refused_at[parallel] = candidate
             parallel -= 1
 
+        alternatives, most = self._slot_alternatives(
+            planner,
+            pinned,
+            plan,
+            parallel=parallel,
+            floor=floor,
+            ceiling=int(max_slots) if max_slots is not None else planner.parallel_cap(pinned),
+            refused_at=refused_at,
+        )
         attempt.update(
             fits=True,
             ctx_size=ctx_size,
@@ -3405,8 +3779,64 @@ class ModelManager:
             vram_mb=round(plan.estimate.total_bytes / MB),
             # The walk's own plan, for the dry run's notes and estimate (D64).
             plan=plan,
+            # What the chosen count leaves, every count around it, and the most
+            # this placement holds at the window (D88).
+            margin=planner.fit_margin(plan),
+            alternatives=alternatives,
+            max_parallel_that_fits=most,
         )
         return attempt
+
+    def _slot_alternatives(
+        self,
+        planner: Planner,
+        pinned: ModelRecord,
+        plan: LoadPlan,
+        *,
+        parallel: int,
+        floor: int,
+        ceiling: int,
+        refused_at: Mapping[int, LoadRejected],
+    ) -> tuple[list[dict[str, Any]], int]:
+        """The slot counts around the chosen one, with what each leaves (D88, B.5).
+
+        ``(alternatives, max_parallel_that_fits)``. Every count from the floor
+        up to the most that fit, plus the first that does not -- the near miss
+        a client otherwise meets as a refused load ("six slots, refused by
+        0.03 GiB") -- most slots first, the chosen one marked. Priced by
+        :meth:`Planner.slot_margins`: this placement, this context and KV
+        rung, the D51 corrections a load would apply, against the capacity the
+        chosen plan was decided on. The chosen count carries the plan's own
+        numbers, and a count the descent's real planner call refused stays
+        refused whatever the arithmetic says.
+        """
+        upper = max(int(parallel), int(ceiling))
+        table = planner.slot_margins(
+            pinned,
+            plan,
+            counts=list(range(int(floor), upper + 1)),
+            draft=self._draft_for(pinned),
+            adapters=[a for a, _ in self._adapters_for(pinned)],
+        )
+        chosen_margin = _margin_fields(planner.fit_margin(plan))
+        for row in table:
+            count = int(row["parallel"])
+            if count == int(parallel):
+                row.update(fits=True, **chosen_margin)
+            elif count in refused_at:
+                row["fits"] = False
+                missed = planner.refusal_margin(refused_at[count])
+                if missed.get("margin_bytes") is not None and (row["margin_bytes"] or 0) >= 0:
+                    row.update(_margin_fields(missed))
+            row["chosen"] = count == int(parallel)
+        most = max(
+            (int(r["parallel"]) for r in table if r["fits"]),
+            default=int(parallel),
+        )
+        most = max(most, int(parallel))
+        shown = [r for r in table if int(r["parallel"]) <= most + 1]
+        shown.sort(key=lambda r: -int(r["parallel"]))
+        return shown, most
 
     def _recommendation_refused(
         self,
@@ -3548,6 +3978,8 @@ class ModelManager:
                     **entry,
                     "leased_devices": attempt.get("leased_devices"),
                     "fits_once_lease_released": attempt.get("fits_once_lease_released"),
+                    # How far this mode missed at the floor (D88).
+                    "margin_bytes": (attempt.get("margin") or {}).get("margin_bytes"),
                 }
                 for entry, attempt in zip(modes, attempts, strict=True)
             ],
@@ -3566,7 +3998,29 @@ class ModelManager:
             # pre-D72 caller's refusal body is exactly what it was.
             details["min_slots"] = int(min_slots) if min_slots else None
             details["kv_unified"] = bool(kv_unified)
-            details["max_parallel_that_fits"] = best_slots or None
+        # Always present since D88 (B.5): the most slots any mode holds at the
+        # window, None when not even the floor's count does.
+        details["max_parallel_that_fits"] = best_slots or None
+        # How far the CLOSEST mode missed at the floor, in the numbers it was
+        # judged on (negative margin_bytes: "refused by 0.03 GiB"), and every
+        # fewer-slot load that does fit, per mode (D88).
+        margins = [
+            a["margin"] for a in attempts if (a.get("margin") or {}).get("margin_bytes") is not None
+        ]
+        closest = max(margins, key=lambda m: int(m["margin_bytes"]), default=None)
+        details.update(
+            needs_bytes=closest["needs_bytes"] if closest else None,
+            usable_bytes=closest["usable_bytes"] if closest else None,
+            margin_bytes=closest["margin_bytes"] if closest else None,
+            observed_applied=bool(closest["observed_applied"]) if closest else False,
+            headroom_fraction=float(self.config.planner.headroom_fraction),
+            alternatives=[
+                {"mode": a["mode"], "devices": list(a["devices"]), **alt}
+                for a in attempts
+                for alt in (a.get("alternatives") or [])
+                if alt.get("fits")
+            ],
+        )
         # The model's saved placement, when it shaped the walk (D76); absent
         # otherwise, for the same reason.
         if saved_override is not None:
@@ -4747,6 +5201,9 @@ class ModelManager:
                     actual_bytes=actual,
                     note=OBSERVATION_NOTE_PER_PID_DEVICE,
                     per_gpu_actual=per_device,
+                    # The file is part of the D51 key since D88: a GGUF
+                    # replaced under the same id starts its own history.
+                    gguf_size=int(record.size_bytes or 0) or None,
                 )
             else:
                 log.debug(
@@ -6987,18 +7444,16 @@ class ModelManager:
         # INFO one call would log a line per model per mode per rung, which is
         # exactly the flood the 2026-08-19 log review found when an external
         # client fetched profiles for the whole library.
-        planner = Planner(self.config, self.planner.probe, log_plans=False)
+        # Both read the main planner's D51 history (D88): a mode's verdict here
+        # is the one load-recommended and the real load would reach.
+        planner = self._walk_planner(self.planner.probe)
         instance = self.supervisor.get(record.id)
         loaded = [i for i in self.supervisor.list() if i.model_id != record.id]
         live = planner
         if instance is not None:
             footprint = Planner.instance_footprint(instance)
             if footprint:
-                live = Planner(
-                    self.config,
-                    catalog_mod.CreditedProbe(self.planner.probe, footprint),
-                    log_plans=False,
-                )
+                live = self._walk_planner(catalog_mod.CreditedProbe(self.planner.probe, footprint))
 
         entries = placements_mod.placement_report(
             record,
@@ -7233,6 +7688,9 @@ class ModelManager:
                 # bytes (D64, CR-5). Both stay: clients read the first.
                 "estimate_mb": result.estimate.breakdown_mb(),
                 "estimate_bytes": _estimate_bytes_of(result.estimate),
+                # How far it missed, in the numbers it was judged on (D88):
+                # needs_bytes / usable_bytes / margin_bytes (negative).
+                **self._preview_margin(result),
             }
         return {
             "fits": True,
@@ -7254,7 +7712,124 @@ class ModelManager:
             "single_gpu": result.fits_single_gpu,
             "mixed_generation": any("mixed-generation split" in n for n in result.notes),
             "last_observation": self._last_vram_observation(serving_id),
+            # What the load reserves against what the cards offered when the
+            # fit was decided, and the gap (D88).
+            **self._preview_margin(result),
         }
+
+    def _preview_margin(self, result: Any) -> dict[str, Any]:
+        """The D88 margin block of ``GET /api/models/{id}/plan`` (B.5).
+
+        Read off the main planner, which made the plan: ``needs_bytes``,
+        ``usable_bytes``, ``usable_bytes_per_gpu``, ``margin_bytes``,
+        ``observed_applied``, ``headroom_fraction`` (plus the per-card margins
+        on a fit). A planner stand-in without the methods yields nothing, so
+        the body is exactly the pre-D88 one.
+        """
+        planner = self.planner
+        if isinstance(result, LoadPlan):
+            measure = getattr(planner, "fit_margin", None)
+        else:
+            measure = getattr(planner, "refusal_margin", None)
+        if not callable(measure):
+            return {}
+        try:
+            found = measure(result)
+        except Exception:  # noqa: BLE001 - a report must never fail the preview
+            return {}
+        return dict(found) if isinstance(found, dict) else {}
+
+    @staticmethod
+    def load_route_for(
+        *,
+        context_length: int | None,
+        devices: Sequence[int] | None = None,
+        parallel: int | None = None,
+        kv_cache_type: Any = None,
+        kv_cache_type_v: Any = None,
+    ) -> str:
+        """Which load a ``/models/load`` body is: ``"load"`` or ``"load_recommended"`` (D88).
+
+        The one rule both the real ``POST /models/load`` and its
+        ``?dryRun=true`` must apply (B.0, B.5), so the dry run is the same
+        decision as the load. A body that places the model itself -- names
+        ``devices``, ``parallel`` or a KV cache type -- or names no
+        ``context_length`` is an explicit load (``POST /api/models/{id}/load``
+        and its dry run ``GET /api/models/{id}/plan``); a body that names only
+        the window (plus ``min_slots``, ``max_slots``, ``kv_unified``,
+        ``allowed_devices``, ``priority``) is the strict-context mode walk
+        (``load-recommended`` and ``plan-recommended``).
+        """
+        explicit = (
+            devices is not None
+            or parallel is not None
+            or kv_cache_type is not None
+            or kv_cache_type_v is not None
+        )
+        if explicit or context_length is None:
+            return "load"
+        return "load_recommended"
+
+    async def load_dry_run(
+        self,
+        name: str,
+        *,
+        context_length: int | None = None,
+        devices: Sequence[int] | None = None,
+        parallel: int | None = None,
+        kv_cache_type: Any = None,
+        kv_cache_type_v: Any = None,
+        allowed_devices: Sequence[int] | None = None,
+        priority: int | None = None,
+        min_slots: int | None = None,
+        max_slots: int | None = None,
+        kv_unified: bool | None = None,
+        prefer_modes: Sequence[str] | None = None,
+        kv_min: str | None = None,
+    ) -> dict[str, Any]:
+        """``POST /models/load?dryRun=true``: the load's decision, nothing started (D88, B.5).
+
+        The plumbing for the canonical dry run (k8s ``?dryRun`` semantics,
+        B.0): routed by :meth:`load_route_for` exactly as the real load is, it
+        returns :meth:`plan_recommended`'s body for a window-only request and
+        :meth:`plan_preview`'s for an explicit one, each with ``dry_run: true``
+        and the D88 margin fields; ``dry_run_of`` names which. Nothing is
+        loaded, evicted, held or persisted, and a bad request is the same 400
+        the load would answer. ``GET /api/models/{id}/plan`` and
+        ``/plan-recommended`` keep working as the deprecated aliases (E.4).
+        """
+        route = self.load_route_for(
+            context_length=context_length,
+            devices=devices,
+            parallel=parallel,
+            kv_cache_type=kv_cache_type,
+            kv_cache_type_v=kv_cache_type_v,
+        )
+        if route == "load_recommended":
+            assert context_length is not None
+            body = await self.plan_recommended(
+                name,
+                int(context_length),
+                prefer_modes=prefer_modes,
+                kv_min=kv_min,
+                max_slots=max_slots,
+                allowed_devices=allowed_devices,
+                priority=priority,
+                min_slots=min_slots,
+                kv_unified=kv_unified,
+            )
+        else:
+            body = self.plan_preview(
+                name,
+                ctx_size=context_length,
+                kv_cache_type=kv_cache_type,
+                kv_cache_type_v=kv_cache_type_v,
+                parallel=parallel,
+                devices=devices,
+                allowed_devices=allowed_devices,
+                priority=priority,
+            )
+        return {**body, "dry_run": True, "dry_run_of": route}
 
     def _last_vram_observation(self, model_id: str) -> dict[str, Any] | None:
         """The planner's last predicted-vs-actual record, or ``None``.

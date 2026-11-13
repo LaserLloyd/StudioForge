@@ -39,7 +39,7 @@ log = get_logger(__name__)
 
 #: Highest migration version this build of the code ships. ``migrate()``
 #: brings any older database up to this.
-SCHEMA_VERSION: int = 10
+SCHEMA_VERSION: int = 11
 
 #: SQLite's own words for "this file is not a usable database". Only a message
 #: carrying one of these is treated as corruption by ``migrate_with_recovery``;
@@ -116,7 +116,19 @@ _OBSERVATION_COLUMNS: tuple[str, ...] = (
     # see :meth:`Database.matching_observation` for what NULL is allowed to
     # match, and why it is not read as "the same as K".
     "kv_cache_type_v",
+    # What kind of cards, which split, which file (migration 011, D88): the
+    # placement's sorted card classes ("sm_86-24g+sm_86-24g"), the split mode
+    # the child ran with ("none" on one card) and the GGUF's size in bytes.
+    # NULL on older rows, which stay usable as legacy matches (F-6).
+    "class_key",
+    "split_mode",
+    "gguf_size",
 )
+
+#: The D88 columns of the D51 match key, in the order they are compared. A row
+#: whose value is NULL predates migration 011 and is a LEGACY match for that
+#: column; a non-NULL value must equal the one asked for.
+_OBSERVATION_SHAPE_COLUMNS: tuple[str, ...] = ("class_key", "split_mode", "gguf_size")
 
 #: The only ``load_observations.note`` whose ``actual_bytes`` is trustworthy:
 #: our own child's VRAM, attributed per pid AND per device. Everything before
@@ -829,6 +841,9 @@ class Database:
         kv_cache_type_v: str | None,
         device_count: int,
         kv_unified: bool = False,
+        class_key: str | None = None,
+        split_mode: str | None = None,
+        gguf_size: int | None = None,
     ) -> dict[str, Any] | None:
         """The newest trustworthy load of *this exact configuration*, or ``None``.
 
@@ -877,7 +892,25 @@ class Database:
           ``ctx`` at two slots weighs about what one slot of ``ctx`` does and
           half a partitioned pair, so the two shapes never stand in for each
           other.
+        * ``class_key``, ``split_mode``, ``gguf_size`` (migration 011, D88) --
+          the card classes of the placement (``"sm_86-24g+sm_86-24g"``), how
+          the cards share the model (``"none"`` on one card), and the file's
+          size. Without them a correction learned on two 32 GiB Blackwell cards
+          was spent on two 24 GiB Ampere cards of the same count, a tensor
+          split borrowed a layer split's row, and a GGUF replaced under the
+          same id inherited the old file's history. A lookup value of ``None``
+          does not filter (the caller cannot say). A row value of NULL is a
+          LEGACY match (owner decision F-6): such a row is returned only when
+          no row naming the exact value exists in the window, and the returned
+          dict then carries ``legacy_match: True``. A non-NULL row value never
+          matches a different one.
         """
+        asked: dict[str, Any] = {
+            "class_key": class_key,
+            "split_mode": split_mode,
+            "gguf_size": int(gguf_size) if gguf_size else None,
+        }
+        legacy: dict[str, Any] | None = None
         for row in self.load_observations(model_id, limit=_OBSERVATION_MATCH_WINDOW):
             if not row.get("ok"):
                 continue
@@ -905,8 +938,28 @@ class Database:
                 continue
             if _observation_is_unified(row) != bool(kv_unified):
                 continue
-            return row
-        return None
+            is_legacy = False
+            mismatch = False
+            for column in _OBSERVATION_SHAPE_COLUMNS:
+                want = asked[column]
+                if want is None:
+                    continue
+                have = row.get(column)
+                if have is None or have == "":
+                    is_legacy = True
+                elif have != want:
+                    mismatch = True
+                    break
+            if mismatch:
+                continue
+            if not is_legacy:
+                row["legacy_match"] = False
+                return row
+            if legacy is None:
+                legacy = row
+        if legacy is not None:
+            legacy["legacy_match"] = True
+        return legacy
 
     # ------------------------------------------------------------------
     # Throughput calibration

@@ -8047,3 +8047,51 @@ carry `max_parallel_that_fits` beside `requested_parallel` everywhere (D88 adds 
 `lease_release_unloads`, `lease_k8s_fields`, `lease_auto_count`, `lease_refusal_codes`;
 `tests/unit/test_lease_ownership.py`, `test_leases.py`, `test_lease_vacate.py`, `test_mcp.py`,
 `test_companion.py`.
+
+## D88 -- The walk is the load: one D51 history, margins, a slot step-down, a card-class key
+
+**Problem.** The load-recommended walk, its lease-free twin and `/profiles` each planned with a
+bare `Planner(config, probe)` that had no `observation_lookup`, so the walk priced every placement on
+the formula while the real load, planned by the main planner, applied the D51 correction on top
+(A-3). Measured 2026-11-09: a 6-slot plan on a 24 GiB pair (33.8 GB Q8, 16384/slot, q8_0) measured
+about 1% under its estimate; D51's 10% band put it 0.03 GiB over usable, the load was refused, and
+nothing stepped down to 5 -- the retry ran only on `gpu_leased`. A fit response carried no usable,
+needs or margin, no alternatives and no "most slots at this context" (A-8), so a client could not
+see "refused by 0.03 GiB" coming. Slot sizing read live usable VRAM only, ignoring the eviction
+credit the fit was decided with (A-13). And the D51 key named the device COUNT only: a correction
+learned on a 32 GiB pair was spent on a 24 GiB pair, a layer and a tensor split shared one row, and
+a replaced GGUF under the same id inherited the old correction; a fresh copy had no history (A-12).
+
+**Decision.**
+
+1. Every walk planner shares the main planner's observation lookup and sink
+   (`Planner.sibling`, `ModelManager._walk_planner`), so the dry run prices what the real load is
+   charged.
+2. Fit and refusal bodies carry `needs_bytes`, `usable_bytes`, `margin_bytes` (and per card),
+   `observed_applied`, `formula_bytes` / `observed_bytes`, `headroom_fraction`,
+   `max_parallel_that_fits` (always) and `alternatives` (every slot count up to the first miss,
+   most first). `estimate_bytes.total` in plan-recommended is the corrected total; the formula
+   figure is `formula_bytes`.
+3. A real-load `insufficient_vram` re-walks once with `max_slots = refused - 1`, never below
+   `min_slots`, and notes the miss on the plan; a refusal that cannot step down carries
+   `requested_parallel`, the first load's numbers and the walk's `alternatives` beside the
+   planner's own message.
+4. Slot sizing uses the capacity the fit was decided on (`LoadPlan.usable_bytes_per_gpu`), eviction
+   and preemption credit included.
+5. The D51 key adds `class_key` (the placement's card classes, `<arch>-<GiB>g` sorted and joined
+   with `+`), `split_mode` and `gguf_size` (migration 011, `SCHEMA_VERSION` 11; owner decision F-6).
+   Older rows are legacy matches used only when no exact row exists. A virtual copy with no adapters
+   or draft borrows its base's rows.
+6. `load_dry_run` / `load_route_for` back `POST /models/load?dryRun=true` (D90).
+
+**Not done.** The planner still prices tensor-mode VRAM per card like the layer split (D83);
+`placements.py`'s own bare planner should become a sibling; speed is not yet in fit responses.
+
+**Surfaces.** `core/planner.py` (`sibling`, `observation_pass`, `fit_margin`, `device_class_key`,
+`placement_class_key`, the D51 key), `core/manager.py` (`_walk_planner`,
+`_step_down_after_refusal`, `_slot_refusal`, margin fields, `load_dry_run`, `load_route_for`),
+`core/catalog.py` (`slots_for_plan` capacity), `db.py` + `migrations/011_observation_device_class.sql`,
+`types.py` (`LoadPlan` margin fields), `api/mgmt_routes.py`, docs `CATALOG.md`, `LIMITATIONS.md`;
+capabilities `plan_margin`, `load_recommended_step_down`, `observation_class_key`;
+`tests/unit/test_planner_fit_margin.py`, `test_planner_observation_key.py`,
+`test_slots_unified_pool.py`, `test_cli_commands.py`.

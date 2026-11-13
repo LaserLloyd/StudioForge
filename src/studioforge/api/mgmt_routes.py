@@ -1241,10 +1241,12 @@ async def plan_recommended(
     lists every mode tried either way.
 
     Not previewed: the D46 ``priority_hold`` 503 (a transient admission wait,
-    not a placement decision), and the D51 observed correction the real load
-    may apply on top of the walk's formula estimate -- the placement agrees,
-    the last megabyte of the estimate may not. Same auth as ``/plan``: a GET,
-    ungated.
+    not a placement decision). The D51 observed correction IS (D88): the walk
+    reads the same history the load applies, and a fit reports how much room
+    it leaves -- ``needs_bytes``, ``usable_bytes``, ``margin_bytes``,
+    ``observed_applied``, ``max_parallel_that_fits`` and ``alternatives``
+    (every slot count up to the first that does not fit, with its margin).
+    Same auth as ``/plan``: a GET, ungated.
     """
     state = _state(request)
     return await state.manager.plan_recommended(

@@ -43,7 +43,7 @@ import itertools
 import json
 import math
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal
 
 from studioforge.config import Config, FlashAttn, KvCacheType, QuantAffinity, SplitMode
@@ -54,6 +54,7 @@ from studioforge.core.leases import LeaseBook, lease_view
 from studioforge.core.priority import PRIORITY_BACKGROUND
 from studioforge.logging import first_time, get_logger
 from studioforge.types import (
+    GB,
     MB,
     AdapterRecord,
     GpuInfo,
@@ -1186,6 +1187,61 @@ class Planner:
         """
         found = self._last_observations.get(model_id)
         return dict(found) if found is not None else None
+
+    # -- the walk's planners share this one's history (D88) ----------------
+
+    @property
+    def observation_lookup(self) -> Callable[..., dict[str, Any] | None] | None:
+        """The D51 lookup this planner reads; ``None`` when it has no database."""
+        return self._observation_lookup
+
+    @property
+    def observation_sink(self) -> Callable[[dict[str, object]], None] | None:
+        """Where :meth:`observe` writes rows; ``None`` when it has no database."""
+        return self._observation_sink
+
+    def sibling(
+        self,
+        probe: GpuProbe,
+        *,
+        leases: LeaseBook | None = None,
+        log_plans: bool = False,
+    ) -> Planner:
+        """A planner over another view of the cards that reads THIS one's history (D88).
+
+        The load-recommended walk plans against a credited probe, a lease-free
+        probe or a mode's card set, and each of those used to be a bare
+        ``Planner(config, probe)`` with no ``observation_lookup``: the walk
+        priced every placement on the formula while the real load, planned by
+        the main planner, applied the D51 correction on top -- so a walk could
+        choose six slots that the load then refused by 0.03 GiB. A sibling
+        asks the same lookup and writes to the same sink, so the walk and the
+        load answer from one history.
+        """
+        return Planner(
+            self.config,
+            probe,
+            observation_sink=self._observation_sink,
+            observation_lookup=self._observation_lookup,
+            log_plans=log_plans,
+            leases=leases,
+        )
+
+    @contextlib.contextmanager
+    def observation_pass(self) -> Iterator[None]:
+        """One planning pass for a caller outside :meth:`plan_load` (D88).
+
+        :meth:`plan_load` opens its own; a caller that sizes slots for a plan
+        it already holds (:func:`catalog.slots_for_plan` in the load-recommended
+        walk) wraps the sizing in this so the slot count is priced with the
+        same D51 corrections the load will apply.
+        """
+        with self._observation_pass():
+            yield
+
+    def parallel_cap(self, record: ModelRecord) -> int:
+        """The most slots this planner will ever size ``record`` to (D48 cap)."""
+        return self._parallel_cap(record)
 
     # -- device generations (mixed Blackwell/Ampere splits) ---------------
 
@@ -2883,8 +2939,14 @@ class Planner:
         adapters: Sequence[AdapterRecord],
         *,
         kv_unified: bool = False,
+        devices: Sequence[int] | None = None,
     ) -> VramEstimate:
         """The formula estimate, corrected by what this configuration measured (D51).
+
+        ``devices`` names the cards the estimate is for, so the correction is
+        looked up under their card classes and split mode (D88) rather than
+        their count alone; ``None`` (no placement in hand) keys by count, as
+        before D88.
 
         This is where the correction lands because this is the one funnel every
         candidate estimate flows through -- the fit check in
@@ -2940,6 +3002,7 @@ class Planner:
             formula_bytes=estimate.total_bytes,
             weights_bytes=estimate.weights_bytes,
             kv_unified=kv_unified,
+            devices=devices,
         )
         if correction is None:
             return estimate
@@ -2947,11 +3010,203 @@ class Planner:
         # Remembered for :meth:`observe` (D63): the plan will carry only the
         # corrected numbers, and the formula they replaced is what the
         # planner's error and the calibrator are measured against.
+        class_key, split_mode = self._placement_shape(record, devices)
         self._remember_applied(
-            _correction_key(record.id, ctx, slots, kv_k, kv_v, n_devices, kv_unified),
+            _correction_key(
+                record.id, ctx, slots, kv_k, kv_v, n_devices, kv_unified, class_key, split_mode
+            ),
             AppliedCorrection(correction=correction, formula=estimate, corrected=corrected),
         )
         return corrected
+
+    def _device_classes(self) -> dict[int, str]:
+        """``{cuda index: class key}`` for every card the probe reports (D88).
+
+        Cached on the planning pass when one is open (one probe read per
+        ``plan_load``, not one per rung); read fresh otherwise -- that is
+        :meth:`observe`, once per load. A probe that cannot answer yields an
+        empty map, and the correction then keys by device count alone.
+        """
+        memo = self._obs_memo
+        if memo is not None and memo.classes is not None:
+            return memo.classes
+        try:
+            classes = {int(g.index): device_class_key(g) for g in self.probe.list_gpus()}
+        except Exception:  # noqa: BLE001 -- a sick probe costs the class, never a plan
+            classes = {}
+        if memo is not None:
+            memo.classes = classes
+        return classes
+
+    def _placement_shape(
+        self, record: ModelRecord, devices: Sequence[int] | None
+    ) -> tuple[str | None, str | None]:
+        """``(class_key, split_mode)`` the D51 key names for ``devices`` (D88).
+
+        ``class_key`` is the cards' classes, sorted and joined
+        (:func:`placement_class_key`), or ``None`` when a card is unknown to the
+        probe. ``split_mode`` is ``"none"`` on one card -- what the engine is
+        launched with -- else the model's split mode, and ``None`` for
+        ``auto``: the supervisor resolves that at launch (to ``layer`` or
+        ``tensor``) and the row stores what it resolved to, so a plan that
+        cannot yet say which must not filter on it.
+        """
+        if not devices:
+            return None, None
+        classes = self._device_classes()
+        keys = [classes.get(int(d)) for d in devices]
+        class_key = "+".join(sorted(k for k in keys if k)) if all(keys) else None
+        if len(devices) == 1:
+            return class_key, "none"
+        mode = str(self._split_mode_for(record))
+        return class_key, (None if mode == "auto" else mode)
+
+    def applied_correction_for(self, model_id: str, plan: LoadPlan) -> AppliedCorrection | None:
+        """The D51 correction this planner spent on ``plan``'s estimate, if any (D88).
+
+        What a fit response reports as ``formula_bytes`` / ``observed_bytes``:
+        the formula the correction replaced and the measurement it came from.
+        ``None`` for a plan on the formula alone, or one this planner did not
+        make.
+        """
+        return self._correction_spent_on(model_id, plan)
+
+    def fit_margin(self, plan: LoadPlan) -> dict[str, Any]:
+        """How much room a plan leaves, in the numbers its fit was judged on (D88).
+
+        ``needs_bytes`` is what the plan reserves -- the corrected total when
+        D51 moved it (``observed_applied``) -- and ``usable_bytes`` what its
+        cards offered when the fit was decided: free VRAM minus
+        ``headroom_fraction`` of each card's total and ``reserved_mb``, plus
+        whatever an eviction or a priority preemption the plan counts on would
+        free. ``margin_bytes = usable - needs``, never negative on a plan that
+        fits; per card the same for each device. A plan made before D88, or by
+        a planner that recorded no capacities, reports ``usable`` and the
+        margins as ``None`` rather than a guess.
+        """
+        needs = int(plan.estimate.total_bytes)
+        per_gpu = {int(d): int(b) for d, b in (plan.usable_bytes_per_gpu or {}).items()}
+        usable = sum(per_gpu.values()) if per_gpu else None
+        return {
+            "needs_bytes": needs,
+            "usable_bytes": usable,
+            "usable_bytes_per_gpu": per_gpu or None,
+            "margin_bytes": (usable - needs) if usable is not None else None,
+            "margin_bytes_per_gpu": (
+                {d: per_gpu[d] - int(plan.per_gpu_bytes.get(d, 0) or 0) for d in sorted(per_gpu)}
+                if per_gpu
+                else None
+            ),
+            "observed_applied": plan_observed_applied(plan),
+            "headroom_fraction": float(self.config.planner.headroom_fraction),
+        }
+
+    def slot_margins(
+        self,
+        record: ModelRecord,
+        plan: LoadPlan,
+        *,
+        counts: Sequence[int],
+        draft: ModelRecord | None = None,
+        adapters: Sequence[AdapterRecord] = (),
+    ) -> list[dict[str, Any]]:
+        """``plan``'s placement at other slot counts: what each needs and leaves (D88).
+
+        For every count in ``counts``, the estimate a load at that count would
+        be charged -- the formula, corrected by D51 where this exact
+        configuration (card classes included) was measured -- against the
+        capacity ``plan``'s fit was decided on (:attr:`LoadPlan.usable_bytes_per_gpu`,
+        its evictions and preemptions included). Same placement, same context,
+        same KV rung, same pool shape; only the slot count moves. Pure
+        arithmetic in one planning pass: no placement is re-walked and no
+        process table is read, so a fit response can carry the whole table.
+
+        Each row: ``parallel``, ``fits``, ``needs_bytes``, ``usable_bytes``,
+        ``margin_bytes`` (negative = refused by that much) and
+        ``observed_applied``. A plan that recorded no capacities (made before
+        D88) is judged against the live probe's usable VRAM on its cards.
+        """
+        recorded = plan.usable_bytes_per_gpu or {}
+        if recorded and all(int(d) in recorded for d in plan.devices):
+            capacity = sum(int(recorded[int(d)]) for d in plan.devices)
+        else:
+            gpu_map = self._gpu_map()
+            forced = bool(record.settings.device_override)
+            capacity = sum(
+                self.usable_bytes(gpu_map[d], forced=forced) for d in plan.devices if d in gpu_map
+            )
+        rows: list[dict[str, Any]] = []
+        devices = list(plan.devices)
+        with self._observation_pass():
+            for count in counts:
+                slots = max(1, int(count))
+                estimate = self._safe_estimate(
+                    record,
+                    int(plan.ctx_size),
+                    slots,
+                    plan.kv_cache_type,
+                    plan.kv_cache_type_v,
+                    len(devices) or 1,
+                    draft,
+                    record.settings.draft_ctx_size,
+                    adapters,
+                    kv_unified=bool(plan.kv_unified),
+                    devices=devices,
+                )
+                corrected = (
+                    self._memoized_correction(
+                        record,
+                        ctx=int(plan.ctx_size),
+                        slots=slots,
+                        kv_k=plan.kv_cache_type,
+                        kv_v=plan.kv_cache_type_v,
+                        n_devices=len(devices) or 1,
+                        kv_unified=bool(plan.kv_unified),
+                        devices=devices,
+                    )
+                    is not None
+                )
+                needs = int(estimate.total_bytes)
+                rows.append(
+                    {
+                        "parallel": slots,
+                        "fits": needs <= capacity,
+                        "needs_bytes": needs,
+                        "usable_bytes": int(capacity),
+                        "margin_bytes": int(capacity) - needs,
+                        "observed_applied": corrected,
+                    }
+                )
+        return rows
+
+    def refusal_margin(self, rejected: LoadRejected) -> dict[str, Any]:
+        """:meth:`fit_margin` for a refusal: how far it missed (D88).
+
+        ``margin_bytes`` is negative -- the "refused by 0.03 GiB" a client can
+        see coming. ``None`` when nothing was estimated (a lease refusal).
+        """
+        needs = int(rejected.required_bytes or 0)
+        usable = int(rejected.available_bytes or 0)
+        estimated = bool(needs or usable)
+        return {
+            "needs_bytes": needs if estimated else None,
+            "usable_bytes": usable if estimated else None,
+            "usable_bytes_per_gpu": (
+                {int(d): int(b) for d, b in sorted(rejected.per_gpu_free.items())}
+                if estimated and rejected.per_gpu_free
+                else None
+            ),
+            "margin_bytes": (usable - needs) if estimated else None,
+            # A refusal carries no correction note (its notes are the rung's),
+            # so whether D51 moved its estimate is read off the corrections
+            # this planner spent: the refused estimate IS one of them if so.
+            "observed_applied": estimated
+            and any(
+                applied.corrected == rejected.estimate
+                for applied in self._applied_corrections.values()
+            ),
+            "headroom_fraction": float(self.config.planner.headroom_fraction),
+        }
 
     def _remember_applied(self, key: _CorrectionKey, applied: AppliedCorrection) -> None:
         """Keep the newest correction per configuration, bounded (D63).
@@ -2977,9 +3232,16 @@ class Planner:
         can hand back the estimate it was given, corrected at the requested
         count, under the count it finally chose (the same fallback the plan's
         note takes in :meth:`_try_devices`).
+
+        The card classes are part of the key (D88); the split mode is compared
+        only on the exact lookup, because the supervisor rewrites an ``auto``
+        split on the plan to what it resolved at launch, and the term-by-term
+        check is what actually guards against a borrowed formula.
         """
         estimate = plan.estimate
         unified = bool(plan.kv_unified)
+        class_key, _split = self._placement_shape_of_plan(plan)
+        split_now: str | None = "none" if len(plan.devices) == 1 else str(plan.split_mode)
         for candidate in dict.fromkeys((model_id, plan.model_id)):
             exact = self._applied_corrections.get(
                 _correction_key(
@@ -2990,6 +3252,8 @@ class Planner:
                     plan.kv_cache_type_v,
                     len(plan.devices),
                     unified,
+                    class_key,
+                    split_now,
                 )
             )
             if exact is not None and exact.corrected == estimate:
@@ -3002,10 +3266,47 @@ class Planner:
                     and key[4] == str(plan.kv_cache_type_v)
                     and key[5] == len(plan.devices)
                     and key[6] == unified
+                    and key[7] == class_key
                 )
                 if same_shape and applied.corrected == estimate:
                     return applied
         return None
+
+    def _placement_shape_of_plan(self, plan: LoadPlan) -> tuple[str | None, str | None]:
+        """``(class_key, split_mode)`` of a plan already made (D88).
+
+        The split mode is the plan's own -- after a launch, what the child was
+        really started with (the supervisor writes the resolved mode back) --
+        and ``"none"`` on one card.
+        """
+        if not plan.devices:
+            return None, None
+        classes = self._device_classes()
+        keys = [classes.get(int(d)) for d in plan.devices]
+        class_key = "+".join(sorted(k for k in keys if k)) if all(keys) else None
+        if len(plan.devices) == 1:
+            return class_key, "none"
+        mode = str(plan.split_mode)
+        return class_key, (None if mode == "auto" else mode)
+
+    def _history_fallback_id(self, record: ModelRecord) -> str | None:
+        """Whose history a copy with none of its own may borrow (D88, A-12).
+
+        A virtual copy -- persistent (``X@b``) or a lease's ephemeral instance
+        (B.1) -- is the base's file under a new id, so it starts with no D51
+        history even when the base was measured at exactly this configuration.
+        The match key names the file's size and the cards' classes now, so the
+        base's row describes the copy's footprint -- unless the copy launches
+        with something the base's row did not: adapters or a draft model. Those
+        copies keep their own history only.
+        """
+        base = record.base_model_id
+        if not record.is_virtual or not base or base == record.id:
+            return None
+        settings = record.settings
+        if settings.adapters or getattr(settings, "draft_model_id", None):
+            return None
+        return str(base)
 
     def _observed_correction(
         self,
@@ -3019,9 +3320,17 @@ class Planner:
         formula_bytes: int,
         weights_bytes: int = 0,
         kv_unified: bool = False,
+        devices: Sequence[int] | None = None,
     ) -> ObservedCorrection | None:
         """Look up what this configuration last really weighed, and by how much
         the formula should move because of it (D51).
+
+        Since D88 the configuration includes WHERE: ``devices`` gives the
+        lookup the cards' classes and the split mode
+        (:meth:`_placement_shape`), plus the file's size, so a measurement on
+        two 5090s is never spent on two 3090s of the same count. A virtual copy
+        with no row of its own asks its base's history next
+        (:meth:`_history_fallback_id`).
 
         ``weights_bytes`` is the formula's own weights term for this
         configuration, held out of the safety margin (D76). The row's stored
@@ -3049,10 +3358,22 @@ class Planner:
             return None
         if not self.config.planner.observed_correction:
             return None
-        key = _correction_key(record.id, ctx, slots, kv_k, kv_v, n_devices, kv_unified)
+        class_key, split_mode = self._placement_shape(record, devices)
+        key = _correction_key(
+            record.id, ctx, slots, kv_k, kv_v, n_devices, kv_unified, class_key, split_mode
+        )
         if key in memo.rows:
             return memo.rows[key]
         shape: dict[str, Any] = {"kv_unified": True} if kv_unified else {}
+        # The D88 key: only what is known is sent, so a lookup never filters
+        # on a value the planner could not determine.
+        if class_key is not None:
+            shape["class_key"] = class_key
+        if split_mode is not None:
+            shape["split_mode"] = split_mode
+        if int(record.size_bytes or 0) > 0:
+            shape["gguf_size"] = int(record.size_bytes)
+        source_id = record.id
         try:
             row = self._observation_lookup(
                 record.id,
@@ -3063,6 +3384,18 @@ class Planner:
                 device_count=int(n_devices),
                 **shape,
             )
+            fallback = self._history_fallback_id(record) if row is None else None
+            if fallback is not None:
+                row = self._observation_lookup(
+                    fallback,
+                    ctx_size=int(ctx),
+                    parallel=int(slots),
+                    kv_cache_type=kv_k,
+                    kv_cache_type_v=kv_v,
+                    device_count=int(n_devices),
+                    **shape,
+                )
+                source_id = fallback
         except Exception as exc:  # noqa: BLE001 -- any failure means "no history"
             memo.failed = True
             log.warning(
@@ -3083,6 +3416,24 @@ class Planner:
                 observed_bytes=int(actual),
                 weights_bytes=int(weights_bytes),
             )
+        if correction is not None and row is not None:
+            legacy = row.get("legacy_match") is True
+            borrowed = source_id != record.id
+            if legacy or borrowed:
+                extra = ""
+                if borrowed:
+                    extra += f"; measured as '{source_id}', the same file this copy runs"
+                if legacy:
+                    extra += (
+                        "; a row recorded before D88 that cannot name its card class, "
+                        "split mode or file size"
+                    )
+                correction = replace(
+                    correction,
+                    note=correction.note + extra,
+                    legacy=legacy,
+                    source_model_id=source_id,
+                )
         memo.rows[key] = correction
         if correction is not None:
             # DEBUG, not INFO: the ladder applies this once per placement per
@@ -3105,7 +3456,7 @@ class Planner:
 
     def _memoized_correction(
         self,
-        model_id: str,
+        record: ModelRecord,
         *,
         ctx: int,
         slots: int,
@@ -3113,6 +3464,7 @@ class Planner:
         kv_v: KvCacheType,
         n_devices: int,
         kv_unified: bool = False,
+        devices: Sequence[int] | None = None,
     ) -> ObservedCorrection | None:
         """The correction already spent on this configuration's estimate, for the note.
 
@@ -3124,8 +3476,11 @@ class Planner:
         memo = self._obs_memo
         if memo is None:
             return None
+        class_key, split_mode = self._placement_shape(record, devices)
         return memo.rows.get(
-            _correction_key(model_id, ctx, slots, kv_k, kv_v, n_devices, kv_unified)
+            _correction_key(
+                record.id, ctx, slots, kv_k, kv_v, n_devices, kv_unified, class_key, split_mode
+            )
         )
 
     def _try_devices(
@@ -3165,6 +3520,7 @@ class Planner:
             draft_ctx,
             adapters,
             kv_unified=kv_unified,
+            devices=devices,
         )
 
         capacities = {
@@ -3230,6 +3586,13 @@ class Planner:
                 if record.settings.allowed_devices is not None
                 else None
             ),
+            # What each card offered when this fit was decided (D88): free
+            # minus headroom and reservations, plus whatever the eviction or
+            # preemption this plan counts on frees there. The fit response's
+            # margin is read off it, and so is the slot sizer's capacity
+            # (catalog.slots_for_plan), which is how slot sizing gets the
+            # eviction credit the fit decision already had (A-13).
+            "usable_bytes_per_gpu": {int(d): int(b) for d, b in capacities.items()},
         }
 
         # Whatever history moved this estimate travels with the plan (D51). A
@@ -3246,13 +3609,14 @@ class Planner:
         correction: ObservedCorrection | None = None
         for candidate_slots in dict.fromkeys((chosen_slots, slots)):
             correction = self._memoized_correction(
-                record.id,
+                record,
                 ctx=ctx,
                 slots=candidate_slots,
                 kv_k=kv_k,
                 kv_v=kv_v,
                 n_devices=len(devices),
                 kv_unified=kv_unified,
+                devices=devices,
             )
             if correction is not None:
                 break
@@ -3374,8 +3738,12 @@ class Planner:
         draft_ctx: int | None = None,
         adapters: Sequence[AdapterRecord] = (),
         kv_unified: bool = False,
+        devices: Sequence[int] | None = None,
     ) -> tuple[int, VramEstimate]:
         """Largest slot count in ``[1, cap]`` that really fits, and its estimate.
+
+        ``devices`` (D88) names the placement so a D51 correction is looked up
+        under its card classes; omitted, by ``n_devices`` alone.
 
         The exact VRAM bound, replacing ``kv_budget // (ctx * kv_per_token)``.
         That quotient assumed the KV cache scales linearly with slots, which no
@@ -3405,6 +3773,7 @@ class Planner:
             draft_ctx,
             adapters,
             kv_unified=kv_unified,
+            devices=devices,
         )
         for slots in range(cap, 1, -1):
             candidate = self._safe_estimate(
@@ -3418,6 +3787,7 @@ class Planner:
                 draft_ctx,
                 adapters,
                 kv_unified=kv_unified,
+                devices=devices,
             )
             if candidate.total_bytes <= capacity_bytes:
                 return slots, candidate
@@ -3488,6 +3858,7 @@ class Planner:
             draft_ctx=draft_ctx,
             adapters=adapters,
             kv_unified=kv_unified,
+            devices=devices,
         )
         fixed = base_estimate.total_bytes - base_estimate.kv_bytes
         kv_budget = max(0, capacity_bytes - fixed)
@@ -3523,6 +3894,7 @@ class Planner:
                 draft_ctx,
                 adapters,
                 kv_unified=kv_unified,
+                devices=devices,
             )
         return estimate, slots, slots, bound
 
@@ -3698,6 +4070,7 @@ class Planner:
         adapters: Sequence[AdapterRecord],
         available: int,
         kv_unified: bool = False,
+        devices: Sequence[int] | None = None,
     ) -> int:
         """The largest ladder context under ``below`` this placement would accept (D76).
 
@@ -3759,6 +4132,7 @@ class Planner:
                 draft_ctx,
                 adapters,
                 kv_unified=kv_unified,
+                devices=devices,
             )
             if charged.total_bytes <= available:
                 return rung
@@ -3786,6 +4160,7 @@ class Planner:
         priority: int = PRIORITY_BACKGROUND,
         kv_unified: bool = False,
     ) -> LoadRejected:
+        placement = [int(gpu.index) for gpu in gpus]
         estimate = self._safe_estimate(
             record,
             ctx,
@@ -3797,6 +4172,7 @@ class Planner:
             record.settings.draft_ctx_size,
             adapters,
             kv_unified=kv_unified,
+            devices=placement or None,
         )
         per_gpu_free = {gpu.index: self.usable_bytes(gpu, forced=forced) for gpu in gpus}
         available = sum(per_gpu_free.values())
@@ -3817,10 +4193,15 @@ class Planner:
             # card, then the whole usable pool (each device costs a CUDA
             # context, so the pool is not simply "more room").
             usable_gpus = [g for g in gpus if per_gpu_free.get(g.index, 0) > 0]
-            placements = [(1, best_single)]
+            best_index = max(per_gpu_free, key=lambda d: per_gpu_free[d]) if per_gpu_free else None
+            placements: list[tuple[int, int, list[int] | None]] = [
+                (1, best_single, [int(best_index)] if best_index is not None else None)
+            ]
             if len(usable_gpus) > 1:
-                placements.append((len(usable_gpus), available))
-            for n_devices, capacity in placements:
+                placements.append(
+                    (len(usable_gpus), available, [int(g.index) for g in usable_gpus])
+                )
+            for n_devices, capacity, on_devices in placements:
                 fewer, at_fewer = self.max_slots_by_vram(
                     record,
                     ctx=ctx,
@@ -3833,6 +4214,7 @@ class Planner:
                     draft_ctx=record.settings.draft_ctx_size,
                     adapters=adapters,
                     kv_unified=kv_unified,
+                    devices=on_devices,
                 )
                 if at_fewer.total_bytes <= capacity and fewer > (max_parallel or 0):
                     max_parallel = fewer
@@ -3866,6 +4248,7 @@ class Planner:
                     adapters=adapters,
                     available=available,
                     kv_unified=kv_unified,
+                    devices=placement or None,
                 )
             if raw <= 0 and not kv_layers(meta):
                 budget = available - (estimate.total_bytes - estimate.kv_bytes)
@@ -4301,8 +4684,16 @@ class Planner:
         ok: bool = True,
         note: str | None = None,
         per_gpu_actual: Mapping[int, int] | None = None,
+        gguf_size: int | None = None,
     ) -> None:
         """Record predicted-vs-actual VRAM so the fudge factor can be tuned.
+
+        Since D88 the stored row also names WHERE and WHAT it measured, the
+        columns migration 011 added to the D51 match key: ``class_key`` (the
+        plan's cards' classes, from the probe), ``split_mode`` (``"none"`` on
+        one card, else what the child was launched with -- the supervisor
+        writes the resolved mode back onto the plan) and ``gguf_size``, which
+        the caller passes because a plan does not carry its file.
 
         Logged at INFO with the ratio, and forwarded to the observation sink
         (the SQLite table) when one is wired in.
@@ -4345,6 +4736,7 @@ class Planner:
         observation was one total.
         """
         planned = plan.estimate.total_bytes
+        class_key, split_mode = self._placement_shape_of_plan(plan)
         applied = self._correction_spent_on(model_id, plan)
         corrected = applied is not None or any(
             n.startswith(CORRECTION_NOTE_PREFIX) for n in plan.notes
@@ -4475,6 +4867,8 @@ class Planner:
             "kv_cache_type": plan.kv_cache_type,
             "kv_cache_type_v": plan.kv_cache_type_v,
             "devices": list(plan.devices),
+            "class_key": class_key,
+            "split_mode": split_mode,
             "per_gpu_planned_mb": {
                 str(d): round(b / MB) for d, b in sorted(plan.per_gpu_bytes.items())
             },
@@ -4552,6 +4946,12 @@ class Planner:
                         if per_gpu_actual
                         else None
                     ),
+                    # The D88 half of the match key (migration 011): which
+                    # kind of cards, which split, which file. NULL where this
+                    # process cannot say, which reads back as a legacy row.
+                    "class_key": class_key,
+                    "split_mode": split_mode,
+                    "gguf_size": int(gguf_size) if gguf_size else None,
                 }
             )
 
@@ -4661,6 +5061,12 @@ class ObservedCorrection:
     clamped: bool
     note: str
     weights_bytes: int = 0
+    #: The row predates D88's card-class key and was matched as a legacy row
+    #: (owner decision F-6): it cannot say on which kind of card it measured.
+    legacy: bool = False
+    #: Whose measurement this is when it is not the planned record's own: a
+    #: virtual copy borrowing its base's history (D88). ``None`` = its own.
+    source_model_id: str | None = None
 
     @property
     def corrected_bytes(self) -> int:
@@ -4684,9 +5090,10 @@ class AppliedCorrection:
     corrected: VramEstimate
 
 
-#: ``(model_id, ctx, slots, kv_k, kv_v, n_devices)``: one configuration as
-#: the D51 lookup and :attr:`Planner._applied_corrections` key it.
-_CorrectionKey = tuple[str, int, int, str, str, int, bool]
+#: ``(model_id, ctx, slots, kv_k, kv_v, n_devices, kv_unified, class_key,
+#: split_mode)``: one configuration as the D51 lookup and
+#: :attr:`Planner._applied_corrections` key it.
+_CorrectionKey = tuple[str, int, int, str, str, int, bool, str | None, str | None]
 
 
 def _correction_key(
@@ -4697,9 +5104,15 @@ def _correction_key(
     kv_v: str,
     n_devices: int,
     kv_unified: bool = False,
+    class_key: str | None = None,
+    split_mode: str | None = None,
 ) -> _CorrectionKey:
-    # ``kv_unified`` last (D72): a shared pool and a partitioned load of the
-    # same (ctx, slots) are different footprints and never share a correction.
+    # ``kv_unified`` after the count (D72): a shared pool and a partitioned
+    # load of the same (ctx, slots) are different footprints and never share a
+    # correction. The card classes and the split mode last (D88): one planning
+    # pass walks several same-count device sets (the 5090 pair, then the 3090
+    # pair), and keyed by count alone the first set's answer was memoized for
+    # the second.
     return (
         model_id,
         int(ctx),
@@ -4708,7 +5121,49 @@ def _correction_key(
         str(kv_v),
         int(n_devices),
         bool(kv_unified),
+        class_key,
+        split_mode,
     )
+
+
+def device_class_key(gpu: GpuInfo) -> str:
+    """The portable class of one card, ``"<arch>-<GiB>g"`` (D88, B.3).
+
+    ``sm_86-24g`` for a 24 GiB Ampere card, ``sm_120-32g`` for a 32 GiB
+    Blackwell one, ``gfx1100-24g`` for an AMD card that names its ISA. Built
+    from facts the driver reports -- compute capability (or the AMD ISA) and
+    total memory -- never from the product name, so two cards that differ only
+    in branding share a class and a 48 GB workstation card is not mistaken for
+    a 32 GB one. A probe that already supplies ``class_key`` on the card (the
+    card-facts work, B.3) is trusted as is, so both always agree.
+    """
+    supplied = getattr(gpu, "class_key", None)
+    if isinstance(supplied, str) and supplied:
+        return supplied
+    if gpu.compute_capability is not None:
+        arch = f"sm_{gpu.compute_capability[0]}{gpu.compute_capability[1]}"
+    elif gpu.gfx_target:
+        arch = str(gpu.gfx_target)
+    else:
+        arch = "unknown"
+    return f"{arch}-{round(int(gpu.total_bytes) / GB)}g"
+
+
+def placement_class_key(gpus: Sequence[GpuInfo]) -> str | None:
+    """The classes of a placement's cards, sorted and joined with ``+`` (D88).
+
+    Order-blind on purpose: D42 moves a model between same-class sets and the
+    tensor split is recomputed every load, so ``[2, 3]`` and ``[3, 2]`` are one
+    configuration. ``None`` for no cards.
+    """
+    if not gpus:
+        return None
+    return "+".join(sorted(device_class_key(g) for g in gpus))
+
+
+def plan_observed_applied(plan: LoadPlan) -> bool:
+    """Whether a D51 measurement moved this plan's estimate (its note says so)."""
+    return any(str(n).startswith(CORRECTION_NOTE_PREFIX) for n in plan.notes)
 
 
 #: How many configurations' corrections a planner remembers for
@@ -4898,6 +5353,9 @@ class _ObservationMemo:
 
     rows: dict[_CorrectionKey, ObservedCorrection | None] = field(default_factory=dict)
     failed: bool = False
+    #: ``{cuda index: class key}`` read once per pass (D88), so keying the
+    #: lookup by card class costs one probe read per ``plan_load``.
+    classes: dict[int, str] | None = None
 
 
 #: Written into ``load_observations.note`` when ``actual_bytes`` is our own

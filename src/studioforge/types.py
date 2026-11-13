@@ -816,6 +816,13 @@ class LoadPlan(BaseModel):
     #: copy that carried the one-shot is discarded after the load, and the
     #: rebalancer (D42) must not relocate the model outside it.
     allowed_devices: list[int] | None = None
+    #: What each card offered when this fit was decided (D88): free VRAM minus
+    #: the headroom and reservations, plus whatever the eviction or priority
+    #: preemption this plan counts on frees there. ``usable - estimate`` is the
+    #: margin a fit response reports, and the slot sizer reads its capacity
+    #: here so it counts the same eviction credit the fit did. Empty on plans
+    #: from before D88.
+    usable_bytes_per_gpu: dict[int, int] = Field(default_factory=dict)
 
     # --- concurrency (DECISIONS.md D17) --------------------------------
     #: Slots the estimator judged this placement could sustain. Equal to
