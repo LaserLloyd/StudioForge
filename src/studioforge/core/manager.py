@@ -4172,10 +4172,13 @@ class ModelManager:
         when the user does not need it.
         """
         record = self.registry.resolve(model_id)
-        instance = self.supervisor.get(record.id) if record else None
-        if record is None or instance is None:
+        # A persona riding its base has no instance under its own id; the timer
+        # that matters is the serving record's (A-17).
+        serving = self.serving_record(record) if record else None
+        instance = self.supervisor.get(serving.id) if serving else None
+        if serving is None or instance is None:
             return None
-        self.apply_effective_ttl(record, instance)
+        self.apply_effective_ttl(serving, instance)
         return instance.ttl_s
 
     def set_pinned(self, model_id: str, pinned: bool) -> tuple[ModelRecord, int]:
@@ -5421,7 +5424,8 @@ class ModelManager:
         ``ttl: 3600`` with no priority; the model was JIT-loaded at tier 3 and
         got an hour of idle timer instead of the policy's ten minutes.
         """
-        record = self.registry.resolve(model_id)
+        resolved = self.registry.resolve(model_id)
+        record = self.serving_record(resolved) if resolved else None
         instance = self.supervisor.get(record.id) if record else None
         if record is None or instance is None:
             return None

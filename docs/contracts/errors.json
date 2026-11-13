@@ -414,6 +414,15 @@
       "surface": "api"
     },
     {
+      "code": "model_id_conflict",
+      "docs": "errors/model_id_conflict",
+      "error_type": "invalid_request_error",
+      "fix": "Pick a different id for the virtual model; the response's studioforge.colliding_model_id names the model that already owns the name (GET /api/models lists every id).",
+      "http_status": 409,
+      "message": "The id '{id}' collides with an existing model id or alias.",
+      "surface": "api"
+    },
+    {
       "code": "model_load_failed",
       "docs": "errors/model_load_failed",
       "error_type": "server_error",

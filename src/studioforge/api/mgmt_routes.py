@@ -1554,6 +1554,7 @@ async def _validated_settings_save(state: Any, record: Any, settings: Any) -> di
         if problems:
             raise BadRequestError("; ".join(problems), param="draft_model_id")
 
+    refuse_serving_flip_while_resident(state, record, settings)
     updated = state.registry.save_settings(record.id, settings)
     # A pin or ttl change must bite now, not at the next load.
     state.manager.refresh_ttl(updated.id)
@@ -1632,7 +1633,52 @@ def _instance_holding(state: Any, model_id: str) -> str | None:
             serving = candidate
         if str(serving.id) == str(model_id) or str(candidate.id) == str(model_id):
             return str(instance.model_id)
+        # An own-server copy (``base@b``) opens the BASE's GGUF under its own
+        # id: deleting the base would pull the file out from under it (A-5).
+        if candidate.is_virtual and str(candidate.base_model_id) == str(model_id):
+            return str(instance.model_id)
     return None
+
+
+def _model_loaded_error(model_id: str, holder: str, action: str) -> BadRequestError:
+    """409 ``model_loaded`` naming the resident instance that blocks *action*."""
+    return BadRequestError(
+        f"model '{model_id}' is loaded"
+        + (f" (serving as '{holder}')" if holder != model_id else "")
+        + f"; unload it before {action}",
+        code="model_loaded",
+        param="model",
+        status_code=409,
+        details={"model_id": model_id, "holder": holder},
+    )
+
+
+def refuse_serving_flip_while_resident(state: Any, record: Any, settings: Any) -> None:
+    """A-18: refuse a settings save that would strand a resident own-server copy.
+
+    A copy owns its instance only while its settings differ from the defaults
+    (``serving_record``). Reverting them while that instance is resident would
+    send every request to the base and leave the copy's child running, unreachable
+    by its serving id until the TTL sweep. Unload first, then revert.
+    """
+    if not getattr(record, "is_virtual", False):
+        return
+    if state.supervisor.get(record.id) is None:
+        return
+    if state.manager.serving_record(record).id != record.id:
+        return
+    after = record.model_copy(update={"settings": settings})
+    if state.manager.serving_record(after).id == record.id:
+        return
+    raise BadRequestError(
+        f"model '{record.id}' is loaded on its own instance and these settings would "
+        f"make it share '{record.base_model_id}'s; unload it before reverting its "
+        "launch settings to the defaults",
+        code="model_loaded",
+        param="model",
+        status_code=409,
+        details={"model_id": record.id, "base_model_id": record.base_model_id},
+    )
 
 
 @router.delete("/models/{model_id:path}")
@@ -1656,12 +1702,7 @@ async def delete_model(
     # id. Refuse if anything resident resolves to these files.
     holder = _instance_holding(state, record.id)
     if holder is not None:
-        raise BadRequestError(
-            f"model '{record.id}' is loaded"
-            + (f" (serving as '{holder}')" if holder != record.id else "")
-            + "; unload it before deleting",
-            code="model_loaded",
-        )
+        raise _model_loaded_error(record.id, holder, "deleting")
     removed = state.registry.delete_model(record.id, delete_files=delete_files)
     return {"model_id": record.id, "removed": [str(p) for p in removed]}
 
@@ -1744,24 +1785,101 @@ async def create_virtual_model(
     except Exception as exc:
         raise BadRequestError(f"invalid preset: {exc}", param="preset") from exc
 
+    launch, ignored = _virtual_launch_fields(payload)
+    settings = None
+    if launch:
+        try:
+            settings = ModelSettings.model_validate(launch)
+        except Exception as exc:
+            raise BadRequestError(f"invalid settings: {exc}", param="settings") from exc
+        await _check_virtual_launch_flags(state, str(base), settings)
+
+    # Re-POSTing a virtual id replaces its adapters/preset/launch fields; the
+    # child already running was started from the old ones (A-7).
+    existing = state.registry.get(str(model_id).strip())
+    if existing is not None and existing.is_virtual:
+        holder = _instance_holding(state, existing.id)
+        if holder is not None:
+            raise _model_loaded_error(existing.id, holder, "re-creating it")
+
     record = state.registry.create_virtual_model(
         id=str(model_id),
         base_model_id=str(base),
         name=payload.get("name"),
         adapters=attachments,
         preset=None if preset.is_empty() else preset,
+        settings=settings,
     )
+    body = record.model_dump(mode="json")
+    if ignored:
+        # Additive: a field this route does not know is named, not swallowed.
+        body["ignored_fields"] = ignored
+        log.warning("virtual_models.ignored_fields", model_id=record.id, fields=ignored)
+    return body
 
-    overrides = {k: payload[k] for k in ("ctx_size", "kv_cache_type") if payload.get(k) is not None}
-    if overrides:
-        settings = record.settings.model_copy(update=overrides)
-        record = state.registry.save_settings(record.id, settings)
-    return record.model_dump(mode="json")
+
+#: Keys of the create payload that are not launch settings.
+_VIRTUAL_RESERVED = frozenset(
+    {"id", "base_model_id", "name", "adapters", "settings", *_PRESET_FIELDS}
+)
+
+
+def _virtual_launch_fields(payload: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """Launch settings of a create payload: top-level fields and/or a ``settings`` object.
+
+    Top-level keys win over the nested object. Keys that are neither reserved
+    nor a ``ModelSettings`` field come back in the second element (reported,
+    not applied). ``adapters`` is handled separately (attachments).
+    """
+    nested = payload.get("settings")
+    if nested is not None and not isinstance(nested, dict):
+        raise BadRequestError("'settings' must be an object", param="settings")
+    known = set(ModelSettings.model_fields)
+    launch: dict[str, Any] = dict(nested or {})
+    ignored: list[str] = []
+    for key, value in payload.items():
+        if key in _VIRTUAL_RESERVED:
+            continue
+        if key in known:
+            if value is not None:
+                launch[key] = value
+        else:
+            ignored.append(key)
+    unknown_nested = sorted(set(launch) - known)
+    if unknown_nested:
+        raise BadRequestError(
+            f"unknown settings field(s): {', '.join(unknown_nested)}", param=unknown_nested[0]
+        )
+    return {k: v for k, v in launch.items() if v is not None}, sorted(ignored)
+
+
+async def _check_virtual_launch_flags(state: Any, base_id: str, settings: Any) -> None:
+    """The expert-flag and draft-pairing checks every settings save runs."""
+    if settings.extra_flags.strip():
+        tag = settings.engine_tag or state.config.engine.pinned_tag
+        errors = await state.engine_manager.validate_extra_flags(
+            tag,
+            settings.extra_flags,
+            allow_partial_cpu_offload=settings.allow_partial_cpu_offload,
+        )
+        if errors:
+            raise BadRequestError("extra_flags rejected: " + "; ".join(errors), param="extra_flags")
+    if settings.draft_model_id:
+        base = state.registry.get(base_id)
+        if base is not None:
+            problems = _check_draft_compatibility(state, base, settings.draft_model_id)
+            if problems:
+                raise BadRequestError("; ".join(problems), param="draft_model_id")
 
 
 @router.delete("/virtual-models/{model_id:path}")
 async def delete_virtual_model(model_id: str, request: Request) -> dict[str, Any]:
     state = _state(request)
+    record = state.registry.get(model_id)
+    # Dropping the record of a running copy orphans its child (no record,
+    # invisible to the pin reconciler): unload first (A-6).
+    if record is not None and record.is_virtual and state.supervisor.get(record.id) is not None:
+        raise _model_loaded_error(record.id, record.id, "deleting")
     state.registry.delete_virtual_model(model_id)
     return {"model_id": model_id, "deleted": True}
 

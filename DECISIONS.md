@@ -7951,3 +7951,44 @@ to unify later.
 (`EngineConfig.stub`), `config.example.yaml`, `docs/DEVELOPMENT.md` "No-GPU staging", generated
 settings docs; `tests/unit/test_stub_llama_server.py`, `test_engine_stub_mode.py`,
 `test_fake_vram_ledger.py`, `test_stub_staging_smoke.py`, `test_supervisor.py`.
+
+## D86 -- A virtual record has its own names only, and a resident one cannot be pulled out from under its instance
+
+**Problem.** A review of the multi-card paths (2026-11-09) found virtual records (copies and
+personas) wrong in six ways. A copy inherited its base's `publisher`/`repo`, and aliases were
+claimed in sorted-id order, so a copy whose id sorted before the base took `repo`,
+`publisher/repo` and the trimmed forms: PATCH, DELETE and JIT loads by those names acted on the
+copy. A new virtual id was checked only against non-virtual ids, so it could shadow another
+model's short alias. Deleting a base with a resident own-server copy was not blocked (the copy's
+row went, its instance ran on unreachable); `DELETE /api/virtual-models/{id}` while resident
+answered 200 and orphaned the instance; reverting a resident copy's settings to the defaults made
+`serving_record` return the base while the copy's instance stayed up. `POST /api/virtual-models`
+read only `ctx_size` and `kv_cache_type` and silently dropped `device_override`,
+`kv_cache_type_v`, `priority` and the rest, and a re-POST overwrote a live copy. A base delete left
+its copies' settings rows behind for a later copy of the same id to inherit, and `refresh_ttl` /
+`request_ttl_cap` looked up the record's own id instead of the one that serves it.
+
+**Decision.**
+
+1. A virtual record is reachable by its full id and its own name only; it never takes the base's
+   repo-level aliases, and real models claim aliases before virtual ones.
+2. Creating a virtual id equal to any existing id or alias is refused: 409 `model_id_conflict`,
+   with `studioforge.colliding_model_id` naming the owner.
+3. Deleting a base, deleting a virtual, re-POSTing an existing copy, or reverting an own-server
+   copy's launch settings to the defaults while its instance is resident is refused with 409
+   `model_loaded`: unload first.
+4. `POST /api/virtual-models` accepts every launch setting, at the top level or in `settings{}`,
+   validates them like a settings save before anything is written, and reports names it does not
+   know in `ignored_fields` (additive: an unknown name is not a 400).
+5. A base delete removes its copies' settings rows; a new virtual id starts from the defaults.
+   `refresh_ttl` and `request_ttl_cap` resolve the serving record.
+
+**Not done.** `model_loaded` is 409 on these routes and 400 in the catalog's downloader entry; the
+revert guard covers the REST settings save, not yet the GUI and MCP save paths.
+
+**Surfaces.** `core/registry.py` (alias order, `_id_conflict`, `_validate_settings`,
+`_persist_settings`, cascade), `api/mgmt_routes.py` (`create_virtual_model`,
+`_virtual_launch_fields`, `refuse_serving_flip_while_resident`, `delete_model`),
+`core/manager.py` (`refresh_ttl`, `request_ttl_cap`), `error_catalog.py` (`model_id_conflict`),
+`docs/LIMITATIONS.md`, generated errors docs, capabilities `model_id_conflict_code`,
+`virtual_model_launch_fields`; `tests/unit/test_virtual_copies.py`, `test_registry.py`.

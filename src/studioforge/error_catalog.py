@@ -391,6 +391,14 @@ _ENTRIES: tuple[ErrorEntry, ...] = (
         "The model is loaded (serving as '{holder}'); the file is in use.",
         "Unload the model first (POST /api/models/{id}/unload), then repeat the call.",
     ),
+    _e(
+        "model_id_conflict",
+        409,
+        _INVALID,
+        "The id '{id}' collides with an existing model id or alias.",
+        "Pick a different id for the virtual model; the response's studioforge.colliding_model_id "
+        "names the model that already owns the name (GET /api/models lists every id).",
+    ),
     # --- upstream (llama-server) ------------------------------------------
     _e(
         "upstream_error",

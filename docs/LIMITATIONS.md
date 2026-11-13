@@ -442,6 +442,16 @@ offending slot count), so a client can act on them without parsing the message.
   consulted. A persona with a launch override of its own keeps the field, because it earns its own
   instance and its own row is then what gets read. The GUI disables the *Load priority* select for
   a sharing persona rather than letting you meet the refusal.
+* A virtual record is reachable by its full id and its own name only; it never takes the base's
+  repo-level short names (`repo`, `publisher/repo`, the trimmed forms). Creating a virtual id that
+  equals any existing id or alias is refused (`409 model_id_conflict`; `studioforge.colliding_model_id`
+  names the owner).
+* `POST /api/virtual-models` takes every launch setting (`ctx_size`, `kv_cache_type(_v)`,
+  `device_override`, `parallel`, `priority`, `pinned`, `ttl_s`, ... at the top level or in a
+  `settings` object) and validates them like a settings save before anything is written; a name it
+  does not know comes back in `ignored_fields`. Re-posting a copy, deleting it, deleting its base, or
+  reverting its settings to the defaults while its instance is resident is refused
+  (`409 model_loaded`): unload first. Deleting a base removes its copies and their settings rows.
 * Quality of a LoRA over a heavily quantized base (Q4 and below) is often poor. That is a llama.cpp
   property, not a bug here.
 

@@ -1568,3 +1568,26 @@ def test_live_real_library(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -
         assert reg.resolve(record.name.lower()) is not None
 
     database.close()
+
+
+def test_virtual_record_never_steals_a_repo_level_alias(scanned: Registry) -> None:
+    """B.9: a virtual id that sorts before its base keeps the base's aliases."""
+    repo = "Qwen2.5-0.5B-Instruct-GGUF"
+    before = {a: scanned.resolve(a) for a in (repo, f"lmstudio-community/{repo}")}
+    assert all(r is not None and r.id == QWEN_TINY for r in before.values())
+    scanned.create_virtual_model(id="a-early", base_model_id=QWEN_TINY, name=None, adapters=[])
+    for alias in before:
+        assert scanned.resolve(alias).id == QWEN_TINY
+    assert scanned.resolve("a-early").id == "a-early"
+
+
+def test_virtual_id_equal_to_an_alias_is_refused(scanned: Registry) -> None:
+    from studioforge.errors import BadRequestError
+
+    with pytest.raises(BadRequestError) as info:
+        scanned.create_virtual_model(
+            id="Qwen2.5-0.5B-Instruct-GGUF", base_model_id=QWEN_TINY, name=None, adapters=[]
+        )
+    assert info.value.code == "model_id_conflict" and info.value.status_code == 409
+    assert info.value.details["colliding_model_id"] == QWEN_TINY
+    assert scanned.get("Qwen2.5-0.5B-Instruct-GGUF") is None

@@ -76,7 +76,7 @@ FEATURE_NOTES: dict[str, str] = {
 #: on instead. **Bump it in the same commit that appends a decision**:
 #: ``tests/unit/test_capabilities_implemented.py`` reads the headings of
 #: ``DECISIONS.md`` and fails until the two agree.
-LATEST_DECISION = 85
+LATEST_DECISION = 86
 
 #: Every decision number this build includes, ``"D1"`` .. ``"D<LATEST_DECISION>"``.
 IMPLEMENTED_DECISIONS: tuple[str, ...] = tuple(f"D{n}" for n in range(1, LATEST_DECISION + 1))
@@ -155,6 +155,13 @@ SERVER_FEATURES: dict[str, str] = {
     "tensor_split_hybrid": "D83",
     # leases.holder_kinds: an operator's own holder families for the lease kind.
     "lease_holder_kinds": "D84",
+    # A virtual id equal to any existing id or alias is refused with 409
+    # model_id_conflict (an older server accepts it and the alias is shadowed).
+    "model_id_conflict_code": "D86",
+    # POST /api/virtual-models takes every launch setting (top level or
+    # settings{}) and lists unknown names in ignored_fields; an older server
+    # reads ctx_size / kv_cache_type only and drops the rest.
+    "virtual_model_launch_fields": "D86",
 }
 
 

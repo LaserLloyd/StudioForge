@@ -228,6 +228,17 @@ def _newest_mtime(paths: Sequence[Path], *, fallback: float) -> float:
     return newest
 
 
+def _id_conflict(model_id: str, holder_id: str, what: str) -> BadRequestError:
+    """409 ``model_id_conflict``: the new virtual id collides with *holder_id*."""
+    return BadRequestError(
+        f"id {model_id!r} collides with {what} ({holder_id!r})",
+        param="id",
+        code="model_id_conflict",
+        status_code=409,
+        details={"colliding_model_id": holder_id, "id": model_id},
+    )
+
+
 class Registry:
     """In-memory model index backed by the filesystem and SQLite.
 
@@ -801,6 +812,12 @@ class Registry:
 
     def _alias_candidates(self, record: ModelRecord) -> list[str]:
         stem = record.name
+        if record.is_virtual:
+            # B.9 / F-1: a virtual (copy, persona) is reachable by its full id
+            # and its own name only. It copies publisher/repo from its base for
+            # display, and registering the repo-level forms too let a copy that
+            # sorted first steal ``repo`` and ``publisher/repo`` from the base.
+            return [stem.lower()] if stem else []
         aliases = [stem]
         if record.publisher:
             aliases.append(f"{record.publisher}/{stem}")
@@ -838,7 +855,10 @@ class Registry:
         collisions: dict[tuple[str, str], set[str]] = {}
         for model_id in sorted(self._models):
             aliases[model_id.lower()] = model_id
-        for model_id in sorted(self._models):
+        # Real models first, virtuals second: whatever a virtual's name stem
+        # would shadow stays with the model that owned it.
+        ordered = sorted(self._models, key=lambda i: (self._models[i].is_virtual, i))
+        for model_id in ordered:
             record = self._models[model_id]
             for alias in self._alias_candidates(record):
                 owner = aliases.get(alias)
@@ -932,6 +952,17 @@ class Registry:
         record = self.get(model_id)
         if record is None:
             raise ModelNotFoundError(model_id, known=self.known_ids())
+        validated = self._validate_settings(record, settings)
+        return self._persist_settings(record, validated)
+
+    def _validate_settings(self, record: ModelRecord, settings: ModelSettings) -> ModelSettings:
+        """The save-time checks of :meth:`save_settings`, with no side effect.
+
+        Split out so ``create_virtual_model`` can run exactly the same checks on
+        a record that is not registered yet (a refused create must leave
+        nothing behind).
+        """
+        model_id = record.id
         try:
             validated = ModelSettings.model_validate(settings.model_dump())
         except ValidationError as exc:
@@ -1028,6 +1059,10 @@ class Registry:
                 details={"model_id": model_id, "base_model_id": record.base_model_id},
             )
 
+        return validated
+
+    def _persist_settings(self, record: ModelRecord, validated: ModelSettings) -> ModelRecord:
+        model_id = record.id
         self._db.save_model_settings(model_id, validated.model_dump(mode="json"))
         if record.is_virtual and record.base_model_id is not None:
             self._db.save_virtual_model(
@@ -1187,14 +1222,27 @@ class Registry:
         name: str | None,
         adapters: list[AdapterAttachment],
         preset: VirtualPreset | None = None,
+        settings: ModelSettings | None = None,
     ) -> ModelRecord:
-        """Register a base + adapter-set (+ optional preset) as its own model name."""
+        """Register a base + adapter-set (+ optional preset) as its own model name.
+
+        ``settings`` carries the launch fields (ctx, KV types, devices, tier,
+        pin, ttl, ...). They are validated with the same checks as a settings
+        save BEFORE anything is written, so a refused create leaves no record
+        and no settings row behind.
+        """
         model_id = id.strip()
         if not model_id:
             raise BadRequestError("virtual model id must not be empty", param="id")
         existing = self.get(model_id)
         if existing is not None and not existing.is_virtual:
-            raise BadRequestError(f"id {model_id!r} collides with an existing model", param="id")
+            raise _id_conflict(model_id, existing.id, "an existing model")
+        if existing is None:
+            # F-1: a new id may not equal any existing id or alias (short
+            # names included); the colliding model is named in the message.
+            holder = self.resolve(model_id)
+            if holder is not None:
+                raise _id_conflict(model_id, holder.id, "an existing model name or alias")
         base = self.get(base_model_id)
         if base is None or base.is_virtual:
             raise BadRequestError(f"unknown base model: {base_model_id!r}", param="base_model_id")
@@ -1207,6 +1255,20 @@ class Registry:
         if preset is not None and preset.is_empty():
             preset = None
         display = name or model_id
+        validated: ModelSettings | None = None
+        if settings is not None:
+            # The candidate carries default settings, so every field the caller
+            # names counts as an assertion (the parallel/cap pair, the MTP head).
+            candidate = self._virtual_record(
+                model_id, display, base, ModelSettings(adapters=list(adapters)), preset=preset
+            )
+            validated = self._validate_settings(
+                candidate, settings.model_copy(update={"adapters": list(adapters)})
+            )
+        if existing is None:
+            # A new virtual id starts from defaults: a row left behind by an
+            # earlier record of the same id must not be inherited (A-16).
+            self._db.delete_model_settings(model_id)
         self._db.save_virtual_model(
             model_id,
             base.id,
@@ -1214,9 +1276,13 @@ class Registry:
             [a.model_dump() for a in adapters],
             preset=preset.model_dump(exclude_none=True) if preset is not None else None,
         )
-        settings = self._settings_from(model_id, self._db.all_model_settings())
-        settings = settings.model_copy(update={"adapters": list(adapters)})
-        record = self._virtual_record(model_id, display, base, settings, preset=preset)
+        if validated is not None:
+            self._db.save_model_settings(model_id, validated.model_dump(mode="json"))
+            current = validated
+        else:
+            current = self._settings_from(model_id, self._db.all_model_settings())
+        current = current.model_copy(update={"adapters": list(adapters)})
+        record = self._virtual_record(model_id, display, base, current, preset=preset)
         with self._lock:
             self._models[model_id] = record
             self._rebuild_aliases()
@@ -1303,6 +1369,9 @@ class Registry:
                 if virtual.is_virtual and virtual.base_model_id == model_id:
                     self._models.pop(virtual_id, None)
                     self._db.delete_virtual_model(virtual_id)
+                    # The copy's settings row goes with it: a later copy with
+                    # the same id must not inherit a stale device_override.
+                    self._db.delete_model_settings(virtual_id)
             self._rebuild_aliases()
         self._db.delete_model_settings(model_id)
         log.info(
