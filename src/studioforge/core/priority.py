@@ -7,11 +7,22 @@ Three tiers, given per load request and remembered per model:
   tiers must be unloaded to give it, it jumps the machine-wide load queue,
   and while it loads the server refuses new inference for lower-tier models
   so they drain and stop competing for the cards.
-* **2 -- dispatched agent.** A model a person sent off to work. Same rights,
-  but only over tier 3.
+* **2 -- dispatched agent.** A model a person sent off to work. Same
+  *preemption* rights, but only over tier 3.
 * **3 -- background (the default).** Takes a backseat to everything: it may
   never displace a tier-1 or tier-2 resident, and its traffic is the first
   refused while a higher tier is loading.
+
+Two different things move a resident, and the tier rules differ between them:
+
+* **Preemption** -- the rights above: displacing a model to take the placement
+  a load wants, holding off its traffic, jumping the queue. Only over a
+  strictly worse tier (the planner asks ``_evictable(for_priority=tier + 1)``).
+* **Ordinary eviction** -- making room the way every load always has: an IDLE,
+  unpinned resident is unloaded, worst tier first, least recently used within
+  a tier. A load may evict idle residents of its own tier or a worse one
+  (``_evictable(for_priority=tier)``), never a better one. So a tier-2 load can
+  evict an idle tier-2 model, but never preempts one.
 
 An unspecified priority means background, so the minimal load request --
 model plus context size -- keeps working unchanged, and every pre-existing
