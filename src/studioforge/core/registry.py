@@ -1026,6 +1026,17 @@ class Registry:
         record = self.get(model_id)
         if record is None:
             raise ModelNotFoundError(model_id, known=self.known_ids())
+        if record.ephemeral:
+            # D91: parity with the base is the server's guarantee, and an
+            # instance's shape lives with its lease -- it has no settings row.
+            raise BadRequestError(
+                f"{model_id!r} is an instance of lease {record.lease_id}: its settings are a copy "
+                f"of {record.base_model_id!r}'s and are not saved on their own. Change the base "
+                f"model's settings, or take a new lease with instances[].launch.",
+                param="model_id",
+                code="unsupported",
+                details={"model_id": model_id, "lease_id": record.lease_id},
+            )
         validated = self._validate_settings(record, settings)
         return self._persist_settings(record, validated)
 
@@ -1378,8 +1389,7 @@ class Registry:
                 f"{model_id!r} is an instance of lease {record.lease_id}; it ends with its lease "
                 f"(DELETE /api/leases/{record.lease_id}), never on its own",
                 param="model_id",
-                code="model_loaded",
-                status_code=409,
+                code="unsupported",
                 details={"model_id": model_id, "lease_id": record.lease_id},
             )
         self._db.delete_virtual_model(model_id)

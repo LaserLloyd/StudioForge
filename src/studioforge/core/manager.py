@@ -2373,6 +2373,16 @@ class ModelManager:
                 self._refuse_reshaping_held(
                     name, caller, ctx_size=ctx_size, min_slots=min_slots, max_slots=max_slots
                 )
+        target = self.registry.resolve(name)
+        if persist and target is not None and getattr(target, "ephemeral", False):
+            if created is not None:
+                self._drop_instance(created, target.lease_id)
+            raise BadRequestError(
+                f"persist writes a model's saved settings, and '{target.id}' is an instance of "
+                f"lease {target.lease_id} with none of its own: its shape is stored with the "
+                f"lease. Drop persist, or persist on the base model '{target.base_model_id}'.",
+                param="persist",
+            )
         try:
             instance = await self._load_recommended_body(
                 name,

@@ -738,3 +738,29 @@ def test_the_panel_lease_line_names_the_instances() -> None:
     lease.model_ids = [f"{MODEL}:2"]
     line = st.lease_line(lease)
     assert f"instances: {MODEL}:2 [0, 1]" in line and "by " + A in line
+
+
+def test_the_mcp_recipes_teach_two_copies_of_one_model() -> None:
+    from studioforge.mcp.management import INSTRUCTIONS
+
+    assert "two copies of one model" in INSTRUCTIONS
+    assert 'instances=[{"model": "<id>"}]' in INSTRUCTIONS
+
+
+async def test_an_instance_has_no_settings_of_its_own(state: Any) -> None:
+    """Parity is the server's: a settings save, a delete or a persist on a copy is refused."""
+    grant = await state.manager.grant_lease(
+        [0], holder="mb", instances=[{"model": TINY, "load": False}]
+    )
+    copy = grant.instances[0]["id"]
+    with pytest.raises(BadRequestError) as saved:
+        state.registry.save_settings(copy, ModelSettings(ctx_size=4096))
+    assert saved.value.code == "unsupported"
+    with pytest.raises(BadRequestError) as deleted:
+        state.registry.delete_virtual_model(copy)
+    assert deleted.value.code == "unsupported"
+    assert state.db.get_model_settings(copy) is None, "no settings row was written"
+    with pytest.raises(BadRequestError) as persisted:
+        await state.manager.load_recommended(copy, 4096, persist=True)
+    assert persisted.value.param == "persist"
+    assert state.registry.get(copy) is not None, "a refused persist drops nothing"

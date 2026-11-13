@@ -162,7 +162,9 @@ X-SF-Client: bench-run-7
 ## 4. Load and unload
 
 * `POST /api/models/{id}/load` (or `/models/load`) with an instance id and no shape loads it with its
-  stored shape; with `ctx_size` / `parallel` / KV types it reloads it in that shape (on its cards only).
+  stored shape (a loaded one is returned as it is); with `ctx_size` / `parallel` / KV types it loads in
+  that shape -- `force: true` to reshape a loaded one -- on its own cards only (`devices` may name a
+  subset). Reshaping another holder's copy is admin-only (`409 instance_held`).
 * An unload of a **base id** by a holder takes down **its own** copy; the reply says which:
 
   ```http

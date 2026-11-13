@@ -545,7 +545,9 @@ def other_clients(instance: InstanceInfo | None, caller: Caller | None) -> list[
             continue
         if who not in names:
             names.append(who)
-    if not names and not instance.in_flight and instance.active_requests > 0 and not mine:
+    if instance.active_requests > len(instance.in_flight) and "unknown" not in names:
+        # Requests past the bounded in-flight window carry no name: they may be
+        # anyone's, so they count as somebody else's.
         names.append("unknown")
     return names
 
