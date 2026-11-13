@@ -7908,3 +7908,46 @@ the kind it had (`render` for an image server). Capability `lease_holder_kinds` 
 `api/app.py`, `config.example.yaml`, generated `docs/reference/settings.md` and
 `docs/contracts/settings-schema.json`, capabilities `lease_holder_kinds`;
 `tests/unit/test_lease_holder_kinds.py`, and the lease tests' example holder renamed to `imagegen`.
+
+## D85 -- A no-GPU staging mode: stub children, a fake VRAM ledger, nothing touches a card
+
+**Problem.** Every multi-card behaviour of this round (leases, the walk, virtual copies, the stock
+llama-server surface) had to be proven end to end before it reached a rig whose cards are in use
+around the clock, and the only way to run the product was against real GPUs. A fake GPU probe
+existed (`gpu.backend: fake`, `SF_FAKE_GPUS`), but its free memory never moved when a child started,
+and the only stub child lived inside `tests/unit/test_supervisor.py`, unreachable from a real
+`serve`. A staging instance had to download an engine and load real weights.
+
+**Decision.**
+
+1. `engine.stub` (`SF_ENGINE__STUB`, default `false`) launches
+   `studioforge.testing.stub_llama_server` for every load instead of `llama-server`. `ensure_engine`
+   and the boot check are satisfied by a synthetic `stub` `EngineInfo` (its `--version`, `--help` and
+   `--list-devices` come from the stub): no download, no install, no `active.json`.
+2. It cannot switch on by accident: start-up refuses `engine.stub` unless the GPU probe is the fake
+   one, logs `engine_stub_mode` at WARNING, and `/health.build` reads `<sha>+stub`.
+3. `FakeGpuProbe` keeps a child ledger. The supervisor charges a ready stub child to it (the plan's
+   per-card bytes, or `--stub-vram-mib` in the plan's proportions) and credits it back on exit or
+   crash; `measure_child_vram` reads the ledger, so `GET /api/gpus` shows free memory move and D51
+   observation rows are written.
+4. The stub is stdlib only. It parses the real `llama-server` argv and answers `/health`, `/props`,
+   `/slots`, `/metrics` (`llamacpp:*`, counters advance per request), `/tokenize`, `/detokenize`,
+   `/apply-template`, `/completion`, `/v1/completions`, `/v1/chat/completions` (streaming too),
+   `/v1/embeddings`, `/embedding`, `/infill`, `/reranking` and `/lora-adapters`
+   deterministically: text is a pure function of the prompt and `seed`. Pacing (`--stub-tps` /
+   `SF_STUB_TPS`) is off by default; set it to see busy slots and tok/s.
+5. The supervisor unit tests run the same stub as their fake child (`test_supervisor.FAKE_CHILD`
+   is a shim to it), so one implementation serves tests and staging.
+
+**Not done.** The stub proves the plumbing, not a real card's arithmetic; real-GPU staging stays the
+test for memory behaviour. Fake cards do not yet carry D89's `uuid` / `pci_bus_id` / bandwidth
+(null). The unit suite's in-process native stub (`tests/unit/native_stub.py`, D90) is a second stub
+to unify later.
+
+**Surfaces.** `testing/stub_llama_server.py` (new), `core/engine.py` (`stub_mode`, `stub_info`,
+`stub_features`, `launch_prefix`), `core/gpu.py` (`FakeGpuProbe.attach_child` / `release_child` /
+`child_vram`), `core/supervisor.py` (`stub_children`, ready/exit ledger hooks), `core/manager.py`
+(`measure_child_vram`), `build.py` (`mark_stub_engine`, `+stub`), `api/app.py`, `config.py`
+(`EngineConfig.stub`), `config.example.yaml`, `docs/DEVELOPMENT.md` "No-GPU staging", generated
+settings docs; `tests/unit/test_stub_llama_server.py`, `test_engine_stub_mode.py`,
+`test_fake_vram_ledger.py`, `test_stub_staging_smoke.py`, `test_supervisor.py`.

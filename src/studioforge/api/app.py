@@ -708,11 +708,19 @@ def build_state(config: Config, *, version: str = __version__) -> Any:
     # nothing about the engine manager -- and answers the question a Path
     # cannot: which build a request for `tag` (None = the active one) lands on,
     # taken from the EngineInfo rather than parsed off a directory name (D50).
+    # No-GPU staging (D85): `engine.stub` makes every child a stub llama-server
+    # (the engine manager already refused to start without the fake probe), so
+    # the supervisor launches it through the stub prefix, reads its features
+    # from the stub's own --help and charges it to the fake probe's ledger.
+    stub = engine_manager.stub_mode
     supervisor = Supervisor(
         config,
         resolve_binary=engine_manager.server_binary,
         resolve_engine_tag=_engine_tag_resolver(engine_manager),
         probe=probe,
+        launch_prefix=engine_manager.launch_prefix(),
+        engine_features=engine_manager.stub_features if stub else None,
+        stub_children=stub,
     )
     # Late-bound rather than a constructor argument: the supervisor already
     # depends on the engine manager for `resolve_binary`, and the reverse

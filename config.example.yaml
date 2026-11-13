@@ -192,6 +192,10 @@ engine:
   # true = refuse to install an engine archive that has no published SHA-256.
   # false (default) installs it, records verified: false and warns.
   require_verified: false
+  # No-GPU staging only (D85): launch a stub llama-server for every load, with no
+  # engine download. Refused at start-up unless gpu.backend is `fake`; never set
+  # it on a real install. See docs/DEVELOPMENT.md ("No-GPU staging").
+  stub: false
 gpu:
   # auto = NVML, then ROCm, then Vulkan, then Metal; the first that lists a
   # GPU wins. Force nvml / cuda / rocm / vulkan / metal to skip the others.

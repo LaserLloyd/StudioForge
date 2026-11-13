@@ -384,6 +384,15 @@ def measure_child_vram(
     )
 
     wanted = [int(d) for d in devices]
+    # The no-GPU staging probe (D85) keeps its own ledger of what each stub
+    # child "holds"; nothing else can attribute a pid that holds no real VRAM.
+    ledger = getattr(probe, "child_vram", None)
+    if callable(ledger):
+        held = ledger(pid)
+        if held:
+            per_device = {d: int(b) for d, b in held.items() if not wanted or d in wanted}
+            if per_device:
+                return sum(per_device.values()), per_device
     # A fresh sample: the child just became ready, and a cached counter read
     # from before its weights landed would say it holds nothing.
     split = process_gpu_bytes(pid, ttl_s=0.0)

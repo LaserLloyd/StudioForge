@@ -1,5 +1,5 @@
 {
-  "count": 117,
+  "count": 118,
   "env_nested_delimiter": "__",
   "env_prefix": "SF_",
   "levels": [
@@ -947,6 +947,20 @@
       "label": "Require verified",
       "level": "advanced",
       "restart_required": false,
+      "secret": false,
+      "section": "engine",
+      "type": "bool"
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": false,
+      "description": "No-GPU staging only (D85): launch a stub llama-server for every load, with no engine download. Refused at start-up unless gpu.backend is `fake`; never set it on a real install. See docs/DEVELOPMENT.md (\"No-GPU staging\").",
+      "env": "SF_ENGINE__STUB",
+      "key": "engine.stub",
+      "label": "Stub",
+      "level": "advanced",
+      "restart_required": true,
       "secret": false,
       "section": "engine",
       "type": "bool"

@@ -6,8 +6,9 @@ Two layers:
   surface is pinned: a wrong spelling there does not fail loudly (llama-server
   prints "the argument has been removed" and carries on), so the argv is
   asserted exactly.
-* **Lifecycle** -- driven against a fake child written into ``tmp_path``. The
-  fake ignores unknown flags, so the real builder output can be handed to it
+* **Lifecycle** -- driven against the stub llama-server
+  (``studioforge.testing.stub_llama_server``) run through a shim written into
+  ``tmp_path``. The stub ignores unknown flags, so the real builder output can be handed to it
   unchanged; ``launch_prefix`` supplies the Python interpreter.
 
 One live test exercises the real ``llama-server.exe`` when it is installed.
@@ -37,6 +38,7 @@ from studioforge.core.supervisor import (
     safe_log_name,
 )
 from studioforge.errors import ModelLoadError
+from studioforge.testing import stub_llama_server
 from studioforge.types import (
     AdapterRecord,
     LoadPlan,
@@ -702,140 +704,16 @@ def test_engine_tag_is_passed_to_the_resolver(config: Config, tmp_path: Path) ->
 # Fake child, for lifecycle tests
 # ---------------------------------------------------------------------------
 
-FAKE_CHILD = '''
-"""A stand-in for llama-server: ignores unknown flags, serves the endpoints."""
-import json
-import os
-import sys
-import threading
-import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+# The fake child is the shipped stub (D85): the same program a no-GPU staging
+# instance launches, so the unit suite and staging exercise one implementation.
+# This shim only runs it by path (it needs no import path of its own), under
+# `python -u script.py <flags>` exactly like the old in-test fake.
+_STUB_PATH = Path(stub_llama_server.__file__).resolve()
+FAKE_CHILD = f"""
+import runpy
 
-ARGS = sys.argv[1:]
-
-
-def opt(name, default=None):
-    if name in ARGS:
-        index = ARGS.index(name)
-        if index + 1 < len(ARGS):
-            return ARGS[index + 1]
-    return default
-
-
-PORT = int(opt("--port", "0"))
-N_CTX = int(opt("--ctx-size", "4096"))
-PARALLEL = int(opt("--parallel", "1"))
-ALIAS = opt("--alias", "fake")
-MODEL = opt("--model", "fake.gguf")
-EXIT_CODE = opt("--fake-exit-code")
-UNHEALTHY = "--fake-unhealthy" in ARGS
-UNHEALTHY_IF = opt("--fake-unhealthy-if")
-CRASH_AFTER = opt("--fake-crash-after")
-CRASH_ONCE = opt("--fake-crash-once")
-TOUCH_ON_CRASH = opt("--fake-touch-on-crash")
-NO_LISTEN = "--fake-no-listen" in ARGS
-
-sys.stderr.write("fake-llama-server starting on port %d\\n" % PORT)
-sys.stderr.flush()
-
-if EXIT_CODE is not None:
-    sys.stderr.write("CUDA error: out of memory\\n")
-    sys.stderr.write("fatal: failed to load model\\n")
-    sys.stderr.flush()
-    sys.exit(int(EXIT_CODE))
-
-should_crash = CRASH_AFTER is not None
-if should_crash and CRASH_ONCE:
-    if os.path.exists(CRASH_ONCE):
-        should_crash = False
-    else:
-        with open(CRASH_ONCE, "w") as handle:
-            handle.write("1")
-
-if should_crash:
-    def _crash():
-        time.sleep(float(CRASH_AFTER))
-        sys.stderr.write("fake: simulated crash\\n")
-        sys.stderr.flush()
-        if TOUCH_ON_CRASH:
-            with open(TOUCH_ON_CRASH, "w") as handle:
-                handle.write("1")
-        os._exit(9)
-
-    threading.Thread(target=_crash, daemon=True).start()
-
-
-class Handler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-
-    def _send(self, code, payload):
-        body = json.dumps(payload).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def do_GET(self):
-        if self.path == "/health":
-            if UNHEALTHY or (UNHEALTHY_IF and os.path.exists(UNHEALTHY_IF)):
-                self._send(503, {"error": {"message": "Loading model"}})
-            else:
-                self._send(200, {"status": "ok"})
-        elif self.path == "/props":
-            self._send(
-                200,
-                {
-                    "default_generation_settings": {"n_ctx": N_CTX // PARALLEL,
-                                                    "params": {"n_predict": -1}},
-                    "total_slots": PARALLEL,
-                    "model_alias": ALIAS,
-                    "model_path": MODEL,
-                    "chat_template": "{{ messages }}",
-                },
-            )
-        elif self.path == "/slots":
-            self._send(200, [{"id": i, "is_processing": False} for i in range(PARALLEL)])
-        else:
-            self._send(404, {"error": {"message": "not found"}})
-
-    def do_POST(self):
-        length = int(self.headers.get("Content-Length") or 0)
-        if length:
-            self.rfile.read(length)
-        if self.path == "/lora-adapters":
-            self._send(200, {"success": True})
-        else:
-            self._send(404, {"error": {"message": "not found"}})
-
-    def log_message(self, fmt, *args):
-        sys.stderr.write("fake: " + (fmt % args) + "\\n")
-        sys.stderr.flush()
-
-
-if NO_LISTEN:
-    # Alive but deaf: used to test that a foreign listener on our port is not
-    # mistaken for this child.
-    while True:
-        time.sleep(0.1)
-
-
-class Server(ThreadingHTTPServer):
-    daemon_threads = True
-    # Mirror the real llama-server, which sets SO_REUSEADDR -- on POSIX only.
-    # The flag decides whether this child's TIME_WAIT connections leave the
-    # port bindable after it exits (the kernel copies the ORIGINAL socket's
-    # reuse flag onto its TIME_WAIT, so a fake without it makes the port
-    # un-rebindable for a minute in a way the real engine never does). On
-    # Windows SO_REUSEADDR lets a second bind silently share a LIVE listener,
-    # which would hide a genuine port clash -- and that is the platform whose
-    # probe uses SO_EXCLUSIVEADDRUSE for exactly that reason.
-    allow_reuse_address = os.name != "nt"
-
-
-server = Server(("127.0.0.1", PORT), Handler)
-server.serve_forever()
-'''
+runpy.run_path({str(_STUB_PATH)!r}, run_name="__main__")
+"""
 
 
 @pytest.fixture

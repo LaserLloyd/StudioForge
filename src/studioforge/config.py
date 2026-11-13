@@ -575,6 +575,15 @@ class EngineConfig(BaseModel):
     #: the unverified install is recorded (``verified: false``) and warned
     #: about rather than silent. Turn on for a hardened box.
     require_verified: bool = False
+    #: No-GPU staging mode (D85). ``true`` launches a stub ``llama-server``
+    #: (``studioforge.testing.stub_llama_server``) for every load instead of a
+    #: real engine, with no download and no engine install, so a staging
+    #: instance can exercise every API and MCP flow without touching a GPU.
+    #: Refused at start-up unless the GPU probe is the fake one
+    #: (``gpu.backend: fake``, or ``SF_GPU_PROBE=fake`` while that is ``auto``):
+    #: it can never run against real cards. Off by default and not for
+    #: production; see ``docs/DEVELOPMENT.md``.
+    stub: bool = False
 
     @field_validator("cache_ram_mb")
     @classmethod
@@ -1897,6 +1906,9 @@ RESTART_REQUIRED_KEYS = frozenset(
         "watchdog.port",
         "data_dir",
         "gpu.backend",
+        # Staging stub engine (D85): chosen once, when the engine manager and
+        # the supervisor are composed.
+        "engine.stub",
         "gpu.probe_cache_s",
         "gpu.probe_timeout_s",
         "gateway.child_port_start",

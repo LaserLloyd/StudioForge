@@ -62,12 +62,32 @@ def _git(args: list[str], cwd: Path) -> str | None:
     return completed.stdout.strip()
 
 
-@functools.cache
-def build_id() -> str:
-    """``<short sha>``, ``<short sha>-dirty`` or ``unknown``; computed once.
+#: Set once by a no-GPU staging process (D85) so that every place that prints
+#: the build -- ``/health``, ``/api/version``, the metrics page, the support
+#: bundle -- says ``+stub`` and nobody mistakes a staging instance for a real one.
+_STUB_ENGINE = False
+STUB_SUFFIX = "+stub"
 
-    Never raises. Tests reset it with ``build_id.cache_clear()``.
+
+def mark_stub_engine(active: bool = True) -> None:
+    """Record that this process runs the stub engine (``engine.stub``, D85)."""
+    global _STUB_ENGINE
+    _STUB_ENGINE = bool(active)
+
+
+def build_id() -> str:
+    """``<short sha>``, ``<short sha>-dirty`` or ``unknown``, plus ``+stub`` in staging.
+
+    The git part is computed once. Never raises. Tests reset it with
+    ``build_id.cache_clear()``.
     """
+    base = _checkout_build_id()
+    return f"{base}{STUB_SUFFIX}" if _STUB_ENGINE else base
+
+
+@functools.cache
+def _checkout_build_id() -> str:
+    """The checkout's own identity (see :func:`build_id`); computed once."""
     root = checkout_root()
     if root is None or shutil.which("git") is None:
         return UNKNOWN
@@ -81,3 +101,6 @@ def build_id() -> str:
     if status:
         return f"{sha}-dirty"
     return sha
+
+
+build_id.cache_clear = _checkout_build_id.cache_clear  # type: ignore[attr-defined]

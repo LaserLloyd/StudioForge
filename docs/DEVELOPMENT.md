@@ -49,10 +49,58 @@ Points worth knowing:
 | `1234` / `8080` / `1235` | the defaults — i.e. whatever install is already running |
 | `1299` | `just run-dev`'s gateway |
 | `18100–18200` | `llama-server` children of the default config |
-| `19420–19460` | `test_supervisor.py`'s fake children, deliberately out of the production range |
+| `19420–19460` | the stub children of the unit suite and of a no-GPU staging instance, deliberately out of the production range |
 
 Pick something else entirely for a scratch instance (`server.port`, `gui.port`, `watchdog.port` are
 all validated against each other and against the child range at load time).
+
+## No-GPU staging
+
+A staging instance can run the whole product -- gateway, planner, leases, loads, every `/v1`, `/api`
+and MCP route -- on synthetic cards, with a stub `llama-server` as every child, so nothing touches a
+GPU (D85). It is opt-in and cannot switch on by accident: `engine.stub` is refused at start-up
+unless the GPU probe is the fake one.
+
+```yaml
+# staging config.yaml (data dir somewhere disposable, never a real install's)
+server: {host: 127.0.0.1, port: 1299}
+gui: {port: 1298}
+watchdog: {port: 1297}
+gateway: {child_port_start: 19420, child_port_end: 19460}
+gpu: {backend: fake}
+engine: {stub: true}
+models: {dir: <a folder of small .gguf files>}
+```
+
+```powershell
+$env:SF_DATA_DIR = '<scratch dir>'
+$env:SF_FAKE_GPUS = '[{"index":0,"name":"RTX 5090","total_bytes":34359738368,"compute_capability":[12,0]},
+                      {"index":1,"name":"RTX 3090","total_bytes":25769803776,"compute_capability":[8,6]}]'
+studioforge serve --config <config.yaml> --no-gui
+```
+
+What it does:
+
+- **Stub child.** `studioforge.testing.stub_llama_server` is a stdlib-only HTTP server that parses the
+  real `llama-server` argv and answers `/health`, `/props`, `/slots`, `/metrics` (`llamacpp:*`),
+  `/tokenize`, `/detokenize`, `/apply-template`, `/completion`, `/v1/completions`,
+  `/v1/chat/completions` (streaming too), `/v1/embeddings`, `/embedding`, `/infill`, `/reranking`
+  and `/lora-adapters`. Text is a pure function of the prompt and `seed`. The unit suite's
+  supervisor tests run the same program as their fake child.
+- **No engine.** `ensure_engine` and the boot check are satisfied by a synthetic `stub` engine
+  (`--version`, `--help`, `--list-devices` come from the stub): no download, no install, no
+  `active.json`. `/health.build` reads `<sha>+stub`, and boot logs `engine_stub_mode` at WARNING.
+- **Moving VRAM.** A ready child is charged to the fake probe (its plan's per-card bytes, or
+  `--stub-vram-mib` spread in the same proportions) and credited back when it exits, so
+  `GET /api/gpus` shows free memory move and the D51 observation row is written.
+- **Tuning**, per model via `extra_flags` or for the instance via environment: `--stub-load-ms` /
+  `SF_STUB_LOAD_MS` (`/health` answers 503 for that long), `--stub-tps` / `SF_STUB_TPS` (paces
+  generation so busy slots and tok/s are visible), `--stub-vram-mib`, `--stub-build`,
+  `--stub-embed-dim`, and the fault flags `--fake-exit-code`, `--fake-unhealthy`,
+  `--fake-crash-after` (with `--fake-crash-once`) and `--fake-no-listen`.
+
+Use real-GPU staging (with `engine.stub` off) for anything that needs real memory behaviour: the
+stub proves the plumbing, not the arithmetic of a real card.
 
 ## The shape of the code
 

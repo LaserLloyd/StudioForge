@@ -46,6 +46,7 @@ import shutil
 import socket
 import stat
 import subprocess
+import sys
 import tarfile
 import threading
 import time
@@ -60,7 +61,7 @@ import httpx
 import psutil
 
 from studioforge.config import Config
-from studioforge.errors import StudioForgeError
+from studioforge.errors import ConfigError, StudioForgeError
 from studioforge.logging import get_logger
 from studioforge.types import EngineInfo, GpuInfo
 
@@ -74,6 +75,11 @@ log = get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 BIN_NAME = "llama-server.exe" if os.name == "nt" else "llama-server"
+
+#: The one engine tag the no-GPU staging mode (``engine.stub``, D85) serves. Not
+#: a directory on disk: the "binary" is the Python interpreter and every launch
+#: goes through :meth:`EngineManager.launch_prefix`.
+STUB_TAG = "stub"
 GITHUB_API = "https://api.github.com"
 ACTIVE_FILE = "active.json"
 META_FILE = "engine.json"
@@ -2003,6 +2009,15 @@ class EngineManager:
         self._probe: Any = probe
         self._client = client
         self._owns_client = client is None
+        #: No-GPU staging (D85): serve the stub engine instead of a real one.
+        #: ``is True`` rather than truthiness so a loosely typed test config can
+        #: never switch it on by accident.
+        self._stub: bool = getattr(getattr(config, "engine", None), "stub", False) is True
+        if self._stub:
+            self._require_fake_probe(config, probe)
+            from studioforge.build import mark_stub_engine
+
+            mark_stub_engine()
         #: "Which loaded models are running engine ``<tag>``?", or ``None`` when
         #: nobody has said (the CLI, a test, first-run bootstrap). Set by
         #: ``api.app.build_state`` to a supervisor-backed check; consulted only
@@ -2022,6 +2037,8 @@ class EngineManager:
         #: install runs in this process. Process-local by design -- it describes
         #: an in-flight transfer, not durable state.
         self.install_progress: dict[str, Any] | None = None
+        self._stub_version: str | None = None
+        self._stub_started: float = time.time()
         #: What the last :meth:`list_releases` call saw and threw away (D49-3):
         #: ``{examined, kept, skipped, pages, reasons: {reason: count}}``. Kept
         #: on the manager rather than returned so the signature stays a plain
@@ -2107,6 +2124,98 @@ class EngineManager:
         if token:
             headers["Authorization"] = f"Bearer {token}"
         return headers
+
+    # -- stub engine (no-GPU staging, D85) --------------------------------
+
+    @staticmethod
+    def _require_fake_probe(config: Config, probe: Any) -> None:
+        """Refuse ``engine.stub`` unless the GPU probe is the fake one.
+
+        The stub holds no VRAM and the planner would believe real cards were
+        free; the only safe pairing is synthetic cards. A probe object is
+        trusted over the config (it is what the planner reads); with no probe
+        the config has to name ``gpu.backend: fake``.
+        """
+        if probe is not None:
+            backend = str(getattr(probe, "backend", "") or "")
+        else:
+            backend = str(getattr(getattr(config, "gpu", None), "backend", "auto") or "auto")
+        if backend != "fake":
+            raise ConfigError(
+                "engine.stub is on but the GPU probe is "
+                f"'{backend}', not 'fake'. The stub engine is for no-GPU staging only and is "
+                "refused on real hardware: set gpu.backend to 'fake' (with SF_FAKE_GPUS "
+                "describing the synthetic cards), or turn engine.stub off."
+            )
+
+    @property
+    def stub_mode(self) -> bool:
+        """Whether this manager serves the stub engine (``engine.stub``)."""
+        return self._stub
+
+    def launch_prefix(self) -> list[str]:
+        """The argv placed before the engine binary for every launch.
+
+        ``[]`` for a real engine. For the stub, the interpreter running the
+        stub module by path (stdlib only, so the child needs no import path).
+        """
+        if not self._stub:
+            return []
+        from studioforge.testing import stub_llama_server
+
+        return [sys.executable, "-u", str(Path(stub_llama_server.__file__).resolve())]
+
+    def _is_stub_binary(self, binary: Path) -> bool:
+        return self._stub and Path(binary) == Path(sys.executable)
+
+    def stub_info(self) -> EngineInfo:
+        """The synthetic :class:`EngineInfo` for the stub engine (no files involved)."""
+        return EngineInfo(
+            tag=STUB_TAG,
+            path=self.engines_dir / STUB_TAG,
+            server_binary=Path(sys.executable),
+            variant="stub",
+            version_string=self._stub_version,
+            smoke_tested=True,
+            smoke_tested_at=self._stub_started,
+            active=True,
+            installed_at=self._stub_started,
+            backend="",
+            verified=None,
+            verified_by="",
+            smoke_result="passed",
+            warnings=["stub engine: a test double, not llama.cpp; no GPU is used"],
+        )
+
+    def stub_features(self, tag: str | None = None) -> EngineFeatures:
+        """Features of the stub's own ``--help`` (sync; for the supervisor)."""
+        if not self._stub or tag not in (None, "", STUB_TAG):
+            return EngineFeatures.unknown(tag or "")
+        cached = self._features_cache.get(STUB_TAG)
+        if cached is None:
+            from studioforge.testing import stub_llama_server
+
+            cached = parse_engine_features(stub_llama_server.help_text(), STUB_TAG)
+            self._features_cache[STUB_TAG] = cached
+        return cached
+
+    async def _ensure_stub_engine(self) -> EngineInfo:
+        """:meth:`ensure_engine` for the stub: the boot check, no download, no install."""
+        info = self.stub_info()
+        smoke = await self._boot_check(STUB_TAG, info)
+        if not smoke.version_ok:
+            raise EngineError(f"the stub engine does not run: {smoke.detail}")
+        info.version_string = smoke.version_string or info.version_string
+        self._stub_version = info.version_string
+        log.warning(
+            "engine_stub_mode",
+            detail=(
+                "engine.stub is on: every load starts a stub llama-server and no GPU is "
+                "touched. This instance is for staging only; the build reads +stub."
+            ),
+            version=info.version_string,
+        )
+        return info
 
     # -- paths ----------------------------------------------------------
 
@@ -2631,6 +2740,8 @@ class EngineManager:
 
     def installed(self) -> list[EngineInfo]:
         """Every engine directory that actually contains a server binary."""
+        if self._stub:
+            return [self.stub_info()]
         root = self.engines_dir
         if not root.is_dir():
             return []
@@ -2713,6 +2824,8 @@ class EngineManager:
         return [engine_record(info) for info in self.installed()]
 
     def get(self, tag: str) -> EngineInfo | None:
+        if self._stub:
+            return self.stub_info() if tag == STUB_TAG else None
         directory = self.engine_dir(tag)
         if not directory.is_dir():
             return None
@@ -2727,6 +2840,8 @@ class EngineManager:
         Falls back to the configured pinned tag, then to the newest install, so
         a missing/stale ``active.json`` degrades instead of breaking startup.
         """
+        if self._stub:
+            return self.stub_info()
         tag = self._read_active()
         if tag:
             info = self.get(tag)
@@ -2740,6 +2855,8 @@ class EngineManager:
 
     def server_binary(self, tag: str | None = None) -> Path:
         """Absolute path to a specific engine's ``llama-server``."""
+        if self._stub and tag in (None, STUB_TAG):
+            return Path(sys.executable)
         if tag is None:
             info = self.active()
             if info is None:
@@ -2767,6 +2884,8 @@ class EngineManager:
         D66 needs no reinstall. ``None`` -- no engine, a pin naming a build that
         is not installed, a library that cannot be read -- means "cannot tell".
         """
+        if self._stub and tag in (None, STUB_TAG):
+            return None  # the stub loads no model: nothing to read, nothing to refuse
         try:
             binary = self.server_binary(tag)
         except Exception:  # noqa: BLE001 - "cannot tell" is never a refusal
@@ -3747,6 +3866,8 @@ class EngineManager:
         child's stderr tail. Reinstalling is an explicit act (Setup tab,
         ``engine --update``, ``install(force=True)``), not a boot side effect.
         """
+        if self._stub:
+            return await self._ensure_stub_engine()
         self.check_pinned_tag()
         tag = self.config.engine.pinned_tag
         for candidate in (tag, f"{tag}-local"):
@@ -4015,6 +4136,13 @@ class EngineManager:
 
         code, text = await self._capture(binary, ["--version"])
         version = _version_line(text)
+        if self._is_stub_binary(binary) and code == 0 and version is not None:
+            return _SmokeResult(
+                True,
+                f"engine {tag}: {version}; stub engine, there is no model to micro-load",
+                version_ok=True,
+                version_string=version,
+            )
         if code != 0 or version is None:
             tail = "\n".join(text.splitlines()[-40:])
             return _SmokeResult(
@@ -4189,10 +4317,12 @@ class EngineManager:
 
     async def _capture(self, binary: Path, args: Sequence[str]) -> tuple[int, str]:
         """Run the engine with ``args`` and return ``(exit code, stdout+stderr)``."""
+        command = (
+            [*self.launch_prefix(), *args] if self._is_stub_binary(binary) else [str(binary), *args]
+        )
         try:
             proc = await asyncio.create_subprocess_exec(
-                str(binary),
-                *args,
+                *command,
                 cwd=str(binary.parent),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -4214,6 +4344,10 @@ class EngineManager:
 
     async def help_text(self, tag: str) -> str:
         """The engine's ``--help`` output, cached in memory and on disk."""
+        if self._stub and tag == STUB_TAG:
+            from studioforge.testing import stub_llama_server
+
+            return stub_llama_server.help_text()
         cached = self._help_cache.get(tag)
         if cached is not None:
             return cached
@@ -4298,6 +4432,8 @@ class EngineManager:
         so the supervisor can read it synchronously on the load path without
         importing this manager -- see :func:`probe_engine_features`.
         """
+        if self._stub and tag in (None, "", STUB_TAG):
+            return self.stub_features(STUB_TAG)
         resolved = tag or self.config.engine.pinned_tag
         cached = self._features_cache.get(resolved)
         if cached is not None:

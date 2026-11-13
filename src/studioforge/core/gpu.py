@@ -31,7 +31,7 @@ import shutil
 import subprocess
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -445,6 +445,11 @@ class FakeGpuProbe:
         self._driver = driver
         self._cuda_version = cuda_version
         self._processes: list[VramProcess] = []
+        # The child ledger (D85): what each stub child holds, by pid. Fed by the
+        # supervisor when a child becomes ready and emptied when it exits, so a
+        # no-GPU staging instance sees free memory move like a real one does.
+        self._ledger: dict[int, dict[int, int]] = {}
+        self._ledger_lock = threading.RLock()
 
     @property
     def backend(self) -> str:
@@ -467,10 +472,63 @@ class FakeGpuProbe:
         return self._cuda_version
 
     def compute_processes(self) -> list[VramProcess]:
-        return [p.model_copy(deep=True) for p in self._processes]
+        held = [p.model_copy(deep=True) for p in self._processes]
+        with self._ledger_lock:
+            for pid, per_device in sorted(self._ledger.items()):
+                held.extend(
+                    VramProcess(
+                        gpu_index=device,
+                        pid=pid,
+                        name="llama-server (stub)",
+                        used_bytes=nbytes,
+                    )
+                    for device, nbytes in sorted(per_device.items())
+                )
+        return held
 
     def shutdown(self) -> None:
         return None
+
+    # -- child ledger (D85) ---------------------------------------------
+
+    def attach_child(self, pid: int, per_device: Mapping[int, int]) -> dict[int, int]:
+        """Charge a stub child's VRAM to its cards; returns what was really taken.
+
+        ``per_device`` is ``{gpu index: bytes}``. A request larger than a card's
+        free memory is clamped to what is free (a synthetic card cannot go
+        negative); an unknown index is skipped. Re-attaching a pid first
+        releases what it held, so a relaunch does not double-charge.
+        """
+        with self._ledger_lock:
+            self.release_child(pid)
+            taken: dict[int, int] = {}
+            for device, nbytes in per_device.items():
+                gpu = self._gpus.get(int(device))
+                if gpu is None or nbytes <= 0:
+                    continue
+                grant = min(int(nbytes), gpu.free_bytes)
+                self.consume(int(device), grant)
+                taken[int(device)] = grant
+            self._ledger[int(pid)] = taken
+            return dict(taken)
+
+    def release_child(self, pid: int) -> int:
+        """Give back everything ``pid`` held; returns the bytes freed (0 if none)."""
+        with self._ledger_lock:
+            held = self._ledger.pop(int(pid), None)
+            if not held:
+                return 0
+            for device, nbytes in held.items():
+                gpu = self._gpus.get(device)
+                if gpu is not None:
+                    self.set_free(device, min(gpu.total_bytes, gpu.free_bytes + nbytes))
+            return sum(held.values())
+
+    def child_vram(self, pid: int) -> dict[int, int] | None:
+        """What ``pid`` holds per card, or ``None`` when the ledger does not know it."""
+        with self._ledger_lock:
+            held = self._ledger.get(int(pid))
+            return dict(held) if held else None
 
     # -- test helpers ---------------------------------------------------
 

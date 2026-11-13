@@ -1627,6 +1627,7 @@ class Supervisor:
         probe: GpuProbe | None = None,
         engine_features: Callable[[str | None], EngineFeatures] | None = None,
         resolve_engine_tag: Callable[[str | None], str | None] | None = None,
+        stub_children: bool = False,
     ) -> None:
         self._config = config
         self._resolve_binary = resolve_binary
@@ -1659,6 +1660,10 @@ class Supervisor:
         # Interpreter/wrapper args placed before the engine binary. Real
         # deployments leave this empty; tests use it to run a fake child.
         self._launch_prefix = list(launch_prefix)
+        # No-GPU staging (D85): the children are stubs that hold no real VRAM,
+        # so when this is set a ready child is charged to the fake probe's
+        # ledger and credited back when it exits. Never set against real cards.
+        self._stub_children = bool(stub_children)
         self._instances: dict[str, _Instance] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         # The holder set the last cache_ram_pool_oversubscribed WARNING was
@@ -2563,6 +2568,7 @@ class Supervisor:
             inst.info.state = "ready"
             inst.info.started_at = time.time()
             inst.info.last_activity_at = time.time()
+            self._ledger_attach(inst)
             inst.watcher = asyncio.create_task(self._watch(inst), name=f"sf-watch-{record.id}")
             # ``engine_tag`` here is the build this child is RUNNING, not the
             # build it asked for. Until D50 it was the request, which is None
@@ -3096,6 +3102,7 @@ class Supervisor:
             described = f"exited with code {code}" if code is not None else "exited"
             inst.info.last_error = self._failure_message(inst, described)
             _TRACKED_PIDS.discard(inst.info.pid or -1)
+            self._ledger_release(inst)
             self._log_child_exit(inst, phase=phase, code=code)
 
             if inst.info.restarts >= gateway.max_restarts:
@@ -3158,6 +3165,7 @@ class Supervisor:
 
             inst.info.state = "ready"
             inst.info.started_at = time.time()
+            self._ledger_attach(inst)
             log.info(
                 "model_restarted",
                 model_id=inst.record.id,
@@ -3191,7 +3199,69 @@ class Supervisor:
         inst.pumps = []
         if inst.info.pid is not None:
             _TRACKED_PIDS.discard(inst.info.pid)
+        self._ledger_release(inst)
         inst.close_log()
+
+    # ------------------------------------------------------------------
+    # Fake VRAM ledger (no-GPU staging, D85)
+    # ------------------------------------------------------------------
+
+    def _ledger_attach(self, inst: _Instance) -> None:
+        """Charge a ready stub child to the fake probe: what it "uses" leaves the cards.
+
+        The figure is the plan's per-card bytes, or, when the launch carries
+        ``--stub-vram-mib``, that many MiB spread over the plan's cards in the
+        plan's own proportions. A no-op unless the supervisor was told its
+        children are stubs and the probe keeps a ledger.
+        """
+        pid = inst.info.pid
+        attach = getattr(self._probe, "attach_child", None)
+        if not self._stub_children or pid is None or not callable(attach):
+            return
+        try:
+            per_device = self._ledger_bytes(inst)
+            taken = attach(pid, per_device)
+        except Exception as exc:  # noqa: BLE001 - a synthetic ledger must never fail a load
+            log.warning("stub_vram_ledger_failed", model_id=inst.record.id, error=str(exc))
+            return
+        if sum(taken.values()) < sum(per_device.values()):
+            log.warning(
+                "stub_vram_clamped",
+                model_id=inst.record.id,
+                wanted_mb=round(sum(per_device.values()) / (1024 * 1024)),
+                taken_mb=round(sum(taken.values()) / (1024 * 1024)),
+                detail="the synthetic cards had less free memory than the plan expected",
+            )
+
+    @staticmethod
+    def _ledger_bytes(inst: _Instance) -> dict[int, int]:
+        plan = inst.plan
+        base = {int(d): int(b) for d, b in plan.per_gpu_bytes.items() if int(b) > 0}
+        if not base and plan.devices:
+            share = plan.estimate.total_bytes // len(plan.devices)
+            base = {int(d): share for d in plan.devices} if share > 0 else {}
+        argv = inst.argv
+        for index, token in enumerate(argv[:-1]):
+            if token == "--stub-vram-mib":
+                try:
+                    wanted = int(argv[index + 1]) * 1024 * 1024
+                except ValueError:
+                    break
+                weights = base or {int(d): 1 for d in plan.devices}
+                total = sum(weights.values()) or 1
+                return {d: wanted * w // total for d, w in weights.items()}
+        return base
+
+    def _ledger_release(self, inst: _Instance) -> None:
+        """Credit a stub child's memory back to the cards (idempotent)."""
+        pid = inst.info.pid
+        release = getattr(self._probe, "release_child", None)
+        if not self._stub_children or pid is None or not callable(release):
+            return
+        try:
+            release(pid)
+        except Exception as exc:  # noqa: BLE001 - see _ledger_attach
+            log.warning("stub_vram_ledger_failed", model_id=inst.record.id, error=str(exc))
 
     def _vram_used_bytes(self, devices: Sequence[int]) -> int:
         """Used VRAM across ``devices`` right now, or 0 without a probe."""
