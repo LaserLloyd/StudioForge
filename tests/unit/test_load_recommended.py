@@ -63,6 +63,18 @@ class Registry:
     def touch(self, model_id: str) -> None:
         return None
 
+    # D91: lease instances live in the registry beside the library's records.
+    def add_ephemeral(self, record: Any) -> Any:
+        self._records[record.id] = record
+        return record
+
+    def drop_ephemeral(self, model_id: str) -> Any:
+        return self._records.pop(model_id, None)
+
+    def name_holder(self, name: str) -> str | None:
+        record = self._records.get(name)
+        return record.id if record is not None else None
+
     def save_settings(self, model_id: str, settings: ModelSettings) -> Any:
         # The real registry re-validates here because this is reachable from
         # the HTTP API, and since D48 it refuses a row whose ``parallel`` is

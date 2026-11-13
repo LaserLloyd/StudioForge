@@ -76,7 +76,7 @@ FEATURE_NOTES: dict[str, str] = {
 #: on instead. **Bump it in the same commit that appends a decision**:
 #: ``tests/unit/test_capabilities_implemented.py`` reads the headings of
 #: ``DECISIONS.md`` and fails until the two agree.
-LATEST_DECISION = 90
+LATEST_DECISION = 91
 
 #: Every decision number this build includes, ``"D1"`` .. ``"D<LATEST_DECISION>"``.
 IMPLEMENTED_DECISIONS: tuple[str, ...] = tuple(f"D{n}" for n in range(1, LATEST_DECISION + 1))
@@ -215,6 +215,19 @@ SERVER_FEATURES: dict[str, str] = {
     "problem_json": "D90",
     "autoload_param": "D90",
     "deprecation_headers": "D90",
+    # Several instances of one model (D91): POST /api/leases (and MCP
+    # reserve_gpus) take instances[{model, count, gpus, tag, launch, load}];
+    # each copy is <model>:<n> or <model>@<tag>, addressable in "model"
+    # everywhere, granted all or nothing, ended with its lease (410
+    # instance_released in flight, 404 instance_not_found after), restored
+    # unloaded and reloaded with its exact stored shape.
+    "lease_instances": "D91",
+    # A second holder never replaces the first: a lease or a lease-bound load
+    # naming a model another holder holds gets its own copy; base-id requests,
+    # loads and unloads mean the caller's own instance (X-SF-Lease, X-SF-Client,
+    # the lease's key); an unload never cuts another client's requests without
+    # an explicit force (409 instance_in_use).
+    "multi_instance_default": "D91",
 }
 
 

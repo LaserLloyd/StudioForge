@@ -257,17 +257,26 @@ async def test_load_recommended_with_lease_id_binds_and_a_failure_unbinds() -> N
     assert lease.model_ids == [MODEL]
 
 
-async def test_lease_id_refuses_an_unknown_lease_and_a_model_another_lease_names() -> None:
+async def test_lease_id_refuses_an_unknown_lease_and_copies_a_model_another_lease_names() -> None:
+    """D91 changed the second half: a model another lease names is never taken from it.
+
+    Before D91 the bound load was a 409 ``lease_conflict``; now the binding
+    lease gets its own instance ``<model>:2`` on its cards, and the first
+    lease still names the model.
+    """
     manager, _supervisor = walk_manager()
     manager.planner.leases = manager.leases
     with pytest.raises(LeaseNotFoundError):
         await manager.load(MODEL, lease_id="nope")
-    manager.leases.acquire([0], holder="a", model_ids=[MODEL])
+    first = manager.leases.acquire([0], holder="a", model_ids=[MODEL])
     other = manager.leases.acquire([2], holder="b")
-    with pytest.raises(LeaseConflictError) as excinfo:
-        await manager.load_recommended(MODEL, 8192, lease_id=other.id)
-    assert excinfo.value.code == "lease_conflict"
-    assert excinfo.value.details["code"] == "lease_conflict"
+    instance = await manager.load_recommended(MODEL, 8192, lease_id=other.id)
+    assert instance.model_id == f"{MODEL}:2"
+    assert instance.plan is not None and sorted(instance.plan.devices) == [2]
+    assert first.model_ids == [MODEL]
+    assert other.model_ids == [f"{MODEL}:2"]
+    assert [spec.id for spec in other.instances] == [f"{MODEL}:2"]
+    assert other.instances[0].origin == "second_holder"
 
 
 async def test_a_lease_id_dry_run_plans_on_the_lease_and_binds_nothing() -> None:

@@ -605,7 +605,63 @@ _ENTRIES: tuple[ErrorEntry, ...] = (
         404,
         _INVALID,
         "No loaded instance matches '{instance}'.",
-        "List loaded instances with GET /api/v1/models (loaded_instances) and unload by that id.",
+        "List loaded instances with GET /api/v1/models (loaded_instances) and unload by that id. "
+        "A lease instance id (<model>:<n>, <model>@<tag>) exists only while its lease stands "
+        "(GET /api/leases lists them, D91): take a new lease with instances[] to get one again "
+        "-- it is never reloaded on its own.",
+    ),
+    # --- several instances of one model under leases (D91) ------------------
+    _e(
+        "instance_released",
+        410,
+        _SERVER,
+        "Instance '{instance}' was released with its lease while this request was in flight.",
+        "The lease that owned the instance ended (released, idled out). Take a new lease with "
+        "instances[] (POST /api/leases) and send the new instance id as model; requests naming "
+        "the old id now answer 404 instance_not_found.",
+    ),
+    _e(
+        "instance_held",
+        409,
+        _INVALID,
+        "'{model}' belongs to another holder: a lease names it, or it serves another client.",
+        "Take a lease naming the model -- you get your own copy, <model>:<n> (POST /api/leases "
+        "with model_ids or instances[]) -- and address that. Only an admin may touch another "
+        "holder's instance, on its exact id, with force=true.",
+    ),
+    _e(
+        "instance_in_use",
+        409,
+        _INVALID,
+        "'{model}' is serving requests from other clients; an unload would cut them.",
+        "Wait for them to finish (Retry-After; GET /api/status loaded[].in_flight names them), "
+        "unload your own instance instead (its exact id), or send force=true to cut them.",
+    ),
+    _e(
+        "instance_ambiguous",
+        409,
+        _INVALID,
+        "'{model}' names several instances this caller holds.",
+        "Name the exact instance id (<model>:<n> or <model>@<tag>); GET /api/leases lists your "
+        "lease's instances.",
+    ),
+    _e(
+        "instance_id_conflict",
+        409,
+        _INVALID,
+        "The instance id '{id}' is already taken by a model, an alias or another instance.",
+        "Pick another tag, or omit tag to get the next free numbered id (<model>:<n>). The "
+        "response's studioforge.colliding_model_id names the owner.",
+    ),
+    _e(
+        "launch_key_not_allowed",
+        400,
+        _INVALID,
+        "An instance's launch may set ctx_size, parallel, min_slots, max_slots, kv_cache_type and "
+        "kv_cache_type_v only.",
+        "Drop the key: everything else (file, chat template, sampling, adapters, engine build, "
+        "reasoning format) is copied from the base model -- parity is the server's guarantee. "
+        "Change the base model's settings (PATCH /api/models/{id}/settings) instead.",
     ),
     _e(
         "download_not_found",
