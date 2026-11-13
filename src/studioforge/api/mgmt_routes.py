@@ -29,6 +29,7 @@ from studioforge.api.auth import (
     require_admin_action,
     require_owner,
 )
+from studioforge.api.holder import caller_of
 from studioforge.build import build_id
 from studioforge.config import RESTART_REQUIRED_KEYS, apply_live, apply_overrides
 from studioforge.core import parallel_bench
@@ -42,6 +43,7 @@ from studioforge.core.benchmark import (
     available_modes,
 )
 from studioforge.core.diskspace import disk_report
+from studioforge.core.instances import Caller, names_other_holder
 from studioforge.core.leases import (
     LEASE_DEPRECATED_FIELDS,
     VACATE_TOKEN_HEADER,
@@ -160,7 +162,21 @@ def lease_holder_may_act(request: Request, state: Any, lease: Any) -> bool:
       owns (taken with no credential, before 2.0.1, or by a key since revoked).
       On this rig every tenant is a loopback peer, so for a key-bound lease the
       peer proves nothing: it would let one tenant's key act on another's.
+
+    **Holder identity first (D91, 8a).** A caller that names ANOTHER lease
+    (``X-SF-Lease`` / ``?lease_id=``) or another holder (an ``X-SF-Client`` that
+    is a different standing lease's holder, or of another family) is not this
+    lease's holder -- not even with the key that took it. Every bench run on
+    one client shares one inference key, and on 2026-11-14 that key made holder
+    B holder A: B's unload of A's model ran as a forced unload and cut A's
+    streams.
     """
+    try:
+        standing = state.manager.leases.all()
+    except Exception:  # noqa: BLE001 - a stub state without a book has nobody else to name
+        standing = []
+    if names_other_holder(caller_of(request, state), lease, standing):
+        return False
     principal = principal_of(request)
     owner = getattr(lease, "holder_key", None)
     if owner and principal is not None and principal.kind == "key" and principal.actor == owner:
@@ -246,7 +262,10 @@ async def status(request: Request) -> dict[str, Any]:
     # them: /api/status showed a lease with no idle_s and no expiry while
     # /api/leases showed both, and `sfctl status` rendered "-" in the two
     # columns that answer "is this lease alive?". One projection, everywhere.
-    data["leases"] = [lease_view(lease) for lease in state.manager.leases.all()]
+    data["leases"] = [
+        lease_view(lease, live=_live(state, lease)) for lease in state.manager.leases.all()
+    ]
+    _attach_instance_owners(state, data)
     # The tenant registry (D77): who shares the cards and whether each is up.
     # Same projection GET /api/tenants gives a LAN reader -- URLs withheld.
     data["tenants"] = _tenant_views(state, request)
@@ -281,6 +300,28 @@ async def status(request: Request) -> dict[str, Any]:
     # event loop: it walks the process table. See DECISIONS.md D23 and D39.
     await run_in_threadpool(_attach_vram_attribution, state, data)
     return data
+
+
+def _attach_instance_owners(state: Any, data: dict[str, Any]) -> None:
+    """Each ``loaded[]`` row says whose it is (D91): ``lease_id``, ``holder``, ``ephemeral``.
+
+    ``ephemeral`` rows are instances a lease created (``<model>:<n>`` or
+    ``<model>@<tag>``, ``base_model_id`` naming the model they copy); a named
+    model's row carries the lease that names it. ``null`` lease for anything
+    else.
+    """
+    manager = state.manager
+    for entry in data.get("loaded", []):
+        model_id = str(entry.get("model_id"))
+        found = manager.instance_of(model_id) if hasattr(manager, "instance_of") else None
+        lease = found[0] if found is not None else None
+        if lease is None and len(manager.leases):
+            lease = manager.leases.for_model(model_id)
+        record = state.registry.get(model_id)
+        entry["ephemeral"] = bool(getattr(record, "ephemeral", False))
+        entry["base_model_id"] = getattr(record, "base_model_id", None) if record else None
+        entry["lease_id"] = lease.id if lease is not None else None
+        entry["holder"] = lease.holder if lease is not None else None
 
 
 def _attach_vram_attribution(state: Any, data: dict[str, Any]) -> None:
@@ -493,6 +534,12 @@ async def vram_reclaim(request: Request, dry_run: bool = Body(False, embed=True)
 # ---------------------------------------------------------------------------
 
 
+def _live(state: Any, lease: Any) -> dict[str, Any] | None:
+    """``{instance id: running child}`` for a lease's instance rows (D91); ``None`` without."""
+    reader = getattr(state.manager, "live_instances", None)
+    return reader(lease) if reader is not None else None
+
+
 def _lease_uuids(state: Any) -> dict[int, str | None]:
     """``{index: uuid}`` for the lease records' ``allocation.devices[]`` (D87)."""
     planner = getattr(state.manager, "planner", None)
@@ -521,7 +568,7 @@ async def list_leases(request: Request) -> dict[str, Any]:
     reveal = is_admin_caller(request, state.config)
     uuids = _lease_uuids(state)
     leases = [
-        lease_view(lease, reveal_vacate_url=reveal, gpu_uuids=uuids)
+        lease_view(lease, reveal_vacate_url=reveal, gpu_uuids=uuids, live=_live(state, lease))
         for lease in state.manager.leases.all()
     ]
     return {
@@ -553,8 +600,40 @@ async def create_lease(
             'With devices "auto": how many cards, all of one class (class_key). Default 1.'
         ),
     ),
+    instances: list[Any] | None = Body(
+        None,
+        description=(
+            "Copies of models to create on the lease's cards (D91): "
+            '[{"model": "<id>", "count"?: 1, "gpus"?: [..], "tag"?: "<tag>", '
+            '"launch"?: {ctx_size, parallel, min_slots, max_slots, kv_cache_type, '
+            'kv_cache_type_v}, "load"?: true}]. Each is <model>:<n> (or <model>@<tag>) and '
+            "lives and dies with the lease; all are granted, or none."
+        ),
+    ),
 ) -> dict[str, Any]:
     """Give CUDA ``devices`` to ``model_ids`` -- or, with none, to something outside this server.
+
+    **Instances (D91).** ``instances`` asks for copies of a model on these cards,
+    in Triton's ``instance_group`` shape: ``[{"model": X, "count"?: 1, "gpus"?:
+    [..], "tag"?: "mb-a", "launch"?: {...}, "load"?: true}]``. Each copy's id is
+    LM Studio's ``X:<n>`` (``n`` the smallest free integer from 2; the base is
+    plain ``X``) or ``X@<tag>`` -- the string to put in ``model`` on every
+    OpenAI-shape and native route. ``launch`` may set ``ctx_size`` (alias
+    ``context_length``), ``parallel`` or ``min_slots``/``max_slots``,
+    ``kv_cache_type``, ``kv_cache_type_v``; any other key is 400
+    ``launch_key_not_allowed`` -- the rest is a deep copy of the base's settings.
+    Copies with ``load: true`` (the default) are loaded before this returns and
+    reported in ``instances[]`` as actually loaded (``id``, ``model``,
+    ``devices``, ``ctx_per_slot``, ``parallel``, ``kv_cache_type(_v)``,
+    ``state``, ``engine_tag``). All or nothing: one failure unloads the rest,
+    releases the lease and answers one error with ``error.studioforge.instances[]``.
+    A taken tag is 409 ``instance_id_conflict``.
+
+    **A second holder never replaces the first (D91).** A model in ``model_ids``
+    that another holder holds (another lease names it, or it is serving another
+    client's requests on other cards) gets a copy of its own on these cards,
+    listed in ``instances`` with ``origin: "second_holder"`` and loaded on first
+    use -- the other holder's instance is never moved, reloaded or unloaded.
 
     ``devices`` may be ``"auto"`` or omitted (D78): the server picks the card(s)
     the way this grant judges a card -- never one with a busy resident, never a
@@ -655,18 +734,20 @@ async def create_lease(
         prefer=prefer or [],
         avoid=avoid or [],
         count=count,
+        instances=instances,
     )
-    return lease_grant_reply(grant, gpu_uuids=_lease_uuids(state))
+    return lease_grant_reply(grant, gpu_uuids=_lease_uuids(state), live=_live(state, grant.lease))
 
 
-def lease_grant_reply(grant: Any, *, gpu_uuids: Any = None) -> dict[str, Any]:
+def lease_grant_reply(grant: Any, *, gpu_uuids: Any = None, live: Any = None) -> dict[str, Any]:
     """The ``POST /api/leases`` body for a :class:`~studioforge.core.manager.LeaseGrant` (D87).
 
     The registrant just sent the vacate URL, so echoing it back tells it what
     was stored. The flat top level is the pre-D87 reply (CrucibleForge reads
-    ``lease_id``/``id`` there); ``lease`` is the canonical place.
+    ``lease_id``/``id`` there); ``lease`` is the canonical place. ``instances``
+    (D91) sits at the top level and inside ``lease``.
     """
-    view = lease_view(grant.lease, reveal_vacate_url=True, gpu_uuids=gpu_uuids)
+    view = lease_view(grant.lease, reveal_vacate_url=True, gpu_uuids=gpu_uuids, live=live)
     body: dict[str, Any] = {
         **view,
         "lease": dict(view),
@@ -719,6 +800,11 @@ async def release_lease(
     ``unloaded``. ``?unload=false`` keeps them resident. A model serving a
     request, a pinned one, or one another lease names is never unloaded here;
     it is listed in ``kept`` with the reason.
+
+    The lease's own instances (D91) always end with it, ``unload=false`` or not,
+    busy or not: a request in flight on one ends with ``instance_released``
+    (410, or an SSE error frame mid-stream), a later request naming its id is
+    404 ``instance_not_found``. They are listed in ``instances_ended``.
     """
     state = _state(request)
     _require_lease_owner(state, request, lease_id)
@@ -727,6 +813,9 @@ async def release_lease(
         "released": lease_view(result.lease, gpu_uuids=_lease_uuids(state)),
         "unloaded": list(result.unloaded),
         "kept": list(result.kept),
+        # D91: the lease's own instances, which always end with it (unload=false
+        # keeps named models resident, never an instance).
+        "instances_ended": list(getattr(result, "instances_ended", []) or []),
     }
 
 
@@ -928,7 +1017,13 @@ async def warm_tenant(name: str, request: Request) -> dict[str, Any]:
 
 
 @router.get("/models")
-async def list_models(request: Request) -> dict[str, Any]:
+async def list_models(
+    request: Request,
+    include_ephemeral: bool = Query(
+        False,
+        description="Also list the instances leases created (<model>:<n>, <model>@<tag>; D91).",
+    ),
+) -> dict[str, Any]:
     """The whole library, each row's saved record plus what it is doing now.
 
     Additive per-row keys on top of the stored ``ModelRecord``: ``loaded`` /
@@ -962,7 +1057,9 @@ async def list_models(request: Request) -> dict[str, Any]:
 
     await wait_for_boot(state, timeout_s=60.0, scan_only=True)  # D33: not an empty list mid-boot
     loaded = {i.model_id: i for i in state.supervisor.list()}
-    records = list(state.registry.all())
+    records = list(
+        state.registry.all(include_ephemeral=True) if include_ephemeral else state.registry.all()
+    )
     # D66: can the build that would serve each model load its architecture, and
     # did its last launch die? One lookup per build for the whole list.
     arch_memo: dict[Any, Any] = {}
@@ -1382,6 +1479,7 @@ async def load_model(
     state = _state(request)
     lease = _bound_lease_id(state, request, lease_id, lease_id_query)
     route = f"api:/api/leases/{lease}" if lease else "api:/api/models/{id}/load"
+    caller = request_caller(state, request)
     instance = await state.manager.load(
         model_id,
         ctx_size=ctx_size,
@@ -1394,8 +1492,52 @@ async def load_model(
         source=attributed_source(route, client_of(request)),
         priority=priority,
         lease_id=lease,
+        caller=caller,
     )
     return instance.model_dump(mode="json")
+
+
+def request_caller(state: Any, request: Request, lease_ids: Any = ()) -> Caller:
+    """The caller of a load or unload route, its named leases ownership-checked (D91).
+
+    A lease named in ``X-SF-Lease`` decides which instance a base id means, so
+    naming one is held to the same rule as binding to it (D80, D87): the key
+    that took it, the holder's D55 proof, or an admin -- 403 otherwise. Routing
+    an inference request needs no such proof (it changes nothing).
+    """
+    caller = caller_of(request, state, lease_ids=lease_ids)
+    for lease_id in caller.lease_ids:
+        _require_lease_owner(state, request, lease_id)
+    return caller
+
+
+async def unload_for_request(
+    state: Any, request: Request, name: str, *, force: bool, source: str = "rest"
+) -> tuple[str, bool]:
+    """One unload rule for every route (D91, 8a): ``(the id taken down, whether it was up)``.
+
+    The target is the caller's own instance when it names a base it holds a
+    copy of; another holder's instance only on its exact id with an admin
+    credential and ``force``. The D55 lease waiver is decided for THAT target by
+    holder identity (:func:`may_unload_lease_held`), and ``force`` is only ever
+    what the caller sent -- never derived from the waiver: without it, a
+    lease-held model serving another client's requests is a 409
+    ``instance_in_use`` naming them.
+    """
+    caller = request_caller(state, request)
+    manager = state.manager
+    targeter = getattr(manager, "unload_target", None)
+    target = targeter(name, caller, force=force) if targeter is not None else name
+    unloaded = await manager.unload(
+        target,
+        force=force,
+        lease_ok=may_unload_lease_held(request, state, [target]),
+        caller=caller,
+        source=source,
+        client=client_of(request),
+        peer=_peer_host(request),
+    )
+    return target, bool(unloaded)
 
 
 def _bound_lease_id(
@@ -1607,28 +1749,38 @@ async def load_recommended(
         min_slots=min_slots,
         kv_unified=kv_unified,
         lease_id=lease,
+        caller=request_caller(state, request),
     )
     return instance.model_dump(mode="json")
 
 
 @router.post("/models/{model_id:path}/unload")
-async def unload_model(model_id: str, request: Request) -> dict[str, Any]:
+async def unload_model(
+    model_id: str,
+    request: Request,
+    body: dict[str, Any] | None = Body(None),
+    force_query: bool | None = Query(None, alias="force", include_in_schema=False),
+) -> dict[str, Any]:
     """Stop the child serving this model. Open, except against a GPU lease (D55).
 
     Logged with the caller (D70): the peer address, the ``X-SF-Client`` label
     and what the model was serving at that moment. This route does not
     drain -- requests in flight are cut -- and until D70 nothing recorded who
     had asked.
+
+    **Whose instance (D91).** A base id from a caller holding its own instance
+    of the model (by ``X-SF-Lease``, its ``X-SF-Client`` label against the
+    lease's holder, or the key that took the lease) unloads THAT instance; the
+    reply's ``unloaded_id`` names it. Another holder's instance is touched only
+    on its exact id, with an admin credential and ``force: true`` (409
+    ``instance_held`` otherwise). A model a lease holds that is serving another
+    client's requests is a 409 ``instance_in_use`` naming them unless the body
+    (or query) says ``force: true`` -- the lease waiver never implies it.
     """
     state = _state(request)
-    unloaded = await state.manager.unload(
-        model_id,
-        force=may_unload_lease_held(request, state, [model_id]),
-        source="rest",
-        client=client_of(request),
-        peer=_peer_host(request),
-    )
-    return {"model_id": model_id, "unloaded": unloaded}
+    force = bool((body or {}).get("force")) or bool(force_query)
+    target, unloaded = await unload_for_request(state, request, model_id, force=force)
+    return {"model_id": model_id, "unloaded": unloaded, "unloaded_id": target}
 
 
 @router.post("/models/{model_id:path}/test")

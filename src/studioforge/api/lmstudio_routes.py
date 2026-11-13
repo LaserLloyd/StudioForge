@@ -43,7 +43,7 @@ from typing import Any
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from studioforge.api.mgmt_routes import _peer_host, may_unload_lease_held, start_download
+from studioforge.api.mgmt_routes import start_download
 from studioforge.api.openai_routes import (
     _app_state,
     _apply_ttl_override,
@@ -185,12 +185,15 @@ async def v1_load_model(request: Request) -> JSONResponse:
     ignored = [k for k in ("eval_batch_size", "flash_attention", "num_experts") if k in body]
 
     started = time.perf_counter()
+    from studioforge.api.mgmt_routes import request_caller
+
     instance = await state.manager.load(
         record.id,
         ctx_size=context_length,
         parallel=parallel,
         source=attributed_source("api:/api/v1/models/load", client_of(request)),
         priority=priority,
+        caller=request_caller(state, request),
     )
     elapsed = time.perf_counter() - started
     _apply_ttl_override(state, instance.model_id, ttl)
@@ -244,14 +247,13 @@ async def v1_unload_model(request: Request) -> JSONResponse:
                 code="instance_not_found",
                 status_code=404,
             )
-    await state.manager.unload(
-        instance_id,
-        force=may_unload_lease_held(request, state, [instance_id]),
-        source="rest",
-        client=client_of(request),
-        peer=_peer_host(request),
+    from studioforge.api.mgmt_routes import unload_for_request
+
+    # D91 (8a): holder identity picks and guards the target; force only when sent.
+    target, _unloaded = await unload_for_request(
+        state, request, instance_id, force=bool(body.get("force"))
     )
-    return JSONResponse({"instance_id": instance_id})
+    return JSONResponse({"instance_id": target})
 
 
 # ---------------------------------------------------------------------------

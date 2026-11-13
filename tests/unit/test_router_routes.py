@@ -216,7 +216,17 @@ def test_v1_models_carries_status_meta_architecture_and_loaded_instances(app: An
     }
     assert loaded["studioforge"]["max_context_length"] == 32768
     assert loaded["studioforge"]["loaded_instances"] == [
-        {"id": A, "config": {"context_length": 8192, "parallel": 2}, "context_length": 8192}
+        {
+            "id": A,
+            "config": {"context_length": 8192, "parallel": 2},
+            "context_length": 8192,
+            # D91: where it runs and whose it is, for every instance of the model.
+            "devices": [0],
+            "parallel": 2,
+            "lease_id": None,
+            "holder": None,
+            "ephemeral": False,
+        }
     ]
     assert unloaded["studioforge"]["loaded_instances"] == []
     assert unloaded["architecture"]["input_modalities"] == ["text", "image"]

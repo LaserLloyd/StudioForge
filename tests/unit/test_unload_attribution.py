@@ -187,11 +187,17 @@ def test_the_rest_route_passes_peer_label_and_source(
             f"/api/models/{MODEL_ID}/unload", headers={"X-SF-Client": "crucibleforge-judge"}
         )
     assert response.status_code == 200
-    assert response.json() == {"model_id": MODEL_ID, "unloaded": True}
+    # D91: the reply names the instance the unload took down (here the model itself).
+    assert response.json() == {"model_id": MODEL_ID, "unloaded": True, "unloaded_id": MODEL_ID}
+    assert len(seen) == 1
+    caller = seen[0].pop("caller")
+    assert caller.client == "crucibleforge-judge" and caller.peer == "testclient"
     assert seen == [
         {
             "model_id": MODEL_ID,
+            # D91 (8a): force is only what the caller sent; the D55 waiver rides apart.
             "force": False,
+            "lease_ok": False,
             "source": "rest",
             "client": "crucibleforge-judge",
             "peer": "testclient",

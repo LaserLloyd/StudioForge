@@ -122,6 +122,9 @@ QUICK RECIPES -- copy these exact calls; every argument name is literal:
   keep a model loaded forever   pin_model(model_id="<id>")
   stop keeping it loaded        pin_model(model_id="<id>", pinned=false)
   give a model its own GPU(s)   reserve_gpus(devices=[0], model_id="<id>")
+  two copies of one model       reserve_gpus(devices=[2, 3], instances=[{"model": "<id>"}])
+                                -> instances[0].model is "<id>:2": send THAT as "model";
+                                the copy is yours, loaded, and ends with release_gpus
   release that reservation      release_gpus(lease_id="<lease id>")
   who is holding the cards?     server_status()  -> leases[].kind
   every lease, with its clocks  gpu_leases()
@@ -1852,6 +1855,7 @@ def build_management_mcp(state: Any) -> MCPServer:
         prefer: list[int] | None = None,
         avoid: list[int] | None = None,
         count: int | None = None,
+        instances: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Reserve GPUs for one or more models, or for something outside this server.
 
@@ -1860,6 +1864,16 @@ def build_management_mcp(state: Any) -> MCPServer:
             reserve_gpus(devices=[0], model_id="vendor/Some-Model-GGUF/Some-Model-Q4_K_M")
             reserve_gpus(devices="auto", count=2, model_id="<id>")  # two alike cards, server picks
             reserve_gpus(devices=[3], reason="ComfyUI render")   # no model: held for an outsider
+            reserve_gpus(devices=[2, 3], instances=[{"model": "<id>"}])  # your own copy: "<id>:2"
+
+        **Two copies of one model (D91).** ``instances`` creates copies of a
+        model on these cards, loaded before this returns: each is ``<id>:<n>``
+        (``n`` from 2) or ``<id>@<tag>``, and ``instances[].model`` in the
+        result is the exact string to send as ``model``. A copy has the base's
+        settings; ``launch`` may change only ``ctx_size``, ``parallel`` (or
+        ``min_slots``/``max_slots``) and the KV types. It ends with the lease.
+        A model another holder already holds is never taken from them: naming it
+        in ``model_id`` gives this lease its own copy instead.
 
         **A lease reserves; it does not load.** While it stands nothing else is
         planned onto those cards, and no other model's load may evict the
@@ -1923,6 +1937,10 @@ def build_management_mcp(state: Any) -> MCPServer:
             avoid: With ``devices="auto"``: CUDA indices never to choose.
             count: With ``devices="auto"``: how many cards, all of one class
                 (``gpus[].class_key``); default 1.
+            instances: Copies to create on the leased cards (D91):
+                ``[{"model": "<id>", "count": 1, "gpus": [2, 3], "tag": "b",
+                "launch": {"ctx_size": 32768, "parallel": 4}, "load": true}]``;
+                every key but ``model`` is optional. All are granted or none.
 
         Returns:
             ``{"ok": true, "lease": {id, devices, holder, model_ids, reason,
@@ -1930,7 +1948,9 @@ def build_management_mcp(state: Any) -> MCPServer:
             priority, state, vacate_registered, vacate_deadline,
             holder_identity, lease_duration_seconds, acquire_time, renew_time,
             allocation}, "evicted": [{model_id, reason, devices, priority}],
-            "adopted": [...], "placement": {...} (auto only)}``.
+            "adopted": [...], "placement": {...} (auto only), "instances":
+            [{id, model, devices, ctx_per_slot, parallel, kv_cache_type,
+            kv_cache_type_v, state, engine_tag, lease_id, holder}]}``.
             Keep ``lease.id`` -- ``release_gpus`` and ``renew_lease`` need it.
         """
         names = list(model_ids or [])
@@ -1957,6 +1977,7 @@ def build_management_mcp(state: Any) -> MCPServer:
             prefer=prefer or [],
             avoid=avoid or [],
             count=count,
+            instances=instances,
         )
         # The MCP plane is PIN-gated (D32): the registrant may see its own URL.
         out: dict[str, Any] = {
@@ -1965,9 +1986,11 @@ def build_management_mcp(state: Any) -> MCPServer:
                 grant.lease,
                 reveal_vacate_url=True,
                 gpu_uuids=gpu_uuid_map(state.manager.planner.probe),
+                live=state.manager.live_instances(grant.lease),
             ),
             "evicted": list(grant.evicted),
             "adopted": list(grant.adopted),
+            "instances": list(grant.instances),
         }
         if grant.placement is not None:
             out["placement"] = grant.placement.view()
@@ -2000,8 +2023,10 @@ def build_management_mcp(state: Any) -> MCPServer:
 
         Returns:
             ``{"ok": true, "released": {...the lease as it stood...},
-            "unloaded": [...], "kept": [{model_id, reason, detail}]}``, or an
-            error result naming the id when no such lease exists.
+            "unloaded": [...], "kept": [{model_id, reason, detail}],
+            "instances_ended": [...]}``, or an error result naming the id when
+            no such lease exists. The lease's own instances (D91) end with it
+            even with ``unload=false``.
         """
         # D80: the same ownership rule as ``DELETE /api/leases/{id}``. This
         # tool is ``inference`` scope, so without it any inference key could
@@ -2013,6 +2038,8 @@ def build_management_mcp(state: Any) -> MCPServer:
             "released": lease_view(result.lease),
             "unloaded": list(result.unloaded),
             "kept": list(result.kept),
+            # D91: the lease's own instances always end with it.
+            "instances_ended": list(result.instances_ended),
         }
 
     @_guard
@@ -2074,7 +2101,10 @@ def build_management_mcp(state: Any) -> MCPServer:
         Returns:
             ``{"ok": true, "leases": [...], "count": n}``.
         """
-        rows = [lease_view(lease) for lease in state.manager.leases.all()]
+        rows = [
+            lease_view(lease, live=state.manager.live_instances(lease))
+            for lease in state.manager.leases.all()
+        ]
         return {"ok": True, "leases": rows, "count": len(rows)}
 
     @_guard
@@ -2620,7 +2650,10 @@ def build_management_mcp(state: Any) -> MCPServer:
             "busy": state.manager.busy_snapshot(),
             "active_downloads": status.active_downloads,
             "draining": status.draining,
-            "leases": [lease_view(lease) for lease in status.leases],
+            "leases": [
+                lease_view(lease, live=state.manager.live_instances(lease))
+                for lease in status.leases
+            ],
             "engine_tag": status.engine.tag if status.engine is not None else None,
             "engine_variant": status.engine.variant if status.engine is not None else None,
             "system_ram_total_gib": round(status.system_ram_total_bytes / GB, 2),

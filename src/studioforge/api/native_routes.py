@@ -169,7 +169,13 @@ async def _select(
             code="not_an_embedding_model",
             param="model",
         )
-    serving = state.manager.serving_record(record)
+    # D91: a base id from a caller holding its own instance of it is routed there.
+    from studioforge.api.holder import routed_serving
+
+    lease_value = body.get("lease_id") if body else None
+    serving = routed_serving(
+        state, request, record, lease_ids=[lease_value] if isinstance(lease_value, str) else []
+    )
     note_serving(serving.id)
     _note_client(state, request, serving.id)
     client = client_of(request)
@@ -594,6 +600,9 @@ class ModelsUnloadBody(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     model: str | None = None
+    #: D91 (8a): cut another client's in-flight requests on a lease-held model,
+    #: or (with an admin credential) take another holder's exact instance down.
+    force: bool = False
 
 
 def _require_named(model: str | None) -> str:
@@ -636,9 +645,7 @@ async def router_load_model(
     """
     state = _state(request)
     name = _require_named(body.model)
-    record = state.registry.resolve(name)
-    if record is None:
-        raise ModelNotFoundError(name, known=state.registry.known_ids())
+    record = _resolve_or_404(state, name)
     ctx = body.context_length if body.context_length is not None else body.ctx_size
     explicit = any(
         value is not None
@@ -685,7 +692,7 @@ async def router_load_model(
             code="invalid_request",
         )
 
-    from studioforge.api.mgmt_routes import _bound_lease_id
+    from studioforge.api.mgmt_routes import _bound_lease_id, request_caller
 
     # lease_id (D87, B.6): body or ?lease_id=, ownership-checked as on
     # /api/models/{id}/load (D80); an unknown id is the manager's 404.
@@ -721,6 +728,8 @@ async def router_load_model(
         )
     source = attributed_source("api:/models/load", client_of(request))
     extra: dict[str, Any] = {"lease_id": lease_id} if lease_id else {}
+    # D91: whose instance a base id means, and the copy a second holder gets.
+    extra["caller"] = request_caller(state, request)
     if route == "load":
         instance = await state.manager.load(
             record.id,
@@ -762,22 +771,16 @@ async def router_unload_model(request: Request, body: ModelsUnloadBody) -> dict[
     ``unloaded: false``. A model held by a GPU lease is refused unless the caller
     may override it, exactly as ``POST /api/models/{id}/unload``.
     """
-    from studioforge.api.mgmt_routes import may_unload_lease_held
+    from studioforge.api.mgmt_routes import unload_for_request
 
     state = _state(request)
     name = _require_named(body.model)
-    record = state.registry.resolve(name)
-    if record is None:
-        raise ModelNotFoundError(name, known=state.registry.known_ids())
-    host = getattr(getattr(request, "client", None), "host", None)
-    unloaded = await state.manager.unload(
-        record.id,
-        force=may_unload_lease_held(request, state, [record.id]),
-        source="rest",
-        client=client_of(request),
-        peer=str(host) if host else None,
+    record = _resolve_or_404(state, name)
+    # D91 (8a): the caller's own instance for a base id; force only when sent.
+    target, unloaded = await unload_for_request(
+        state, request, record.id, force=bool(getattr(body, "force", False))
     )
-    return {"success": True, "model": record.id, "unloaded": bool(unloaded)}
+    return {"success": True, "model": target, "unloaded": bool(unloaded)}
 
 
 # ---------------------------------------------------------------------------

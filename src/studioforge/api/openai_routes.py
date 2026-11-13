@@ -27,6 +27,7 @@ import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from studioforge.api.holder import routed_serving
 from studioforge.api.identity import enforce_autoload, note_serving
 from studioforge.api.vision import prepare_messages
 from studioforge.core.attribution import attributed_source, client_of
@@ -242,18 +243,64 @@ def _decorate_router_vocabulary(state: Any, entry: dict[str, Any], instance: Any
         entry["meta"] = {k: v for k, v in block.items() if v}
     instances: list[dict[str, Any]] = []
     if value == "loaded" and instance is not None:
-        plan = instance.plan
-        config: dict[str, Any] = {}
-        if plan is not None:
-            config = {"context_length": plan.ctx_size, "parallel": plan.parallel}
-        instances.append(
-            {
-                "id": instance.model_id,
-                "config": config,
-                "context_length": plan.ctx_size if plan is not None else None,
-            }
-        )
+        instances.append(_loaded_instance_row(state, instance))
+    if record is not None and not getattr(record, "ephemeral", False):
+        # D91: the base's entry lists every loaded instance of the model -- its
+        # own and each lease's copy -- in LM Studio's loaded_instances shape.
+        instances.extend(_copies_loaded(state, record.id))
     studio["loaded_instances"] = instances
+    if record is not None and getattr(record, "ephemeral", False):
+        found = state.manager.instance_of(record.id)
+        lease = found[0] if found is not None else None
+        studio["ephemeral"] = True
+        studio["lease_id"] = lease.id if lease is not None else record.lease_id
+        studio["holder"] = lease.holder if lease is not None else None
+        studio["devices"] = list(record.settings.device_override or [])
+
+
+def _lease_of(state: Any, model_id: str) -> Any:
+    """The lease holding ``model_id`` -- the one that created it, or one that names it."""
+    manager = state.manager
+    found = manager.instance_of(model_id) if hasattr(manager, "instance_of") else None
+    if found is not None:
+        return found[0]
+    leases = getattr(manager, "leases", None)
+    return leases.for_model(model_id) if leases is not None and len(leases) else None
+
+
+def _loaded_instance_row(state: Any, instance: Any) -> dict[str, Any]:
+    """One ``loaded_instances[]`` row: LM Studio's shape plus where and whose (D91)."""
+    plan = instance.plan
+    config: dict[str, Any] = {}
+    if plan is not None:
+        config = {"context_length": plan.ctx_size, "parallel": plan.parallel}
+    lease = _lease_of(state, instance.model_id)
+    record = state.registry.get(instance.model_id)
+    return {
+        "id": instance.model_id,
+        "config": config,
+        "context_length": plan.ctx_size if plan is not None else None,
+        "devices": list(plan.devices) if plan is not None else [],
+        "parallel": plan.parallel if plan is not None else None,
+        "lease_id": lease.id if lease is not None else None,
+        "holder": lease.holder if lease is not None else None,
+        "ephemeral": bool(getattr(record, "ephemeral", False)),
+    }
+
+
+def _copies_loaded(state: Any, base_id: str) -> list[dict[str, Any]]:
+    """``loaded_instances`` rows for the loaded lease copies of ``base_id`` (D91)."""
+    rows: list[dict[str, Any]] = []
+    for instance in state.supervisor.list():
+        if instance.state != "ready" or instance.model_id == base_id:
+            continue
+        record = state.registry.get(instance.model_id)
+        if record is None or not getattr(record, "ephemeral", False):
+            continue
+        if record.base_model_id != base_id:
+            continue
+        rows.append(_loaded_instance_row(state, instance))
+    return rows
 
 
 def _serving_id(state: Any, model_id: str) -> str:
@@ -398,6 +445,7 @@ async def prepare_chat(request: Request, body: dict[str, Any]) -> PreparedChat:
     )
     payload["messages"] = prepared
     payload["model"] = record.id
+    lease_ids = _pop_lease_id(payload)
 
     _validate_tools(payload)
     _validate_response_format(payload)
@@ -409,8 +457,9 @@ async def prepare_chat(request: Request, body: dict[str, Any]) -> PreparedChat:
     if record.preset is not None:
         record.preset.apply_to_payload(payload, chat=True)
     # A preset-only virtual model is served by its base's instance; everything
-    # from here down (load, URL, request accounting) keys off `serving`.
-    serving = state.manager.serving_record(record)
+    # from here down (load, URL, request accounting) keys off `serving`. D91: a
+    # base id from a caller holding its own instance of it is routed there.
+    serving = routed_serving(state, request, record, lease_ids=lease_ids)
     note_serving(serving.id)
     enforce_autoload(request, state, serving.id)
     _note_client(state, request, serving.id)
@@ -510,8 +559,21 @@ async def chat_json(prepared: PreparedChat, *, route: str) -> dict[str, Any]:
 def _resolve_or_404(state: Any, name: str) -> ModelRecord:
     record = state.registry.resolve(name)
     if record is None:
+        # D91: an instance id with no instance behind it -- released with its
+        # lease, or a <model>:<n> nobody created -- is its own 404, and never a
+        # just-in-time load on the default ladder.
+        gone = getattr(state.manager, "instance_gone_error", None)
+        error = gone(name) if gone is not None else None
+        if error is not None:
+            raise error
         raise ModelNotFoundError(name, known=state.registry.known_ids())
     return record
+
+
+def _pop_lease_id(payload: dict[str, Any]) -> list[str]:
+    """Take a body ``lease_id`` out of a payload bound for the engine (D91: it names the caller)."""
+    value = payload.pop("lease_id", None)
+    return [value] if isinstance(value, str) and value.strip() else []
 
 
 async def _stream_with_jit_load(
@@ -597,7 +659,11 @@ async def _stream_with_jit_load(
     _apply_ttl_override(state, record.id, ttl_override)
     base = state.supervisor.base_url(record.id)
     if base is None:
-        yield _sse_error(f"model '{record.id}' is not serving", code="upstream_error")
+        released = _released_error(state, record.id)
+        if released is not None:
+            yield _sse_error_frame(released, default_code="instance_released")
+        else:
+            yield _sse_error(f"model '{record.id}' is not serving", code="upstream_error")
         yield b"data: [DONE]\n\n"
         return
 
@@ -606,6 +672,12 @@ async def _stream_with_jit_load(
         state, record, f"{base}/v1/chat/completions", payload, started, client=client
     ):
         yield chunk
+
+
+def _released_error(state: Any, model_id: str) -> StudioForgeError | None:
+    """``410 instance_released`` when ``model_id`` is a lease instance that just ended (D91)."""
+    finder = getattr(getattr(state, "manager", None), "instance_released_error", None)
+    return finder(model_id) if finder is not None else None
 
 
 def _consume_load_exception(task: asyncio.Task[Any]) -> None:
@@ -641,10 +713,11 @@ async def completions(request: Request) -> Any:
     _normalize_sampler_aliases(payload)
     ttl_override = _pop_ttl(payload)
     priority = _pop_priority(payload)
+    lease_ids = _pop_lease_id(payload)
     if record.preset is not None:
         # Sampler defaults only: there are no messages to carry a system prompt.
         record.preset.apply_to_payload(payload, chat=False)
-    serving = state.manager.serving_record(record)
+    serving = routed_serving(state, request, record, lease_ids=lease_ids)
     enforce_autoload(request, state, serving.id)
     _note_client(state, request, serving.id)
     client = client_of(request)
@@ -681,7 +754,7 @@ async def embeddings(request: Request) -> Any:
     payload["model"] = record.id
     if "input" not in payload:
         raise BadRequestError("'input' is required", param="input")
-    serving = state.manager.serving_record(record)
+    serving = routed_serving(state, request, record, lease_ids=_pop_lease_id(payload))
     enforce_autoload(request, state, serving.id)
     _note_client(state, request, serving.id)
     client = client_of(request)
@@ -702,7 +775,7 @@ async def rerank(request: Request) -> Any:
     record = _resolve_or_404(state, model_name)
     payload = dict(body)
     payload["model"] = record.id
-    serving = state.manager.serving_record(record)
+    serving = routed_serving(state, request, record, lease_ids=_pop_lease_id(payload))
     enforce_autoload(request, state, serving.id)
     _note_client(state, request, serving.id)
     client = client_of(request)
@@ -721,14 +794,15 @@ async def tokenize(request: Request) -> Any:
     body = await _json_body(request)
     model_name = _resolve_loaded_alias(state, _require_model(body, state.config), want="chat")
     record = _resolve_or_404(state, model_name)
-    serving = state.manager.serving_record(record)
+    payload = dict(body)
+    serving = routed_serving(state, request, record, lease_ids=_pop_lease_id(payload))
     enforce_autoload(request, state, serving.id)
     _note_client(state, request, serving.id)
     client = client_of(request)
     await state.manager.ensure_loaded(
         serving.id, source=attributed_source("jit:/v1/tokenize", client)
     )
-    return await _forward(state, serving, "/tokenize", dict(body), client=client)
+    return await _forward(state, serving, "/tokenize", payload, client=client)
 
 
 # ---------------------------------------------------------------------------
@@ -1084,6 +1158,9 @@ async def _forward(
 ) -> Any:
     base = state.supervisor.base_url(record.id)
     if base is None:
+        released = _released_error(state, record.id)
+        if released is not None:
+            raise released
         raise UpstreamError(f"model '{record.id}' is not serving")
     url = f"{base}{path}"
     stream = bool(payload.get("stream"))
@@ -1126,6 +1203,9 @@ async def _forward(
                 status_code=504,
             ) from exc
         except httpx.HTTPError as exc:
+            released = _released_error(state, record.id)
+            if released is not None:
+                raise released from exc
             raise UpstreamError(
                 f"llama-server for '{record.id}' failed: {_exc_text(exc)}. "
                 f"{_stderr_hint(state, record.id)}"
@@ -1281,12 +1361,19 @@ async def _stream_upstream(
         closing = True
         raise
     except httpx.HTTPError as exc:
-        log.warning("stream failed", model_id=record.id, error=_exc_text(exc))
-        yield _sse_error(
-            f"llama-server for '{record.id}' failed mid-stream: {_exc_text(exc)}. "
-            f"{_stderr_hint(state, record.id)}",
-            code="upstream_error",
-        )
+        released = _released_error(state, record.id)
+        if released is not None:
+            # D91: the lease that owned this instance ended mid-stream -- its own
+            # code, so a client can tell "released" from "the engine fell over".
+            log.info("stream cut: its instance was released", model_id=record.id)
+            yield _sse_error_frame(released, default_code="instance_released")
+        else:
+            log.warning("stream failed", model_id=record.id, error=_exc_text(exc))
+            yield _sse_error(
+                f"llama-server for '{record.id}' failed mid-stream: {_exc_text(exc)}. "
+                f"{_stderr_hint(state, record.id)}",
+                code="upstream_error",
+            )
     finally:
         # Cancel a first-chunk read still pending when the client vanished
         # mid-prefill, so it does not hold the httpx stream open after us.
