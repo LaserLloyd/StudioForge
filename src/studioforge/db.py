@@ -39,7 +39,7 @@ log = get_logger(__name__)
 
 #: Highest migration version this build of the code ships. ``migrate()``
 #: brings any older database up to this.
-SCHEMA_VERSION: int = 11
+SCHEMA_VERSION: int = 12
 
 #: SQLite's own words for "this file is not a usable database". Only a message
 #: carrying one of these is treated as corruption by ``migrate_with_recovery``;
@@ -1184,6 +1184,8 @@ class Database:
             "vacate_token": row.get("vacate_token"),
             "holder_peer": row.get("holder_peer"),
             "holder_key": row.get("holder_key"),
+            # D91 (migration 012): the instances the lease created, with their specs.
+            "instances_json": json.dumps(list(row.get("instances") or []), default=str),
             "updated_at": float(row.get("updated_at") or now),
         }
         columns = list(values)
@@ -1214,6 +1216,7 @@ class Database:
             try:
                 record["devices"] = json.loads(record.pop("devices_json"))
                 record["model_ids"] = json.loads(record.pop("model_ids_json"))
+                record["instances"] = json.loads(record.pop("instances_json", None) or "[]")
             except (TypeError, ValueError):
                 log.warning("db.lease_row_unreadable", lease_id=record.get("id"))
                 continue

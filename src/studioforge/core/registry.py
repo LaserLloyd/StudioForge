@@ -267,6 +267,9 @@ class Registry:
         #: The alias collisions already warned about, as ``(kept, dropped,
         #: aliases)``. See :meth:`_rebuild_aliases` (D69 §16).
         self._alias_collisions_warned: set[tuple[str, str, tuple[str, ...]]] = set()
+        #: Instance records GPU leases created (D91), by id: in memory only,
+        #: re-entered into the index after every scan while their base stands.
+        self._ephemeral: dict[str, ModelRecord] = {}
 
     # ------------------------------------------------------------------
     # Scanning
@@ -331,6 +334,7 @@ class Registry:
             self._adapters = {a.id: a for a in adapters}
             self._adapters_loaded = True
             self._load_virtual_models(saved_settings)
+            self._restore_ephemeral()
             self._rebuild_aliases()
             self._last_scan_at = time.time()
 
@@ -812,6 +816,9 @@ class Registry:
 
     def _alias_candidates(self, record: ModelRecord) -> list[str]:
         stem = record.name
+        if record.ephemeral:
+            # D91: an instance a lease created is reachable by its full id only.
+            return []
         if record.is_virtual:
             # B.9 / F-1: a virtual (copy, persona) is reachable by its full id
             # and its own name only. It copies publisher/repo from its base for
@@ -888,9 +895,18 @@ class Registry:
     # Read API
     # ------------------------------------------------------------------
 
-    def all(self) -> list[ModelRecord]:
+    def all(self, *, include_ephemeral: bool = False) -> list[ModelRecord]:
+        """Every record, sorted by id; lease instances (D91) only when asked for.
+
+        The library listings, the catalog, the pin reconciler and the GUI read
+        this and see the models the operator owns; a lease's ``<model>:<n>``
+        copies are the lease's, listed by ``/v1/models`` and the lease views.
+        """
         with self._lock:
-            return sorted(self._models.values(), key=lambda r: r.id)
+            return sorted(
+                (r for r in self._models.values() if include_ephemeral or not r.ephemeral),
+                key=lambda r: r.id,
+            )
 
     def get(self, model_id: str) -> ModelRecord | None:
         with self._lock:
@@ -911,7 +927,65 @@ class Registry:
             return sorted(self._models)
 
     def openai_list(self) -> list[dict[str, Any]]:
-        return [record.openai_dict() for record in self.all()]
+        return [record.openai_dict() for record in self.all(include_ephemeral=True)]
+
+    # ------------------------------------------------------------------
+    # Lease instances (D91)
+    # ------------------------------------------------------------------
+
+    def name_holder(self, name: str) -> str | None:
+        """The id of the record ``name`` already is or resolves to, else ``None``.
+
+        An instance id must collide with nothing: not an id, not an alias.
+        """
+        record = self.resolve(name)
+        return record.id if record is not None else None
+
+    def add_ephemeral(self, record: ModelRecord) -> ModelRecord:
+        """Enter a lease instance's record (D91). Refused when the id is taken."""
+        if not record.ephemeral:
+            raise ValueError("add_ephemeral takes an ephemeral record")
+        with self._lock:
+            holder = self._models.get(record.id)
+            if holder is None:
+                owner = self._aliases.get(record.id.lower())
+                holder = self._models.get(owner) if owner else None
+            if holder is not None and holder.id != record.id:
+                raise _id_conflict(record.id, holder.id, "an existing model name or alias")
+            if holder is not None and not holder.ephemeral:
+                raise _id_conflict(record.id, holder.id, "an existing model")
+            self._ephemeral[record.id] = record
+            self._models[record.id] = record
+            self._rebuild_aliases()
+        return record
+
+    def drop_ephemeral(self, model_id: str) -> ModelRecord | None:
+        """Take a lease instance's record out (its lease ended, or its creation rolled back)."""
+        with self._lock:
+            record = self._ephemeral.pop(model_id, None)
+            current = self._models.get(model_id)
+            if current is not None and current.ephemeral:
+                self._models.pop(model_id, None)
+                self._rebuild_aliases()
+            return record or current
+
+    def ephemeral_records(self) -> list[ModelRecord]:
+        with self._lock:
+            return sorted(self._ephemeral.values(), key=lambda r: r.id)
+
+    def _restore_ephemeral(self) -> None:
+        """Re-enter the lease instances after a scan rebuilt the index. Caller holds the lock.
+
+        An instance whose base left the library stays out of the index (and so
+        cannot serve) until the base comes back; its id never shadows a real
+        record that appeared under the same name meanwhile.
+        """
+        for model_id, record in self._ephemeral.items():
+            if model_id in self._models:
+                continue
+            if record.base_model_id not in self._models:
+                continue
+            self._models[model_id] = record
 
     @property
     def last_scan_at(self) -> float | None:
@@ -1299,6 +1373,15 @@ class Registry:
         record = self.get(model_id)
         if record is None or not record.is_virtual:
             raise BadRequestError(f"{model_id!r} is not a virtual model", param="model_id")
+        if record.ephemeral:
+            raise BadRequestError(
+                f"{model_id!r} is an instance of lease {record.lease_id}; it ends with its lease "
+                f"(DELETE /api/leases/{record.lease_id}), never on its own",
+                param="model_id",
+                code="model_loaded",
+                status_code=409,
+                details={"model_id": model_id, "lease_id": record.lease_id},
+            )
         self._db.delete_virtual_model(model_id)
         self._db.delete_model_settings(model_id)
         with self._lock:
@@ -1366,6 +1449,12 @@ class Registry:
         with self._lock:
             self._models.pop(model_id, None)
             for virtual_id, virtual in list(self._models.items()):
+                if virtual.ephemeral:
+                    # D91: a lease instance is its lease's; it leaves the index
+                    # with its base and comes back if the base does.
+                    if virtual.base_model_id == model_id:
+                        self._models.pop(virtual_id, None)
+                    continue
                 if virtual.is_virtual and virtual.base_model_id == model_id:
                     self._models.pop(virtual_id, None)
                     self._db.delete_virtual_model(virtual_id)

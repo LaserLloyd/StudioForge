@@ -1,0 +1,16 @@
+-- 012_lease_instances.sql: the instances a GPU lease holds, stored with it (D91).
+--
+-- A lease may create its own copies of a model on its cards -- "<base>:<n>"
+-- or "<base>@<tag>" -- so two holders of one model never fight over one
+-- instance (2026-11-14: a second holder's unload of the shared id cut the
+-- first holder's streams and the id came back on the default context ladder).
+-- Those instances belong to the lease and must survive a restart with it
+-- (D61): the restore rebuilds each record unloaded and the first request
+-- loads it with exactly the shape it last ran with -- devices, context per
+-- slot, slots and KV types -- never the ladder.
+--
+-- One JSON array per lease row: [{id, base_model_id, devices, tag, launch,
+-- load, origin, created_at, loaded_spec}]. An empty array (the default) is a
+-- lease with no instances, which is every lease written before this
+-- migration.
+ALTER TABLE gpu_leases ADD COLUMN instances_json TEXT NOT NULL DEFAULT '[]';

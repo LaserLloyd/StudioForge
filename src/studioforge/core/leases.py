@@ -50,7 +50,7 @@ import httpx
 from studioforge.core.priority import PRIORITY_BACKGROUND, PRIORITY_LEVELS
 from studioforge.errors import BadRequestError, LeaseConflictError, LeaseNotFoundError
 from studioforge.logging import get_logger
-from studioforge.types import GpuLease
+from studioforge.types import GpuLease, LeaseInstance
 
 log = get_logger(__name__)
 
@@ -247,6 +247,8 @@ def lease_row(lease: GpuLease) -> dict[str, Any]:
         "vacate_token": lease.vacate_token,
         "holder_peer": lease.holder_peer,
         "holder_key": lease.holder_key,
+        # D91: the instances the lease created, spec and last-loaded shape.
+        "instances": [spec.model_dump(mode="json") for spec in lease.instances],
         "updated_at": time.time(),
     }
 
@@ -268,7 +270,23 @@ def lease_from_row(row: Mapping[str, Any]) -> GpuLease:
         vacate_token=row.get("vacate_token") or None,
         holder_peer=row.get("holder_peer") or None,
         holder_key=row.get("holder_key") or None,
+        instances=_instances_from_row(row),
     )
+
+
+def _instances_from_row(row: Mapping[str, Any]) -> list[LeaseInstance]:
+    """The stored instance specs of a lease row (D91); an unreadable one is skipped, said once."""
+    out: list[LeaseInstance] = []
+    for raw in row.get("instances") or []:
+        try:
+            out.append(LeaseInstance.model_validate(raw))
+        except Exception as exc:  # noqa: BLE001 - one bad spec must not lose the lease
+            log.warning(
+                "lease instance not restored: unreadable spec",
+                lease_id=row.get("id"),
+                error=type(exc).__name__,
+            )
+    return out
 
 
 class DatabaseLeaseStore:
@@ -657,6 +675,64 @@ class LeaseBook:
             lease.model_ids = kept
             self._persist(lease, at=time.time())
 
+    # -- instances (D91) ---------------------------------------------------
+
+    def attach_instances(
+        self, lease_id: str, instances: Iterable[LeaseInstance], *, now: float | None = None
+    ) -> list[LeaseInstance]:
+        """Give a standing lease these instances; each id is named in ``model_ids`` too (D91).
+
+        Written through like an acquire, so a restart brings them back. The
+        caller has already refused an id that collides with anything standing.
+        """
+        lease = self._leases.get(lease_id)
+        if lease is None:
+            raise LeaseNotFoundError(f"no lease '{lease_id}'", param="lease_id")
+        added = [spec for spec in instances if spec.id not in {i.id for i in lease.instances}]
+        if added:
+            lease.instances = [*lease.instances, *added]
+            ids = [spec.id for spec in added if spec.id not in lease.model_ids]
+            lease.model_ids = [*lease.model_ids, *ids]
+            self._persist(lease, at=time.time() if now is None else now)
+        return added
+
+    def detach_instances(self, lease_id: str, instance_ids: Iterable[str]) -> list[LeaseInstance]:
+        """Take instances out of a lease (and out of its ``model_ids``); returns what went."""
+        lease = self._leases.get(lease_id)
+        if lease is None:
+            return []
+        drop = set(instance_ids)
+        gone = [spec for spec in lease.instances if spec.id in drop]
+        if gone:
+            lease.instances = [spec for spec in lease.instances if spec.id not in drop]
+            lease.model_ids = [m for m in lease.model_ids if m not in drop]
+            self._persist(lease, at=time.time())
+        return gone
+
+    def note_instance_loaded(self, instance_id: str, shape: Mapping[str, Any]) -> None:
+        """Remember the shape an instance ACTUALLY loaded with, for the restore (D91)."""
+        found = self.instance(instance_id)
+        if found is None:
+            return
+        lease, spec = found
+        shape = dict(shape)
+        if spec.loaded_spec == shape:
+            return
+        spec.loaded_spec = shape
+        self._persist(lease, at=time.time())
+
+    def instance(self, instance_id: str) -> tuple[GpuLease, LeaseInstance] | None:
+        """The lease holding instance ``instance_id`` and its spec, if one does."""
+        for lease in self._leases.values():
+            for spec in lease.instances:
+                if spec.id == instance_id:
+                    return lease, spec
+        return None
+
+    def instances(self) -> list[tuple[GpuLease, LeaseInstance]]:
+        """Every standing instance with its lease, oldest lease first."""
+        return [(lease, spec) for lease in self.all() for spec in lease.instances]
+
     def blocked_for(self, model_id: str | None) -> frozenset[int]:
         """Devices ``model_id`` may NOT be planned onto: every lease that does not name it."""
         blocked: set[int] = set()
@@ -863,8 +939,15 @@ def lease_view(
     now: float | None = None,
     reveal_vacate_url: bool = False,
     gpu_uuids: Mapping[int, str | None] | None = None,
+    live: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The API/MCP projection: the stored fields plus the derived clocks.
+
+    ``instances`` (D91) are rendered as reply rows (:func:`~studioforge.core.
+    instances.instance_row`): ``live`` maps an instance id to its running
+    :class:`~studioforge.types.InstanceInfo` (or ``None``), and with it each
+    row carries ``state`` and the shape the child actually runs; without it
+    (a caller with no supervisor at hand) ``state`` is ``null``.
 
     ``idle_s``/``expires_at`` are ``@property`` on :class:`GpuLease`, so a bare
     ``model_dump`` drops them -- every consumer of a lease record goes through
@@ -897,6 +980,17 @@ def lease_view(
     if reveal_vacate_url:
         data["vacate_url"] = url
     uuids = gpu_uuids or {}
+    from studioforge.core.instances import instance_row
+
+    data["instances"] = [
+        instance_row(
+            lease,
+            spec,
+            live.get(spec.id) if live is not None else None,
+            live_known=live is not None,
+        )
+        for spec in lease.instances
+    ]
     return {
         **data,
         "vacate_registered": bool(url),

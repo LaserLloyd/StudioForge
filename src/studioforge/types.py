@@ -651,6 +651,13 @@ class ModelRecord(BaseModel):
     stale: bool = False
     #: Why the record is stale (the parse error), for the GUI/logs.
     stale_reason: str | None = None
+    #: An instance a GPU lease created (D91): ``<base>:<n>`` or ``<base>@<tag>``,
+    #: a copy of ``base_model_id`` on the lease's cards. Held in memory only
+    #: (the lease row persists its spec), never in the virtual-model table,
+    #: reachable by its full id only, and gone when its lease ends.
+    ephemeral: bool = False
+    #: The lease an ephemeral instance belongs to; ``None`` for every other record.
+    lease_id: str | None = None
 
     @property
     def all_files(self) -> list[Path]:
@@ -689,6 +696,9 @@ class ModelRecord(BaseModel):
                 "preset": (
                     self.preset.model_dump(exclude_none=True) if self.preset is not None else None
                 ),
+                # D91: an instance a lease created, and the lease it belongs to.
+                "ephemeral": self.ephemeral,
+                "lease_id": self.lease_id,
             },
         }
 
@@ -1391,6 +1401,39 @@ class EngineInfo(BaseModel):
     archive_sha256: str | None = None
 
 
+class LeaseInstance(BaseModel):
+    """One model instance a GPU lease holds (D91): a copy of a model on the lease's cards.
+
+    Stored WITH its lease (``gpu_leases.instances_json``, migration 012) so a
+    restart brings it back: the record is rebuilt unloaded, and the first
+    request loads it with exactly ``loaded_spec`` -- the devices, context,
+    slots and KV it last ran with -- never the default context ladder.
+
+    ``id`` is the string a client puts in ``model``: ``<base>:<n>`` (LM Studio's
+    instance identifier, ``n`` the smallest free integer from 2) or
+    ``<base>@<tag>`` when the client asked for a tag. ``launch`` holds only the
+    keys a client may change (``ctx_size``, ``parallel``, ``min_slots``,
+    ``max_slots``, ``kv_cache_type``, ``kv_cache_type_v``); everything else is
+    the base's settings, copied. ``origin`` says why it exists: ``requested``
+    (the lease's ``instances[]``) or ``second_holder`` (the lease or a load
+    named a model another holder already held, so the server made a copy
+    rather than move, reload or unload theirs).
+    """
+
+    id: str
+    base_model_id: str
+    devices: list[int]
+    tag: str | None = None
+    launch: dict[str, Any] = Field(default_factory=dict)
+    load: bool = True
+    origin: Literal["requested", "second_holder"] = "requested"
+    created_at: float = Field(default_factory=time.time)
+    #: The shape it last ACTUALLY loaded with: ``devices``, ``ctx_per_slot``,
+    #: ``parallel``, ``kv_cache_type``, ``kv_cache_type_v``, ``kv_unified``,
+    #: ``engine_tag``. ``None`` until its first load.
+    loaded_spec: dict[str, Any] | None = None
+
+
 class GpuLease(BaseModel):
     """A claim on specific CUDA devices that the planner honours (D43).
 
@@ -1458,6 +1501,10 @@ class GpuLease(BaseModel):
     #: owner or local caller, or a lease from before this field) means only an
     #: ``admin`` caller may touch it. Excluded from every dump.
     holder_key: str | None = Field(default=None, exclude=True, repr=False)
+    #: The instances this lease created (D91). Each id is also in
+    #: ``model_ids``, so the planner, the eviction ladders and the release
+    #: treat it as the lease's own model.
+    instances: list[LeaseInstance] = Field(default_factory=list)
 
     @property
     def idle_s(self) -> float:
