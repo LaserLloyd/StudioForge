@@ -729,8 +729,25 @@ different box gets honest labels. On the reference rig, in this order:
 | `all_gpus` | `[0, 1, 2, 3]` | all 4 GPUs (2x RTX 5090 + 2x RTX 3090) |
 | `single_5090` | `[0]` | 1x RTX 5090 |
 
+Cards are grouped by performance class and `class_key` (below), never by VRAM alone, so other boxes get
+the same shapes: `dual_<class>` for every class with two cards, `triple_<class>` for a class with three or
+more, `all_gpus`, `single_<best class>`, and a `single_<class>` for any other class that is a single card.
+A card the performance table does not know is named by its `class_key` (`dual_sm_89_48g`). A one-GPU box
+yields just `single_<class>`.
+
 The best pair leads because it is the fastest placement that still leaves the rest of the box free,
 and `placements[0]` is what the entry promotes to `recommended`.
+
+### Card facts
+
+`GET /api/gpus`, `/api/status` `gpus[]` and the MCP `server_status` carry NVIDIA GPU Feature Discovery
+names beside the legacy fields (`name`, `total_bytes`, `free_bytes`, ... are unchanged): `uuid`, `product`,
+`memory_mib`, `memory_free_mib`, `compute_major`, `compute_minor`, `family`, `arch` (`sm_120`),
+`pci_bus_id`, `driver_version`, plus `studioforge: {class_key, memory_bandwidth_gbps, class_label}`.
+`class_key` is `<arch>-<GiB>g` (`sm_120-32g`): group cards by it, not by name. Every NVML-derived field is
+`null` when the driver does not answer. `memory_bandwidth_gbps` is NVML bus width x max memory clock x 2 / 8.
+`/metrics` adds `hw_gpu_memory_usage_bytes`, `hw_gpu_memory_limit_bytes` and `hw_gpu_memory_utilization_ratio`
+(OpenTelemetry `hw.gpu.memory.*`, labels `hw_id`, `hw_name`, `gpu`); the `studioforge_gpu_memory_*` gauges stay.
 
 **Each mode is computed against its own cards, idle.** "What can this model do on the two 5090s" is
 a question about the hardware, not about the last ten seconds, so `headroom_fraction`,

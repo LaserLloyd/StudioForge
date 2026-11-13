@@ -146,6 +146,8 @@ class NvmlGpuProbe:
         self._handles: list[Any] = []
         self._initialized = False
         self._failed = False
+        #: Per-index static card facts (uuid, PCI id, bandwidth), read once.
+        self._static: dict[int, dict[str, Any]] = {}
         #: Why NVML is unusable (import/init failure or zero devices); ``None``
         #: while it works. Read by :class:`AutoGpuProbe` to explain a skip.
         self.failure_reason: str | None = None
@@ -196,6 +198,7 @@ class NvmlGpuProbe:
                     log.warning("nvml_shutdown_failed", error=str(exc))
             self._nvml = None
             self._handles = []
+            self._static = {}
             self._initialized = False
             self._failed = False
             self.failure_reason = None
@@ -358,7 +361,47 @@ class NvmlGpuProbe:
             compute_capability=capability,
             backend="cuda",
             vendor="nvidia",
+            driver_version=self._driver_for_card(),
+            **self._static_facts(index, handle),
         )
+
+    def _driver_for_card(self) -> str | None:
+        try:
+            return _decode(self._nvml.nvmlSystemGetDriverVersion())
+        except Exception:
+            return None
+
+    def _static_facts(self, index: int, handle: Any) -> dict[str, Any]:
+        """uuid, PCI bus id and peak memory bandwidth; they never change, so
+        they are read once per card. Each degrades to ``None`` on its own."""
+        cached = self._static.get(index)
+        if cached is not None:
+            return cached
+        nvml = self._nvml
+        facts: dict[str, Any] = {"uuid": None, "pci_bus_id": None, "memory_bandwidth_gbps": None}
+        try:
+            facts["uuid"] = _decode(nvml.nvmlDeviceGetUUID(handle))
+        except Exception:
+            log.debug("nvml_field_failed", field="uuid", index=index)
+        try:
+            pci = nvml.nvmlDeviceGetPciInfo(handle)
+            raw = getattr(pci, "busId", None) or getattr(pci, "busIdLegacy", None)
+            if raw is not None:
+                facts["pci_bus_id"] = _decode(raw).strip(chr(0)) or None
+        except Exception:
+            log.debug("nvml_field_failed", field="pci_bus_id", index=index)
+        try:
+            width = int(nvml.nvmlDeviceGetMemoryBusWidth(handle))
+            clock_mhz = int(
+                nvml.nvmlDeviceGetMaxClockInfo(handle, getattr(nvml, "NVML_CLOCK_MEM", 2))
+            )
+            if width > 0 and clock_mhz > 0:
+                # bits / 8 = bytes per transfer; DDR moves two per clock.
+                facts["memory_bandwidth_gbps"] = round(width / 8 * clock_mhz * 2 / 1000, 1)
+        except Exception:
+            log.debug("nvml_field_failed", field="memory_bandwidth", index=index)
+        self._static[index] = facts
+        return facts
 
 
 def _process_name(nvml: Any, pid: int) -> str:
@@ -570,6 +613,14 @@ def _fake_probe_from_env() -> FakeGpuProbe:
     The spec is a list of objects with ``index``, ``name``, ``total_bytes``,
     ``free_bytes``, and ``compute_capability`` (a two-int list). Missing
     ``free_bytes`` defaults to ``total_bytes``.
+
+    The D89 card facts are optional: ``uuid``, ``pci_bus_id``,
+    ``memory_bandwidth_gbps`` and ``driver_version`` are taken as given. A
+    missing ``uuid`` / ``pci_bus_id`` is synthesized from the index (an
+    obviously fake ``GPU-00000000-0000-0000-0000-<index>`` and bus ``<index+1>``)
+    so a no-GPU staging instance (D85) shows the same shapes as a real card --
+    lease ``allocation.devices[].uuid`` included. Bandwidth is never invented:
+    it would move the throughput estimate of a card the name table knows.
     """
     raw = os.environ.get(_ENV_FAKE_GPUS, "").strip() or "[]"
     try:
@@ -587,14 +638,21 @@ def _fake_probe_from_env() -> FakeGpuProbe:
             free = int(item.get("free_bytes", total))
             cc_raw = item.get("compute_capability")
             capability = (int(cc_raw[0]), int(cc_raw[1])) if cc_raw is not None else None
+            index = int(item["index"])
+            bandwidth = item.get("memory_bandwidth_gbps")
+            driver = item.get("driver_version")
             gpus.append(
                 GpuInfo(
-                    index=int(item["index"]),
+                    index=index,
                     name=str(item.get("name", "Fake GPU")),
                     total_bytes=total,
                     free_bytes=free,
                     used_bytes=int(item.get("used_bytes", total - free)),
                     compute_capability=capability,
+                    uuid=str(item.get("uuid") or f"GPU-00000000-0000-0000-0000-{index:012d}"),
+                    pci_bus_id=str(item.get("pci_bus_id") or f"00000000:{index + 1:02X}:00.0"),
+                    memory_bandwidth_gbps=float(bandwidth) if bandwidth is not None else None,
+                    driver_version=str(driver) if driver is not None else None,
                 )
             )
         except (KeyError, TypeError, ValueError, IndexError) as exc:

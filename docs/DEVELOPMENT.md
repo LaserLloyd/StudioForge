@@ -93,6 +93,9 @@ What it does:
 - **Moving VRAM.** A ready child is charged to the fake probe (its plan's per-card bytes, or
   `--stub-vram-mib` spread in the same proportions) and credited back when it exits, so
   `GET /api/gpus` shows free memory move and the D51 observation row is written.
+- **Card facts.** Each `SF_FAKE_GPUS` entry may also carry `uuid`, `pci_bus_id`,
+  `memory_bandwidth_gbps` and `driver_version` (D89). A missing `uuid` / `pci_bus_id` is made up from
+  the index, so lease `allocation.devices[].uuid` has a value; bandwidth is never made up.
 - **Tuning**, per model via `extra_flags` or for the instance via environment: `--stub-load-ms` /
   `SF_STUB_LOAD_MS` (`/health` answers 503 for that long), `--stub-tps` / `SF_STUB_TPS` (paces
   generation so busy slots and tok/s are visible), `--stub-vram-mib`, `--stub-build`,

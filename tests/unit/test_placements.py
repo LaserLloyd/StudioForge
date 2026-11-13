@@ -92,7 +92,7 @@ def test_two_identical_cards_do_not_produce_a_duplicate_all_gpus_mode() -> None:
 def test_a_mixed_pair_has_no_dual_mode_of_its_own() -> None:
     """One card of each class: the only two-card option is the whole box."""
     gpus = [gpu(0, "NVIDIA GeForce RTX 5090", 31.84), gpu(1, "NVIDIA GeForce RTX 3090", 24.0)]
-    assert [m.key for m in hardware_modes(gpus)] == ["all_gpus", "single_5090"]
+    assert [m.key for m in hardware_modes(gpus)] == ["all_gpus", "single_5090", "single_3090"]
 
 
 def test_an_unnamed_card_is_classified_by_its_vram() -> None:

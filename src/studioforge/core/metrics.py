@@ -183,6 +183,36 @@ async def render_metrics(state: Any, *, include_children: bool = True) -> str:
             "Free memory per GPU.",
             [(f'{{gpu="{g.index}",name="{_esc(g.name)}"}}', float(g.free_bytes)) for g in gpus],
         )
+    if gpus:
+        # OpenTelemetry hardware semantic conventions (hw.gpu.memory.*), in the
+        # Prometheus spelling (dots -> underscores, unit suffix). The studioforge_
+        # gauges above stay as the deprecated aliases.
+        def _hw(g: Any) -> str:
+            ident = getattr(g, "uuid", None) or str(g.index)
+            return f'{{hw_id="{_esc(ident)}",hw_name="{_esc(g.name)}",gpu="{g.index}"}}'
+
+        _gauge(
+            lines,
+            "hw_gpu_memory_usage_bytes",
+            "GPU memory in use (OTel hw.gpu.memory.usage).",
+            [(_hw(g), float(max(0, g.total_bytes - g.free_bytes))) for g in gpus],
+        )
+        _gauge(
+            lines,
+            "hw_gpu_memory_limit_bytes",
+            "GPU memory capacity (OTel hw.gpu.memory.limit).",
+            [(_hw(g), float(g.total_bytes)) for g in gpus],
+        )
+        _gauge(
+            lines,
+            "hw_gpu_memory_utilization_ratio",
+            "Fraction of GPU memory in use, 0-1 (OTel hw.gpu.memory.utilization).",
+            [
+                (_hw(g), max(0.0, g.total_bytes - g.free_bytes) / g.total_bytes)
+                for g in gpus
+                if g.total_bytes > 0
+            ],
+        )
     accounts = getattr(state, "accounts", None)
     if accounts is not None:
         try:

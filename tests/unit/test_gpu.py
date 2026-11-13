@@ -352,6 +352,31 @@ class TestGetProbe:
         assert gpus[1].free_bytes == 24576 * MIB
         assert fastest_gpu_order(gpus) == [0, 1]
 
+    def test_env_spec_cards_carry_the_card_facts(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A staging card (D85) has the D89 shapes: given facts kept, uuid/PCI synthesized."""
+        spec = [
+            {
+                "index": 0,
+                "name": "Fake RTX 5090",
+                "total_bytes": 32 * 1024 * MIB,
+                "compute_capability": [12, 0],
+                "uuid": "GPU-given",
+                "pci_bus_id": "00000000:41:00.0",
+                "memory_bandwidth_gbps": 1792.0,
+                "driver_version": "621.14",
+            },
+            {"index": 3, "name": "Fake RTX 3090", "total_bytes": 24 * 1024 * MIB},
+        ]
+        monkeypatch.setenv("SF_FAKE_GPUS", json.dumps(spec))
+        given, synthesized = get_probe(force="fake").list_gpus()
+        assert given.uuid == "GPU-given" and given.pci_bus_id == "00000000:41:00.0"
+        assert given.memory_bandwidth_gbps == 1792.0 and given.driver_version == "621.14"
+        assert given.studioforge["class_key"] == "sm_120-32g"
+        assert synthesized.uuid == "GPU-00000000-0000-0000-0000-000000000003"
+        assert synthesized.pci_bus_id == "00000000:04:00.0"
+        # Never invented: a bandwidth would move the estimate of a known card.
+        assert synthesized.memory_bandwidth_gbps is None and synthesized.driver_version is None
+
     def test_env_var_selects_backend(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SF_GPU_PROBE", "null")
         probe = get_probe()

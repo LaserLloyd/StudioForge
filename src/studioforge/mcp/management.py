@@ -455,6 +455,17 @@ def _compact_gpu(gpu: Any) -> dict[str, Any]:
         "utilization_pct": gpu.utilization_pct,
         "temperature_c": gpu.temperature_c,
         "compute_capability": gpu.cc_str,
+        # GFD / NVML names beside the legacy ones (WP5b); group by class_key.
+        "uuid": gpu.uuid,
+        "product": gpu.product,
+        "memory_mib": gpu.memory_mib,
+        "memory_free_mib": gpu.memory_free_mib,
+        "compute_major": gpu.compute_major,
+        "compute_minor": gpu.compute_minor,
+        "family": gpu.family,
+        "pci_bus_id": gpu.pci_bus_id,
+        "driver_version": gpu.driver_version,
+        "studioforge": gpu.studioforge,
     }
 
 

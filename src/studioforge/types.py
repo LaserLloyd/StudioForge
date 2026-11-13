@@ -698,6 +698,39 @@ class ModelRecord(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+_NVIDIA_FAMILIES: tuple[tuple[tuple[int, int], str], ...] = (
+    ((12, 0), "blackwell"),
+    ((10, 0), "blackwell"),
+    ((9, 0), "hopper"),
+    ((8, 9), "ada-lovelace"),
+    ((8, 0), "ampere"),
+    ((7, 5), "turing"),
+    ((7, 0), "volta"),
+    ((6, 0), "pascal"),
+    ((5, 0), "maxwell"),
+    ((3, 0), "kepler"),
+)
+
+
+def _nvidia_family(major: int, minor: int) -> str | None:
+    """GFD ``family`` for an NVIDIA compute capability (newest first)."""
+    for floor, family in _NVIDIA_FAMILIES:
+        if (major, minor) >= floor:
+            return family
+    return None
+
+
+_VENDOR_PREFIXES = frozenset({"nvidia", "geforce", "quadro", "amd", "intel", "intel(r)"})
+
+
+def _class_label(name: str) -> str:
+    """``"NVIDIA GeForce RTX 5090"`` -> ``"RTX 5090"``; display only."""
+    words = (name or "").split()
+    while words and words[0].lower() in _VENDOR_PREFIXES:
+        words.pop(0)
+    return " ".join(words) or (name or "unknown GPU")
+
+
 class GpuInfo(BaseModel):
     index: int
     name: str
@@ -721,6 +754,91 @@ class GpuInfo(BaseModel):
     #: (APUs such as Strix Halo, Apple silicon). The budget formula is the
     #: driver-reported figure with no bonus; see ``core/gpu.py``.
     unified_memory: bool = False
+    #: NVML board UUID (``GPU-...``); stable across reboots and re-ordering.
+    uuid: str | None = None
+    #: ``domain:bus:device.function`` as NVML reports it (``00000000:01:00.0``).
+    pci_bus_id: str | None = None
+    #: Peak memory bandwidth in GB/s: NVML bus width x max memory clock x 2 / 8
+    #: when the driver reports both, else ``None`` (never guessed from the name
+    #: here; ``core/throughput.py`` falls back to its nominal table).
+    memory_bandwidth_gbps: float | None = None
+    #: Driver version as the probe's vendor tool reports it, per device (the
+    #: GFD ``driver-version`` label); ``None`` when unknown.
+    driver_version: str | None = None
+
+    # -- NVIDIA GPU Feature Discovery vocabulary (WP5b, B.3) ------------------
+    # Canonical card facts, all derived from the fields above so a GpuInfo
+    # built by any probe (or a test) carries them. Legacy fields stay.
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def product(self) -> str:
+        """GFD ``product``: the device name the driver reports."""
+        return self.name
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def memory_mib(self) -> int:
+        """GFD ``memory``: total device memory in MiB."""
+        return int(self.total_bytes) // (1024 * 1024)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def memory_free_mib(self) -> int:
+        return int(self.free_bytes) // (1024 * 1024)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def compute_major(self) -> int | None:
+        return self.compute_capability[0] if self.compute_capability else None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def compute_minor(self) -> int | None:
+        return self.compute_capability[1] if self.compute_capability else None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def arch(self) -> str | None:
+        """``sm_120`` from the compute capability; AMD ``gfx_target``; else ``None``."""
+        if self.compute_capability is not None:
+            return f"sm_{self.compute_capability[0]}{self.compute_capability[1]}"
+        return self.gfx_target or None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def family(self) -> str | None:
+        """GFD ``family`` (``blackwell``, ``ada-lovelace``, ``ampere``...) or ``None``."""
+        if self.compute_capability is None:
+            return None
+        return _nvidia_family(*self.compute_capability)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def class_key(self) -> str:
+        """Portable grouping key ``<arch>-<GiB>g`` (``sm_120-32g``).
+
+        Never a marketing name: two cards with the same key are interchangeable
+        for placement. ``unknown`` stands in for the arch when none is known.
+        """
+        gib = round(int(self.total_bytes) / (1024**3))
+        return f"{self.arch or 'unknown'}-{gib}g"
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def class_label(self) -> str:
+        """Human label derived from the name (``RTX 5090``); display only."""
+        return _class_label(self.name)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def studioforge(self) -> dict[str, Any]:
+        """StudioForge's own card facts (no standard exists for these)."""
+        return {
+            "class_key": self.class_key,
+            "memory_bandwidth_gbps": self.memory_bandwidth_gbps,
+            "class_label": self.class_label,
+        }
 
     @property
     def cc_str(self) -> str:

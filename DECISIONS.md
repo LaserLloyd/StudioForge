@@ -8095,3 +8095,43 @@ a replaced GGUF under the same id inherited the old correction; a fresh copy had
 capabilities `plan_margin`, `load_recommended_step_down`, `observation_class_key`;
 `tests/unit/test_planner_fit_margin.py`, `test_planner_observation_key.py`,
 `test_slots_unified_pool.py`, `test_cli_commands.py`.
+
+## D89 -- Card facts in GPU Feature Discovery names, and cards grouped by class, never by name
+
+**Problem.** A GPU record carried `index`, `name`, total/free/used bytes, utilization, temperature
+and compute capability -- no uuid, no PCI bus id, no bandwidth, no class -- so a client grouping
+"alike" cards had to match marketing names. The throughput table knew three cards by name and fell
+back on VRAM alone (>= 30 GiB is a 5090, >= 23 GiB a 3090), so a 48 GB workstation card was priced
+as a 5090; `hardware_modes` built `dual_*` from the top two classes by index, with no three-card
+mode and no single for a second class (A-19). A portability risk for every box that is not the
+reference rig.
+
+**Decision.**
+
+1. GPU records carry the NVIDIA GPU Feature Discovery names -- `uuid`, `product`, `memory_mib`,
+   `memory_free_mib`, `compute_major` / `compute_minor`, `family`, `pci_bus_id`, `driver_version`
+   -- and `studioforge{class_key, memory_bandwidth_gbps, class_label}`. Legacy fields stay. NVML
+   static facts are read once per card and each degrades to null on its own.
+2. `class_key` is `<arch>-<GiB>g` (`sm_120-32g`, `gfx1100-24g`), never a marketing name or an
+   index; clients group cards by it. The lease auto placement (D87) and the D51 key (D88) use the
+   same formula and trust the card's own value.
+3. Bandwidth = NVML memory bus width x max memory clock x 2 / 8. The throughput table resolves by
+   name, then measured bandwidth, then `class_key`, then a bounded VRAM band (30-36 GiB, 23-26
+   GiB); anything else is the pessimistic unknown profile, labelled by its `class_label`.
+4. `hardware_modes` gives a `dual_<class>` for every class with two cards, a three-card mode,
+   `all_gpus`, `single_<best>` and a single for a lone card of another class; known cards keep
+   their slugs (`dual_5090`), others are named by `class_key`.
+5. `/metrics` adds the OpenTelemetry `hw_gpu_memory_{usage_bytes,limit_bytes,utilization_ratio}`
+   gauges (labelled by uuid); the `studioforge_` gauges stay as aliases.
+6. A no-GPU staging card (D85) takes these facts from `SF_FAKE_GPUS`; a missing `uuid` /
+   `pci_bus_id` is synthesized from the index, bandwidth never is.
+
+**Not done.** `hf_meta._gpu_class` keeps a duplicate class rule; MCP output schemas must allow the
+extra GPU fields when they arrive.
+
+**Surfaces.** `types.py` (`GpuInfo` fields and computed GFD names), `core/gpu.py` (NVML static
+facts, `SF_FAKE_GPUS` facts), `core/throughput.py` (`GPU_PERF_BY_CLASS_KEY`, `gpu_perf_of`),
+`core/placements.py` (mode families), `core/metrics.py`, `api/mgmt_routes.py` and
+`mcp/management.py` GPU summaries, `docs/CATALOG.md`, `docs/DEVELOPMENT.md`; capabilities
+`gpu_card_facts`, `hardware_mode_families`, `hw_gpu_memory_metrics`;
+`tests/unit/test_gpu_card_facts.py`, `test_gpu.py`, `test_placements.py`, `test_mcp.py`.

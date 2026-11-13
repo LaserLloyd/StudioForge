@@ -33,6 +33,7 @@ model's ``recommended`` load.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -66,7 +67,10 @@ class HardwareMode:
 
 
 def _class_of(gpu: GpuInfo) -> throughput.GpuPerf:
-    return throughput.gpu_perf_for(gpu.name, int(gpu.total_bytes or 0))
+    return throughput.gpu_perf_of(gpu)
+
+
+_KNOWN_LABELS = frozenset(perf.label for _, perf in throughput.GPU_PERF_TABLE)
 
 
 def _slug(label: str) -> str:
@@ -82,6 +86,19 @@ def _slug(label: str) -> str:
     return label.split()[0].lower() if label.split() else "gpu"
 
 
+def _class_slug(label: str, class_key: str) -> str:
+    """Mode-key slug for a card class.
+
+    A card the performance table knows keeps its familiar slug (``5090``,
+    ``3090``), so ``dual_5090`` stays ``dual_5090``. Anything else is named by
+    its ``class_key`` (``sm_89-48g`` -> ``sm_89_48g``), which is portable and
+    never collides with a marketing name (A-19).
+    """
+    if label in _KNOWN_LABELS:
+        return _slug(label)
+    return re.sub(r"[^a-z0-9]+", "_", class_key.lower()).strip("_") or "gpu"
+
+
 def _mix(gpus: Sequence[GpuInfo]) -> str:
     counts: dict[str, int] = {}
     for gpu in gpus:
@@ -90,14 +107,25 @@ def _mix(gpus: Sequence[GpuInfo]) -> str:
     return " + ".join(f"{n}x {label}" for label, n in counts.items())
 
 
+#: At most this many card classes get their own pair/single modes; a rig with
+#: more kinds of card than this is better served by ``devices`` than by a menu.
+_MAX_CLASSES = 4
+
+
 def hardware_modes(gpus: Sequence[GpuInfo], *, excluded: Iterable[int] = ()) -> list[HardwareMode]:
     """The sets of cards worth reporting on, best-and-fewest first.
 
-    Order: ``dual_<best class>``, ``dual_<second class>``, ``all_gpus``,
-    ``single_<best class>``. The pair of best cards leads because it is what
-    the user asks for by default -- the fastest placement that still leaves the
-    rest of the rig free for a second model -- and because a pair is where a
-    31B's context stops being cramped.
+    Cards are grouped by performance class AND ``GpuInfo.class_key`` (arch +
+    GiB), so a 48 GB card is never lumped with a 32 GB one. Order:
+    ``dual_<class>`` for each class with two cards (best class first),
+    ``triple_<class>`` for a class with three or more, ``all_gpus``, then
+    ``single_<best class>`` and a single for every other class that is a lone
+    card. The pair of best cards leads because it
+    is what the user asks for by default -- the fastest placement that still
+    leaves the rest of the rig free for a second model -- and because a pair is
+    where a 31B's context stops being cramped. A one-card box yields just
+    ``single_<class>``; a mixed box without a pair of anything still gets
+    ``all_gpus`` and a single per class.
 
     Deduplicated on the device set, keeping the first (and therefore
     best-named) description: on a two-card box "2x RTX 5090" and "all 2 GPUs"
@@ -117,23 +145,43 @@ def hardware_modes(gpus: Sequence[GpuInfo], *, excluded: Iterable[int] = ()) -> 
     if not usable:
         return []
 
-    by_class: dict[str, list[GpuInfo]] = {}
+    by_class: dict[tuple[str, str], list[GpuInfo]] = {}
     for gpu in sorted(usable, key=lambda g: g.index):
-        by_class.setdefault(_class_of(gpu).label, []).append(gpu)
+        by_class.setdefault((_class_of(gpu).label, gpu.class_key), []).append(gpu)
     ranked = sorted(
         by_class.items(),
         key=lambda kv: (-_class_of(kv[1][0]).bw_bytes_per_s, kv[0]),
-    )
+    )[:_MAX_CLASSES]
+
+    # One slug per class; two classes that would share one (two unknown parts
+    # with the same arch and size cannot, but a table label can repeat across
+    # sizes) are told apart by their class_key.
+    slugs: dict[tuple[str, str], str] = {}
+    taken: set[str] = set()
+    for (label, class_key), _members in ranked:
+        slug = _class_slug(label, class_key)
+        if slug in taken:
+            slug = re.sub(r"[^a-z0-9]+", "_", f"{slug}_{class_key}".lower()).strip("_")
+        taken.add(slug)
+        slugs[(label, class_key)] = slug
 
     candidates: list[HardwareMode] = []
-    for label, members in ranked[:2]:
+    for ident, members in ranked:
         if len(members) >= 2:
-            pair = members[:2]
             candidates.append(
                 HardwareMode(
-                    key=f"dual_{_slug(label)}",
-                    label=f"2x {label}",
-                    devices=tuple(g.index for g in pair),
+                    key=f"dual_{slugs[ident]}",
+                    label=f"2x {ident[0]}",
+                    devices=tuple(g.index for g in members[:2]),
+                )
+            )
+    for ident, members in ranked:
+        if len(members) >= 3:
+            candidates.append(
+                HardwareMode(
+                    key=f"triple_{slugs[ident]}",
+                    label=f"3x {ident[0]}",
+                    devices=tuple(g.index for g in members[:3]),
                 )
             )
     if len(usable) >= 2:
@@ -145,14 +193,20 @@ def hardware_modes(gpus: Sequence[GpuInfo], *, excluded: Iterable[int] = ()) -> 
                 devices=tuple(g.index for g in every),
             )
         )
-    best_label, best_members = ranked[0]
-    candidates.append(
-        HardwareMode(
-            key=f"single_{_slug(best_label)}",
-            label=f"1x {best_label}",
-            devices=(best_members[0].index,),
+    for rank, (ident, members) in enumerate(ranked):
+        # The best class always gets a single. Any other class gets one only
+        # when it is a lone card (no pair of its own to stand for it), so a
+        # 5090 + 3090 box can ask about each card (A-19) while a rig with a
+        # pair of every class keeps its familiar four modes.
+        if rank > 0 and len(members) >= 2:
+            continue
+        candidates.append(
+            HardwareMode(
+                key=f"single_{slugs[ident]}",
+                label=f"1x {ident[0]}",
+                devices=(members[0].index,),
+            )
         )
-    )
 
     seen: set[tuple[int, ...]] = set()
     modes: list[HardwareMode] = []

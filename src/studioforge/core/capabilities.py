@@ -76,7 +76,7 @@ FEATURE_NOTES: dict[str, str] = {
 #: on instead. **Bump it in the same commit that appends a decision**:
 #: ``tests/unit/test_capabilities_implemented.py`` reads the headings of
 #: ``DECISIONS.md`` and fails until the two agree.
-LATEST_DECISION = 88
+LATEST_DECISION = 89
 
 #: Every decision number this build includes, ``"D1"`` .. ``"D<LATEST_DECISION>"``.
 IMPLEMENTED_DECISIONS: tuple[str, ...] = tuple(f"D{n}" for n in range(1, LATEST_DECISION + 1))
@@ -189,6 +189,15 @@ SERVER_FEATURES: dict[str, str] = {
     "load_recommended_step_down": "D88",
     # The D51 observation key names the card classes, split mode and GGUF size.
     "observation_class_key": "D88",
+    # GPU records carry the GFD names (uuid, product, memory_mib, compute_major,
+    # family, pci_bus_id, ...) and studioforge{class_key, memory_bandwidth_gbps,
+    # class_label}; group cards by studioforge.class_key, never by name.
+    "gpu_card_facts": "D89",
+    # hardware_modes: dual_<class> per class with two cards, a three-card mode,
+    # a single for a lone card of another class; unknown cards keyed by class_key.
+    "hardware_mode_families": "D89",
+    # /metrics hw_gpu_memory_{usage_bytes,limit_bytes,utilization_ratio}.
+    "hw_gpu_memory_metrics": "D89",
 }
 
 

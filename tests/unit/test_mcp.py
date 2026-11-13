@@ -621,7 +621,11 @@ async def test_list_models_never_leaks_a_chat_template_or_meta_dump(state: State
     # sentence saying `arch_supported: false` means "cannot load, pick another".
     # Per model it costs nothing on a loadable row -- the compact view drops a
     # `true`, and a `null` like every null.
-    assert len(raw) < 13800, f"list_models output is {len(raw)} chars"
+    #
+    # Re-anchored at WP5b (A-19) by ~1.4k characters, all PER MODEL: this fixture
+    # is a 5090 + 3090 box, which now also gets a `single_3090` placement row
+    # (a lone card of a non-best class is a mode of its own).
+    assert len(raw) < 15600, f"list_models output is {len(raw)} chars"
 
 
 async def test_model_options_returns_the_whole_table_for_one_model(state: State) -> None:

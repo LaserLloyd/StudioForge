@@ -3141,6 +3141,10 @@ def _gpu_summary(gpu: Any) -> dict[str, Any]:
         "compute_capability": (
             list(gpu.compute_capability) if gpu.compute_capability is not None else None
         ),
+        "class_key": gpu.class_key,
+        "product": gpu.product,
+        "memory_mib": gpu.memory_mib,
+        "studioforge": gpu.studioforge,
     }
 
 

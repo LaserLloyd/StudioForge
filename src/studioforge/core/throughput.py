@@ -83,11 +83,23 @@ GPU_PERF_TABLE: tuple[tuple[str, GpuPerf], ...] = (
 #: number on the page a lie.
 GPU_PERF_UNKNOWN = GpuPerf("unknown GPU", 600e9, 40e12)
 
-#: VRAM-size fallback, largest first, for an unnamed/renamed card. A 32 GiB
-#: consumer card on this class of machine is a 5090; a 24 GiB one is a 3090.
-GPU_PERF_BY_VRAM: tuple[tuple[float, GpuPerf], ...] = (
-    (30.0, GPU_PERF_TABLE[0][1]),
-    (23.0, GPU_PERF_TABLE[2][1]),
+#: Card class (``GpuInfo.class_key``, ``<arch>-<GiB>g``) -> nominal performance,
+#: for a card whose name matched nothing above (a renamed or "Graphics Device"
+#: part). Keyed on the class, never on VRAM alone, so a 48 GB Ada workstation
+#: card (``sm_89-48g``) is not mistaken for a 5090 (A-19).
+GPU_PERF_BY_CLASS_KEY: dict[str, GpuPerf] = {
+    "sm_120-32g": GPU_PERF_TABLE[0][1],
+    "sm_89-24g": GPU_PERF_TABLE[1][1],
+    "sm_86-24g": GPU_PERF_TABLE[2][1],
+}
+
+#: VRAM-band fallback (low GiB, high GiB, profile) for a card with no usable
+#: name, no bandwidth and no architecture. Bounded above, so anything bigger
+#: (48 GB workstation cards, 80 GB datacenter parts) falls through to the
+#: pessimistic unknown profile instead of being classed as a 5090.
+GPU_PERF_BY_VRAM: tuple[tuple[float, float, GpuPerf], ...] = (
+    (30.0, 36.0, GPU_PERF_TABLE[0][1]),
+    (23.0, 26.0, GPU_PERF_TABLE[2][1]),
 )
 
 #: Fraction of nominal memory bandwidth a single-GPU decode actually reaches.
@@ -258,17 +270,56 @@ BITS_PER_WEIGHT: dict[str, float] = {
 BITS_PER_WEIGHT_DEFAULT = 5.0
 
 
-def gpu_perf_for(name: str | None, total_bytes: int = 0) -> GpuPerf:
-    """Nominal performance for a GPU, by name then by VRAM size."""
+def gpu_perf_for(
+    name: str | None,
+    total_bytes: int = 0,
+    *,
+    bandwidth_gbps: float | None = None,
+    class_key: str | None = None,
+    label: str | None = None,
+) -> GpuPerf:
+    """Nominal performance for a GPU.
+
+    Order: name fragment (a known card), measured memory bandwidth (NVML bus
+    width x clock; the estimate scales the unknown-card compute rate with it),
+    ``class_key`` table, then a bounded VRAM band, else the pessimistic unknown
+    profile. ``label`` names the profile of a card found by anything but its
+    name (the card's own ``class_label``, not "unknown GPU").
+    """
     haystack = (name or "").lower()
     for fragment, perf in GPU_PERF_TABLE:
         if fragment in haystack:
             return perf
+    if bandwidth_gbps and bandwidth_gbps > 0:
+        bw = float(bandwidth_gbps) * 1e9
+        return GpuPerf(
+            label or GPU_PERF_UNKNOWN.label,
+            bw,
+            GPU_PERF_UNKNOWN.flops_fp16 * bw / GPU_PERF_UNKNOWN.bw_bytes_per_s,
+        )
+    if class_key and class_key in GPU_PERF_BY_CLASS_KEY:
+        return GPU_PERF_BY_CLASS_KEY[class_key]
     gib = total_bytes / GIB if total_bytes else 0.0
-    for threshold, perf in GPU_PERF_BY_VRAM:
-        if gib >= threshold:
+    for low, high, perf in GPU_PERF_BY_VRAM:
+        if low <= gib < high:
             return perf
+    if label:
+        return GpuPerf(label, GPU_PERF_UNKNOWN.bw_bytes_per_s, GPU_PERF_UNKNOWN.flops_fp16)
     return GPU_PERF_UNKNOWN
+
+
+def gpu_perf_of(gpu: Any) -> GpuPerf:
+    """:func:`gpu_perf_for` for a ``GpuInfo`` (or anything shaped like one)."""
+    if gpu is None:
+        return GPU_PERF_UNKNOWN
+    bandwidth = getattr(gpu, "memory_bandwidth_gbps", None)
+    return gpu_perf_for(
+        getattr(gpu, "name", None),
+        int(getattr(gpu, "total_bytes", 0) or 0),
+        bandwidth_gbps=bandwidth if isinstance(bandwidth, int | float) else None,
+        class_key=getattr(gpu, "class_key", None),
+        label=getattr(gpu, "class_label", None),
+    )
 
 
 def gpu_class(gpus: Sequence[Any]) -> str:
@@ -286,7 +337,7 @@ def gpu_class(gpus: Sequence[Any]) -> str:
     """
     counts: dict[str, int] = {}
     for gpu in gpus:
-        perf = gpu_perf_for(getattr(gpu, "name", None), int(getattr(gpu, "total_bytes", 0) or 0))
+        perf = gpu_perf_of(gpu)
         counts[perf.label] = counts.get(perf.label, 0) + 1
     return "+".join(f"{label}x{n}" for label, n in sorted(counts.items())) or "unknown"
 
@@ -575,10 +626,7 @@ def estimate(
     perf_by_device: dict[int, str] = {}
     for index, bytes_here in split.items():
         share = bytes_here / total_split if total_split else 1.0 / n_devices
-        perf = gpu_perf_for(
-            getattr(gpu_map.get(index), "name", None),
-            int(getattr(gpu_map.get(index), "total_bytes", 0) or 0),
-        )
+        perf = gpu_perf_of(gpu_map.get(index))
         perf_by_device[index] = perf.label
         weight_times.append((active * share) / perf.bw_bytes_per_s)
         kv_times.append((kv_per_slot * share) / perf.bw_bytes_per_s)
