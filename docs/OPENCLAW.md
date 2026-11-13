@@ -452,6 +452,18 @@ reserve_gpus(devices=[3], reason="ComfyUI render")           # nothing loads her
 release_gpus(lease_id="...")                                  # early exit; idle_ttl_s (60 min) is the default one
 ```
 
+**Two copies of one model.** A lease can hold its own copy of a model, loaded on its cards, so two
+agents (or a bench and a judge) never fight over one instance:
+
+```
+reserve_gpus(devices=[2, 3], instances=[{"model": "pub/agent-model"}])
+# -> instances[0].model == "pub/agent-model:2": send THAT as "model"; it ends with release_gpus
+```
+
+A model another holder already holds is never taken from them: naming it in `model_id` gives your
+lease its own copy instead (listed in `instances`). [MULTI-INSTANCE.md](MULTI-INSTANCE.md) has the
+whole contract.
+
 A lease is the strong form: it holds the cards against *everyone*, until released. When you only
 need **one load** kept off a card — and cannot hold a lease, because the card is ambiguous between
 two identical GPUs or because you do not own it — pass `allowed_devices` to that load instead. It

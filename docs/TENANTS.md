@@ -241,6 +241,8 @@ every retryable refusal also carries a `Retry-After` header.
 `avoid` and `count` (cards of one class, default 1) steer an automatic placement only (a 400 beside
 explicit devices). `exclusive` must be `true` (§10). `model_ids` names StudioForge's own models
 that may be planned onto the cards; a tenant that allocates its own memory sends none.
+`instances` asks for copies of a model on the cards (D91, below and
+[MULTI-INSTANCE.md](MULTI-INSTANCE.md)).
 
 Reply `200`: the lease record (every field below, at the top level as before, and again under
 `lease`, the canonical place to read it), plus `evicted` (`[{model_id, reason, devices,
@@ -282,6 +284,10 @@ docs/MIGRATION.md maps each to its successor. Read new code against the canonica
 | 409 | `lease_vacating` | the holder has been asked to leave | re-ask every `retry_after_s` until granted or `lease_conflict` |
 | 503 | `model_busy` | a resident on the card is mid-request (`busy_models[].{model_id, in_flight}`), or a load planned onto these cards is in flight (`loading_devices`) | wait `retry_after_s`, re-ask |
 | 507 | `insufficient_vram` | auto with `min_free_gib`: no card would have that much | ask for less, or wait |
+| 400 | `launch_key_not_allowed` | an `instances[].launch` key other than `ctx_size`, `parallel`, `min_slots`, `max_slots`, `kv_cache_type(_v)` (D91) | drop it |
+| 409 | `instance_id_conflict` | an `instances[].tag` whose id is taken (D91) | another tag, or none |
+| 409 | `instance_held` | another lease's model is resident on these cards (D91) | lease other cards |
+| any | the failed load's | an instance could not be loaded: the whole grant was rolled back; `error.studioforge.instances[]` says what became of each (D91) | fix and retry |
 
 Every automatic refusal carries `error.studioforge.considered` (the per-card verdicts:
 `chosen`, `candidate`, `avoided`, `excluded`, `not_allowed`, `leased`, `busy`, `pinned`,
@@ -302,9 +308,10 @@ rel="deprecation"` headers; `404 lease_not_found` when it is gone.
 
 ### `DELETE /api/leases/{id}` — release
 
-Reply `200 {"released": {...}, "unloaded": [...], "kept": [{model_id, reason, detail}]}`; `404
-lease_not_found` when already gone (treat as success). `?unload=false` keeps the lease's models
-resident.
+Reply `200 {"released": {...}, "unloaded": [...], "kept": [{model_id, reason, detail}],
+"instances_ended": [...]}`; `404 lease_not_found` when already gone (treat as success).
+`?unload=false` keeps the lease's named models resident; its own instances (D91) end with it
+regardless.
 
 ### `GET /api/leases` — the book
 
@@ -316,14 +323,42 @@ admin callers). Open to read.
 `POST /api/models/{id}/load` and `/load-recommended` (and `GET .../plan-recommended`, as a dry run)
 take an optional `lease_id` (body or `?lease_id=`): the model joins that lease and loads onto its
 cards (`devices` may name a subset). Only the lease's holder may bind (`403 permission_denied`
-otherwise); a model another lease already names is `409 lease_conflict`. The instance reports
-`loaded_by: "api:/api/leases/<id>"`. MCP `load_model` / `load_recommended` take the same argument.
+otherwise). A model another holder holds -- another lease names it, or it serves another client's
+requests elsewhere -- is not taken: since D91 the lease gets its own copy `<model>:<n>` on its cards
+and the reply is that instance (before D91 this was `409 lease_conflict`). A model the lease already
+has a copy of loads that copy. The instance reports `loaded_by: "api:/api/leases/<id>"`. MCP
+`load_model` / `load_recommended` take the same argument.
+
+### Instances under a lease (D91)
+
+A lease may hold its own copies of a model -- `instances: [{"model", "count"?, "gpus"?, "tag"?,
+"launch"?, "load"?}]` on `POST /api/leases` (MCP `reserve_gpus(instances=...)`, `sfctl leases add
+--instance`). Each copy is `<model>:<n>` (from 2, gaps reused) or `<model>@<tag>`, a deep copy of the
+base's settings on the lease's cards with only its context, slots and KV types from `launch`, loaded
+before the reply (all or nothing) and reported in `instances[]` as actually loaded (`id`, `model`,
+`devices`, `ctx_per_slot`, `parallel`, `kv_cache_type(_v)`, `state`, `engine_tag`). Every lease row
+(`GET /api/leases`, `/api/status`) carries the same `instances[]` with live state.
+
+* **Address it** by its id in `model` on any route; a base id from the holder -- matched by
+  `X-SF-Lease`, by an `X-SF-Client` equal to the lease's holder, or by the key that took the lease --
+  goes to the holder's own copy. Everyone else gets the base as before.
+* **A second holder never replaces the first.** Naming a model another holder holds (old
+  `model_ids` shape or a bound load) gives this lease its own copy (`origin: "second_holder"`).
+* **Holder identity, not key equality.** A caller that names another lease, or sends an
+  `X-SF-Client` that is another standing lease's holder, is not this lease's holder even with the
+  key that took it. An unload of a lease-held model serving other clients' requests is `409
+  instance_in_use` unless the body says `force: true`.
+* **It ends with the lease** (release, expiry): requests in flight end `410 instance_released` (an
+  SSE error frame mid-stream), later ones `404 instance_not_found`. A restart restores the copies
+  unloaded; the first request loads exactly the stored shape.
+
+The full contract, with every request shape and error: [MULTI-INSTANCE.md](MULTI-INSTANCE.md).
 
 ### `GET /api/capabilities` — feature gating (D64)
 
 `implemented.features` contains `lease_vacate` (D56), `lease_persistence` (D61),
-`tenant_registry` and `tenant_protocol_vt1` (D77), `lease_auto_placement` (D78). Gate on these,
-not on the version string.
+`tenant_registry` and `tenant_protocol_vt1` (D77), `lease_auto_placement` (D78), `lease_instances`
+and `multi_instance_default` (D91). Gate on these, not on the version string.
 
 ## 8. The host rule for every URL you register
 
@@ -459,4 +494,5 @@ Its README says how SpeechForge and an image-generation tenant would adopt it wi
 
 D43 (leases), D53 (`gpu_leased`, `holder_family`, `kind`), D56 (vacate), D61 (persistence), D65
 (a saved override onto a leased card), D77 (this protocol and the registry), D78 (automatic
-placement), D79 (StudioForge never launches a tenant) in `DECISIONS.md`.
+placement), D79 (StudioForge never launches a tenant), D87 (lease ownership and the load path),
+D91 (instances under a lease; a second holder never replaces the first) in `DECISIONS.md`.

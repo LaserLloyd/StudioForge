@@ -450,6 +450,7 @@ decisions it carries are in [`CHANGELOG.md`](CHANGELOG.md).
 - [`docs/CLI.md`](docs/CLI.md): every `studioforge` command (generated)
 - [`docs/SECURITY.md`](docs/SECURITY.md), [`SECURITY.md`](SECURITY.md) and [`docs/ACCOUNTS.md`](docs/ACCOUNTS.md): scopes, TLS, audit, reporting, logins
 - [`docs/TENANTS.md`](docs/TENANTS.md): the VRAM Tenant Protocol
+- [`docs/MULTI-INSTANCE.md`](docs/MULTI-INSTANCE.md): several copies of one model under GPU leases
 - [`docs/panel.md`](docs/panel.md): every control in the panel
 - [`docs/ENGINES.md`](docs/ENGINES.md), [`docs/ENGINE-FEATURES.md`](docs/ENGINE-FEATURES.md): llama.cpp builds, hardware detection, features
 - [`docs/CATALOG.md`](docs/CATALOG.md), [`docs/BENCHMARKING.md`](docs/BENCHMARKING.md): the model catalog and the benchmarking playbook

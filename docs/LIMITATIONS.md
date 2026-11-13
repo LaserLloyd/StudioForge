@@ -205,6 +205,15 @@ own:
   own `vacate_token` in `X-SF-Vacate-Token`. A peer address is what it is behind a reverse proxy
   (the proxy's), so put a proxied install behind `server.api_key`, which makes every caller an
   admin by the middleware and the proof moot.
+* Holder identity (D91) is what a caller SAYS -- the lease it names, its `X-SF-Client` label, the
+  key it holds. Two clients that share one key and send no label cannot be told apart: a base model
+  id from them means the base (routing) or is refused as ambiguous (unload). Send `X-SF-Client`
+  (or `X-SF-Lease`) from every run. A label that is no standing holder's but shares a holder's
+  family (`crucibleforge` for `crucibleforge-judge`) is still that holder's by its key, as before.
+* Lease instances (D91): a dry run (`?dryRun=true`, `plan-recommended`) answers for the model as
+  named and does not preview the copy a real bound load would make; a base id is not balanced
+  across different holders' copies (F-4); the idle residents a failed all-or-nothing grant evicted
+  are not brought back; a copy whose base left the library at restart is dropped from its lease.
 
 ## Who is holding the VRAM: what can and cannot be answered
 

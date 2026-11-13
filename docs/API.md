@@ -82,7 +82,7 @@ extras are StudioForge's. The router vocabulary is canonical for model state and
 | `GET /models` | yes | `data[]` of `{id, path, status{value, args?, failed?, exit_code?}, architecture{input_modalities, output_modalities}, sidecars?, studioforge{...}}`. `status.value` is `unloaded`, `loading` or `loaded` (`failed: true` on an unloaded model whose last launch died). `?reload=1` rescans the library first (admin, like `POST /api/models/scan`). |
 | `POST /models/load` | yes | `{"model"}` as in llama-server, plus `context_length` (tokens per slot), `devices`, `allowed_devices`, `parallel`, `min_slots`, `max_slots`, `kv_cache_type`, `kv_cache_type_v`, `kv_unified`, `priority`, `persist`, `lease_id`. `context_length` alone is the strict walk of `load-recommended`; `devices` / `parallel` / `kv_cache_type*` / `force` is the explicit load; a bare model is a plain load. Reply: `{"success": true, ...instance}`. Unknown keys are ignored. |
 | `POST /models/load?dryRun=true` | extension | The same decision, nothing started (the same routing rule as the load, `lease_id` included): the plan body with `dry_run: true` and `dry_run_of` (`load` or `load_recommended`). |
-| `POST /models/unload` | yes | `{"model"}` -> `{"success": true, "unloaded": bool}`. |
+| `POST /models/unload` | yes | `{"model", "force"?}` -> `{"success": true, "model": <the instance taken down>, "unloaded": bool}`. A base id from a lease holder unloads its own copy (D91). |
 | `POST /tokenize`, `/detokenize`, `/apply-template`, `/completion`, `/infill`, `/embedding`, `/reranking` (`/rerank`) | yes | The child's answer, status and body byte for byte (`stream: true` relays the child's SSE untouched, no `[DONE]` added). Needs an `inference` key. |
 | `GET /props`, `GET /slots` | yes | The child's JSON; `/props` gains one key, `studioforge` (instance id, devices, split, parallel, `ctx_per_slot`, KV types, batch sizes, engine tag, `lease_id` when leased). `POST /props` is a 405: per-model settings are the source of truth. |
 | `GET /v2/health/live`, `GET /v2/health/ready`, `GET /v2/models/{id}/ready` | yes | KServe v2 probes. The two server probes need no key; ready is 503 while booting or draining. A model is ready (200) only when resident and serving, else 503 with its state. |
@@ -105,6 +105,15 @@ line), and on responses a model produced `X-SF-Model` (the instance that served 
 n_ctx_train, n_embd, n_params, size}`, plus `studioforge.loaded_instances[]` and
 `studioforge.max_context_length`; `?loaded=true` keeps only resident models. `state` (`not-loaded`
 spelling) stays as before.
+
+**Several instances of one model (D91).** A GPU lease may hold copies of a model, `<model>:<n>` (LM
+Studio's instance identifier, `n` from 2) or `<model>@<tag>`, each usable in `model` on every route
+above. A base model's `studioforge.loaded_instances[]` lists every loaded instance of it --
+`{id, config{context_length, parallel}, context_length, devices, parallel, lease_id, holder,
+ephemeral}` -- and each copy is its own `/v1/models` entry with `studioforge.ephemeral: true`,
+`lease_id`, `holder`, `devices`. A request naming the base id from a caller that holds its own copy
+(`X-SF-Lease`, or `X-SF-Client` equal to the lease's holder, or the lease's key) is served by that
+copy; `X-SF-Model` says which. The contract is [MULTI-INSTANCE.md](MULTI-INSTANCE.md).
 
 ### Anthropic-compatible
 
@@ -129,7 +138,8 @@ by the gateway and never forwarded to the engine.
 | --- | --- |
 | `ttl` (seconds) | Idle time after which a model this request loaded may unload. A request may **shorten** the idle timer or lengthen it up to its tier's ceiling (`models.ttl_by_priority`); it can never pin a model (`0` and negatives are ignored) and never unpin one the owner pinned. LM Studio defaults to 60 minutes; StudioForge uses its own configured defaults. |
 | `priority` (`1`, `2`, `3`) | The load tier: 1 the model a person is chatting with, 2 a dispatched agent, 3 (default) background. Anything else is a 400 naming `priority`. |
-| `X-SF-Client: <label>` | Names the caller in logs and `GET /api/status` (otherwise its IP address). |
+| `X-SF-Client: <label>` | Names the caller in logs and `GET /api/status` (otherwise its IP address). Matched exactly to a GPU lease's holder, it also says whose instance a base model id means (D91). |
+| `X-SF-Lease: <lease id>` / `lease_id` | The lease the caller acts for: a base model id then means that lease's own copy of the model (D91). The body field is consumed, never forwarded. |
 
 Just-in-time loading is the default everywhere: naming an unloaded model in any inference request loads
 it, and concurrent requests queue behind the one load. Streams carry keep-alive frames while it loads.
@@ -223,7 +233,13 @@ Codes introduced with the compatibility surface:
 | --- | --- | --- | --- |
 | `not_implemented` | 501 | `POST /api/v1/chat` | This server does not implement the endpoint; `error.studioforge.alternatives` lists what to use. |
 | `unsupported_parameter` | 400 | `/v1/messages`, `/v1/responses`, `/api/v1/models/*` | A field or content type that would change the answer is not supported; `param` names it. |
-| `instance_not_found` | 404 | `POST /api/v1/models/unload` | The model exists but has no loaded instance. |
+| `instance_not_found` | 404 | `POST /api/v1/models/unload`; every route taking `model` (D91) | The model exists but has no loaded instance; or a lease instance id whose lease ended, or that never existed (never JIT-loaded). |
+| `instance_released` | 410 | an inference request in flight (an SSE error frame mid-stream) | The lease that owned the instance ended under the request (D91). |
+| `instance_held` | 409 | load, unload, lease grant | The instance belongs to another holder; only an admin with `force` on its exact id may touch it (D91). |
+| `instance_in_use` | 409 | `POST /api/models/{id}/unload`, `/models/unload`, `/api/v1/models/unload` | A lease-held model is serving other clients' requests; `error.studioforge.in_flight_clients` names them. Send `force: true` to cut them (D91). |
+| `instance_ambiguous` | 409 | unload | A base id names several of the caller's own copies; name the exact id (D91). |
+| `instance_id_conflict` | 409 | `POST /api/leases` | An instance tag's id is taken (D91). |
+| `launch_key_not_allowed` | 400 | `POST /api/leases` | An instance `launch` key other than the context, slots and KV types (D91). |
 | `download_not_found` | 404 | `GET /api/v1/models/download/status/{job_id}` | No such download job. |
 | `model_required` | 400 | native routes, `POST /models/load` and `/models/unload` | No model was named and the choice is not unique; `error.studioforge.resident` lists the loaded ids. |
 | `model_not_loaded` | 404 | any inference POST with `?autoload=false`; native `GET`s | The model is not resident and this request said not to load it. |

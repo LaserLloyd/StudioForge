@@ -79,6 +79,19 @@
             "default": 3600.0,
             "title": "Idle Ttl S"
           },
+          "instances": {
+            "anyOf": [
+              {
+                "items": {},
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Copies of models to create on the lease's cards (D91): [{\"model\": \"<id>\", \"count\"?: 1, \"gpus\"?: [..], \"tag\"?: \"<tag>\", \"launch\"?: {ctx_size, parallel, min_slots, max_slots, kv_cache_type, kv_cache_type_v}, \"load\"?: true}]. Each is <model>:<n> (or <model>@<tag>) and lives and dies with the lease; all are granted, or none.",
+            "title": "Instances"
+          },
           "min_free_gib": {
             "anyOf": [
               {
@@ -999,6 +1012,11 @@
       },
       "ModelsUnloadBody": {
         "properties": {
+          "force": {
+            "default": false,
+            "title": "Force",
+            "type": "boolean"
+          },
           "model": {
             "anyOf": [
               {
@@ -2459,7 +2477,7 @@
         ]
       },
       "post": {
-        "description": "Give CUDA ``devices`` to ``model_ids`` -- or, with none, to something outside this server.\n\n``devices`` may be ``\"auto\"`` or omitted (D78): the server picks the card(s)\nthe way this grant judges a card -- never one with a busy resident, never a\nleased one (automatic placement asks nobody to vacate), never a pinned or\nbetter-tier idle resident without ``force``, never one\n``planner.excluded_devices`` names or the named models' saved\n``device_override``/``allowed_devices`` leaves out (D87); then fewest\nevictions first, the caller's ``prefer`` order, most free VRAM, lowest\nindex. ``count`` asks for that many cards of ONE class (``class_key``; D87).\n``min_free_gib`` is measured against the card once its evictable idle\nresidents are gone; ``avoid`` rules cards out. The reply carries the chosen\n``devices`` and a ``placement`` block with every card ``considered``; so\ndoes a refusal, in ``error.studioforge.considered``, under the usual codes.\n``exclusive`` must be ``true``: a lease is a whole card (the partial-card\nshare lease is the documented extension point, docs/TENANTS.md).\n\n**A lease reserves cards; it does not load anything.** While it stands\nnothing else is planned onto those cards and no other model's eviction\nladder stops the models it names (D87). The named models' next load -- a\nplain ``/load``, ``load-recommended`` (which then walks the lease's cards\nalone), a load sent with ``lease_id``, or a JIT request -- lands on exactly\nthem, sized for as many slots as their context allows, in the split mode\ntheir own benchmark measured fastest there. Idle residents on the cards are\nunloaded and listed in the reply's ``evicted`` (``[{model_id, reason,\ndevices, priority}]``); a resident copy of a named base (``<base>@<tag>``)\nis kept and named in the lease instead (``adopted``); a model mid-request\nrefuses the call (503, ``retry_after_s``); a pinned idle resident refuses\nunless ``force``. ``idle_ttl_s`` (default 3600) is how long the lease\nsurvives without activity before the server releases it -- and unloads the\nmodels it names (F-2); ``null`` holds it until ``DELETE``.\n\n``holder`` defaults to the ``X-SF-Client`` header when one is sent, else\n``\"api\"``. ``priority`` is the D46 class of the claim (1 chat, 2 dispatched\nagent, 3 background -- the default). ``vacate_url`` / ``vacate_token``\nregister where a *better* class may ask this holder to leave (D56): the\nserver POSTs ``{lease_id, devices, requester, requester_priority,\ndeadline_s, deadline_at}`` there with the token in ``X-SF-Vacate-Token``,\nand the asker is answered ``409 lease_vacating`` (``retry_after_s``,\n``Retry-After``) until this lease is released or ``leases.vacate_timeout_s``\npasses. A card already leased by an equal or better class, or by a holder\nthat registered no URL, is a plain ``409 lease_conflict`` -- also with\n``Retry-After`` now. ``force`` never overrides a standing lease. Every 409\nkeeps ``error.code: lease_conflict``; ``error.studioforge.code`` names the\nspecific case (``lease_outranked``, ``resident_outranks``,\n``resident_pinned``, ``lease_conflict``; D87).\n\nThe reply is the lease record at the top level (``id``/``lease_id`` and\nevery field, as before) and again under ``lease`` -- the canonical place to\nread it from (D87) -- plus ``evicted``, ``adopted`` and\n``deprecated_fields``.",
+        "description": "Give CUDA ``devices`` to ``model_ids`` -- or, with none, to something outside this server.\n\n**Instances (D91).** ``instances`` asks for copies of a model on these cards,\nin Triton's ``instance_group`` shape: ``[{\"model\": X, \"count\"?: 1, \"gpus\"?:\n[..], \"tag\"?: \"mb-a\", \"launch\"?: {...}, \"load\"?: true}]``. Each copy's id is\nLM Studio's ``X:<n>`` (``n`` the smallest free integer from 2; the base is\nplain ``X``) or ``X@<tag>`` -- the string to put in ``model`` on every\nOpenAI-shape and native route. ``launch`` may set ``ctx_size`` (alias\n``context_length``), ``parallel`` or ``min_slots``/``max_slots``,\n``kv_cache_type``, ``kv_cache_type_v``; any other key is 400\n``launch_key_not_allowed`` -- the rest is a deep copy of the base's settings.\nCopies with ``load: true`` (the default) are loaded before this returns and\nreported in ``instances[]`` as actually loaded (``id``, ``model``,\n``devices``, ``ctx_per_slot``, ``parallel``, ``kv_cache_type(_v)``,\n``state``, ``engine_tag``). All or nothing: one failure unloads the rest,\nreleases the lease and answers one error with ``error.studioforge.instances[]``.\nA taken tag is 409 ``instance_id_conflict``.\n\n**A second holder never replaces the first (D91).** A model in ``model_ids``\nthat another holder holds (another lease names it, or it is serving another\nclient's requests on other cards) gets a copy of its own on these cards,\nlisted in ``instances`` with ``origin: \"second_holder\"`` and loaded on first\nuse -- the other holder's instance is never moved, reloaded or unloaded.\n\n``devices`` may be ``\"auto\"`` or omitted (D78): the server picks the card(s)\nthe way this grant judges a card -- never one with a busy resident, never a\nleased one (automatic placement asks nobody to vacate), never a pinned or\nbetter-tier idle resident without ``force``, never one\n``planner.excluded_devices`` names or the named models' saved\n``device_override``/``allowed_devices`` leaves out (D87); then fewest\nevictions first, the caller's ``prefer`` order, most free VRAM, lowest\nindex. ``count`` asks for that many cards of ONE class (``class_key``; D87).\n``min_free_gib`` is measured against the card once its evictable idle\nresidents are gone; ``avoid`` rules cards out. The reply carries the chosen\n``devices`` and a ``placement`` block with every card ``considered``; so\ndoes a refusal, in ``error.studioforge.considered``, under the usual codes.\n``exclusive`` must be ``true``: a lease is a whole card (the partial-card\nshare lease is the documented extension point, docs/TENANTS.md).\n\n**A lease reserves cards; it does not load anything.** While it stands\nnothing else is planned onto those cards and no other model's eviction\nladder stops the models it names (D87). The named models' next load -- a\nplain ``/load``, ``load-recommended`` (which then walks the lease's cards\nalone), a load sent with ``lease_id``, or a JIT request -- lands on exactly\nthem, sized for as many slots as their context allows, in the split mode\ntheir own benchmark measured fastest there. Idle residents on the cards are\nunloaded and listed in the reply's ``evicted`` (``[{model_id, reason,\ndevices, priority}]``); a resident copy of a named base (``<base>@<tag>``)\nis kept and named in the lease instead (``adopted``); a model mid-request\nrefuses the call (503, ``retry_after_s``); a pinned idle resident refuses\nunless ``force``. ``idle_ttl_s`` (default 3600) is how long the lease\nsurvives without activity before the server releases it -- and unloads the\nmodels it names (F-2); ``null`` holds it until ``DELETE``.\n\n``holder`` defaults to the ``X-SF-Client`` header when one is sent, else\n``\"api\"``. ``priority`` is the D46 class of the claim (1 chat, 2 dispatched\nagent, 3 background -- the default). ``vacate_url`` / ``vacate_token``\nregister where a *better* class may ask this holder to leave (D56): the\nserver POSTs ``{lease_id, devices, requester, requester_priority,\ndeadline_s, deadline_at}`` there with the token in ``X-SF-Vacate-Token``,\nand the asker is answered ``409 lease_vacating`` (``retry_after_s``,\n``Retry-After``) until this lease is released or ``leases.vacate_timeout_s``\npasses. A card already leased by an equal or better class, or by a holder\nthat registered no URL, is a plain ``409 lease_conflict`` -- also with\n``Retry-After`` now. ``force`` never overrides a standing lease. Every 409\nkeeps ``error.code: lease_conflict``; ``error.studioforge.code`` names the\nspecific case (``lease_outranked``, ``resident_outranks``,\n``resident_pinned``, ``lease_conflict``; D87).\n\nThe reply is the lease record at the top level (``id``/``lease_id`` and\nevery field, as before) and again under ``lease`` -- the canonical place to\nread it from (D87) -- plus ``evicted``, ``adopted`` and\n``deprecated_fields``.",
         "operationId": "create_lease_api_leases_post",
         "requestBody": {
           "content": {
@@ -2502,7 +2520,7 @@
     },
     "/api/leases/{lease_id}": {
       "delete": {
-        "description": "Release a lease -- also how a holder answers a vacate request (D56).\n\nAn ``admin`` caller may release any lease; an ``inference`` key only the\none it took (``403 permission_denied`` otherwise, 2.0.1).\n\nThe lease is the resource boundary (D87, lead decision F-2): the models it\nnames -- the ones it was taken for, a resident copy the grant adopted, a\nmodel a ``lease_id`` load bound to it -- are unloaded with it and listed in\n``unloaded``. ``?unload=false`` keeps them resident. A model serving a\nrequest, a pinned one, or one another lease names is never unloaded here;\nit is listed in ``kept`` with the reason.",
+        "description": "Release a lease -- also how a holder answers a vacate request (D56).\n\nAn ``admin`` caller may release any lease; an ``inference`` key only the\none it took (``403 permission_denied`` otherwise, 2.0.1).\n\nThe lease is the resource boundary (D87, lead decision F-2): the models it\nnames -- the ones it was taken for, a resident copy the grant adopted, a\nmodel a ``lease_id`` load bound to it -- are unloaded with it and listed in\n``unloaded``. ``?unload=false`` keeps them resident. A model serving a\nrequest, a pinned one, or one another lease names is never unloaded here;\nit is listed in ``kept`` with the reason.\n\nThe lease's own instances (D91) always end with it, ``unload=false`` or not,\nbusy or not: a request in flight on one ends with ``instance_released``\n(410, or an SSE error frame mid-stream), a later request naming its id is\n404 ``instance_not_found``. They are listed in ``instances_ended``.",
         "operationId": "release_lease_api_leases__lease_id__delete",
         "parameters": [
           {
@@ -2936,6 +2954,20 @@
       "get": {
         "description": "The whole library, each row's saved record plus what it is doing now.\n\nAdditive per-row keys on top of the stored ``ModelRecord``: ``loaded`` /\n``state`` / ``port`` (is there a child, and where), ``ttl_remaining_s`` and\n``effective_ttl_s`` (0 means pinned), ``active_requests`` and\n``last_tokens_per_second``, and ``priority`` -- the tier this model would\nload at right now (D46/D48): the running instance if there is one, else the\nin-memory memo of what clients have been asking for, else the saved\n``settings.priority``, else background.\n\n``priority`` and ``effective_ttl_s`` share a caveat: both are **soft\nanswers** about the *next* load, not promises. A request may still name its\nown tier, and a tier that outranks the standing one wins.\n\n``effective`` (D54) is the opposite kind of answer: the launch settings a\n*running* child was really started with -- prompt cache, continuous\nbatching, KV pool shape, slots -- parsed from its argv with the engine's\ndefaults filled in. ``null`` for anything not loaded.\n\n``arch_supported`` (D66): whether the llama.cpp build that would serve the\nnext load (the model's ``engine_tag`` pin, else the active build) can load\nits architecture -- ``false`` with a short ``arch_note``, ``engine_supported:\nfalse`` and the full ``unsupported_reason`` when it certainly cannot, ``null``\nwhen that cannot be told. Every load of a ``false`` model is refused ``400\nunsupported_architecture``. ``last_load_failure`` (``{at, code, message,\nengine_tag}``) is the last launch of the model that died, until one works:\nthe failed child is gone, so ``state`` alone would just say ``stopped``.",
         "operationId": "list_models_api_models_get",
+        "parameters": [
+          {
+            "description": "Also list the instances leases created (<model>:<n>, <model>@<tag>; D91).",
+            "in": "query",
+            "name": "include_ephemeral",
+            "required": false,
+            "schema": {
+              "default": false,
+              "description": "Also list the instances leases created (<model>:<n>, <model>@<tag>; D91).",
+              "title": "Include Ephemeral",
+              "type": "boolean"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -2948,6 +2980,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
         "summary": "List Models",
@@ -4429,7 +4471,7 @@
     },
     "/api/models/{model_id}/unload": {
       "post": {
-        "description": "Stop the child serving this model. Open, except against a GPU lease (D55).\n\nLogged with the caller (D70): the peer address, the ``X-SF-Client`` label\nand what the model was serving at that moment. This route does not\ndrain -- requests in flight are cut -- and until D70 nothing recorded who\nhad asked.",
+        "description": "Stop the child serving this model. Open, except against a GPU lease (D55).\n\nLogged with the caller (D70): the peer address, the ``X-SF-Client`` label\nand what the model was serving at that moment. This route does not\ndrain -- requests in flight are cut -- and until D70 nothing recorded who\nhad asked.\n\n**Whose instance (D91).** A base id from a caller holding its own instance\nof the model (by ``X-SF-Lease``, its ``X-SF-Client`` label against the\nlease's holder, or the key that took the lease) unloads THAT instance; the\nreply's ``unloaded_id`` names it. Another holder's instance is touched only\non its exact id, with an admin credential and ``force: true`` (409\n``instance_held`` otherwise). A model a lease holds that is serving another\nclient's requests is a 409 ``instance_in_use`` naming them unless the body\n(or query) says ``force: true`` -- the lease waiver never implies it.",
         "operationId": "unload_model_api_models__model_id__unload_post",
         "parameters": [
           {
@@ -4442,6 +4484,24 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "additionalProperties": true,
+                    "type": "object"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Body"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "content": {
