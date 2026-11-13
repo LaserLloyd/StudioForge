@@ -567,7 +567,9 @@ async def _undrain(state: Any) -> None:
 
 
 @router.get("/capabilities")
-async def capabilities(request: Request, check_update: bool = False) -> dict[str, Any]:
+async def capabilities(
+    request: Request, check_update: bool = False, brief: bool = False
+) -> dict[str, Any]:
     """What this backend supports, what the hardware allows, and what is newer.
 
     Answers "what kinds of model can I actually run?" in one call, for the GUI,
@@ -578,8 +580,19 @@ async def capabilities(request: Request, check_update: bool = False) -> dict[str
     ``features`` (named behaviours such as ``plan_recommended``, with
     ``feature_decisions`` naming the decision behind each). Additive, and correct
     for a server running past its release tag, which ``/api/version`` is not.
+
+    ``?brief=true`` returns only ``{product, version, features, decisions,
+    feature_decisions, latest_decision}`` and needs no credential (unless
+    ``server.public_capabilities_brief`` is off).
     """
-    from studioforge.core.capabilities import build_report, implemented_report
+    from studioforge.core.capabilities import brief_report, build_report, implemented_report
+
+    if brief:
+        # ``?brief=true`` (D90, lead decision F-5): product, version, feature
+        # names and decision numbers only -- no hardware, engine or paths --
+        # which is why it is also served without a key (server.public_
+        # capabilities_brief). A probe-then-degrade client reads this first.
+        return brief_report()
 
     state = _state(request)
     gpus = await asyncio.to_thread(state.probe.list_gpus)  # vendor tools: off the event loop

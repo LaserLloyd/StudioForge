@@ -411,6 +411,10 @@ _FALLBACK_DESCRIPTIONS: dict[str, str] = {
     "shuts down.",
     "server.request_timeout_s": "Seconds a single upstream request may take before it is "
     "abandoned with a 504.",
+    "server.identity_headers": "Send Server, X-Request-Id, X-SF-Model and X-SF-Engine on "
+    "responses so a client or a log can tell which server, model and engine build answered.",
+    "server.public_capabilities_brief": "Serve GET /api/capabilities?brief=true (product, "
+    "version, feature names, decision numbers) without an API key.",
     "gui.enabled": "Serve the control panel.",
     "gui.host": "Address the control panel binds to.",
     "gui.port": "TCP port of the control panel.",

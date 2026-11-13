@@ -1,5 +1,5 @@
 {
-  "count": 118,
+  "count": 120,
   "env_nested_delimiter": "__",
   "env_prefix": "SF_",
   "levels": [
@@ -205,6 +205,34 @@
       "secret": false,
       "section": "server",
       "type": "float"
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": true,
+      "description": "Answer every response with `Server: StudioForge/<version>` and `X-Request-Id`, and every response a model produced with `X-SF-Model` and `X-SF-Engine`. On by default (D90): it is how a client, a log and a bug report say which server, model and build answered.",
+      "env": "SF_SERVER__IDENTITY_HEADERS",
+      "key": "server.identity_headers",
+      "label": "Identity headers",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "server",
+      "type": "bool"
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": true,
+      "description": "Serve `GET /api/capabilities?brief=true` (product, version, feature names, decision numbers) without a key. The full report stays `read` scope. Off makes the brief form need a key like the rest.",
+      "env": "SF_SERVER__PUBLIC_CAPABILITIES_BRIEF",
+      "key": "server.public_capabilities_brief",
+      "label": "Public capabilities brief",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "server",
+      "type": "bool"
     },
     {
       "choices": null,

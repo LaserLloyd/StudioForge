@@ -299,6 +299,44 @@ _ENTRIES: tuple[ErrorEntry, ...] = (
         "Load a model of that kind first, or name a model explicitly.",
     ),
     _e(
+        "model_required",
+        400,
+        _INVALID,
+        "No model was named, and {resident_count} models are loaded that could serve this "
+        "request, so there is no single one to pick.",
+        'Name the model: the "model" field in a POST body, the ?model= query parameter on a '
+        "GET, or the X-SF-Model header. With exactly one model loaded the name may be omitted. "
+        "GET /models lists the ids and their status.",
+    ),
+    _e(
+        "model_not_loaded",
+        404,
+        _INVALID,
+        "The model '{model}' is not loaded, and this request said not to load it "
+        "(autoload=false, or a GET that never loads).",
+        'Load it first with POST /models/load {"model": "<id>"}, or repeat the request '
+        "without autoload=false (POST routes load the model just in time). GET /models shows "
+        "which models are loaded.",
+    ),
+    _e(
+        "tool_call_parse_failed",
+        502,
+        _SERVER,
+        "The model produced a tool call the engine could not parse: {upstream_message}",
+        "Retry the request (the model's output differs per attempt), simplify or tighten the "
+        "tools schema, or lower the temperature. The engine's own words are in the message "
+        "unchanged.",
+    ),
+    _e(
+        "context_exceeds_training",
+        400,
+        _INVALID,
+        "'{model}' is trained to {n_ctx_train} tokens; the request asked for {requested_ctx}.",
+        "Ask for no more than the trained window (error.studioforge.n_ctx_train carries it). "
+        "Serving past the trained window needs RoPE scaling and degrades quality, so this "
+        "server does not do it silently.",
+    ),
+    _e(
         "unsupported_architecture",
         400,
         _INVALID,

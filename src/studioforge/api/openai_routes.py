@@ -27,6 +27,7 @@ import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from studioforge.api.identity import enforce_autoload, note_serving
 from studioforge.api.vision import prepare_messages
 from studioforge.core.attribution import attributed_source, client_of
 from studioforge.core.harmony import guard_tool_schemas, record_uses_harmony, repair_history
@@ -91,8 +92,13 @@ async def _wait_for_scan(state: Any) -> None:
 
 
 @router.get("/v1/models")
-async def list_models(request: Request) -> JSONResponse:
-    """Every downloaded model, loaded or not -- LM Studio parity."""
+async def list_models(request: Request, loaded: bool = False) -> JSONResponse:
+    """Every downloaded model, loaded or not -- LM Studio parity.
+
+    ``?loaded=true`` keeps only the models that are resident and ready (D90);
+    the default stays "everything downloaded", which is what LM Studio clients
+    expect and what a JIT-loading client needs.
+    """
     state = _app_state(request)
     # A client that connects the moment the port answers (OpenClaw reconnects
     # on a timer) must not read an empty library because the boot scan is
@@ -106,6 +112,8 @@ async def list_models(request: Request) -> JSONResponse:
     arch_memo: dict[Any, Any] = {}
     for entry in data:
         _decorate_openai_entry(state, entry, arch_memo=arch_memo)
+    if loaded:
+        data = [entry for entry in data if entry["state"] == "loaded"]
     return JSONResponse({"object": "list", "data": data})
 
 
@@ -186,6 +194,66 @@ def _decorate_openai_entry(
             instance.effective.compact() if instance.effective is not None else None
         )
     entry["studioforge"]["state"] = entry["state"]
+    _decorate_router_vocabulary(state, entry, instance)
+
+
+def architecture_modalities(record: ModelRecord | None) -> dict[str, list[str]]:
+    """llama-server's ``architecture`` object: what a model takes in and gives out.
+
+    Derived from the registry record (no load, no file read): ``image`` when the
+    model has vision, ``text`` always -- the README's own fallback when the GGUF
+    metadata is unavailable.
+    """
+    inputs = ["text"]
+    if record is not None and record.capabilities.vision:
+        inputs.append("image")
+    return {"input_modalities": inputs, "output_modalities": ["text"]}
+
+
+def _decorate_router_vocabulary(state: Any, entry: dict[str, Any], instance: Any) -> None:
+    """The llama-server router fields on a ``/v1/models`` entry (D90), additive.
+
+    ``status.value`` is the standard state vocabulary (``unloaded|loading|loaded``);
+    top-level ``state`` (``not-loaded`` spelling) and ``studioforge.state`` stay as
+    deprecated aliases with the same meaning. ``meta`` is llama-server's own block
+    (``n_vocab``, ``n_ctx_train``, ``n_embd``, ``n_params``, ``size``) from the GGUF
+    header the registry already parsed; ``studioforge.loaded_instances`` and
+    ``max_context_length`` are LM Studio's per-model fields.
+    """
+    value = {"loaded": "loaded", "loading": "loading"}.get(entry["state"], "unloaded")
+    status: dict[str, Any] = {"value": value}
+    args = getattr(instance, "launch_args", None) if instance is not None else None
+    if value != "unloaded" and args:
+        status["args"] = list(args)
+    entry["status"] = status
+    record = state.registry.get(entry["id"])
+    entry["architecture"] = architecture_modalities(record)
+    meta = getattr(record, "meta", None)
+    studio = entry["studioforge"]
+    studio["max_context_length"] = meta.n_ctx_train if meta is not None else None
+    if meta is not None:
+        block = {
+            "n_vocab": meta.n_vocab,
+            "n_ctx_train": meta.n_ctx_train,
+            "n_embd": meta.n_embd,
+            "n_params": meta.param_count,
+            "size": record.size_bytes if record is not None else None,
+        }
+        entry["meta"] = {k: v for k, v in block.items() if v}
+    instances: list[dict[str, Any]] = []
+    if value == "loaded" and instance is not None:
+        plan = instance.plan
+        config: dict[str, Any] = {}
+        if plan is not None:
+            config = {"context_length": plan.ctx_size, "parallel": plan.parallel}
+        instances.append(
+            {
+                "id": instance.model_id,
+                "config": config,
+                "context_length": plan.ctx_size if plan is not None else None,
+            }
+        )
+    studio["loaded_instances"] = instances
 
 
 def _serving_id(state: Any, model_id: str) -> str:
@@ -343,6 +411,8 @@ async def prepare_chat(request: Request, body: dict[str, Any]) -> PreparedChat:
     # A preset-only virtual model is served by its base's instance; everything
     # from here down (load, URL, request accounting) keys off `serving`.
     serving = state.manager.serving_record(record)
+    note_serving(serving.id)
+    enforce_autoload(request, state, serving.id)
     _note_client(state, request, serving.id)
     # The X-SF-Client label (else the peer address) rides on the load's
     # ``source`` and on the in-flight record for this request (D70).
@@ -575,6 +645,7 @@ async def completions(request: Request) -> Any:
         # Sampler defaults only: there are no messages to carry a system prompt.
         record.preset.apply_to_payload(payload, chat=False)
     serving = state.manager.serving_record(record)
+    enforce_autoload(request, state, serving.id)
     _note_client(state, request, serving.id)
     client = client_of(request)
     await state.manager.ensure_loaded(
@@ -611,6 +682,7 @@ async def embeddings(request: Request) -> Any:
     if "input" not in payload:
         raise BadRequestError("'input' is required", param="input")
     serving = state.manager.serving_record(record)
+    enforce_autoload(request, state, serving.id)
     _note_client(state, request, serving.id)
     client = client_of(request)
     await state.manager.ensure_loaded(
@@ -631,6 +703,7 @@ async def rerank(request: Request) -> Any:
     payload = dict(body)
     payload["model"] = record.id
     serving = state.manager.serving_record(record)
+    enforce_autoload(request, state, serving.id)
     _note_client(state, request, serving.id)
     client = client_of(request)
     await state.manager.ensure_loaded(
@@ -649,6 +722,7 @@ async def tokenize(request: Request) -> Any:
     model_name = _resolve_loaded_alias(state, _require_model(body, state.config), want="chat")
     record = _resolve_or_404(state, model_name)
     serving = state.manager.serving_record(record)
+    enforce_autoload(request, state, serving.id)
     _note_client(state, request, serving.id)
     client = client_of(request)
     await state.manager.ensure_loaded(
@@ -1013,6 +1087,7 @@ async def _forward(
         raise UpstreamError(f"model '{record.id}' is not serving")
     url = f"{base}{path}"
     stream = bool(payload.get("stream"))
+    note_serving(record.id)
 
     started = time.perf_counter()
 
@@ -1062,8 +1137,10 @@ async def _forward(
             overflow = _context_overflow(response, record, state)
             if overflow is not None:
                 raise overflow
+            message = _upstream_message(response, record.id, state)
             raise UpstreamError(
-                _upstream_message(response, record.id, state),
+                message,
+                code=_upstream_code(message),
                 status_code=response.status_code if response.status_code < 500 else 502,
             )
         data = response.json()
@@ -1153,7 +1230,7 @@ async def _stream_upstream(
                     sent_done = True
                     return
                 message = _upstream_message(response, record.id, state)
-                yield _sse_error(message, code="upstream_error")
+                yield _sse_error(message, code=_upstream_code(message))
                 yield b"data: [DONE]\n\n"
                 sent_done = True
                 return
@@ -1342,6 +1419,26 @@ def _context_overflow(
         code="context_exceeded",
         details=details,
     )
+
+
+#: The engine's own wordings for "the model's tool call could not be parsed". The
+#: text is passed through untouched (CrucibleForge matches it); the code is added
+#: beside it so a client can branch without matching prose.
+_TOOL_CALL_MARKERS = (
+    "failed to parse tool call",
+    "invalid tool call",
+    "tool call arguments",
+    "unable to generate parser",
+)
+
+
+def _upstream_code(message: str) -> str:
+    """``tool_call_parse_failed`` for the engine's tool-call refusals, else ``upstream_error``."""
+    text = message.lower()
+    code = "upstream_error"
+    if any(marker in text for marker in _TOOL_CALL_MARKERS):
+        code = "tool_call_parse_failed"
+    return code
 
 
 def _upstream_error_body(response: httpx.Response) -> dict[str, Any]:

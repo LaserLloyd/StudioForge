@@ -100,6 +100,8 @@ server:
     key_file: null
   drain_timeout_s: 30.0
   request_timeout_s: 900.0
+  identity_headers: true
+  public_capabilities_brief: true
 gui:
   enabled: true
   host: 127.0.0.1

@@ -70,6 +70,42 @@ persona (a preset-only virtual model) is served by its base model and reports th
 | `POST /v1/tokenize` | extension | llama-server's tokenizer. |
 | `/v1/audio/*`, `/v1/images/*`, `/v1/files`, `/v1/batches`, Assistants | no | Out of scope. |
 
+### llama-server router and native routes (D90)
+
+A client written for stock `llama-server` (build b12110, `tools/server/README.md`) works unchanged; the
+extras are StudioForge's. The router vocabulary is canonical for model state and load/unload; the older
+`/api/models/{id}/load|load-recommended|unload|plan|plan-recommended` routes keep working and answer with
+`Deprecation: @1794182400` and `Link: <docs/MIGRATION.md>; rel="deprecation"` (no `Sunset` yet).
+
+| Endpoint | Status | Notes |
+| --- | --- | --- |
+| `GET /models` | yes | `data[]` of `{id, path, status{value, args?, failed?, exit_code?}, architecture{input_modalities, output_modalities}, sidecars?, studioforge{...}}`. `status.value` is `unloaded`, `loading` or `loaded` (`failed: true` on an unloaded model whose last launch died). `?reload=1` rescans the library first (admin, like `POST /api/models/scan`). |
+| `POST /models/load` | yes | `{"model"}` as in llama-server, plus `context_length` (tokens per slot), `devices`, `allowed_devices`, `parallel`, `min_slots`, `max_slots`, `kv_cache_type`, `kv_cache_type_v`, `kv_unified`, `priority`, `persist`, `lease_id`. `context_length` alone is the strict walk of `load-recommended`; `devices` / `parallel` / `kv_cache_type*` / `force` is the explicit load; a bare model is a plain load. Reply: `{"success": true, ...instance}`. Unknown keys are ignored. |
+| `POST /models/load?dryRun=true` | extension | The same decision, nothing started: the plan body with `dry_run: true`. |
+| `POST /models/unload` | yes | `{"model"}` -> `{"success": true, "unloaded": bool}`. |
+| `POST /tokenize`, `/detokenize`, `/apply-template`, `/completion`, `/infill`, `/embedding`, `/reranking` (`/rerank`) | yes | The child's answer, status and body byte for byte (`stream: true` relays the child's SSE untouched, no `[DONE]` added). Needs an `inference` key. |
+| `GET /props`, `GET /slots` | yes | The child's JSON; `/props` gains one key, `studioforge` (instance id, devices, split, parallel, `ctx_per_slot`, KV types, batch sizes, engine tag, `lease_id` when leased). `POST /props` is a 405: per-model settings are the source of truth. |
+| `GET /v2/health/live`, `GET /v2/health/ready`, `GET /v2/models/{id}/ready` | yes | KServe v2 probes. The two server probes need no key; ready is 503 while booting or draining. A model is ready (200) only when resident and serving, else 503 with its state. |
+
+**Which model.** A POST names it in the JSON body (`model`), a GET in `?model=`; `X-SF-Model` works on both
+(body, then query, then header). With no name: the one resident model that can serve the route, else
+`models.default_model`, else `400 model_required` listing the loaded ids. A named model that is not
+resident is loaded just in time on a POST; a GET never loads unless it says `?autoload=true`.
+`?autoload=false` on any inference POST (native, `/v1/chat/completions`, `/v1/completions`,
+`/v1/embeddings`, `/v1/rerank`, `/v1/tokenize`) refuses the load with `404 model_not_loaded`.
+
+**Identity headers** (`server.identity_headers`, default on) on every response: `Server: StudioForge/<ver>`,
+`X-Request-Id` (the client's own, when it sent a token of 1-128 safe characters; also bound into the log
+line), and on responses a model produced `X-SF-Model` (the instance that served it) and `X-SF-Engine`
+(the llama.cpp build). `GET /health` adds `product: "StudioForge"`; `GET /api/capabilities?brief=true`
+(`product`, `version`, `features`, `decisions`, `feature_decisions`) needs no key
+(`server.public_capabilities_brief`, default on).
+
+`GET /v1/models` entries gain llama-server's `status{value, args}`, `architecture{...}` and `meta{n_vocab,
+n_ctx_train, n_embd, n_params, size}`, plus `studioforge.loaded_instances[]` and
+`studioforge.max_context_length`; `?loaded=true` keeps only resident models. `state` (`not-loaded`
+spelling) stays as before.
+
 ### Anthropic-compatible
 
 | Endpoint | Status | Notes |
@@ -174,6 +210,13 @@ Every route answers errors with `{"error": {"message", "type", "code", "param"}}
 `studioforge` block carries diagnostics; `/v1/messages` uses Anthropic's envelope with the same `code`).
 Unknown routes, including anything unrecognised under `/api/v1`, are JSON 404s in that envelope.
 
+Management routes (`/api/*` except the LM Studio trees, and `/models/*`) answer RFC 9457
+`application/problem+json` to a caller that sends `Accept: application/problem+json`: `type`
+(`urn:studioforge:error:<code>`), `title`, `status`, `detail`, `instance` (`urn:studioforge:request:<id>`,
+the `X-Request-Id`), `code`, `fix`, `retry_after_s` and `studioforge`, with the legacy `error{}` object
+embedded whole. Without that header the body is the envelope above, unchanged, plus a `Deprecation` marker;
+the default flips only once every caller has migrated. Inference routes never negotiate.
+
 Codes introduced with the compatibility surface:
 
 | `code` | HTTP | Where | Meaning |
@@ -182,6 +225,10 @@ Codes introduced with the compatibility surface:
 | `unsupported_parameter` | 400 | `/v1/messages`, `/v1/responses`, `/api/v1/models/*` | A field or content type that would change the answer is not supported; `param` names it. |
 | `instance_not_found` | 404 | `POST /api/v1/models/unload` | The model exists but has no loaded instance. |
 | `download_not_found` | 404 | `GET /api/v1/models/download/status/{job_id}` | No such download job. |
+| `model_required` | 400 | native routes, `POST /models/load` and `/models/unload` | No model was named and the choice is not unique; `error.studioforge.resident` lists the loaded ids. |
+| `model_not_loaded` | 404 | any inference POST with `?autoload=false`; native `GET`s | The model is not resident and this request said not to load it. |
+| `tool_call_parse_failed` | 502 | `/v1/*` | The engine could not parse the model's tool call; its own message is kept verbatim. |
+| `context_exceeds_training` | 400 | `load-recommended`, `POST /models/load` | The context asked for is past the trained window; `error.studioforge.n_ctx_train` has the number. |
 
 The existing codes (`model_not_found`, `insufficient_vram`, `model_busy`, `context_exceeded`, ...) apply
 unchanged.

@@ -30,6 +30,7 @@ from studioforge.api import (
     health_routes,
     lmstudio_routes,
     mgmt_routes,
+    native_routes,
     openai_routes,
     responses_routes,
     security_routes,
@@ -41,6 +42,8 @@ from studioforge.api.auth import (
     principal_of,
     required_scope,
 )
+from studioforge.api.identity import IdentityMiddleware
+from studioforge.api.problem import error_response
 from studioforge.auditlog import AuditLog
 from studioforge.build import build_id
 from studioforge.config import Config, load_config
@@ -66,7 +69,17 @@ log = get_logger(__name__)
 
 #: Paths that answer during the boot without waiting for the first library
 #: scan: liveness for the watchdog/tray/load balancers, and the API docs.
-_NO_BOOT_WAIT_PATHS = frozenset({"/health", "/healthz", "/api/health", "/docs", "/openapi.json"})
+_NO_BOOT_WAIT_PATHS = frozenset(
+    {
+        "/health",
+        "/healthz",
+        "/api/health",
+        "/docs",
+        "/openapi.json",
+        "/v2/health/live",
+        "/v2/health/ready",
+    }
+)
 
 #: Refusals an operator should see in a WARNING filter (D64, CR-3): the ones
 #: whose documented client behaviour is to stop and escalate or change the
@@ -229,7 +242,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 self._audit(request, result="denied", detail=exc.code)
             if metrics is not None:
                 metrics.observe(method, "(rejected)", exc.status_code, time.monotonic() - started)
-            return JSONResponse(exc.to_payload(), status_code=exc.status_code, headers=headers)
+            return error_response(request, exc.to_payload(), exc.status_code, headers)
         if request.url.path not in _NO_BOOT_WAIT_PATHS:
             await wait_for_boot(request.app.state, timeout_s=SCAN_WAIT_S, scan_only=True)
         response = await call_next(request)
@@ -971,7 +984,12 @@ def create_app(
         allow_headers=["*"],
     )
 
+    # Outermost: the request id and identity headers reach every response,
+    # including a CORS preflight and an authentication refusal (D90).
+    app.add_middleware(IdentityMiddleware, config=config)
+
     app.include_router(openai_routes.router, tags=["openai"])
+    app.include_router(native_routes.router, tags=["llama-server"])
     app.include_router(lmstudio_routes.router, tags=["lmstudio"])
     app.include_router(anthropic_routes.router, tags=["anthropic"])
     app.include_router(responses_routes.router, tags=["openai"])
@@ -1027,6 +1045,15 @@ def create_app(
         loaded = app.state.supervisor.list()
         payload: dict[str, Any] = {
             "status": "ok",
+            # Who is answering (D90): a client that probes /health on "an
+            # OpenAI-compatible server" tells StudioForge from stock
+            # llama-server by this key, then reads /api/capabilities?brief=true.
+            "product": "StudioForge",
+            "api": {
+                "openai": "v1",
+                "studioforge": "v1",
+                "capabilities": "/api/capabilities",
+            },
             "version": __version__,
             # The commit this process runs from (D70): `version` names the
             # last release and a server past its tag still reports the tag;
@@ -1171,7 +1198,7 @@ def _install_error_handlers(app: FastAPI) -> None:
     """
 
     @app.exception_handler(StudioForgeError)
-    async def _studioforge_error(_request: Request, exc: StudioForgeError) -> JSONResponse:
+    async def _studioforge_error(request: Request, exc: StudioForgeError) -> JSONResponse:
         log_rejection(exc)
         headers: dict[str, str] = {}
         # A 503 here means "busy / transient", so tell the client how long to
@@ -1186,16 +1213,17 @@ def _install_error_handlers(app: FastAPI) -> None:
         # when nothing is going to change.
         elif exc.details.get("retry_after_s"):
             headers["Retry-After"] = str(int(exc.details["retry_after_s"]))
-        return JSONResponse(exc.to_payload(), status_code=exc.status_code, headers=headers)
+        return error_response(request, exc.to_payload(), exc.status_code, headers)
 
     from fastapi.exceptions import RequestValidationError
     from starlette.exceptions import HTTPException as StarletteHTTPException
 
     @app.exception_handler(StarletteHTTPException)
-    async def _http_error(_request: Request, exc: StarletteHTTPException) -> JSONResponse:
+    async def _http_error(request: Request, exc: StarletteHTTPException) -> JSONResponse:
         error_type = "invalid_request_error" if exc.status_code < 500 else "server_error"
         code = HTTP_STATUS_CODES.get(exc.status_code)
-        return JSONResponse(
+        return error_response(
+            request,
             {
                 "error": {
                     "message": str(exc.detail),
@@ -1205,13 +1233,14 @@ def _install_error_handlers(app: FastAPI) -> None:
                     **envelope_extras(code),
                 }
             },
-            status_code=exc.status_code,
-            headers=dict(exc.headers or {}),
+            exc.status_code,
+            dict(exc.headers or {}),
         )
 
     @app.exception_handler(RequestValidationError)
-    async def _validation_error(_request: Request, exc: RequestValidationError) -> JSONResponse:
-        return JSONResponse(
+    async def _validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+        return error_response(
+            request,
             {
                 "error": {
                     "message": f"Invalid request: {exc.errors()}",
@@ -1221,11 +1250,11 @@ def _install_error_handlers(app: FastAPI) -> None:
                     **envelope_extras("invalid_request"),
                 }
             },
-            status_code=400,
+            400,
         )
 
     @app.exception_handler(Exception)
-    async def _unhandled(_request: Request, exc: Exception) -> JSONResponse:
+    async def _unhandled(request: Request, exc: Exception) -> JSONResponse:
         # D55: the body used to be f"Internal server error: {exc}". An unhandled
         # exception's text is written for the operator, not for a caller -- it
         # carries absolute paths, SQL, httpx URLs -- and on an open install
@@ -1237,7 +1266,8 @@ def _install_error_handlers(app: FastAPI) -> None:
 
         ref = uuid.uuid4().hex[:8]
         log.exception("unhandled error", error=str(exc), ref=ref)
-        return JSONResponse(
+        return error_response(
+            request,
             {
                 "error": {
                     "message": (
@@ -1251,5 +1281,5 @@ def _install_error_handlers(app: FastAPI) -> None:
                     "studioforge": {"ref": ref},
                 }
             },
-            status_code=500,
+            500,
         )

@@ -420,6 +420,9 @@ async def _serve(config: Config, *, open_gui: bool = False) -> int:
             log_level=config.logging.level.lower(),
             log_config=None,
             access_log=False,
+            # The identity middleware owns the Server header (D90); without
+            # this uvicorn adds its own "Server: uvicorn" beside it.
+            server_header=False,
             timeout_graceful_shutdown=int(config.server.drain_timeout_s),
             **ssl_kwargs,
         ),

@@ -62,7 +62,38 @@ from studioforge.errors import AuthError
 # Endpoints reachable without a key: liveness probes and CORS preflight. Keeping
 # /health open lets the watchdog and load balancers check the server without
 # being handed a credential.
-PUBLIC_PATHS = frozenset({"/health", "/healthz", "/api/health", "/favicon.ico"})
+PUBLIC_PATHS = frozenset(
+    {
+        "/health",
+        "/healthz",
+        "/api/health",
+        "/favicon.ico",
+        # KServe v2 server probes (D90): same audience as /health -- an
+        # orchestrator that holds no credential.
+        "/v2/health/live",
+        "/v2/health/ready",
+    }
+)
+
+#: The one capabilities form that needs no key (lead decision F-5): product,
+#: version, feature names and decision numbers -- no hardware, engine or paths.
+#: Gated by ``server.public_capabilities_brief``.
+BRIEF_CAPABILITIES_PATH = "/api/capabilities"
+
+
+def is_public_brief_capabilities(path: str, query: Any, config: Any) -> bool:
+    """``GET /api/capabilities?brief=true`` on a server that publishes it."""
+    if path != BRIEF_CAPABILITIES_PATH:
+        return False
+    if not getattr(getattr(config, "server", None), "public_capabilities_brief", True):
+        return False
+    raw = ""
+    try:
+        raw = (query.get("brief") or "").strip().lower()
+    except Exception:  # noqa: BLE001 - a malformed query is simply not the brief form
+        return False
+    return raw in {"1", "true", "yes", "on"}
+
 
 #: Query values meaning "false" for the /health ``deep`` flag. Anything else
 #: (including junk) fails closed: ``/health?deep=true`` runs a real completion
@@ -499,7 +530,24 @@ _INFERENCE_PREFIXES: tuple[str, ...] = ("/v1/", "/api/v0/")
 #: there later must be a deliberate decision (``admin`` until listed here), not
 #: an ``inference`` key's accidental permission. Model download stays ``admin``.
 _INFERENCE_NATIVE_POSTS: frozenset[str] = frozenset(
-    {"/api/v1/chat", "/api/v1/models/load", "/api/v1/models/unload"}
+    {
+        "/api/v1/chat",
+        "/api/v1/models/load",
+        "/api/v1/models/unload",
+        # llama-server's own root routes (D90). Loading and unloading through the
+        # router vocabulary is the same residency right the per-model routes give
+        # an ``inference`` key; the natives are inference.
+        "/models/load",
+        "/models/unload",
+        "/tokenize",
+        "/detokenize",
+        "/apply-template",
+        "/completion",
+        "/embedding",
+        "/infill",
+        "/reranking",
+        "/rerank",
+    }
 )
 
 
@@ -800,6 +848,8 @@ def check_request(request: Request, config: Config, accounts: Any = None) -> Non
     if request.method == "OPTIONS":
         return
     deep = False
+    if is_public_brief_capabilities(path, request.query_params, config):
+        return
     if path in PUBLIC_PATHS:
         # The liveness form stays credential-free for watchdogs and load
         # balancers -- but /health?deep=true is genuine inference against

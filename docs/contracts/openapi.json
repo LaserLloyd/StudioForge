@@ -809,6 +809,211 @@
         "title": "HTTPValidationError",
         "type": "object"
       },
+      "ModelsLoadBody": {
+        "description": "``POST /models/load``: llama-server's ``{\"model\"}`` plus StudioForge's extras.\n\n``context_length`` is tokens PER SLOT (LM Studio's option name; the same\nnumber as ``ctx_size`` on ``/api/models/{id}/load-recommended``). Unknown\nkeys are ignored, as llama-server ignores them.",
+        "properties": {
+          "allowed_devices": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Allowed Devices"
+          },
+          "context_length": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Context Length"
+          },
+          "ctx_size": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ctx Size"
+          },
+          "devices": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Devices"
+          },
+          "force": {
+            "default": false,
+            "title": "Force",
+            "type": "boolean"
+          },
+          "kv_cache_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Kv Cache Type"
+          },
+          "kv_cache_type_v": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Kv Cache Type V"
+          },
+          "kv_min": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Kv Min"
+          },
+          "kv_unified": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Kv Unified"
+          },
+          "lease_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lease Id"
+          },
+          "max_slots": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Slots"
+          },
+          "min_slots": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Min Slots"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "parallel": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parallel"
+          },
+          "persist": {
+            "default": false,
+            "title": "Persist",
+            "type": "boolean"
+          },
+          "prefer_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prefer Mode"
+          },
+          "priority": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Priority"
+          }
+        },
+        "title": "ModelsLoadBody",
+        "type": "object"
+      },
+      "ModelsUnloadBody": {
+        "properties": {
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          }
+        },
+        "title": "ModelsUnloadBody",
+        "type": "object"
+      },
       "ValidationError": {
         "properties": {
           "ctx": {
@@ -1177,7 +1382,7 @@
     },
     "/api/capabilities": {
       "get": {
-        "description": "What this backend supports, what the hardware allows, and what is newer.\n\nAnswers \"what kinds of model can I actually run?\" in one call, for the GUI,\nthe CLI and MCP alike.\n\n``implemented`` (D64) is what a client feature-gates on: ``decisions`` (every\nDECISIONS.md number this build includes, ``\"D1\"`` .. ``latest_decision``) and\n``features`` (named behaviours such as ``plan_recommended``, with\n``feature_decisions`` naming the decision behind each). Additive, and correct\nfor a server running past its release tag, which ``/api/version`` is not.",
+        "description": "What this backend supports, what the hardware allows, and what is newer.\n\nAnswers \"what kinds of model can I actually run?\" in one call, for the GUI,\nthe CLI and MCP alike.\n\n``implemented`` (D64) is what a client feature-gates on: ``decisions`` (every\nDECISIONS.md number this build includes, ``\"D1\"`` .. ``latest_decision``) and\n``features`` (named behaviours such as ``plan_recommended``, with\n``feature_decisions`` naming the decision behind each). Additive, and correct\nfor a server running past its release tag, which ``/api/version`` is not.\n\n``?brief=true`` returns only ``{product, version, features, decisions,\nfeature_decisions, latest_decision}`` and needs no credential (unless\n``server.public_capabilities_brief`` is off).",
         "operationId": "capabilities_api_capabilities_get",
         "parameters": [
           {
@@ -1187,6 +1392,16 @@
             "schema": {
               "default": false,
               "title": "Check Update",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "brief",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Brief",
               "type": "boolean"
             }
           }
@@ -5450,6 +5665,94 @@
         ]
       }
     },
+    "/apply-template": {
+      "post": {
+        "description": "llama-server ``POST /apply-template`` (``messages`` -> ``prompt``), no inference.",
+        "operationId": "native_apply_template_apply_template_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Native Apply Template Apply Template Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Native Apply Template",
+        "tags": [
+          "llama-server"
+        ]
+      }
+    },
+    "/completion": {
+      "post": {
+        "description": "llama-server ``POST /completion`` (``prompt``, every native sampler field, ``stream``).\n\nThe model's preset sampler defaults fill absent fields, as on ``/v1/completions``.",
+        "operationId": "native_completion_completion_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Native Completion Completion Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Native Completion",
+        "tags": [
+          "llama-server"
+        ]
+      }
+    },
+    "/detokenize": {
+      "post": {
+        "description": "llama-server ``POST /detokenize`` (``tokens``).",
+        "operationId": "native_detokenize_detokenize_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Native Detokenize Detokenize Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Native Detokenize",
+        "tags": [
+          "llama-server"
+        ]
+      }
+    },
+    "/embedding": {
+      "post": {
+        "description": "llama-server ``POST /embedding`` (``content``): the non-OpenAI embedding shape.",
+        "operationId": "native_embedding_embedding_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Native Embedding Embedding Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Native Embedding",
+        "tags": [
+          "llama-server"
+        ]
+      }
+    },
     "/health": {
       "get": {
         "description": "Liveness by default; genuine generation when ``deep=true``.\n\nThe shallow answer stays the default because the watchdog and load\nbalancers poll it constantly, and it must stay free. But shallow is\nalso exactly the check that lied for hours during the incident behind\nthe deep mode -- a 200 here proves this process is alive and nothing\nmore. ``?deep=true`` is the one that proves models generate.",
@@ -5516,6 +5819,28 @@
         ]
       }
     },
+    "/infill": {
+      "post": {
+        "description": "llama-server ``POST /infill``: prefix / suffix plus every ``/completion`` option.",
+        "operationId": "native_infill_infill_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Native Infill Infill Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Native Infill",
+        "tags": [
+          "llama-server"
+        ]
+      }
+    },
     "/metrics": {
       "get": {
         "description": "Prometheus text: gateway counters, GPU memory and every loaded model's own metrics.",
@@ -5533,6 +5858,282 @@
         "summary": "Metrics",
         "tags": [
           "health"
+        ]
+      }
+    },
+    "/models": {
+      "get": {
+        "description": "llama-server router ``GET /models``: every model with ``status.value``.\n\n``status.value`` is ``unloaded``, ``loading`` or ``loaded`` (``failed: true``\non an unloaded model whose last launch died); ``architecture`` is the\n``input_modalities`` / ``output_modalities`` pair; ``studioforge`` carries the\nrest. ``?reload=1`` rescans the model library first (admin, like\n``POST /api/models/scan``).",
+        "operationId": "router_list_models_models_get",
+        "parameters": [
+          {
+            "description": "1 / true rescans the library first.",
+            "in": "query",
+            "name": "reload",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "1 / true rescans the library first.",
+              "title": "Reload"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Router List Models",
+        "tags": [
+          "llama-server"
+        ]
+      }
+    },
+    "/models/load": {
+      "post": {
+        "description": "llama-server router ``POST /models/load`` -> ``{\"success\": true, ...}``.\n\nTwo decisions behind one name, picked by what the body carries:\n\n* ``context_length`` alone (optionally with ``min_slots``, ``max_slots``,\n  ``kv_unified``, ``kv_min``, ``prefer_mode``, ``allowed_devices``,\n  ``priority``, ``persist``) is the strict walk of\n  ``/api/models/{id}/load-recommended``: exactly that context per slot or a\n  structured refusal.\n* ``devices``, ``parallel``, ``kv_cache_type(_v)`` or ``force`` is the explicit\n  load of ``/api/models/{id}/load``; ``context_length`` is then its ``ctx_size``.\n* Neither: the model's own settings, like a just-in-time load.\n\n``?dryRun=true`` runs the same decision without starting anything\n(:meth:`ModelManager.load_dry_run`, routed by the same\n:meth:`~ModelManager.load_route_for` as the real load) and returns the plan\nbody with ``dry_run: true`` and ``dry_run_of`` (``load`` or\n``load_recommended``) added. ``lease_id`` (body or ``?lease_id=``) binds the\nload to a lease the caller holds, as on ``/api/models/{id}/load`` (D87). The\nreply to a real load is the instance (as ``/load`` answers) with\n``success: true`` in front.",
+        "operationId": "router_load_model_models_load_post",
+        "parameters": [
+          {
+            "description": "Plan only; start nothing.",
+            "in": "query",
+            "name": "dryRun",
+            "required": false,
+            "schema": {
+              "default": false,
+              "description": "Plan only; start nothing.",
+              "title": "Dryrun",
+              "type": "boolean"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ModelsLoadBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Router Load Model Models Load Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Router Load Model",
+        "tags": [
+          "llama-server"
+        ]
+      }
+    },
+    "/models/unload": {
+      "post": {
+        "description": "llama-server router ``POST /models/unload`` -> ``{\"success\": true}``.\n\nIdempotent: a model that was not loaded answers ``success: true`` with\n``unloaded: false``. A model held by a GPU lease is refused unless the caller\nmay override it, exactly as ``POST /api/models/{id}/unload``.",
+        "operationId": "router_unload_model_models_unload_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ModelsUnloadBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Router Unload Model Models Unload Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Router Unload Model",
+        "tags": [
+          "llama-server"
+        ]
+      }
+    },
+    "/props": {
+      "get": {
+        "description": "llama-server ``GET /props``, plus a ``studioforge`` block.\n\n``/props?model=<id>`` (or the one resident model). The child's JSON is passed\nthrough untouched except for the added ``studioforge`` key: instance id,\nplacement, slots, KV types and engine tag.",
+        "operationId": "native_props_props_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Native Props",
+        "tags": [
+          "llama-server"
+        ]
+      },
+      "post": {
+        "description": "Refused: llama-server lets ``POST /props`` change global properties; here\na model's settings are the single source of truth.",
+        "operationId": "native_props_post_props_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Native Props Post",
+        "tags": [
+          "llama-server"
+        ]
+      }
+    },
+    "/rerank": {
+      "post": {
+        "description": "llama-server's alias of ``/reranking``.",
+        "operationId": "native_rerank_alias_rerank_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Native Rerank Alias Rerank Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Native Rerank Alias",
+        "tags": [
+          "llama-server"
+        ]
+      }
+    },
+    "/reranking": {
+      "post": {
+        "description": "llama-server ``POST /reranking`` (``query``, ``documents``, ``top_n``).",
+        "operationId": "native_reranking_reranking_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Native Reranking Reranking Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Native Reranking",
+        "tags": [
+          "llama-server"
+        ]
+      }
+    },
+    "/slots": {
+      "get": {
+        "description": "llama-server ``GET /slots`` for the selected model, the child's answer unchanged.",
+        "operationId": "native_slots_slots_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Native Slots",
+        "tags": [
+          "llama-server"
+        ]
+      }
+    },
+    "/tokenize": {
+      "post": {
+        "description": "llama-server ``POST /tokenize`` (``content``, ``add_special``, ``with_pieces``).",
+        "operationId": "native_tokenize_tokenize_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Native Tokenize Tokenize Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Native Tokenize",
+        "tags": [
+          "llama-server"
         ]
       }
     },
@@ -5626,8 +6227,20 @@
     },
     "/v1/models": {
       "get": {
-        "description": "Every downloaded model, loaded or not -- LM Studio parity.",
+        "description": "Every downloaded model, loaded or not -- LM Studio parity.\n\n``?loaded=true`` keeps only the models that are resident and ready (D90);\nthe default stays \"everything downloaded\", which is what LM Studio clients\nexpect and what a JIT-loading client needs.",
         "operationId": "list_models_v1_models_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "loaded",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Loaded",
+              "type": "boolean"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -5636,6 +6249,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
         "summary": "List Models",
@@ -5747,6 +6370,91 @@
         "summary": "Tokenize",
         "tags": [
           "openai"
+        ]
+      }
+    },
+    "/v2/health/live": {
+      "get": {
+        "description": "KServe v2 server liveness: this process answers.",
+        "operationId": "v2_live_v2_health_live_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response V2 Live V2 Health Live Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "V2 Live",
+        "tags": [
+          "llama-server"
+        ]
+      }
+    },
+    "/v2/health/ready": {
+      "get": {
+        "description": "KServe v2 server readiness: boot finished and not draining (503 otherwise).",
+        "operationId": "v2_ready_v2_health_ready_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "V2 Ready",
+        "tags": [
+          "llama-server"
+        ]
+      }
+    },
+    "/v2/models/{model_id}/ready": {
+      "get": {
+        "description": "KServe v2 model readiness: 200 when the model is resident and serving, else 503.",
+        "operationId": "v2_model_ready_v2_models__model_id__ready_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "V2 Model Ready",
+        "tags": [
+          "llama-server"
         ]
       }
     }

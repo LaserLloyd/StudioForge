@@ -76,7 +76,7 @@ FEATURE_NOTES: dict[str, str] = {
 #: on instead. **Bump it in the same commit that appends a decision**:
 #: ``tests/unit/test_capabilities_implemented.py`` reads the headings of
 #: ``DECISIONS.md`` and fails until the two agree.
-LATEST_DECISION = 89
+LATEST_DECISION = 90
 
 #: Every decision number this build includes, ``"D1"`` .. ``"D<LATEST_DECISION>"``.
 IMPLEMENTED_DECISIONS: tuple[str, ...] = tuple(f"D{n}" for n in range(1, LATEST_DECISION + 1))
@@ -198,7 +198,45 @@ SERVER_FEATURES: dict[str, str] = {
     "hardware_mode_families": "D89",
     # /metrics hw_gpu_memory_{usage_bytes,limit_bytes,utilization_ratio}.
     "hw_gpu_memory_metrics": "D89",
+    # Stock llama-server superset (D90): the router vocabulary at the root
+    # (GET /models, POST /models/load|unload, ?dryRun, ?autoload), the native
+    # per-model routes (/props, /slots, /tokenize, /detokenize, /apply-template,
+    # /completion, /embedding, /infill, /reranking) with the model selector,
+    # KServe /v2 probes, the Server / X-SF-Model / X-SF-Engine / X-Request-Id
+    # headers, /health.product, the public brief capabilities, RFC 9457
+    # problem+json by Accept negotiation on management routes.
+    "router_models_api": "D90",
+    "native_routes": "D90",
+    "model_selector": "D90",
+    "identity_headers": "D90",
+    "health_product": "D90",
+    "capabilities_brief": "D90",
+    "kserve_v2_health": "D90",
+    "problem_json": "D90",
+    "autoload_param": "D90",
+    "deprecation_headers": "D90",
 }
+
+
+def brief_report() -> dict[str, Any]:
+    """The public form of ``GET /api/capabilities`` (``?brief=true``, D90, lead decision F-5).
+
+    Product, version, feature names and decision numbers -- nothing about the
+    hardware, the engine, the library or any path, so it is safe to serve without a
+    credential. ``features`` / ``decisions`` are the same lists as
+    :func:`implemented_report`, which stays the gating contract.
+    """
+    from studioforge import __version__
+
+    implemented = implemented_report()
+    return {
+        "product": "StudioForge",
+        "version": __version__,
+        "latest_decision": implemented["latest_decision"],
+        "features": implemented["features"],
+        "decisions": implemented["decisions"],
+        "feature_decisions": implemented["feature_decisions"],
+    }
 
 
 def implemented_report() -> dict[str, Any]:

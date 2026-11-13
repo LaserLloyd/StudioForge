@@ -31,7 +31,7 @@ from studioforge.core import catalog as catalog_mod
 from studioforge.core.manager import ModelManager
 from studioforge.core.planner import OBS_SAFETY, OBSERVATION_NOTE_PER_PID_DEVICE, Planner
 from studioforge.db import Database
-from studioforge.errors import InsufficientVramError
+from studioforge.errors import BadRequestError, InsufficientVramError
 from studioforge.types import GB, LoadPlan, ModelRecord, ModelSettings
 from tests.unit.test_load_recommended import MODEL, Registry, make_manager, serving
 from tests.unit.test_load_retry import StubSupervisor
@@ -463,6 +463,29 @@ def test_profiles_price_modes_with_the_correction(database: Database) -> None:
 )
 def test_the_dry_run_routes_as_the_load_would(body: dict[str, Any], route: str) -> None:
     assert ModelManager.load_route_for(**body) == route
+
+
+def test_force_is_an_explicit_load_in_both() -> None:
+    """``force`` is the explicit load's reload licence; the walk never takes it."""
+    assert ModelManager.load_route_for(context_length=CTX, force=True) == "load"
+
+
+async def test_a_lease_bound_explicit_dry_run_plans_on_the_lease_and_binds_nothing(
+    database: Database,
+) -> None:
+    """The dry run of ``load(lease_id=...)`` (D87): the lease's cards, the same refusals."""
+    manager, supervisor, _planner = judge_manager(database)
+    lease = manager.leases.acquire([1], holder="judge-a")
+    dry = await manager.load_dry_run(JUDGE, context_length=4096, parallel=1, lease_id=lease.id)
+    assert dry["dry_run_of"] == "load"
+    assert dry["lease_id"] == lease.id and dry["lease_devices"] == [1]
+    assert JUDGE not in manager.leases.get(lease.id).model_ids, "a dry run binds nothing"
+    assert supervisor.starts == 0
+    with pytest.raises(BadRequestError):
+        # devices outside the lease: the 400 the bound load answers.
+        await manager.load_dry_run(
+            JUDGE, context_length=4096, devices=[0], parallel=1, lease_id=lease.id
+        )
 
 
 async def test_the_dry_run_of_an_explicit_load_is_that_loads_verdict(database: Database) -> None:

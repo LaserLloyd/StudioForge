@@ -8135,3 +8135,59 @@ facts, `SF_FAKE_GPUS` facts), `core/throughput.py` (`GPU_PERF_BY_CLASS_KEY`, `gp
 `mcp/management.py` GPU summaries, `docs/CATALOG.md`, `docs/DEVELOPMENT.md`; capabilities
 `gpu_card_facts`, `hardware_mode_families`, `hw_gpu_memory_metrics`;
 `tests/unit/test_gpu_card_facts.py`, `test_gpu.py`, `test_placements.py`, `test_mcp.py`.
+
+## D90 -- A clean superset of stock llama-server: router vocabulary, native routes, identity
+
+**Problem.** A client written for stock `llama-server` -- or one that probes "an OpenAI-compatible
+server on :1234" -- could not use StudioForge as one. The router vocabulary b12110 ships
+(`GET /models` with `status.value`, `POST /models/load|unload`, `?autoload`) did not exist; the
+per-model native routes (`/props`, `/slots`, `/tokenize`, `/completion`, ...) were reachable only
+on a child's internal port; nothing told StudioForge apart from llama-server, LM Studio or vLLM, and
+a response did not say which model and engine produced it. Management errors had one envelope with
+no standard form, and the StudioForge-specific spellings that now have standard twins were not
+marked as aliases.
+
+**Decision.**
+
+1. The root surface of llama-server b12110 -- `GET /models`, `POST /models/load` (with
+   `?dryRun=true`) and `/models/unload`, `?autoload`; `/props`, `/slots`, `/tokenize`,
+   `/detokenize`, `/apply-template`, `/completion`, `/infill`, `/embedding`, `/reranking` --
+   forwards to the selected child unchanged; only `/props` gains a `studioforge` block. Verified
+   against the b12110 README: `status.failed` / `exit_code` live inside `status`; the child
+   ignores an unknown `model` in a body.
+2. The model selector is the body's `model`, then `?model=`, then `X-SF-Model`; with none, the one
+   resident model able to serve the route, else `models.default_model`, else 400
+   `model_required`. GET natives never load unless `?autoload=true`; `?autoload=false` on a POST
+   is 404 `model_not_loaded` instead of a just-in-time load.
+3. `POST /models/load` is routed by `ModelManager.load_route_for` -- the one rule its dry run uses
+   too (`load_dry_run`, D88): a body that places the model (`devices`, `parallel`, a KV type, or
+   `force`) or names no `context_length` is the explicit load, a window alone is the strict walk.
+   `lease_id` (body or query) binds it to a lease the caller holds, as on the per-model routes
+   (D87). The dry run answers with `dry_run: true` and `dry_run_of`.
+4. KServe `/v2/health/live|ready` and `/v2/models/{id}/ready`; `/health.product ==
+   "StudioForge"`; a public `GET /api/capabilities?brief=true` (product, version, features,
+   decisions only; `server.public_capabilities_brief`, owner decision F-5).
+5. `Server: StudioForge/<version>`, `X-Request-Id` (a sane client id echoed), `X-SF-Model` and
+   `X-SF-Engine` on every response a model produced (`server.identity_headers`, default on, F-7).
+6. RFC 9457 `application/problem+json` on management routes by `Accept` negotiation only (F-9);
+   the legacy `error{}` envelope stays the default.
+7. `Deprecation` + `Link: <docs/MIGRATION.md>; rel="deprecation"` on the old load / plan / unload
+   aliases and the lease `touch` (F-10; no `Sunset` yet). `/v1/models` gains `status`,
+   `architecture` (modalities), `meta`, `studioforge.loaded_instances` and `?loaded=true`.
+
+**Not done.** The request id is not yet handed to the supervisor's in-flight record; native
+`/completions` 404s without a custom fix text; identity headers are not on an unhandled 500;
+`POST /slots/{id}?action=save|restore|erase` is not mounted. `tests/unit/native_stub.py` is a second
+stub child beside D85's.
+
+**Surfaces.** `api/native_routes.py`, `api/identity.py`, `api/problem.py` (new), `api/app.py`,
+`api/openai_routes.py`, `api/admin_routes.py`, `api/auth.py` (public paths, inference natives),
+`__main__.py` (`server_header=False`), `config.py` (`server.identity_headers`,
+`server.public_capabilities_brief`), `config.example.yaml`, `settings_schema.py`,
+`error_catalog.py` (`model_required`, `model_not_loaded`, `tool_call_parse_failed`,
+`context_exceeds_training`), `core/manager.py` (`load_route_for` `force`, `load_dry_run`
+`lease_id`), `core/capabilities.py` (`brief_report`), `capability_registry.py`, `docs/API.md`,
+generated contracts; capabilities `router_models_api`, `native_routes`, `model_selector`,
+`identity_headers`, `health_product`, `capabilities_brief`, `kserve_v2_health`, `problem_json`,
+`autoload_param`, `deprecation_headers`; `tests/unit/test_native_routes.py`,
+`test_router_routes.py`, `test_identity_headers.py`, `test_problem_json.py`.

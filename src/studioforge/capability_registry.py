@@ -123,6 +123,94 @@ CAPABILITIES: tuple[Capability, ...] = (
         panel="Advanced > Watchdog & recovery: Unload all models",
         cli="unload --all",
     ),
+    # --- stock llama-server superset (D90): the router vocabulary and natives ---
+    Capability(
+        "router.models",
+        "llama-server router listing: every model with status.value (unloaded|loading|loaded).",
+        api=("GET", "/models"),
+        notes="Standard spelling of GET /api/models state; ?reload=1 rescans (admin).",
+    ),
+    Capability(
+        "router.load",
+        "llama-server router load; ?dryRun=true plans without starting anything.",
+        api=("POST", "/models/load"),
+        notes="Canonical spelling of load / load-recommended / plan-recommended.",
+    ),
+    Capability(
+        "router.unload",
+        "llama-server router unload.",
+        api=("POST", "/models/unload"),
+    ),
+    Capability(
+        "native.props",
+        "llama-server /props for the selected model, plus a studioforge block.",
+        api=("GET", "/props"),
+    ),
+    Capability(
+        "native.props_post",
+        "llama-server POST /props: refused (405); per-model settings are the source of truth.",
+        api=("POST", "/props"),
+    ),
+    Capability(
+        "native.slots",
+        "llama-server /slots for the selected model.",
+        api=("GET", "/slots"),
+    ),
+    Capability(
+        "native.tokenize",
+        "llama-server /tokenize.",
+        api=("POST", "/tokenize"),
+    ),
+    Capability(
+        "native.detokenize",
+        "llama-server /detokenize.",
+        api=("POST", "/detokenize"),
+    ),
+    Capability(
+        "native.apply_template",
+        "llama-server /apply-template (chat template to prompt string, no inference).",
+        api=("POST", "/apply-template"),
+    ),
+    Capability(
+        "native.completion",
+        "llama-server /completion (native sampler fields, optional SSE stream).",
+        api=("POST", "/completion"),
+    ),
+    Capability(
+        "native.infill",
+        "llama-server /infill (fill-in-the-middle).",
+        api=("POST", "/infill"),
+    ),
+    Capability(
+        "native.embedding",
+        "llama-server /embedding (the non-OpenAI embedding shape).",
+        api=("POST", "/embedding"),
+    ),
+    Capability(
+        "native.reranking",
+        "llama-server /reranking.",
+        api=("POST", "/reranking"),
+    ),
+    Capability(
+        "native.rerank",
+        "llama-server /rerank, the alias of /reranking.",
+        api=("POST", "/rerank"),
+    ),
+    Capability(
+        "probe.v2_live",
+        "KServe v2 server liveness.",
+        api=("GET", "/v2/health/live"),
+    ),
+    Capability(
+        "probe.v2_ready",
+        "KServe v2 server readiness (503 while booting or draining).",
+        api=("GET", "/v2/health/ready"),
+    ),
+    Capability(
+        "probe.v2_model_ready",
+        "KServe v2 model readiness: 200 when the model is resident and serving.",
+        api=("GET", "/v2/models/{model_id}/ready"),
+    ),
     Capability(
         "models.delete",
         "Delete a model's files from disk (needs confirmation).",

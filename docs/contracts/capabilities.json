@@ -1159,6 +1159,149 @@
     },
     {
       "api": {
+        "method": "POST",
+        "path": "/apply-template"
+      },
+      "cli": null,
+      "description": "llama-server /apply-template (chat template to prompt string, no inference).",
+      "id": "native.apply_template",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/completion"
+      },
+      "cli": null,
+      "description": "llama-server /completion (native sampler fields, optional SSE stream).",
+      "id": "native.completion",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/detokenize"
+      },
+      "cli": null,
+      "description": "llama-server /detokenize.",
+      "id": "native.detokenize",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/embedding"
+      },
+      "cli": null,
+      "description": "llama-server /embedding (the non-OpenAI embedding shape).",
+      "id": "native.embedding",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/infill"
+      },
+      "cli": null,
+      "description": "llama-server /infill (fill-in-the-middle).",
+      "id": "native.infill",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "GET",
+        "path": "/props"
+      },
+      "cli": null,
+      "description": "llama-server /props for the selected model, plus a studioforge block.",
+      "id": "native.props",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/props"
+      },
+      "cli": null,
+      "description": "llama-server POST /props: refused (405); per-model settings are the source of truth.",
+      "id": "native.props_post",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/rerank"
+      },
+      "cli": null,
+      "description": "llama-server /rerank, the alias of /reranking.",
+      "id": "native.rerank",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/reranking"
+      },
+      "cli": null,
+      "description": "llama-server /reranking.",
+      "id": "native.reranking",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "GET",
+        "path": "/slots"
+      },
+      "cli": null,
+      "description": "llama-server /slots for the selected model.",
+      "id": "native.slots",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/tokenize"
+      },
+      "cli": null,
+      "description": "llama-server /tokenize.",
+      "id": "native.tokenize",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
         "method": "GET",
         "path": "/api/openclaw-setup"
       },
@@ -1169,6 +1312,45 @@
       "notes": "",
       "panel": null,
       "sfctl": "openclaw-setup"
+    },
+    {
+      "api": {
+        "method": "GET",
+        "path": "/v2/health/live"
+      },
+      "cli": null,
+      "description": "KServe v2 server liveness.",
+      "id": "probe.v2_live",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "GET",
+        "path": "/v2/models/{model_id}/ready"
+      },
+      "cli": null,
+      "description": "KServe v2 model readiness: 200 when the model is resident and serving.",
+      "id": "probe.v2_model_ready",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "GET",
+        "path": "/v2/health/ready"
+      },
+      "cli": null,
+      "description": "KServe v2 server readiness (503 while booting or draining).",
+      "id": "probe.v2_ready",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
     },
     {
       "api": null,
@@ -1259,6 +1441,45 @@
       "cli": null,
       "description": "Whether a restart is in progress and how it is going.",
       "id": "restart.status",
+      "mcp": null,
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/models/load"
+      },
+      "cli": null,
+      "description": "llama-server router load; ?dryRun=true plans without starting anything.",
+      "id": "router.load",
+      "mcp": null,
+      "notes": "Canonical spelling of load / load-recommended / plan-recommended.",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "GET",
+        "path": "/models"
+      },
+      "cli": null,
+      "description": "llama-server router listing: every model with status.value (unloaded|loading|loaded).",
+      "id": "router.models",
+      "mcp": null,
+      "notes": "Standard spelling of GET /api/models state; ?reload=1 rescans (admin).",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
+        "method": "POST",
+        "path": "/models/unload"
+      },
+      "cli": null,
+      "description": "llama-server router unload.",
+      "id": "router.unload",
       "mcp": null,
       "notes": "",
       "panel": null,

@@ -90,6 +90,15 @@
       "surface": "api"
     },
     {
+      "code": "context_exceeds_training",
+      "docs": "errors/context_exceeds_training",
+      "error_type": "invalid_request_error",
+      "fix": "Ask for no more than the trained window (error.studioforge.n_ctx_train carries it). Serving past the trained window needs RoPE scaling and degrades quality, so this server does not do it silently.",
+      "http_status": 400,
+      "message": "'{model}' is trained to {n_ctx_train} tokens; the request asked for {requested_ctx}.",
+      "surface": "api"
+    },
+    {
       "code": "cross_site_control_channel",
       "docs": "errors/cross_site_control_channel",
       "error_type": "invalid_request_error",
@@ -459,12 +468,30 @@
       "surface": "api"
     },
     {
+      "code": "model_not_loaded",
+      "docs": "errors/model_not_loaded",
+      "error_type": "invalid_request_error",
+      "fix": "Load it first with POST /models/load {\"model\": \"<id>\"}, or repeat the request without autoload=false (POST routes load the model just in time). GET /models shows which models are loaded.",
+      "http_status": 404,
+      "message": "The model '{model}' is not loaded, and this request said not to load it (autoload=false, or a GET that never loads).",
+      "surface": "api"
+    },
+    {
       "code": "model_not_multimodal",
       "docs": "errors/model_not_multimodal",
       "error_type": "invalid_request_error",
       "fix": "Use a vision model, or put the matching mmproj file next to the GGUF and rescan.",
       "http_status": 400,
       "message": "Model '{model}' does not support image input. It has no multimodal projector.",
+      "surface": "api"
+    },
+    {
+      "code": "model_required",
+      "docs": "errors/model_required",
+      "error_type": "invalid_request_error",
+      "fix": "Name the model: the \"model\" field in a POST body, the ?model= query parameter on a GET, or the X-SF-Model header. With exactly one model loaded the name may be omitted. GET /models lists the ids and their status.",
+      "http_status": 400,
+      "message": "No model was named, and {resident_count} models are loaded that could serve this request, so there is no single one to pick.",
       "surface": "api"
     },
     {
@@ -699,6 +726,15 @@
       "fix": "Send fewer images, or raise gateway.max_images_per_request.",
       "http_status": 400,
       "message": "Too many images in one request: limit is {limit} (gateway.max_images_per_request).",
+      "surface": "api"
+    },
+    {
+      "code": "tool_call_parse_failed",
+      "docs": "errors/tool_call_parse_failed",
+      "error_type": "server_error",
+      "fix": "Retry the request (the model's output differs per attempt), simplify or tighten the tools schema, or lower the temperature. The engine's own words are in the message unchanged.",
+      "http_status": 502,
+      "message": "The model produced a tool call the engine could not parse: {upstream_message}",
       "surface": "api"
     },
     {

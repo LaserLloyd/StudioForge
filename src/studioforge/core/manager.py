@@ -2863,6 +2863,7 @@ class ModelManager:
                 f"fewer. Serving past the trained window needs RoPE scaling and "
                 f"degrades quality, so this server will not do it silently.",
                 param="ctx_size",
+                code="context_exceeds_training",
                 details={"n_ctx_train": trained, "requested_ctx": ctx_size},
             )
 
@@ -7747,13 +7748,15 @@ class ModelManager:
         parallel: int | None = None,
         kv_cache_type: Any = None,
         kv_cache_type_v: Any = None,
+        force: bool = False,
     ) -> str:
         """Which load a ``/models/load`` body is: ``"load"`` or ``"load_recommended"`` (D88).
 
         The one rule both the real ``POST /models/load`` and its
         ``?dryRun=true`` must apply (B.0, B.5), so the dry run is the same
         decision as the load. A body that places the model itself -- names
-        ``devices``, ``parallel`` or a KV cache type -- or names no
+        ``devices``, ``parallel`` or a KV cache type, or asks to ``force`` a
+        reload (an explicit-load licence the walk does not take) -- or names no
         ``context_length`` is an explicit load (``POST /api/models/{id}/load``
         and its dry run ``GET /api/models/{id}/plan``); a body that names only
         the window (plus ``min_slots``, ``max_slots``, ``kv_unified``,
@@ -7765,6 +7768,7 @@ class ModelManager:
             or parallel is not None
             or kv_cache_type is not None
             or kv_cache_type_v is not None
+            or bool(force)
         )
         if explicit or context_length is None:
             return "load"
@@ -7786,6 +7790,8 @@ class ModelManager:
         kv_unified: bool | None = None,
         prefer_modes: Sequence[str] | None = None,
         kv_min: str | None = None,
+        force: bool = False,
+        lease_id: str | None = None,
     ) -> dict[str, Any]:
         """``POST /models/load?dryRun=true``: the load's decision, nothing started (D88, B.5).
 
@@ -7797,6 +7803,14 @@ class ModelManager:
         loaded, evicted, held or persisted, and a bad request is the same 400
         the load would answer. ``GET /api/models/{id}/plan`` and
         ``/plan-recommended`` keep working as the deprecated aliases (E.4).
+
+        ``lease_id`` (D87, B.6) answers for the load bound to that lease, with
+        the same 404/409/400 the load would raise: the walk offers the lease's
+        cards alone (:meth:`plan_recommended`), and an explicit load is planned
+        on the lease's cards (or the subset ``devices`` names) with the model
+        provisionally named in the lease for the length of the synchronous
+        preview -- nothing is bound. Whether the caller may use that lease is
+        the route's check (D80).
         """
         route = self.load_route_for(
             context_length=context_length,
@@ -7804,6 +7818,7 @@ class ModelManager:
             parallel=parallel,
             kv_cache_type=kv_cache_type,
             kv_cache_type_v=kv_cache_type_v,
+            force=force,
         )
         if route == "load_recommended":
             assert context_length is not None
@@ -7817,7 +7832,25 @@ class ModelManager:
                 priority=priority,
                 min_slots=min_slots,
                 kv_unified=kv_unified,
+                # Only when sent: a dry run without a lease forwards exactly what it did.
+                **({"lease_id": lease_id} if lease_id is not None else {}),
             )
+        elif lease_id is not None:
+            # The explicit load's lease rules (load(lease_id=...)), read-only.
+            bound, serving = self.lease_for_binding(lease_id, name)
+            self._lease_bounds_check(bound, devices=devices, allowed_devices=allowed_devices)
+            with self.leases.provisionally_named(bound.id, serving.id):
+                body = self.plan_preview(
+                    name,
+                    ctx_size=context_length,
+                    kv_cache_type=kv_cache_type,
+                    kv_cache_type_v=kv_cache_type_v,
+                    parallel=parallel,
+                    devices=list(devices) if devices is not None else list(bound.devices),
+                    allowed_devices=allowed_devices,
+                    priority=priority,
+                )
+            body = {**body, "lease_id": bound.id, "lease_devices": sorted(bound.devices)}
         else:
             body = self.plan_preview(
                 name,

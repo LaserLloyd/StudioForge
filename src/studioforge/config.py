@@ -285,6 +285,15 @@ class ServerConfig(BaseModel):
     tls: TlsConfig = Field(default_factory=TlsConfig)
     drain_timeout_s: NonNegativeFloat = 30.0
     request_timeout_s: PositiveFloat = 900.0
+    #: Answer every response with ``Server: StudioForge/<version>`` and
+    #: ``X-Request-Id``, and every response a model produced with ``X-SF-Model``
+    #: and ``X-SF-Engine``. On by default (D90): it is how a client, a log and a
+    #: bug report say which server, model and build answered. Off removes all four.
+    identity_headers: bool = True
+    #: Serve ``GET /api/capabilities?brief=true`` (product, version, feature
+    #: names, decision numbers) without a key. The full report stays ``read``
+    #: scope. Off makes the brief form need a key like the rest.
+    public_capabilities_brief: bool = True
 
     @model_validator(mode="after")
     def _no_credentialed_wildcard_cors(self) -> ServerConfig:
@@ -1776,6 +1785,8 @@ LIVE_SERVER_FIELDS: tuple[str, ...] = (
     "request_timeout_s",
     "behind_proxy",
     "allowed_hosts",
+    "identity_headers",
+    "public_capabilities_brief",
 )
 
 
