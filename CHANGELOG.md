@@ -58,7 +58,44 @@ the build implements, and the `build` field on `/health` names the exact commit.
   diagnostics for known failures, upload an override, set or clear its reasoning format.
 - MCP `check_updates` / `update_engine` (admin, `confirm=true`): ask for a newer official prebuilt
   llama.cpp build to be installed and smoke-tested, and with `activate=true` used for new loads.
-- 27 management MCP tools (37 with the watchdog's).
+- 29 management MCP tools (39 with the watchdog's): `renew_lease` and `touch_lease` (D87).
+- D90: StudioForge answers as a superset of stock `llama-server` b12110: `GET /models`,
+  `POST /models/load` (`?dryRun=true`) / `/models/unload`, the native `/props`, `/slots`,
+  `/tokenize`, `/detokenize`, `/apply-template`, `/completion`, `/infill`, `/embedding`,
+  `/reranking` (model chosen by body `model`, `?model=` or `X-SF-Model`), KServe `/v2/health/*`,
+  `/health.product`, a public `GET /api/capabilities?brief=true`, `Server` / `X-Request-Id` /
+  `X-SF-Model` / `X-SF-Engine` headers (`server.identity_headers`), and RFC 9457
+  `application/problem+json` on management routes when asked for by `Accept`.
+- D89: GPU records carry the NVIDIA GPU Feature Discovery names (`uuid`, `product`, `memory_mib`,
+  `compute_major`, `family`, `pci_bus_id`, ...) and `studioforge.class_key` (`sm_120-32g`); group
+  cards by `class_key`, never by name. `/metrics` adds `hw_gpu_memory_*`.
+- D88: plan and fit bodies say how much room a load leaves (`needs_bytes`, `usable_bytes`,
+  `margin_bytes`, `alternatives`, `max_parallel_that_fits`).
+- D87: lease records carry the Kubernetes Lease names beside the old ones; `PATCH
+  /api/leases/{id}` renews; `lease_id` on the load routes binds a load to a lease you hold;
+  `devices: "auto"` takes `count`.
+- D85: a no-GPU staging mode for development (`engine.stub` with the fake GPU probe).
+
+### Changed
+
+- D87: **releasing or expiring a lease unloads the idle models it names.** Send
+  `DELETE /api/leases/{id}?unload=false` (MCP `release_gpus(unload=false)`) to keep them. A grant
+  keeps a resident copy of a named base instead of evicting it and lists `evicted` and `adopted`;
+  no other load may evict a model a lease names. 409 lease refusals keep `error.code:
+  lease_conflict` and their words and add `error.studioforge.code`. `POST
+  /api/leases/{id}/touch` is a deprecated alias (`Deprecation` header).
+- D88: load-recommended prices the walk with the same measured (D51) correction as the load, and
+  steps down one slot once when the real load is refused. `estimate_bytes.total` from
+  plan-recommended is now the corrected total (`formula_bytes` is the old figure). Schema 11 adds
+  the card class, split mode and file size to the D51 observation key; older rows still match.
+- D86: a virtual copy no longer takes its base's short aliases; a virtual id that collides with any
+  id or alias is refused (409 `model_id_conflict`); deleting or re-creating a resident copy, or its
+  base, is refused (409 `model_loaded`); `POST /api/virtual-models` takes every launch setting.
+- D89: the speed estimate of a card the name table does not know uses its measured bandwidth, then
+  its class; a 48 GB card is no longer priced as a 5090. `hardware_modes` adds a mode per card
+  class.
+- D90: the old `/api/models/{id}/load|load-recommended|unload|plan|plan-recommended` routes carry
+  `Deprecation` and `Link` headers; they keep working.
 
 ## 2.3.0
 
