@@ -83,7 +83,7 @@ from studioforge.core.chat_template import (
     validate_template_text,
 )
 from studioforge.core.harmony import effective_reasoning_format, record_uses_harmony
-from studioforge.core.leases import lease_view
+from studioforge.core.leases import gpu_uuid_map, lease_view
 from studioforge.core.model_gate import (
     GateRequirement,
     gate_answer,
@@ -1257,6 +1257,7 @@ def build_management_mcp(state: Any) -> MCPServer:
         allowed_devices: list[int] | None = None,
         force: bool = False,
         priority: int | None = None,
+        lease_id: str | None = None,
     ) -> dict[str, Any]:
         """Load a model into VRAM now, returning once it is serving.
 
@@ -1351,6 +1352,11 @@ def build_management_mcp(state: Any) -> MCPServer:
                 new worse-tier traffic off (503 + Retry-After) while it loads.
                 The tier is remembered per model, so later loads of the same
                 model keep it. A tier-3 load never displaces tier 1 or 2.
+            lease_id: Bind this load to a GPU lease you took (``reserve_gpus``'s
+                ``lease.id``): the model joins the lease, loads onto its cards
+                (``devices`` may name a subset of them), no other model can
+                evict it, and ``release_gpus`` unloads it. Only the lease's
+                holder may bind to it.
 
         Returns:
             The running instance: port, pid, devices, planned VRAM breakdown,
@@ -1358,6 +1364,7 @@ def build_management_mcp(state: Any) -> MCPServer:
             and its resolved ``speculative`` block (``null`` = not decided yet,
             ``{"type": "none", "reason": ...}`` = considered and declined).
         """
+        _check_lease_owner(lease_id)
         instance = await state.manager.load(
             model_id,
             ctx_size=ctx_size,
@@ -1367,8 +1374,9 @@ def build_management_mcp(state: Any) -> MCPServer:
             devices=devices,
             allowed_devices=allowed_devices,
             force=force,
-            source="mcp:load_model",
+            source=f"mcp:/api/leases/{lease_id}" if lease_id else "mcp:load_model",
             priority=priority,
+            lease_id=lease_id,
         )
         return {
             "ok": True,
@@ -1388,6 +1396,7 @@ def build_management_mcp(state: Any) -> MCPServer:
         persist: bool = False,
         min_slots: int | None = None,
         kv_unified: bool | None = None,
+        lease_id: str | None = None,
     ) -> dict[str, Any]:
         """**The easy way to load.** Say the model and the context you need.
 
@@ -1507,12 +1516,18 @@ def build_management_mcp(state: Any) -> MCPServer:
                 long conversations at once, which would run out of room
                 mid-reply. Omitted or ``false``: ``ctx_size`` per slot, each
                 slot's own. Cannot be combined with ``persist``.
+            lease_id: Bind this load to a GPU lease you took
+                (``reserve_gpus``'s ``lease.id``): the model joins the lease
+                and the walk uses the lease's cards alone. Without it, a lease
+                that already names this model does the same -- your load lands
+                on the cards you reserved, not elsewhere.
 
         Returns:
             The running instance: port, pid, devices, the KV cache type chosen,
             the slot count, the tier it loaded at (``priority``), its resolved
             ``speculative`` block, and the planned VRAM breakdown.
         """
+        _check_lease_owner(lease_id)
         instance = await state.manager.load_recommended(
             model_id,
             int(ctx_size),
@@ -1521,10 +1536,11 @@ def build_management_mcp(state: Any) -> MCPServer:
             max_slots=max_slots,
             allowed_devices=allowed_devices,
             persist=persist,
-            source="mcp:load_recommended",
+            source=f"mcp:/api/leases/{lease_id}" if lease_id else "mcp:load_recommended",
             priority=priority,
             min_slots=min_slots,
             kv_unified=kv_unified,
+            lease_id=lease_id,
         )
         return {
             "ok": True,
@@ -1791,9 +1807,27 @@ def build_management_mcp(state: Any) -> MCPServer:
         report["applies"] = "next load"
         return report
 
+    def _check_lease_owner(lease_id: str | None) -> None:
+        """D80 ownership for a tool that acts on, or binds to, a lease (D87).
+
+        An unknown id is left to the manager's 404, as on the REST routes.
+        """
+        if not lease_id:
+            return
+        standing = state.manager.leases.get(lease_id)
+        if standing is not None:
+            owner_check(current_principal(), standing.holder_key, f"lease {lease_id}")
+
+    def _caller_key() -> str | None:
+        """``key:<id>`` of the scoped key calling this tool, else ``None`` (as ``key_owner_of``)."""
+        principal = current_principal()
+        if principal is not None and principal.kind == "key" and principal.id:
+            return principal.actor
+        return None
+
     @_guard
     async def reserve_gpus(
-        devices: list[int],
+        devices: list[int] | str | None = None,
         model_id: str | None = None,
         reason: str = "",
         idle_ttl_s: float | None = 3600.0,
@@ -1802,25 +1836,36 @@ def build_management_mcp(state: Any) -> MCPServer:
         priority: int | None = None,
         vacate_url: str | None = None,
         vacate_token: str | None = None,
+        model_ids: list[str] | None = None,
+        min_free_gib: float | None = None,
+        prefer: list[int] | None = None,
+        avoid: list[int] | None = None,
+        count: int | None = None,
     ) -> dict[str, Any]:
-        """Reserve specific GPUs for one model, or for something outside this server.
+        """Reserve GPUs for one or more models, or for something outside this server.
 
-        The two calls you will make::
+        The calls you will make::
 
             reserve_gpus(devices=[0], model_id="vendor/Some-Model-GGUF/Some-Model-Q4_K_M")
+            reserve_gpus(devices="auto", count=2, model_id="<id>")  # two alike cards, server picks
             reserve_gpus(devices=[3], reason="ComfyUI render")   # no model: held for an outsider
 
-        While the lease stands nothing else is planned onto those cards. A
-        named model is loaded onto exactly them (pin it too if it must also
-        survive restarts), sized for as many parallel slots as its context
-        allows, and in the split mode its own benchmark measured fastest on
-        those cards -- tensor split is never assumed, because whether it wins
-        depends on the model (slower for small and MoE models, about 1.5x
-        faster decode but slower prefill for large dense ones); run a
-        benchmark if you want it considered. Idle residents on the cards are
-        unloaded to make room; a model mid-request refuses the call (retry
-        when idle); a pinned idle
-        resident refuses unless ``force=true``.
+        **A lease reserves; it does not load.** While it stands nothing else is
+        planned onto those cards, and no other model's load may evict the
+        models it names. Their next load -- ``load_recommended`` (which then
+        uses the leased cards alone), ``load_model``, either with
+        ``lease_id=<lease.id>``, or simply the first chat request -- lands on
+        exactly these cards (pin it too if it must also survive restarts),
+        sized for as many parallel slots as its context allows, and in the
+        split mode its own benchmark measured fastest on those cards -- tensor
+        split is never assumed, because whether it wins depends on the model
+        (slower for small and MoE models, about 1.5x faster decode but slower
+        prefill for large dense ones); run a benchmark if you want it
+        considered. Idle residents on the cards are unloaded to make room
+        (listed in ``evicted``); a resident copy of a named model
+        (``<id>@<tag>``) is kept and joins the lease (``adopted``); a model
+        mid-request refuses the call (retry when idle); a pinned idle resident
+        refuses unless ``force=true``.
 
         **A card already leased is a conflict, never a takeover** -- but a
         strictly better ``priority`` may ASK the holder to leave (D56). If
@@ -1835,12 +1880,17 @@ def build_management_mcp(state: Any) -> MCPServer:
 
         Args:
             devices: CUDA indices, e.g. ``[0]`` or ``[0, 1]`` -- exactly the
-                cards the model should run on. ``server_status`` lists them.
+                cards the model should run on (``server_status`` lists them);
+                or ``"auto"`` (or omitted) to let the server choose, the way
+                this grant judges a card: never a busy, leased, excluded or
+                (without ``force``) pinned/better-tier one, and inside the
+                named models' saved placement.
             model_id: The ``id`` from ``list_models``. Omit to hold the cards
                 for something outside this server.
             reason: Free text shown beside the lease (what it is for).
             idle_ttl_s: Seconds of idleness after which the server releases
-                the lease by itself (default 3600). ``null`` = until released.
+                the lease by itself -- and unloads the models it names
+                (default 3600). ``null`` = until released.
             force: Evict a *pinned* idle resident from the cards.
             holder: Who is holding them -- say who you are, the same name you
                 send as ``X-SF-Client``. Defaults to ``"mcp"``, which other
@@ -1854,40 +1904,80 @@ def build_management_mcp(state: Any) -> MCPServer:
                 only; never this server's own address.
             vacate_token: Sent back in ``X-SF-Vacate-Token`` on that POST so
                 your endpoint can trust it. Never shown anywhere.
+            model_ids: Several models for one lease (``model_id`` is the
+                one-model shorthand; both may be given).
+            min_free_gib: With ``devices="auto"``: only a card that would have
+                this much free VRAM once its idle residents were gone.
+            prefer: With ``devices="auto"``: CUDA indices to rank first.
+            avoid: With ``devices="auto"``: CUDA indices never to choose.
+            count: With ``devices="auto"``: how many cards, all of one class
+                (``gpus[].class_key``); default 1.
 
         Returns:
             ``{"ok": true, "lease": {id, devices, holder, model_ids, reason,
             created_at, last_activity_at, idle_ttl_s, idle_s, expires_at,
-            priority, state, vacate_registered, vacate_deadline}}``.
-            Keep ``lease.id`` -- ``release_gpus`` needs it.
+            priority, state, vacate_registered, vacate_deadline,
+            holder_identity, lease_duration_seconds, acquire_time, renew_time,
+            allocation}, "evicted": [{model_id, reason, devices, priority}],
+            "adopted": [...], "placement": {...} (auto only)}``.
+            Keep ``lease.id`` -- ``release_gpus`` and ``renew_lease`` need it.
         """
-        lease = await state.manager.acquire_lease(
+        names = list(model_ids or [])
+        if model_id and model_id not in names:
+            names.insert(0, model_id)
+        if isinstance(devices, str) and devices.strip().lower() != "auto":
+            raise BadRequestError(
+                'devices must be a list of CUDA indices, "auto", or omitted', param="devices"
+            )
+        grant = await state.manager.grant_lease(
             devices,
             holder=(holder or "").strip() or "mcp",
-            model_ids=[model_id] if model_id else [],
+            model_ids=names,
             reason=reason,
             idle_ttl_s=idle_ttl_s,
             force=force,
             priority=priority,
             vacate_url=vacate_url,
             vacate_token=vacate_token,
+            # D87 (A-21): a lease taken with a scoped key belongs to that key,
+            # as over REST -- before, an MCP lease was releasable by admin only.
+            holder_key=_caller_key(),
+            min_free_gib=min_free_gib,
+            prefer=prefer or [],
+            avoid=avoid or [],
+            count=count,
         )
         # The MCP plane is PIN-gated (D32): the registrant may see its own URL.
-        return {"ok": True, "lease": lease_view(lease, reveal_vacate_url=True)}
+        out: dict[str, Any] = {
+            "ok": True,
+            "lease": lease_view(
+                grant.lease,
+                reveal_vacate_url=True,
+                gpu_uuids=gpu_uuid_map(state.manager.planner.probe),
+            ),
+            "evicted": list(grant.evicted),
+            "adopted": list(grant.adopted),
+        }
+        if grant.placement is not None:
+            out["placement"] = grant.placement.view()
+        return out
 
     @_guard
-    async def release_gpus(lease_id: str) -> dict[str, Any]:
+    async def release_gpus(lease_id: str, unload: bool = True) -> dict[str, Any]:
         """Release a GPU lease now, so the cards go back to the general pool.
 
         The id is the ``lease.id`` that ``reserve_gpus`` returned; ``server_status``
-        lists every standing lease with its id if you lost it. Releasing does
-        not unload the model that held the cards -- it simply stops being the
-        only model allowed there, and goes back to the ordinary idle TTL and
-        eviction rules (unless it is pinned). Leases also end by themselves
-        once idle for their ``idle_ttl_s``, so this is the early exit, not the
-        only one. If your lease shows ``state: "vacating"`` a better class
-        has asked for the cards (D56): finish or stop the work on them and
-        release here -- that is the only way a vacate completes; nothing
+        lists every standing lease with its id if you lost it. Releasing
+        unloads the models the lease names (``unloaded``) -- the lease was
+        their placement, so the cards come back clean. ``unload=false`` keeps
+        them loaded instead: they stop being the only models allowed there and
+        go back to the ordinary idle TTL and eviction rules. A model serving a
+        request, a pinned one, or one another lease names is never unloaded
+        here (``kept`` says why). Leases also end by themselves once idle for
+        their ``idle_ttl_s`` (with the same unload), so this is the early exit,
+        not the only one. If your lease shows ``state: "vacating"`` a better
+        class has asked for the cards (D56): finish or stop the work on them
+        and release here -- that is the only way a vacate completes; nothing
         takes the lease from you.
 
         A key with the ``inference`` scope may release only a lease that key
@@ -1895,19 +1985,61 @@ def build_management_mcp(state: Any) -> MCPServer:
 
         Args:
             lease_id: The lease to release.
+            unload: Unload the lease's models with it (default ``true``).
 
         Returns:
-            ``{"ok": true, "released": {...the lease as it stood...}}``, or an
+            ``{"ok": true, "released": {...the lease as it stood...},
+            "unloaded": [...], "kept": [{model_id, reason, detail}]}``, or an
             error result naming the id when no such lease exists.
         """
-        standing = state.manager.leases.get(lease_id)
-        if standing is not None:
-            # D80: the same ownership rule as ``DELETE /api/leases/{id}``. This
-            # tool is ``inference`` scope, so without it any inference key could
-            # take another tenant's card back over /mcp.
-            owner_check(current_principal(), standing.holder_key, f"lease {lease_id}")
-        lease = state.manager.release_lease(lease_id)
-        return {"ok": True, "released": lease_view(lease)}
+        # D80: the same ownership rule as ``DELETE /api/leases/{id}``. This
+        # tool is ``inference`` scope, so without it any inference key could
+        # take another tenant's card back over /mcp.
+        _check_lease_owner(lease_id)
+        result = await state.manager.release_and_unload(lease_id, unload_owned=unload)
+        return {
+            "ok": True,
+            "released": lease_view(result.lease),
+            "unloaded": list(result.unloaded),
+            "kept": list(result.kept),
+        }
+
+    @_guard
+    async def renew_lease(lease_id: str) -> dict[str, Any]:
+        """Keep a GPU lease alive: restart its idle clock now (the Kubernetes "renew").
+
+        A lease ends by itself once nothing has used it for its ``idle_ttl_s``
+        (``lease_duration_seconds``). A model the lease names keeps it alive
+        just by serving requests; call this when the work holding the cards
+        runs OUTSIDE this server (a render, a benchmark controller between
+        jobs), on an interval comfortably shorter than the TTL. The server
+        stamps its own clock into ``renew_time``. Same ownership rule as
+        ``release_gpus``: an ``inference`` key renews only its own lease.
+
+        Args:
+            lease_id: The ``lease.id`` from ``reserve_gpus``.
+
+        Returns:
+            ``{"ok": true, "lease": {...renew_time, expires_at, state...}}``.
+        """
+        _check_lease_owner(lease_id)
+        return {"ok": True, "lease": lease_view(state.manager.renew_lease(lease_id))}
+
+    @_guard
+    async def touch_lease(lease_id: str) -> dict[str, Any]:
+        """Keep a GPU lease alive -- the same call as ``renew_lease`` under the REST verb's name.
+
+        ``POST /api/leases/{id}/touch`` has always done this over REST; this is
+        its MCP twin. ``renew_lease`` is the canonical name.
+
+        Args:
+            lease_id: The ``lease.id`` from ``reserve_gpus``.
+
+        Returns:
+            ``{"ok": true, "lease": {...}}``.
+        """
+        _check_lease_owner(lease_id)
+        return {"ok": True, "lease": lease_view(state.manager.touch_lease(lease_id))}
 
     @_guard
     async def gpu_leases() -> dict[str, Any]:
@@ -2855,6 +2987,8 @@ def build_management_mcp(state: Any) -> MCPServer:
         set_model_template,
         reserve_gpus,
         release_gpus,
+        renew_lease,
+        touch_lease,
         gpu_leases,
         gpu_tenants,
         search_models,

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import re
 import time
 from collections import deque
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -33,14 +34,18 @@ from studioforge.core.harmony import effective_reasoning_format, record_uses_har
 from studioforge.core.leases import (
     DEFAULT_IDLE_TTL_S,
     LEASE_OPEN_ENDED_RETRY_S,
+    OWN_HOLDER_FAMILIES,
+    VERDICT_AVOIDED,
     VERDICT_BETTER_TIER,
     VERDICT_BUSY,
+    VERDICT_CANDIDATE,
     VERDICT_LEASED,
     VERDICT_PINNED,
     VERDICT_TOO_LITTLE_FREE,
     AutoPlacement,
     LeaseBook,
     choose_auto_devices,
+    holder_family,
     lease_store_for,
     lease_view,
     send_vacate_request,
@@ -59,6 +64,7 @@ from studioforge.errors import (
     BadRequestError,
     InsufficientVramError,
     LeaseConflictError,
+    LeaseNotFoundError,
     ModelBusyError,
     ModelLoadError,
     ModelNotFoundError,
@@ -499,6 +505,90 @@ def _attempt_summary(attempt: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _with_in_flight(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """``busy_models`` rows with ``in_flight`` beside ``active_requests`` (D87).
+
+    The B.0 fragile-item table: CrucibleForge falls back to the regex
+    ``(\\S+) \\((\\d+) in flight\\) is serving`` when ``busy_models`` is absent; the
+    rows now always carry the number under the word the prose uses.
+    """
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        entry = dict(row)
+        if "in_flight" not in entry:
+            entry["in_flight"] = int(entry.get("active_requests") or 0)
+        out.append(entry)
+    return out
+
+
+#: The planner's own slot advice, "reduce parallel from N to M" -- the phrase
+#: CrucibleForge regex-matches today (B.0 fragile-item table).
+_REDUCE_PARALLEL_RE = re.compile(r"reduce parallel from (\d+) to (\d+)")
+
+
+def _requested_parallel(rejected: LoadRejected) -> int | None:
+    """The slot count a 507 was refused at, when the refusal is about slots (D87).
+
+    A planner refusal that carries the field (a later planner revision) is
+    read directly; otherwise the number is the ``N`` of the planner's own
+    "reduce parallel from N to M" suggestion -- the same words a client parses,
+    so the field and the prose cannot disagree. ``None`` when the refusal says
+    nothing about slots.
+    """
+    direct = getattr(rejected, "requested_parallel", None)
+    if isinstance(direct, int) and not isinstance(direct, bool):
+        return direct
+    for line in [*rejected.suggestions, rejected.reason]:
+        match = _REDUCE_PARALLEL_RE.search(str(line))
+        if match is not None:
+            return int(match.group(1))
+    return None
+
+
+def _busy_rows(instances: Iterable[InstanceInfo]) -> list[dict[str, Any]]:
+    """The ``busy_models`` rows a 503 ``model_busy`` carries for these instances (D87)."""
+    return [
+        {
+            "model_id": i.model_id,
+            "active_requests": int(i.active_requests),
+            "in_flight": int(i.active_requests),
+        }
+        for i in instances
+    ]
+
+
+@dataclass
+class LeaseGrant:
+    """What a lease grant did (D87): the lease, what it evicted, how its cards were chosen.
+
+    ``evicted`` rows are ``{model_id, reason, devices, priority}`` -- the idle
+    residents the grant stopped (``reason: "lease"``), which before D87 only
+    ``GET /api/evictions`` and a log line recorded (A-15). ``adopted`` are the
+    resident copies of a named base the grant kept and named in the lease
+    rather than evicting (A-1). ``placement`` is the ``devices: "auto"``
+    decision, ``None`` for named cards.
+    """
+
+    lease: GpuLease
+    evicted: list[dict[str, Any]] = field(default_factory=list)
+    adopted: list[str] = field(default_factory=list)
+    placement: AutoPlacement | None = None
+
+
+@dataclass
+class LeaseRelease:
+    """What releasing (or expiring) a lease did with the models it owned (D87, F-2).
+
+    ``unloaded`` were stopped; ``kept`` stayed resident, each with the reason
+    (``busy`` -- a release never cuts a stream; ``pinned``; ``leased`` --
+    another standing lease names it; ``not_requested`` -- ``unload=false``).
+    """
+
+    lease: GpuLease
+    unloaded: list[str] = field(default_factory=list)
+    kept: list[dict[str, Any]] = field(default_factory=list)
+
+
 @dataclass
 class _RecommendedPrep:
     """A ``load_recommended`` request resolved and validated, before any planning."""
@@ -522,6 +612,11 @@ class _RecommendedPrep:
     bound: frozenset[int] | None = None
     #: Where ``bound`` came from, for the words of a refusal (D76).
     bound_label: str = "this call's allowed_devices"
+    #: The standing lease that names this model -- by the call's ``lease_id``
+    #: or because the lease was taken for it (D87, A-2/B.6). When set and the
+    #: model saves no ``device_override``, ``saved_override`` is the lease's
+    #: cards: the holder's walk lands on its own cards, never elsewhere.
+    lease: GpuLease | None = None
 
 
 @dataclass
@@ -616,6 +711,15 @@ class ModelManager:
         #: this covers the planning window too, which is where two callers used
         #: to collide.
         self._loading: set[str] = set()
+        #: model id -> the cards its in-flight load PLANNED onto, from the
+        #: moment the plan exists until the load settles (D87, A-10). A lease
+        #: grant refuses only a load whose cards overlap the ones it wants; a
+        #: load still waiting at the gate has no plan yet and will read the
+        #: lease book when it plans, so it is not in the way of any grant.
+        self._loading_devices: dict[str, frozenset[int]] = {}
+        #: Unloads a lease's release or expiry started (F-2), held so the loop
+        #: cannot collect them; the sweep is sync and spawns these.
+        self._lease_unload_tasks: set[asyncio.Task[Any]] = set()
         #: One smoke test at a time, and never while the server is busy (D36).
         #: `test_model` loads a model to poke it and unloads it afterwards; two
         #: of those at once, or one during somebody's stream, is the opposite of
@@ -1513,6 +1617,7 @@ class ModelManager:
         hold_traffic: bool = True,
         enforce_parallel_cap: bool = True,
         kv_unified: bool = False,
+        lease_id: str | None = None,
     ) -> InstanceInfo:
         """Explicit load (GUI/CLI/MCP). ``force`` reloads an already-running model.
 
@@ -1601,6 +1706,15 @@ class ModelManager:
         :meth:`load_recommended` builds the pool it chose, and how the restore
         and the rebalancer (:func:`reload_settings`) put one back; it is not a
         field of the ``/load`` route.
+
+        ``lease_id`` binds this load to a standing lease (D87, B.6): the model
+        is named in the lease (so it may be planned onto the lease's cards, no
+        other model's ladder may stop it, and the release takes it down), and
+        the lease's cards are the placement -- ``devices`` may name a subset of
+        them, never another card. A resident standing off the lease's cards is
+        reloaded onto them (never mid-stream unless ``force``). A failed load
+        takes the binding back out. Whether the caller may use that lease is
+        the route's check (D80).
         """
         validate_load_args(
             ctx_size=ctx_size,
@@ -1612,10 +1726,29 @@ class ModelManager:
             known_devices=self._known_devices(),
         )
         await self._await_boot()
+        bound: GpuLease | None = None
+        if lease_id is not None:
+            bound, _joining = self.lease_for_binding(lease_id, name)
+            self._lease_bounds_check(bound, devices=devices, allowed_devices=allowed_devices)
+            if devices is None:
+                devices = list(bound.devices)
         record = self.registry.resolve(name)
         if record is None:
             raise ModelNotFoundError(name, known=self.registry.known_ids())
         record = self.serving_record(record)
+        if bound is not None and not force:
+            # A resident somewhere else is not "already loaded" for a load bound
+            # to these cards: it moves -- with the reload licence only, never
+            # the licence to cut its streams (D36).
+            resident = self.supervisor.get(record.id)
+            if (
+                resident is not None
+                and resident.plan is not None
+                and not {int(d) for d in resident.plan.devices} <= set(bound.devices)
+            ):
+                force = True
+                if evict_busy is None:
+                    evict_busy = False
         # D66, before anything is held, queued, planned or evicted. A ready
         # resident this call would hand back untouched is exempt; a forced
         # reload is not -- it launches on whatever build a launch uses now, and
@@ -1685,6 +1818,9 @@ class ModelManager:
         # outcome we are trying to detect.
         queued_behind = self.supervisor.get(record.id)
         seq_before = queued_behind.spawn_seq if queued_behind is not None else -1
+        # B.6: named in the lease before the plan, so the planner lets it onto
+        # the lease's cards; taken back out below if this load does not land.
+        newly_bound = self.leases.bind_models(bound.id, [record.id]) if bound is not None else []
         lock = await self._lock_for(record.id)
         self._load_waiters[record.id] = self._load_waiters.get(record.id, 0) + 1
         try:
@@ -1742,6 +1878,10 @@ class ModelManager:
                 if explicit_tier:
                     self._model_priority[record.id] = tier
                 return instance
+        except BaseException:
+            if bound is not None and newly_bound:
+                self.leases.unbind_models(bound.id, newly_bound)
+            raise
         finally:
             # The same waiter bookkeeping ensure_loaded keeps: without it,
             # _prune_lock can discard a lock this call is queued on, and two
@@ -2018,6 +2158,7 @@ class ModelManager:
         priority: int | None = None,
         min_slots: int | None = None,
         kv_unified: bool | None = None,
+        lease_id: str | None = None,
     ) -> InstanceInfo:
         """Load at **exactly** ``ctx_size`` per slot, letting the server pick the rest.
 
@@ -2130,6 +2271,13 @@ class ModelManager:
                 ``persist`` is refused with it: the saved ``kv_unified``
                 setting keeps ``ctx_size`` per slot, so a later plain load
                 would build a pool as many times larger as there are slots.
+            lease_id: bind this load to a standing lease (D87, B.6): the model
+                is named in it and the walk offers the lease's cards alone,
+                over a saved ``device_override`` too. Without it, a lease that
+                already names the model does the same unless the model saves a
+                ``device_override`` (which wins, as on ``/load``) -- the
+                holder's load lands on its own cards (A-2), never on the
+                headline mode while the leased cards sit empty.
         """
         _validate_recommended_args(
             ctx_size=ctx_size,
@@ -2148,14 +2296,23 @@ class ModelManager:
             priority=priority,
             min_slots=min_slots,
             kv_unified=kv_unified,
+            lease_id=lease_id,
         )
         record = prep.record
+        prefer_modes = self._lease_prefer_modes(prep, prefer_modes)
         self._refuse_if_held(record.id, priority=prep.tier)
         # Same rule as load(): an explicit tier is remembered only once the
         # load has succeeded (D46; D66 review item 19) -- the already-loaded
         # branch below writes it, and the inner load() writes it on success.
 
         hold = prep.tier < PRIORITY_BACKGROUND
+        # B.6: named before the walk, so the walk's planner lets it onto the
+        # lease's cards; taken back out if nothing lands.
+        newly_bound = (
+            self.leases.bind_models(prep.lease.id, [record.id])
+            if lease_id is not None and prep.lease is not None
+            else []
+        )
         try:
             # Two passes, and only a lease granted between the walk and the
             # load can use the second: the walk plans against the lease book
@@ -2172,8 +2329,11 @@ class ModelManager:
                     # (so a second pass re-arms it); the outer pop is the
                     # backstop for every refusal path out of the walk.
                     self._priority_holds[record.id] = prep.tier
-                decision = self._decide_recommended(
-                    prep, prefer_modes=prefer_modes, kv_min=kv_min, max_slots=max_slots
+                decision = self._lease_bound_decision(
+                    prep,
+                    self._decide_recommended(
+                        prep, prefer_modes=prefer_modes, kv_min=kv_min, max_slots=max_slots
+                    ),
                 )
                 if decision.refusal is not None:
                     raise decision.refusal
@@ -2265,6 +2425,10 @@ class ModelManager:
                     self._persist_load_profile(record, instance, prep.asked_tier)
                 return instance
             raise AssertionError("unreachable: the second walk pass returns or raises")
+        except BaseException:
+            if newly_bound and prep.lease is not None:
+                self.leases.unbind_models(prep.lease.id, newly_bound)
+            raise
         finally:
             if hold:
                 self._priority_holds.pop(record.id, None)
@@ -2281,6 +2445,7 @@ class ModelManager:
         priority: int | None = None,
         min_slots: int | None = None,
         kv_unified: bool | None = None,
+        lease_id: str | None = None,
     ) -> dict[str, Any]:
         """What :meth:`load_recommended` would do right now, without doing it (D64).
 
@@ -2312,6 +2477,12 @@ class ModelManager:
         pinned the walk to its one placement, ``allowed_devices`` is the bound
         every mode was built from (the call's, narrowed by the saved one, or
         the saved one alone), and ``notes`` say which, on a fit and a refusal.
+
+        ``lease_id`` (D87, B.6) answers for the load bound to that lease: the
+        model is counted as named in it for this one decision -- nothing is
+        written to the book -- and the walk offers the lease's cards alone. A
+        lease that already names the model shapes the answer the same way
+        without it; either way ``lease_id``/``lease_devices`` say so.
         """
         _validate_recommended_args(
             ctx_size=ctx_size,
@@ -2330,11 +2501,26 @@ class ModelManager:
             priority=priority,
             min_slots=min_slots,
             kv_unified=kv_unified,
+            lease_id=lease_id,
         )
-        decision = self._decide_recommended(
-            prep, prefer_modes=prefer_modes, kv_min=kv_min, max_slots=max_slots
-        )
-        return self._render_recommended_decision(decision)
+        prefer_modes = self._lease_prefer_modes(prep, prefer_modes)
+        # The decision is synchronous, so naming the model for its length is
+        # invisible to everything else on the loop -- and never persisted.
+        with self.leases.provisionally_named(
+            prep.lease.id if lease_id is not None and prep.lease is not None else None,
+            prep.record.id,
+        ):
+            decision = self._lease_bound_decision(
+                prep,
+                self._decide_recommended(
+                    prep, prefer_modes=prefer_modes, kv_min=kv_min, max_slots=max_slots
+                ),
+            )
+        rendered = self._render_recommended_decision(decision)
+        if prep.lease is not None:
+            rendered["lease_id"] = prep.lease.id
+            rendered["lease_devices"] = sorted(int(d) for d in prep.lease.devices)
+        return rendered
 
     def _recommended_prep(
         self,
@@ -2346,11 +2532,18 @@ class ModelManager:
         priority: int | None,
         min_slots: int | None = None,
         kv_unified: bool | None = None,
+        lease_id: str | None = None,
     ) -> _RecommendedPrep:
         """Resolve the model and the call's own settings; raise the 400s/404 (D64).
 
         Pure: shared by the real call and the dry run, so both refuse a bad
         request with the same error before anything is planned.
+
+        The lease placement (D87): with ``lease_id`` the lease's cards are the
+        only placement (404/409 per :meth:`lease_for_binding`); without it, a
+        lease that already names the model supplies its cards unless the model
+        saves a ``device_override``. A call ``allowed_devices`` that excludes a
+        card of that lease is a 400 naming both.
         """
         if persist and kv_unified:
             # Before the model is even resolved: nothing about which model it
@@ -2408,6 +2601,31 @@ class ModelManager:
             if saved.allowed_devices is not None
             else None
         )
+        # A-2: the lease's cards are this model's placement, the way /load's
+        # lease profile makes them (D43) -- before D87 the walk treated a lease
+        # only as a block for OTHERS, so the holder's own model went to the
+        # headline mode while its leased cards sat empty.
+        lease: GpuLease | None = None
+        if lease_id is not None:
+            lease, _joining = self.lease_for_binding(lease_id, name)
+        elif saved_override is None:
+            lease = self.leases.for_model(record.id)
+        if lease is not None:
+            cards = sorted(int(d) for d in lease.devices)
+            if narrowed is not None and not set(cards) <= narrowed:
+                raise BadRequestError(
+                    f"'{record.id}' runs on the cards of lease {lease.id} (CUDA {cards}), and "
+                    f"this call's allowed_devices {sorted(narrowed)} excludes CUDA "
+                    f"{sorted(set(cards) - narrowed)}; a lease's cards are its models' "
+                    f"placement. Widen allowed_devices to them, or release the lease.",
+                    param="allowed_devices",
+                    details={
+                        "lease_id": lease.id,
+                        "lease_devices": cards,
+                        "allowed_devices": sorted(narrowed),
+                    },
+                )
+            saved_override = tuple(cards)
         bound = narrowed if narrowed is not None else saved_allowed
         if narrowed is not None and saved_allowed is not None:
             bound_label = (
@@ -2428,7 +2646,64 @@ class ModelManager:
             saved_override=saved_override,
             bound=bound,
             bound_label=bound_label,
+            lease=lease,
         )
+
+    def _lease_prefer_modes(
+        self, prep: _RecommendedPrep, prefer_modes: Sequence[str] | None
+    ) -> Sequence[str] | None:
+        """A ``prefer_mode`` on a lease-bound walk may only name the lease's own placement (D87)."""
+        lease = prep.lease
+        if lease is None or prefer_modes is None or prep.saved_override is None:
+            return prefer_modes
+        from studioforge.core import placements as placements_mod
+
+        mode = placements_mod.saved_override_mode(
+            list(self.planner.probe.list_gpus()), prep.saved_override
+        )
+        unknown = [key for key in prefer_modes if key != mode.key]
+        if unknown:
+            raise BadRequestError(
+                f"unknown hardware mode(s) for this call: {', '.join(unknown)}. "
+                f"'{prep.record.id}' runs on the cards of lease {lease.id} (CUDA "
+                f"{list(prep.saved_override)}), so the only placement load-recommended walks is "
+                f"'{mode.key}'; omit prefer_mode, or release the lease to choose among the "
+                f"hardware modes",
+                param="prefer_modes",
+                details={"lease_id": lease.id, "modes": [mode.key]},
+            )
+        return prefer_modes
+
+    @staticmethod
+    def _lease_bound_decision(
+        prep: _RecommendedPrep, decision: RecommendedDecision
+    ) -> RecommendedDecision:
+        """Tell a lease-bound walk as the lease's, not as a saved ``device_override`` (D87).
+
+        The walk machinery describes a single-placement walk in D76's words
+        ("the model's saved device_override"); for a lease that is the wrong
+        setting to send a caller to, so the labels, the refusal sentence and
+        the refusal details are re-worded here, in one place.
+        """
+        lease = prep.lease
+        if lease is None:
+            return decision
+        theirs = f"lease {lease.id}'s cards"
+        for attempt in decision.attempts:
+            label = attempt.get("label")
+            if isinstance(label, str):
+                attempt["label"] = label.replace("the model's saved device_override", theirs)
+        decision.saved_override = None
+        refusal = decision.refusal
+        if isinstance(refusal, InsufficientVramError):
+            refusal.message = refusal.message.replace(
+                "the placement its saved device_override names",
+                f"the cards lease {lease.id} ({lease.holder}) holds for it",
+            )
+            refusal.details.pop("device_override", None)
+            refusal.details["lease_id"] = lease.id
+            refusal.details["lease_devices"] = sorted(int(d) for d in lease.devices)
+        return decision
 
     @staticmethod
     def _saved_placement_notes(prep: _RecommendedPrep) -> list[str]:
@@ -2439,6 +2714,14 @@ class ModelManager:
         attached, and the reason is a setting it may never have read.
         """
         record = prep.record
+        if prep.lease is not None and prep.saved_override is not None:
+            lease = prep.lease
+            return [
+                f"'{record.id}' is named by lease {lease.id} ({lease.holder}) on CUDA "
+                f"{list(prep.saved_override)}, so load-recommended walked those cards alone: a "
+                f"lease's cards are its models' placement, as on /load. Release the lease to "
+                f"let the walk choose among the hardware modes."
+            ]
         if prep.saved_override is not None:
             return [
                 f"'{record.id}' saves settings.device_override = CUDA "
@@ -2597,6 +2880,7 @@ class ModelManager:
                     f"anyway.",
                     details={
                         "busy": self.busy_snapshot(),
+                        "busy_models": _busy_rows([resident]),
                         "retry_after_s": BUSY_RETRY_AFTER_S,
                         "loaded_by": resident.loaded_by,
                     },
@@ -3440,6 +3724,7 @@ class ModelManager:
                 self._load_gate.release()
         finally:
             self._loading.discard(record.id)
+            self._loading_devices.pop(record.id, None)
             if hold:
                 self._priority_holds.pop(record.id, None)
             # Bring back what this load displaced, where it still fits --
@@ -3501,6 +3786,7 @@ class ModelManager:
                 f"finish, or pass force=true to load_model to do it anyway.",
                 details={
                     "busy": self.busy_snapshot(),
+                    "busy_models": _busy_rows([existing]),
                     "retry_after_s": BUSY_RETRY_AFTER_S,
                     "loaded_by": existing.loaded_by,
                 },
@@ -3619,6 +3905,9 @@ class ModelManager:
             raise self._vram_error(plan_result)
 
         plan: LoadPlan = plan_result
+        # From here to the settle this load is headed for these cards and only
+        # these (D87, A-10): a lease grant elsewhere need not wait for it.
+        self._loading_devices[record.id] = frozenset(int(d) for d in plan.devices)
         victims = list(plan.evict_model_ids)
         if reload_of is not None and reload_of not in victims:
             victims.insert(0, reload_of)
@@ -3641,6 +3930,7 @@ class ModelManager:
                         f"would interrupt them. Retry shortly.",
                         details={
                             "busy": self.busy_snapshot(),
+                            "busy_models": _busy_rows([inst]),
                             "retry_after_s": BUSY_RETRY_AFTER_S,
                         },
                     )
@@ -3904,26 +4194,43 @@ class ModelManager:
         return None
 
     def _vram_error(self, rejected: LoadRejected) -> InsufficientVramError:
-        """Turn a planner refusal into the 507, keeping every number with it."""
+        """Turn a planner refusal into the 507, keeping every number with it.
+
+        Two machine-readable additions for prose clients match today (D87, the
+        B.0 fragile-item table), the prose itself untouched: every refusal
+        carries ``requested_parallel`` beside ``max_parallel_that_fits`` (the
+        numbers inside "reduce parallel from N to M"; ``None`` when nothing was
+        estimated), and a ``gpu_leased`` whose words are "a lease is not a
+        default to override" carries ``reason: "lease_not_default"``.
+        ``busy_models`` rows gain ``in_flight`` (= ``active_requests``).
+        """
         lease = rejected.leases[0] if rejected.leases else None
         retry = rejected.retry_after_s
         if retry is None and lease is not None:
             # A lease with no TTL has no clock to count down, so fall back to a
             # short re-ask interval rather than "never retry" (D53).
             retry = lease.get("retry_after_s") or LEASE_OPEN_ENDED_RETRY_S
+        message = rejected.message()
+        reason = (
+            {"reason": "lease_not_default"}
+            if rejected.reason_code == "gpu_leased" and "a lease is not a default" in message
+            else {}
+        )
         return InsufficientVramError(
-            rejected.message(),
+            message,
             # A lease is not a shortfall: the box has the VRAM, somebody else
             # has the promise. Same 507 -- clients already branch on it -- but
             # a code they can switch on instead of matching the word "leased".
             # ``None`` leaves the class default (``insufficient_vram``) intact.
             code=rejected.reason_code or None,
             details={
+                **reason,
                 "required_bytes": rejected.required_bytes,
                 "available_bytes": rejected.available_bytes,
                 "per_gpu_free": rejected.per_gpu_free,
                 "max_ctx_that_fits": rejected.max_ctx_that_fits,
                 "max_parallel_that_fits": rejected.max_parallel_that_fits,
+                "requested_parallel": _requested_parallel(rejected),
                 "suggestions": rejected.suggestions,
                 "notes": rejected.notes,
                 # Who is holding the VRAM: on a shared GPU box this is usually
@@ -3935,7 +4242,7 @@ class ModelManager:
                 # A box that is BUSY rather than full: these models would have
                 # freed the VRAM but are serving right now, so the refusal is
                 # worth retrying and says how long to wait (D36).
-                "busy_models": rejected.busy_models,
+                "busy_models": _with_in_flight(rejected.busy_models),
                 "retry_after_s": retry,
                 # A box that is LEASED rather than full. ``lease`` is the one
                 # standing in the way (the common case, and what a client
@@ -4010,7 +4317,9 @@ class ModelManager:
                     model_id=record.id,
                 )
                 raise
-            victim = self._eviction_candidate(exclude=record.id, for_priority=priority)
+            victim = self._eviction_candidate(
+                exclude=record.id, for_priority=priority, devices=plan.devices
+            )
             if victim is None:
                 log.warning(
                     "load failed transiently but nothing can be evicted; not retrying",
@@ -4056,6 +4365,9 @@ class ModelManager:
         )
         if isinstance(replanned, LoadRejected):
             raise self._vram_error(replanned)
+        if record.id in self._loading_devices:
+            # The retry may land elsewhere; a grant must judge the new cards (A-10).
+            self._loading_devices[record.id] = frozenset(int(d) for d in replanned.devices)
         # The replan may carry victims of its own -- routinely so for a
         # tier-1/2 load, whose preemption credit lists the lower-tier
         # residents on its chosen cards (D46). Launching without stopping
@@ -4090,15 +4402,31 @@ class ModelManager:
         if settle > 0:
             await asyncio.sleep(settle)
 
-    def _eviction_candidate(self, *, exclude: str, for_priority: int | None = None) -> str | None:
+    def _eviction_candidate(
+        self,
+        *,
+        exclude: str,
+        for_priority: int | None = None,
+        devices: Sequence[int] | None = None,
+    ) -> str | None:
         """Best eviction victim -- worst tier, LRU within it -- or None.
 
         ``for_priority`` keeps the D46 rule on the transient-OOM retry path
-        too: a background load's retry may not free the chat model.
+        too: a background load's retry may not free the chat model. A model a
+        GPU lease names is never the victim of another model's retry, and with
+        ``devices`` only a resident on those cards qualifies -- one elsewhere
+        would be stopped for nothing (D87, A-9).
         """
+        protected: set[str] = set()
+        for lease in self.leases.all():
+            if exclude not in lease.model_ids:
+                protected.update(lease.model_ids)
         for instance in self.planner._evictable(self.supervisor.list(), for_priority=for_priority):
-            if instance.model_id != exclude:
-                return instance.model_id
+            if instance.model_id == exclude or instance.model_id in protected:
+                continue
+            if devices is not None and not Planner._frees_on(instance, devices):
+                continue
+            return instance.model_id
         return None
 
     def apply_effective_ttl(self, record: ModelRecord, instance: InstanceInfo) -> None:
@@ -4674,19 +5002,76 @@ class ModelManager:
         min_free_gib: float | None = None,
         prefer: Sequence[int] = (),
         avoid: Sequence[int] = (),
+        count: int | None = None,
     ) -> GpuLease:
         """Give ``devices`` to ``model_ids`` (or to nobody) until released or idle.
 
-        ``devices`` may be ``"auto"`` (or ``None``) to have the card chosen
-        (D78): :meth:`auto_lease_placement` picks one the way this grant would
-        judge it and the lease is then taken on exactly that card; the
-        placement's ``considered`` rows ride on any refusal. Explicit devices
-        behave exactly as before. :meth:`acquire_lease_auto` returns the
-        placement beside the lease for a caller that wants to show it.
+        :meth:`grant_lease` without the report: the lease alone, for the
+        in-process callers (the benchmarks) that never needed to know what the
+        grant evicted. Every argument and refusal is :meth:`grant_lease`'s.
+        """
+        grant = await self.grant_lease(
+            devices,
+            holder=holder,
+            model_ids=model_ids,
+            reason=reason,
+            idle_ttl_s=idle_ttl_s,
+            force=force,
+            priority=priority,
+            vacate_url=vacate_url,
+            vacate_token=vacate_token,
+            holder_peer=holder_peer,
+            holder_key=holder_key,
+            min_free_gib=min_free_gib,
+            prefer=prefer,
+            avoid=avoid,
+            count=count,
+        )
+        return grant.lease
+
+    async def grant_lease(
+        self,
+        devices: Sequence[int] | str | None,
+        *,
+        holder: str,
+        model_ids: Sequence[str] = (),
+        reason: str = "",
+        idle_ttl_s: float | None = DEFAULT_IDLE_TTL_S,
+        force: bool = False,
+        priority: int | None = None,
+        vacate_url: str | None = None,
+        vacate_token: str | None = None,
+        holder_peer: str | None = None,
+        holder_key: str | None = None,
+        min_free_gib: float | None = None,
+        prefer: Sequence[int] = (),
+        avoid: Sequence[int] = (),
+        count: int | None = None,
+    ) -> LeaseGrant:
+        """Give ``devices`` to ``model_ids`` (or to nobody) until released or idle.
+
+        ``devices`` may be ``"auto"`` (or ``None``) to have the card(s) chosen
+        (D78): :meth:`auto_lease_placement` picks them the way this grant would
+        judge them -- ``count`` cards of one class (default one; D87) off
+        ``planner.excluded_devices`` and inside the named models' saved
+        placement -- and the lease is then taken on exactly those; the
+        placement's ``considered`` rows ride on any refusal and on the
+        returned :class:`LeaseGrant`. Explicit devices behave exactly as before.
+
+        **A grant reserves; it does not load.** The named models may be planned
+        onto these cards and nothing else may; their next load -- an explicit
+        one, ``load_recommended`` (which walks the lease's cards alone, D87),
+        a load bound with ``lease_id`` (B.6) or a JIT request -- lands there in
+        the measured-fastest shape (:meth:`_apply_lease_profile`). Until then
+        the cards are simply held.
 
         Idle residents on those cards that are not the new owners are unloaded
-        -- that is what "the card is yours" means. A resident mid-request is
-        never interrupted: the call refuses with ``retry_after_s`` (D36). A
+        -- that is what "the card is yours" means -- and listed in the grant's
+        ``evicted`` (A-15). A resident COPY of a named base (a virtual
+        ``<base>@<tag>`` with its own server) is not a stranger: it is kept and
+        named in the lease beside its base (A-1), so its holder's cards are not
+        emptied of the very model they were taken for. A resident mid-request
+        is never interrupted: the call refuses with ``retry_after_s`` (D36). A
         *pinned* idle resident refuses too unless ``force`` is set, because a
         pin is a standing wish; with ``force`` it is evicted and the pin
         reconciler brings it back on other cards if they fit, or on these once
@@ -4697,10 +5082,18 @@ class ModelManager:
         registered a ``vacate_url`` to leave (D56): one POST, the lease is
         marked ``vacating``, and the answer is 409 ``lease_vacating`` with a
         re-ask interval until the holder releases or the window lapses.
+
+        Every 409 keeps ``error.code: lease_conflict`` and its words; the
+        specific refusal is ``details.code`` (D87): ``resident_pinned``,
+        ``resident_outranks``, ``lease_outranked`` (the holder's class is equal
+        or better, so it could not be asked to leave) or ``lease_conflict``.
+        A load in flight refuses the grant only when its planned cards overlap
+        these (A-10).
         """
         tier = normalise_priority(priority)
         if tier is None:
             tier = PRIORITY_BACKGROUND
+        placement: AutoPlacement | None = None
         if devices is None or isinstance(devices, str):
             placement = self.auto_lease_placement(
                 devices,
@@ -4710,6 +5103,7 @@ class ModelManager:
                 min_free_gib=min_free_gib,
                 prefer=prefer,
                 avoid=avoid,
+                count=count,
             )
             wanted = list(placement.devices or [])
         else:
@@ -4720,6 +5114,13 @@ class ModelManager:
                     param="devices",
                 )
             wanted = sorted({int(d) for d in devices})
+            if count is not None and (isinstance(count, bool) or int(count) != len(wanted)):
+                raise BadRequestError(
+                    f'count steers an automatic placement ("auto" picks that many cards of '
+                    f"one class); these devices name {len(wanted)} card(s) and count says "
+                    f'{count} -- drop count, or send devices "auto" with it',
+                    param="count",
+                )
         if not wanted:
             raise BadRequestError("a lease must name at least one CUDA device", param="devices")
         if vacate_url is not None:
@@ -4740,6 +5141,8 @@ class ModelManager:
                     f"unknown CUDA device(s) {unknown}; this box has {known}", param="devices"
                 )
         owners: list[str] = []
+        #: Named models that are bases: their resident copies belong with them (A-1).
+        owner_bases: set[str] = set()
         for name in model_ids:
             record = self.registry.resolve(name)
             if record is None:
@@ -4753,25 +5156,49 @@ class ModelManager:
             serving_id = serving.id
             if serving_id not in owners:
                 owners.append(serving_id)
+            if not serving.is_virtual:
+                owner_bases.add(serving_id)
         clash = self.leases.conflicts(wanted)
         if clash:
             # Ask a worse-class holder to leave (D56) or let the book phrase
             # today's conflict -- either way this raises.
             self._vacate_or_conflict(wanted, clash, holder=holder, priority=tier)
-        if self._loading:
+        in_flight = self._loads_onto(wanted)
+        if in_flight:
+            # Only a load whose PLAN overlaps these cards (A-10): one elsewhere
+            # cannot land here, and one still queued for the gate has no plan
+            # yet -- it reads the lease book when it plans, so it routes around
+            # this grant by itself.
+            names = ", ".join(f"{mid} on CUDA {sorted(devs)}" for mid, devs in in_flight.items())
             raise ModelBusyError(
-                f"a model load is in flight ({', '.join(sorted(self._loading))}) and may "
-                f"land on these cards; retry once it settles",
-                details={"retry_after_s": BUSY_RETRY_AFTER_S, "loading": sorted(self._loading)},
+                f"a model load is in flight ({names}) and may land on these cards; retry "
+                f"once it settles",
+                details={
+                    "retry_after_s": BUSY_RETRY_AFTER_S,
+                    "loading": sorted(in_flight),
+                    "loading_devices": {mid: sorted(devs) for mid, devs in in_flight.items()},
+                },
             )
         busy: list[InstanceInfo] = []
         pinned: list[InstanceInfo] = []
         tiered: list[InstanceInfo] = []
         victims: list[InstanceInfo] = []
+        adopted: list[str] = []
         for instance in self.supervisor.list():
             if instance.model_id in owners or instance.plan is None:
                 continue
             if not (set(instance.plan.devices) & set(wanted)):
+                continue
+            if self._is_copy_of(instance.model_id, owner_bases):
+                # A-1: ``base@b`` on the cards a lease for ``base`` just claimed
+                # is the holder's own model, not a squatter -- stopping it was
+                # the "loaded, gone 6 s later" of 2026-11-09. It is kept, and
+                # named in the lease so it may be planned here again, its
+                # activity keeps the lease alive and the release takes it down
+                # with the rest -- unless another lease already names it (a
+                # model belongs to at most one).
+                if self.leases.for_model(instance.model_id) is None:
+                    adopted.append(instance.model_id)
                 continue
             if instance.state == "loading" or instance.active_requests > 0:
                 busy.append(instance)
@@ -4792,12 +5219,7 @@ class ModelManager:
             raise ModelBusyError(
                 f"{names} is serving on CUDA {wanted}; a lease never interrupts a stream "
                 f"(D36). Retry when it is idle.",
-                details={
-                    "retry_after_s": BUSY_RETRY_AFTER_S,
-                    "busy_models": [
-                        {"model_id": i.model_id, "active_requests": i.active_requests} for i in busy
-                    ],
-                },
+                details={"retry_after_s": BUSY_RETRY_AFTER_S, "busy_models": _busy_rows(busy)},
             )
         if pinned:
             names = ", ".join(i.model_id for i in pinned)
@@ -4806,7 +5228,7 @@ class ModelManager:
                 f"evict them -- the pin reconciler brings them back on other cards if they "
                 f"fit, or on these once the lease ends",
                 param="force",
-                details={"pinned": [i.model_id for i in pinned]},
+                details={"code": "resident_pinned", "pinned": [i.model_id for i in pinned]},
             )
         if tiered:
             names = ", ".join(f"{i.model_id} (priority {i.priority})" for i in tiered)
@@ -4815,7 +5237,11 @@ class ModelManager:
                 f"grant at priority {tier} does not outrank a better tier (D46). Pass "
                 f"force=true to evict them anyway, or lease other cards",
                 param="force",
-                details={"priority_models": [i.model_id for i in tiered], "priority": tier},
+                details={
+                    "code": "resident_outranks",
+                    "priority_models": [i.model_id for i in tiered],
+                    "priority": tier,
+                },
             )
         # Book first, evict second. The planner reads the book, and every
         # supervisor.stop() below yields to the event loop for the length of a
@@ -4830,7 +5256,7 @@ class ModelManager:
         lease = self.leases.acquire(
             wanted,
             holder=holder,
-            model_ids=owners,
+            model_ids=[*owners, *adopted],
             reason=reason,
             idle_ttl_s=idle_ttl_s,
             priority=tier,
@@ -4839,7 +5265,7 @@ class ModelManager:
             holder_peer=holder_peer,
             holder_key=holder_key,
         )
-        evicted_any = False
+        evicted: list[dict[str, Any]] = []
         try:
             for victim in victims:
                 current = self.supervisor.get(victim.model_id)
@@ -4854,12 +5280,7 @@ class ModelManager:
                         f"interrupts a stream (D36). Retry when it is idle.",
                         details={
                             "retry_after_s": BUSY_RETRY_AFTER_S,
-                            "busy_models": [
-                                {
-                                    "model_id": current.model_id,
-                                    "active_requests": current.active_requests,
-                                }
-                            ],
+                            "busy_models": _busy_rows([current]),
                         },
                     )
                 log.info(
@@ -4871,13 +5292,22 @@ class ModelManager:
                 )
                 self._record_eviction(victim.model_id, reason="lease", evicted_by=holder)
                 await self.supervisor.stop(victim.model_id)
-                evicted_any = True
+                evicted.append(
+                    {
+                        "model_id": victim.model_id,
+                        "reason": "lease",
+                        "devices": sorted(
+                            int(d) for d in (victim.plan.devices if victim.plan else ())
+                        ),
+                        "priority": victim.priority,
+                    }
+                )
         except BaseException:
             # CancelledError included: a cancelled benchmark must not leave a
             # lease standing that nobody holds a handle to.
             self.leases.release(lease.id)
             raise
-        if evicted_any:
+        if evicted:
             # The holder starts allocating the moment it has the lease; give the
             # driver the same beat the supervisor gives its own VRAM sample, or
             # the holder allocates into memory that has not been handed back.
@@ -4893,33 +5323,46 @@ class ModelManager:
             lease_id=lease.id,
             devices=wanted,
             holder=holder,
-            model_ids=owners,
+            model_ids=list(lease.model_ids),
+            adopted=adopted or None,
+            evicted=[row["model_id"] for row in evicted] or None,
             idle_ttl_s=idle_ttl_s,
             reason=reason or None,
             priority=tier,
             vacate_target=vacate_target,
         )
-        return lease
+        return LeaseGrant(lease=lease, evicted=evicted, adopted=adopted, placement=placement)
+
+    def _loads_onto(self, devices: Iterable[int]) -> dict[str, frozenset[int]]:
+        """In-flight loads whose PLANNED cards overlap ``devices`` (D87, A-10)."""
+        wanted = {int(d) for d in devices}
+        return {
+            model_id: planned
+            for model_id, planned in self._loading_devices.items()
+            if model_id in self._loading and planned & wanted
+        }
+
+    def _is_copy_of(self, model_id: str, bases: set[str]) -> bool:
+        """Whether ``model_id`` is a virtual copy (``<base>@<tag>``) of one of ``bases`` (A-1)."""
+        if not bases:
+            return False
+        record = self.registry.get(model_id)
+        return (
+            record is not None
+            and bool(getattr(record, "is_virtual", False))
+            and getattr(record, "base_model_id", None) in bases
+        )
 
     async def acquire_lease_auto(self, **kwargs: Any) -> tuple[GpuLease, AutoPlacement]:
-        """:meth:`acquire_lease` with the card chosen, returning the placement too (D78).
+        """:meth:`grant_lease` with the card chosen, returning the placement too (D78).
 
-        Takes :meth:`acquire_lease`'s keyword arguments except ``devices``.
-        The placement is computed once and the grant is made on its card; a
+        Takes :meth:`grant_lease`'s keyword arguments except ``devices``. The
+        placement is computed once and the grant is made on its cards; a
         resident that became busy between the two is the grant's usual 503.
         """
-        tier = normalise_priority(kwargs.get("priority"))
-        placement = self.auto_lease_placement(
-            "auto",
-            priority=PRIORITY_BACKGROUND if tier is None else tier,
-            model_ids=kwargs.get("model_ids") or (),
-            force=bool(kwargs.get("force", False)),
-            min_free_gib=kwargs.pop("min_free_gib", None),
-            prefer=kwargs.pop("prefer", ()) or (),
-            avoid=kwargs.pop("avoid", ()) or (),
-        )
-        lease = await self.acquire_lease(list(placement.devices or []), **kwargs)
-        return lease, placement
+        grant = await self.grant_lease("auto", **kwargs)
+        assert grant.placement is not None  # an auto grant always carries its placement
+        return grant.lease, grant.placement
 
     def auto_lease_placement(
         self,
@@ -4931,17 +5374,23 @@ class ModelManager:
         min_free_gib: float | None = None,
         prefer: Sequence[int] = (),
         avoid: Sequence[int] = (),
+        count: int | None = None,
     ) -> AutoPlacement:
-        """Choose the card for an automatic lease, or raise the refusal (D78).
+        """Choose the card(s) for an automatic lease, or raise the refusal (D78).
 
         The decision is :func:`choose_auto_devices` over the probe's cards, the
-        supervisor's residents and the lease book. Nothing fitting raises the
-        code a tenant already knows how to read, chosen by what stood in the
-        way: ``model_busy`` (503) when a busy resident did and waiting may help;
-        ``lease_conflict`` (409, the book's own phrasing) when leases did;
-        ``lease_conflict`` on ``force`` when only pins or better tiers did;
-        ``insufficient_vram`` (507) when ``min_free_gib`` did; else a 400. Every
-        refusal carries ``details.considered``.
+        supervisor's residents and the lease book. Since D87 (A-14) it also
+        honours ``planner.excluded_devices`` (no model is planned there, so no
+        automatic lease lands there either) and the named models' own saved
+        placement -- a ``device_override`` or ``allowed_devices`` the lease's
+        cards must fall inside -- and ``count`` asks for that many cards of one
+        class (``class_key``); more than the box has is a 400. Nothing fitting
+        raises the code a tenant already knows how to read, chosen by what
+        stood in the way: ``model_busy`` (503) when a busy resident did and
+        waiting may help; ``lease_conflict`` (409, the book's own phrasing)
+        when leases did; ``lease_conflict`` on ``force`` when only pins or
+        better tiers did; ``insufficient_vram`` (507) when ``min_free_gib``
+        did; else a 400. Every refusal carries ``details.considered``.
         """
         if devices is not None and str(devices).strip().lower() != "auto":
             raise BadRequestError(
@@ -4954,6 +5403,10 @@ class ModelManager:
             isinstance(min_free_gib, bool) or float(min_free_gib) <= 0
         ):
             raise BadRequestError("min_free_gib must be a positive number", param="min_free_gib")
+        if count is not None and (
+            isinstance(count, bool) or not isinstance(count, int) or count < 1
+        ):
+            raise BadRequestError("count must be a whole number of cards, 1 or more", param="count")
         try:
             gpus = list(self.planner.probe.list_gpus())
         except Exception as exc:  # noqa: BLE001 - a sick probe cannot place anything
@@ -4977,11 +5430,31 @@ class ModelManager:
                     f"{name} names unknown CUDA device(s) {unknown}; this box has {sorted(known)}",
                     param=name,
                 )
+        if count is not None and count > len(known):
+            raise BadRequestError(
+                f"count {count} asks for more cards than this box has ({len(known)}); ask for "
+                f"{len(known)} or fewer",
+                param="count",
+            )
         owners: list[str] = []
+        allowed: set[int] | None = None
+        why: list[str] = []
         for name in model_ids:
             record = self.registry.resolve(name)
-            if record is not None:
-                owners.append(self.serving_record(record).id)
+            if record is None:
+                continue
+            serving = self.serving_record(record)
+            owners.append(serving.id)
+            saved = serving.settings
+            if saved.device_override:
+                cards = {int(d) for d in saved.device_override}
+                why.append(f"'{serving.id}' saves device_override {sorted(cards)}")
+            elif saved.allowed_devices is not None:
+                cards = {int(d) for d in saved.allowed_devices}
+                why.append(f"'{serving.id}' saves allowed_devices {sorted(cards)}")
+            else:
+                continue
+            allowed = cards if allowed is None else allowed & cards
         placement = choose_auto_devices(
             gpus,
             self.supervisor.list(),
@@ -4992,11 +5465,16 @@ class ModelManager:
             min_free_gib=min_free_gib,
             prefer=prefer,
             avoid=avoid,
+            excluded=self.config.planner.excluded_devices,
+            allowed=allowed,
+            allowed_reason="; ".join(why) or None,
+            count=count or 1,
         )
         if not placement.refused:
             log.info(
                 "gpu lease placed automatically",
                 devices=placement.devices,
+                count=placement.count,
                 priority=priority,
                 prefer=list(prefer) or None,
                 avoid=list(avoid) or None,
@@ -5011,20 +5489,35 @@ class ModelManager:
         verdicts = placement.verdicts()
         considered: dict[str, Any] = {"considered": list(placement.considered), "placement": "auto"}
         rows = placement.considered
+        want = placement.count
+        # The pre-D87 sentences, word for word, for a one-card ask; a count names itself.
+        none_free = "no card is free" if want == 1 else f"no {want} cards of one class are free"
         if VERDICT_BUSY in verdicts:
             busy = [row for row in rows if row["verdict"] == VERDICT_BUSY]
+            busy_devices = {int(row["device"]) for row in busy}
+            busy_instances = [
+                i
+                for i in self.supervisor.list()
+                if i.plan is not None
+                and {int(d) for d in i.plan.devices} & busy_devices
+                and (i.state == "loading" or i.active_requests > 0)
+            ]
             return ModelBusyError(
-                "no card is free for an automatic lease: "
+                f"{none_free} for an automatic lease: "
                 + "; ".join(f"CUDA {row['device']}: {row['detail']}" for row in busy)
                 + ". A lease never interrupts a stream (D36); retry when one is idle, or "
                 "name a card.",
-                details={**considered, "retry_after_s": BUSY_RETRY_AFTER_S},
+                details={
+                    **considered,
+                    "retry_after_s": BUSY_RETRY_AFTER_S,
+                    "busy_models": _busy_rows(busy_instances),
+                },
             )
         if VERDICT_LEASED in verdicts:
             leased = [int(row["device"]) for row in rows if row["verdict"] == VERDICT_LEASED]
             error = self.leases.conflict_error(leased, self.leases.conflicts(leased))
             error.message = (
-                "no card is free for an automatic lease; the ones not otherwise ruled out are "
+                f"{none_free} for an automatic lease; the ones not otherwise ruled out are "
                 "leased: " + error.message + " Automatic placement never asks a holder to "
                 "vacate -- name the card to invoke D56."
             )
@@ -5037,12 +5530,18 @@ class ModelManager:
                 if row["verdict"] in (VERDICT_PINNED, VERDICT_BETTER_TIER)
             ]
             return LeaseConflictError(
-                "no card is free for an automatic lease without evicting a pinned or "
+                f"{none_free} for an automatic lease without evicting a pinned or "
                 f"better-tier resident: {'; '.join(held)}. Pass force=true to evict them "
                 f"(the pin reconciler brings a pinned one back elsewhere), or lease other "
                 f"cards; the claim's class is {priority}.",
                 param="force",
-                details={**considered, "priority": priority},
+                details={
+                    **considered,
+                    "code": (
+                        "resident_pinned" if VERDICT_PINNED in verdicts else "resident_outranks"
+                    ),
+                    "priority": priority,
+                },
             )
         if VERDICT_TOO_LITTLE_FREE in verdicts:
             short = [
@@ -5055,9 +5554,33 @@ class ModelManager:
                 param="min_free_gib",
                 details=considered,
             )
+        if VERDICT_CANDIDATE in verdicts:
+            # Free cards exist, just not ``want`` of one class (D87).
+            classes: dict[str, list[int]] = {}
+            for row in rows:
+                if row["verdict"] == VERDICT_CANDIDATE:
+                    classes.setdefault(str(row["class_key"]), []).append(int(row["device"]))
+            spread = "; ".join(f"{key}: CUDA {cards}" for key, cards in sorted(classes.items()))
+            return BadRequestError(
+                f"{none_free} for an automatic lease: the free cards are {spread}. An automatic "
+                f"lease of {want} cards takes them from ONE class, because a split runs at the "
+                f"slower card's pace; name the cards to mix classes, or ask for fewer.",
+                code="placement_unavailable",
+                param="count",
+                details=considered,
+            )
+        if verdicts <= {VERDICT_AVOIDED}:
+            return BadRequestError(
+                "no card is left to place onto: every GPU is named in avoid",
+                param="avoid",
+                details=considered,
+            )
         return BadRequestError(
-            "no card is left to place onto: every GPU is named in avoid",
-            param="avoid",
+            "no card is left to place onto: "
+            + "; ".join(f"CUDA {row['device']}: {row['detail']}" for row in rows)
+            + ". Clear the exclusion or the model's saved placement, or name the cards.",
+            code="placement_unavailable",
+            param="devices",
             details=considered,
         )
 
@@ -5079,7 +5602,12 @@ class ModelManager:
         now = time.time()
         askable = [lease for lease in clash if lease.priority > priority and lease.vacate_url]
         if len(askable) != len(clash):
-            raise self.leases.conflict_error(wanted, clash, now=now)
+            error = self.leases.conflict_error(wanted, clash, now=now)
+            if any(lease.priority <= priority for lease in clash):
+                # The requester's class does not outrank a holder in the way, so
+                # no vacate could ever be asked: waiting is the only path (D87).
+                error.details.update({"code": "lease_outranked"})
+            raise error
         window_s = float(self.config.leases.vacate_timeout_s)
         sent: list[str] = []
         for lease in askable:
@@ -5206,6 +5734,13 @@ class ModelManager:
         return await vacate_url_targets_self(url, own_ports=own_ports, own_addresses=own_addresses)
 
     def release_lease(self, lease_id: str) -> GpuLease:
+        """Take the lease out of the book; its models stay resident.
+
+        The book half of a release, and all of it for the in-process callers
+        whose leases must keep their pre-D87 behaviour -- the benchmark and the
+        parallel benchmark put back what they found themselves. Every API
+        surface releases through :meth:`release_and_unload` instead (F-2).
+        """
         lease = self.leases.release(lease_id)
         log.info(
             "gpu lease released",
@@ -5217,8 +5752,169 @@ class ModelManager:
         )
         return lease
 
+    async def release_and_unload(self, lease_id: str, *, unload_owned: bool = True) -> LeaseRelease:
+        """Release a lease and unload the models it owns (D87, lead decision F-2).
+
+        A lease is the resource boundary: the models it names -- the ones it
+        was taken for, the copies the grant adopted, the ones a ``lease_id``
+        load bound to it -- go down with it, so the cards come back clean
+        instead of carrying an ordinary idle resident the next tenant must
+        evict. ``unload_owned=False`` (``DELETE /api/leases/{id}?unload=false``)
+        keeps them resident, the pre-D87 behaviour. Never cut: a model serving
+        a request (or still loading), a pinned one, one another standing lease
+        names, or one resident off the lease's cards stays up and is listed in
+        ``kept`` with the reason -- the idle TTL takes a busy one down later.
+        """
+        lease = self.release_lease(lease_id)
+        return await self._unload_lease_models(lease, unload=unload_owned, why="released")
+
+    async def _unload_lease_models(
+        self, lease: GpuLease, *, unload: bool, why: str
+    ) -> LeaseRelease:
+        """Unload a just-ended lease's idle, unpinned, no-longer-leased models (F-2)."""
+        result = LeaseRelease(lease=lease)
+        for model_id in lease.model_ids:
+            instance = self.supervisor.get(model_id)
+            if instance is None:
+                continue
+            keep: str | None = None
+            on_cards = instance.plan is not None and bool(
+                {int(d) for d in instance.plan.devices} & {int(d) for d in lease.devices}
+            )
+            if not unload:
+                keep = "not_requested"
+            elif not on_cards:
+                # Named, but resident elsewhere (loaded before the lease and never
+                # moved onto it): the lease's boundary is its cards, and a release
+                # must not become a way to unload a model off them.
+                keep = "elsewhere: resident off the lease's cards"
+            elif (other := self.leases.for_model(model_id)) is not None:
+                keep = f"leased: lease {other.id} ({other.holder}) names it"
+            elif instance.ttl_s == 0:
+                keep = "pinned"
+            elif instance.state == "loading" or instance.active_requests > 0:
+                keep = "busy"
+            if keep is not None:
+                result.kept.append(
+                    {"model_id": model_id, "reason": keep.split(":")[0], "detail": keep}
+                )
+                continue
+            log.info(
+                f"unloading a gpu lease's model: the lease was {why}",
+                model_id=model_id,
+                lease_id=lease.id,
+                holder=lease.holder,
+                devices=list(instance.plan.devices) if instance.plan else None,
+            )
+            self._record_eviction(model_id, reason=f"lease_{why}", evicted_by=lease.holder)
+            # Housekeeping, not a deliberate unload: a pin reconciler or a
+            # restore entry is not this release's business (it never reaches a
+            # pinned model anyway).
+            await self.unload(model_id, deliberate=False, source=f"lease:{lease.id}")
+            result.unloaded.append(model_id)
+        if result.unloaded or result.kept:
+            log.info(
+                "gpu lease models after the lease ended",
+                lease_id=lease.id,
+                ended=why,
+                unloaded=result.unloaded or None,
+                kept=[row["model_id"] for row in result.kept] or None,
+            )
+        return result
+
+    def _spawn_lease_unload(self, lease: GpuLease, *, why: str) -> None:
+        """Unload an expired lease's models without making the sweep step async (F-2).
+
+        Skipped for this server's own benchmark leases (their runs put back
+        what they found) and when nothing it names is resident; without a
+        running loop (a synchronous caller) nothing is spawned.
+        """
+        if holder_family(lease.holder) in OWN_HOLDER_FAMILIES:
+            return
+        if not any(self.supervisor.get(model_id) is not None for model_id in lease.model_ids):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            log.debug("no running loop; an expired lease's models stay up", lease_id=lease.id)
+            return
+        task = loop.create_task(
+            self._unload_lease_models(lease, unload=True, why=why),
+            name=f"studioforge-lease-unload-{lease.id}",
+        )
+        self._lease_unload_tasks.add(task)
+        task.add_done_callback(self._lease_unload_tasks.discard)
+
     def touch_lease(self, lease_id: str) -> GpuLease:
+        """Restart a lease's idle clock -- the legacy name of :meth:`renew_lease`."""
         return self.leases.touch(lease_id)
+
+    def renew_lease(self, lease_id: str) -> GpuLease:
+        """Renew a lease: ``renew_time`` (= ``last_activity_at``) becomes this server's now.
+
+        The Kubernetes Lease verb (D87): a holder renews by updating
+        ``renew_time``; the server stamps its own clock whatever the holder
+        sent, so a skewed client clock can neither shorten nor stretch a lease.
+        """
+        return self.leases.touch(lease_id)
+
+    def lease_for_binding(self, lease_id: str, name: str) -> tuple[GpuLease, ModelRecord]:
+        """The lease a ``lease_id`` load names, and the record that would join it (B.6).
+
+        Read-only: 404 ``lease_not_found`` for an unknown lease, 404 for an
+        unknown model, and 409 ``lease_conflict`` when ANOTHER standing lease
+        already names the model -- a model belongs to at most one lease
+        (:meth:`LeaseBook.for_model`), and quietly moving it would change the
+        other holder's cards. Whether the caller may use the lease is the
+        route's question (D80 ownership).
+        """
+        lease = self.leases.get(lease_id)
+        if lease is None:
+            raise LeaseNotFoundError(
+                f"no lease '{lease_id}'; GET /api/leases (or server_status.leases) lists the "
+                f"standing ones",
+                param="lease_id",
+            )
+        record = self.registry.resolve(name)
+        if record is None:
+            raise ModelNotFoundError(name, known=self.registry.known_ids())
+        serving = self.serving_record(record)
+        other = self.leases.for_model(serving.id)
+        if other is not None and other.id != lease.id:
+            raise LeaseConflictError(
+                f"'{serving.id}' is already named by lease {other.id} ({other.holder}) on CUDA "
+                f"{sorted(other.devices)}; a model belongs to at most one lease. Release that "
+                f"lease first, or load without lease_id.",
+                param="lease_id",
+                details={"code": "lease_conflict", "leases": [lease_view(other)]},
+            )
+        return lease, serving
+
+    @staticmethod
+    def _lease_bounds_check(
+        lease: GpuLease,
+        *,
+        devices: Sequence[int] | None = None,
+        allowed_devices: Sequence[int] | None = None,
+    ) -> None:
+        """A ``lease_id`` load's one-shot placement must stay on the lease's cards (B.6)."""
+        held = {int(d) for d in lease.devices}
+        if devices is not None and not {int(d) for d in devices} <= held:
+            raise BadRequestError(
+                f"devices {sorted(int(d) for d in devices)} reach outside lease {lease.id}, "
+                f"which holds CUDA {sorted(held)}; a load bound to a lease runs on its cards. "
+                f"Drop devices (the lease's cards are the placement) or name a subset of them.",
+                param="devices",
+                details={"lease_id": lease.id, "lease_devices": sorted(held)},
+            )
+        if allowed_devices is not None and not held <= {int(d) for d in allowed_devices}:
+            raise BadRequestError(
+                f"allowed_devices {sorted(int(d) for d in allowed_devices)} excludes cards of "
+                f"lease {lease.id} (CUDA {sorted(held)}), and a load bound to a lease runs on "
+                f"exactly its cards; drop allowed_devices, or widen it to the lease's cards.",
+                param="allowed_devices",
+                details={"lease_id": lease.id, "lease_devices": sorted(held)},
+            )
 
     def _restore_leases(self) -> None:
         """Re-enter the leases the registry holds from before the restart (D61).
@@ -5304,6 +6000,9 @@ class ModelManager:
                 idle_ttl_s=lease.idle_ttl_s,
                 vacate_pending_for=lease.vacate_requested_by if lease.vacating() else None,
             )
+            # F-2: an expiry ends the lease the way a release does -- its idle
+            # models go down with it (off the loop's own task, the sweep is sync).
+            self._spawn_lease_unload(lease, why="expired")
 
     def _apply_lease_profile(self, record: ModelRecord) -> tuple[ModelRecord, bool]:
         """Steer a leased model onto its cards in the measured-fastest shape (D43).

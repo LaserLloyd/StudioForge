@@ -41,7 +41,7 @@ To check what a server runs, `curl -s <host>/api/version`; to branch on behaviou
 - **Loads on demand.** Name a model in a request and it loads. Idle models unload on a timer; pinned ones stay.
 - **Shares the cards.** Other GPU programs take a lease first, and StudioForge plans around it.
 - **Scoped keys and accounts.** `read`, `inference` and `admin` keys, an owner login, and an audit log.
-- **Manageable by an agent.** 37 MCP tools (27 on the server, 10 on a separate watchdog) cover load, pin, download, benchmark, lease and recover.
+- **Manageable by an agent.** 39 MCP tools (29 on the server, 10 on a separate watchdog) cover load, pin, download, benchmark, lease and recover.
 - **Private.** No telemetry. The only outbound requests are the ones you ask for: Hugging Face for search and downloads, GitHub for llama.cpp builds and updates.
 
 It does no inference of its own and never offloads to CPU. It speaks the OpenAI API, the Anthropic Messages API and the LM Studio native API; [`docs/API.md`](docs/API.md) lists which endpoints are complete, partial or refused.
@@ -112,7 +112,7 @@ flowchart LR
   subgraph host["Host machine"]
     subgraph gw["Gateway :1234"]
       api["/v1 and /api"]
-      mcp["/mcp (27 tools)"]
+      mcp["/mcp (29 tools)"]
       core["Registry, planner,<br/>supervisor, leases"]
     end
     panel["Panel :8080"]
@@ -362,7 +362,7 @@ sfctl status
 
 ## MCP tools
 
-`/mcp` on the gateway offers 27 management tools; the watchdog on `:1235` offers 10 recovery tools.
+`/mcp` on the gateway offers 29 management tools; the watchdog on `:1235` offers 10 recovery tools.
 `sfctl mcp` merges them into one stdio server, so an agent keeps `restart_server` even when the
 gateway is down. There are no inference tools: chat goes through `/v1`. Each tool needs a scope:
 read-only tools need `read`, tools that load or lease need `inference`, and anything destructive, or
@@ -372,7 +372,7 @@ policy table does not know needs `admin`.
 ```mermaid
 flowchart LR
   agent["Agent"] -- "stdio" --> bridge["sfctl mcp"]
-  bridge -- "HTTP + key" --> g["Gateway /mcp<br/>27 tools"]
+  bridge -- "HTTP + key" --> g["Gateway /mcp<br/>29 tools"]
   bridge -- "HTTP + key" --> w["Watchdog :1235<br/>10 tools"]
   g --> pol["Scope check,<br/>then audit log"]
   w --> pol

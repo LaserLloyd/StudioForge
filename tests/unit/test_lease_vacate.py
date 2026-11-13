@@ -558,7 +558,8 @@ def test_a_jit_load_never_vacates_only_a_lease_acquire_does() -> None:
     """D56 item 5, pinned two ways: the planner refuses a load onto a leased
     card (D53 ``gpu_leased``) without touching the lease's vacate clocks --
     whatever the load's tier -- and ``_vacate_or_conflict`` has exactly one
-    caller in the manager, ``acquire_lease``."""
+    caller in the manager, the grant (``grant_lease``, which ``acquire_lease``
+    wraps since D87)."""
     import inspect
 
     from tests.unit.test_leases import make_planner
@@ -577,8 +578,9 @@ def test_a_jit_load_never_vacates_only_a_lease_acquire_does() -> None:
     source = inspect.getsource(manager_mod.ModelManager)
     callers = [line for line in source.splitlines() if "self._vacate_or_conflict(" in line]
     assert len(callers) == 1
-    acquire = inspect.getsource(manager_mod.ModelManager.acquire_lease)
+    acquire = inspect.getsource(manager_mod.ModelManager.grant_lease)
     assert "self._vacate_or_conflict(" in acquire
+    assert "self.grant_lease(" in inspect.getsource(manager_mod.ModelManager.acquire_lease)
     assert "_vacate_or_conflict" not in inspect.getsource(manager_mod.ModelManager.load)
 
 

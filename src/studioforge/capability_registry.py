@@ -733,7 +733,14 @@ CAPABILITIES: tuple[Capability, ...] = (
         "leases.touch",
         "Extend a standing lease's time to live.",
         api=("POST", "/api/leases/{lease_id}/touch"),
+        mcp=_g("touch_lease"),
         sfctl="leases touch",
+    ),
+    Capability(
+        "leases.renew",
+        "Renew a standing lease (Kubernetes-style: renew_time stamped by the server).",
+        api=("PATCH", "/api/leases/{lease_id}"),
+        mcp=_g("renew_lease"),
     ),
     Capability(
         "tenants.register",

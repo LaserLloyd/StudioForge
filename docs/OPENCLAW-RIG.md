@@ -33,7 +33,7 @@ Which card is whose is a question with a live answer, never a written-down one:
 
 ## 2. Registration
 
-**StudioForge is a stdio bridge.** The companion CLI (`sfctl`) merges the app's 27 management tools
+**StudioForge is a stdio bridge.** The companion CLI (`sfctl`) merges the app's 29 management tools
 and the watchdog's 10 recovery tools into one local stdio MCP server, so OpenClaw launches a
 process rather than opening a socket:
 
@@ -254,7 +254,7 @@ Everything else means *change the request*, *stand down*, or *report*.
 
 ## 10. The short version (this is the part to hand an agent)
 
-> **You are talking to one GPU rig.** `studioforge` (37 tools) manages the LLM host; text
+> **You are talking to one GPU rig.** `studioforge` (39 tools) manages the LLM host; text
 > generation is NOT a tool — it is `POST http://<rig-host>:1234/v1/chat/completions`. Other
 > programs share the four GPUs, and a **lease** is how one tenant tells the others to keep off a
 > card.

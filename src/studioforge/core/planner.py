@@ -42,7 +42,7 @@ import contextlib
 import itertools
 import json
 import math
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -1640,7 +1640,9 @@ class Planner:
             # *nicer placement*; D36 allows interrupting a stream only when the
             # fit genuinely demands it, and that path is the eviction ladder
             # below, which still honours ``evict_busy``.
-            preempt = self._evictable(others, include_busy=False, for_priority=priority + 1)
+            preempt = self._evictable(
+                others, include_busy=False, for_priority=priority + 1, for_model=record.id
+            )
         preempt_ids = {i.model_id for i in preempt}
 
         credited = ([resident] if resident is not None else []) + preempt
@@ -2097,7 +2099,9 @@ class Planner:
         # available + reclaimable and take the highest rung that fits. Loading
         # at the 8192 floor after freeing 19 GB, when 65536 would have fitted
         # for the identical cost, is the defect this pass exists to fix.
-        reclaimable = self._reclaimable_bytes(loaded, evict_busy=evict_busy, for_priority=priority)
+        reclaimable = self._reclaimable_bytes(
+            loaded, evict_busy=evict_busy, for_priority=priority, for_model=record.id
+        )
         for ctx in ladder:
             for cand_k, cand_v in kv_options:
                 tried.append(f"{ctx}/{cand_k}+evict")
@@ -2258,10 +2262,13 @@ class Planner:
         *,
         evict_busy: bool = False,
         for_priority: int | None = None,
+        for_model: str | None = None,
     ) -> int:
         """VRAM the planner is allowed to take back by evicting idle models."""
         total = 0
-        for instance in self._evictable(loaded, include_busy=evict_busy, for_priority=for_priority):
+        for instance in self._evictable(
+            loaded, include_busy=evict_busy, for_priority=for_priority, for_model=for_model
+        ):
             total += sum(self.instance_footprint(instance).values())
         return total
 
@@ -2691,12 +2698,14 @@ class Planner:
         # tier first (D46) and least-recently-used within one; a tier the
         # asking load does not outrank or match is never a candidate.
         if evict_allowed:
-            evictable = self._evictable(loaded, include_busy=evict_busy, for_priority=priority)
+            evictable = self._evictable(
+                loaded, include_busy=evict_busy, for_priority=priority, for_model=record.id
+            )
             if evictable:
                 freed: dict[int, int] = {}
-                evicted: list[str] = []
+                evicted: list[InstanceInfo] = []
                 for instance in evictable:
-                    evicted.append(instance.model_id)
+                    evicted.append(instance)
                     for dev, amount in self.instance_footprint(instance).items():
                         freed[dev] = freed.get(dev, 0) + amount
                     for pool, pool_note in pools:
@@ -2720,12 +2729,19 @@ class Planner:
                                 kv_unified=kv_unified,
                             )
                             if result is not None:
-                                result.evict_model_ids = list(evicted)
+                                # Only the victims sitting on the chosen cards
+                                # (D87, A-9): the ladder is cumulative across
+                                # every candidate set, and one that frees
+                                # nothing here would be stopped for nothing.
+                                victims = [
+                                    i.model_id for i in evicted if self._frees_on(i, devices)
+                                ]
+                                result.evict_model_ids = victims
                                 result.notes.extend(notes)
                                 result.notes.append(
                                     "evicting unpinned models, lowest priority tier "
                                     "first and least-recently-used within one: "
-                                    + ", ".join(evicted)
+                                    + ", ".join(victims)
                                 )
                                 if mixed:
                                     result.notes.append(self._mixed_note(devices, gpu_map))
@@ -3613,7 +3629,13 @@ class Planner:
         if evict_allowed:
             freed: dict[int, int] = {}
             evicted: list[str] = []
-            for instance in self._evictable(loaded, include_busy=evict_busy, for_priority=priority):
+            for instance in self._evictable(
+                loaded, include_busy=evict_busy, for_priority=priority, for_model=record.id
+            ):
+                if not self._frees_on(instance, devices):
+                    # A victim off these cards frees nothing for this placement
+                    # and would be stopped for nothing (D87, A-9).
+                    continue
                 evicted.append(instance.model_id)
                 for dev, amount in self.instance_footprint(instance).items():
                     freed[dev] = freed.get(dev, 0) + amount
@@ -4049,12 +4071,34 @@ class Planner:
         """A TTL of 0 means pinned; that is the wire representation everywhere."""
         return instance.ttl_s == 0
 
+    def _lease_protected(self, for_model: str | None) -> frozenset[str]:
+        """Model ids a standing lease names that ``for_model``'s load may not evict (D87)."""
+        if self.leases is None or not len(self.leases):
+            return frozenset()
+        protected: set[str] = set()
+        for lease in self.leases.all():
+            if for_model is not None and for_model in lease.model_ids:
+                continue  # the holder's own load: its lease-mates are its business
+            protected.update(lease.model_ids)
+        return frozenset(protected)
+
+    @staticmethod
+    def _frees_on(instance: InstanceInfo, devices: Iterable[int]) -> bool:
+        """Whether evicting ``instance`` frees anything on ``devices`` (D87, A-9)."""
+        wanted = {int(d) for d in devices}
+        footprint = Planner.instance_footprint(instance)
+        if footprint:
+            return any(int(d) in wanted and amount > 0 for d, amount in footprint.items())
+        plan = instance.plan
+        return plan is not None and bool(wanted & {int(d) for d in plan.devices})
+
     def _evictable(
         self,
         loaded: Sequence[InstanceInfo],
         *,
         include_busy: bool = False,
         for_priority: int | None = None,
+        for_model: str | None = None,
     ) -> list[InstanceInfo]:
         """Unpinned, idle instances, worst tier first, least-recently-used within one.
 
@@ -4075,7 +4119,18 @@ class Planner:
         background load can never displace the chat model to make room for
         itself. ``None`` applies no tier rule -- the informational surfaces
         that predate tiers.
+
+        A model a standing GPU lease NAMES is never a candidate for anyone but
+        that lease's own models (D87, A-9): the lease is its holder's promise,
+        and an outsider's ladder stopping the holder's model -- wherever it
+        happens to sit -- broke it as surely as a load onto the leased card
+        would. ``for_model`` is the model asking; a model named by the same
+        lease may displace its lease-mate (the holder rearranging its own
+        cards). ``None`` (the informational surfaces) exempts every owner.
+        ``force`` does not lift this: ``include_busy`` is about streams, and a
+        lease is released, never evicted around.
         """
+        protected = self._lease_protected(for_model)
         candidates = [
             i
             for i in loaded
@@ -4083,6 +4138,7 @@ class Planner:
             and i.state == "ready"
             and (include_busy or i.active_requests == 0)
             and (for_priority is None or i.priority >= for_priority)
+            and i.model_id not in protected
         ]
         return sorted(
             candidates,

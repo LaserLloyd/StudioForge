@@ -455,11 +455,16 @@ async def test_acquire_lease_refuses_a_pinned_resident_unless_forced() -> None:
 
 
 async def test_acquire_lease_waits_for_a_load_in_flight_and_names_conflicts() -> None:
+    """A-10 (D87): only a load whose PLANNED cards overlap refuses the grant."""
     manager, _supervisor = make_manager([make_record()])
     manager._loading.add("some/model")
-    with pytest.raises(ModelBusyError):
+    manager._loading_devices["some/model"] = frozenset({0})
+    with pytest.raises(ModelBusyError) as busy:
         await manager.acquire_lease([0], holder="api")
+    assert "a model load is in flight (some/model on CUDA [0])" in busy.value.message
+    assert busy.value.details["loading_devices"] == {"some/model": [0]}
     manager._loading.clear()
+    manager._loading_devices.clear()
 
     first = await manager.acquire_lease([0], holder="api")
     with pytest.raises(LeaseConflictError) as excinfo:

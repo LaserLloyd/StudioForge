@@ -7992,3 +7992,58 @@ revert guard covers the REST settings save, not yet the GUI and MCP save paths.
 `core/manager.py` (`refresh_ttl`, `request_ttl_cap`), `error_catalog.py` (`model_id_conflict`),
 `docs/LIMITATIONS.md`, generated errors docs, capabilities `model_id_conflict_code`,
 `virtual_model_launch_fields`; `tests/unit/test_virtual_copies.py`, `test_registry.py`.
+
+## D87 -- A lease's models are its holder's, and the load path honours the lease
+
+**Problem.** The 2026-11-09 multi-card review found the lease and the load path disagreeing about
+who owns what. A grant on [2,3] naming a base stopped a resident `base@b` copy on those cards as an
+idle non-owner, and the reply did not say so (A-1). A holder that took a lease naming X and then
+called `load_recommended(X)` could land X on other cards, leaving the lease empty and X an ordinary
+resident the next grant evicts (A-2). Another load's eviction ladder could stop a model a lease
+names, and stopped victims that freed nothing on the target cards (A-9). Any load in flight refused
+a grant on unrelated cards with 503 (A-10). `devices: "auto"` picked exactly one card and ignored
+`planner.excluded_devices` and the owner's placement (A-14). Release and expiry left the lease's
+models resident, with no way to ask otherwise (A-22). Docstrings said a grant loads the model; it
+never did (A-11). The MCP `reserve_gpus` lacked the REST options and MCP leases were unowned (A-21).
+
+**Decision.**
+
+1. The models a lease names are its holder's. A grant naming a base keeps a resident
+   `<base>@<tag>` copy on the wanted cards and names it in the lease (`adopted`). The planner's
+   eviction never stops a model another lease names, and only stops models that free VRAM on the
+   target cards (the transient-OOM retry follows the same rule).
+2. `load_recommended` walks the cards of a lease that names the model (a saved `device_override`
+   still wins), and the dry run agrees. `lease_id` on `POST /load`, `/load-recommended` and
+   `GET /plan-recommended` (and the MCP load tools) binds the load to a lease the caller holds;
+   another key's lease is 403 (D80 ownership).
+3. A grant is refused only by an in-flight load whose planned cards overlap.
+4. `devices: "auto"` honours `excluded_devices` and the named models' saved placement and takes
+   `count` cards of one `class_key`.
+5. The grant reply lists `evicted` and `adopted`. Release and expiry unload the lease's idle models
+   on its cards (owner decision F-2); `DELETE /api/leases/{id}?unload=false` keeps them; the
+   benchmark's own leases are unchanged. A grant reserves; it does not load.
+6. Lease records carry the Kubernetes Lease names (`holder_identity`, `lease_duration_seconds`,
+   `acquire_time`, `renew_time`, `lease_transitions`, `allocation.devices`) beside equal-valued
+   legacy keys. `PATCH /api/leases/{id}` renews; `POST .../touch` stays as a deprecated alias with
+   `Deprecation` and `Link` headers.
+7. A 409 keeps `error.code: lease_conflict` and its exact words; `error.studioforge.code` names the
+   case: `lease_outranked`, `resident_outranks`, `resident_pinned` or `lease_conflict`. A slot 507
+   carries `requested_parallel`; a 503 `model_busy` row carries `in_flight`.
+8. MCP `reserve_gpus` takes `auto`, `min_free_gib`, `prefer`, `avoid`, `count` and `model_ids` and
+   binds the caller's key; `release_gpus` takes `unload`; new `renew_lease` and `touch_lease`
+   (29 management tools, 39 through `sfctl mcp`).
+
+**Not done.** `allocation.devices[].uuid` is null until the probe reports card uuids (D89 adds
+them). The panel's "Release lease" button does not yet say it unloads. A walk refusal does not yet
+carry `max_parallel_that_fits` beside `requested_parallel` everywhere (D88 adds it to the walk).
+
+**Surfaces.** `core/leases.py` (field aliases, `class_key`, `choose_auto_devices` count),
+`core/manager.py` (grant/adopt/evict, `release_lease(unload_owned)`, `_loading` planned devices,
+`lease_id` plumbing), `core/planner.py` (`_evictable`, the two victim loops),
+`api/mgmt_routes.py` (lease and load routes, `PATCH /api/leases/{id}`), `api/auth.py`
+(PATCH is tenant-protocol scope), `mcp/management.py`, `mcp_policy.py`, `capability_registry.py`,
+`error_catalog.py`, the `sfctl mcp` tool count, docs `TENANTS.md`,
+`BENCHMARKING.md`, `OPENCLAW*.md`; capabilities `lease_ownership`, `lease_bound_loads`,
+`lease_release_unloads`, `lease_k8s_fields`, `lease_auto_count`, `lease_refusal_codes`;
+`tests/unit/test_lease_ownership.py`, `test_leases.py`, `test_lease_vacate.py`, `test_mcp.py`,
+`test_companion.py`.

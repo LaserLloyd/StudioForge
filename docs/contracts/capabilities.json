@@ -711,13 +711,32 @@
     },
     {
       "api": {
+        "method": "PATCH",
+        "path": "/api/leases/{lease_id}"
+      },
+      "cli": null,
+      "description": "Renew a standing lease (Kubernetes-style: renew_time stamped by the server).",
+      "id": "leases.renew",
+      "mcp": {
+        "server": "gateway",
+        "tool": "renew_lease"
+      },
+      "notes": "",
+      "panel": null,
+      "sfctl": null
+    },
+    {
+      "api": {
         "method": "POST",
         "path": "/api/leases/{lease_id}/touch"
       },
       "cli": null,
       "description": "Extend a standing lease's time to live.",
       "id": "leases.touch",
-      "mcp": null,
+      "mcp": {
+        "server": "gateway",
+        "tool": "touch_lease"
+      },
       "notes": "",
       "panel": null,
       "sfctl": "leases touch"

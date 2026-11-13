@@ -88,11 +88,11 @@ others — want this shape:
 }
 ```
 
-`sfctl mcp` merges **two** upstream toolsets into one list of 37 tools:
+`sfctl mcp` merges **two** upstream toolsets into one list of 39 tools:
 
 | Tools | Source | Available when the main server is wedged? |
 | --- | --- | --- |
-| `list_models`, `model_options`, `model_info`, `plan_load`, `check_loaded_model`, `load_model`, `load_recommended`, `unload_model`, `pin_model`, `get_model_template`, `set_model_template`, `reserve_gpus`, `release_gpus`, `gpu_leases`, `gpu_tenants`, `test_model`, `benchmark_parallel`, `search_models`, `repo_details`, `download_model`, `delete_model`, `server_status`, `connection_info`, `get_config`, `set_config`, `check_updates`, `update_engine` | main app | no |
+| `list_models`, `model_options`, `model_info`, `plan_load`, `check_loaded_model`, `load_model`, `load_recommended`, `unload_model`, `pin_model`, `get_model_template`, `set_model_template`, `reserve_gpus`, `release_gpus`, `renew_lease`, `touch_lease`, `gpu_leases`, `gpu_tenants`, `test_model`, `benchmark_parallel`, `search_models`, `repo_details`, `download_model`, `delete_model`, `server_status`, `connection_info`, `get_config`, `set_config`, `check_updates`, `update_engine` | main app | no |
 | `restart_server`, `kill_model`, `nuke_all_models`, `reclaim_orphan_engines`, `tail_logs`, `gpu_status`, `rollback_update`, `recovery_health`, `recovery_get_config`, `recovery_set_config` | watchdog sidecar | **yes** |
 
 That split is the point: when the main server locks up, OpenClaw still holds working tools to
@@ -457,8 +457,10 @@ need **one load** kept off a card — and cannot hold a lease, because the card 
 two identical GPUs or because you do not own it — pass `allowed_devices` to that load instead. It
 binds nothing but the call that carries it, and it cannot take a card away from anybody.
 
-While a lease stands nobody else is planned onto those cards; the named model is loaded onto exactly
-them, sized for as many slots as its context allows, in the split mode its own benchmark measured
+While a lease stands nobody else is planned onto those cards and no other load may evict the named
+model. The grant does not load it: its next load (`load_recommended` included, or with
+`lease_id=<lease.id>`) lands on exactly those cards, sized for as many slots as its context allows,
+in the split mode its own benchmark measured
 fastest there (tensor split is never assumed -- on the reference rig it was slower for small and
 MoE models and about 1.5x faster at generation, but slower at prompt processing, for 27-31B
 ones, so benchmark first if you want it considered). Idle residents on the cards are

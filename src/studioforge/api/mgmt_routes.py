@@ -13,7 +13,7 @@ import re
 import time
 from typing import Any
 
-from fastapi import APIRouter, Body, Query, Request
+from fastapi import APIRouter, Body, Query, Request, Response
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 
@@ -42,7 +42,14 @@ from studioforge.core.benchmark import (
     available_modes,
 )
 from studioforge.core.diskspace import disk_report
-from studioforge.core.leases import VACATE_TOKEN_HEADER, holder_family, lease_view
+from studioforge.core.leases import (
+    LEASE_DEPRECATED_FIELDS,
+    VACATE_TOKEN_HEADER,
+    deprecation_headers,
+    gpu_uuid_map,
+    holder_family,
+    lease_view,
+)
 from studioforge.core.manager import validate_load_args
 from studioforge.core.model_gate import (
     GateRequirement,
@@ -486,6 +493,12 @@ async def vram_reclaim(request: Request, dry_run: bool = Body(False, embed=True)
 # ---------------------------------------------------------------------------
 
 
+def _lease_uuids(state: Any) -> dict[int, str | None]:
+    """``{index: uuid}`` for the lease records' ``allocation.devices[]`` (D87)."""
+    planner = getattr(state.manager, "planner", None)
+    return gpu_uuid_map(getattr(planner, "probe", None))
+
+
 @router.get("/leases")
 async def list_leases(request: Request) -> dict[str, Any]:
     """Every standing GPU lease: which cards, held by whom, for which models.
@@ -496,11 +509,26 @@ async def list_leases(request: Request) -> dict[str, Any]:
     itself is shown only to an admin caller (D32 as ``is_admin_caller``: this
     machine, the MCP PIN, or a key-bearing request); the token is never shown
     to anyone.
+
+    The rows also carry the Kubernetes Lease names (D87) -- ``holder_identity``,
+    ``lease_duration_seconds``, ``acquire_time``, ``renew_time``,
+    ``lease_transitions``, ``allocation.devices[{index, uuid}]`` -- with the
+    same values as the StudioForge names they replace, which stay as
+    deprecated aliases for the transition window (``deprecated_fields`` lists
+    them; docs/MIGRATION.md maps each to its successor).
     """
     state = _state(request)
     reveal = is_admin_caller(request, state.config)
-    leases = [lease_view(lease, reveal_vacate_url=reveal) for lease in state.manager.leases.all()]
-    return {"leases": leases, "count": len(leases)}
+    uuids = _lease_uuids(state)
+    leases = [
+        lease_view(lease, reveal_vacate_url=reveal, gpu_uuids=uuids)
+        for lease in state.manager.leases.all()
+    ]
+    return {
+        "leases": leases,
+        "count": len(leases),
+        "deprecated_fields": list(LEASE_DEPRECATED_FIELDS),
+    }
 
 
 @router.post("/leases")
@@ -519,29 +547,44 @@ async def create_lease(
     prefer: list[int] | None = Body(None),
     avoid: list[int] | None = Body(None),
     exclusive: bool = Body(True),
+    count: int | None = Body(
+        None,
+        description=(
+            'With devices "auto": how many cards, all of one class (class_key). Default 1.'
+        ),
+    ),
 ) -> dict[str, Any]:
     """Give CUDA ``devices`` to ``model_ids`` -- or, with none, to something outside this server.
 
-    ``devices`` may be ``"auto"`` or omitted (D78): the server picks ONE card the
-    way this grant judges a card -- never one with a busy resident, never a
+    ``devices`` may be ``"auto"`` or omitted (D78): the server picks the card(s)
+    the way this grant judges a card -- never one with a busy resident, never a
     leased one (automatic placement asks nobody to vacate), never a pinned or
-    better-tier idle resident without ``force``; then fewest evictions first,
-    the caller's ``prefer`` order, most free VRAM, lowest index. ``min_free_gib``
-    is measured against the card once its evictable idle residents are gone;
-    ``avoid`` rules cards out. The reply carries the chosen ``devices`` and a
-    ``placement`` block with every card ``considered``; so does a refusal, in
-    ``error.studioforge.considered``, under the usual codes. ``exclusive`` must
-    be ``true``: a lease is a whole card (the partial-card share lease is the
-    documented extension point, docs/TENANTS.md).
+    better-tier idle resident without ``force``, never one
+    ``planner.excluded_devices`` names or the named models' saved
+    ``device_override``/``allowed_devices`` leaves out (D87); then fewest
+    evictions first, the caller's ``prefer`` order, most free VRAM, lowest
+    index. ``count`` asks for that many cards of ONE class (``class_key``; D87).
+    ``min_free_gib`` is measured against the card once its evictable idle
+    residents are gone; ``avoid`` rules cards out. The reply carries the chosen
+    ``devices`` and a ``placement`` block with every card ``considered``; so
+    does a refusal, in ``error.studioforge.considered``, under the usual codes.
+    ``exclusive`` must be ``true``: a lease is a whole card (the partial-card
+    share lease is the documented extension point, docs/TENANTS.md).
 
-    While the lease stands nothing else is planned onto those cards; the named
-    models are loaded onto exactly them, sized for as many slots as their
-    context allows, in the split mode their own benchmark measured fastest
-    there. Idle residents on the cards are unloaded; a model mid-request
+    **A lease reserves cards; it does not load anything.** While it stands
+    nothing else is planned onto those cards and no other model's eviction
+    ladder stops the models it names (D87). The named models' next load -- a
+    plain ``/load``, ``load-recommended`` (which then walks the lease's cards
+    alone), a load sent with ``lease_id``, or a JIT request -- lands on exactly
+    them, sized for as many slots as their context allows, in the split mode
+    their own benchmark measured fastest there. Idle residents on the cards are
+    unloaded and listed in the reply's ``evicted`` (``[{model_id, reason,
+    devices, priority}]``); a resident copy of a named base (``<base>@<tag>``)
+    is kept and named in the lease instead (``adopted``); a model mid-request
     refuses the call (503, ``retry_after_s``); a pinned idle resident refuses
     unless ``force``. ``idle_ttl_s`` (default 3600) is how long the lease
-    survives without activity before the server releases it; ``null`` holds
-    it until ``DELETE``.
+    survives without activity before the server releases it -- and unloads the
+    models it names (F-2); ``null`` holds it until ``DELETE``.
 
     ``holder`` defaults to the ``X-SF-Client`` header when one is sent, else
     ``"api"``. ``priority`` is the D46 class of the claim (1 chat, 2 dispatched
@@ -553,7 +596,15 @@ async def create_lease(
     ``Retry-After``) until this lease is released or ``leases.vacate_timeout_s``
     passes. A card already leased by an equal or better class, or by a holder
     that registered no URL, is a plain ``409 lease_conflict`` -- also with
-    ``Retry-After`` now. ``force`` never overrides a standing lease.
+    ``Retry-After`` now. ``force`` never overrides a standing lease. Every 409
+    keeps ``error.code: lease_conflict``; ``error.studioforge.code`` names the
+    specific case (``lease_outranked``, ``resident_outranks``,
+    ``resident_pinned``, ``lease_conflict``; D87).
+
+    The reply is the lease record at the top level (``id``/``lease_id`` and
+    every field, as before) and again under ``lease`` -- the canonical place to
+    read it from (D87) -- plus ``evicted``, ``adopted`` and
+    ``deprecated_fields``.
     """
     state = _state(request)
     if exclusive is not True:
@@ -578,38 +629,54 @@ async def create_lease(
             )
         except TenantUrlError as exc:
             raise BadRequestError(str(exc), code="tenant_url_refused", param="vacate_url") from exc
+    if isinstance(devices, str) and devices.strip().lower() != "auto":
+        raise BadRequestError(
+            'devices must be a list of CUDA indices, "auto", or omitted', param="devices"
+        )
     client_label = (request.headers.get("x-sf-client") or "").strip()
     # The registering peer is the holder's proof on the open unload routes
     # (D55, ``may_unload_lease_held``): stored on the lease, never shown.
     peer = str(getattr(getattr(request, "client", None), "host", None) or "") or None
-    common: dict[str, Any] = {
-        "holder": (holder or "").strip() or client_label or "api",
-        "model_ids": model_ids or [],
-        "reason": reason,
-        "idle_ttl_s": idle_ttl_s,
-        "force": force,
-        "priority": priority,
-        "vacate_url": vacate_url,
-        "vacate_token": vacate_token,
-        "holder_peer": peer,
+    grant = await state.manager.grant_lease(
+        devices,
+        holder=(holder or "").strip() or client_label or "api",
+        model_ids=model_ids or [],
+        reason=reason,
+        idle_ttl_s=idle_ttl_s,
+        force=force,
+        priority=priority,
+        vacate_url=vacate_url,
+        vacate_token=vacate_token,
+        holder_peer=peer,
         # 2.0.1: the key that took the lease is the only non-admin key that may
         # renew or release it (``require_owner``).
-        "holder_key": key_owner_of(request),
-    }
-    if devices is None or isinstance(devices, str):
-        if isinstance(devices, str) and devices.strip().lower() != "auto":
-            raise BadRequestError(
-                'devices must be a list of CUDA indices, "auto", or omitted', param="devices"
-            )
-        lease, placement = await state.manager.acquire_lease_auto(
-            min_free_gib=min_free_gib, prefer=prefer or [], avoid=avoid or [], **common
-        )
-        # The registrant just sent the URL: echoing it back tells it what was stored.
-        return {**lease_view(lease, reveal_vacate_url=True), "placement": placement.view()}
-    lease = await state.manager.acquire_lease(
-        devices, min_free_gib=min_free_gib, prefer=prefer or [], avoid=avoid or [], **common
+        holder_key=key_owner_of(request),
+        min_free_gib=min_free_gib,
+        prefer=prefer or [],
+        avoid=avoid or [],
+        count=count,
     )
-    return lease_view(lease, reveal_vacate_url=True)
+    return lease_grant_reply(grant, gpu_uuids=_lease_uuids(state))
+
+
+def lease_grant_reply(grant: Any, *, gpu_uuids: Any = None) -> dict[str, Any]:
+    """The ``POST /api/leases`` body for a :class:`~studioforge.core.manager.LeaseGrant` (D87).
+
+    The registrant just sent the vacate URL, so echoing it back tells it what
+    was stored. The flat top level is the pre-D87 reply (CrucibleForge reads
+    ``lease_id``/``id`` there); ``lease`` is the canonical place.
+    """
+    view = lease_view(grant.lease, reveal_vacate_url=True, gpu_uuids=gpu_uuids)
+    body: dict[str, Any] = {
+        **view,
+        "lease": dict(view),
+        "evicted": list(grant.evicted),
+        "adopted": list(grant.adopted),
+        "deprecated_fields": list(LEASE_DEPRECATED_FIELDS),
+    }
+    if grant.placement is not None:
+        body["placement"] = grant.placement.view()
+    return body
 
 
 def _require_lease_owner(state: Any, request: Request, lease_id: str) -> None:
@@ -630,26 +697,83 @@ def _require_lease_owner(state: Any, request: Request, lease_id: str) -> None:
 
 
 @router.delete("/leases/{lease_id}")
-async def release_lease(lease_id: str, request: Request) -> dict[str, Any]:
+async def release_lease(
+    lease_id: str,
+    request: Request,
+    unload: bool = Query(
+        True,
+        description=(
+            "Unload the models the lease names once it is released (the default, F-2). "
+            "false keeps them resident, the pre-D87 behaviour."
+        ),
+    ),
+) -> dict[str, Any]:
     """Release a lease -- also how a holder answers a vacate request (D56).
 
     An ``admin`` caller may release any lease; an ``inference`` key only the
     one it took (``403 permission_denied`` otherwise, 2.0.1).
+
+    The lease is the resource boundary (D87, lead decision F-2): the models it
+    names -- the ones it was taken for, a resident copy the grant adopted, a
+    model a ``lease_id`` load bound to it -- are unloaded with it and listed in
+    ``unloaded``. ``?unload=false`` keeps them resident. A model serving a
+    request, a pinned one, or one another lease names is never unloaded here;
+    it is listed in ``kept`` with the reason.
     """
     state = _state(request)
     _require_lease_owner(state, request, lease_id)
-    return {"released": lease_view(state.manager.release_lease(lease_id))}
+    result = await state.manager.release_and_unload(lease_id, unload_owned=unload)
+    return {
+        "released": lease_view(result.lease, gpu_uuids=_lease_uuids(state)),
+        "unloaded": list(result.unloaded),
+        "kept": list(result.kept),
+    }
+
+
+@router.patch("/leases/{lease_id}")
+async def renew_lease(
+    lease_id: str, request: Request, body: dict[str, Any] = Body(...)
+) -> dict[str, Any]:
+    """Renew a lease the Kubernetes way: ``{"renew_time": <anything>}`` (D87).
+
+    The canonical twin of ``POST /api/leases/{id}/touch``: the server stamps its
+    OWN clock into ``renew_time`` whatever value was sent (a holder's clock
+    neither shortens nor stretches its lease), and the idle TTL
+    (``lease_duration_seconds``) runs from there. ``renew_time`` is the only
+    field this route changes; any other key is a 400 naming it. Same ownership
+    rule as the release: an ``inference`` key renews only its own lease.
+    """
+    state = _state(request)
+    if "renew_time" not in body:
+        raise BadRequestError(
+            'nothing to change: send {"renew_time": "<now>"} to renew this lease (the server '
+            "stamps its own clock)",
+            param="renew_time",
+        )
+    unknown = sorted(set(body) - {"renew_time"})
+    if unknown:
+        raise BadRequestError(
+            f"PATCH /api/leases/{{id}} changes renew_time only; not changeable here: "
+            f"{', '.join(unknown)}. Release the lease and take a new one to change anything else.",
+            param=unknown[0],
+        )
+    _require_lease_owner(state, request, lease_id)
+    return lease_view(state.manager.renew_lease(lease_id), gpu_uuids=_lease_uuids(state))
 
 
 @router.post("/leases/{lease_id}/touch")
-async def touch_lease(lease_id: str, request: Request) -> dict[str, Any]:
+async def touch_lease(lease_id: str, request: Request, response: Response) -> dict[str, Any]:
     """Restart the idle clock -- for a holder outside this server that is still busy.
 
     Same ownership rule as the release: an ``inference`` key renews only its own lease.
+    Deprecated alias (D87) of ``PATCH /api/leases/{id} {"renew_time": ...}``: the
+    response carries ``Deprecation`` and ``Link: <docs/MIGRATION.md>;
+    rel="deprecation"``; the route keeps working for the transition window.
     """
     state = _state(request)
     _require_lease_owner(state, request, lease_id)
-    return lease_view(state.manager.touch_lease(lease_id))
+    response.headers.update(deprecation_headers())
+    return lease_view(state.manager.touch_lease(lease_id), gpu_uuids=_lease_uuids(state))
 
 
 # ---------------------------------------------------------------------------
@@ -1076,6 +1200,13 @@ async def plan_recommended(
             "ctx_size per slot."
         ),
     ),
+    lease_id: str | None = Query(
+        None,
+        description=(
+            "Answer for the load bound to this standing lease: the walk offers its cards "
+            "alone (B.6). Nothing is bound by the dry run."
+        ),
+    ),
 ) -> dict[str, Any]:
     """The dry run of ``POST /api/models/{id}/load-recommended`` (D64).
 
@@ -1126,6 +1257,8 @@ async def plan_recommended(
         priority=priority,
         min_slots=min_slots,
         kv_unified=kv_unified,
+        # Only when sent: a dry run without a lease forwards exactly what it did.
+        **({"lease_id": lease_id} if lease_id else {}),
     )
 
 
@@ -1183,6 +1316,14 @@ async def load_model(
     ),
     force: bool = Body(False),
     priority: int | None = Body(None),
+    lease_id: str | None = Body(
+        None,
+        description=(
+            "Bind this load to a standing lease you hold (B.6): the model joins the lease "
+            "and loads onto its cards. Also accepted as ?lease_id=."
+        ),
+    ),
+    lease_id_query: str | None = Query(None, alias="lease_id", include_in_schema=False),
 ) -> dict[str, Any]:
     """Load one model, optionally onto named GPUs.
 
@@ -1225,8 +1366,20 @@ async def load_model(
     answers 503 with the code ``priority_hold`` (not the generic busy code),
     ``Retry-After`` and ``details.priority_hold`` naming the model being loaded
     and its tier. It is a wait, not a failure -- honour the header.
+
+    ``lease_id`` (body, or ``?lease_id=``) binds the load to a standing lease
+    (D87, B.6): the model is named in the lease -- so no other model's eviction
+    ladder stops it and releasing the lease unloads it -- and the lease's cards
+    are the placement (``devices`` may name a subset of them; a resident
+    elsewhere is moved onto them). Only the lease's holder may bind to it: the
+    key that took it, the holder's D55 proof, or an admin (403
+    ``permission_denied`` otherwise); an unknown lease is 404
+    ``lease_not_found``; a model another lease already names is 409
+    ``lease_conflict``. The instance reports ``loaded_by: "api:/api/leases/<id>"``.
     """
     state = _state(request)
+    lease = _bound_lease_id(state, request, lease_id, lease_id_query)
+    route = f"api:/api/leases/{lease}" if lease else "api:/api/models/{id}/load"
     instance = await state.manager.load(
         model_id,
         ctx_size=ctx_size,
@@ -1236,10 +1389,34 @@ async def load_model(
         devices=devices,
         allowed_devices=allowed_devices,
         force=force,
-        source=attributed_source("api:/api/models/{id}/load", client_of(request)),
+        source=attributed_source(route, client_of(request)),
         priority=priority,
+        lease_id=lease,
     )
     return instance.model_dump(mode="json")
+
+
+def _bound_lease_id(
+    state: Any, request: Request, body_value: str | None, query_value: str | None
+) -> str | None:
+    """The ``lease_id`` a load route was given, ownership-checked (D87, B.6; D80).
+
+    Accepted in the body or the query string; both, disagreeing, is a 400. The
+    caller must be allowed to act on the lease the way a renew or a release
+    is (:func:`_require_lease_owner`): binding a model to someone else's lease
+    would put it on their cards and take it down with their release.
+    """
+    values = {v.strip() for v in (body_value, query_value) if v is not None and v.strip()}
+    if len(values) > 1:
+        raise BadRequestError(
+            "lease_id was sent twice with different values (body and query); send one",
+            param="lease_id",
+        )
+    if not values:
+        return None
+    lease_id = values.pop()
+    _require_lease_owner(state, request, lease_id)
+    return lease_id
 
 
 @router.post("/models/{model_id:path}/load-recommended")
@@ -1297,6 +1474,14 @@ async def load_recommended(
             "extra slot's sliding window. Omitted or false: ctx_size per slot."
         ),
     ),
+    lease_id: str | None = Body(
+        None,
+        description=(
+            "Bind this load to a standing lease you hold (B.6): the model joins the lease "
+            "and the walk offers the lease's cards alone. Also accepted as ?lease_id=."
+        ),
+    ),
+    lease_id_query: str | None = Query(None, alias="lease_id", include_in_schema=False),
 ) -> dict[str, Any]:
     """Load at exactly ``ctx_size`` per slot; the server picks everything else.
 
@@ -1386,8 +1571,16 @@ async def load_recommended(
     ``priority_hold``, ``Retry-After`` and ``details.priority_hold`` naming the
     holder -- distinct from the other 503s this route can return, so honour the
     header rather than retrying immediately.
+
+    **Leases (D87).** A standing lease that names this model makes its cards the
+    walk's only placement (unless the model saves a ``device_override``, which
+    wins as on ``/load``): the holder's load lands on the cards it leased, not
+    on the headline mode. ``lease_id`` (body or ``?lease_id=``) binds the load
+    to a lease the caller holds, exactly as on ``/load`` (B.6): named in the
+    lease, walked on its cards alone, ``loaded_by: "api:/api/leases/<id>"``.
     """
     state = _state(request)
+    lease = _bound_lease_id(state, request, lease_id, lease_id_query)
     if persist:
         # The path-based D32 middleware cannot see a body field, and this one
         # writes settings that outlive the instance.
@@ -1404,10 +1597,14 @@ async def load_recommended(
         max_slots=max_slots,
         allowed_devices=allowed_devices,
         persist=persist,
-        source=attributed_source("api:/api/models/{id}/load-recommended", client_of(request)),
+        source=attributed_source(
+            f"api:/api/leases/{lease}" if lease else "api:/api/models/{id}/load-recommended",
+            client_of(request),
+        ),
         priority=priority,
         min_slots=min_slots,
         kv_unified=kv_unified,
+        lease_id=lease,
     )
     return instance.model_dump(mode="json")
 
@@ -2449,8 +2646,8 @@ async def openclaw_setup(request: Request) -> JSONResponse:
                 "New model: search_models -> repo_details(repo_id) -> download_model.",
                 "VRAM missing: server_status names every holder; reclaim_orphan_engines "
                 "(watchdog) kills leaked engine processes and nothing else.",
-                "`sfctl mcp` merges the app's 27 management tools with the "
-                "watchdog's 10 recovery tools into one stdio tool list (31).",
+                "`sfctl mcp` merges the app's 29 management tools with the "
+                "watchdog's 10 recovery tools into one stdio tool list (39).",
             ],
         }
     )

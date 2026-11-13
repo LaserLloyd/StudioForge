@@ -52,7 +52,7 @@ Three rules hold at every class:
 ## 3. Lease lifecycle
 
 ```
-acquire ──► (held) ──touch──► (held) ──release──► gone
+acquire ──► (held) ──renew──► (held) ──release──► gone
                 │                           ▲
                 └── idle for idle_ttl_s ────┘  (the sweep releases it)
 ```
@@ -96,15 +96,22 @@ sequenceDiagram
 ```
 
 * **Acquire** — `POST /api/leases`. Name the devices, or let StudioForge choose (§5). Idle
-  residents on the granted cards are unloaded as part of the grant; that is what "the card is
-  yours" means. The reply is the lease record with its `id`.
-* **Touch** — `POST /api/leases/{id}/touch` restarts the idle clock. StudioForge cannot see a
-  tenant's own activity, so a long job must say it is still running; a lease nobody touched for
-  `idle_ttl_s` (default 3600 s; `null` = until released) is released by the sweep. Touches are
-  cheap: StudioForge coalesces the disk writes.
+  residents on the granted cards are unloaded as part of the grant -- that is what "the card is
+  yours" means -- and listed in the reply's `evicted`. A grant **reserves; it does not load**: the
+  models it names are loaded by their next load (§5). The reply is the lease record with its `id`.
+* **Renew** — `PATCH /api/leases/{id}` with `{"renew_time": "<now>"}` restarts the idle clock (the
+  server stamps its own clock, whatever value you send). `POST /api/leases/{id}/touch` does the same
+  and still works; it is the deprecated spelling (D87, its replies carry a `Deprecation` header).
+  StudioForge cannot see a tenant's own activity, so a long job must say it is still running; a
+  lease nobody renewed for `idle_ttl_s` (default 3600 s; `null` = until released) is released by
+  the sweep. Renewals are cheap: StudioForge coalesces the disk writes.
 * **Release** — `DELETE /api/leases/{id}`. A `404` means it is already gone, which is the outcome
-  you wanted.
-* **Expiry** — the sweep's release. The safety net for a holder that died; not the normal exit.
+  you wanted. Since D87 (lead decision F-2) the release also **unloads the StudioForge models the
+  lease names** that sit on its cards and are idle (`unloaded` in the reply; `kept` lists a busy,
+  pinned or otherwise-leased one with the reason); `?unload=false` keeps them resident.
+* **Expiry** — the sweep's release, with the same unload. The safety net for a holder that died;
+  not the normal exit. This server's own benchmark leases are released as before, unloading
+  nothing.
 * **Across a StudioForge restart** — leases are persisted and restored with their clocks (D61).
   A lease your previous process took is still standing when your new one boots: release it
   (§7, "release stale leases").
@@ -154,10 +161,17 @@ noise. To invoke D56, name the card.
   tenant never sends it.
 * **A lease is never taken away.** Not by a better class, not by `force`, not by a restart (D61).
   It ends when the holder releases it, or when it has been idle for its TTL.
-* **Automatic placement, when asked** (`devices: "auto"`, D78): one card, chosen the way the
-  grant judges a card — never a busy, leased, pinned or better-class-held card; then fewest
-  evictions first, the caller's `prefer` order, most free VRAM, lowest index. A refusal lists
-  every card `considered` with its verdict.
+* **Automatic placement, when asked** (`devices: "auto"`, D78): one card -- or `count` cards of
+  ONE class (`class_key`, e.g. `sm_86-24g`; D87) -- chosen the way the grant judges a card: never
+  a busy, leased, pinned or better-class-held card, never one `planner.excluded_devices` names or
+  the named models' saved `device_override`/`allowed_devices` leaves out; then fewest evictions
+  first, the caller's `prefer` order, most free VRAM, lowest index. A refusal lists every card
+  `considered` with its verdict.
+* **The models a lease names are the holder's** (D87). No other model's load may evict them,
+  wherever they sit; a resident copy of a named base (`<base>@<tag>`) is kept by the grant and
+  joins the lease (`adopted`) instead of being evicted; and their next load -- `load-recommended`
+  included -- lands on the lease's cards. A load sent with `lease_id` (§7) joins a lease the
+  caller holds.
 * **A registry row with live health** for every tenant that declares or registers itself, and a
   health poll every 30 s that never follows a redirect and never leaves the allowed hosts (§8).
 * **It never starts or stops a tenant** (D79). A `module` may be *asked* to warm, through the
@@ -223,12 +237,14 @@ every retryable refusal also carries a `Retry-After` header.
 }
 ```
 
-`devices` is a list of CUDA indices, `"auto"`, or omitted (= auto). `min_free_gib`, `prefer` and
-`avoid` steer an automatic placement only (a 400 beside explicit devices). `exclusive` must be
-`true` (§10). `model_ids` names StudioForge's own models that may be planned onto the cards; a
-tenant that allocates its own memory sends none.
+`devices` is a list of CUDA indices, `"auto"`, or omitted (= auto). `min_free_gib`, `prefer`,
+`avoid` and `count` (cards of one class, default 1) steer an automatic placement only (a 400 beside
+explicit devices). `exclusive` must be `true` (§10). `model_ids` names StudioForge's own models
+that may be planned onto the cards; a tenant that allocates its own memory sends none.
 
-Reply `200`: the lease record —
+Reply `200`: the lease record (every field below, at the top level as before, and again under
+`lease`, the canonical place to read it), plus `evicted` (`[{model_id, reason, devices,
+priority}]`), `adopted` and `deprecated_fields` —
 
 ```json
 {
@@ -248,32 +264,60 @@ Reply `200`: the lease record —
 `placement` is present only for an automatic placement. `vacate_url` is echoed to the registrant
 and to admin callers; the token is never shown to anyone.
 
+**Canonical field names (D87).** Every lease record also carries the Kubernetes Lease names with
+the same values: `holder_identity` (= `holder`), `lease_duration_seconds` (= `idle_ttl_s`),
+`acquire_time` (= `created_at`), `renew_time` (= `last_activity_at`), `lease_transitions` (always
+0: a lease never changes holder) and `allocation.devices[{index, uuid}]`. Times stay Unix epoch
+seconds. The StudioForge names -- and the legacy spellings `lease_id` (= `id`) and `expires_in_s` --
+are kept as deprecated aliases for the transition window; `deprecated_fields` lists them and
+docs/MIGRATION.md maps each to its successor. Read new code against the canonical names.
+
 | Status | `code` | Meaning | Do |
 | --- | --- | --- | --- |
 | 200 | — | granted | keep `id`; touch; release |
 | 400 | `invalid_request_error` (param named) | a bad field: unknown device, `devices` word, steering beside explicit devices, `vacate_token` without a URL, a `vacate_url` onto StudioForge's own listener | fix the request |
 | 400 | `unsupported` | `exclusive: false` asked for a share lease (§10) | lease a whole card |
 | 400 | `placement_unavailable` | auto asked and the GPU probe did not answer | name the devices |
-| 409 | `lease_conflict` | a card is leased by an equal or better class, by a holder with no vacate URL, or the ask lapsed (`vacate.state`: `timed_out` / `undeliverable`); or a pinned / better-class idle resident is on it (`param: force`) | do not force; wait `retry_after_s` only if you expect a release, else lease elsewhere |
+| 409 | `lease_conflict` | a card is leased by an equal or better class, by a holder with no vacate URL, or the ask lapsed (`vacate.state`: `timed_out` / `undeliverable`); or a pinned / better-class idle resident is on it (`param: force`). `error.studioforge.code` names which (D87): `lease_outranked` (the holder's class is equal or better), `lease_conflict` (a worse class that cannot be asked, or a lapsed ask), `resident_pinned`, `resident_outranks`; the message keeps its words | do not force; wait `retry_after_s` only if you expect a release, else lease elsewhere |
 | 409 | `lease_vacating` | the holder has been asked to leave | re-ask every `retry_after_s` until granted or `lease_conflict` |
-| 503 | `model_busy` | a resident on the card is mid-request, or a load is in flight | wait `retry_after_s`, re-ask |
+| 503 | `model_busy` | a resident on the card is mid-request (`busy_models[].{model_id, in_flight}`), or a load planned onto these cards is in flight (`loading_devices`) | wait `retry_after_s`, re-ask |
 | 507 | `insufficient_vram` | auto with `min_free_gib`: no card would have that much | ask for less, or wait |
 
 Every automatic refusal carries `error.studioforge.considered` (the per-card verdicts:
-`chosen`, `candidate`, `avoided`, `leased`, `busy`, `pinned`, `better_tier_resident`,
-`too_little_free`) and `error.studioforge.placement: "auto"`.
+`chosen`, `candidate`, `avoided`, `excluded`, `not_allowed`, `leased`, `busy`, `pinned`,
+`better_tier_resident`, `too_little_free`; each row also has its `class_key`) and
+`error.studioforge.placement: "auto"`. `count` with free cards of mixed classes only is `400
+placement_unavailable` naming the classes.
 
-### `POST /api/leases/{id}/touch` — keep alive
+### `PATCH /api/leases/{id}` — renew
 
-Reply `200` with the lease record; `404 lease_not_found` when it is gone.
+Body `{"renew_time": "<anything>"}`; the server stamps its own clock. Reply `200` with the lease
+record; `404 lease_not_found` when it is gone; `400` for any other key. `inference` scope, same
+ownership rule as the release.
+
+### `POST /api/leases/{id}/touch` — keep alive (deprecated alias of the renew)
+
+Reply `200` with the lease record and `Deprecation` / `Link: <docs/MIGRATION.md>;
+rel="deprecation"` headers; `404 lease_not_found` when it is gone.
 
 ### `DELETE /api/leases/{id}` — release
 
-Reply `200 {"released": {...}}`; `404 lease_not_found` when already gone (treat as success).
+Reply `200 {"released": {...}, "unloaded": [...], "kept": [{model_id, reason, detail}]}`; `404
+lease_not_found` when already gone (treat as success). `?unload=false` keeps the lease's models
+resident.
 
 ### `GET /api/leases` — the book
 
-`{"leases": [...], "count": n}`, every row as above (URLs only to admin callers). Open to read.
+`{"leases": [...], "count": n, "deprecated_fields": [...]}`, every row as above (URLs only to
+admin callers). Open to read.
+
+### `lease_id` on the load routes (B.6)
+
+`POST /api/models/{id}/load` and `/load-recommended` (and `GET .../plan-recommended`, as a dry run)
+take an optional `lease_id` (body or `?lease_id=`): the model joins that lease and loads onto its
+cards (`devices` may name a subset). Only the lease's holder may bind (`403 permission_denied`
+otherwise); a model another lease already names is `409 lease_conflict`. The instance reports
+`loaded_by: "api:/api/leases/<id>"`. MCP `load_model` / `load_recommended` take the same argument.
 
 ### `GET /api/capabilities` — feature gating (D64)
 

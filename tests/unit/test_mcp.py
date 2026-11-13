@@ -91,6 +91,9 @@ EXPECTED_TOOLS = {
     # and an agent that only sees reserve_gpus does not know release exists.
     "reserve_gpus",
     "release_gpus",
+    # Renewing a lease (D87): the k8s verb, and the REST touch's name for it.
+    "renew_lease",
+    "touch_lease",
     # The tenant plane, read-only (D77): the lease book on its own, and the
     # registry of programs sharing the cards. Two tools because an agent that
     # only sees server_status does not know the registry exists, and neither

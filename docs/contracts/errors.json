@@ -378,6 +378,15 @@
       "surface": "api"
     },
     {
+      "code": "lease_outranked",
+      "docs": "errors/lease_outranked",
+      "error_type": "invalid_request_error",
+      "fix": "Wait for the lease to end (Retry-After, GET /api/leases shows its expires_at), choose other devices, or take the lease at a better priority if this work really outranks it -- a holder that registered a vacate_url is then asked to leave (409 lease_vacating).",
+      "http_status": 409,
+      "message": "CUDA {devices} is already leased by a holder of an equal or better class; this claim cannot ask it to leave.",
+      "surface": "api"
+    },
+    {
       "code": "lease_vacating",
       "docs": "errors/lease_vacating",
       "error_type": "invalid_request_error",
@@ -591,6 +600,24 @@
       "fix": "Retry; the estimate falls back to a bounded guess. Check connectivity to huggingface.co and hf.token for gated repos.",
       "http_status": 502,
       "message": "The GGUF header could not be read over HTTP.",
+      "surface": "api"
+    },
+    {
+      "code": "resident_outranks",
+      "docs": "errors/resident_outranks",
+      "error_type": "invalid_request_error",
+      "fix": "Lease other devices, take the lease at that tier's priority, or pass force=true to evict the resident anyway (it is idle; a model mid-request is never evicted).",
+      "http_status": 409,
+      "message": "A higher-priority model is resident on CUDA {devices}; a lease grant at this priority does not outrank a better tier.",
+      "surface": "api"
+    },
+    {
+      "code": "resident_pinned",
+      "docs": "errors/resident_pinned",
+      "error_type": "invalid_request_error",
+      "fix": "Pass force=true to evict it (the pin reconciler brings it back on other cards, or on these once the lease ends), or lease other devices.",
+      "http_status": 409,
+      "message": "A pinned model is resident on CUDA {devices}.",
       "surface": "api"
     },
     {

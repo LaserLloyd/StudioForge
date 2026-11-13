@@ -76,7 +76,7 @@ FEATURE_NOTES: dict[str, str] = {
 #: on instead. **Bump it in the same commit that appends a decision**:
 #: ``tests/unit/test_capabilities_implemented.py`` reads the headings of
 #: ``DECISIONS.md`` and fails until the two agree.
-LATEST_DECISION = 86
+LATEST_DECISION = 87
 
 #: Every decision number this build includes, ``"D1"`` .. ``"D<LATEST_DECISION>"``.
 IMPLEMENTED_DECISIONS: tuple[str, ...] = tuple(f"D{n}" for n in range(1, LATEST_DECISION + 1))
@@ -162,6 +162,24 @@ SERVER_FEATURES: dict[str, str] = {
     # settings{}) and lists unknown names in ignored_fields; an older server
     # reads ctx_size / kv_cache_type only and drops the rest.
     "virtual_model_launch_fields": "D86",
+    # A lease's named models are its holder's: a grant adopts a resident copy,
+    # no other load's eviction stops them, and only victims on the target
+    # cards are stopped. The grant reply lists evicted and adopted.
+    "lease_ownership": "D87",
+    # lease_id on load / load-recommended / plan-recommended (and the MCP load
+    # tools) binds the load to a lease the caller holds.
+    "lease_bound_loads": "D87",
+    # Release and expiry unload the lease's idle models; ?unload=false keeps them.
+    "lease_release_unloads": "D87",
+    # holder_identity, lease_duration_seconds, acquire_time, renew_time,
+    # lease_transitions, allocation.devices; PATCH /api/leases/{id} renews.
+    "lease_k8s_fields": "D87",
+    # devices "auto" takes count (cards of one class_key) and honours
+    # excluded_devices and the named models' saved placement.
+    "lease_auto_count": "D87",
+    # A lease 409 names its case in error.studioforge.code (lease_outranked,
+    # resident_outranks, resident_pinned, lease_conflict).
+    "lease_refusal_codes": "D87",
 }
 
 

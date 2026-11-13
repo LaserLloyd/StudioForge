@@ -33,6 +33,7 @@ today's plain ``lease_conflict``. The book never takes a lease away.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import ipaddress
 import re
@@ -40,7 +41,7 @@ import socket
 import ssl
 import time
 import uuid
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from typing import Any, Protocol
 from urllib.parse import urlsplit
 
@@ -120,6 +121,52 @@ LEASE_RETRY_CAP_S = 300.0
 #: There is no clock to count down, so rather than invent one (or say nothing,
 #: which reads as "never retry") the advice is a short re-ask interval.
 LEASE_OPEN_ENDED_RETRY_S = 60.0
+
+# -- the canonical shape (B.0 standards-first, D87) ---------------------------
+
+#: Kubernetes ``coordination.k8s.io/v1`` Lease field names are the canonical
+#: lease shape: ``holder_identity``, ``lease_duration_seconds``,
+#: ``acquire_time``, ``renew_time``, ``lease_transitions``, plus an
+#: ``allocation.devices[]`` echo in DRA's vocabulary. Times stay Unix epoch
+#: seconds -- every other clock this API publishes is one, and the legacy twin
+#: must carry the EQUAL value -- rather than k8s MicroTime strings. Each
+#: StudioForge name below stays on every lease record as a deprecated alias
+#: with the same value for the transition window (``deprecated_fields`` in the
+#: envelope says which), mapped to the canonical name a client moves to.
+LEASE_FIELD_ALIASES: dict[str, str] = {
+    "holder": "holder_identity",
+    "idle_ttl_s": "lease_duration_seconds",
+    "created_at": "acquire_time",
+    "last_activity_at": "renew_time",
+    "lease_id": "id",
+    "expires_in_s": "expires_at",
+}
+#: The alias names, in a stable order, for the ``deprecated_fields`` envelope key.
+LEASE_DEPRECATED_FIELDS: tuple[str, ...] = tuple(LEASE_FIELD_ALIASES)
+
+#: When the StudioForge-specific lease surfaces were deprecated (this release),
+#: as the RFC 9745 ``Deprecation`` structured-field date ``@<epoch>``. No
+#: ``Sunset`` yet: that is set per surface once the clients report "migrated"
+#: (lead decision F-10).
+ALIASES_DEPRECATED_AT = 1794182400  # 2026-11-09T00:00:00Z
+#: Where a client reads what replaces a deprecated surface (F-10).
+MIGRATION_DOC = "docs/MIGRATION.md"
+
+
+def deprecation_headers() -> dict[str, str]:
+    """``Deprecation`` + ``Link: rel="deprecation"`` for a response from a deprecated alias.
+
+    Only on a response whose RESOURCE is the deprecated one (``POST
+    /api/leases/{id}/touch``, superseded by ``PATCH /api/leases/{id}``); a
+    canonical route that merely still carries alias FIELDS says so in its body
+    (``deprecated_fields``) instead, because RFC 9745 deprecates the resource,
+    and these routes are not deprecated.
+    """
+    return {
+        "Deprecation": f"@{ALIASES_DEPRECATED_AT}",
+        "Link": f'<{MIGRATION_DOC}>; rel="deprecation"',
+    }
+
 
 #: ``holder_family`` -> a coarse description of the work holding the cards.
 #: **Descriptive only, and deliberately not policy**: the book stays strictly
@@ -432,7 +479,15 @@ class LeaseBook:
             row["retry_after_s"] if row["retry_after_s"] is not None else LEASE_OPEN_ENDED_RETRY_S
             for row in rows
         ]
-        details: dict[str, Any] = {"leases": rows, "retry_after_s": max(1, int(min(waits)))}
+        # ``code`` is the specific refusal (D87): ``error.code`` stays the
+        # ``lease_conflict`` every client already branches on, and this one is
+        # sharpened by the manager to ``lease_outranked`` when the requester's
+        # class could not have asked the holder to leave.
+        details: dict[str, Any] = {
+            "code": "lease_conflict",
+            "leases": rows,
+            "retry_after_s": max(1, int(min(waits))),
+        }
         timed_out = [
             lease
             for lease in clash
@@ -549,6 +604,58 @@ class LeaseBook:
             if written is None or stamp - written >= TOUCH_PERSIST_INTERVAL_S:
                 self._persist(lease, at=stamp)
         return lease
+
+    def bind_models(
+        self, lease_id: str, model_ids: Iterable[str], *, now: float | None = None
+    ) -> list[str]:
+        """Name more models in a standing lease; returns the ids that were NEW to it (D87).
+
+        How a load bound with ``lease_id`` (B.6) or a resident copy the grant
+        spared (A-1) becomes an owner: :meth:`blocked_for` then lets it onto
+        the lease's cards, the planner's ladders treat it as the holder's, and
+        the release unloads it. Written through like an acquire. The caller
+        has already refused a model another lease names -- a model belongs to
+        at most one lease (:meth:`for_model`).
+        """
+        lease = self._leases.get(lease_id)
+        if lease is None:
+            raise LeaseNotFoundError(f"no lease '{lease_id}'", param="lease_id")
+        added = [m for m in dict.fromkeys(model_ids) if m and m not in lease.model_ids]
+        if added:
+            lease.model_ids = [*lease.model_ids, *added]
+            self._persist(lease, at=time.time() if now is None else now)
+        return added
+
+    @contextlib.contextmanager
+    def provisionally_named(self, lease_id: str | None, model_id: str) -> Iterator[None]:
+        """Count ``model_id`` as named by ``lease_id`` for a synchronous dry run only (D87).
+
+        In memory, never written to the store, and undone on the way out: the
+        dry run of a ``lease_id`` load must plan the way the bound load would,
+        and a decision with no ``await`` inside cannot be observed half-way by
+        anything else on the loop. ``None`` (or an unknown lease, or a model it
+        already names) changes nothing.
+        """
+        lease = self._leases.get(lease_id) if lease_id is not None else None
+        if lease is None or model_id in lease.model_ids:
+            yield
+            return
+        lease.model_ids = [*lease.model_ids, model_id]
+        try:
+            yield
+        finally:
+            lease.model_ids = [m for m in lease.model_ids if m != model_id]
+
+    def unbind_models(self, lease_id: str, model_ids: Iterable[str]) -> None:
+        """Take models back out of a lease -- the undo of a bind whose load failed."""
+        lease = self._leases.get(lease_id)
+        if lease is None:
+            return
+        drop = set(model_ids)
+        kept = [m for m in lease.model_ids if m not in drop]
+        if kept != lease.model_ids:
+            lease.model_ids = kept
+            self._persist(lease, at=time.time())
 
     def blocked_for(self, model_id: str | None) -> frozenset[int]:
         """Devices ``model_id`` may NOT be planned onto: every lease that does not name it."""
@@ -751,7 +858,11 @@ def lease_state(lease: GpuLease, now: float | None = None) -> str:
 
 
 def lease_view(
-    lease: GpuLease, *, now: float | None = None, reveal_vacate_url: bool = False
+    lease: GpuLease,
+    *,
+    now: float | None = None,
+    reveal_vacate_url: bool = False,
+    gpu_uuids: Mapping[int, str | None] | None = None,
 ) -> dict[str, Any]:
     """The API/MCP projection: the stored fields plus the derived clocks.
 
@@ -766,6 +877,15 @@ def lease_view(
     holder's private endpoint is not something every LAN reader of
     ``GET /api/leases`` needs. Pass ``reveal_vacate_url`` only for a caller
     the D32 gate already trusts with the box.
+
+    The canonical Kubernetes Lease names ride beside the StudioForge ones with
+    equal values (D87, :data:`LEASE_FIELD_ALIASES`): ``holder_identity``,
+    ``lease_duration_seconds``, ``acquire_time``, ``renew_time`` (epoch
+    seconds), ``lease_transitions`` (always 0 -- the book never hands a lease
+    to another holder) and ``allocation.devices[{index, uuid}]``. ``uuid`` is
+    filled from ``gpu_uuids`` when the caller has the probe's answer, else
+    ``null``. ``lease_id`` and ``expires_in_s`` are the legacy spellings some
+    clients read.
     """
     stamp = time.time() if now is None else now
     expires = lease.expires_at
@@ -776,6 +896,7 @@ def lease_view(
     url = data.pop("vacate_url", None)
     if reveal_vacate_url:
         data["vacate_url"] = url
+    uuids = gpu_uuids or {}
     return {
         **data,
         "vacate_registered": bool(url),
@@ -789,7 +910,37 @@ def lease_view(
         "retry_after_s": (
             None if expires is None else max(1, int(min(expires - stamp, LEASE_RETRY_CAP_S)))
         ),
+        # -- the canonical k8s Lease names (D87), equal to their aliases ------
+        "holder_identity": lease.holder,
+        "lease_duration_seconds": lease.idle_ttl_s,
+        "acquire_time": lease.created_at,
+        "renew_time": lease.last_activity_at,
+        "lease_transitions": 0,
+        "allocation": {
+            "devices": [{"index": int(d), "uuid": uuids.get(int(d))} for d in lease.devices]
+        },
+        # -- legacy spellings clients read (deprecated aliases) ---------------
+        "lease_id": lease.id,
+        "expires_in_s": None if expires is None else round(max(0.0, expires - stamp)),
     }
+
+
+def gpu_uuid_map(probe: Any) -> dict[int, str | None]:
+    """``{index: uuid}`` from a probe's cards, for ``allocation.devices[].uuid``.
+
+    Duck-typed: a card that publishes no ``uuid`` (today's ``GpuInfo``, a stub
+    probe) maps to ``None``, and a probe that cannot answer yields ``{}`` --
+    never an error on a read of the lease book.
+    """
+    try:
+        cards = list(probe.list_gpus()) if probe is not None else []
+    except Exception:  # noqa: BLE001 - a sick probe must not break a lease listing
+        return {}
+    out: dict[int, str | None] = {}
+    for card in cards:
+        uuid_value = getattr(card, "uuid", None)
+        out[int(card.index)] = str(uuid_value) if uuid_value else None
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1071,23 +1222,55 @@ VERDICT_BUSY = "busy"
 VERDICT_PINNED = "pinned"
 VERDICT_BETTER_TIER = "better_tier_resident"
 VERDICT_TOO_LITTLE_FREE = "too_little_free"
+#: ``planner.excluded_devices`` names the card: no model is ever planned there,
+#: so an automatic lease (which judges a card the way a placement would) skips it.
+VERDICT_EXCLUDED = "excluded"
+#: A model the lease will name may not run on the card: its saved
+#: ``device_override`` or ``allowed_devices`` leaves the card out (A-14).
+VERDICT_NOT_ALLOWED = "not_allowed"
+
+
+def card_class_key(gpu: Any) -> str:
+    """A portable "these cards are alike" key: architecture + rounded memory (D87).
+
+    The card's own ``class_key`` when the probe publishes one (B.3); otherwise
+    the same shape built here -- ``sm_<major><minor>`` from the compute
+    capability (or the AMD ``gfx_target``) and the total memory in whole GiB,
+    e.g. ``sm_120-32g``. Never a marketing name and never an index, so two
+    identical cards on any box group together and a 48 GB workstation card
+    does not pass for a 32 GB one.
+    """
+    published = getattr(gpu, "class_key", None)
+    if published:
+        return str(published)
+    capability = getattr(gpu, "compute_capability", None)
+    if capability:
+        arch = f"sm_{int(capability[0])}{int(capability[1])}"
+    else:
+        arch = str(getattr(gpu, "gfx_target", None) or "unknown")
+    total = int(getattr(gpu, "total_bytes", 0) or 0)
+    return f"{arch}-{round(total / GIB)}g"
 
 
 class AutoPlacement:
     """What ``devices: "auto"`` decided, and why, card by card.
 
-    ``devices`` is the chosen card as a one-element list, or ``None`` when
-    nothing fit; ``considered`` has one row per card the box has, in the order
-    they were ranked (the chosen card first), each with a ``verdict`` from the
-    ``VERDICT_*`` set and the numbers the verdict rests on. A tenant that is
-    refused can show its user exactly this list.
+    ``devices`` is the chosen card set (one card, or ``count`` cards of one
+    class), or ``None`` when nothing fit; ``considered`` has one row per card
+    the box has, in the order they were ranked (the chosen cards first), each
+    with a ``verdict`` from the ``VERDICT_*`` set, its ``class_key`` and the
+    numbers the verdict rests on. A tenant that is refused can show its user
+    exactly this list.
     """
 
-    __slots__ = ("considered", "devices")
+    __slots__ = ("considered", "count", "devices")
 
-    def __init__(self, devices: list[int] | None, considered: list[dict[str, Any]]) -> None:
+    def __init__(
+        self, devices: list[int] | None, considered: list[dict[str, Any]], *, count: int = 1
+    ) -> None:
         self.devices = devices
         self.considered = considered
+        self.count = count
 
     @property
     def refused(self) -> bool:
@@ -1097,7 +1280,12 @@ class AutoPlacement:
         return {str(row["verdict"]) for row in self.considered}
 
     def view(self) -> dict[str, Any]:
-        return {"mode": "auto", "devices": self.devices, "considered": list(self.considered)}
+        return {
+            "mode": "auto",
+            "devices": self.devices,
+            "count": self.count,
+            "considered": list(self.considered),
+        }
 
 
 def choose_auto_devices(
@@ -1111,13 +1299,21 @@ def choose_auto_devices(
     min_free_gib: float | None = None,
     prefer: Iterable[int] = (),
     avoid: Iterable[int] = (),
+    excluded: Iterable[int] = (),
+    allowed: Iterable[int] | None = None,
+    allowed_reason: str | None = None,
+    count: int = 1,
 ) -> AutoPlacement:
-    """Pick ONE card for an exclusive lease, the way the grant itself would judge it (D78).
+    """Pick the card(s) for an exclusive lease, the way the grant itself would judge them (D78).
 
     The rules are the grant's own (:meth:`ModelManager.acquire_lease`), applied
     per card before anything is touched:
 
     * a card in ``avoid`` is out;
+    * a card in ``excluded`` (``planner.excluded_devices``) is out, and so is
+      one outside ``allowed`` -- the cards the lease's own models may run on
+      (their saved ``device_override`` / ``allowed_devices``, D87/A-14),
+      ``allowed_reason`` saying which setting;
     * a card any standing lease holds is out -- auto placement never asks a
       holder to vacate (D56 is for a claim on *named* cards; an ask for a card
       the asker did not need is noise);
@@ -1134,10 +1330,18 @@ def choose_auto_devices(
     order, then the most free VRAM, then the lowest index. ``owners`` are the
     models the lease will name; a resident that IS an owner counts for nothing
     against its card.
+
+    ``count`` (default 1) asks for that many cards of ONE class
+    (:func:`card_class_key`) -- a model split over two cards paces at the
+    slower one, so an automatic pair is never a mixed pair; name the cards to
+    mix. The class whose best ``count`` cards rank best (same keys, summed)
+    wins. No class with ``count`` candidates is a refusal like any other.
     """
     owner_ids = set(owners)
     prefer_rank = {int(d): i for i, d in enumerate(prefer)}
     avoid_set = {int(d) for d in avoid}
+    excluded_set = {int(d) for d in excluded}
+    allowed_set = None if allowed is None else {int(d) for d in allowed}
     by_device: dict[int, list[Any]] = {}
     for instance in residents:
         plan = getattr(instance, "plan", None)
@@ -1153,6 +1357,7 @@ def choose_auto_devices(
         row: dict[str, Any] = {
             "device": device,
             "name": getattr(gpu, "name", None),
+            "class_key": card_class_key(gpu),
             "free_gib": round(free_now / GIB, 2),
             "reclaimable_gib": 0.0,
             "residents": [i.model_id for i in here],
@@ -1163,6 +1368,14 @@ def choose_auto_devices(
         if device in avoid_set:
             row["verdict"] = VERDICT_AVOIDED
             row["detail"] = "named in avoid"
+            continue
+        if device in excluded_set:
+            row["verdict"] = VERDICT_EXCLUDED
+            row["detail"] = "planner.excluded_devices names it"
+            continue
+        if allowed_set is not None and device not in allowed_set:
+            row["verdict"] = VERDICT_NOT_ALLOWED
+            row["detail"] = allowed_reason or "the lease's models may not run on it"
             continue
         clash = book.conflicts([device])
         if clash:
@@ -1199,18 +1412,42 @@ def choose_auto_devices(
             )
             continue
         row["evictions"] = len(here)
-    candidates = [row for row in rows if row["verdict"] == VERDICT_CANDIDATE]
-    candidates.sort(
-        key=lambda row: (
+
+    def rank(row: dict[str, Any]) -> tuple[int, int, float, int]:
+        return (
             int(row.get("evictions", 0)),
             prefer_rank.get(int(row["device"]), len(prefer_rank)),
             -float(row.get("projected_free_gib", row["free_gib"])),
             int(row["device"]),
         )
-    )
+
+    want = max(1, int(count))
+    candidates = sorted((row for row in rows if row["verdict"] == VERDICT_CANDIDATE), key=rank)
     rejected = [row for row in rows if row["verdict"] != VERDICT_CANDIDATE]
+    picked: list[dict[str, Any]] = []
+    if want == 1:
+        picked = candidates[:1]
+    else:
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for row in candidates:
+            groups.setdefault(str(row["class_key"]), []).append(row)
+        options = [group[:want] for group in groups.values() if len(group) >= want]
+        if options:
+            # Summed per-card keys: the pair that costs the fewest evictions,
+            # follows the caller's preference, frees the most and sits lowest.
+            picked = min(
+                options,
+                key=lambda group: (
+                    sum(rank(row)[0] for row in group),
+                    sum(rank(row)[1] for row in group),
+                    sum(rank(row)[2] for row in group),
+                    min(int(row["device"]) for row in group),
+                ),
+            )
     chosen: list[int] | None = None
-    if candidates:
-        candidates[0]["verdict"] = VERDICT_CHOSEN
-        chosen = [int(candidates[0]["device"])]
-    return AutoPlacement(chosen, candidates + rejected)
+    if picked:
+        for row in picked:
+            row["verdict"] = VERDICT_CHOSEN
+        chosen = sorted(int(row["device"]) for row in picked)
+    ordered = picked + [row for row in candidates if row not in picked]
+    return AutoPlacement(chosen, ordered + rejected, count=want)

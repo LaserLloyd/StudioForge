@@ -232,6 +232,8 @@ _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _TENANT_PROTOCOL_ROUTES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("POST", re.compile(r"/api/leases/?")),
     ("DELETE", re.compile(r"/api/leases/[^/]+/?")),
+    # D87: the Kubernetes-style renew, canonical twin of ``.../touch``.
+    ("PATCH", re.compile(r"/api/leases/[^/]+/?")),
     ("POST", re.compile(r"/api/leases/[^/]+/touch/?")),
     ("POST", re.compile(r"/api/tenants/register/?")),
     ("DELETE", re.compile(r"/api/tenants/(?!register/?$)[^/]+/?")),

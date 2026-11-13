@@ -183,9 +183,10 @@ reserve_gpus(devices=[0, 1], model_id="<id>")     # the winning mode's devices
 pin_model(model_id="<id>")                         # optional: survive restarts too
 ```
 
-The lease loads the model onto exactly those cards, applies the **split mode and micro-batch
-its latest benchmark measured fastest on those very devices**, and sizes slots automatically
-(even when the server's `default_parallel` is 1). Nothing else will load there until you
+The lease reserves those cards for the model; its next load (any load path, or
+`load_recommended(model_id, ctx_size, lease_id=...)`) lands on exactly them, applies the **split
+mode and micro-batch its latest benchmark measured fastest on those very devices**, and sizes
+slots automatically (even when the server's `default_parallel` is 1). Nothing else will load there until you
 `release_gpus(lease_id=...)` or the model sits idle for `idle_ttl_s` (default 60 min), and the
 rebalancer (`planner.rebalance`, D42) never moves a leased model off its cards. A grant is
 refused, not forced, if a resident on those cards picks up a request before it is unloaded.

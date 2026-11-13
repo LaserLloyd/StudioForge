@@ -138,9 +138,9 @@ others — want this shape:
 
 Add `"args": ["-s", "rig", "mcp"]` to pin a profile.
 
-`sfctl mcp` merges **two** upstream MCP servers into one list of **37 tools**.
+`sfctl mcp` merges **two** upstream MCP servers into one list of **39 tools**.
 
-**Management** (the main app, `<url>/mcp`) — 27 tools:
+**Management** (the main app, `<url>/mcp`) — 29 tools:
 
 | Tool | What it does |
 | --- | --- |
@@ -155,7 +155,9 @@ Add `"args": ["-s", "rig", "mcp"]` to pin a profile.
 | `get_model_template` | The chat template a model loads with, its reasoning format, and `diagnostics` for known template failures (e.g. gpt-oss 500s) — read-only |
 | `set_model_template` | Admin: override a model's chat template and/or `reasoning_format` from its next load; `reset=true` goes back to the GGUF's template |
 | `reserve_gpus` | Give specific GPUs to one model (loaded there at its measured-fastest settings, auto-sized slots) or hold them for an outside program; auto-releases after `idle_ttl_s` |
-| `release_gpus` | End a reservation early by its lease id |
+| `release_gpus` | End a reservation early by its lease id (unloads the lease's models unless `unload=false`) |
+| `renew_lease` | Keep a reservation alive: restart its idle clock (`touch_lease` is the same call) |
+| `touch_lease` | The REST `touch` verb's name for `renew_lease` |
 | `gpu_leases` | Every standing lease with its clocks, class and `kind` — read-only |
 | `gpu_tenants` | Who shares the rig's GPUs (the tenant registry, docs/TENANTS.md): kind, health, version, leases — read-only |
 | `test_model` | Smoke-test end to end on an idle server and report tokens/second |

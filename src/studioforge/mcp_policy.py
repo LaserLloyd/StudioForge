@@ -101,6 +101,10 @@ GATEWAY_TOOLS: dict[str, ToolPolicy] = {
     "load_model": _mutate(idempotent=True),
     "load_recommended": _mutate(idempotent=True, admin_arg="persist"),
     "release_gpus": _mutate(idempotent=True),
+    # D87: renew a lease (the k8s verb) and its legacy-named twin; ownership is
+    # checked in the tool, as on the REST routes.
+    "renew_lease": _mutate(idempotent=True),
+    "touch_lease": _mutate(idempotent=True),
     "test_model": _mutate(),
     # pinning persists across restarts (the REST route is an admin route, D32)
     "pin_model": _mutate(idempotent=True, scope="admin"),

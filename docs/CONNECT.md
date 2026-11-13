@@ -73,7 +73,7 @@ Claude Code, Cline, LibreChat and other clients that take the generic map want t
 { "mcpServers": { "studioforge": { "command": "sfctl", "args": ["mcp"] } } }
 ```
 
-That gives the agent 37 tools: the server's 27 management tools plus the watchdog's 10 recovery
+That gives the agent 39 tools: the server's 29 management tools plus the watchdog's 10 recovery
 tools, so it still holds `restart_server` when the main server is wedged. The step-by-step
 two-machine install with a check after each step is
 [`docs/OPENCLAW-SETUP.md`](OPENCLAW-SETUP.md); the loop an agent actually runs is

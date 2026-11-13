@@ -17,6 +17,18 @@
             ],
             "title": "Avoid"
           },
+          "count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "With devices \"auto\": how many cards, all of one class (class_key). Default 1.",
+            "title": "Count"
+          },
           "devices": {
             "anyOf": [
               {
@@ -289,6 +301,18 @@
             ],
             "title": "Kv Cache Type V"
           },
+          "lease_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Bind this load to a standing lease you hold (B.6): the model joins the lease and loads onto its cards. Also accepted as ?lease_id=.",
+            "title": "Lease Id"
+          },
           "parallel": {
             "anyOf": [
               {
@@ -359,6 +383,18 @@
             ],
             "description": "true: the slots share ONE KV pool of ctx_size tokens -- each may use all of it, together they may not exceed it -- for the VRAM of one slot plus each extra slot's sliding window. Omitted or false: ctx_size per slot.",
             "title": "Kv Unified"
+          },
+          "lease_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Bind this load to a standing lease you hold (B.6): the model joins the lease and the walk offers the lease's cards alone. Also accepted as ?lease_id=.",
+            "title": "Lease Id"
           },
           "max_slots": {
             "anyOf": [
@@ -2186,7 +2222,7 @@
     },
     "/api/leases": {
       "get": {
-        "description": "Every standing GPU lease: which cards, held by whom, for which models.\n\nEach row carries ``priority`` (the D46 class of the claim), ``state``\n(``vacating`` while the holder has been asked to leave, D56),\n``vacate_registered`` and ``vacate_deadline``. The holder's ``vacate_url``\nitself is shown only to an admin caller (D32 as ``is_admin_caller``: this\nmachine, the MCP PIN, or a key-bearing request); the token is never shown\nto anyone.",
+        "description": "Every standing GPU lease: which cards, held by whom, for which models.\n\nEach row carries ``priority`` (the D46 class of the claim), ``state``\n(``vacating`` while the holder has been asked to leave, D56),\n``vacate_registered`` and ``vacate_deadline``. The holder's ``vacate_url``\nitself is shown only to an admin caller (D32 as ``is_admin_caller``: this\nmachine, the MCP PIN, or a key-bearing request); the token is never shown\nto anyone.\n\nThe rows also carry the Kubernetes Lease names (D87) -- ``holder_identity``,\n``lease_duration_seconds``, ``acquire_time``, ``renew_time``,\n``lease_transitions``, ``allocation.devices[{index, uuid}]`` -- with the\nsame values as the StudioForge names they replace, which stay as\ndeprecated aliases for the transition window (``deprecated_fields`` lists\nthem; docs/MIGRATION.md maps each to its successor).",
         "operationId": "list_leases_api_leases_get",
         "responses": {
           "200": {
@@ -2208,7 +2244,7 @@
         ]
       },
       "post": {
-        "description": "Give CUDA ``devices`` to ``model_ids`` -- or, with none, to something outside this server.\n\n``devices`` may be ``\"auto\"`` or omitted (D78): the server picks ONE card the\nway this grant judges a card -- never one with a busy resident, never a\nleased one (automatic placement asks nobody to vacate), never a pinned or\nbetter-tier idle resident without ``force``; then fewest evictions first,\nthe caller's ``prefer`` order, most free VRAM, lowest index. ``min_free_gib``\nis measured against the card once its evictable idle residents are gone;\n``avoid`` rules cards out. The reply carries the chosen ``devices`` and a\n``placement`` block with every card ``considered``; so does a refusal, in\n``error.studioforge.considered``, under the usual codes. ``exclusive`` must\nbe ``true``: a lease is a whole card (the partial-card share lease is the\ndocumented extension point, docs/TENANTS.md).\n\nWhile the lease stands nothing else is planned onto those cards; the named\nmodels are loaded onto exactly them, sized for as many slots as their\ncontext allows, in the split mode their own benchmark measured fastest\nthere. Idle residents on the cards are unloaded; a model mid-request\nrefuses the call (503, ``retry_after_s``); a pinned idle resident refuses\nunless ``force``. ``idle_ttl_s`` (default 3600) is how long the lease\nsurvives without activity before the server releases it; ``null`` holds\nit until ``DELETE``.\n\n``holder`` defaults to the ``X-SF-Client`` header when one is sent, else\n``\"api\"``. ``priority`` is the D46 class of the claim (1 chat, 2 dispatched\nagent, 3 background -- the default). ``vacate_url`` / ``vacate_token``\nregister where a *better* class may ask this holder to leave (D56): the\nserver POSTs ``{lease_id, devices, requester, requester_priority,\ndeadline_s, deadline_at}`` there with the token in ``X-SF-Vacate-Token``,\nand the asker is answered ``409 lease_vacating`` (``retry_after_s``,\n``Retry-After``) until this lease is released or ``leases.vacate_timeout_s``\npasses. A card already leased by an equal or better class, or by a holder\nthat registered no URL, is a plain ``409 lease_conflict`` -- also with\n``Retry-After`` now. ``force`` never overrides a standing lease.",
+        "description": "Give CUDA ``devices`` to ``model_ids`` -- or, with none, to something outside this server.\n\n``devices`` may be ``\"auto\"`` or omitted (D78): the server picks the card(s)\nthe way this grant judges a card -- never one with a busy resident, never a\nleased one (automatic placement asks nobody to vacate), never a pinned or\nbetter-tier idle resident without ``force``, never one\n``planner.excluded_devices`` names or the named models' saved\n``device_override``/``allowed_devices`` leaves out (D87); then fewest\nevictions first, the caller's ``prefer`` order, most free VRAM, lowest\nindex. ``count`` asks for that many cards of ONE class (``class_key``; D87).\n``min_free_gib`` is measured against the card once its evictable idle\nresidents are gone; ``avoid`` rules cards out. The reply carries the chosen\n``devices`` and a ``placement`` block with every card ``considered``; so\ndoes a refusal, in ``error.studioforge.considered``, under the usual codes.\n``exclusive`` must be ``true``: a lease is a whole card (the partial-card\nshare lease is the documented extension point, docs/TENANTS.md).\n\n**A lease reserves cards; it does not load anything.** While it stands\nnothing else is planned onto those cards and no other model's eviction\nladder stops the models it names (D87). The named models' next load -- a\nplain ``/load``, ``load-recommended`` (which then walks the lease's cards\nalone), a load sent with ``lease_id``, or a JIT request -- lands on exactly\nthem, sized for as many slots as their context allows, in the split mode\ntheir own benchmark measured fastest there. Idle residents on the cards are\nunloaded and listed in the reply's ``evicted`` (``[{model_id, reason,\ndevices, priority}]``); a resident copy of a named base (``<base>@<tag>``)\nis kept and named in the lease instead (``adopted``); a model mid-request\nrefuses the call (503, ``retry_after_s``); a pinned idle resident refuses\nunless ``force``. ``idle_ttl_s`` (default 3600) is how long the lease\nsurvives without activity before the server releases it -- and unloads the\nmodels it names (F-2); ``null`` holds it until ``DELETE``.\n\n``holder`` defaults to the ``X-SF-Client`` header when one is sent, else\n``\"api\"``. ``priority`` is the D46 class of the claim (1 chat, 2 dispatched\nagent, 3 background -- the default). ``vacate_url`` / ``vacate_token``\nregister where a *better* class may ask this holder to leave (D56): the\nserver POSTs ``{lease_id, devices, requester, requester_priority,\ndeadline_s, deadline_at}`` there with the token in ``X-SF-Vacate-Token``,\nand the asker is answered ``409 lease_vacating`` (``retry_after_s``,\n``Retry-After``) until this lease is released or ``leases.vacate_timeout_s``\npasses. A card already leased by an equal or better class, or by a holder\nthat registered no URL, is a plain ``409 lease_conflict`` -- also with\n``Retry-After`` now. ``force`` never overrides a standing lease. Every 409\nkeeps ``error.code: lease_conflict``; ``error.studioforge.code`` names the\nspecific case (``lease_outranked``, ``resident_outranks``,\n``resident_pinned``, ``lease_conflict``; D87).\n\nThe reply is the lease record at the top level (``id``/``lease_id`` and\nevery field, as before) and again under ``lease`` -- the canonical place to\nread it from (D87) -- plus ``evicted``, ``adopted`` and\n``deprecated_fields``.",
         "operationId": "create_lease_api_leases_post",
         "requestBody": {
           "content": {
@@ -2251,7 +2287,7 @@
     },
     "/api/leases/{lease_id}": {
       "delete": {
-        "description": "Release a lease -- also how a holder answers a vacate request (D56).\n\nAn ``admin`` caller may release any lease; an ``inference`` key only the\none it took (``403 permission_denied`` otherwise, 2.0.1).",
+        "description": "Release a lease -- also how a holder answers a vacate request (D56).\n\nAn ``admin`` caller may release any lease; an ``inference`` key only the\none it took (``403 permission_denied`` otherwise, 2.0.1).\n\nThe lease is the resource boundary (D87, lead decision F-2): the models it\nnames -- the ones it was taken for, a resident copy the grant adopted, a\nmodel a ``lease_id`` load bound to it -- are unloaded with it and listed in\n``unloaded``. ``?unload=false`` keeps them resident. A model serving a\nrequest, a pinned one, or one another lease names is never unloaded here;\nit is listed in ``kept`` with the reason.",
         "operationId": "release_lease_api_leases__lease_id__delete",
         "parameters": [
           {
@@ -2261,6 +2297,18 @@
             "schema": {
               "title": "Lease Id",
               "type": "string"
+            }
+          },
+          {
+            "description": "Unload the models the lease names once it is released (the default, F-2). false keeps them resident, the pre-D87 behaviour.",
+            "in": "query",
+            "name": "unload",
+            "required": false,
+            "schema": {
+              "default": true,
+              "description": "Unload the models the lease names once it is released (the default, F-2). false keeps them resident, the pre-D87 behaviour.",
+              "title": "Unload",
+              "type": "boolean"
             }
           }
         ],
@@ -2292,11 +2340,66 @@
         "tags": [
           "management"
         ]
+      },
+      "patch": {
+        "description": "Renew a lease the Kubernetes way: ``{\"renew_time\": <anything>}`` (D87).\n\nThe canonical twin of ``POST /api/leases/{id}/touch``: the server stamps its\nOWN clock into ``renew_time`` whatever value was sent (a holder's clock\nneither shortens nor stretches its lease), and the idle TTL\n(``lease_duration_seconds``) runs from there. ``renew_time`` is the only\nfield this route changes; any other key is a 400 naming it. Same ownership\nrule as the release: an ``inference`` key renews only its own lease.",
+        "operationId": "renew_lease_api_leases__lease_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "lease_id",
+            "required": true,
+            "schema": {
+              "title": "Lease Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "title": "Body",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Renew Lease Api Leases  Lease Id  Patch",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Renew Lease",
+        "tags": [
+          "management"
+        ]
       }
     },
     "/api/leases/{lease_id}/touch": {
       "post": {
-        "description": "Restart the idle clock -- for a holder outside this server that is still busy.\n\nSame ownership rule as the release: an ``inference`` key renews only its own lease.",
+        "description": "Restart the idle clock -- for a holder outside this server that is still busy.\n\nSame ownership rule as the release: an ``inference`` key renews only its own lease.\nDeprecated alias (D87) of ``PATCH /api/leases/{id} {\"renew_time\": ...}``: the\nresponse carries ``Deprecation`` and ``Link: <docs/MIGRATION.md>;\nrel=\"deprecation\"``; the route keeps working for the transition window.",
         "operationId": "touch_lease_api_leases__lease_id__touch_post",
         "parameters": [
           {
@@ -3106,7 +3209,7 @@
     },
     "/api/models/{model_id}/load": {
       "post": {
-        "description": "Load one model, optionally onto named GPUs.\n\n``devices`` is a one-shot placement for this load only (D36) -- the\ncatalog's per-hardware-mode ``load_args`` carry one -- and never touches the\nmodel's saved settings. A CUDA index this box does not have is a 400 naming\nthe parameter, not a planner refusal that reads like a VRAM problem.\n\n``allowed_devices`` is the other one-shot, and the distinction is the whole\nof D59: ``devices`` says *use exactly these cards, all of them* -- more than\none becomes a split -- while ``allowed_devices`` says *choose among these*\nand leaves the ranking, the split and the arithmetic to the planner. A\ntenant that needs a load kept off the card ComfyUI renders on wants the\nsecond; forcing the first made it pick placements this server picks better.\nSending both is a 400: one would have decided nothing.\n\nIt **narrows and never widens**. The request's set is intersected with the\nmodel's saved ``settings.allowed_devices``; ``planner.excluded_devices`` and\nstanding GPU leases (D43) still remove cards afterwards; and a saved\n``settings.device_override`` still outranks every allow-list, so a request\nexcluding a card the override names is a 400 rather than a silent placement\nonto exactly the card it asked to avoid. Nothing is persisted -- the next\nload without the field is the model's own business again. An empty list is a\n400, not a no-op: \"every card except that one\", computed to nothing, means\n*nowhere*, and treating it as *anywhere* would place the load on the one\ncard the caller was avoiding. When the set is real but nothing in it fits,\nthe answer is the ordinary honest 507 -- ``allowed_devices_unavailable``, or\n``gpu_leased`` when a lease is why (D53).\n\n``priority`` is the load's tier (D46): 1 the active chat model, 2 a\ndispatched agent, 3 (or omitted) background. A tier-1/2 load takes the\nfastest placement -- displacing idle worse-tier models from the cards it\npicks and reloading the recently active ones afterwards where they fit --\njumps the load queue, and holds new worse-tier traffic off (503 +\nRetry-After) while it loads. The tier is remembered per model, so a JIT\nreload keeps it -- and since D48 a saved ``settings.priority`` is the floor\nthat survives a restart.\n\nThe mirror image: while a better-tier load holds the server, this route\nanswers 503 with the code ``priority_hold`` (not the generic busy code),\n``Retry-After`` and ``details.priority_hold`` naming the model being loaded\nand its tier. It is a wait, not a failure -- honour the header.",
+        "description": "Load one model, optionally onto named GPUs.\n\n``devices`` is a one-shot placement for this load only (D36) -- the\ncatalog's per-hardware-mode ``load_args`` carry one -- and never touches the\nmodel's saved settings. A CUDA index this box does not have is a 400 naming\nthe parameter, not a planner refusal that reads like a VRAM problem.\n\n``allowed_devices`` is the other one-shot, and the distinction is the whole\nof D59: ``devices`` says *use exactly these cards, all of them* -- more than\none becomes a split -- while ``allowed_devices`` says *choose among these*\nand leaves the ranking, the split and the arithmetic to the planner. A\ntenant that needs a load kept off the card ComfyUI renders on wants the\nsecond; forcing the first made it pick placements this server picks better.\nSending both is a 400: one would have decided nothing.\n\nIt **narrows and never widens**. The request's set is intersected with the\nmodel's saved ``settings.allowed_devices``; ``planner.excluded_devices`` and\nstanding GPU leases (D43) still remove cards afterwards; and a saved\n``settings.device_override`` still outranks every allow-list, so a request\nexcluding a card the override names is a 400 rather than a silent placement\nonto exactly the card it asked to avoid. Nothing is persisted -- the next\nload without the field is the model's own business again. An empty list is a\n400, not a no-op: \"every card except that one\", computed to nothing, means\n*nowhere*, and treating it as *anywhere* would place the load on the one\ncard the caller was avoiding. When the set is real but nothing in it fits,\nthe answer is the ordinary honest 507 -- ``allowed_devices_unavailable``, or\n``gpu_leased`` when a lease is why (D53).\n\n``priority`` is the load's tier (D46): 1 the active chat model, 2 a\ndispatched agent, 3 (or omitted) background. A tier-1/2 load takes the\nfastest placement -- displacing idle worse-tier models from the cards it\npicks and reloading the recently active ones afterwards where they fit --\njumps the load queue, and holds new worse-tier traffic off (503 +\nRetry-After) while it loads. The tier is remembered per model, so a JIT\nreload keeps it -- and since D48 a saved ``settings.priority`` is the floor\nthat survives a restart.\n\nThe mirror image: while a better-tier load holds the server, this route\nanswers 503 with the code ``priority_hold`` (not the generic busy code),\n``Retry-After`` and ``details.priority_hold`` naming the model being loaded\nand its tier. It is a wait, not a failure -- honour the header.\n\n``lease_id`` (body, or ``?lease_id=``) binds the load to a standing lease\n(D87, B.6): the model is named in the lease -- so no other model's eviction\nladder stops it and releasing the lease unloads it -- and the lease's cards\nare the placement (``devices`` may name a subset of them; a resident\nelsewhere is moved onto them). Only the lease's holder may bind to it: the\nkey that took it, the holder's D55 proof, or an admin (403\n``permission_denied`` otherwise); an unknown lease is 404\n``lease_not_found``; a model another lease already names is 409\n``lease_conflict``. The instance reports ``loaded_by: \"api:/api/leases/<id>\"``.",
         "operationId": "load_model_api_models__model_id__load_post",
         "parameters": [
           {
@@ -3160,7 +3263,7 @@
     },
     "/api/models/{model_id}/load-recommended": {
       "post": {
-        "description": "Load at exactly ``ctx_size`` per slot; the server picks everything else.\n\nName the model and the context you need. This walks the hardware modes in\nheadline order, asks for that exact context per slot under the quality-first\nKV rule with the recommended slot count, and loads the first placement that\nfits -- evicting only idle models, never a busy one.\n\n**Strict about context, unlike every other load path.** A window that does\nnot fit is a structured 507 naming, per mode, the largest context that would\nwork and what is in the way, with ``retry_after_s`` when the cause is a\nmodel that is serving right now. Above the model's trained window it is a\n400 with the number that would be accepted.\n\n``kv_min`` is the lowest KV cache quality this call will accept -- ``f16``,\n``q8_0`` or ``q4_0``. It floors the quality-first ladder rather than\nsteering it: a window that needs a worse cache than the floor is refused\nwith the same structured 507, never quietly quantized to reach the number.\nOmitted, the whole ladder is available (and a q4_0 K cache is still never\nchosen automatically).\n\n``max_slots`` caps the slot count for this load only. The estimator's\nanswer is what a placement *could* sustain; a caller that knows it has\nthree bots wanting one window each does not want the other five slots' KV\ncache priced into the fit. Must be >= 1 (400 naming the parameter\notherwise). The cap applies before the descent loop, so the winning plan is\nreally planned at the capped count rather than planned larger and launched\nsmaller.\n\n``allowed_devices`` bounds the walk to those CUDA indices, for this call\nonly (D59). It is a bound, not a placement: the mode walk still chooses\nwithin it, still applies the quality-first KV rule, and still returns the\nsame structured 507 when nothing in the set reaches the window. It is\napplied where ``planner.excluded_devices`` is -- to the card list the\nhardware modes are built from -- so the modes offered are the real ones over\nthe permitted cards and ``prefer_mode`` names one of those; a mode outside\nthe set is unreachable rather than merely unpreferred. Narrows only: it is\nintersected with the model's saved ``settings.allowed_devices``, contradicts\na saved ``settings.device_override`` with a 400 rather than quietly\noverruling it, and never widens past a lease or an exclusion. An empty list\nis a 400. Nothing about it is persisted, ``persist: true`` included -- a\nplacement is a one-shot load argument (D36), and so is a bound on one.\n\n``persist`` writes the *resolved* profile -- context per slot, both KV\ncache types, the slot count and the tier -- into the model's saved settings\nonce the load succeeds, so the next plain load (a JIT reload included)\nreproduces it. The trade: it freezes the KV ladder and the slot estimator\nfor this model, which then stop responding to a changed machine; null those\nfields with ``PATCH /api/models/{id}/settings`` to hand the decision back.\nDevices are deliberately **not** persisted -- a placement is a one-shot\nload argument (D36). It is refused for a preset-only virtual model (the\nwrite would land on the base model and every persona sharing it -- call it\non the base id instead) and while the model is being benchmarked; both are\nchecked before the walk begins, so the 400 arrives with nothing loaded.\nAfterwards the write is best-effort: anything that refuses it once the load\nhas succeeded -- a benchmark that started *during* the load, or the settings\nvalidation rejecting the resolved row (a resident whose slot count predates\na ``max_parallel_cap`` lowered under it) -- leaves the load standing and\nskips only the write, with a warning in the server log.\n\n``priority`` is the load's tier (D46): 1 the active chat model, 2 a\ndispatched agent, 3 (or omitted) background.\n\n``min_slots`` and ``kv_unified`` shape the slots (D72). ``min_slots`` is a\nfloor on the count the walk picks -- the fit, the KV cache type and any\nrefusal are all judged at it, so a mode that reaches the window only with\nfewer slots is a 507 carrying ``max_ctx_that_fits`` and\n``max_parallel_that_fits``, never a shorter load. ``kv_unified: true``\nmakes ``ctx_size`` ONE shared pool: the child runs ``--parallel N\n--kv-unified --ctx-size ctx_size --no-cache-idle-slots``, every slot may\nuse the whole pool, and VRAM is one slot's KV plus each extra slot's\nsliding window and recurrent state. ClawChat asks for ``min_slots: 2,\nmax_slots: 2, kv_unified: true``: one slot for the chat, one for\neverything else, at the price of one. A resident is \"already exactly\nthat\" only at or above the floor and, when the caller names a pool shape,\nin that shape. ``persist`` with ``kv_unified: true`` is a 400: the saved\nsettings keep ``ctx_size`` per slot and cannot hold a shared pool.\n\n**Auth.** The route itself is ungated (residency is open, LM Studio\nparity), but ``persist: true`` writes settings -- the same box change\n``PUT /settings`` is gated for (D32) -- so that field alone needs\n``server.api_key``, a caller on this machine, or the MCP pairing PIN. The\nrefusal is a 403 ``remote_admin_requires_credential`` and the same request\nwithout ``persist`` still loads.\n\nA load held off by a higher-tier load in flight is a 503 with code\n``priority_hold``, ``Retry-After`` and ``details.priority_hold`` naming the\nholder -- distinct from the other 503s this route can return, so honour the\nheader rather than retrying immediately.",
+        "description": "Load at exactly ``ctx_size`` per slot; the server picks everything else.\n\nName the model and the context you need. This walks the hardware modes in\nheadline order, asks for that exact context per slot under the quality-first\nKV rule with the recommended slot count, and loads the first placement that\nfits -- evicting only idle models, never a busy one.\n\n**Strict about context, unlike every other load path.** A window that does\nnot fit is a structured 507 naming, per mode, the largest context that would\nwork and what is in the way, with ``retry_after_s`` when the cause is a\nmodel that is serving right now. Above the model's trained window it is a\n400 with the number that would be accepted.\n\n``kv_min`` is the lowest KV cache quality this call will accept -- ``f16``,\n``q8_0`` or ``q4_0``. It floors the quality-first ladder rather than\nsteering it: a window that needs a worse cache than the floor is refused\nwith the same structured 507, never quietly quantized to reach the number.\nOmitted, the whole ladder is available (and a q4_0 K cache is still never\nchosen automatically).\n\n``max_slots`` caps the slot count for this load only. The estimator's\nanswer is what a placement *could* sustain; a caller that knows it has\nthree bots wanting one window each does not want the other five slots' KV\ncache priced into the fit. Must be >= 1 (400 naming the parameter\notherwise). The cap applies before the descent loop, so the winning plan is\nreally planned at the capped count rather than planned larger and launched\nsmaller.\n\n``allowed_devices`` bounds the walk to those CUDA indices, for this call\nonly (D59). It is a bound, not a placement: the mode walk still chooses\nwithin it, still applies the quality-first KV rule, and still returns the\nsame structured 507 when nothing in the set reaches the window. It is\napplied where ``planner.excluded_devices`` is -- to the card list the\nhardware modes are built from -- so the modes offered are the real ones over\nthe permitted cards and ``prefer_mode`` names one of those; a mode outside\nthe set is unreachable rather than merely unpreferred. Narrows only: it is\nintersected with the model's saved ``settings.allowed_devices``, contradicts\na saved ``settings.device_override`` with a 400 rather than quietly\noverruling it, and never widens past a lease or an exclusion. An empty list\nis a 400. Nothing about it is persisted, ``persist: true`` included -- a\nplacement is a one-shot load argument (D36), and so is a bound on one.\n\n``persist`` writes the *resolved* profile -- context per slot, both KV\ncache types, the slot count and the tier -- into the model's saved settings\nonce the load succeeds, so the next plain load (a JIT reload included)\nreproduces it. The trade: it freezes the KV ladder and the slot estimator\nfor this model, which then stop responding to a changed machine; null those\nfields with ``PATCH /api/models/{id}/settings`` to hand the decision back.\nDevices are deliberately **not** persisted -- a placement is a one-shot\nload argument (D36). It is refused for a preset-only virtual model (the\nwrite would land on the base model and every persona sharing it -- call it\non the base id instead) and while the model is being benchmarked; both are\nchecked before the walk begins, so the 400 arrives with nothing loaded.\nAfterwards the write is best-effort: anything that refuses it once the load\nhas succeeded -- a benchmark that started *during* the load, or the settings\nvalidation rejecting the resolved row (a resident whose slot count predates\na ``max_parallel_cap`` lowered under it) -- leaves the load standing and\nskips only the write, with a warning in the server log.\n\n``priority`` is the load's tier (D46): 1 the active chat model, 2 a\ndispatched agent, 3 (or omitted) background.\n\n``min_slots`` and ``kv_unified`` shape the slots (D72). ``min_slots`` is a\nfloor on the count the walk picks -- the fit, the KV cache type and any\nrefusal are all judged at it, so a mode that reaches the window only with\nfewer slots is a 507 carrying ``max_ctx_that_fits`` and\n``max_parallel_that_fits``, never a shorter load. ``kv_unified: true``\nmakes ``ctx_size`` ONE shared pool: the child runs ``--parallel N\n--kv-unified --ctx-size ctx_size --no-cache-idle-slots``, every slot may\nuse the whole pool, and VRAM is one slot's KV plus each extra slot's\nsliding window and recurrent state. ClawChat asks for ``min_slots: 2,\nmax_slots: 2, kv_unified: true``: one slot for the chat, one for\neverything else, at the price of one. A resident is \"already exactly\nthat\" only at or above the floor and, when the caller names a pool shape,\nin that shape. ``persist`` with ``kv_unified: true`` is a 400: the saved\nsettings keep ``ctx_size`` per slot and cannot hold a shared pool.\n\n**Auth.** The route itself is ungated (residency is open, LM Studio\nparity), but ``persist: true`` writes settings -- the same box change\n``PUT /settings`` is gated for (D32) -- so that field alone needs\n``server.api_key``, a caller on this machine, or the MCP pairing PIN. The\nrefusal is a 403 ``remote_admin_requires_credential`` and the same request\nwithout ``persist`` still loads.\n\nA load held off by a higher-tier load in flight is a 503 with code\n``priority_hold``, ``Retry-After`` and ``details.priority_hold`` naming the\nholder -- distinct from the other 503s this route can return, so honour the\nheader rather than retrying immediately.\n\n**Leases (D87).** A standing lease that names this model makes its cards the\nwalk's only placement (unless the model saves a ``device_override``, which\nwins as on ``/load``): the holder's load lands on the cards it leased, not\non the headline mode. ``lease_id`` (body or ``?lease_id=``) binds the load\nto a lease the caller holds, exactly as on ``/load`` (B.6): named in the\nlease, walked on its cards alone, ``loaded_by: \"api:/api/leases/<id>\"``.",
         "operationId": "load_recommended_api_models__model_id__load_recommended_post",
         "parameters": [
           {
@@ -3691,6 +3794,24 @@
               ],
               "description": "true: the slots share ONE KV pool of ctx_size tokens. Omitted or false: ctx_size per slot.",
               "title": "Kv Unified"
+            }
+          },
+          {
+            "description": "Answer for the load bound to this standing lease: the walk offers its cards alone (B.6). Nothing is bound by the dry run.",
+            "in": "query",
+            "name": "lease_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Answer for the load bound to this standing lease: the walk offers its cards alone (B.6). Nothing is bound by the dry run.",
+              "title": "Lease Id"
             }
           }
         ],

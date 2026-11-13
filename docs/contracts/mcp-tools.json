@@ -1,5 +1,5 @@
 {
-  "count": 37,
+  "count": 39,
   "format": 1,
   "tools": [
     {
@@ -453,7 +453,7 @@
         "open_world_hint": false,
         "read_only_hint": false
       },
-      "description": "Load a model into VRAM now, returning once it is serving.\n\n**Pass a catalog ``load_args`` object straight in.** Every key in it\nis an argument of this tool, nothing needs adding, and that is the\nintended way to call it::\n\n    model = list_models()[\"models\"][0]\n    load_model(**model[\"recommended\"][\"load_args\"])      # names the devices\n    load_model(**model[\"options\"][3][\"load_args\"])       # a context tier; the\n                                                         # planner picks the cards\n\nThe ``recommended`` block and every ``placements[]`` recipe carry\n``devices``; the per-context ``options`` rows deliberately do not --\ntheir placement is the planner's choice at load time, which the row's\n``devices`` column previews.\n\nYou often do not need this tool at all: naming an unloaded model in an\nOpenAI API request loads it automatically with planner defaults. Reach\nfor it to pre-warm a model, or -- the usual reason -- to load one at a\nspecific context size and slot count from the catalog.\n\nThis is GPU-only. If the model cannot fit entirely in VRAM the call\nfails with the required-vs-available byte counts, the largest context\nthat *would* fit, and concrete suggestions -- there is no CPU fallback,\nso read those numbers and retry with a smaller ctx_size or a smaller\nkv_cache_type instead of retrying the same call. Better: call\n``model_options`` and pick a row whose ``fits`` is true.\n\nLoading may evict other idle models to make room (this is normal and is\nreported in the plan's ``evict_model_ids``).\n\nPlacement is normally the planner's decision against live free VRAM,\nand the catalog's ``devices`` column tells you what it will choose. To\npick the hardware yourself, pass ``devices`` -- which is what a\n``placements[]`` row's ``load_args`` does. To keep the load OFF a card\nwithout picking one yourself, pass ``allowed_devices``: the planner\nstill chooses, inside the set you name. Never pass both.\n\nArgs:\n    model_id: Model id or alias.\n    ctx_size: Context tokens per parallel slot. None uses the saved\n        per-model setting, else the global default.\n    kv_cache_type: KV cache quantization for the K cache -- \"f16\",\n        \"q8_0\" or \"q4_0\" (those three only). Each step down roughly\n        halves KV cache VRAM at a quality cost that is real and\n        family-dependent, and the K cache is the sensitive one: a q4_0\n        K cache is never chosen automatically. None lets the planner\n        pick the best-quality cache that reaches the requested context.\n    kv_cache_type_v: The V cache, when it should differ from K. Omit it\n        and V follows K. The one combination worth asking for is\n        \"q8_0\" K with \"q4_0\" V: the V cache tolerates 4 bits where the\n        K cache does not.\n    parallel: Number of concurrent slots, i.e. how many conversations\n        this load can serve at once. The engine is launched with\n        ctx_size * parallel total context, so each slot really gets\n        ctx_size. Match your own client concurrency to this number. A\n        catalog row's ``parallel`` is the **most** that placement\n        sustains, not a requirement -- asking for fewer is always fine\n        and simply leaves VRAM free for something else.\n    devices: CUDA indices to place this load on, for this load only --\n        it does not change the model's saved settings, so the next load\n        without it goes back to the planner's choice. Take it from a\n        ``placements[]`` row's ``load_args``; naming an index this box\n        does not have is rejected immediately. This is a FORCED\n        placement: exactly these cards, all of them, and more than one\n        becomes a split.\n    allowed_devices: CUDA indices the planner may CHOOSE AMONG for this\n        load only. Use this, not ``devices``, when what you know is\n        which card to stay off -- one another program is rendering on,\n        say. The planner still ranks the cards, sizes the context and\n        picks the split; you have only bounded where it may look, so\n        you keep every placement decision this server makes better than\n        you can. Not persisted, so the next load without it is\n        unbounded again. It only narrows: a card the model's own\n        settings, an operator exclusion or a GPU lease forbids stays\n        forbidden, and asking for one does not unlock it. Passing both\n        this and ``devices`` is an error -- the second would decide\n        nothing. An empty list is an error too, not \"no restriction\":\n        if you computed \"every card except X\" and got nothing, the\n        answer is \"nowhere\", and this server will not read it as\n        \"anywhere\". If nothing in the set fits, the refusal says so\n        with the numbers and names the lease when a lease is why.\n    force: Reload even if the model is already running (use after\n        changing its settings).\n    priority: The load's tier: 1 for the model a person is actively\n        chatting with, 2 for a model dispatched to work on a task, 3\n        (or omitted) for background work. A tier-1/2 load takes the\n        fastest placement -- idle worse-tier models are displaced from\n        the cards it picks and the recently active ones reloaded\n        afterwards where they fit -- jumps the load queue, and holds\n        new worse-tier traffic off (503 + Retry-After) while it loads.\n        The tier is remembered per model, so later loads of the same\n        model keep it. A tier-3 load never displaces tier 1 or 2.\n\nReturns:\n    The running instance: port, pid, devices, planned VRAM breakdown,\n    the plan's ``max_parallel``, the tier it loaded at (``priority``)\n    and its resolved ``speculative`` block (``null`` = not decided yet,\n    ``{\"type\": \"none\", \"reason\": ...}`` = considered and declined).",
+      "description": "Load a model into VRAM now, returning once it is serving.\n\n**Pass a catalog ``load_args`` object straight in.** Every key in it\nis an argument of this tool, nothing needs adding, and that is the\nintended way to call it::\n\n    model = list_models()[\"models\"][0]\n    load_model(**model[\"recommended\"][\"load_args\"])      # names the devices\n    load_model(**model[\"options\"][3][\"load_args\"])       # a context tier; the\n                                                         # planner picks the cards\n\nThe ``recommended`` block and every ``placements[]`` recipe carry\n``devices``; the per-context ``options`` rows deliberately do not --\ntheir placement is the planner's choice at load time, which the row's\n``devices`` column previews.\n\nYou often do not need this tool at all: naming an unloaded model in an\nOpenAI API request loads it automatically with planner defaults. Reach\nfor it to pre-warm a model, or -- the usual reason -- to load one at a\nspecific context size and slot count from the catalog.\n\nThis is GPU-only. If the model cannot fit entirely in VRAM the call\nfails with the required-vs-available byte counts, the largest context\nthat *would* fit, and concrete suggestions -- there is no CPU fallback,\nso read those numbers and retry with a smaller ctx_size or a smaller\nkv_cache_type instead of retrying the same call. Better: call\n``model_options`` and pick a row whose ``fits`` is true.\n\nLoading may evict other idle models to make room (this is normal and is\nreported in the plan's ``evict_model_ids``).\n\nPlacement is normally the planner's decision against live free VRAM,\nand the catalog's ``devices`` column tells you what it will choose. To\npick the hardware yourself, pass ``devices`` -- which is what a\n``placements[]`` row's ``load_args`` does. To keep the load OFF a card\nwithout picking one yourself, pass ``allowed_devices``: the planner\nstill chooses, inside the set you name. Never pass both.\n\nArgs:\n    model_id: Model id or alias.\n    ctx_size: Context tokens per parallel slot. None uses the saved\n        per-model setting, else the global default.\n    kv_cache_type: KV cache quantization for the K cache -- \"f16\",\n        \"q8_0\" or \"q4_0\" (those three only). Each step down roughly\n        halves KV cache VRAM at a quality cost that is real and\n        family-dependent, and the K cache is the sensitive one: a q4_0\n        K cache is never chosen automatically. None lets the planner\n        pick the best-quality cache that reaches the requested context.\n    kv_cache_type_v: The V cache, when it should differ from K. Omit it\n        and V follows K. The one combination worth asking for is\n        \"q8_0\" K with \"q4_0\" V: the V cache tolerates 4 bits where the\n        K cache does not.\n    parallel: Number of concurrent slots, i.e. how many conversations\n        this load can serve at once. The engine is launched with\n        ctx_size * parallel total context, so each slot really gets\n        ctx_size. Match your own client concurrency to this number. A\n        catalog row's ``parallel`` is the **most** that placement\n        sustains, not a requirement -- asking for fewer is always fine\n        and simply leaves VRAM free for something else.\n    devices: CUDA indices to place this load on, for this load only --\n        it does not change the model's saved settings, so the next load\n        without it goes back to the planner's choice. Take it from a\n        ``placements[]`` row's ``load_args``; naming an index this box\n        does not have is rejected immediately. This is a FORCED\n        placement: exactly these cards, all of them, and more than one\n        becomes a split.\n    allowed_devices: CUDA indices the planner may CHOOSE AMONG for this\n        load only. Use this, not ``devices``, when what you know is\n        which card to stay off -- one another program is rendering on,\n        say. The planner still ranks the cards, sizes the context and\n        picks the split; you have only bounded where it may look, so\n        you keep every placement decision this server makes better than\n        you can. Not persisted, so the next load without it is\n        unbounded again. It only narrows: a card the model's own\n        settings, an operator exclusion or a GPU lease forbids stays\n        forbidden, and asking for one does not unlock it. Passing both\n        this and ``devices`` is an error -- the second would decide\n        nothing. An empty list is an error too, not \"no restriction\":\n        if you computed \"every card except X\" and got nothing, the\n        answer is \"nowhere\", and this server will not read it as\n        \"anywhere\". If nothing in the set fits, the refusal says so\n        with the numbers and names the lease when a lease is why.\n    force: Reload even if the model is already running (use after\n        changing its settings).\n    priority: The load's tier: 1 for the model a person is actively\n        chatting with, 2 for a model dispatched to work on a task, 3\n        (or omitted) for background work. A tier-1/2 load takes the\n        fastest placement -- idle worse-tier models are displaced from\n        the cards it picks and the recently active ones reloaded\n        afterwards where they fit -- jumps the load queue, and holds\n        new worse-tier traffic off (503 + Retry-After) while it loads.\n        The tier is remembered per model, so later loads of the same\n        model keep it. A tier-3 load never displaces tier 1 or 2.\n    lease_id: Bind this load to a GPU lease you took (``reserve_gpus``'s\n        ``lease.id``): the model joins the lease, loads onto its cards\n        (``devices`` may name a subset of them), no other model can\n        evict it, and ``release_gpus`` unloads it. Only the lease's\n        holder may bind to it.\n\nReturns:\n    The running instance: port, pid, devices, planned VRAM breakdown,\n    the plan's ``max_parallel``, the tier it loaded at (``priority``)\n    and its resolved ``speculative`` block (``null`` = not decided yet,\n    ``{\"type\": \"none\", \"reason\": ...}`` = considered and declined).",
       "input_schema": {
         "properties": {
           "allowed_devices": {
@@ -527,6 +527,18 @@
             "default": null,
             "title": "Kv Cache Type V"
           },
+          "lease_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Lease Id"
+          },
           "model_id": {
             "title": "Model Id",
             "type": "string"
@@ -577,7 +589,7 @@
         "open_world_hint": false,
         "read_only_hint": false
       },
-      "description": "**The easy way to load.** Say the model and the context you need.\n\nSay the model and the context you need -- 65536, 131072, 262144, 524288,\nor any number up to the model's trained window -- and the server picks\nthe GPUs, the KV cache type and the slot count under the quality-first\npolicy and loads at **exactly** that context. Or it tells you why it\ncannot.\n\nUse this instead of ``load_model`` whenever what you know is \"I need a\n200k window for this transcript\" rather than \"I want these two cards\".\nUse ``list_models`` -> a ``placements[]`` row -> ``load_model`` when you\nwant to choose the hardware yourself.\n\n**This is the one load path that never quietly shrinks your window.**\nEverywhere else a context that does not fit steps down to one that does,\nbecause a roomier window is a nicety. Here the window is the request, so\na refusal is a structured error listing, per set of cards, the largest\ncontext that *would* work and what is in the way -- a model that is\nserving (with ``retry_after_s``, so waiting is the right move), memory\nheld by something that is not us, or the model's own trained window. Ask\nagain with the number it names and it will load.\n\nIt never interrupts anyone: only idle models are evicted to make room,\nnever one that is mid-request.\n\nArgs:\n    model_id: Model id or alias.\n    ctx_size: Tokens **per concurrent conversation**, exactly. Above the\n        model's ``n_ctx_train`` this is refused with the number that\n        would be accepted, because serving past the trained window needs\n        RoPE scaling and degrades quality.\n    prefer_mode: A hardware-mode key from a ``placements[]`` row\n        (``dual_5090``, ``dual_3090``, ``all_gpus``, ``single_5090`` on\n        this rig) to try that placement instead of the default order.\n        A model whose saved settings pin its cards\n        (``device_override``) is loaded on exactly those and nowhere\n        else, as every other load of it is; naming another mode for it\n        is an error that says so. Its saved ``allowed_devices`` bounds\n        every mode the same way.\n    kv_min: The lowest KV cache quality this load may accept -- \"f16\",\n        \"q8_0\" or \"q4_0\", those three only. It is a floor on the\n        quality-first ladder, not a choice: pass \"f16\" to mean \"do not\n        quantize the cache to reach this window at all\", and a window\n        that would need a worse cache is refused with the same\n        structured error instead of being reached quietly at lower\n        quality. Omitted, the whole ladder is available (a q4_0 K cache\n        is still never chosen automatically).\n    priority: The load's tier: 1 for the model a person is actively\n        chatting with, 2 for a dispatched agent, 3 (or omitted) for\n        background work. A tier-1/2 load takes the best placement even\n        when idle worse-tier models must be displaced for it; the\n        recently active ones are reloaded afterwards where they fit.\n    max_slots: Ceiling on the number of concurrent slots this load may\n        choose, >= 1. The server's own answer is what the placement\n        *could* sustain; if you know how many conversations will really\n        run -- three bots, one window each -- cap it here and the KV\n        cache for the slots you will not use is never priced into the\n        fit, which often buys a larger window instead. Omitted, the\n        recommendation stands.\n    allowed_devices: CUDA indices this call may use, for this call\n        only. A bound on the search, not a placement: the server still\n        walks the placements over the cards you named, still picks the\n        KV cache type and the slot count, and still refuses with the\n        same structured error if the window does not fit on any of\n        them. Use it when what you know is which card to stay off --\n        one another program is rendering on, say -- rather than which\n        to use. ``prefer_mode`` then names one of the modes over those\n        cards. It only narrows: a card the model's own settings, an\n        operator exclusion or a GPU lease forbids stays forbidden. It\n        is never saved, ``persist=true`` included.\n    persist: Write the profile this call resolves -- context per slot,\n        both KV cache types, the slot count and the tier -- into the\n        model's saved settings, so a later plain load (including the\n        automatic one an inference request triggers) reproduces it\n        without you asking again. The trade: it freezes the KV ladder\n        and the slot estimator for this model, which then stop adapting\n        to what else is resident or to a changed machine; the settings\n        fields have to be nulled to hand the decision back, and no MCP\n        tool writes per-model settings, so that undo happens elsewhere:\n        ``PATCH /api/models/{id}/settings`` on the management REST port\n        with ``{\"ctx_size\": null, \"kv_cache_type\": null,\n        \"kv_cache_type_v\": null, \"parallel\": null, \"priority\": null}``\n        (a merge-patch: an explicit null clears exactly that field and\n        nothing else), the same fields set back to \"Auto\" in the\n        GUI's model settings dialog, or ``sfctl models settings\n        <model> --set ctx_size=null`` and friends from a shell -- a\n        literal null clears the field whatever it holds. Devices are\n        deliberately not persisted -- a placement is a one-shot load\n        argument. Refused for a preset-only virtual model (the write\n        would land on the base model and every persona sharing it, so\n        call it on the base id) and while that model is being\n        benchmarked. Both are checked before the walk begins, so the\n        refusal is an ordinary error result naming the reason and\n        nothing was loaded. After a successful load the write is\n        best-effort instead: anything that refuses it then -- a\n        benchmark that started *during* the load, or the settings\n        validation rejecting the resolved row (a resident whose slot\n        count predates a max_parallel_cap lowered under it) -- leaves\n        the load standing and skips only the write, so a success here\n        means the model is loaded but does not by itself prove the\n        profile was saved.\n    min_slots: The fewest concurrent slots this load may have, >= 1\n        and not above ``max_slots``. The server still picks the count,\n        but never below this, and it judges the fit AT this count: if\n        the window only fits with fewer slots, the answer is the same\n        structured refusal, naming the largest context that would fit\n        with this many slots and the most slots that fit at this\n        context -- never a load with fewer slots than you asked for.\n    kv_unified: ``true`` makes ``ctx_size`` ONE memory pool that every\n        slot shares: each conversation may use the whole window, all of\n        them together may not exceed it, and the pool costs about what\n        ONE slot of that window costs (plus a little per extra slot).\n        Right for \"one main conversation plus quick side requests\" --\n        two slots so the side requests never push the conversation's\n        cached prompt out, for the price of one. Wrong for several\n        long conversations at once, which would run out of room\n        mid-reply. Omitted or ``false``: ``ctx_size`` per slot, each\n        slot's own. Cannot be combined with ``persist``.\n\nReturns:\n    The running instance: port, pid, devices, the KV cache type chosen,\n    the slot count, the tier it loaded at (``priority``), its resolved\n    ``speculative`` block, and the planned VRAM breakdown.",
+      "description": "**The easy way to load.** Say the model and the context you need.\n\nSay the model and the context you need -- 65536, 131072, 262144, 524288,\nor any number up to the model's trained window -- and the server picks\nthe GPUs, the KV cache type and the slot count under the quality-first\npolicy and loads at **exactly** that context. Or it tells you why it\ncannot.\n\nUse this instead of ``load_model`` whenever what you know is \"I need a\n200k window for this transcript\" rather than \"I want these two cards\".\nUse ``list_models`` -> a ``placements[]`` row -> ``load_model`` when you\nwant to choose the hardware yourself.\n\n**This is the one load path that never quietly shrinks your window.**\nEverywhere else a context that does not fit steps down to one that does,\nbecause a roomier window is a nicety. Here the window is the request, so\na refusal is a structured error listing, per set of cards, the largest\ncontext that *would* work and what is in the way -- a model that is\nserving (with ``retry_after_s``, so waiting is the right move), memory\nheld by something that is not us, or the model's own trained window. Ask\nagain with the number it names and it will load.\n\nIt never interrupts anyone: only idle models are evicted to make room,\nnever one that is mid-request.\n\nArgs:\n    model_id: Model id or alias.\n    ctx_size: Tokens **per concurrent conversation**, exactly. Above the\n        model's ``n_ctx_train`` this is refused with the number that\n        would be accepted, because serving past the trained window needs\n        RoPE scaling and degrades quality.\n    prefer_mode: A hardware-mode key from a ``placements[]`` row\n        (``dual_5090``, ``dual_3090``, ``all_gpus``, ``single_5090`` on\n        this rig) to try that placement instead of the default order.\n        A model whose saved settings pin its cards\n        (``device_override``) is loaded on exactly those and nowhere\n        else, as every other load of it is; naming another mode for it\n        is an error that says so. Its saved ``allowed_devices`` bounds\n        every mode the same way.\n    kv_min: The lowest KV cache quality this load may accept -- \"f16\",\n        \"q8_0\" or \"q4_0\", those three only. It is a floor on the\n        quality-first ladder, not a choice: pass \"f16\" to mean \"do not\n        quantize the cache to reach this window at all\", and a window\n        that would need a worse cache is refused with the same\n        structured error instead of being reached quietly at lower\n        quality. Omitted, the whole ladder is available (a q4_0 K cache\n        is still never chosen automatically).\n    priority: The load's tier: 1 for the model a person is actively\n        chatting with, 2 for a dispatched agent, 3 (or omitted) for\n        background work. A tier-1/2 load takes the best placement even\n        when idle worse-tier models must be displaced for it; the\n        recently active ones are reloaded afterwards where they fit.\n    max_slots: Ceiling on the number of concurrent slots this load may\n        choose, >= 1. The server's own answer is what the placement\n        *could* sustain; if you know how many conversations will really\n        run -- three bots, one window each -- cap it here and the KV\n        cache for the slots you will not use is never priced into the\n        fit, which often buys a larger window instead. Omitted, the\n        recommendation stands.\n    allowed_devices: CUDA indices this call may use, for this call\n        only. A bound on the search, not a placement: the server still\n        walks the placements over the cards you named, still picks the\n        KV cache type and the slot count, and still refuses with the\n        same structured error if the window does not fit on any of\n        them. Use it when what you know is which card to stay off --\n        one another program is rendering on, say -- rather than which\n        to use. ``prefer_mode`` then names one of the modes over those\n        cards. It only narrows: a card the model's own settings, an\n        operator exclusion or a GPU lease forbids stays forbidden. It\n        is never saved, ``persist=true`` included.\n    persist: Write the profile this call resolves -- context per slot,\n        both KV cache types, the slot count and the tier -- into the\n        model's saved settings, so a later plain load (including the\n        automatic one an inference request triggers) reproduces it\n        without you asking again. The trade: it freezes the KV ladder\n        and the slot estimator for this model, which then stop adapting\n        to what else is resident or to a changed machine; the settings\n        fields have to be nulled to hand the decision back, and no MCP\n        tool writes per-model settings, so that undo happens elsewhere:\n        ``PATCH /api/models/{id}/settings`` on the management REST port\n        with ``{\"ctx_size\": null, \"kv_cache_type\": null,\n        \"kv_cache_type_v\": null, \"parallel\": null, \"priority\": null}``\n        (a merge-patch: an explicit null clears exactly that field and\n        nothing else), the same fields set back to \"Auto\" in the\n        GUI's model settings dialog, or ``sfctl models settings\n        <model> --set ctx_size=null`` and friends from a shell -- a\n        literal null clears the field whatever it holds. Devices are\n        deliberately not persisted -- a placement is a one-shot load\n        argument. Refused for a preset-only virtual model (the write\n        would land on the base model and every persona sharing it, so\n        call it on the base id) and while that model is being\n        benchmarked. Both are checked before the walk begins, so the\n        refusal is an ordinary error result naming the reason and\n        nothing was loaded. After a successful load the write is\n        best-effort instead: anything that refuses it then -- a\n        benchmark that started *during* the load, or the settings\n        validation rejecting the resolved row (a resident whose slot\n        count predates a max_parallel_cap lowered under it) -- leaves\n        the load standing and skips only the write, so a success here\n        means the model is loaded but does not by itself prove the\n        profile was saved.\n    min_slots: The fewest concurrent slots this load may have, >= 1\n        and not above ``max_slots``. The server still picks the count,\n        but never below this, and it judges the fit AT this count: if\n        the window only fits with fewer slots, the answer is the same\n        structured refusal, naming the largest context that would fit\n        with this many slots and the most slots that fit at this\n        context -- never a load with fewer slots than you asked for.\n    kv_unified: ``true`` makes ``ctx_size`` ONE memory pool that every\n        slot shares: each conversation may use the whole window, all of\n        them together may not exceed it, and the pool costs about what\n        ONE slot of that window costs (plus a little per extra slot).\n        Right for \"one main conversation plus quick side requests\" --\n        two slots so the side requests never push the conversation's\n        cached prompt out, for the price of one. Wrong for several\n        long conversations at once, which would run out of room\n        mid-reply. Omitted or ``false``: ``ctx_size`` per slot, each\n        slot's own. Cannot be combined with ``persist``.\n    lease_id: Bind this load to a GPU lease you took\n        (``reserve_gpus``'s ``lease.id``): the model joins the lease\n        and the walk uses the lease's cards alone. Without it, a lease\n        that already names this model does the same -- your load lands\n        on the cards you reserved, not elsewhere.\n\nReturns:\n    The running instance: port, pid, devices, the KV cache type chosen,\n    the slot count, the tier it loaded at (``priority``), its resolved\n    ``speculative`` block, and the planned VRAM breakdown.",
       "input_schema": {
         "properties": {
           "allowed_devices": {
@@ -622,6 +634,18 @@
             ],
             "default": null,
             "title": "Kv Unified"
+          },
+          "lease_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Lease Id"
           },
           "max_slots": {
             "anyOf": [
@@ -919,12 +943,17 @@
         "open_world_hint": false,
         "read_only_hint": false
       },
-      "description": "Release a GPU lease now, so the cards go back to the general pool.\n\nThe id is the ``lease.id`` that ``reserve_gpus`` returned; ``server_status``\nlists every standing lease with its id if you lost it. Releasing does\nnot unload the model that held the cards -- it simply stops being the\nonly model allowed there, and goes back to the ordinary idle TTL and\neviction rules (unless it is pinned). Leases also end by themselves\nonce idle for their ``idle_ttl_s``, so this is the early exit, not the\nonly one. If your lease shows ``state: \"vacating\"`` a better class\nhas asked for the cards (D56): finish or stop the work on them and\nrelease here -- that is the only way a vacate completes; nothing\ntakes the lease from you.\n\nA key with the ``inference`` scope may release only a lease that key\ntook (``permission_denied`` otherwise); an ``admin`` key any.\n\nArgs:\n    lease_id: The lease to release.\n\nReturns:\n    ``{\"ok\": true, \"released\": {...the lease as it stood...}}``, or an\n    error result naming the id when no such lease exists.",
+      "description": "Release a GPU lease now, so the cards go back to the general pool.\n\nThe id is the ``lease.id`` that ``reserve_gpus`` returned; ``server_status``\nlists every standing lease with its id if you lost it. Releasing\nunloads the models the lease names (``unloaded``) -- the lease was\ntheir placement, so the cards come back clean. ``unload=false`` keeps\nthem loaded instead: they stop being the only models allowed there and\ngo back to the ordinary idle TTL and eviction rules. A model serving a\nrequest, a pinned one, or one another lease names is never unloaded\nhere (``kept`` says why). Leases also end by themselves once idle for\ntheir ``idle_ttl_s`` (with the same unload), so this is the early exit,\nnot the only one. If your lease shows ``state: \"vacating\"`` a better\nclass has asked for the cards (D56): finish or stop the work on them\nand release here -- that is the only way a vacate completes; nothing\ntakes the lease from you.\n\nA key with the ``inference`` scope may release only a lease that key\ntook (``permission_denied`` otherwise); an ``admin`` key any.\n\nArgs:\n    lease_id: The lease to release.\n    unload: Unload the lease's models with it (default ``true``).\n\nReturns:\n    ``{\"ok\": true, \"released\": {...the lease as it stood...},\n    \"unloaded\": [...], \"kept\": [{model_id, reason, detail}]}``, or an\n    error result naming the id when no such lease exists.",
       "input_schema": {
         "properties": {
           "lease_id": {
             "title": "Lease Id",
             "type": "string"
+          },
+          "unload": {
+            "default": true,
+            "title": "Unload",
+            "type": "boolean"
           }
         },
         "required": [
@@ -937,6 +966,35 @@
       "output_schema": {
         "additionalProperties": true,
         "title": "release_gpusDictOutput",
+        "type": "object"
+      },
+      "server": "gateway"
+    },
+    {
+      "annotations": {
+        "destructive_hint": false,
+        "idempotent_hint": true,
+        "open_world_hint": false,
+        "read_only_hint": false
+      },
+      "description": "Keep a GPU lease alive: restart its idle clock now (the Kubernetes \"renew\").\n\nA lease ends by itself once nothing has used it for its ``idle_ttl_s``\n(``lease_duration_seconds``). A model the lease names keeps it alive\njust by serving requests; call this when the work holding the cards\nruns OUTSIDE this server (a render, a benchmark controller between\njobs), on an interval comfortably shorter than the TTL. The server\nstamps its own clock into ``renew_time``. Same ownership rule as\n``release_gpus``: an ``inference`` key renews only its own lease.\n\nArgs:\n    lease_id: The ``lease.id`` from ``reserve_gpus``.\n\nReturns:\n    ``{\"ok\": true, \"lease\": {...renew_time, expires_at, state...}}``.",
+      "input_schema": {
+        "properties": {
+          "lease_id": {
+            "title": "Lease Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "lease_id"
+        ],
+        "title": "renew_leaseArguments",
+        "type": "object"
+      },
+      "name": "renew_lease",
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "renew_leaseDictOutput",
         "type": "object"
       },
       "server": "gateway"
@@ -982,15 +1040,53 @@
         "open_world_hint": false,
         "read_only_hint": false
       },
-      "description": "Reserve specific GPUs for one model, or for something outside this server.\n\nThe two calls you will make::\n\n    reserve_gpus(devices=[0], model_id=\"vendor/Some-Model-GGUF/Some-Model-Q4_K_M\")\n    reserve_gpus(devices=[3], reason=\"ComfyUI render\")   # no model: held for an outsider\n\nWhile the lease stands nothing else is planned onto those cards. A\nnamed model is loaded onto exactly them (pin it too if it must also\nsurvive restarts), sized for as many parallel slots as its context\nallows, and in the split mode its own benchmark measured fastest on\nthose cards -- tensor split is never assumed, because whether it wins\ndepends on the model (slower for small and MoE models, about 1.5x\nfaster decode but slower prefill for large dense ones); run a\nbenchmark if you want it considered. Idle residents on the cards are\nunloaded to make room; a model mid-request refuses the call (retry\nwhen idle); a pinned idle\nresident refuses unless ``force=true``.\n\n**A card already leased is a conflict, never a takeover** -- but a\nstrictly better ``priority`` may ASK the holder to leave (D56). If\nevery lease in the way is a worse class that registered a vacate\nendpoint, the server sends it one vacate request and answers\n``lease_vacating`` with ``retry_after_s``: re-call this tool on that\ninterval; it succeeds once the holder releases, and degrades to a\nplain ``lease_conflict`` if the holder has not released within\n``leases.vacate_timeout_s`` (default 180 s). Send ``priority=2`` for\ndispatched work that should be able to ask a background render tenant\nto vacate; ``force`` never overrides a standing lease.\n\nArgs:\n    devices: CUDA indices, e.g. ``[0]`` or ``[0, 1]`` -- exactly the\n        cards the model should run on. ``server_status`` lists them.\n    model_id: The ``id`` from ``list_models``. Omit to hold the cards\n        for something outside this server.\n    reason: Free text shown beside the lease (what it is for).\n    idle_ttl_s: Seconds of idleness after which the server releases\n        the lease by itself (default 3600). ``null`` = until released.\n    force: Evict a *pinned* idle resident from the cards.\n    holder: Who is holding them -- say who you are, the same name you\n        send as ``X-SF-Client``. Defaults to ``\"mcp\"``, which other\n        tenants read as \"an agent\" and cannot tell apart from the\n        next agent.\n    priority: The D46 class of the CLAIM: 1 active chat, 2 dispatched\n        agent, 3 background (the default; asks nobody to leave).\n    vacate_url: Where a better class may ask *you* to leave: the\n        server POSTs ``{lease_id, devices, requester,\n        requester_priority, deadline_s, deadline_at}`` there. http(s)\n        only; never this server's own address.\n    vacate_token: Sent back in ``X-SF-Vacate-Token`` on that POST so\n        your endpoint can trust it. Never shown anywhere.\n\nReturns:\n    ``{\"ok\": true, \"lease\": {id, devices, holder, model_ids, reason,\n    created_at, last_activity_at, idle_ttl_s, idle_s, expires_at,\n    priority, state, vacate_registered, vacate_deadline}}``.\n    Keep ``lease.id`` -- ``release_gpus`` needs it.",
+      "description": "Reserve GPUs for one or more models, or for something outside this server.\n\nThe calls you will make::\n\n    reserve_gpus(devices=[0], model_id=\"vendor/Some-Model-GGUF/Some-Model-Q4_K_M\")\n    reserve_gpus(devices=\"auto\", count=2, model_id=\"<id>\")  # two alike cards, server picks\n    reserve_gpus(devices=[3], reason=\"ComfyUI render\")   # no model: held for an outsider\n\n**A lease reserves; it does not load.** While it stands nothing else is\nplanned onto those cards, and no other model's load may evict the\nmodels it names. Their next load -- ``load_recommended`` (which then\nuses the leased cards alone), ``load_model``, either with\n``lease_id=<lease.id>``, or simply the first chat request -- lands on\nexactly these cards (pin it too if it must also survive restarts),\nsized for as many parallel slots as its context allows, and in the\nsplit mode its own benchmark measured fastest on those cards -- tensor\nsplit is never assumed, because whether it wins depends on the model\n(slower for small and MoE models, about 1.5x faster decode but slower\nprefill for large dense ones); run a benchmark if you want it\nconsidered. Idle residents on the cards are unloaded to make room\n(listed in ``evicted``); a resident copy of a named model\n(``<id>@<tag>``) is kept and joins the lease (``adopted``); a model\nmid-request refuses the call (retry when idle); a pinned idle resident\nrefuses unless ``force=true``.\n\n**A card already leased is a conflict, never a takeover** -- but a\nstrictly better ``priority`` may ASK the holder to leave (D56). If\nevery lease in the way is a worse class that registered a vacate\nendpoint, the server sends it one vacate request and answers\n``lease_vacating`` with ``retry_after_s``: re-call this tool on that\ninterval; it succeeds once the holder releases, and degrades to a\nplain ``lease_conflict`` if the holder has not released within\n``leases.vacate_timeout_s`` (default 180 s). Send ``priority=2`` for\ndispatched work that should be able to ask a background render tenant\nto vacate; ``force`` never overrides a standing lease.\n\nArgs:\n    devices: CUDA indices, e.g. ``[0]`` or ``[0, 1]`` -- exactly the\n        cards the model should run on (``server_status`` lists them);\n        or ``\"auto\"`` (or omitted) to let the server choose, the way\n        this grant judges a card: never a busy, leased, excluded or\n        (without ``force``) pinned/better-tier one, and inside the\n        named models' saved placement.\n    model_id: The ``id`` from ``list_models``. Omit to hold the cards\n        for something outside this server.\n    reason: Free text shown beside the lease (what it is for).\n    idle_ttl_s: Seconds of idleness after which the server releases\n        the lease by itself -- and unloads the models it names\n        (default 3600). ``null`` = until released.\n    force: Evict a *pinned* idle resident from the cards.\n    holder: Who is holding them -- say who you are, the same name you\n        send as ``X-SF-Client``. Defaults to ``\"mcp\"``, which other\n        tenants read as \"an agent\" and cannot tell apart from the\n        next agent.\n    priority: The D46 class of the CLAIM: 1 active chat, 2 dispatched\n        agent, 3 background (the default; asks nobody to leave).\n    vacate_url: Where a better class may ask *you* to leave: the\n        server POSTs ``{lease_id, devices, requester,\n        requester_priority, deadline_s, deadline_at}`` there. http(s)\n        only; never this server's own address.\n    vacate_token: Sent back in ``X-SF-Vacate-Token`` on that POST so\n        your endpoint can trust it. Never shown anywhere.\n    model_ids: Several models for one lease (``model_id`` is the\n        one-model shorthand; both may be given).\n    min_free_gib: With ``devices=\"auto\"``: only a card that would have\n        this much free VRAM once its idle residents were gone.\n    prefer: With ``devices=\"auto\"``: CUDA indices to rank first.\n    avoid: With ``devices=\"auto\"``: CUDA indices never to choose.\n    count: With ``devices=\"auto\"``: how many cards, all of one class\n        (``gpus[].class_key``); default 1.\n\nReturns:\n    ``{\"ok\": true, \"lease\": {id, devices, holder, model_ids, reason,\n    created_at, last_activity_at, idle_ttl_s, idle_s, expires_at,\n    priority, state, vacate_registered, vacate_deadline,\n    holder_identity, lease_duration_seconds, acquire_time, renew_time,\n    allocation}, \"evicted\": [{model_id, reason, devices, priority}],\n    \"adopted\": [...], \"placement\": {...} (auto only)}``.\n    Keep ``lease.id`` -- ``release_gpus`` and ``renew_lease`` need it.",
       "input_schema": {
         "properties": {
+          "avoid": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Avoid"
+          },
+          "count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Count"
+          },
           "devices": {
-            "items": {
-              "type": "integer"
-            },
-            "title": "Devices",
-            "type": "array"
+            "anyOf": [
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Devices"
           },
           "force": {
             "default": false,
@@ -1021,6 +1117,18 @@
             "default": 3600.0,
             "title": "Idle Ttl S"
           },
+          "min_free_gib": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Min Free Gib"
+          },
           "model_id": {
             "anyOf": [
               {
@@ -1032,6 +1140,36 @@
             ],
             "default": null,
             "title": "Model Id"
+          },
+          "model_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Model Ids"
+          },
+          "prefer": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Prefer"
           },
           "priority": {
             "anyOf": [
@@ -1075,9 +1213,6 @@
             "title": "Vacate Url"
           }
         },
-        "required": [
-          "devices"
-        ],
         "title": "reserve_gpusArguments",
         "type": "object"
       },
@@ -1308,6 +1443,35 @@
       "output_schema": {
         "additionalProperties": true,
         "title": "test_modelDictOutput",
+        "type": "object"
+      },
+      "server": "gateway"
+    },
+    {
+      "annotations": {
+        "destructive_hint": false,
+        "idempotent_hint": true,
+        "open_world_hint": false,
+        "read_only_hint": false
+      },
+      "description": "Keep a GPU lease alive -- the same call as ``renew_lease`` under the REST verb's name.\n\n``POST /api/leases/{id}/touch`` has always done this over REST; this is\nits MCP twin. ``renew_lease`` is the canonical name.\n\nArgs:\n    lease_id: The ``lease.id`` from ``reserve_gpus``.\n\nReturns:\n    ``{\"ok\": true, \"lease\": {...}}``.",
+      "input_schema": {
+        "properties": {
+          "lease_id": {
+            "title": "Lease Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "lease_id"
+        ],
+        "title": "touch_leaseArguments",
+        "type": "object"
+      },
+      "name": "touch_lease",
+      "output_schema": {
+        "additionalProperties": true,
+        "title": "touch_leaseDictOutput",
         "type": "object"
       },
       "server": "gateway"

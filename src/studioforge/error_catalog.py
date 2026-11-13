@@ -452,6 +452,36 @@ _ENTRIES: tuple[ErrorEntry, ...] = (
         "Those devices are held by an existing GPU lease or a pinned model.",
         "Release the lease (DELETE /api/leases/{id}) or choose other devices.",
     ),
+    # D87: the specific 409 a lease grant refused with. These ride in
+    # error.studioforge.code; error.code stays lease_conflict (every existing
+    # client branches on it) and the message keeps its words.
+    _e(
+        "lease_outranked",
+        409,
+        _INVALID,
+        "CUDA {devices} is already leased by a holder of an equal or better class; this claim "
+        "cannot ask it to leave.",
+        "Wait for the lease to end (Retry-After, GET /api/leases shows its expires_at), choose "
+        "other devices, or take the lease at a better priority if this work really outranks it "
+        "-- a holder that registered a vacate_url is then asked to leave (409 lease_vacating).",
+    ),
+    _e(
+        "resident_outranks",
+        409,
+        _INVALID,
+        "A higher-priority model is resident on CUDA {devices}; a lease grant at this priority "
+        "does not outrank a better tier.",
+        "Lease other devices, take the lease at that tier's priority, or pass force=true to "
+        "evict the resident anyway (it is idle; a model mid-request is never evicted).",
+    ),
+    _e(
+        "resident_pinned",
+        409,
+        _INVALID,
+        "A pinned model is resident on CUDA {devices}.",
+        "Pass force=true to evict it (the pin reconciler brings it back on other cards, or on "
+        "these once the lease ends), or lease other devices.",
+    ),
     _e(
         "lease_not_found",
         404,
