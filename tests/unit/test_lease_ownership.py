@@ -681,7 +681,7 @@ def test_the_holder_classification_contract_is_unchanged() -> None:
 
 
 def test_the_lease_routes_speak_both_shapes(app: Any) -> None:
-    """CrucibleForge / an image gateway / SpeechForge / makobench-operator / DisPatch shapes, pinned."""
+    """CrucibleForge / image-gen / SpeechForge / makobench-operator / DisPatch shapes, pinned."""
     with TestClient(app, client=LOOPBACK) as http:
         created = http.post(
             "/api/leases",
