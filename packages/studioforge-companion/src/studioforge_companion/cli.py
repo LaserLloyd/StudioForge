@@ -568,6 +568,32 @@ def status(json_out: bool = JSON_OPTION) -> None:
                 fmt_duration(expires - time.time()) if isinstance(expires, (int, float)) else "-",
             )
         console.print(lease_table)
+        # D91: the instances the leases created -- which copy runs where, whose.
+        instance_rows = [row for lease in standing for row in lease.get("instances") or []]
+        if instance_rows:
+            instance_table = _table(
+                "Instance",
+                "Copy of",
+                "Holder",
+                "Lease",
+                "GPUs",
+                "Ctx/slot",
+                "Slots",
+                "State",
+                title="Lease instances",
+            )
+            for row in instance_rows:
+                instance_table.add_row(
+                    str(row.get("id")),
+                    str(row.get("base_model_id") or "-"),
+                    str(row.get("holder") or "?"),
+                    str(row.get("lease_id") or "-"),
+                    ",".join(str(d) for d in row.get("devices") or []),
+                    str(row.get("ctx_per_slot") or "-"),
+                    str(row.get("parallel") or "-"),
+                    str(row.get("state") or "-"),
+                )
+            console.print(instance_table)
 
     # The tenant registry (D77) rides on the same payload: who else is on these
     # cards and whether each is up. Older servers send no key; nothing printed.
@@ -2109,7 +2135,16 @@ def leases_list(json_out: bool = JSON_OPTION) -> None:
         STATE.console.print("no GPU leases standing")
         return
     table = _table(
-        "Lease", "GPUs", "Holder", "Prio", "State", "For", "Reason", "Idle", "Expires in"
+        "Lease",
+        "GPUs",
+        "Holder",
+        "Prio",
+        "State",
+        "For",
+        "Instances",
+        "Reason",
+        "Idle",
+        "Expires in",
     )
     for lease in standing:
         model_ids = lease.get("model_ids") or []
@@ -2122,11 +2157,40 @@ def leases_list(json_out: bool = JSON_OPTION) -> None:
             str(lease.get("priority") or "-"),
             str(lease.get("state") or "-"),
             ", ".join(model_ids) if model_ids else "nothing may load",
+            # D91: the lease's own copies, with their cards and state.
+            instances_cell(lease.get("instances")),
             str(lease.get("reason") or ""),
             fmt_duration(lease.get("idle_s")),
             fmt_duration(expires - time.time()) if isinstance(expires, (int, float)) else "never",
         )
     STATE.console.print(table)
+
+
+def instances_cell(rows: Any) -> str:
+    """``pub/x:2 [0,1] loaded; pub/x@b [2,3] unloaded`` -- a lease's instances (D91)."""
+    if not rows:
+        return "-"
+    parts = []
+    for row in rows:
+        cards = ",".join(str(d) for d in row.get("devices") or [])
+        parts.append(f"{row.get('id')} [{cards}] {row.get('state') or '?'}")
+    return "; ".join(parts)
+
+
+def parse_instance_option(value: str) -> dict[str, Any]:
+    """One ``--instance``: a model id, or a JSON object ``{"model": ..., "launch": {...}}``."""
+    text = value.strip()
+    if text.startswith("{"):
+        try:
+            parsed = json.loads(text)
+        except ValueError as exc:
+            raise ValueError(f"--instance {value!r} is not valid JSON: {exc}") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError(f"--instance {value!r} must be a JSON object")
+        return parsed
+    if not text:
+        raise ValueError("--instance needs a model id")
+    return {"model": text}
 
 
 @leases_app.command("add")
@@ -2143,9 +2207,22 @@ def leases_add(
     force: bool = typer.Option(
         False, "--force", help="Take the cards even if a resident must be evicted."
     ),
+    instance: list[str] | None = typer.Option(
+        None,
+        "--instance",
+        help=(
+            "A copy of a model on these cards (repeatable): a model id, or JSON like "
+            '\'{"model": "<id>", "tag": "b", "launch": {"ctx_size": 32768, "parallel": 4}}\'. '
+            "Each becomes <id>:<n> (or <id>@<tag>), is loaded now, and ends with the lease."
+        ),
+    ),
     json_out: bool = JSON_OPTION,
 ) -> None:
     """Claim GPUs so nothing else is planned onto them.
+
+    ``--instance`` (D91) asks for copies of a model on the claimed cards -- two
+    holders of one model each get their own instead of fighting over one. The
+    reply lists each copy's id: send THAT as ``model`` in chat requests.
 
     With no ``--models`` the cards are held for something OUTSIDE this server
     (an image-generation run, a training job) and nothing at all may load on
@@ -2164,6 +2241,11 @@ def leases_add(
         STATE.err.print("error: --devices needs at least one CUDA index")
         raise typer.Exit(EXIT_USAGE)
     model_ids = [m.strip() for m in models.split(",") if m.strip()] if models else None
+    try:
+        instances = [parse_instance_option(value) for value in instance or []]
+    except ValueError as exc:
+        STATE.err.print(f"error: {exc}")
+        raise typer.Exit(EXIT_USAGE) from None
 
     async def work(client: StudioForgeClient) -> Any:
         return await client.create_lease(
@@ -2174,6 +2256,7 @@ def leases_add(
             # `--ttl 0` is the wire form of "no expiry"; the API wants null.
             idle_ttl_s=ttl or None,
             force=force,
+            instances=instances or None,
         )
 
     payload = with_client(work)
@@ -2185,6 +2268,12 @@ def leases_add(
         f"{','.join(str(d) for d in payload.get('devices') or [])} for "
         f"{payload.get('holder')}"
     )
+    for row in payload.get("instances") or []:
+        STATE.console.print(
+            f"  instance {row.get('id')} on GPU "
+            f"{','.join(str(d) for d in row.get('devices') or [])}: {row.get('state')}"
+            f" (send model={row.get('model')!r})"
+        )
     STATE.console.print(f"release it with: sfctl leases release {payload.get('id')}")
 
 

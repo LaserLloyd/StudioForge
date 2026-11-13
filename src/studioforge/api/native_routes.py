@@ -563,7 +563,9 @@ async def router_list_models(
         require_admin_action(request, state.config, "rescanning the model library")
         await asyncio.to_thread(state.registry.scan, force=False)
     arch_memo: dict[Any, Any] = {}
-    data = [_router_entry(state, record, arch_memo) for record in state.registry.all()]
+    # D91: a lease's instances are models a client may name, so they are listed too.
+    records = state.registry.all(include_ephemeral=True)
+    data = [_router_entry(state, record, arch_memo) for record in records]
     return JSONResponse({"object": "list", "data": data})
 
 

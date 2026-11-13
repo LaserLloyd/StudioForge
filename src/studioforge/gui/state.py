@@ -1216,7 +1216,17 @@ def lease_line(lease: Any) -> str:
             f"(idle {_span_text(lease.idle_s)})"
         )
     reason = f" · {lease.reason}" if lease.reason else ""
-    return f"CUDA {list(lease.devices)} → {who} · by {lease.holder}{reason} · {clock} · {lease.id}"
+    # D91: the lease's own copies of a model, each on its cards.
+    copies = list(getattr(lease, "instances", None) or [])
+    instances = (
+        " · instances: " + ", ".join(f"{spec.id} {list(spec.devices)}" for spec in copies)
+        if copies
+        else ""
+    )
+    return (
+        f"CUDA {list(lease.devices)} → {who} · by {lease.holder}{reason}{instances} · {clock} · "
+        f"{lease.id}"
+    )
 
 
 def unload_all_prompt(model_ids: Sequence[str]) -> str:

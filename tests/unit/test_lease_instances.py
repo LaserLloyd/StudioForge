@@ -727,3 +727,14 @@ def test_the_capability_features_name_d91() -> None:
     assert SERVER_FEATURES["multi_instance_default"] == "D91"
     report = implemented_report()
     assert "lease_instances" in report["features"] and report["latest_decision"] == "D91"
+
+
+def test_the_panel_lease_line_names_the_instances() -> None:
+    from studioforge.gui import state as st
+    from studioforge.types import LeaseInstance
+
+    lease = GpuLease(id="l1", devices=[0, 1], holder=A, created_at=1.0, last_activity_at=1.0)
+    lease.instances = [LeaseInstance(id=f"{MODEL}:2", base_model_id=MODEL, devices=[0, 1])]
+    lease.model_ids = [f"{MODEL}:2"]
+    line = st.lease_line(lease)
+    assert f"instances: {MODEL}:2 [0, 1]" in line and "by " + A in line

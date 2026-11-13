@@ -1600,6 +1600,86 @@ def test_status_renders_a_standing_lease(monkeypatch: Any, live_server: ServerHa
     assert "nothing may load" in output
 
 
+def test_status_and_leases_list_show_lease_instances(
+    monkeypatch: Any, live_server: ServerHandle
+) -> None:
+    """D91: which copy of a model runs on which cards, and whose, from `sfctl status`."""
+    copy = {
+        "id": "pub/x:2",
+        "model": "pub/x:2",
+        "base_model_id": "pub/x",
+        "lease_id": "lease-b",
+        "holder": "bench-b",
+        "devices": [0, 1],
+        "ctx_per_slot": 16384,
+        "parallel": 4,
+        "state": "loaded",
+    }
+    lease = {
+        "id": "lease-b",
+        "devices": [0, 1],
+        "holder": "bench-b",
+        "model_ids": ["pub/x:2"],
+        "instances": [copy],
+        "idle_s": 3,
+        "expires_at": time.time() + 600,
+    }
+    real_status = cli_module.StudioForgeClient.status
+
+    async def status_with_instances(self: Any) -> Any:
+        payload = await real_status(self)
+        payload["leases"] = [lease]
+        return payload
+
+    async def leases_with_instances(self: Any) -> Any:
+        return {"leases": [lease], "count": 1}
+
+    monkeypatch.setattr(cli_module.StudioForgeClient, "status", status_with_instances)
+    monkeypatch.setattr(cli_module.StudioForgeClient, "leases", leases_with_instances)
+    output = _all_output(_invoke(live_server, "status"))
+    assert "Lease instances" in output and "pub/x:2" in output and "bench-b" in output
+    assert "16384" in output
+    listed = _all_output(_invoke(live_server, "leases", "list"))
+    assert "pub/x:2 [0,1] loaded" in listed
+
+
+def test_leases_add_sends_instances(monkeypatch: Any, live_server: ServerHandle) -> None:
+    """`sfctl leases add --instance` (D91): a plain id or a JSON object per copy."""
+    seen: dict[str, Any] = {}
+
+    async def create_lease(self: Any, **kwargs: Any) -> Any:
+        seen.update(kwargs)
+        return {
+            "id": "lease-1",
+            "devices": kwargs["devices"],
+            "holder": kwargs["holder"],
+            "instances": [
+                {"id": "pub/x:2", "model": "pub/x:2", "devices": [2, 3], "state": "loaded"}
+            ],
+        }
+
+    monkeypatch.setattr(cli_module.StudioForgeClient, "create_lease", create_lease)
+    result = _invoke(
+        live_server,
+        "leases",
+        "add",
+        "--devices",
+        "2,3",
+        "--instance",
+        "pub/x",
+        "--instance",
+        '{"model": "pub/x", "tag": "b", "launch": {"ctx_size": 8192}}',
+    )
+    assert result.exit_code == 0, _all_output(result)
+    assert seen["instances"] == [
+        {"model": "pub/x"},
+        {"model": "pub/x", "tag": "b", "launch": {"ctx_size": 8192}},
+    ]
+    assert "instance pub/x:2 on GPU 2,3: loaded" in _all_output(result)
+    bad = _invoke(live_server, "leases", "add", "--devices", "0", "--instance", "{nope")
+    assert bad.exit_code != 0
+
+
 def test_the_lease_plane_is_reachable_from_the_cli(live_server: ServerHandle) -> None:
     """`/api/leases` has been live with no CLI in front of it: create, list,
     touch and release all had to go through `sfctl mcp`."""

@@ -543,18 +543,21 @@ class StudioForgeClient:
         reason: str = "",
         idle_ttl_s: float | None = 3600.0,
         force: bool = False,
+        instances: list[dict[str, Any]] | None = None,
     ) -> Any:
-        return await self.post(
-            "leases",
-            {
-                "devices": devices,
-                "model_ids": model_ids,
-                "holder": holder,
-                "reason": reason,
-                "idle_ttl_s": idle_ttl_s,
-                "force": force,
-            },
-        )
+        body: dict[str, Any] = {
+            "devices": devices,
+            "model_ids": model_ids,
+            "holder": holder,
+            "reason": reason,
+            "idle_ttl_s": idle_ttl_s,
+            "force": force,
+        }
+        if instances:
+            # D91: copies of models on the leased cards; sent only when asked for,
+            # so an older server never sees a field it would ignore.
+            body["instances"] = instances
+        return await self.post("leases", body)
 
     async def release_lease(self, lease_id: str) -> Any:
         return await self.delete(f"leases/{_path_segment(lease_id)}")
