@@ -12,10 +12,13 @@ instance, loaded on demand.
 ## The ideas in one screen
 
 * **Ids follow LM Studio's instance identifiers.** The base model is its plain id `X`. A copy is
-  `X:2`, `X:3`, ... -- `n` is the smallest free integer from 2, and a gap is reused (`X:2` released
-  while `X:3` stands: the next copy is `X:2` again). Ask for a name instead with a `tag`: `X@<tag>`
-  (the virtual-copy convention). An id that is already a model, an alias, a persistent copy (such as a
-  judge's `X@b`) or a standing instance is refused with `409 instance_id_conflict`.
+  `X:2`, `X:3`, ... Numbers are **never reused while the server runs**: with `X:2` released, the
+  next copy is `X:4` (or higher), so a late request for `X:2` is always `404 instance_not_found` and
+  never lands on someone else's copy. The counter stays above every id restored at start. Ask for a
+  name instead with a `tag`: `X@<tag>` (the virtual-copy convention) -- a tag *is* reusable once its
+  lease ended, when a new lease asks for it explicitly (reproducible names across runs). An id that
+  is already a model, an alias, a persistent copy (such as a judge's `X@b`) or another lease's
+  instance is refused with `409 instance_id_conflict`; two grants racing never share an id.
 * **The id goes in `model`.** Every OpenAI-shape route (`/v1/chat/completions`, `/v1/completions`,
   `/v1/embeddings`, `/v1/rerank`, `/v1/tokenize`, `/v1/messages`, `/v1/responses`) and every native
   route (`/completion`, `/tokenize`, `/props?model=`, ...) accepts it. `X-SF-Model` on the response
@@ -30,7 +33,12 @@ instance, loaded on demand.
 * **Holder identity, not key equality.** Several clients often share one API key. Who you are, for
   "which instance do I mean", is: the lease you name (`X-SF-Lease: <lease id>`, or a body
   `lease_id`), else your `X-SF-Client` label matched exactly to a lease's holder, else the key that
-  took the lease.
+  took the lease -- but the key counts only when you send no label, the holder's own, or exactly its
+  family root (`crucibleforge` for `crucibleforge-judge`). Send any other label and you are someone
+  else, whatever key you share: you cannot bind a load to that lease, release or renew it, or name
+  it in `X-SF-Lease` (`403 permission_denied`). **Send `X-SF-Client` from every run** -- a request is
+  yours only when it carried your label; the peer address (the same `127.0.0.1` for every tenant on
+  one box) never makes another client's stream yours.
 
 ## 1. Ask for copies: `POST /api/leases` with `instances`
 
@@ -178,13 +186,18 @@ X-SF-Client: bench-run-7
 
   With two copies of its own, a base-id unload is `409 instance_ambiguous`: name the exact id.
 * **Another holder's instance** is touched only on its exact id, by an admin, with `{"force": true}`
-  in the body (or `?force=true`): `409 instance_held` otherwise.
+  in the body (or `?force=true`): `409 instance_held` otherwise. Loading it with a shape (or
+  `force`, or through load-recommended) is admin-only the same way, and an admin's reshape never
+  rewrites the shape the holder's restart restores -- only the holder's own loads do.
 * **Never another client's streams without saying so.** An unload of a model a lease holds that is
   serving requests from other clients is `409 instance_in_use`, naming them in
   `error.studioforge.in_flight_clients`, unless the call says `force: true`. A lease waiver (you proved
   you hold the lease) is not a `force`.
 * `POST /models/unload {"model", "force"?}` and `POST /api/v1/models/unload {"instance_id", "force"?}`
-  follow the same rules.
+  follow the same rules; LM Studio's unload of a base id finds your own loaded copy even when the
+  base itself is not loaded.
+* MCP `load_model` / `load_recommended` carry your key, `lease_id` and admin-ness (no label): a
+  non-admin key reloading or reshaping another holder's copy is `instance_held`.
 
 ## 5. Release, expiry, restart
 
@@ -202,8 +215,10 @@ DELETE /api/leases/ab12cd34ef56
   stream, an SSE error frame `data: {"error": {"code": "instance_released", ...}}` followed by
   `data: [DONE]`.
 * A **later** request naming the id gets `404 instance_not_found` (with `lease_id`, `reason` and
-  `released_at` in `error.studioforge`) -- never a reload on the default context ladder. Any
-  `X:<n>` nobody created is the same 404.
+  `released_at` in `error.studioforge`) -- never a reload on the default context ladder, and never a
+  new holder's copy (numbers are not reused while the server runs). Any `X:<n>` nobody created is
+  the same 404. A load that was waiting when the lease ended stops what it started and answers
+  `410 instance_released`.
 * **Restart.** Copies are stored with their lease (`gpu_leases.instances_json`, D61's mirror). After
   a restart the lease comes back, each copy is rebuilt **unloaded**, and its first request loads it
   with exactly the shape it last ran with -- the same cards, context per slot, slots and KV types.
@@ -216,7 +231,8 @@ DELETE /api/leases/ab12cd34ef56
 | 400 | `invalid_request_error` (param named) | `POST /api/leases` | a bad entry: unknown field, `gpus` off the lease, `count` out of range, a bad `tag`, `min_slots` without a window | fix the field named in `param` |
 | 404 | `instance_not_found` | every route taking `model` | the instance ended with its lease, or never existed | take a new lease |
 | 409 | `instance_id_conflict` | `POST /api/leases` | the `tag`'s id is taken | another tag, or none |
-| 409 | `instance_held` | load, unload, grant | the instance belongs to another holder | lease your own copy; admin + `force` on the exact id |
+| 403 | `permission_denied` | bind a load, release, renew, `X-SF-Lease` | your `X-SF-Client` says you are not that lease's holder (a shared key does not change that) | act on your own lease |
+| 409 | `instance_held` | load, unload, grant | the instance belongs to another holder (a shaped or forced load of it included) | lease your own copy; admin + `force` on the exact id |
 | 409 | `instance_in_use` | unload | it serves other clients' requests | wait (`Retry-After`), unload your own copy, or `force: true` |
 | 409 | `instance_ambiguous` | unload | the base id names several of your copies | name the exact id |
 | 410 | `instance_released` | an in-flight request | its lease ended under it | take a new lease |

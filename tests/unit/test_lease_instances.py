@@ -97,7 +97,8 @@ def test_the_id_grammar() -> None:
     assert next_free_number("pub/x", set().__contains__) == 2
 
 
-async def test_numbered_ids_start_at_two_and_reuse_gaps() -> None:
+async def test_numbered_ids_start_at_two_and_are_never_reused_while_running() -> None:
+    """A released ``X:2`` stays a 404 for a late request: its number is not handed out again."""
     manager, _ = manager_with()
     first = await manager.grant_lease(
         [0], holder="a", instances=[{"model": MODEL, "count": 2, "load": False}]
@@ -107,8 +108,19 @@ async def test_numbered_ids_start_at_two_and_reuse_gaps() -> None:
     assert [row["id"] for row in second.instances] == [f"{MODEL}:4"]
     await manager.release_and_unload(first.lease.id)
     third = await manager.grant_lease([2], holder="c", instances=[{"model": MODEL, "load": False}])
-    assert [row["id"] for row in third.instances] == [f"{MODEL}:2"], "the gap is reused"
-    assert manager.registry.get(f"{MODEL}:2").lease_id == third.lease.id
+    assert [row["id"] for row in third.instances] == [f"{MODEL}:5"], "numbers are monotonic"
+    late = manager.instance_gone_error(f"{MODEL}:2")
+    assert late is not None and late.code == "instance_not_found"
+    assert late.details["lease_id"] == first.lease.id, "the late request reaches no new holder"
+    # A tag, asked for explicitly, may be reused once its lease ended.
+    tagged = await manager.grant_lease(
+        [3], holder="d", instances=[{"model": MODEL, "tag": "run", "load": False}]
+    )
+    await manager.release_and_unload(tagged.lease.id)
+    again = await manager.grant_lease(
+        [3], holder="d", instances=[{"model": MODEL, "tag": "run", "load": False}]
+    )
+    assert [row["id"] for row in again.instances] == [f"{MODEL}@run"]
 
 
 async def test_a_tag_names_the_instance_and_a_taken_id_is_refused() -> None:
@@ -764,3 +776,251 @@ async def test_an_instance_has_no_settings_of_its_own(state: Any) -> None:
         await state.manager.load_recommended(copy, 4096, persist=True)
     assert persisted.value.param == "persist"
     assert state.registry.get(copy) is not None, "a refused persist drops nothing"
+
+
+# ---------------------------------------------------------------------------
+# Review fixes (2026-11-14): one regression test per finding
+# ---------------------------------------------------------------------------
+
+
+def test_review1_a_same_family_label_never_borrows_the_key() -> None:
+    """B with NO lease of its own and A's key: its label still says it is not A."""
+    from studioforge.core.instances import label_vouches, other_clients
+
+    a = GpuLease(id="la", devices=[2, 3], holder=A, created_at=1, last_activity_at=1)
+    a.holder_key = KEY
+    as_b = Caller(client=B, key=KEY)
+    assert names_other_holder(as_b, a, [a]), "same family, different holder: someone else"
+    assert not claims(as_b, a, [a]), "the shared key is not identity"
+    # Exactly the family root still vouches (crucibleforge for crucibleforge-judge).
+    judge = GpuLease(
+        id="lj", devices=[0], holder="crucibleforge-judge", created_at=1, last_activity_at=1
+    )
+    judge.holder_key = KEY
+    assert label_vouches("crucibleforge", judge)
+    assert claims(Caller(client="crucibleforge", key=KEY), judge, [judge])
+    assert not label_vouches("crucibleforge-judge-b", judge)
+    # A peer address never makes an unlabeled request the caller's own.
+    instance = InstanceInfo(model_id=MODEL, state="ready")
+    streams(instance, "127.0.0.1")
+    assert other_clients(instance, Caller(key=KEY, peer="127.0.0.1")) == ["127.0.0.1"]
+    assert other_clients(instance, Caller(client=B, peer="127.0.0.1")) == ["127.0.0.1"]
+    streams(instance, B)
+    assert other_clients(instance, Caller(client=B, peer="127.0.0.1")) == []
+
+
+async def test_review1_b_without_a_lease_cannot_cut_as_unlabeled_streams() -> None:
+    """The key-only caller that resolves to A's model meets 409 instance_in_use."""
+    manager, supervisor = manager_with()
+    lease = await manager.grant_lease([2, 3], holder=A, model_ids=[MODEL], holder_key=KEY)
+    resident = await manager.load(MODEL, lease_id=lease.lease.id)
+    streams(resident, "127.0.0.1")  # the holder's requests, unlabeled: the peer is all they carry
+    key_only = Caller(key=KEY, peer="127.0.0.1")
+    with pytest.raises(StudioForgeError) as busy:
+        await manager.unload(MODEL, caller=key_only, lease_ok=True)
+    assert busy.value.code == "instance_in_use"
+    assert supervisor.get(MODEL) is resident and resident.active_requests == 3
+
+
+async def test_review2_concurrent_grants_never_share_an_instance_id() -> None:
+    """Two grants planned before either made its copy (an eviction awaits between)."""
+    import asyncio
+
+    manager, supervisor = manager_with()
+    other = manager.registry.get(MODEL).model_copy(update={"id": "pub/other", "name": "pub/other"})
+    manager.registry._records[other.id] = other  # noqa: SLF001
+    await manager.load(other.id, devices=[0, 1])
+    await manager.load(MODEL, devices=[2, 3])
+
+    async def slow_settle() -> None:
+        await asyncio.sleep(0.05)
+
+    manager._settle_vram = slow_settle  # type: ignore[method-assign]  # noqa: SLF001
+    first, second = await asyncio.gather(
+        manager.grant_lease([0, 1], holder="a", instances=[{"model": MODEL, "load": False}]),
+        manager.grant_lease([2, 3], holder="b", instances=[{"model": MODEL, "load": False}]),
+    )
+    ids = {first.instances[0]["id"], second.instances[0]["id"]}
+    assert ids == {f"{MODEL}:2", f"{MODEL}:3"}, "each grant has its own id"
+    for grant in (first, second):
+        copy = grant.instances[0]["id"]
+        assert manager.registry.get(copy).lease_id == grant.lease.id
+        assert [spec.id for spec in grant.lease.instances] == [copy]
+    assert supervisor.get(other.id) is None and supervisor.get(MODEL) is None, "both evicted"
+
+
+async def test_review2_the_book_refuses_another_leases_instance_id() -> None:
+    from studioforge.types import LeaseInstance
+
+    manager, _ = manager_with()
+    grant = await manager.grant_lease([0], holder="a", instances=[{"model": MODEL, "load": False}])
+    copy = grant.instances[0]["id"]
+    rival = manager.leases.acquire([1], holder="b")
+    with pytest.raises(StudioForgeError) as booked:
+        manager.leases.attach_instances(
+            rival.id, [LeaseInstance(id=copy, base_model_id=MODEL, devices=[1])]
+        )
+    assert booked.value.code == "instance_id_conflict"
+    assert manager.leases.instance(copy)[0].id == grant.lease.id
+
+
+async def test_review2_a_tag_taken_between_plan_and_make_is_a_409(state: Any) -> None:
+    """The tag re-check inside the make, and the real registry's refusal to replace."""
+    from studioforge.core.instances import ephemeral_record
+
+    record = state.registry.get(TINY)
+    clash = ephemeral_record(
+        record, instance_id=f"{TINY}@t", lease_id="other", devices=[0], launch={}
+    )
+    state.registry.add_ephemeral(clash)
+    stranger = ephemeral_record(
+        record, instance_id=f"{TINY}@t", lease_id="mine", devices=[1], launch={}
+    )
+    with pytest.raises(BadRequestError) as refused:
+        state.registry.add_ephemeral(stranger)
+    assert refused.value.code == "instance_id_conflict"
+    lease = state.manager.leases.acquire([1], holder="b")
+    with pytest.raises(StudioForgeError) as made:
+        state.manager._make_instance(  # noqa: SLF001
+            lease,
+            record,
+            instance_id=f"{TINY}@t",
+            devices=[1],
+            launch={},
+            tag="t",
+            load=False,
+            origin="requested",
+        )
+    assert made.value.code == "instance_id_conflict"
+    assert state.registry.get(f"{TINY}@t").lease_id == "other"
+
+
+async def test_review3_a_forced_bound_load_into_another_holders_lease_is_refused() -> None:
+    """Defence in depth behind the route's 403: force on a lease's copy needs its holder."""
+    manager, supervisor = manager_with()
+    lease_a = await manager.grant_lease(
+        [2, 3],
+        holder=A,
+        holder_key=KEY,
+        instances=[{"model": MODEL, "launch": {"ctx_size": 4096}}],
+    )
+    copy = lease_a.instances[0]["id"]
+    streams(supervisor.get(copy), A)
+    with pytest.raises(LeaseConflictError) as refused:
+        await manager.load(
+            MODEL, lease_id=lease_a.lease.id, force=True, caller=Caller(client=B, key=KEY)
+        )
+    assert refused.value.code == "instance_held"
+    assert supervisor.get(copy).active_requests == 3
+
+
+async def test_review5_another_holders_copy_cannot_be_reshaped_without_admin() -> None:
+    manager, _ = manager_with()
+    lease_a = await manager.grant_lease(
+        [2, 3],
+        holder=A,
+        holder_key=KEY,
+        instances=[{"model": MODEL, "launch": {"ctx_size": 16384}}],
+    )
+    copy = lease_a.instances[0]["id"]
+    stored = dict(lease_a.lease.instances[0].loaded_spec)
+    as_b = Caller(client=B, key=KEY)
+    with pytest.raises(LeaseConflictError) as shaped:
+        await manager.load(copy, ctx_size=8192, caller=as_b)
+    assert shaped.value.code == "instance_held"
+    with pytest.raises(LeaseConflictError):
+        await manager.load_recommended(copy, 2048, caller=as_b)
+    assert lease_a.lease.instances[0].loaded_spec == stored
+    # An admin may reshape it -- and the holder's restore spec stays the holder's.
+    reshaped = await manager.load(copy, ctx_size=8192, force=True, caller=Caller(admin=True))
+    assert reshaped.plan.ctx_per_slot == 8192
+    assert lease_a.lease.instances[0].loaded_spec == stored, "only the owner's loads are stored"
+    # The holder's own reshape is stored.
+    await manager.load(copy, ctx_size=4096, force=True, caller=Caller(client=A, key=KEY))
+    assert lease_a.lease.instances[0].loaded_spec["ctx_per_slot"] == 4096
+
+
+async def test_review6_a_keyed_bound_load_without_a_label_gets_its_own_copy() -> None:
+    """The bound lease is the caller's identity: the other lease is another holder's."""
+    manager, supervisor = manager_with()
+    lease_a = await manager.grant_lease([2, 3], holder=A, model_ids=[MODEL], holder_key=KEY)
+    resident = await manager.load(MODEL, lease_id=lease_a.lease.id)
+    lease_b = await manager.grant_lease([0, 1], holder=B, holder_key=KEY)
+    key_only = Caller(lease_ids=(lease_b.lease.id,), key=KEY)
+    instance = await manager.load(MODEL, lease_id=lease_b.lease.id, ctx_size=4096, caller=key_only)
+    assert instance.model_id == f"{MODEL}:2" and sorted(instance.plan.devices) == [0, 1]
+    assert supervisor.get(MODEL) is resident
+
+
+async def test_review7_a_load_that_outlived_its_lease_is_stopped_and_410() -> None:
+    manager, supervisor = manager_with()
+    grant = await manager.grant_lease([0, 1], holder=A, instances=[{"model": MODEL, "load": False}])
+    copy = grant.instances[0]["id"]
+    real_start = supervisor.start
+
+    async def start_while_released(record: Any, plan: Any, **kwargs: Any) -> InstanceInfo:
+        # The lease ends while this load waits for its child.
+        await manager.release_and_unload(grant.lease.id)
+        return await real_start(record, plan, **kwargs)
+
+    supervisor.start = start_while_released  # type: ignore[method-assign]
+    with pytest.raises(StudioForgeError) as gone:
+        await manager.load(copy, ctx_size=4096)
+    assert gone.value.code == "instance_released" and gone.value.status_code == 410
+    assert supervisor.get(copy) is None, "the orphan child was stopped"
+
+
+def test_review8_a_torn_instances_column_keeps_the_lease(tmp_path: Any) -> None:
+    from studioforge.db import Database
+
+    db = Database(tmp_path / "registry.sqlite3")
+    db.migrate()
+    try:
+        lease = GpuLease(id="l1", devices=[0], holder=A, created_at=1.0, last_activity_at=1.0)
+        db.save_lease(lease_row(lease))
+        connection = db.connect()
+        connection.execute("UPDATE gpu_leases SET instances_json = '{not json' WHERE id = 'l1'")
+        connection.commit()
+        (row,) = db.list_leases()
+        assert row["id"] == "l1" and row["instances"] == []
+        assert lease_from_row(row).devices == [0]
+    finally:
+        db.close()
+
+
+async def test_review_restored_numbers_stay_below_new_ones() -> None:
+    """After a restart, a new copy numbers above every restored id."""
+    store = MemoryStore()
+    manager, _ = manager_with()
+    manager.leases = LeaseBook(store=store)
+    manager.planner.leases = manager.leases
+    await manager.grant_lease(
+        [0], holder=A, instances=[{"model": MODEL, "count": 3, "load": False}]
+    )
+    reborn, _ = manager_with()
+    reborn.leases = LeaseBook(store=store)
+    reborn.planner.leases = reborn.leases
+    reborn._restore_leases()  # noqa: SLF001
+    fresh = await reborn.grant_lease([1], holder=B, instances=[{"model": MODEL, "load": False}])
+    assert fresh.instances[0]["id"] == f"{MODEL}:5"
+
+
+async def test_review4_mcp_load_by_a_non_admin_key_cannot_take_another_holders_copy(
+    state: Any,
+) -> None:
+    from studioforge import mcp_policy
+    from studioforge.authkeys import Principal
+
+    grant = await state.manager.grant_lease(
+        [0], holder="mb-a", holder_key="key:ka", instances=[{"model": TINY, "load": False}]
+    )
+    copy = grant.instances[0]["id"]
+    server = build_management_mcp(state)
+    token = mcp_policy._CALLER.set(Principal("key", "kb", "bench-b", "inference"))  # noqa: SLF001
+    try:
+        refused = await call(server, "load_model", model_id=copy, force=True)
+        shaped = await call(server, "load_recommended", model_id=copy, ctx_size=4096)
+    finally:
+        mcp_policy._CALLER.reset(token)  # noqa: SLF001
+    assert refused["ok"] is False and refused["error"]["code"] == "instance_held", refused
+    assert shaped["ok"] is False and shaped["error"]["code"] == "instance_held", shaped

@@ -8207,11 +8207,16 @@ per copy, with parity the client's burden (B.1).
 
 1. **Instances under a lease.** `POST /api/leases` (and MCP `reserve_gpus`) take
    `instances: [{model, count?, gpus?, tag?, launch?, load?}]` (Triton's `instance_group` shape).
-   A copy is `<model>:<n>` -- LM Studio's instance identifier, `n` the smallest free integer from 2
-   (the base is the plain id), gaps reused -- or `<model>@<tag>` (the virtual-copy convention; a tag
-   with `count > 1` numbers its copies `<tag>1`, `<tag>2`). The id works in `model` on every
-   OpenAI-shape and native route. A taken id or alias (the judge's persistent `...@b` included) is
-   409 `instance_id_conflict`.
+   A copy is `<model>:<n>` -- LM Studio's instance identifier, the base being the plain id -- or
+   `<model>@<tag>` (the virtual-copy convention; a tag with `count > 1` numbers its copies `<tag>1`,
+   `<tag>2`). The id works in `model` on every OpenAI-shape and native route. Numbers start at 2 and
+   are **never reused while the server runs** (one counter per model, kept above every id restored
+   from persisted leases), so a late request for a released `X:2` is always a 404 and never reaches
+   a new holder's copy; a tag is reusable when a new lease asks for it explicitly (reproducible
+   names across runs). A numbered id is assigned, and a tag re-checked, synchronously as the copy
+   is made, and the registry and the lease book both refuse an id another lease holds, so two
+   grants racing (or a grant and a bound load) never share one. A taken id or alias (the judge's
+   persistent `...@b` included) is 409 `instance_id_conflict`.
 2. **Parity is the server's.** An instance's record is a deep copy of the base's record and
    settings; `launch` may set `ctx_size` (alias `context_length`), `parallel` or
    `min_slots`/`max_slots`, `kv_cache_type`, `kv_cache_type_v` -- any other key is 400
@@ -8231,13 +8236,25 @@ per copy, with parity the client's burden (B.1).
    reserved and unloaded like any named model). A load bound to a lease (`lease_id`) does the same
    instead of the old 409. A lease-less forced reload, or a load-recommended that would reshape
    another holder's resident, is 409 `instance_held` naming the holder unless the caller is an
-   admin; a grant whose cards carry another lease's resident is refused the same way.
+   admin; a grant whose cards carry another lease's resident is refused the same way. A forced or
+   shaped load (`ctx_size`, `parallel`, KV types, `devices`; any load-recommended) of another
+   holder's copy by its exact id -- or of a lease's copy bound with `lease_id` -- is 409
+   `instance_held` unless the caller is that lease's holder or an admin, and only the holder's own
+   loads (or the server's own lifecycle load) rewrite the stored restore shape. A load that waited
+   at the gate while its copy's lease ended stops the child it spawned and answers 410
+   `instance_released`.
 5. **Holder identity, not key equality (8a).** Ownership for load, unload and reload is decided by
-   the lease the caller names (`X-SF-Lease`, `X-SF-Lease-Id`, body or query `lease_id`), else its
-   `X-SF-Client` label matched EXACTLY to a lease's holder, else the key that took the lease. A
-   caller naming another lease, or a label that is another standing lease's holder (or of another
-   family), is not this holder whatever key it shares (`lease_holder_may_act`). A lease named in a
-   header on a load or unload route must be one the caller may act on (D80).
+   the lease the caller names (`X-SF-Lease`, `X-SF-Lease-Id`, body or query `lease_id` -- a bound
+   load's own lease included), else its `X-SF-Client` label matched EXACTLY to a lease's holder,
+   else the key that took the lease. The key counts only for a caller whose label vouches for the
+   holder: none, the holder's name, or exactly its family root (`crucibleforge` for a lease held as
+   `crucibleforge-judge`, D55's compatibility case). Any other label -- `bench-run-p` for a lease
+   held as `bench-run-d`, same family or not, with or without a standing lease of its own -- makes
+   the caller someone else whatever key it shares: `lease_holder_may_act` refuses it, and a
+   non-admin such caller naming the lease to bind a load, release, renew, or in `X-SF-Lease` is 403
+   `permission_denied` before the key is consulted. For a load bound to a lease, every other lease
+   is another holder's. A request in flight is the caller's own only when it carried the caller's
+   own label -- never on the peer address, which every tenant of one box shares.
 6. **Routing.** An exact instance id routes exactly. A base id from a caller that holds its own
    instance of it goes there (the least busy of its own); anyone else -- and a caller whose
    identity matches two holders' leases -- gets the base resident, else JIT, as before.
@@ -8246,8 +8263,9 @@ per copy, with parity the client's burden (B.1).
    `force` (409 `instance_held`). `force` on the REST, native and LM Studio unload routes is only
    what the caller sent -- the D55 waiver rides apart (`lease_ok`) -- and a lease-held model serving
    another client's requests is 409 `instance_in_use` naming them unless `force` (requests past
-   the bounded in-flight window count as another client's). The GUI and MCP operator surfaces keep
-   their explicit force.
+   the bounded in-flight window count as another client's). The GUI and the MCP `unload_model`
+   tool (admin scope) keep their explicit force. LM Studio's `/api/v1/models/unload` resolves a base
+   id to the caller's own copy before it looks for a loaded instance.
 8. **Lifecycle.** Instances belong to their lease. Release (`?unload=false` too), idle expiry and
    every other end: the ids become unreachable at once, the children stop busy or not (in flight:
    410 `instance_released`, or an SSE error frame mid-stream), the records go, then the lease.
@@ -8255,7 +8273,7 @@ per copy, with parity the client's burden (B.1).
    created -- never a JIT load. Specs persist with their lease (migration 012,
    `gpu_leases.instances_json`, `SCHEMA_VERSION` 12): a restart rebuilds the records unloaded and
    the first request loads EXACTLY the stored shape (devices, ctx per slot, slots, KV), never the
-   ladder.
+   ladder. A torn instances column loses the instances, never the lease.
 9. **Surfaces.** `/v1/models`: the base's `studioforge.loaded_instances[]` lists every loaded
    instance (`id`, `devices`, `config.context_length`, `parallel`, `lease_id`, `holder`,
    `ephemeral`), and each instance is its own entry with `studioforge.ephemeral: true`, `lease_id`,
@@ -8269,8 +8287,12 @@ per copy, with parity the client's burden (B.1).
 as named: a bound dry run of a model another lease names is still the old 409 where the real load
 now makes a copy. Base-id pooling across holders stays deferred (F-4). The idle residents a failed
 all-or-nothing grant evicted are not brought back. An instance whose base left the library at
-restart is dropped from its lease with a warning. MCP `load_model` / `load_recommended` /
-`unload_model` carry no holder identity (operator plane, PIN-gated).
+restart is dropped from its lease with a warning. MCP `load_model` and `load_recommended`
+(`inference` scope) carry the caller's key, its `lease_id` and whether it is an admin, but no
+`X-SF-Client` label (MCP tools see no request headers), so a key shared by two holders cannot be
+told apart there; `unload_model` is `admin` scope and keeps its operator force. Numbered ids are
+monotonic only within one run: after a restart a released (not restored) number may be handed out
+again.
 
 **Surfaces.** `core/instances.py` (new: ids, launch keys, `Caller`, `claims`,
 `names_other_holder`, `ephemeral_record`, `instance_row`, the errors), `core/manager.py`

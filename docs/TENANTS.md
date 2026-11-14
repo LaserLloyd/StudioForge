@@ -333,7 +333,7 @@ has a copy of loads that copy. The instance reports `loaded_by: "api:/api/leases
 
 A lease may hold its own copies of a model -- `instances: [{"model", "count"?, "gpus"?, "tag"?,
 "launch"?, "load"?}]` on `POST /api/leases` (MCP `reserve_gpus(instances=...)`, `sfctl leases add
---instance`). Each copy is `<model>:<n>` (from 2, gaps reused) or `<model>@<tag>`, a deep copy of the
+--instance`). Each copy is `<model>:<n>` (from 2, never reused while the server runs) or `<model>@<tag>`, a deep copy of the
 base's settings on the lease's cards with only its context, slots and KV types from `launch`, loaded
 before the reply (all or nothing) and reported in `instances[]` as actually loaded (`id`, `model`,
 `devices`, `ctx_per_slot`, `parallel`, `kv_cache_type(_v)`, `state`, `engine_tag`). Every lease row

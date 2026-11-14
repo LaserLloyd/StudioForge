@@ -184,13 +184,13 @@ def test_two_holders_one_key_the_second_never_replaces_the_first(staging_dir: Pa
         with_copies = client.get("/api/models?include_ephemeral=true", headers=key).json()
         assert COPY in {m["id"] for m in with_copies["models"]}
 
-        # B naming A's lease while saying it is B: the shared key may name the
-        # lease (D80), but holder identity decides the unload -- refused, A intact.
+        # B naming A's lease while saying it is B: a shared key does not make B
+        # A's holder (D91 review fix 3) -- 403 before anything is looked at.
         stolen = client.post(
             f"/api/models/{MODEL}/unload", headers={**as_b, "X-SF-Lease": lease_a_id}
         )
-        assert stolen.status_code == 409, stolen.text
-        assert stolen.json()["error"]["code"] == "lease_conflict"
+        assert stolen.status_code == 403, stolen.text
+        assert stolen.json()["error"]["code"] == "permission_denied"
         a_is_intact()
         # The shared key alone matches both holders: ambiguous, refused, A intact.
         ambiguous = client.post(f"/api/models/{MODEL}/unload", headers=key)
@@ -208,10 +208,15 @@ def test_two_holders_one_key_the_second_never_replaces_the_first(staging_dir: Pa
         released = client.delete(f"/api/leases/{lease_b_id}", headers=as_b)
         assert released.status_code == 200, released.text
         assert released.json()["instances_ended"] == [COPY]
-        # With no lease of its own, B's unload of the base id meets A's streams.
+        # With no lease of its own, B is still not A: its label stops the shared key.
         cut = client.post(f"/api/models/{MODEL}/unload", headers=as_b)
         assert cut.status_code == 409, cut.text
-        error = cut.json()["error"]
+        assert cut.json()["error"]["code"] == "lease_conflict"
+        a_is_intact()
+        # The key alone (no label) does prove the lease -- and then meets A's streams.
+        keyed = client.post(f"/api/models/{MODEL}/unload", headers=key)
+        assert keyed.status_code == 409, keyed.text
+        error = keyed.json()["error"]
         assert error["code"] == "instance_in_use"
         assert error["studioforge"]["in_flight_clients"] == [A]
         a_is_intact()
@@ -296,3 +301,174 @@ def test_a_restart_restores_the_copies_unloaded_and_loads_the_stored_shape(
         released = client.delete(f"/api/leases/{lease_id}")
         assert sorted(released.json()["instances_ended"]) == sorted([COPY, f"{MODEL}@b"])
         assert COPY not in _loaded(client, {})
+
+
+# ---------------------------------------------------------------------------
+# Review fixes, end to end (2026-11-14)
+# ---------------------------------------------------------------------------
+
+
+def _keyed(staging_dir: Path) -> tuple[Any, Any, dict[str, str]]:
+    cfg = _config(staging_dir)
+    app, state = _app(cfg)
+    _record, secret = state.accounts.create_key("bench", "inference")
+    return app, state, {"Authorization": f"Bearer {secret}"}
+
+
+def test_review1_b_with_no_lease_and_the_shared_key_never_cuts_as_streams(
+    staging_dir: Path,
+) -> None:
+    """B holds no lease; A's streams are unlabeled (the peer is all they carry)."""
+    app, state, key = _keyed(staging_dir)
+    as_a = {**key, "X-SF-Client": A}
+    as_b = {**key, "X-SF-Client": B}
+    with TestClient(app) as client:
+        lease_a = client.post(
+            "/api/leases", json={"devices": [2, 3], "model_ids": [MODEL], "holder": A}, headers=as_a
+        ).json()["id"]
+        loaded = client.post(
+            f"/api/models/{MODEL}/load", json={"lease_id": lease_a, "ctx_size": 4096}, headers=as_a
+        )
+        assert loaded.status_code == 200, loaded.text
+        pid_a = loaded.json()["pid"]
+        # The same peer every caller here has: an unlabeled stream names only it.
+        in_flight = [
+            state.supervisor.mark_request_start(MODEL, client="testclient") for _ in range(3)
+        ]
+
+        def a_is_intact() -> None:
+            row = _loaded(client, key)[MODEL]
+            assert row["pid"] == pid_a and row["active_requests"] == 3
+
+        # B's label is not A's: the shared key does not make it A's holder.
+        refused = client.post(f"/api/models/{MODEL}/unload", headers=as_b)
+        assert refused.status_code == 409, refused.text
+        assert refused.json()["error"]["code"] == "lease_conflict"
+        a_is_intact()
+        # No label at all: the key proves the lease, but the peer it shares with
+        # A's streams does not make them its own.
+        cut = client.post(f"/api/models/{MODEL}/unload", headers=key)
+        assert cut.status_code == 409, cut.text
+        assert cut.json()["error"]["code"] == "instance_in_use"
+        assert cut.json()["error"]["studioforge"]["in_flight_clients"] == ["testclient"]
+        a_is_intact()
+        for request_id in in_flight:
+            state.supervisor.mark_request_end(MODEL, request_id=request_id)
+
+
+def test_review2_two_concurrent_grants_get_two_ids(staging_dir: Path) -> None:
+    """Both grants evict a resident (an await between planning and making the copy)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    other = staging_dir / "models" / "pub" / "Other-Q4_K_M.gguf"
+    other.write_bytes(b"GGUF" + b"\0" * (4 * 1024 * 1024))
+    cfg = _config(staging_dir)
+    app, state = _app(cfg)
+    with TestClient(app, client=LOOPBACK) as client:
+        _booted(app.state)
+        for model, cards in ((MODEL, [0, 1]), ("pub/Other-Q4_K_M", [2, 3])):
+            placed = client.post(
+                f"/api/models/{model}/load", json={"devices": cards, "ctx_size": 2048}
+            )
+            assert placed.status_code == 200, placed.text
+
+        def grant(cards: list[int], holder: str) -> Any:
+            return client.post(
+                "/api/leases",
+                json={
+                    "devices": cards,
+                    "holder": holder,
+                    "instances": [{"model": MODEL, "load": False}],
+                },
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            replies = list(pool.map(grant, ([0, 1], [2, 3]), ("run-a", "run-b")))
+        for reply in replies:
+            assert reply.status_code == 200, reply.text
+        ids = [reply.json()["instances"][0]["id"] for reply in replies]
+        assert sorted(ids) == [f"{MODEL}:2", f"{MODEL}:3"], ids
+        by_lease = {
+            lease["id"]: [row["id"] for row in lease["instances"]]
+            for lease in client.get("/api/leases").json()["leases"]
+        }
+        assert sorted(by_lease.values()) == [[f"{MODEL}:2"], [f"{MODEL}:3"]]
+        for reply in replies:
+            body = reply.json()
+            record = state.registry.get(body["instances"][0]["id"])
+            assert record is not None and record.lease_id == body["id"]
+
+
+def test_review3_b_naming_as_lease_is_refused_everywhere(staging_dir: Path) -> None:
+    """B, with its own lease and the shared key, cannot act on A's lease by naming it."""
+    app, state, key = _keyed(staging_dir)
+    as_a = {**key, "X-SF-Client": A}
+    as_b = {**key, "X-SF-Client": B}
+    with TestClient(app) as client:
+        granted = client.post(
+            "/api/leases",
+            json={
+                "devices": [2, 3],
+                "holder": A,
+                "instances": [{"model": MODEL, "launch": {"ctx_size": 4096}}],
+            },
+            headers=as_a,
+        )
+        assert granted.status_code == 200, granted.text
+        lease_a = granted.json()["id"]
+        copy_a = granted.json()["instances"][0]["id"]
+        pid_a = _loaded(client, key)[copy_a]["pid"]
+        lease_b = client.post(
+            "/api/leases", json={"devices": [0, 1], "holder": B}, headers=as_b
+        ).json()["id"]
+        in_flight = [state.supervisor.mark_request_start(copy_a, client=A) for _ in range(2)]
+
+        bound = client.post(
+            f"/api/models/{MODEL}/load", json={"lease_id": lease_a, "force": True}, headers=as_b
+        )
+        assert bound.status_code == 403, bound.text
+        assert bound.json()["error"]["code"] == "permission_denied"
+        renew = client.patch(f"/api/leases/{lease_a}", json={"renew_time": "now"}, headers=as_b)
+        assert renew.status_code == 403, renew.text
+        release = client.delete(f"/api/leases/{lease_a}", headers=as_b)
+        assert release.status_code == 403, release.text
+        named = client.post(
+            "/v1/chat/completions",
+            json={"model": copy_a, "messages": MESSAGES, "max_tokens": 2},
+            headers={**as_b, "X-SF-Lease": lease_a},
+        )
+        assert named.status_code == 200, "naming a lease never gates inference"
+        reshape = client.post(f"/api/models/{copy_a}/load", json={"ctx_size": 2048}, headers=as_b)
+        assert reshape.status_code == 409, reshape.text
+        assert reshape.json()["error"]["code"] == "instance_held"
+        row = _loaded(client, key)[copy_a]
+        assert row["pid"] == pid_a and row["plan"]["ctx_per_slot"] == 4096
+        assert {
+            lease["id"] for lease in client.get("/api/leases", headers=key).json()["leases"]
+        } == {
+            lease_a,
+            lease_b,
+        }
+        for request_id in in_flight:
+            state.supervisor.mark_request_end(copy_a, request_id=request_id)
+
+
+def test_review_lm_studio_unload_by_base_id_finds_the_callers_own_copy(staging_dir: Path) -> None:
+    app, _state, key = _keyed(staging_dir)
+    as_b = {**key, "X-SF-Client": B}
+    with TestClient(app) as client:
+        granted = client.post(
+            "/api/leases",
+            json={
+                "devices": [0, 1],
+                "holder": B,
+                "instances": [{"model": MODEL, "launch": {"ctx_size": 2048}}],
+            },
+            headers=as_b,
+        )
+        assert granted.status_code == 200, granted.text
+        assert MODEL not in _loaded(client, key), "only the copy is loaded"
+        unloaded = client.post("/api/v1/models/unload", json={"instance_id": MODEL}, headers=as_b)
+        assert unloaded.status_code == 200, unloaded.text
+        assert unloaded.json() == {"instance_id": COPY}
+        assert COPY not in _loaded(client, key)

@@ -208,8 +208,11 @@ own:
 * Holder identity (D91) is what a caller SAYS -- the lease it names, its `X-SF-Client` label, the
   key it holds. Two clients that share one key and send no label cannot be told apart: a base model
   id from them means the base (routing) or is refused as ambiguous (unload). Send `X-SF-Client`
-  (or `X-SF-Lease`) from every run. A label that is no standing holder's but shares a holder's
-  family (`crucibleforge` for `crucibleforge-judge`) is still that holder's by its key, as before.
+  (or `X-SF-Lease`) from every run: a request is yours only when it carried your label, never
+  because it came from the same address. The key proves a lease only beside no label, the
+  holder's own, or exactly its family root (`crucibleforge` for `crucibleforge-judge`); any other
+  label is somebody else. MCP load tools see no label, so a key shared by two holders cannot be told
+  apart there.
 * Lease instances (D91): a dry run (`?dryRun=true`, `plan-recommended`) answers for the model as
   named and does not preview the copy a real bound load would make; a base id is not balanced
   across different holders' copies (F-4); the idle residents a failed all-or-nothing grant evicted
