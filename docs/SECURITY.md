@@ -134,6 +134,21 @@ the panel on the same machine keep working: they use a local admin key kept in `
 (owner-only), created on demand. Errors are specific: `api_key_revoked`, `api_key_expired` (401) and
 `key_rate_limited` (429 with `Retry-After`).
 
+Two rules answer 429, and they are easy to confuse from the client side:
+
+- `too_many_credential_attempts` is **per client address**: three wrong credentials (an unknown,
+  revoked or expired key, or a wrong PIN) are free, then each further one locks the address out for
+  1 s, 2 s, 4 s ... up to 300 s; the record is forgotten after 15 minutes without a failure, and
+  only a successful `admin` credential clears it early. Every client behind one address shares it:
+  one machine with a stale key in one config locks out every other client on that machine.
+- `key_rate_limited` is **per key**, a sliding 60-second window of `--rate-limit-rpm` requests. It
+  never counts toward the lockout.
+
+Every refusal by the auth layer (401, 403, 429) is logged as `auth refused` with the code, status,
+method, path, peer address, `X-SF-Client` label and user agent (trimmed), the message and
+`retry_after_s` -- never the credential. 401 and 429 are WARNING, 403 is INFO; repeats from one
+address with one code are held to one line per 10 seconds and counted (`suppressed=`) on the next.
+
 ### The owner account
 
 `studioforge setup` (or `studioforge users create`, or the panel's Advanced > Accounts & keys page) creates it. The

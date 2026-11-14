@@ -129,6 +129,74 @@ def log_rejection(exc: StudioForgeError) -> None:
         log.info("request rejected", error=exc.message, code=exc.code)
 
 
+#: One "auth refused" line per (address, code) per this many seconds; the
+#: refusals in between are counted and reported on the next line as
+#: ``suppressed``. A locked-out client retrying in a loop would otherwise write a
+#: line per request.
+AUTH_REFUSAL_LOG_INTERVAL_S = 10.0
+#: Ceiling on the (address, code) pairs the throttle remembers; past it the
+#: table starts over (a spray from many addresses must not grow it unbounded).
+_AUTH_REFUSAL_MAX_TRACKED = 1024
+_auth_refusal_seen: dict[tuple[str, str], list[float]] = {}
+
+
+def _short_header(request: Request, name: str, limit: int = 64) -> str | None:
+    """A request header trimmed for a log line: printable ASCII only, ``limit`` chars."""
+    raw = request.headers.get(name)
+    if not raw:
+        return None
+    cleaned = "".join(ch for ch in raw.strip() if 32 <= ord(ch) < 127)
+    return cleaned[:limit] or None
+
+
+def log_auth_refusal(request: Request, exc: StudioForgeError) -> None:
+    """Log a request the auth middleware refused: which rule, from where, as whom.
+
+    Until this line, a refused credential (401), a scope refusal (403), the
+    per-address lockout (429 ``too_many_credential_attempts``) and a key over
+    its rate limit (429 ``key_rate_limited``) left no trace but a metrics
+    counter: on 2026-11-15 a client's lockout stopped a long run and nothing
+    on the server could say which rule fired or which caller tripped it.
+
+    Never logs the credential. It logs the refusal code and status, method and
+    path, the peer address, the ``X-SF-Client`` label and user agent (trimmed),
+    the message (which names a key only for revoked, expired and rate-limited
+    keys) and ``retry_after_s``. WARNING for 401 and 429, INFO otherwise;
+    throttled per (address, code) to one line every
+    :data:`AUTH_REFUSAL_LOG_INTERVAL_S`.
+    """
+    peer = request.client.host if request.client else "-"
+    code = str(exc.code or "")
+    now = time.monotonic()
+    seen = _auth_refusal_seen.get((peer, code))
+    if seen is not None and now - seen[0] < AUTH_REFUSAL_LOG_INTERVAL_S:
+        seen[1] += 1
+        return
+    suppressed = int(seen[1]) if seen is not None else 0
+    if len(_auth_refusal_seen) >= _AUTH_REFUSAL_MAX_TRACKED:
+        _auth_refusal_seen.clear()
+    _auth_refusal_seen[(peer, code)] = [now, 0.0]
+    fields: dict[str, Any] = {
+        "code": code,
+        "status": exc.status_code,
+        "method": request.method,
+        "path": request.url.path,
+        "peer": peer,
+        "client": _short_header(request, "x-sf-client"),
+        "user_agent": _short_header(request, "user-agent", 96),
+        "error": exc.message,
+    }
+    retry = exc.details.get("retry_after_s") if isinstance(exc.details, dict) else None
+    if retry is not None:
+        fields["retry_after_s"] = retry
+    if suppressed:
+        fields["suppressed"] = suppressed
+    if exc.status_code in (401, 429):
+        log.warning("auth refused", **fields)
+    else:
+        log.info("auth refused", **fields)
+
+
 #: How long a request waits for the boot's first library scan (D33). A cold
 #: scan of a large library is tens of seconds; past this the request proceeds
 #: against whatever is indexed so far, and /health says why.
@@ -238,6 +306,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 # below ever runs, so the header has to be set here too or a
                 # locked-out client gets the wait only in the JSON body.
                 headers["Retry-After"] = str(exc.details["retry_after_s"])
+            log_auth_refusal(request, exc)
             if audited:
                 self._audit(request, result="denied", detail=exc.code)
             if metrics is not None:
