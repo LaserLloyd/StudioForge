@@ -34,6 +34,7 @@ from studioforge.build import build_id
 from studioforge.config import RESTART_REQUIRED_KEYS, apply_live, apply_overrides
 from studioforge.core import parallel_bench
 from studioforge.core.attribution import attributed_source, client_of
+from studioforge.core.attribution import client_label as clean_client_label
 from studioforge.core.benchmark import (
     DEFAULT_CTX_SIZE,
     DEFAULT_MAX_TOKENS,
@@ -751,7 +752,9 @@ async def create_lease(
         instances=instances,
         # D91: the exact label this holder sends, which then vouches for it even
         # when it differs from the holder name (``openclaw`` / ``openclaw-main``).
-        holder_label=client_label or None,
+        # Stored in the form every later request is compared in (whitespace
+        # collapsed, parentheses dropped, capped), never the raw header.
+        holder_label=clean_client_label(request.headers.get("x-sf-client")),
     )
     return lease_grant_reply(grant, gpu_uuids=_lease_uuids(state), live=_live(state, grant.lease))
 

@@ -47,6 +47,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from studioforge.core.attribution import client_label
 from studioforge.core.priority import PRIORITY_BACKGROUND, PRIORITY_LEVELS
 from studioforge.errors import (
     BadRequestError,
@@ -276,7 +277,8 @@ def lease_from_row(row: Mapping[str, Any]) -> GpuLease:
         vacate_token=row.get("vacate_token") or None,
         holder_peer=row.get("holder_peer") or None,
         holder_key=row.get("holder_key") or None,
-        holder_label=row.get("holder_label") or None,
+        # The same normal form a request's label is compared in (D91, N1).
+        holder_label=client_label(row.get("holder_label")),
         instances=_instances_from_row(row),
     )
 
@@ -477,7 +479,7 @@ class LeaseBook:
             vacate_token=token,
             holder_peer=(holder_peer or "").strip() or None,
             holder_key=(holder_key or "").strip() or None,
-            holder_label=(holder_label or "").strip() or None,
+            holder_label=client_label(holder_label),
         )
         self._leases[lease.id] = lease
         self._persist(lease, at=stamp)
