@@ -5976,7 +5976,7 @@ class ModelManager:
         sources: Sequence[ModelRecord],
         *,
         cards: Sequence[int],
-    ) -> list[tuple[InstanceRequest, ModelRecord, list[str], list[int]]]:
+    ) -> list[tuple[InstanceRequest, ModelRecord, list[str | None], list[int]]]:
         """Ids and cards for every requested instance, all checked before anything is made.
 
         A tagged id already in use -- an id, an alias, a persistent copy such as
