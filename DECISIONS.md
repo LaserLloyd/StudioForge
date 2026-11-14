@@ -8210,10 +8210,11 @@ per copy, with parity the client's burden (B.1).
    A copy is `<model>:<n>` -- LM Studio's instance identifier, the base being the plain id -- or
    `<model>@<tag>` (the virtual-copy convention; a tag with `count > 1` numbers its copies `<tag>1`,
    `<tag>2`). The id works in `model` on every OpenAI-shape and native route. Numbers start at 2 and
-   are **never reused while the server runs** (one counter per model, kept above every id restored
-   from persisted leases), so a late request for a released `X:2` is always a 404 and never reaches
-   a new holder's copy; a tag is reusable when a new lease asks for it explicitly (reproducible
-   names across runs). A numbered id is assigned, and a tag re-checked, synchronously as the copy
+   are **not reused within a server run** (one counter per model, kept above every id restored from
+   persisted leases) -- a deliberate change from the brief's "smallest free integer, gaps reused",
+   so that a late request for a released `X:2` always gets 404 `instance_not_found` and never
+   reaches a new holder's copy. A tag is reusable when a new lease asks for it explicitly
+   (reproducible names across runs). A numbered id is assigned, and a tag re-checked, synchronously as the copy
    is made, and the registry and the lease book both refuse an id another lease holds, so two
    grants racing (or a grant and a bound load) never share one. A taken id or alias (the judge's
    persistent `...@b` included) is 409 `instance_id_conflict`.
@@ -8236,7 +8237,9 @@ per copy, with parity the client's burden (B.1).
    reserved and unloaded like any named model). A load bound to a lease (`lease_id`) does the same
    instead of the old 409. A lease-less forced reload, or a load-recommended that would reshape
    another holder's resident, is 409 `instance_held` naming the holder unless the caller is an
-   admin; a grant whose cards carry another lease's resident is refused the same way. A forced or
+   admin; a grant whose cards carry another lease's resident is refused the same way. A non-admin
+   forced reload of a copy serving requests someone else labelled (`X-SF-Client`) is 409
+   `instance_in_use`, the copy's own lease included (a key may be shared). A forced or
    shaped load (`ctx_size`, `parallel`, KV types, `devices`; any load-recommended) of another
    holder's copy by its exact id -- or of a lease's copy bound with `lease_id` -- is 409
    `instance_held` unless the caller is that lease's holder or an admin, and only the holder's own
@@ -8247,10 +8250,14 @@ per copy, with parity the client's burden (B.1).
    the lease the caller names (`X-SF-Lease`, `X-SF-Lease-Id`, body or query `lease_id` -- a bound
    load's own lease included), else its `X-SF-Client` label matched EXACTLY to a lease's holder,
    else the key that took the lease. The key counts only for a caller whose label vouches for the
-   holder: none, the holder's name, or exactly its family root (`crucibleforge` for a lease held as
-   `crucibleforge-judge`, D55's compatibility case). Any other label -- `bench-run-p` for a lease
-   held as `bench-run-d`, same family or not, with or without a standing lease of its own -- makes
-   the caller someone else whatever key it shares: `lease_holder_may_act` refuses it, and a
+   holder: none, the holder's name, the exact label the lease was taken with (`holder_label`,
+   recorded from the creating request's `X-SF-Client`, migration 013 -- a holder leasing as
+   `openclaw` and labelling `openclaw-main`), or exactly its family root (`crucibleforge` for a
+   lease held as `crucibleforge-judge`, D55's compatibility case). An exact match wins: a label that
+   IS one standing lease's holder name or recorded label means that lease only, never another
+   through the family root. Any other label -- `bench-run-p` for a lease held as `bench-run-d`,
+   same family or not, with or without a standing lease of its own -- makes the caller someone else
+   whatever key it shares: `lease_holder_may_act` refuses it, and a
    non-admin such caller naming the lease to bind a load, release, renew, or in `X-SF-Lease` is 403
    `permission_denied` before the key is consulted. For a load bound to a lease, every other lease
    is another holder's. A request in flight is the caller's own only when it carried the caller's
@@ -8271,7 +8278,7 @@ per copy, with parity the client's burden (B.1).
    410 `instance_released`, or an SSE error frame mid-stream), the records go, then the lease.
    A later request naming the id is 404 `instance_not_found` -- as is any `<model>:<n>` nobody
    created -- never a JIT load. Specs persist with their lease (migration 012,
-   `gpu_leases.instances_json`, `SCHEMA_VERSION` 12): a restart rebuilds the records unloaded and
+   `gpu_leases.instances_json`): a restart rebuilds the records unloaded and
    the first request loads EXACTLY the stored shape (devices, ctx per slot, slots, KV), never the
    ladder. A torn instances column loses the instances, never the lease.
 9. **Surfaces.** `/v1/models`: the base's `studioforge.loaded_instances[]` lists every loaded
@@ -8289,8 +8296,11 @@ now makes a copy. Base-id pooling across holders stays deferred (F-4). The idle 
 all-or-nothing grant evicted are not brought back. An instance whose base left the library at
 restart is dropped from its lease with a warning. MCP `load_model` and `load_recommended`
 (`inference` scope) carry the caller's key, its `lease_id` and whether it is an admin, but no
-`X-SF-Client` label (MCP tools see no request headers), so a key shared by two holders cannot be
-told apart there; `unload_model` is `admin` scope and keeps its operator force. Numbered ids are
+`X-SF-Client` label (MCP tools see no request headers), so there the key never identifies the
+holder: a non-admin forced or shaped load of a copy must name the copy's own lease (`lease_id`).
+MCP lease ownership (`release_gpus`, `renew_lease`, `lease_id` on the load tools) stays the key
+plus the explicit lease id, as before; `unload_model` is `admin` scope and keeps its operator
+force. Numbered ids are
 monotonic only within one run: after a restart a released (not restored) number may be handed out
 again.
 
@@ -8300,7 +8310,7 @@ again.
 `_refuse_cutting_others`, `_load_instance`, `_end_instances`, `_restore_instances`, release and
 expiry), `core/leases.py` (instance specs in the book, the row and `lease_view`),
 `core/registry.py` (ephemeral records), `types.py` (`LeaseInstance`, `GpuLease.instances`,
-`ModelRecord.ephemeral` / `lease_id`), `db.py` + `migrations/012_lease_instances.sql`,
+`ModelRecord.ephemeral` / `lease_id`), `db.py` + `migrations/012_lease_instances.sql` and `013_lease_holder_label.sql` (`SCHEMA_VERSION` 13),
 `api/holder.py` (new), `api/mgmt_routes.py`, `api/openai_routes.py`, `api/native_routes.py`,
 `api/lmstudio_routes.py`, `mcp/management.py`, `error_catalog.py` (`instance_released`,
 `instance_held`, `instance_in_use`, `instance_ambiguous`, `instance_id_conflict`,

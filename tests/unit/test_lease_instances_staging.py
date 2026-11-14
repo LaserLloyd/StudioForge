@@ -472,3 +472,37 @@ def test_review_lm_studio_unload_by_base_id_finds_the_callers_own_copy(staging_d
         assert unloaded.status_code == 200, unloaded.text
         assert unloaded.json() == {"instance_id": COPY}
         assert COPY not in _loaded(client, key)
+
+
+def test_r1_a_holder_whose_label_differs_from_its_lease_name_keeps_its_lease(
+    staging_dir: Path,
+) -> None:
+    """Leased as ``openclaw``, labelled ``openclaw-main``, its own key: all of it is its own."""
+    app, _state, key = _keyed(staging_dir)
+    me = {**key, "X-SF-Client": "openclaw-main"}
+    with TestClient(app) as client:
+        granted = client.post(
+            "/api/leases",
+            json={
+                "devices": [0, 1],
+                "holder": "openclaw",
+                "instances": [{"model": MODEL, "launch": {"ctx_size": 2048}}],
+            },
+            headers=me,
+        )
+        assert granted.status_code == 200, granted.text
+        lease_id = granted.json()["id"]
+        chat = client.post(
+            "/v1/chat/completions",
+            json={"model": MODEL, "messages": MESSAGES, "max_tokens": 2},
+            headers=me,
+        )
+        assert chat.status_code == 200 and chat.headers["X-SF-Model"] == COPY
+        unloaded = client.post(f"/api/models/{MODEL}/unload", headers=me)
+        assert unloaded.status_code == 200, unloaded.text
+        assert unloaded.json()["unloaded_id"] == COPY
+        renewed = client.patch(f"/api/leases/{lease_id}", json={"renew_time": "now"}, headers=me)
+        assert renewed.status_code == 200, renewed.text
+        released = client.delete(f"/api/leases/{lease_id}", headers=me)
+        assert released.status_code == 200, released.text
+        assert released.json()["instances_ended"] == [COPY]

@@ -33,8 +33,11 @@ instance, loaded on demand.
 * **Holder identity, not key equality.** Several clients often share one API key. Who you are, for
   "which instance do I mean", is: the lease you name (`X-SF-Lease: <lease id>`, or a body
   `lease_id`), else your `X-SF-Client` label matched exactly to a lease's holder, else the key that
-  took the lease -- but the key counts only when you send no label, the holder's own, or exactly its
-  family root (`crucibleforge` for `crucibleforge-judge`). Send any other label and you are someone
+  took the lease -- but the key counts only when you send no label, the holder's own name, the label
+  you took the lease with (it is recorded: lease as `openclaw` while labelling `openclaw-main` and
+  that label stays yours), or exactly the family root (`crucibleforge` for `crucibleforge-judge`).
+  An exact match wins: with `crucibleforge` and `crucibleforge-judge` both standing, the label
+  `crucibleforge` means the first only. Send any other label and you are someone
   else, whatever key you share: you cannot bind a load to that lease, release or renew it, or name
   it in `X-SF-Lease` (`403 permission_denied`). **Send `X-SF-Client` from every run** -- a request is
   yours only when it carried your label; the peer address (the same `127.0.0.1` for every tenant on
@@ -196,8 +199,11 @@ X-SF-Client: bench-run-7
 * `POST /models/unload {"model", "force"?}` and `POST /api/v1/models/unload {"instance_id", "force"?}`
   follow the same rules; LM Studio's unload of a base id finds your own loaded copy even when the
   base itself is not loaded.
-* MCP `load_model` / `load_recommended` carry your key, `lease_id` and admin-ness (no label): a
-  non-admin key reloading or reshaping another holder's copy is `instance_held`.
+* MCP `load_model` / `load_recommended` carry your key, `lease_id` and admin-ness but no label, so
+  there the key never says whose copy you mean: a non-admin forced or shaped load of a copy must
+  pass `lease_id` naming the copy's own lease (`instance_held` otherwise).
+* A forced reload never cuts requests someone else labelled: with another client's labelled
+  requests in flight it is `409 instance_in_use`, even from the copy's own lease (admins excepted).
 
 ## 5. Release, expiry, restart
 

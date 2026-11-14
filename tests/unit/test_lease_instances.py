@@ -1024,3 +1024,137 @@ async def test_review4_mcp_load_by_a_non_admin_key_cannot_take_another_holders_c
         mcp_policy._CALLER.reset(token)  # noqa: SLF001
     assert refused["ok"] is False and refused["error"]["code"] == "instance_held", refused
     assert shaped["ok"] is False and shaped["error"]["code"] == "instance_held", shaped
+
+
+# ---------------------------------------------------------------------------
+# Re-review fixes (2026-11-14): R1-R3
+# ---------------------------------------------------------------------------
+
+
+def test_r1_the_label_a_lease_was_taken_with_vouches_for_its_holder() -> None:
+    """A holder leasing as ``openclaw`` that labels its requests ``openclaw-main``."""
+    from studioforge.core.instances import label_vouches
+
+    lease = GpuLease(id="lo", devices=[0], holder="openclaw", created_at=1.0, last_activity_at=1.0)
+    lease.holder_key = KEY
+    lease.holder_label = "openclaw-main"
+    me = Caller(client="openclaw-main", key=KEY)
+    assert label_vouches("openclaw-main", lease)
+    assert claims(me, lease, [lease]) and not names_other_holder(me, lease, [lease])
+    # Persisted with the lease; an older row (no label recorded) keeps today's rule.
+    back = lease_from_row(lease_row(lease))
+    assert back.holder_label == "openclaw-main"
+    old = {**lease_row(lease)}
+    old.pop("holder_label")
+    legacy = lease_from_row(old)
+    assert legacy.holder_label is None
+    assert names_other_holder(me, legacy, [legacy]), "an unrecorded label does not vouch"
+    assert claims(Caller(key=KEY), legacy, [legacy]), "the key alone still works as before"
+    assert "holder_label" not in lease_view(lease), "never shown, like holder_peer"
+
+
+async def test_r1_its_own_key_and_label_route_and_unload_its_own_copy() -> None:
+    manager, supervisor = manager_with()
+    grant = await manager.grant_lease(
+        [0, 1],
+        holder="openclaw",
+        holder_key=KEY,
+        holder_label="openclaw-main",
+        instances=[{"model": MODEL, "launch": {"ctx_size": 4096}}],
+    )
+    copy = grant.instances[0]["id"]
+    me = Caller(client="openclaw-main", key=KEY)
+    assert manager.route_for(manager.registry.get(MODEL), me).id == copy
+    assert manager.unload_target(MODEL, me) == copy
+    assert await manager.unload(MODEL, caller=me, lease_ok=True) is True
+    assert supervisor.get(copy) is None
+
+
+def test_r2_an_exact_label_wins_over_the_family_root() -> None:
+    cf = GpuLease(id="lc", devices=[0], holder="crucibleforge", created_at=1, last_activity_at=1)
+    judge = GpuLease(
+        id="lj", devices=[1], holder="crucibleforge-judge", created_at=1, last_activity_at=1
+    )
+    cf.holder_key = judge.holder_key = KEY
+    both = [cf, judge]
+    run = Caller(client="crucibleforge", key=KEY)
+    assert claims(run, cf, both) and not claims(run, judge, both)
+    assert not names_other_holder(run, cf, both) and names_other_holder(run, judge, both)
+    # With only the judge's lease standing, the family root still vouches (D55).
+    assert claims(run, judge, [judge]) and not names_other_holder(run, judge, [judge])
+
+
+async def test_r2_routing_and_unload_follow_the_exact_match() -> None:
+    manager, _ = manager_with()
+    run = await manager.grant_lease(
+        [0, 1],
+        holder="crucibleforge",
+        holder_key=KEY,
+        instances=[{"model": MODEL, "load": False}],
+    )
+    await manager.grant_lease(
+        [2, 3],
+        holder="crucibleforge-judge",
+        holder_key=KEY,
+        instances=[{"model": MODEL, "load": False}],
+    )
+    caller = Caller(client="crucibleforge", key=KEY)
+    mine = run.instances[0]["id"]
+    assert manager.route_for(manager.registry.get(MODEL), caller).id == mine
+    assert manager.unload_target(MODEL, caller) == mine, "not instance_ambiguous"
+
+
+async def test_r3_a_forced_reload_never_cuts_requests_someone_else_labelled() -> None:
+    manager, supervisor = manager_with()
+    grant = await manager.grant_lease(
+        [0, 1],
+        holder=A,
+        holder_key=KEY,
+        instances=[{"model": MODEL, "launch": {"ctx_size": 4096}}],
+    )
+    copy = grant.instances[0]["id"]
+    me = Caller(client=A, key=KEY)
+    streams(supervisor.get(copy), "chat-app")
+    with pytest.raises(StudioForgeError) as busy:
+        await manager.load(copy, ctx_size=4096, force=True, caller=me)
+    assert busy.value.code == "instance_in_use"
+    assert busy.value.details["in_flight_clients"] == ["chat-app"]
+    with pytest.raises(StudioForgeError):
+        await manager.load(MODEL, lease_id=grant.lease.id, force=True, caller=me)
+    # Its own labelled requests, or unlabeled ones (a peer address), do not stop it.
+    streams(supervisor.get(copy), A)
+    reloaded = await manager.load(copy, ctx_size=4096, force=True, caller=me)
+    streams(reloaded, "127.0.0.1")
+    reloaded = await manager.load(copy, ctx_size=4096, force=True, caller=me)
+    streams(reloaded, "chat-app")
+    assert await manager.load(copy, ctx_size=4096, force=True, caller=Caller(admin=True))
+
+
+async def test_r3_mcp_a_shared_key_must_name_the_copys_own_lease(
+    state: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from studioforge import mcp_policy
+    from studioforge.authkeys import Principal
+
+    grant = await state.manager.grant_lease(
+        [0], holder="mb-a", holder_key="key:ks", instances=[{"model": TINY, "load": False}]
+    )
+    copy = grant.instances[0]["id"]
+    server = build_management_mcp(state)
+    busy = InstanceInfo(model_id=copy, state="ready")
+    streams(busy, "mb-a")
+    real_get = state.supervisor.get
+    monkeypatch.setattr(
+        state.supervisor, "get", lambda model_id: busy if model_id == copy else real_get(model_id)
+    )
+    # The SAME key as the lease's: on MCP it still does not say which holder calls.
+    token = mcp_policy._CALLER.set(Principal("key", "ks", "bench", "inference"))  # noqa: SLF001
+    try:
+        unnamed = await call(server, "load_model", model_id=copy, force=True)
+        shaped = await call(server, "load_recommended", model_id=copy, ctx_size=4096)
+        named = await call(server, "load_model", model_id=copy, force=True, lease_id=grant.lease.id)
+    finally:
+        mcp_policy._CALLER.reset(token)  # noqa: SLF001
+    assert unnamed["ok"] is False and unnamed["error"]["code"] == "instance_held", unnamed
+    assert shaped["ok"] is False and shaped["error"]["code"] == "instance_held", shaped
+    assert named["ok"] is False and named["error"]["code"] == "instance_in_use", named
