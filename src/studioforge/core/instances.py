@@ -475,6 +475,11 @@ class Caller:
     key: str | None = None
     admin: bool = False
     peer: str | None = None
+    #: Whether the key alone may identify the holder. ``False`` on the MCP
+    #: plane, which sees no ``X-SF-Client``: there a key shared by two holders
+    #: could never be told apart, so a copy is named by its own lease
+    #: (``lease_id``) or acted on by an admin (D91, R3).
+    key_proves: bool = True
 
     @property
     def anonymous(self) -> bool:
@@ -488,7 +493,8 @@ def _same(left: str | None, right: str | None) -> bool:
 def label_vouches(label: str | None, lease: GpuLease) -> bool:
     """Whether an ``X-SF-Client`` label is compatible with being ``lease``'s holder.
 
-    No label (it claims nothing), the holder's name exactly, or exactly the
+    No label (it claims nothing), the holder's name exactly, the label the
+    lease was taken with (``holder_label``, migration 013), or exactly the
     holder's family root -- ``crucibleforge`` for a lease held as
     ``crucibleforge-judge``, the compatibility case D55 was written for. Any
     other label -- ``bench-run-p`` for a lease held as ``bench-run-d``, same
@@ -499,7 +505,28 @@ def label_vouches(label: str | None, lease: GpuLease) -> bool:
     text = (label or "").strip()
     if not text:
         return True
-    return _same(text, lease.holder) or _same(text, holder_family(lease.holder))
+    return (
+        _same(text, lease.holder)
+        or _same(text, getattr(lease, "holder_label", None))
+        or _same(text, holder_family(lease.holder))
+    )
+
+
+def exact_owners(label: str | None, leases: Iterable[GpuLease]) -> set[str]:
+    """Ids of the standing leases whose holder name or recorded label IS ``label``.
+
+    An exact match is the strongest thing a label says: when ``crucibleforge``
+    and ``crucibleforge-judge`` both hold leases, ``crucibleforge`` means the
+    first one only -- never the second through the family root.
+    """
+    text = (label or "").strip()
+    if not text:
+        return set()
+    return {
+        lease.id
+        for lease in leases
+        if _same(text, lease.holder) or _same(text, getattr(lease, "holder_label", None))
+    }
 
 
 def names_other_holder(caller: Caller, lease: GpuLease, leases: Iterable[GpuLease]) -> bool:
@@ -511,9 +538,13 @@ def names_other_holder(caller: Caller, lease: GpuLease, leases: Iterable[GpuLeas
     inference key, and a key match alone made holder B holder A on 2026-11-14 --
     whether or not B held a lease of its own at that moment.
     """
-    del leases  # kept for the call shape; the label alone decides
     if caller.lease_ids and lease.id not in caller.lease_ids:
         return True
+    exact = exact_owners(caller.client, leases)
+    if exact:
+        # The label IS some standing holder (or the label one was taken with):
+        # that exact match wins over any family-root reading.
+        return lease.id not in exact
     return not label_vouches(caller.client, lease)
 
 
@@ -527,16 +558,20 @@ def claims(caller: Caller | None, lease: GpuLease, leases: Iterable[GpuLease]) -
     act on its own: the routes add D55's proof (``lease_holder_may_act``)
     before anything is taken down.
     """
-    del leases
     if caller is None or caller.anonymous:
         return False
     if caller.lease_ids:
         return lease.id in caller.lease_ids
     if caller.client:
-        if _same(caller.client, lease.holder):
-            return True
+        exact = exact_owners(caller.client, leases)
+        if exact or _same(caller.client, lease.holder):
+            # An exact match wins: this lease is the caller's only if the label
+            # names it, never through the family root beside another's exact match.
+            return lease.id in exact or _same(caller.client, lease.holder)
         if not label_vouches(caller.client, lease):
             return False
+    if not caller.key_proves:
+        return False
     return bool(caller.key and lease.holder_key and caller.key == lease.holder_key)
 
 
@@ -562,6 +597,35 @@ def other_clients(instance: InstanceInfo | None, caller: Caller | None) -> list[
         # Requests past the bounded in-flight window carry no name: they may be
         # anyone's, so they count as somebody else's.
         names.append("unknown")
+    return names
+
+
+def labelled_others(instance: InstanceInfo | None, caller: Caller | None) -> list[str]:
+    """In-flight clients that LABELLED their requests as someone other than ``caller``.
+
+    An in-flight record names the ``X-SF-Client`` label, else the peer address,
+    else nothing (in-process). Only the first is a statement of who a request
+    belongs to, so only labels count here: a forced reload never cuts a
+    request somebody else labelled as theirs (D91, R3).
+    """
+    if instance is None or instance.active_requests <= 0:
+        return []
+    import ipaddress
+
+    names: list[str] = []
+    for entry in instance.in_flight:
+        who = (entry.client or "").strip()
+        if not who:
+            continue
+        try:
+            ipaddress.ip_address(who)
+            continue  # a peer address: not a label
+        except ValueError:
+            pass
+        if caller is not None and _same(who, caller.client):
+            continue
+        if who not in names:
+            names.append(who)
     return names
 
 

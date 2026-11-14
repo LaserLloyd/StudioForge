@@ -42,6 +42,7 @@ from studioforge.core.instances import (
     instance_not_found,
     instance_released,
     instance_row,
+    labelled_others,
     loaded_shape,
     numbered_id,
     other_clients,
@@ -6383,6 +6384,33 @@ class ModelManager:
             },
         )
 
+    def _refuse_reloading_labelled(self, model_id: str, caller: Caller, *, what: str) -> None:
+        """409 ``instance_in_use`` before a non-admin forced reload cuts others' labelled requests.
+
+        A forced reload stops the running child, and every request on it with
+        it. Requests their senders labelled as someone else's (``X-SF-Client``)
+        are never cut that way -- even by the copy's own lease (a key may be
+        shared, D91 R3); an admin may.
+        """
+        clients = labelled_others(self.supervisor.get(model_id), caller)
+        if not clients:
+            return
+        instance = self.supervisor.get(model_id)
+        raise StudioForgeError(
+            f"Refusing {what}: '{model_id}' is serving requests labelled by {', '.join(clients)}, "
+            f"and a forced reload would cut them. Wait for them to finish (Retry-After); only an "
+            f"admin may cut another client's requests.",
+            code="instance_in_use",
+            status_code=409,
+            param="force",
+            details={
+                "model_id": model_id,
+                "in_flight": int(instance.active_requests) if instance is not None else 0,
+                "in_flight_clients": clients,
+                "retry_after_s": BUSY_RETRY_AFTER_S,
+            },
+        )
+
     def _retarget_load(
         self,
         name: str,
@@ -6436,6 +6464,8 @@ class ModelManager:
                 and not claims(caller, lease, standing)
             ):
                 raise instance_held(record.id, lease, what=what)
+            if force and caller is not None and not caller.admin:
+                self._refuse_reloading_labelled(record.id, caller, what=what)
             return record.id, None, None
         serving = self.serving_record(record)
         if lease_id is not None:
@@ -6452,6 +6482,8 @@ class ModelManager:
                     and not claims(caller, bound, standing)
                 ):
                     raise instance_held(chosen, bound, what=what)
+                if force and caller is not None and not caller.admin:
+                    self._refuse_reloading_labelled(chosen, caller, what=what)
                 return chosen, None, None
             held = self._held_by_other(
                 serving.id, caller=caller, lease=bound, cards=devices or bound.devices
@@ -6537,6 +6569,7 @@ class ModelManager:
         avoid: Sequence[int] = (),
         count: int | None = None,
         instances: Sequence[Any] | None = None,
+        holder_label: str | None = None,
     ) -> LeaseGrant:
         """Give ``devices`` to ``model_ids`` (or to nobody) until released or idle.
 
@@ -6826,6 +6859,7 @@ class ModelManager:
             vacate_token=vacate_token,
             holder_peer=holder_peer,
             holder_key=holder_key,
+            holder_label=holder_label,
         )
         evicted: list[dict[str, Any]] = []
         try:

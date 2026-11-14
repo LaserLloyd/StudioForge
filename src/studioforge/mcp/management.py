@@ -1841,8 +1841,11 @@ def build_management_mcp(state: Any) -> MCPServer:
         ``load_model`` and ``load_recommended`` are ``inference`` scope: a tenant's
         key may call them, so they carry the caller like the REST routes do --
         the key, the lease it binds to, and admin only for an admin credential
-        (or an in-process call). A non-admin key reloading or reshaping another
-        holder's instance is then 409 ``instance_held``.
+        (or an in-process call). The key alone never identifies the holder here
+        (no label to tell two holders sharing it apart): a non-admin forced or
+        shaped load of a copy must name the copy's own lease (``lease_id``), or
+        it is 409 ``instance_held``; a forced reload of a copy serving requests
+        someone else labelled is 409 ``instance_in_use`` even then.
         """
         principal = current_principal()
         admin = principal is None or principal.allows("admin")
@@ -1851,7 +1854,11 @@ def build_management_mcp(state: Any) -> MCPServer:
             if principal is not None and principal.kind == "key" and principal.id
             else None
         )
-        return Caller(lease_ids=(lease_id,) if lease_id else (), key=key, admin=admin)
+        # key_proves=False (R3): MCP sees no X-SF-Client, so a key two holders
+        # share cannot say which of them calls; a copy is named by its lease.
+        return Caller(
+            lease_ids=(lease_id,) if lease_id else (), key=key, admin=admin, key_proves=False
+        )
 
     def _caller_key() -> str | None:
         """``key:<id>`` of the scoped key calling this tool, else ``None`` (as ``key_owner_of``)."""

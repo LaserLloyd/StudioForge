@@ -43,7 +43,7 @@ from studioforge.core.benchmark import (
     available_modes,
 )
 from studioforge.core.diskspace import disk_report
-from studioforge.core.instances import Caller, names_other_holder
+from studioforge.core.instances import Caller, exact_owners, names_other_holder
 from studioforge.core.leases import (
     LEASE_DEPRECATED_FIELDS,
     VACATE_TOKEN_HEADER,
@@ -180,10 +180,10 @@ def lease_holder_may_act(request: Request, state: Any, lease: Any) -> bool:
         standing = list(state.manager.leases.all())
     except Exception:  # noqa: BLE001 - a stub state without a book has nobody else to name
         standing = []
-    if caller.client and any(
-        other.id != lease.id and other.holder.strip().lower() == caller.client.strip().lower()
-        for other in standing
-    ):
+    exact = exact_owners(caller.client, [*standing, lease])
+    if exact and lease.id not in exact:
+        # The label IS another standing holder (or the label one was taken
+        # with): that exact match wins over any family reading (D91, R2).
         return False
     principal = principal_of(request)
     owner = getattr(lease, "holder_key", None)
@@ -749,6 +749,9 @@ async def create_lease(
         avoid=avoid or [],
         count=count,
         instances=instances,
+        # D91: the exact label this holder sends, which then vouches for it even
+        # when it differs from the holder name (``openclaw`` / ``openclaw-main``).
+        holder_label=client_label or None,
     )
     return lease_grant_reply(grant, gpu_uuids=_lease_uuids(state), live=_live(state, grant.lease))
 
