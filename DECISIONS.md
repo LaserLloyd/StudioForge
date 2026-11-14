@@ -8217,7 +8217,8 @@ per copy, with parity the client's burden (B.1).
    `min_slots`/`max_slots`, `kv_cache_type`, `kv_cache_type_v` -- any other key is 400
    `launch_key_not_allowed`. Placement follows the instance's cards (`device_override` = `gpus`,
    the lease's cards by default; `allowed_devices` cleared; `main_gpu`/`draft_device_override`
-   cleared when off them) and it is never pinned (its life is its lease's).
+   cleared when off them) and it is never pinned (its life is its lease's). It has no settings of
+   its own: a settings save, a virtual-model delete or a `persist` on it is 400 `unsupported`.
 3. **All or nothing.** Instances with `load: true` (the default) load before the grant returns and
    are reported as actually loaded (`id`, `model` -- the exact chat string -- `devices`,
    `ctx_per_slot`, `parallel`, `kv_cache_type(_v)`, `state`, `engine_tag`). One failure unloads the
@@ -8244,8 +8245,9 @@ per copy, with parity the client's burden (B.1).
    several is 409 `instance_ambiguous`); another holder's instance only on its exact id, admin AND
    `force` (409 `instance_held`). `force` on the REST, native and LM Studio unload routes is only
    what the caller sent -- the D55 waiver rides apart (`lease_ok`) -- and a lease-held model serving
-   another client's requests is 409 `instance_in_use` naming them unless `force`. The GUI and MCP
-   operator surfaces keep their explicit force.
+   another client's requests is 409 `instance_in_use` naming them unless `force` (requests past
+   the bounded in-flight window count as another client's). The GUI and MCP operator surfaces keep
+   their explicit force.
 8. **Lifecycle.** Instances belong to their lease. Release (`?unload=false` too), idle expiry and
    every other end: the ids become unreachable at once, the children stop busy or not (in flight:
    410 `instance_released`, or an SSE error frame mid-stream), the records go, then the lease.

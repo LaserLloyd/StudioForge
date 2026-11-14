@@ -265,6 +265,15 @@ def test_a_restart_restores_the_copies_unloaded_and_loads_the_stored_shape(
                 json={"model": model, "messages": MESSAGES, "max_tokens": 4},
             )
             assert reply.status_code == 200 and reply.headers["X-SF-Model"] == model
+        # Not a virtual model: nothing in the virtual-model table, only the lease row.
+        assert state.db.list_virtual_models() == []
+        # The base cannot be deleted from under a resident copy (D86's guard holds).
+        refused = client.delete(f"/api/models/{MODEL}")
+        assert refused.status_code == 409, refused.text
+        assert refused.json()["error"]["code"] == "model_loaded"
+        # A second lease on the same cards is a conflict, never a takeover.
+        clash = client.post("/api/leases", json={"devices": [0], "holder": "other"})
+        assert clash.status_code == 409 and clash.json()["error"]["code"] == "lease_conflict"
 
     # The process ends and a new one starts on the same data directory.
     reborn, reborn_state = _app(cfg)

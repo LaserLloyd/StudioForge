@@ -564,7 +564,10 @@ async def router_list_models(
         await asyncio.to_thread(state.registry.scan, force=False)
     arch_memo: dict[Any, Any] = {}
     # D91: a lease's instances are models a client may name, so they are listed too.
-    records = state.registry.all(include_ephemeral=True)
+    try:
+        records = state.registry.all(include_ephemeral=True)
+    except TypeError:  # a registry stand-in without lease instances
+        records = state.registry.all()
     data = [_router_entry(state, record, arch_memo) for record in records]
     return JSONResponse({"object": "list", "data": data})
 

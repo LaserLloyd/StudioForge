@@ -181,8 +181,8 @@ def test_migration_008_creates_the_lease_table(db: Database) -> None:
     columns = {
         row["name"]: row for row in db.connect().execute("PRAGMA table_info(gpu_leases)").fetchall()
     }
-    # 008 created these; 010 (2.0.1) added the owning key
-    assert set(columns) == LEASE_COLUMNS | {"holder_key"}
+    # 008 created these; 010 (2.0.1) added the owning key; 012 (D91) the lease's instances
+    assert set(columns) == LEASE_COLUMNS | {"holder_key", "instances_json"}
     assert columns["id"]["pk"] == 1
     for required in ("devices_json", "holder", "model_ids_json", "created_at", "updated_at"):
         assert columns[required]["notnull"] == 1, required
@@ -306,6 +306,7 @@ def test_acquire_writes_a_row_with_every_field_including_token_and_peer(db: Data
         "vacate_token": TOKEN,
         "holder_peer": PEER,
         "holder_key": HOLDER_KEY,
+        "instances": [],
     }
     assert "vacate_token" not in lease.model_dump(), "still excluded from every API dump"
 
