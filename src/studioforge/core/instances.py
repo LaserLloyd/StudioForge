@@ -10,8 +10,8 @@ This module is the vocabulary of the fix; :class:`~studioforge.core.manager.
 ModelManager` does the work.
 
 * **Ids** follow LM Studio's instance identifiers: an instance created without
-  a tag is ``<model>:<n>``, ``n`` the smallest free integer from 2 (the base
-  resident is the plain id, the first copy ``:2``); a client may ask for a tag
+  a tag is ``<model>:<n>``, numbered from 2 and never reused while the server
+  runs (the base resident is the plain id, the first copy ``:2``); a client may ask for a tag
   instead, ``<model>@<tag>`` -- the existing virtual-copy convention. Either
   works in the ``model`` field of every OpenAI-shape and native route.
 * **Parity is a server guarantee.** An instance's record is a deep copy of its
@@ -105,8 +105,9 @@ def parse_numbered_id(model_id: str) -> tuple[str, int] | None:
 def next_free_number(base_id: str, taken: Any, *, start: int = FIRST_INSTANCE_NUMBER) -> int:
     """The smallest ``n >= start`` whose ``<base>:<n>`` ``taken(id)`` says is free.
 
-    Gaps are reused: with ``:2`` released and ``:3`` standing, the next copy is
-    ``:2`` again.
+    A building block: the manager starts it above every number it handed out
+    this run (``ModelManager._next_instance_id``), so released numbers are not
+    reused while the server runs.
     """
     number = max(FIRST_INSTANCE_NUMBER, int(start))
     while taken(numbered_id(base_id, number)):
@@ -293,7 +294,7 @@ def parse_instance_requests(raw: Any) -> list[InstanceRequest]:
 def instance_ids_for(
     request: InstanceRequest, base_id: str, taken: Any, reserved: set[str]
 ) -> list[str]:
-    """The ids ``request`` would create: tagged, or numbered with gaps reused.
+    """The ids ``request`` would create: tagged, or numbered from the first free one.
 
     ``taken(id)`` answers for everything already standing (ids, aliases);
     ``reserved`` holds the ids earlier entries of the same call claimed, and is
@@ -479,69 +480,81 @@ class Caller:
     def anonymous(self) -> bool:
         return not (self.lease_ids or self.client or self.key)
 
-    @property
-    def label(self) -> str | None:
-        """What this caller's in-flight records are stamped with: the label, else the peer."""
-        return self.client or self.peer
-
 
 def _same(left: str | None, right: str | None) -> bool:
     return bool(left) and bool(right) and str(left).strip().lower() == str(right).strip().lower()
 
 
-def names_other_holder(caller: Caller, lease: GpuLease, leases: Iterable[GpuLease]) -> bool:
-    """Whether ``caller`` identifies as someone OTHER than ``lease``'s holder (8a).
+def label_vouches(label: str | None, lease: GpuLease) -> bool:
+    """Whether an ``X-SF-Client`` label is compatible with being ``lease``'s holder.
 
-    True when it names another lease, or sends a label that is not this
-    holder's and is either another standing lease's holder exactly or of a
-    different family (a label that matches no standing holder but shares the
-    family -- ``crucibleforge`` for ``crucibleforge-judge`` -- is not a claim
-    to be someone else, and the D55 rules decide as before). Then a key the
-    two share proves nothing: every bench run on one client shares one
-    inference key, and a key match alone made holder B holder A on 2026-11-14.
+    No label (it claims nothing), the holder's name exactly, or exactly the
+    holder's family root -- ``crucibleforge`` for a lease held as
+    ``crucibleforge-judge``, the compatibility case D55 was written for. Any
+    other label -- ``bench-run-p`` for a lease held as ``bench-run-d``, same
+    family or not -- is a claim to be somebody else.
     """
     from studioforge.core.leases import holder_family
 
+    text = (label or "").strip()
+    if not text:
+        return True
+    return _same(text, lease.holder) or _same(text, holder_family(lease.holder))
+
+
+def names_other_holder(caller: Caller, lease: GpuLease, leases: Iterable[GpuLease]) -> bool:
+    """Whether ``caller`` identifies as someone OTHER than ``lease``'s holder (8a).
+
+    True when it names another lease (``X-SF-Lease`` / ``lease_id``), or sends
+    a label that does not vouch for this holder (:func:`label_vouches`). Then a
+    key the two share proves nothing: every bench run on one client shares one
+    inference key, and a key match alone made holder B holder A on 2026-11-14 --
+    whether or not B held a lease of its own at that moment.
+    """
+    del leases  # kept for the call shape; the label alone decides
     if caller.lease_ids and lease.id not in caller.lease_ids:
         return True
-    label = (caller.client or "").strip()
-    if not label or _same(label, lease.holder):
-        return False
-    if any(_same(label, other.holder) for other in leases if other.id != lease.id):
-        return True
-    return holder_family(label) != holder_family(lease.holder)
+    return not label_vouches(caller.client, lease)
 
 
 def claims(caller: Caller | None, lease: GpuLease, leases: Iterable[GpuLease]) -> bool:
     """Whether ``caller`` identifies as ``lease``'s holder, for routing and targeting.
 
-    The lease id it names, else its label equal to the holder (exactly, case
-    aside), else -- when its label is no standing holder's -- the key that took
-    the lease. Not a proof for a destructive act on its own: the routes add
-    D55's proof (``lease_holder_may_act``) before anything is taken down.
+    The lease id it names; else its label equal to the holder (exactly, case
+    aside); else -- with no label, or exactly the holder's family root -- the
+    key that took the lease. A label that is anybody else's stops there: the key
+    it shares with the holder is not identity. Not a proof for a destructive
+    act on its own: the routes add D55's proof (``lease_holder_may_act``)
+    before anything is taken down.
     """
+    del leases
     if caller is None or caller.anonymous:
         return False
-    standing = list(leases)
     if caller.lease_ids:
         return lease.id in caller.lease_ids
     if caller.client:
         if _same(caller.client, lease.holder):
             return True
-        if any(_same(caller.client, other.holder) for other in standing):
+        if not label_vouches(caller.client, lease):
             return False
     return bool(caller.key and lease.holder_key and caller.key == lease.holder_key)
 
 
 def other_clients(instance: InstanceInfo | None, caller: Caller | None) -> list[str]:
-    """In-flight clients on ``instance`` that are not ``caller`` (``in-process`` for none)."""
+    """In-flight clients on ``instance`` that are not ``caller`` (``in-process`` for none).
+
+    A request is the caller's own only when it carried the caller's own
+    ``X-SF-Client`` label. Never on the peer address: every tenant of one box
+    is ``127.0.0.1``, so a peer match would make the first holder's unlabeled
+    streams the second holder's to cut. A caller with no label owns none.
+    """
     if instance is None or instance.active_requests <= 0:
         return []
-    mine = caller.label if caller is not None else None
+    mine = caller.client if caller is not None else None
     names: list[str] = []
     for entry in instance.in_flight:
         who = entry.client or "in-process"
-        if mine and _same(who, mine):
+        if mine and entry.client and _same(entry.client, mine):
             continue
         if who not in names:
             names.append(who)

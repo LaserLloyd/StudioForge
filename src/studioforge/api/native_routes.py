@@ -734,7 +734,7 @@ async def router_load_model(
     source = attributed_source("api:/models/load", client_of(request))
     extra: dict[str, Any] = {"lease_id": lease_id} if lease_id else {}
     # D91: whose instance a base id means, and the copy a second holder gets.
-    extra["caller"] = request_caller(state, request)
+    extra["caller"] = request_caller(state, request, [lease_id] if lease_id else ())
     if route == "load":
         instance = await state.manager.load(
             record.id,

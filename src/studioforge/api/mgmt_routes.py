@@ -68,6 +68,7 @@ from studioforge.core.parallel_bench import (
     ParallelBenchmarker,
 )
 from studioforge.errors import (
+    AuthError,
     BadRequestError,
     ModelBusyError,
     ModelNotFoundError,
@@ -164,22 +165,35 @@ def lease_holder_may_act(request: Request, state: Any, lease: Any) -> bool:
       peer proves nothing: it would let one tenant's key act on another's.
 
     **Holder identity first (D91, 8a).** A caller that names ANOTHER lease
-    (``X-SF-Lease`` / ``?lease_id=``) or another holder (an ``X-SF-Client`` that
-    is a different standing lease's holder, or of another family) is not this
-    lease's holder -- not even with the key that took it. Every bench run on
-    one client shares one inference key, and on 2026-11-14 that key made holder
-    B holder A: B's unload of A's model ran as a forced unload and cut A's
-    streams.
+    (``X-SF-Lease`` / ``lease_id``) or another standing lease's holder exactly
+    is not this lease's holder -- by any proof. And the key that took the lease
+    proves holdership only for a caller whose ``X-SF-Client`` vouches for the
+    holder (none, the holder's name, or exactly its family root): every bench
+    run on one client shares one inference key, and on 2026-11-14 that key made
+    holder B holder A -- B's unload of A's model ran as a forced unload and cut
+    A's streams. The token and peer proofs keep D55's family match.
     """
+    caller = caller_of(request, state)
+    if caller.lease_ids and lease.id not in caller.lease_ids:
+        return False
     try:
-        standing = state.manager.leases.all()
+        standing = list(state.manager.leases.all())
     except Exception:  # noqa: BLE001 - a stub state without a book has nobody else to name
         standing = []
-    if names_other_holder(caller_of(request, state), lease, standing):
+    if caller.client and any(
+        other.id != lease.id and other.holder.strip().lower() == caller.client.strip().lower()
+        for other in standing
+    ):
         return False
     principal = principal_of(request)
     owner = getattr(lease, "holder_key", None)
-    if owner and principal is not None and principal.kind == "key" and principal.actor == owner:
+    if (
+        owner
+        and principal is not None
+        and principal.kind == "key"
+        and principal.actor == owner
+        and not names_other_holder(caller, lease, standing)
+    ):
         return True
     headers = getattr(request, "headers", None)
     label = ((headers.get("x-sf-client") if headers is not None else None) or "").strip()
@@ -616,8 +630,8 @@ async def create_lease(
     **Instances (D91).** ``instances`` asks for copies of a model on these cards,
     in Triton's ``instance_group`` shape: ``[{"model": X, "count"?: 1, "gpus"?:
     [..], "tag"?: "mb-a", "launch"?: {...}, "load"?: true}]``. Each copy's id is
-    LM Studio's ``X:<n>`` (``n`` the smallest free integer from 2; the base is
-    plain ``X``) or ``X@<tag>`` -- the string to put in ``model`` on every
+    LM Studio's ``X:<n>`` (numbered from 2, never reused while the server runs;
+    the base is plain ``X``) or ``X@<tag>`` -- the string to put in ``model`` on every
     OpenAI-shape and native route. ``launch`` may set ``ctx_size`` (alias
     ``context_length``), ``parallel`` or ``min_slots``/``max_slots``,
     ``kv_cache_type``, ``kv_cache_type_v``; any other key is 400
@@ -760,7 +774,9 @@ def lease_grant_reply(grant: Any, *, gpu_uuids: Any = None, live: Any = None) ->
     return body
 
 
-def _require_lease_owner(state: Any, request: Request, lease_id: str) -> None:
+def _require_lease_owner(
+    state: Any, request: Request, lease_id: str, *, caller: Caller | None = None
+) -> None:
     """403 unless this caller may act on lease ``lease_id`` (see ``auth.require_owner``).
 
     An unknown id is left for the manager to answer with its usual 404, so the
@@ -770,10 +786,33 @@ def _require_lease_owner(state: Any, request: Request, lease_id: str) -> None:
     taken keyless or before 2.0.1, or by a key since revoked -- can still be
     released by the tenant that took it instead of holding its card until the
     idle TTL.
+
+    D91 (8a): a non-admin caller that identifies as another holder -- it names
+    another lease, or its ``X-SF-Client`` does not vouch for this holder -- is
+    refused 403 before the key is consulted, whatever key it shares. That
+    covers binding a load to the lease (body or query ``lease_id``), releasing
+    and renewing it, and naming it in ``X-SF-Lease``.
     """
     lease = state.manager.leases.get(lease_id)
     if lease is None or lease_holder_may_act(request, state, lease):
         return
+    who = caller if caller is not None else caller_of(request, state)
+    if not is_admin_caller(request, state.config):
+        try:
+            standing = list(state.manager.leases.all())
+        except Exception:  # noqa: BLE001 - a stub book
+            standing = []
+        if names_other_holder(who, lease, standing):
+            raise AuthError(
+                f"lease {lease_id} is held by {lease.holder!r}, and this caller identifies as "
+                f"someone else ("
+                + (f"X-SF-Client {who.client!r}" if who.client else f"lease {who.lease_ids}")
+                + "). A shared API key does not make one holder another (D91): send the "
+                "holder's own X-SF-Client, or act on your own lease.",
+                code="permission_denied",
+                status_code=403,
+                details={"lease_id": lease_id, "holder": lease.holder},
+            )
     require_owner(request, lease.holder_key, f"lease {lease_id}")
 
 
@@ -1479,7 +1518,7 @@ async def load_model(
     state = _state(request)
     lease = _bound_lease_id(state, request, lease_id, lease_id_query)
     route = f"api:/api/leases/{lease}" if lease else "api:/api/models/{id}/load"
-    caller = request_caller(state, request)
+    caller = request_caller(state, request, [lease] if lease else ())
     instance = await state.manager.load(
         model_id,
         ctx_size=ctx_size,
@@ -1507,7 +1546,7 @@ def request_caller(state: Any, request: Request, lease_ids: Any = ()) -> Caller:
     """
     caller = caller_of(request, state, lease_ids=lease_ids)
     for lease_id in caller.lease_ids:
-        _require_lease_owner(state, request, lease_id)
+        _require_lease_owner(state, request, lease_id, caller=caller)
     return caller
 
 
@@ -1749,7 +1788,7 @@ async def load_recommended(
         min_slots=min_slots,
         kv_unified=kv_unified,
         lease_id=lease,
-        caller=request_caller(state, request),
+        caller=request_caller(state, request, [lease] if lease else ()),
     )
     return instance.model_dump(mode="json")
 

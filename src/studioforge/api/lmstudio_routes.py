@@ -233,11 +233,23 @@ async def v1_unload_model(request: Request) -> JSONResponse:
     if not isinstance(name, str) or not name.strip():
         raise BadRequestError("'instance_id' is required", param="instance_id")
     name = name.strip()
+    from studioforge.api.mgmt_routes import request_caller, unload_for_request
+
+    force = bool(body.get("force"))
+    # D91: a base id from a holder means its own copy -- decided BEFORE "is anything
+    # loaded", or a caller whose only loaded instance is its copy reads a 404.
+    targeter = getattr(state.manager, "unload_target", None)
+    if targeter is not None and state.registry.resolve(name) is not None:
+        name = targeter(name, request_caller(state, request), force=force)
 
     instance_id = next((i.model_id for i in state.supervisor.list() if i.model_id == name), None)
     if instance_id is None:
         record = state.registry.resolve(name)
         if record is None:
+            gone = getattr(state.manager, "instance_gone_error", None)
+            error = gone(name) if gone is not None else None
+            if error is not None:
+                raise error
             raise ModelNotFoundError(name, known=state.registry.known_ids())
         instance_id = state.manager.serving_record(record).id
         if state.supervisor.get(instance_id) is None:
@@ -247,12 +259,8 @@ async def v1_unload_model(request: Request) -> JSONResponse:
                 code="instance_not_found",
                 status_code=404,
             )
-    from studioforge.api.mgmt_routes import unload_for_request
-
     # D91 (8a): holder identity picks and guards the target; force only when sent.
-    target, _unloaded = await unload_for_request(
-        state, request, instance_id, force=bool(body.get("force"))
-    )
+    target, _unloaded = await unload_for_request(state, request, instance_id, force=force)
     return JSONResponse({"instance_id": target})
 
 
