@@ -544,6 +544,7 @@ def test_migrate_dry_run_changes_nothing(scratch: Path) -> None:
         {"version": 10, "name": "010_lease_holder_key.sql"},
         {"version": 11, "name": "011_observation_device_class.sql"},
         {"version": 12, "name": "012_lease_instances.sql"},
+        {"version": 13, "name": "013_lease_holder_label.sql"},
     ]
     assert summary["dry_run"] is True and "backup" not in summary
     assert db.read_bytes() == before
@@ -557,7 +558,7 @@ def test_migrate_applies_after_taking_a_backup(scratch: Path) -> None:
     old_database(db)
     result = invoke(scratch, "migrate", "--json")
     summary = json.loads(result.stdout)
-    assert summary["applied"] == [10, 11, 12] and summary["current"] == 12
+    assert summary["applied"] == [10, 11, 12, 13] and summary["current"] == 13
     backup = Path(summary["backup"])
     assert backup.is_file() and backup.name == "registry.sqlite3"
     assert backup.parent.parent.name == "backups" and "schema9" in backup.parent.name
@@ -570,7 +571,7 @@ def test_migrate_applies_after_taking_a_backup(scratch: Path) -> None:
     now = sqlite3.connect(db)
     try:
         columns = {row[1] for row in now.execute("PRAGMA table_info(gpu_leases)")}
-        assert "holder_key" in columns and "instances_json" in columns
+        assert {"holder_key", "instances_json", "holder_label"} <= columns
     finally:
         now.close()
     assert "current" in invoke(scratch, "migrate").output  # nothing left
@@ -595,7 +596,7 @@ def test_migrate_prunes_only_its_own_backup_folders(scratch: Path) -> None:
 
 def test_migrate_with_no_database_previews_the_whole_chain(scratch: Path) -> None:
     summary = json.loads(invoke(scratch, "migrate", "--dry-run", "--json").stdout)
-    assert summary["exists"] is False and summary["current"] == 0 and len(summary["pending"]) == 12
+    assert summary["exists"] is False and summary["current"] == 0 and len(summary["pending"]) == 13
 
 
 def test_doctor_text_and_json_and_exit_codes(scratch: Path) -> None:

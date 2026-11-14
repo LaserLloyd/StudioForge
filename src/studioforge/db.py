@@ -39,7 +39,7 @@ log = get_logger(__name__)
 
 #: Highest migration version this build of the code ships. ``migrate()``
 #: brings any older database up to this.
-SCHEMA_VERSION: int = 12
+SCHEMA_VERSION: int = 13
 
 #: SQLite's own words for "this file is not a usable database". Only a message
 #: carrying one of these is treated as corruption by ``migrate_with_recovery``;
@@ -1184,6 +1184,8 @@ class Database:
             "vacate_token": row.get("vacate_token"),
             "holder_peer": row.get("holder_peer"),
             "holder_key": row.get("holder_key"),
+            # D91 (migration 013): the X-SF-Client label the lease was taken with.
+            "holder_label": row.get("holder_label"),
             # D91 (migration 012): the instances the lease created, with their specs.
             "instances_json": json.dumps(list(row.get("instances") or []), default=str),
             "updated_at": float(row.get("updated_at") or now),

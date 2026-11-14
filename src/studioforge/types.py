@@ -1501,6 +1501,12 @@ class GpuLease(BaseModel):
     #: owner or local caller, or a lease from before this field) means only an
     #: ``admin`` caller may touch it. Excluded from every dump.
     holder_key: str | None = Field(default=None, exclude=True, repr=False)
+    #: The ``X-SF-Client`` label the lease was taken with (D91, migration 013),
+    #: when it differs from nothing: a holder that leases as ``openclaw`` and
+    #: labels its requests ``openclaw-main`` is that holder by this exact label.
+    #: ``None`` for a lease taken without one, or restored from an older row.
+    #: Excluded from every dump, like ``holder_peer``.
+    holder_label: str | None = Field(default=None, exclude=True, repr=False)
     #: The instances this lease created (D91). Each id is also in
     #: ``model_ids``, so the planner, the eviction ladders and the release
     #: treat it as the lease's own model.

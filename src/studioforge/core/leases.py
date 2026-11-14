@@ -252,6 +252,7 @@ def lease_row(lease: GpuLease) -> dict[str, Any]:
         "vacate_token": lease.vacate_token,
         "holder_peer": lease.holder_peer,
         "holder_key": lease.holder_key,
+        "holder_label": lease.holder_label,
         # D91: the instances the lease created, spec and last-loaded shape.
         "instances": [spec.model_dump(mode="json") for spec in lease.instances],
         "updated_at": time.time(),
@@ -275,6 +276,7 @@ def lease_from_row(row: Mapping[str, Any]) -> GpuLease:
         vacate_token=row.get("vacate_token") or None,
         holder_peer=row.get("holder_peer") or None,
         holder_key=row.get("holder_key") or None,
+        holder_label=row.get("holder_label") or None,
         instances=_instances_from_row(row),
     )
 
@@ -433,6 +435,7 @@ class LeaseBook:
         holder_peer: str | None = None,
         holder_key: str | None = None,
         now: float | None = None,
+        holder_label: str | None = None,
     ) -> GpuLease:
         """Record a lease, or raise :class:`LeaseConflictError` if a card is taken.
 
@@ -474,6 +477,7 @@ class LeaseBook:
             vacate_token=token,
             holder_peer=(holder_peer or "").strip() or None,
             holder_key=(holder_key or "").strip() or None,
+            holder_label=(holder_label or "").strip() or None,
         )
         self._leases[lease.id] = lease
         self._persist(lease, at=stamp)

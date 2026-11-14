@@ -1,0 +1,13 @@
+-- 013_lease_holder_label.sql: the X-SF-Client label a GPU lease was taken with (D91).
+--
+-- Holder identity decides whose lease and whose instance a request means, and the
+-- key that took a lease proves holdership only beside a label that vouches for the
+-- holder. A client may lease under one name (`openclaw`) and label its requests
+-- with another (`openclaw-main`): the label it sent when it took the lease is
+-- recorded here so that exact label keeps vouching for it, its own release, renew,
+-- unload and base-id routing included, with no other holder involved.
+--
+-- NULL for a lease taken without a label and for every row written before this
+-- migration: those keep the rule of the holder name and its family root. Never
+-- shown in any API dump, like holder_peer.
+ALTER TABLE gpu_leases ADD COLUMN holder_label TEXT;
