@@ -6384,6 +6384,22 @@ class ModelManager:
             },
         )
 
+    @staticmethod
+    def _may_reshape_copy(
+        caller: Caller | None, lease: GpuLease, standing: Sequence[GpuLease]
+    ) -> bool:
+        """Whether a forced or shaped load of ``lease``'s copy is this caller's to make (D91).
+
+        In-process (no caller) and admins may; otherwise the caller must be the
+        lease's holder -- and on the MCP plane (``copy_needs_lease``), where no
+        label tells two holders sharing one key apart, it must name the lease.
+        """
+        if caller is None or caller.admin:
+            return True
+        if not claims(caller, lease, standing):
+            return False
+        return not caller.copy_needs_lease or lease.id in caller.lease_ids
+
     def _refuse_reloading_labelled(self, model_id: str, caller: Caller, *, what: str) -> None:
         """409 ``instance_in_use`` before a non-admin forced reload cuts others' labelled requests.
 
@@ -6457,12 +6473,7 @@ class ModelManager:
                     param="lease_id",
                     details={"instance_lease_id": lease.id},
                 )
-            if (
-                (force or shaped)
-                and caller is not None
-                and not caller.admin
-                and not claims(caller, lease, standing)
-            ):
+            if (force or shaped) and not self._may_reshape_copy(caller, lease, standing):
                 raise instance_held(record.id, lease, what=what)
             if force and caller is not None and not caller.admin:
                 self._refuse_reloading_labelled(record.id, caller, what=what)
@@ -6475,12 +6486,7 @@ class ModelManager:
             own = [spec.id for spec in bound.instances if spec.base_model_id == serving.id]
             if own:
                 chosen = self._least_busy(own)
-                if (
-                    (force or shaped)
-                    and caller is not None
-                    and not caller.admin
-                    and not claims(caller, bound, standing)
-                ):
+                if (force or shaped) and not self._may_reshape_copy(caller, bound, standing):
                     raise instance_held(chosen, bound, what=what)
                 if force and caller is not None and not caller.admin:
                     self._refuse_reloading_labelled(chosen, caller, what=what)
@@ -6496,6 +6502,13 @@ class ModelManager:
             return name, lease_id, None
         own_id = self._claimed_instance_for(record, caller, what=what)
         if own_id is not None and own_id != serving.id:
+            found = self.instance_of(own_id)
+            if found is not None and (force or shaped):
+                # A base id the caller's key resolved to a copy: the copy's rules.
+                if not self._may_reshape_copy(caller, found[0], standing):
+                    raise instance_held(own_id, found[0], what=what)
+                if force and caller is not None and not caller.admin:
+                    self._refuse_reloading_labelled(own_id, caller, what=what)
             return own_id, None, None
         if force and caller is not None and not caller.admin and own_id is None:
             held = self._held_by_other(serving.id, caller=caller)

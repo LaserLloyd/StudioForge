@@ -475,11 +475,11 @@ class Caller:
     key: str | None = None
     admin: bool = False
     peer: str | None = None
-    #: Whether the key alone may identify the holder. ``False`` on the MCP
-    #: plane, which sees no ``X-SF-Client``: there a key shared by two holders
-    #: could never be told apart, so a copy is named by its own lease
-    #: (``lease_id``) or acted on by an admin (D91, R3).
-    key_proves: bool = True
+    #: Whether a forced or shaped load of a COPY must name the copy's own
+    #: lease (``lease_id``). ``True`` on the MCP plane, which sees no
+    #: ``X-SF-Client``: there a key shared by two holders could never say whose
+    #: copy it means (D91, R3). Base models keep the pre-D91 key rule (N2).
+    copy_needs_lease: bool = False
 
     @property
     def anonymous(self) -> bool:
@@ -570,8 +570,6 @@ def claims(caller: Caller | None, lease: GpuLease, leases: Iterable[GpuLease]) -
             return lease.id in exact or _same(caller.client, lease.holder)
         if not label_vouches(caller.client, lease):
             return False
-    if not caller.key_proves:
-        return False
     return bool(caller.key and lease.holder_key and caller.key == lease.holder_key)
 
 

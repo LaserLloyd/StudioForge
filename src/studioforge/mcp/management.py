@@ -1841,11 +1841,13 @@ def build_management_mcp(state: Any) -> MCPServer:
         ``load_model`` and ``load_recommended`` are ``inference`` scope: a tenant's
         key may call them, so they carry the caller like the REST routes do --
         the key, the lease it binds to, and admin only for an admin credential
-        (or an in-process call). The key alone never identifies the holder here
-        (no label to tell two holders sharing it apart): a non-admin forced or
-        shaped load of a copy must name the copy's own lease (``lease_id``), or
+        (or an in-process call). For a copy the key alone never identifies the
+        holder here (no label to tell two holders sharing it apart): a non-admin
+        forced or shaped load of a copy -- by its id, or by a base id the key
+        resolves to a copy -- must name the copy's own lease (``lease_id``), or
         it is 409 ``instance_held``; a forced reload of a copy serving requests
-        someone else labelled is 409 ``instance_in_use`` even then.
+        someone else labelled is 409 ``instance_in_use`` even then. A base model
+        keeps the pre-D91 rule.
         """
         principal = current_principal()
         admin = principal is None or principal.allows("admin")
@@ -1854,10 +1856,12 @@ def build_management_mcp(state: Any) -> MCPServer:
             if principal is not None and principal.kind == "key" and principal.id
             else None
         )
-        # key_proves=False (R3): MCP sees no X-SF-Client, so a key two holders
-        # share cannot say which of them calls; a copy is named by its lease.
+        # copy_needs_lease (R3, N2): MCP sees no X-SF-Client, so a key two holders
+        # share cannot say whose COPY it means -- a forced or shaped load of a copy
+        # names the copy's lease. A base model keeps the pre-D91 key rule: a
+        # tenant whose lease names X loads X with its key, as it always did.
         return Caller(
-            lease_ids=(lease_id,) if lease_id else (), key=key, admin=admin, key_proves=False
+            lease_ids=(lease_id,) if lease_id else (), key=key, admin=admin, copy_needs_lease=True
         )
 
     def _caller_key() -> str | None:
