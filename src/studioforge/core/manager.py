@@ -43,6 +43,7 @@ from studioforge.core.instances import (
     instance_released,
     instance_row,
     loaded_shape,
+    numbered_id,
     other_clients,
     parse_instance_requests,
     parse_numbered_id,
@@ -895,6 +896,11 @@ class ModelManager:
         #: instance id -> ``{at, lease_id, why}`` for lease instances that ended
         #: (D91), newest last, bounded: what a request naming one is told.
         self._released_instances: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        #: base model id -> the highest ``<model>:<n>`` number handed out or
+        #: restored this run (D91). Numbered ids are never reused while the
+        #: server runs, so a late request for a released ``X:2`` is always a 404
+        #: and never reaches a new holder's copy.
+        self._instance_numbers: dict[str, int] = {}
 
     # -- lifecycle --------------------------------------------------------
 
@@ -1721,6 +1727,17 @@ class ModelManager:
         changes nothing.
         """
         created: str | None = None
+        shaped = any(
+            value is not None
+            for value in (
+                ctx_size,
+                parallel,
+                kv_cache_type,
+                kv_cache_type_v,
+                devices,
+                allowed_devices,
+            )
+        )
         if caller is not None or lease_id is not None:
             name, lease_id, created = self._retarget_load(
                 name,
@@ -1735,6 +1752,7 @@ class ModelManager:
                 },
                 devices=devices,
                 what=f"to load '{name}'",
+                shaped=shaped,
             )
         record = self.registry.resolve(name)
         ephemeral = record is not None and bool(getattr(record, "ephemeral", False))
@@ -1785,8 +1803,35 @@ class ModelManager:
             lease_id=lease_id,
         )
         if ephemeral:
-            self._remember_instance(instance)
+            await self._settle_instance_load(instance, caller=caller, in_process_is_owner=False)
         return instance
+
+    async def _settle_instance_load(
+        self, instance: InstanceInfo, *, caller: Caller | None, in_process_is_owner: bool
+    ) -> None:
+        """After a load of a lease instance: still standing? whose shape to keep? (D91)
+
+        A load that waited at the gate while the instance's lease ended spawned a
+        child nothing owns any more: it is stopped and the call answers ``410
+        instance_released``. Otherwise the shape it runs with becomes the stored
+        restore spec -- but only for the owner's own loads: a caller that is the
+        lease's holder, or (``in_process_is_owner``) the server's own lifecycle
+        load of the instance. An admin reshaping someone else's copy does not
+        rewrite what the holder's restart brings back, and neither does the
+        inner plain load a load-recommended walk makes (the walk decides).
+        """
+        found = self.instance_of(instance.model_id)
+        if found is None:
+            with contextlib.suppress(Exception):
+                await self.supervisor.stop(instance.model_id)
+            raise self.instance_released_error(instance.model_id) or instance_not_found(
+                instance.model_id
+            )
+        lease = found[0]
+        if (caller is None and in_process_is_owner) or (
+            caller is not None and claims(caller, lease, self.leases.all())
+        ):
+            self._remember_instance(instance)
 
     async def _load_body(
         self,
@@ -2368,6 +2413,7 @@ class ModelManager:
                 launch={"ctx_size": ctx_size, "min_slots": min_slots, "max_slots": max_slots},
                 devices=None,
                 what=f"to load '{name}'",
+                shaped=True,
             )
             if created is None and lease_id is None and caller is not None and not caller.admin:
                 self._refuse_reshaping_held(
@@ -2403,8 +2449,11 @@ class ModelManager:
                 record = self.registry.get(created)
                 self._drop_instance(created, record.lease_id if record is not None else None)
             raise
-        if self.instance_of(instance.model_id) is not None:
-            self._remember_instance(instance)
+        loaded_record = self.registry.get(instance.model_id)
+        if (loaded_record is not None and getattr(loaded_record, "ephemeral", False)) or (
+            target is not None and getattr(target, "ephemeral", False)
+        ):
+            await self._settle_instance_load(instance, caller=caller, in_process_is_owner=True)
         return instance
 
     def _refuse_reshaping_held(
@@ -5838,13 +5887,17 @@ class ModelManager:
         caller's own, never "another"); ``(None, clients)`` when it is resident
         -- off ``cards`` when cards are given, i.e. a load would MOVE it -- with
         requests in flight from other clients. ``None``: nobody else's.
+
+        For a load bound to ``lease`` every OTHER lease is another holder's,
+        whatever the caller's key also matches: the binding says whose this load
+        is, and a key shared by two holders must not make the other's lease
+        this caller's.
         """
         standing = self.leases.all() if len(self.leases) else []
         other = self.leases.for_model(model_id) if standing else None
-        if (
-            other is not None
-            and (lease is None or other.id != lease.id)
-            and not claims(caller, other, standing)
+        if other is not None and (
+            (lease is not None and other.id != lease.id)
+            or (lease is None and not claims(caller, other, standing))
         ):
             return other, []
         instance = self.supervisor.get(model_id)
@@ -5929,10 +5982,13 @@ class ModelManager:
         A tagged id already in use -- an id, an alias, a persistent copy such as
         the judge's ``...@b``, a standing instance -- is a 409
         ``instance_id_conflict``; a ``gpus`` set outside the lease's cards is a
-        400. Numbered ids take the smallest free ``n`` from 2, gaps reused.
+        400. A numbered copy gets its id only when it is made
+        (:meth:`_make_instance`), so ``None`` stands in for it here: an await
+        between planning and making (an eviction) can never hand two grants the
+        same ``<model>:<n>``.
         """
         reserved: set[str] = set()
-        out: list[tuple[InstanceRequest, ModelRecord, list[str], list[int]]] = []
+        out: list[tuple[InstanceRequest, ModelRecord, list[str | None], list[int]]] = []
         held = {int(d) for d in cards}
         for request, source in zip(requests, sources, strict=True):
             where = f"instances[{request.index}]"
@@ -5946,46 +6002,99 @@ class ModelManager:
                     param=f"{where}.gpus",
                     details={"lease_devices": sorted(held), "outside": outside},
                 )
+            ids: list[str | None]
             if request.tag is not None:
-                ids = instance_ids_for(request, source.id, lambda _c: False, set())
-                for candidate in ids:
+                tagged = instance_ids_for(request, source.id, lambda _c: False, set())
+                for candidate in tagged:
                     if self._instance_taken(candidate, reserved):
-                        name_holder = getattr(self.registry, "name_holder", None)
-                        holder = name_holder(candidate) if name_holder is not None else None
-                        raise StudioForgeError(
-                            f"{where}: the instance id '{candidate}' is taken"
-                            + (f" (by '{holder}')" if holder else " (by a standing instance)")
-                            + "; pick another tag, or omit tag for a numbered id "
-                            f"('{source.id}:<n>')",
-                            code="instance_id_conflict",
-                            status_code=409,
-                            param=f"{where}.tag",
-                            details={"id": candidate, "colliding_model_id": holder or candidate},
-                        )
+                        raise self._id_taken(candidate, source.id, param=f"{where}.tag")
                     reserved.add(candidate)
+                ids = list(tagged)
             else:
-                ids = instance_ids_for(
-                    request,
-                    source.id,
-                    lambda candidate: self._instance_taken(candidate, set()),
-                    reserved,
-                )
+                ids = [None] * request.count
             out.append((request, source, ids, gpus))
         return out
+
+    def _id_taken(self, candidate: str, base_id: str, *, param: str) -> StudioForgeError:
+        """409 ``instance_id_conflict`` for a tag whose id is already in use."""
+        name_holder = getattr(self.registry, "name_holder", None)
+        holder = name_holder(candidate) if name_holder is not None else None
+        found = self.instance_of(candidate)
+        return StudioForgeError(
+            f"the instance id '{candidate}' is taken"
+            + (
+                f" (by '{holder}')"
+                if holder
+                else f" (by lease {found[0].id})"
+                if found is not None
+                else ""
+            )
+            + f"; pick another tag, or omit tag for a numbered id ('{base_id}:<n>')",
+            code="instance_id_conflict",
+            status_code=409,
+            param=param,
+            details={"id": candidate, "colliding_model_id": holder or candidate},
+        )
+
+    def _next_instance_id(self, base_id: str) -> str:
+        """The next ``<base>:<n>`` -- above every number handed out or restored this run.
+
+        Synchronous on purpose: it is called inside :meth:`_make_instance`, with
+        no await before the record and spec are in, so two grants (or a grant and
+        a bound load) can never take the same id. Released numbers are not
+        reused while the server runs: a late request for one is a 404.
+        """
+        highest = self._instance_numbers.get(base_id, 1)
+        for model_id in self._standing_instance_ids():
+            parsed = parse_numbered_id(model_id)
+            if parsed is not None and parsed[0] == base_id:
+                highest = max(highest, parsed[1])
+        number = highest + 1
+        while self._instance_taken(numbered_id(base_id, number), set()) or (
+            numbered_id(base_id, number) in self._released_instances
+        ):
+            number += 1
+        self._instance_numbers[base_id] = number
+        return numbered_id(base_id, number)
+
+    def _standing_instance_ids(self) -> list[str]:
+        """Every instance id a lease holds, plus every lease-instance record."""
+        ids = [spec.id for _lease, spec in self.leases.instances()] if len(self.leases) else []
+        records = getattr(self.registry, "ephemeral_records", None)
+        if records is not None:
+            ids.extend(record.id for record in records())
+        return ids
+
+    def _note_instance_number(self, model_id: str) -> None:
+        """Keep the counter above an id that exists (a restored spec), even a dropped one."""
+        parsed = parse_numbered_id(model_id)
+        if parsed is not None:
+            base_id, number = parsed
+            self._instance_numbers[base_id] = max(self._instance_numbers.get(base_id, 1), number)
 
     def _make_instance(
         self,
         lease: GpuLease,
         source: ModelRecord,
         *,
-        instance_id: str,
+        instance_id: str | None,
         devices: Sequence[int],
         launch: Mapping[str, Any],
         tag: str | None,
         load: bool,
         origin: str,
     ) -> ModelRecord:
-        """Create one instance: its spec on the lease (persisted), its record in the registry."""
+        """Create one instance: its spec on the lease (persisted), its record in the registry.
+
+        ``instance_id`` ``None`` assigns the next numbered id here; a given (tagged)
+        id is re-checked here -- 409 ``instance_id_conflict`` if something took it
+        since it was planned. Nothing awaits between the check and the two
+        writes, so the id is this lease's alone.
+        """
+        if instance_id is None:
+            instance_id = self._next_instance_id(source.id)
+        elif self._instance_taken(instance_id, set()):
+            raise self._id_taken(instance_id, source.id, param="tag")
         spec = LeaseInstance(
             id=instance_id,
             base_model_id=source.id,
@@ -6045,15 +6154,21 @@ class ModelManager:
         self._lease_bounds_check(lease, devices=cards)
         clean = {k: v for k, v in launch.items() if v is not None}
         self._validate_launch(source, clean, "load")
-        request = InstanceRequest(model=source.id, launch=clean)
-        (instance_id,) = instance_ids_for(
-            request, source.id, lambda candidate: self._instance_taken(candidate, set()), set()
-        )
         other, clients = held
+        record = self._make_instance(
+            lease,
+            source,
+            instance_id=None,
+            devices=cards,
+            launch=clean,
+            tag=None,
+            load=True,
+            origin="second_holder",
+        )
         log.info(
             "a second holder named a model another holder holds; it gets its own instance",
             model_id=source.id,
-            instance_id=instance_id,
+            instance_id=record.id,
             lease_id=lease.id,
             holder=lease.holder,
             held_by=other.holder if other is not None else None,
@@ -6061,16 +6176,7 @@ class ModelManager:
             in_flight_clients=clients or None,
             what=what,
         )
-        return self._make_instance(
-            lease,
-            source,
-            instance_id=instance_id,
-            devices=cards,
-            launch=clean,
-            tag=None,
-            load=True,
-            origin="second_holder",
-        )
+        return record
 
     def _remember_instance(self, instance: InstanceInfo) -> None:
         """Store what an instance ACTUALLY loaded with, for the restore (D91)."""
@@ -6287,6 +6393,7 @@ class ModelManager:
         launch: Mapping[str, Any],
         devices: Sequence[int] | None,
         what: str,
+        shaped: bool = False,
     ) -> tuple[str, str | None, str | None]:
         """What a load of ``name`` by ``caller`` means (D91, items 2 and 6).
 
@@ -6295,8 +6402,8 @@ class ModelManager:
         and the id of an instance this call created (the caller rolls it back
         if the load fails).
 
-        * an exact instance id is that instance; reloading another holder's
-          (``force``) is admin-only;
+        * an exact instance id is that instance; reloading or reshaping another
+          holder's (``force``, or any shape argument) is admin-only;
         * a load bound to a lease (``lease_id``) means that lease's own instance
           of the model when it has one; when another holder holds the model --
           another lease names it, or it is serving their streams elsewhere --
@@ -6323,7 +6430,7 @@ class ModelManager:
                     details={"instance_lease_id": lease.id},
                 )
             if (
-                force
+                (force or shaped)
                 and caller is not None
                 and not caller.admin
                 and not claims(caller, lease, standing)
@@ -6337,7 +6444,15 @@ class ModelManager:
                 return name, lease_id, None  # lease_for_binding answers the 404
             own = [spec.id for spec in bound.instances if spec.base_model_id == serving.id]
             if own:
-                return self._least_busy(own), None, None
+                chosen = self._least_busy(own)
+                if (
+                    (force or shaped)
+                    and caller is not None
+                    and not caller.admin
+                    and not claims(caller, bound, standing)
+                ):
+                    raise instance_held(chosen, bound, what=what)
+                return chosen, None, None
             held = self._held_by_other(
                 serving.id, caller=caller, lease=bound, cards=devices or bound.devices
             )
@@ -6427,7 +6542,7 @@ class ModelManager:
 
         ``instances`` (D91) asks the grant for copies of models on its cards:
         ``[{model, count?, gpus?, tag?, launch?, load?}]``. Each copy is
-        ``<model>:<n>`` (``n`` the smallest free integer from 2) or
+        ``<model>:<n>`` (numbered from 2, never reused while the server runs) or
         ``<model>@<tag>``, a deep copy of the model's settings with only
         ``launch``'s context, slots and KV types changed, on ``gpus`` (the
         lease's cards by default), owned by this lease. Copies asking to load
@@ -6793,7 +6908,7 @@ class ModelManager:
     async def _grant_instances(
         self,
         lease: GpuLease,
-        planned: Sequence[tuple[InstanceRequest, ModelRecord, list[str], list[int]]],
+        planned: Sequence[tuple[InstanceRequest, ModelRecord, list[str | None], list[int]]],
         *,
         evicted: Sequence[Mapping[str, Any]],
     ) -> list[dict[str, Any]]:
@@ -6813,20 +6928,24 @@ class ModelManager:
         source_tag = f"api:/api/leases/{lease.id}"
         try:
             for request, source, ids, gpus in planned:
-                for instance_id in ids:
-                    tag = instance_id[len(source.id) + 1 :] if request.tag is not None else None
-                    made.append(
-                        self._make_instance(
-                            lease,
-                            source,
-                            instance_id=instance_id,
-                            devices=gpus,
-                            launch=request.launch,
-                            tag=tag,
-                            load=request.load,
-                            origin=request.origin,
-                        )
+                for planned_id in ids:
+                    tag = (
+                        planned_id[len(source.id) + 1 :]
+                        if request.tag is not None and planned_id is not None
+                        else None
                     )
+                    record = self._make_instance(
+                        lease,
+                        source,
+                        instance_id=planned_id,
+                        devices=gpus,
+                        launch=request.launch,
+                        tag=tag,
+                        load=request.load,
+                        origin=request.origin,
+                    )
+                    made.append(record)
+                    instance_id = record.id
                     report[instance_id] = {
                         "id": instance_id,
                         "model": instance_id,
@@ -7613,6 +7732,7 @@ class ModelManager:
         has meanwhile taken, is dropped from the lease with a warning.
         """
         for spec in list(lease.instances):
+            self._note_instance_number(spec.id)
             source = self.registry.get(spec.base_model_id)
             if source is None:
                 log.warning(

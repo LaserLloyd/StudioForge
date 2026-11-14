@@ -1216,10 +1216,20 @@ class Database:
             try:
                 record["devices"] = json.loads(record.pop("devices_json"))
                 record["model_ids"] = json.loads(record.pop("model_ids_json"))
-                record["instances"] = json.loads(record.pop("instances_json", None) or "[]")
             except (TypeError, ValueError):
                 log.warning("db.lease_row_unreadable", lease_id=record.get("id"))
                 continue
+            # D91: the instances are parsed on their own -- a torn instances column
+            # loses the instances, never the lease (its cards and holder survive).
+            raw_instances = record.pop("instances_json", None)
+            try:
+                instances = json.loads(raw_instances or "[]")
+                if not isinstance(instances, list):
+                    raise ValueError("not a list")
+            except (TypeError, ValueError):
+                log.warning("db.lease_instances_unreadable", lease_id=record.get("id"))
+                instances = []
+            record["instances"] = instances
             out.append(record)
         return out
 

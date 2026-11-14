@@ -954,6 +954,18 @@ class Registry:
                 raise _id_conflict(record.id, holder.id, "an existing model name or alias")
             if holder is not None and not holder.ephemeral:
                 raise _id_conflict(record.id, holder.id, "an existing model")
+            # D91: never silently replace another lease's instance -- two grants
+            # racing for one id must not end with one record and two owners.
+            standing = self._ephemeral.get(record.id) or holder
+            if standing is not None and standing.lease_id != record.lease_id:
+                raise BadRequestError(
+                    f"the instance id {record.id!r} is held by lease {standing.lease_id}; an "
+                    f"instance belongs to one lease",
+                    param="id",
+                    code="instance_id_conflict",
+                    status_code=409,
+                    details={"id": record.id, "lease_id": standing.lease_id},
+                )
             self._ephemeral[record.id] = record
             self._models[record.id] = record
             self._rebuild_aliases()

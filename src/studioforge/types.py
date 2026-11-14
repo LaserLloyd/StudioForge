@@ -1410,7 +1410,7 @@ class LeaseInstance(BaseModel):
     slots and KV it last ran with -- never the default context ladder.
 
     ``id`` is the string a client puts in ``model``: ``<base>:<n>`` (LM Studio's
-    instance identifier, ``n`` the smallest free integer from 2) or
+    instance identifier, numbered from 2 and never reused while the server runs) or
     ``<base>@<tag>`` when the client asked for a tag. ``launch`` holds only the
     keys a client may change (``ctx_size``, ``parallel``, ``min_slots``,
     ``max_slots``, ``kv_cache_type``, ``kv_cache_type_v``); everything else is

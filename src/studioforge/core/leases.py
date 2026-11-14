@@ -48,7 +48,12 @@ from urllib.parse import urlsplit
 import httpx
 
 from studioforge.core.priority import PRIORITY_BACKGROUND, PRIORITY_LEVELS
-from studioforge.errors import BadRequestError, LeaseConflictError, LeaseNotFoundError
+from studioforge.errors import (
+    BadRequestError,
+    LeaseConflictError,
+    LeaseNotFoundError,
+    StudioForgeError,
+)
 from studioforge.logging import get_logger
 from studioforge.types import GpuLease, LeaseInstance
 
@@ -688,6 +693,19 @@ class LeaseBook:
         lease = self._leases.get(lease_id)
         if lease is None:
             raise LeaseNotFoundError(f"no lease '{lease_id}'", param="lease_id")
+        instances = list(instances)
+        for spec in instances:
+            for other in self._leases.values():
+                if other.id != lease_id and any(i.id == spec.id for i in other.instances):
+                    # D91: an instance id belongs to one lease, ever at once.
+                    raise StudioForgeError(
+                        f"the instance id '{spec.id}' is held by lease {other.id} "
+                        f"({other.holder}); an instance belongs to one lease",
+                        code="instance_id_conflict",
+                        status_code=409,
+                        param="instances",
+                        details={"id": spec.id, "lease_id": other.id},
+                    )
         added = [spec for spec in instances if spec.id not in {i.id for i in lease.instances}]
         if added:
             lease.instances = [*lease.instances, *added]

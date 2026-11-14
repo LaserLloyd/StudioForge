@@ -83,6 +83,7 @@ from studioforge.core.chat_template import (
     validate_template_text,
 )
 from studioforge.core.harmony import effective_reasoning_format, record_uses_harmony
+from studioforge.core.instances import Caller
 from studioforge.core.leases import gpu_uuid_map, lease_view
 from studioforge.core.model_gate import (
     GateRequirement,
@@ -1391,6 +1392,7 @@ def build_management_mcp(state: Any) -> MCPServer:
             source=f"mcp:/api/leases/{lease_id}" if lease_id else "mcp:load_model",
             priority=priority,
             lease_id=lease_id,
+            caller=_mcp_caller(lease_id),
         )
         return {
             "ok": True,
@@ -1555,6 +1557,7 @@ def build_management_mcp(state: Any) -> MCPServer:
             min_slots=min_slots,
             kv_unified=kv_unified,
             lease_id=lease_id,
+            caller=_mcp_caller(lease_id),
         )
         return {
             "ok": True,
@@ -1831,6 +1834,24 @@ def build_management_mcp(state: Any) -> MCPServer:
         standing = state.manager.leases.get(lease_id)
         if standing is not None:
             owner_check(current_principal(), standing.holder_key, f"lease {lease_id}")
+
+    def _mcp_caller(lease_id: str | None = None) -> Caller:
+        """Who is calling a load tool, for D91's holder rules (no MCP call is anonymous to them).
+
+        ``load_model`` and ``load_recommended`` are ``inference`` scope: a tenant's
+        key may call them, so they carry the caller like the REST routes do --
+        the key, the lease it binds to, and admin only for an admin credential
+        (or an in-process call). A non-admin key reloading or reshaping another
+        holder's instance is then 409 ``instance_held``.
+        """
+        principal = current_principal()
+        admin = principal is None or principal.allows("admin")
+        key = (
+            principal.actor
+            if principal is not None and principal.kind == "key" and principal.id
+            else None
+        )
+        return Caller(lease_ids=(lease_id,) if lease_id else (), key=key, admin=admin)
 
     def _caller_key() -> str | None:
         """``key:<id>`` of the scoped key calling this tool, else ``None`` (as ``key_owner_of``)."""
