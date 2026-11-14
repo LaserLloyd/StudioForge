@@ -200,8 +200,9 @@ X-SF-Client: bench-run-7
   follow the same rules; LM Studio's unload of a base id finds your own loaded copy even when the
   base itself is not loaded.
 * MCP `load_model` / `load_recommended` carry your key, `lease_id` and admin-ness but no label, so
-  there the key never says whose copy you mean: a non-admin forced or shaped load of a copy must
-  pass `lease_id` naming the copy's own lease (`instance_held` otherwise).
+  there the key never says whose copy you mean: a non-admin forced or shaped load of a copy (by its
+  id, or by a base id your key resolves to a copy) must pass `lease_id` naming the copy's own lease
+  (`instance_held` otherwise). A base model you lease keeps working with your key alone, as before.
 * A forced reload never cuts requests someone else labelled: with another client's labelled
   requests in flight it is `409 instance_in_use`, even from the copy's own lease (admins excepted).
 

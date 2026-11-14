@@ -506,3 +506,22 @@ def test_r1_a_holder_whose_label_differs_from_its_lease_name_keeps_its_lease(
         released = client.delete(f"/api/leases/{lease_id}", headers=me)
         assert released.status_code == 200, released.text
         assert released.json()["instances_ended"] == [COPY]
+
+
+def test_n1_a_label_in_any_spelling_keeps_its_own_lease(staging_dir: Path) -> None:
+    """Parentheses, doubled spaces, past 64 characters: the label is stored as it is compared."""
+    app, _state, key = _keyed(staging_dir)
+    with TestClient(app) as client:
+        for label in ("OpenClaw (main)", "openclaw   main", "agent-" + "x" * 80):
+            me = {**key, "X-SF-Client": label}
+            taken = client.post(
+                "/api/leases", json={"devices": [0], "holder": "openclaw"}, headers=me
+            )
+            assert taken.status_code == 200, taken.text
+            lease_id = taken.json()["id"]
+            renewed = client.patch(
+                f"/api/leases/{lease_id}", json={"renew_time": "now"}, headers=me
+            )
+            assert renewed.status_code == 200, (label, renewed.text)
+            released = client.delete(f"/api/leases/{lease_id}", headers=me)
+            assert released.status_code == 200, (label, released.text)

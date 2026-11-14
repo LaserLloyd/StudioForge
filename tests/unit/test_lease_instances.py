@@ -1158,3 +1158,91 @@ async def test_r3_mcp_a_shared_key_must_name_the_copys_own_lease(
     assert unnamed["ok"] is False and unnamed["error"]["code"] == "instance_held", unnamed
     assert shaped["ok"] is False and shaped["error"]["code"] == "instance_held", shaped
     assert named["ok"] is False and named["error"]["code"] == "instance_in_use", named
+
+
+# ---------------------------------------------------------------------------
+# Final review (2026-11-14): N1, N2
+# ---------------------------------------------------------------------------
+
+
+def test_n1_the_recorded_label_is_stored_and_restored_in_the_compared_form() -> None:
+    book = LeaseBook()
+    lease = book.acquire([0], holder="openclaw", holder_label="OpenClaw  (main)")
+    assert lease.holder_label == "OpenClaw main", "the form caller_of compares in"
+    raw = {**lease_row(lease), "holder_label": "OpenClaw  (main)" + "x" * 80}
+    restored = lease_from_row(raw)
+    assert restored.holder_label is not None and len(restored.holder_label) == 64
+    assert restored.holder_label.startswith("OpenClaw main")
+
+
+def _mcp_principal(key_id: str) -> Any:
+    from studioforge.authkeys import Principal
+
+    return Principal("key", key_id, "tenant", "inference")
+
+
+async def test_n2_mcp_a_tenants_own_base_model_lease_loads_as_before(
+    state: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Old model_ids shape, no copy anywhere: the tenant's key is its identity, as pre-D91."""
+    from studioforge import mcp_policy
+    from studioforge.types import LoadPlan
+
+    state.manager.leases.acquire([0], holder="tenant", model_ids=[TINY], holder_key="key:kt")
+    resident = InstanceInfo(
+        model_id=TINY,
+        state="ready",
+        plan=LoadPlan(model_id=TINY, devices=[0], ctx_size=4096, ctx_per_slot=4096, parallel=1),
+    )
+    real_get = state.supervisor.get
+    monkeypatch.setattr(
+        state.supervisor,
+        "get",
+        lambda model_id: resident if model_id == TINY else real_get(model_id),
+    )
+    loads: list[str] = []
+
+    async def fake_load(name: str, *_args: Any, **_kwargs: Any) -> InstanceInfo:
+        loads.append(name)
+        return resident
+
+    monkeypatch.setattr(state.manager, "_load_body", fake_load)
+    monkeypatch.setattr(state.manager, "_load_recommended_body", fake_load)
+    server = build_management_mcp(state)
+    token = mcp_policy._CALLER.set(_mcp_principal("kt"))  # noqa: SLF001
+    try:
+        walked = await call(server, "load_recommended", model_id=TINY, ctx_size=16384)
+        forced = await call(server, "load_model", model_id=TINY, force=True)
+    finally:
+        mcp_policy._CALLER.reset(token)  # noqa: SLF001
+    assert walked["ok"] is True, walked
+    assert forced["ok"] is True, forced
+    assert loads == [TINY, TINY]
+
+
+async def test_n2_mcp_a_base_id_that_resolves_to_a_copy_keeps_the_copy_rule(
+    state: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from studioforge import mcp_policy
+
+    grant = await state.manager.grant_lease(
+        [0], holder="tenant", holder_key="key:kt", instances=[{"model": TINY, "load": False}]
+    )
+    copy = grant.instances[0]["id"]
+    loads: list[str] = []
+
+    async def fake_load(name: str, *_args: Any, **_kwargs: Any) -> InstanceInfo:
+        loads.append(name)
+        return InstanceInfo(model_id=name, state="ready")
+
+    monkeypatch.setattr(state.manager, "_load_body", fake_load)
+    server = build_management_mcp(state)
+    token = mcp_policy._CALLER.set(_mcp_principal("kt"))  # noqa: SLF001
+    try:
+        unnamed = await call(server, "load_model", model_id=TINY, force=True)
+        named = await call(server, "load_model", model_id=TINY, force=True, lease_id=grant.lease.id)
+    finally:
+        mcp_policy._CALLER.reset(token)  # noqa: SLF001
+    assert unnamed["ok"] is False and unnamed["error"]["code"] == "instance_held", unnamed
+    assert named["ok"] is True, named
+    assert loads == [copy]

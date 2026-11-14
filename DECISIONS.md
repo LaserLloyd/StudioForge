@@ -8251,7 +8251,9 @@ per copy, with parity the client's burden (B.1).
    load's own lease included), else its `X-SF-Client` label matched EXACTLY to a lease's holder,
    else the key that took the lease. The key counts only for a caller whose label vouches for the
    holder: none, the holder's name, the exact label the lease was taken with (`holder_label`,
-   recorded from the creating request's `X-SF-Client`, migration 013 -- a holder leasing as
+   recorded from the creating request's `X-SF-Client` in the normal form every request's label is
+   compared in -- whitespace collapsed, parentheses dropped, 64 characters -- and read back the same
+   way at restore; migration 013 -- a holder leasing as
    `openclaw` and labelling `openclaw-main`), or exactly its family root (`crucibleforge` for a
    lease held as `crucibleforge-judge`, D55's compatibility case). An exact match wins: a label that
    IS one standing lease's holder name or recorded label means that lease only, never another
@@ -8296,8 +8298,12 @@ now makes a copy. Base-id pooling across holders stays deferred (F-4). The idle 
 all-or-nothing grant evicted are not brought back. An instance whose base left the library at
 restart is dropped from its lease with a warning. MCP `load_model` and `load_recommended`
 (`inference` scope) carry the caller's key, its `lease_id` and whether it is an admin, but no
-`X-SF-Client` label (MCP tools see no request headers), so there the key never identifies the
-holder: a non-admin forced or shaped load of a copy must name the copy's own lease (`lease_id`).
+`X-SF-Client` label (MCP tools see no request headers), so for a COPY the key never identifies the
+holder there: a non-admin forced or shaped load of a copy -- by its id, or by a base id the key
+resolves to a copy -- must name the copy's own lease (`lease_id`). A base model keeps the pre-D91
+key rule on MCP (a tenant whose lease names X loads and force-reloads X with its key, as before);
+of the two ways to restore that, the narrower one was chosen -- the stricter rule applies to copies
+only -- rather than letting a key prove whenever it holds exactly one standing lease.
 MCP lease ownership (`release_gpus`, `renew_lease`, `lease_id` on the load tools) stays the key
 plus the explicit lease id, as before; `unload_model` is `admin` scope and keeps its operator
 force. Numbered ids are
