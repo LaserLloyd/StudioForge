@@ -226,6 +226,7 @@ planner:
   # the same context, slots, KV cache types and device COUNT is taken as the
   # estimate plus 10%, clamped to 0.60-1.30 of the formula's own answer.
   observed_correction: true
+  post_load_headroom_check: true
   rebalance: auto
   # What the catalog's one recommended load per model optimises for (D36):
   # "quality" = the best KV cache that reaches the context floor, then the

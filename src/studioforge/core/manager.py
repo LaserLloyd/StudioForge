@@ -73,7 +73,12 @@ from studioforge.core.leases import (
     vacate_url_targets_self,
     validate_vacate_url,
 )
-from studioforge.core.planner import BUSY_RETRY_AFTER_S, OBSERVATION_NOTE_PER_PID_DEVICE, Planner
+from studioforge.core.planner import (
+    BUSY_RETRY_AFTER_S,
+    OBSERVATION_NOTE_PER_PID_DEVICE,
+    Planner,
+    post_load_headroom_shortfall,
+)
 from studioforge.core.priority import PRIORITY_BACKGROUND, PriorityLock, normalise_priority
 from studioforge.core.registry import Registry
 from studioforge.core.supervisor import Supervisor
@@ -4743,8 +4748,82 @@ class ModelManager:
         self.registry.touch(record.id)
         # The instance carries the pid, and the pid is what makes the
         # observation about *this* child rather than about the whole card.
-        self._record_actual_vram(record, instance.plan or plan, instance)
+        actual = self._record_actual_vram(record, instance.plan or plan, instance)
+        await self._enforce_post_load_headroom(record, instance.plan or plan, actual)
         return instance
+
+    async def _enforce_post_load_headroom(
+        self, record: ModelRecord, plan: LoadPlan, actual_bytes: int | None
+    ) -> None:
+        """Unload and 507 a load that ran over its plan into a card's headroom (D92).
+
+        The observation above is already recorded, so D51 plans the next load of
+        this configuration from the measurement: a retry with the same shape is
+        refused up front with "reduce parallel from N to M", and an auto-sized
+        one gets the smaller slot count. Measurement failures never refuse a
+        load -- no number is not evidence of an overrun.
+        """
+        if not actual_bytes or not self.config.planner.post_load_headroom_check:
+            return
+        try:
+            gpus = list(self.planner.probe.list_gpus())
+        except Exception as exc:  # pragma: no cover - a probe hiccup never fails a load
+            log.debug("post-load headroom check skipped: no gpu snapshot", error=str(exc))
+            return
+        short = post_load_headroom_shortfall(
+            plan,
+            int(actual_bytes),
+            gpus,
+            headroom_fraction=float(self.config.planner.headroom_fraction),
+        )
+        if not short:
+            return
+        planned = int(plan.estimate.total_bytes)
+        over_pct = (int(actual_bytes) - planned) / planned * 100.0 if planned else 0.0
+        cards = ", ".join(
+            f"CUDA{row['device']} {row['free_bytes'] / GB:.1f} GiB free "
+            f"(headroom {row['headroom_bytes'] / GB:.1f} GiB)"
+            for row in short
+        )
+        log.error(
+            "load ran over its plan into the headroom; unloading it",
+            model_id=record.id,
+            planned_mb=round(planned / MB),
+            actual_mb=round(int(actual_bytes) / MB),
+            over_pct=round(over_pct, 1),
+            ctx=plan.ctx_size,
+            parallel=plan.parallel,
+            devices=plan.devices,
+            short=short,
+            detail=(
+                "an over-full card on Windows pages the child's memory and serves at a "
+                "fraction of its speed with no error (D92); the measurement is kept, so "
+                "the next plan of this configuration is sized from it"
+            ),
+        )
+        await self.supervisor.stop(record.id)
+        fewer = max(1, int(plan.parallel) - 1)
+        raise InsufficientVramError(
+            f"Loaded '{record.id}' measured {int(actual_bytes) / GB:.2f} GiB against "
+            f"{planned / GB:.2f} GiB planned (+{over_pct:.1f}%), leaving {cards}; it was "
+            f"unloaded rather than served from an over-full card, which runs many times "
+            f"slower without an error. The measurement is recorded: retry and the plan "
+            f"is sized from it (with {int(plan.parallel)} slots at this context, try "
+            f"{fewer}).",
+            details={
+                "reason": "post_load_overrun",
+                "planned_bytes": planned,
+                "actual_bytes": int(actual_bytes),
+                "over_pct": round(over_pct, 1),
+                "short_devices": short,
+                "requested_parallel": int(plan.parallel),
+                "max_parallel_that_fits": None,
+                "suggestions": [
+                    f"reduce parallel from {int(plan.parallel)} to {fewer}",
+                    "or reduce the context per slot",
+                ],
+            },
+        )
 
     def _note_displaced(self, for_record: ModelRecord, victim: str, *, priority: int) -> None:
         """Remember a recently-active victim of a chat/agent load, to bring back (D46).
@@ -5459,8 +5538,11 @@ class ModelManager:
 
     def _record_actual_vram(
         self, record: ModelRecord, plan: LoadPlan, instance: InstanceInfo
-    ) -> None:
+    ) -> int | None:
         """Log predicted-vs-actual so the planner's fudge factor can be tuned.
+
+        Returns the measured bytes (``None`` when nothing could attribute
+        them), which the D92 post-load headroom check reads.
 
         Measures **our child's own** VRAM, per pid **and per device**, not the
         devices' total ``used_bytes``. The device total is whatever else happens
@@ -5486,7 +5568,7 @@ class ModelManager:
         try:
             pid = instance.pid
             if pid is None:
-                return
+                return None
             actual, per_device = measure_child_vram(self.planner.probe, pid, plan.devices)
             if actual > 0:
                 self.planner.observe(
@@ -5499,14 +5581,15 @@ class ModelManager:
                     # replaced under the same id starts its own history.
                     gguf_size=int(record.size_bytes or 0) or None,
                 )
-            else:
-                log.debug(
-                    "no per-pid VRAM attribution available; skipping observation",
-                    model_id=record.id,
-                    pid=pid,
-                )
+                return int(actual)
+            log.debug(
+                "no per-pid VRAM attribution available; skipping observation",
+                model_id=record.id,
+                pid=pid,
+            )
         except Exception as exc:  # pragma: no cover - telemetry must never break a load
             log.debug("could not record vram observation", error=str(exc))
+        return None
 
     # -- unloading --------------------------------------------------------
 

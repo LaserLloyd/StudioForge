@@ -8324,3 +8324,42 @@ expiry), `core/leases.py` (instance specs in the book, the row and `lease_view`)
 `MULTI-INSTANCE.md` (new), `TENANTS.md`, `API.md`, `LIMITATIONS.md`, `OPENCLAW.md`; capabilities
 `lease_instances`, `multi_instance_default`; `tests/unit/test_lease_instances.py`,
 `test_lease_instances_staging.py`.
+
+
+## D92 -- A load that runs over its plan into a card's headroom is unloaded, not served
+
+**Problem.** 2026-11-25 22:09 JST, live 2.3.0 (b12110): CrucibleForge leased the 5090 pair and asked for
+DeepSeek-R1-0528-Qwen3-8B Q4_K_M at 8 x 79,872 tokens, q8_0 K/V. The planner estimated 54,356 MB (KV
+47,736); the child measured 59,831 MB (+10.1%, 31,173 MB on GPU0). `observe` logged "vram prediction
+error exceeds the bar" and "a device holds more than its planned share", and the load was served. GPU0
+was left with ~1.4 GiB of 32 -- inside the 10% headroom the planner promises to keep. On Windows an
+over-full card does not fail: WDDM pages the child's allocations, and every decode step waited on the
+bus. The model served ~5 tok/s per request (GPUs 35-45% busy at ~110 W) for ten hours, with no error,
+until the client was stopped. The rig reproduced the healthy side on 2026-11-26: the same model at
+7 x 79,872 (4.5 / 7 GiB left) ran 125 tok/s per request, at 8 x 24,576 118; D51 had meanwhile learned
+the measurement and now refuses 8 x 79,872 up front (507, "reduce parallel from 8 to 7"). That only helps
+the second load of a configuration; the first one is the one that overflows.
+
+**Decision.** After the post-load observation, `ModelManager._enforce_post_load_headroom` reads a fresh
+GPU snapshot and `planner.post_load_headroom_shortfall` refuses the load when **both** hold:
+
+1. it measured more than `PREDICTION_ERROR_WARN_PCT` (5%) over what the plan reserved, and
+2. a card of the plan now has less free VRAM than `headroom_fraction` of its total.
+
+Then the child is stopped and the caller gets `507 insufficient_vram` with `details.reason:
+"post_load_overrun"`, the planned and measured bytes, `over_pct`, `short_devices`, `requested_parallel`
+and the suggestion "reduce parallel from N to N-1". The observation is already stored, so the retry is
+planned from the measurement (D51). A lease grant with instances (D91) rolls back exactly as for any
+other failed load.
+
+Never refused: a load within the bar (however full the card), an overrun that still leaves the headroom,
+a full card the plan does not use (another tenant's), `headroom_fraction: 0`, and a load nothing could
+measure. `planner.post_load_headroom_check: false` restores warn-and-serve.
+
+**Why not shrink and reload in place.** The caller asked for a shape; silently serving another one
+breaks clients that size their work from the slot count (CrucibleForge does). A 507 with the numbers is
+what they already handle -- the client fell back 9 -> 8 slots on the same evening.
+
+**Surfaces.** `core/planner.py` (`post_load_headroom_shortfall`), `core/manager.py`
+(`_record_actual_vram` returns the measured bytes; `_enforce_post_load_headroom`), `config.py`
+(`planner.post_load_headroom_check`), `tests/unit/test_post_load_headroom.py`.

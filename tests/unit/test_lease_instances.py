@@ -738,7 +738,9 @@ def test_the_capability_features_name_d91() -> None:
     assert SERVER_FEATURES["lease_instances"] == "D91"
     assert SERVER_FEATURES["multi_instance_default"] == "D91"
     report = implemented_report()
-    assert "lease_instances" in report["features"] and report["latest_decision"] == "D91"
+    assert "lease_instances" in report["features"]
+    # Later decisions move the latest past D91; this test only needs D91 included.
+    assert int(report["latest_decision"].lstrip("D")) >= 91
 
 
 def test_the_panel_lease_line_names_the_instances() -> None:

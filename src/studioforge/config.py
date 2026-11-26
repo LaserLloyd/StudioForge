@@ -746,6 +746,15 @@ class PlannerConfig(BaseModel):
     #: history in the same table is unreadable and stays unread. Off makes the
     #: whole feature inert -- no lookup, no note, formula only.
     observed_correction: bool = True
+    #: Refuse, after the fact, a load that measured over its plan and left a
+    #: card inside ``headroom_fraction`` (D92). On Windows an over-full card does
+    #: not fail: WDDM pages the child's memory and the model serves at a small
+    #: fraction of its speed with no error (2026-11-25: 5 tok/s instead of ~120
+    #: for ten hours). With this on, such a load is unloaded at once and the
+    #: caller gets a 507 naming the card; the measurement is kept, so the next
+    #: plan of that configuration is corrected from it (D51). Off restores the
+    #: old warn-and-serve behaviour.
+    post_load_headroom_check: bool = True
     #: Whether the sweep may relocate an idle resident whose placement went
     #: stale (D42) -- e.g. still sharing a card with another model long after
     #: the layout that forced it is gone. ``"auto"`` reloads it onto the

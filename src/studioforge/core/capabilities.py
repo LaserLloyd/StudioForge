@@ -76,7 +76,7 @@ FEATURE_NOTES: dict[str, str] = {
 #: on instead. **Bump it in the same commit that appends a decision**:
 #: ``tests/unit/test_capabilities_implemented.py`` reads the headings of
 #: ``DECISIONS.md`` and fails until the two agree.
-LATEST_DECISION = 91
+LATEST_DECISION = 92
 
 #: Every decision number this build includes, ``"D1"`` .. ``"D<LATEST_DECISION>"``.
 IMPLEMENTED_DECISIONS: tuple[str, ...] = tuple(f"D{n}" for n in range(1, LATEST_DECISION + 1))
@@ -228,6 +228,10 @@ SERVER_FEATURES: dict[str, str] = {
     # the lease's key); an unload never cuts another client's requests without
     # an explicit force (409 instance_in_use).
     "multi_instance_default": "D91",
+    # A load that measured over its plan and left a card inside the headroom is
+    # unloaded and answered 507 (details.reason "post_load_overrun") instead of
+    # served from an over-full card (D92).
+    "post_load_headroom_check": "D92",
 }
 
 

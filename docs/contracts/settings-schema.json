@@ -1,5 +1,5 @@
 {
-  "count": 120,
+  "count": 121,
   "env_nested_delimiter": "__",
   "env_prefix": "SF_",
   "levels": [
@@ -1202,6 +1202,20 @@
       "env": "SF_PLANNER__OBSERVED_CORRECTION",
       "key": "planner.observed_correction",
       "label": "Observed correction",
+      "level": "advanced",
+      "restart_required": false,
+      "secret": false,
+      "section": "planner",
+      "type": "bool"
+    },
+    {
+      "choices": null,
+      "constraints": {},
+      "default": true,
+      "description": "Refuse, after the fact, a load that measured over its plan and left a card inside `headroom_fraction` (D92).",
+      "env": "SF_PLANNER__POST_LOAD_HEADROOM_CHECK",
+      "key": "planner.post_load_headroom_check",
+      "label": "Post load headroom check",
       "level": "advanced",
       "restart_required": false,
       "secret": false,

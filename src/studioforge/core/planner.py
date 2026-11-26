@@ -4984,6 +4984,58 @@ def per_device_overruns(
     return out
 
 
+def post_load_headroom_shortfall(
+    plan: LoadPlan,
+    actual_bytes: int,
+    gpus: Sequence[GpuInfo],
+    *,
+    headroom_fraction: float,
+    bar_pct: float = PREDICTION_ERROR_WARN_PCT,
+) -> list[dict[str, int]]:
+    """The cards a load that ran over its plan left inside their headroom (D92).
+
+    2026-11-25: an 8-slot load of an 8B model was planned at 54,356 MB and
+    measured 59,831 MB (+10.1%). The planner warned and served it anyway; GPU0
+    was left with ~1.4 GB of 32.6, WDDM paged the child's working set, and every
+    decode step waited on the bus -- about 5 tok/s per request instead of
+    ~120, for ten hours, with no error anywhere. The same model at 7 slots with
+    4.5 GB left on the card ran at 125.
+
+    A load is refused after the fact only when BOTH hold, so a placement the
+    planner sized correctly is never second-guessed:
+
+    * it measured more than ``bar_pct`` over what the plan reserved (the OOM
+      direction of the prediction bar), and
+    * some card of the plan now has less free VRAM than the headroom the
+      planner promised to keep (``headroom_fraction`` of its total).
+
+    Returns one row per such card -- ``{"device", "free_bytes",
+    "headroom_bytes", "total_bytes"}`` -- or ``[]``. ``headroom_fraction`` 0
+    (the operator gave up the reserve) never refuses.
+    """
+    planned = int(plan.estimate.total_bytes or 0)
+    if headroom_fraction <= 0 or planned <= 0 or actual_bytes <= 0:
+        return []
+    if actual_bytes <= planned * (1.0 + bar_pct / 100.0):
+        return []
+    wanted = {int(d) for d in plan.devices}
+    out: list[dict[str, int]] = []
+    for gpu in gpus:
+        if int(gpu.index) not in wanted or gpu.total_bytes <= 0:
+            continue
+        headroom = int(gpu.total_bytes * headroom_fraction)
+        if int(gpu.free_bytes) < headroom:
+            out.append(
+                {
+                    "device": int(gpu.index),
+                    "free_bytes": int(gpu.free_bytes),
+                    "headroom_bytes": headroom,
+                    "total_bytes": int(gpu.total_bytes),
+                }
+            )
+    return out
+
+
 #: --- observed-footprint correction (D51) --------------------------------
 #:
 #: What the measured bytes ABOVE the model's weights are multiplied by before
